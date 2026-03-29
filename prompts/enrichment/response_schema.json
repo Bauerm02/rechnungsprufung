@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "project_code": { "type": "string" },
+    "payment_type_candidate": { "type": "string" },
+    "stamp_text_candidate": { "type": "string" }
+  },
+  "required": ["project_code", "payment_type_candidate"]
+}
+

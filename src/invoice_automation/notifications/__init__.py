@@ -1,0 +1,2 @@
+"""Notification drafting boundaries."""
+

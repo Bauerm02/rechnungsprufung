@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "status_candidate": { "type": "string" },
+    "reason_candidate": { "type": "string" },
+    "invoice_number": { "type": "string" },
+    "sender_name": { "type": "string" }
+  },
+  "required": ["status_candidate", "reason_candidate"]
+}
+

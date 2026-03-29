@@ -1,0 +1,703 @@
+[
+  {
+    "id": "valid_company_transfer",
+    "text": "Empfaenger Gutenberg Projekt GmbH. Rechnung fuer Objektpflege 1200,00 EUR. Bitte ueberweisen Sie auf IBAN AT611904300234573201.",
+    "extracted": {
+      "sender_name": "Objektpflege GmbH",
+      "recipient_name": "Gutenberg Projekt GmbH",
+      "invoice_number": "GB-1200",
+      "amount": "1200.00",
+      "iban": "AT611904300234573201",
+      "uid_sender": "ATU12345678",
+      "uid_recipient": "ATU87654321"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "GB",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "PLAN_ONLY",
+      "stamp_allowed": true,
+      "notification_present": false,
+      "routing_artifacts": ["SOURCE_DOCUMENT", "PAYMENT_XML"],
+      "routing_filenames": {
+        "SOURCE_DOCUMENT": "valid_company_transfer_source_document.pdf",
+        "PAYMENT_XML": "valid_company_transfer_payment_draft.xml"
+      },
+      "xml_should_generate": true,
+      "xml_filename": "valid_company_transfer_payment_draft.xml",
+      "xml_reference": "gb-1200",
+      "xml_contains": "<ProjectCode>GB</ProjectCode>",
+      "stamp_should_render": false
+    }
+  },
+  {
+    "id": "duplicate_invoice",
+    "text": "Empfaenger Gutenberg Projekt GmbH. Rechnung fuer Objektpflege 1200,00 EUR.",
+    "seed_duplicate": true,
+    "extracted": {
+      "sender_name": "Objektpflege GmbH",
+      "recipient_name": "Gutenberg Projekt GmbH",
+      "invoice_number": "GB-1200",
+      "amount": "1200.00"
+    },
+    "expected": {
+      "status": "DUPLIKAT",
+      "notification_type": "DUPLICATE_ALERT",
+      "routing_family": "DUPLICATE_HOLD",
+      "payment_type": null,
+      "project_code": "GB",
+      "payable_outcome": false,
+      "manual_review_required": false,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": false
+    }
+  },
+  {
+    "id": "duplicate_by_content_hash_and_document_date",
+    "text": "Empfaenger Gutenberg Projekt GmbH. Rechnung fuer Objektpflege 1200,00 EUR.",
+    "seed_duplicate": {
+      "content_hash": "sha256:dup-001",
+      "document_date": "2026-03-14"
+    },
+    "extracted": {
+      "sender_name": "Objektpflege GmbH",
+      "invoice_number": null,
+      "document_date": "2026-03-14",
+      "amount": "1200.00",
+      "content_hash": "sha256:dup-001"
+    },
+    "expected": {
+      "status": "DUPLIKAT",
+      "notification_type": "DUPLICATE_ALERT",
+      "routing_family": "DUPLICATE_HOLD",
+      "payment_type": null,
+      "project_code": "GB",
+      "payable_outcome": false,
+      "manual_review_required": false,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": false
+    }
+  },
+  {
+    "id": "authority_reminder",
+    "text": "Finanzamt Oesterreich Zahlungserinnerung zu Ihrem Abgabenkonto. Gesamtbetrag 250,00 EUR.",
+    "extracted": {
+      "sender_name": "Finanzamt Oesterreich",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "FA-250",
+      "amount": "250.00"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "7DI",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "reminder_non_authority",
+    "text": "Zahlungserinnerung fuer offene Rechnung 450,00 EUR.",
+    "extracted": {
+      "sender_name": "Lieferant GmbH",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "REM-450",
+      "amount": "450.00"
+    },
+    "expected": {
+      "status": "MAHNUNG",
+      "notification_type": "ACCOUNTING_INFO",
+      "routing_family": "REMINDER_REVIEW_HOLD",
+      "payment_type": null,
+      "project_code": "7DI",
+      "payable_outcome": false,
+      "manual_review_required": true,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": false
+    }
+  },
+  {
+    "id": "private_invoice",
+    "text": "Lottoschein privat 20,00 EUR.",
+    "extracted": {
+      "sender_name": "Lotto Toto GmbH",
+      "recipient_name": "Markus Bauer",
+      "invoice_number": "LOTTO-20",
+      "amount": "20.00"
+    },
+    "expected": {
+      "status": "PRIVAT_RECHNUNG",
+      "notification_type": "ACCOUNTING_INFO",
+      "routing_family": "PRIVATE_REVIEW_HOLD",
+      "payment_type": null,
+      "project_code": "MARKUS_PRIVAT",
+      "payable_outcome": false,
+      "manual_review_required": true,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": false
+    }
+  },
+  {
+    "id": "redlinghofer_special_case",
+    "text": "Rechnung an Pension Redlinghofer GmbH ueber 200,00 EUR.",
+    "extracted": {
+      "sender_name": "Installateur Graz GmbH",
+      "recipient_name": "Pension Redlinghofer GmbH",
+      "invoice_number": "RED-200",
+      "amount": "200.00"
+    },
+    "expected": {
+      "status": "UNGUELTIG",
+      "notification_type": "REDLINGHOFER_CORRECTION",
+      "routing_family": "INVALID_HOLD",
+      "payment_type": null,
+      "project_code": "HTV",
+      "payable_outcome": false,
+      "manual_review_required": true,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": false
+    }
+  },
+  {
+    "id": "reverse_charge_foreign",
+    "text": "Empfaenger Sieben Dorfer Immobilien GmbH. Reverse Charge gemaess Steuerschuldnerschaft. Betrag 800,00 EUR. IBAN DE89370400440532013000.",
+    "extracted": {
+      "sender_name": "Irish Software Ltd",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "RC-F-800",
+      "amount": "800.00",
+      "iban": "DE89370400440532013000",
+      "uid_sender": "IE1234567A",
+      "uid_recipient": "ATU87654321"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "7DI",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "PLAN_ONLY",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "reverse_charge_foreign_beats_generic_austria_hint",
+    "text": "Empfaenger Sieben Dorfer Immobilien GmbH Austria. Reverse Charge gemaess Steuerschuldnerschaft.",
+    "extracted": {
+      "sender_name": "Irish Software Ltd",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "RC-F-801",
+      "amount": "800.00",
+      "iban": "DE89370400440532013000",
+      "uid_sender": "IE1234567A",
+      "uid_recipient": "ATU87654321"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "7DI",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "PLAN_ONLY",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "reverse_charge_conflict_review_hold",
+    "text": "Empfaenger Sieben Dorfer Immobilien GmbH. Reverse Charge gemaess Steuerschuldnerschaft.",
+    "extracted": {
+      "sender_name": "Bau GmbH",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "RC-C-800",
+      "amount": "800.00",
+      "iban": "DE89370400440532013000",
+      "uid_sender": "ATU12345678",
+      "uid_recipient": "ATU87654321"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "ACCOUNTING_INFO",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "7DI",
+      "payable_outcome": false,
+      "manual_review_required": true,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": true,
+      "notification_present": true,
+      "notification_recipients": ["buchhaltung@local.invalid"],
+      "notification_subject_contains": "[ACCOUNTING_INFO]",
+      "routing_artifacts": ["SOURCE_DOCUMENT", "STAMPED_PDF", "NOTIFICATION_DRAFT"],
+      "routing_filenames": {
+        "SOURCE_DOCUMENT": "reverse_charge_conflict_review_hold_source_document.pdf",
+        "STAMPED_PDF": "reverse_charge_conflict_review_hold_stamped_draft.pdf",
+        "NOTIFICATION_DRAFT": "reverse_charge_conflict_review_hold_notification_draft.txt"
+      },
+      "stamp_should_render": true,
+      "stamp_filename": "reverse_charge_conflict_review_hold_stamped_draft.pdf",
+      "stamp_lines_include": ["MANUELLE PRUEFUNG ERFORDERLICH"]
+    }
+  },
+  {
+    "id": "reverse_charge_domestic",
+    "text": "Empfaenger Sieben Dorfer Immobilien GmbH. Reverse Charge gemaess Steuerschuldnerschaft in Oesterreich. Betrag 800,00 EUR.",
+    "extracted": {
+      "sender_name": "Bau GmbH",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "RC-D-800",
+      "amount": "800.00",
+      "uid_sender": "ATU12345678",
+      "uid_recipient": "ATU87654321"
+    },
+    "expected": {
+      "status": "UNGUELTIG",
+      "notification_type": "ACCOUNTING_INFO",
+      "routing_family": "INVALID_HOLD",
+      "payment_type": null,
+      "project_code": "7DI",
+      "payable_outcome": false,
+      "manual_review_required": true,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": false
+    }
+  },
+  {
+    "id": "missing_uid_legal_entity",
+    "text": "Empfaenger Sieben Dorfer Immobilien GmbH. Rechnung Elektro Mayer GmbH 850,00 EUR.",
+    "extracted": {
+      "sender_name": "Elektro Mayer GmbH",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "UID-850-A",
+      "amount": "850.00"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "ACCOUNTING_INFO",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "7DI",
+      "payable_outcome": false,
+      "manual_review_required": true,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": true,
+      "notification_present": true,
+      "notification_recipients": ["buchhaltung@local.invalid"],
+      "notification_subject_contains": "[ACCOUNTING_INFO]",
+      "routing_artifacts": ["SOURCE_DOCUMENT", "STAMPED_PDF", "NOTIFICATION_DRAFT"],
+      "routing_filenames": {
+        "SOURCE_DOCUMENT": "missing_uid_legal_entity_source_document.pdf",
+        "STAMPED_PDF": "missing_uid_legal_entity_stamped_draft.pdf",
+        "NOTIFICATION_DRAFT": "missing_uid_legal_entity_notification_draft.txt"
+      },
+      "stamp_should_render": true,
+      "stamp_filename": "missing_uid_legal_entity_stamped_draft.pdf",
+      "stamp_lines_include": ["UID nicht lesbar - bitte pruefen", "MANUELLE PRUEFUNG ERFORDERLICH"]
+    }
+  },
+  {
+    "id": "missing_uid_non_entity",
+    "text": "Empfaenger Sieben Dorfer Immobilien GmbH. Rechnung Max Muster 850,00 EUR.",
+    "extracted": {
+      "sender_name": "Max Muster",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "UID-850-B",
+      "amount": "850.00",
+      "supplier_email": "office@example.com"
+    },
+    "expected": {
+      "status": "UNGUELTIG",
+      "notification_type": "SUPPLIER_CORRECTION",
+      "routing_family": "INVALID_HOLD",
+      "payment_type": null,
+      "project_code": "7DI",
+      "payable_outcome": false,
+      "manual_review_required": true,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": false,
+      "notification_present": true,
+      "notification_recipients": ["office@example.com"],
+      "notification_subject_contains": "[SUPPLIER_CORRECTION]",
+      "notification_body_contains": "Lieferanten-UID fehlt fuer diese Rechnung.",
+      "routing_artifacts": ["SOURCE_DOCUMENT", "NOTIFICATION_DRAFT"],
+      "routing_filenames": {
+        "SOURCE_DOCUMENT": "missing_uid_non_entity_source_document.pdf",
+        "NOTIFICATION_DRAFT": "missing_uid_non_entity_notification_draft.txt"
+      },
+      "stamp_should_render": false
+    }
+  },
+  {
+    "id": "missing_recipient_uid_over_10000",
+    "text": "Empfaenger Sieben Dorfer Immobilien GmbH. Rechnung Bau GmbH 12000,00 EUR. IBAN AT611904300234573201.",
+    "extracted": {
+      "sender_name": "Bau GmbH",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "BIG-12000",
+      "amount": "12000.00",
+      "iban": "AT611904300234573201",
+      "uid_sender": "ATU12345678"
+    },
+    "expected": {
+      "status": "UNGUELTIG",
+      "notification_type": "ACCOUNTING_INFO",
+      "routing_family": "INVALID_HOLD",
+      "payment_type": null,
+      "project_code": "7DI",
+      "payable_outcome": false,
+      "manual_review_required": true,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": false
+    }
+  },
+  {
+    "id": "auto_paid_vendor",
+    "text": "OpenAI API subscription 99,00 EUR. Zahlung per Kreditkarte.",
+    "extracted": {
+      "sender_name": "OpenAI",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "OPENAI-99",
+      "amount": "99.00",
+      "uid_sender": "IE1234567A"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "AUTO_PAID_CARD",
+      "payment_type": "AUTOMATISCH_BEZAHLT",
+      "project_code": "7DI",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "transfer_reference_overrides_auto_paid_vendor",
+    "text": "Empfaenger Gutenberg Projekt GmbH. OpenAI Rechnung 99,00 EUR. Kreditkarte hinterlegt. Bitte bei der Ueberweisung Verwendungszweck: AI-2026-44 angeben.",
+    "extracted": {
+      "sender_name": "OpenAI",
+      "recipient_name": "Gutenberg Projekt GmbH",
+      "invoice_number": "AI-99",
+      "amount": "99.00",
+      "iban": "DE89370400440532013000"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "GB",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "PLAN_ONLY",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "transfer_reference_unlabeled_instruction_line",
+    "text": "Empfaenger Gutenberg Projekt GmbH.\nOpenAI Rechnung 99,00 EUR.\nKreditkarte hinterlegt.\nBitte bei der Ueberweisung angeben:\nAI 2026 77",
+    "extracted": {
+      "sender_name": "OpenAI",
+      "recipient_name": "Gutenberg Projekt GmbH",
+      "invoice_number": "AI-99-B",
+      "amount": "99.00",
+      "iban": "DE89370400440532013000"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "GB",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "PLAN_ONLY",
+      "stamp_allowed": true,
+      "notification_present": false,
+      "routing_artifacts": ["SOURCE_DOCUMENT", "PAYMENT_XML"],
+      "routing_filenames": {
+        "SOURCE_DOCUMENT": "transfer_reference_unlabeled_instruction_line_source_document.pdf",
+        "PAYMENT_XML": "transfer_reference_unlabeled_instruction_line_payment_draft.xml"
+      },
+      "xml_should_generate": true,
+      "xml_filename": "transfer_reference_unlabeled_instruction_line_payment_draft.xml",
+      "xml_reference": "ai-2026-77",
+      "xml_contains": "<ReferenceId>ai-2026-77</ReferenceId>",
+      "stamp_should_render": false
+    }
+  },
+  {
+    "id": "auto_paid_exception_vendor",
+    "text": "Google Ireland Limited Ads Rechnung 150,00 EUR.",
+    "extracted": {
+      "sender_name": "Google Ireland Limited",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "GOOGLE-150",
+      "amount": "150.00"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "7DI",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "credit_note",
+    "text": "Gutschrift fuer bereits bezahlte Leistung -50,00 EUR.",
+    "extracted": {
+      "sender_name": "Lieferant GmbH",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "CREDIT-50",
+      "amount": "-50.00",
+      "iban": "AT611904300234573201"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "7DI",
+      "payable_outcome": false,
+      "manual_review_required": false,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "internal_expense_without_iban",
+    "text": "Abrechnung Stromkosten Wallbox fuer betriebliche Ausgaben 89,00 EUR.",
+    "extracted": {
+      "sender_name": "Markus Bauer",
+      "recipient_name": "Mabau Beteiligungs GmbH",
+      "invoice_number": "EXP-89",
+      "amount": "89.00"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "MBB",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "PLAN_ONLY",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "government_penalty_markus_private",
+    "text": "Magistrat der Stadt Wien Zwangsstrafverfuegung fuer Markus Bauer 500,00 EUR.",
+    "extracted": {
+      "sender_name": "Magistrat der Stadt Wien",
+      "recipient_name": "Markus Bauer",
+      "invoice_number": "PENALTY-500",
+      "amount": "500.00"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "PRIVATE_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "MARKUS_PRIVAT",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "private_keyword_explicit",
+    "text": "Privatrechnung fuer private Zwecke 55,00 EUR.",
+    "extracted": {
+      "sender_name": "Shop GmbH",
+      "recipient_name": "Markus Bauer",
+      "invoice_number": "PRIV-55",
+      "amount": "55.00"
+    },
+    "expected": {
+      "status": "PRIVAT_RECHNUNG",
+      "notification_type": "ACCOUNTING_INFO",
+      "routing_family": "PRIVATE_REVIEW_HOLD",
+      "payment_type": null,
+      "project_code": "MARKUS_PRIVAT",
+      "payable_outcome": false,
+      "manual_review_required": true,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": false
+    }
+  },
+  {
+    "id": "authority_pattern_sender",
+    "text": "Gerichtliche Gebuehr 180,00 EUR.",
+    "extracted": {
+      "sender_name": "Bezirksgericht Graz-Ost",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "COURT-180",
+      "amount": "180.00"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "7DI",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "duplicate_fallback_missing_invoice",
+    "text": "Empfaenger Sieben Dorfer Immobilien GmbH. Rechnung fuer Betreuung 120,00 EUR. IBAN AT611904300234573201.",
+    "seed_duplicate": true,
+    "extracted": {
+      "sender_name": "Acme GmbH",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": null,
+      "amount": "120.00",
+      "iban": "AT611904300234573201"
+    },
+    "expected": {
+      "status": "DUPLIKAT",
+      "notification_type": "DUPLICATE_ALERT",
+      "routing_family": "DUPLICATE_HOLD",
+      "payment_type": null,
+      "project_code": "7DI",
+      "payable_outcome": false,
+      "manual_review_required": false,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": false
+    }
+  },
+  {
+    "id": "duplicate_guardrail_recipient_only_without_hash_date",
+    "text": "Empfaenger Sieben Dorfer Immobilien GmbH. Rechnung fuer Betreuung 120,00 EUR.",
+    "seed_duplicate": true,
+    "extracted": {
+      "sender_name": "Acme GmbH",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": null,
+      "amount": "120.00"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "7DI",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "legal_entity_law_firm_uid_fallback",
+    "text": "Honorarrechnung 900,00 EUR.",
+    "extracted": {
+      "sender_name": "Rechtsanwaltskanzlei Muster",
+      "recipient_name": "Sieben Dorfer Immobilien GmbH",
+      "invoice_number": "LAW-900",
+      "amount": "900.00"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "ACCOUNTING_INFO",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "7DI",
+      "payable_outcome": false,
+      "manual_review_required": true,
+      "xml_disposition": "NOT_ALLOWED",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "internal_expense_employee_reimbursement",
+    "text": "Markus Bauer hat privat vorgestreckt: Wallbox Stromkosten 89,00 EUR.",
+    "extracted": {
+      "sender_name": "Markus Bauer",
+      "recipient_name": "Mabau Beteiligungs GmbH",
+      "invoice_number": "INT-EMP-89",
+      "amount": "89.00"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "MBB",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "PLAN_ONLY",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "project_mapping_ocr_recipient",
+    "text": "Empfaenger 5ieben D0rfer 1mmobilien Gm6H. Rechnung fuer Objektpflege 1200,00 EUR.",
+    "extracted": {
+      "sender_name": "Objektpflege GmbH",
+      "recipient_name": "5ieben D0rfer 1mmobilien Gm6H",
+      "invoice_number": "OCR-1200",
+      "amount": "1200.00",
+      "iban": "AT611904300234573201",
+      "uid_sender": "ATU12345678",
+      "uid_recipient": "ATU87654321"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "7DI",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "PLAN_ONLY",
+      "stamp_allowed": true
+    }
+  },
+  {
+    "id": "project_mapping_token_order_spacing_damage",
+    "text": "Empfaenger Immobilien GmbH SiebenDorfer. Rechnung fuer Objektpflege 1200,00 EUR.",
+    "extracted": {
+      "sender_name": "Objektpflege GmbH",
+      "recipient_name": "Immobilien GmbH SiebenDorfer",
+      "invoice_number": "OCR-1201",
+      "amount": "1200.00",
+      "iban": "AT611904300234573201",
+      "uid_sender": "ATU12345678",
+      "uid_recipient": "ATU87654321"
+    },
+    "expected": {
+      "status": "GUELTIG",
+      "notification_type": "NONE",
+      "routing_family": "COMPANY_PAYABLE",
+      "payment_type": "UEBERWEISUNG",
+      "project_code": "7DI",
+      "payable_outcome": true,
+      "manual_review_required": false,
+      "xml_disposition": "PLAN_ONLY",
+      "stamp_allowed": true
+    }
+  }
+]

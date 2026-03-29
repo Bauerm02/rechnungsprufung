@@ -1,0 +1,2 @@
+"""Input ingestion boundaries."""
+
