@@ -54,24 +54,33 @@ keine stillschweigend übersprungenen Punkte.
   abweicht (falsches Konto/Währung/Padding/Jahr/Hex/abgeschnittener
   Suffix), wird NIE als gewöhnlicher Einzelumsatz durchgereicht, sondern
   als Prüffall ausgewiesen und "poisoned" jede sonst zufällig valide
-  erscheinende Restgruppe mit gleichem Konto/Währung/Datum/Referenz. Eine
-  Zeile ohne jede brauchbare ID (weder "Enthaltene Überweisung ID" noch
-  "(Sammel-) Überweisung ID") wird nie automatisch Kandidat — eine
-  Buchungsreferenz allein zählt nicht als eindeutiger Schlüssel, egal wie
-  viele Zeilen die Datei hat. Eine Datei ohne jede Datenzeile (nur
-  Kopfzeile) gilt nicht als bestätigt vollständig, sondern wird
-  abgelehnt.
+  erscheinende Restgruppe mit gleichem Konto/Währung/Datum/Referenz —
+  AUSSER die ID entspricht exakt einem separat bestätigten anderen
+  Einzelumsatz-ID-Format (aktuell: 118 Zeichen = IBAN+14 Nullen+
+  Währung+17-stelliges opakes Präfix+64-stelliger Hex-Hash, KEIN
+  S/D-Profil; siehe `_ist_beobachtetes_einzelprofil`). Eine Zeile ohne
+  jede brauchbare ID (weder "Enthaltene Überweisung ID" noch "(Sammel-)
+  Überweisung ID") wird nie automatisch Kandidat — eine Buchungsreferenz
+  allein zählt nicht als eindeutiger Schlüssel, egal wie viele Zeilen die
+  Datei hat. Eine Datei ohne jede Datenzeile (nur Kopfzeile) gilt nicht
+  als bestätigt vollständig, sondern wird abgelehnt.
 
   **Formatbeleg (lokaler Vier-Dateien-Abgleich, außerhalb dieses
-  Repositories, keine Echtdaten übertragen):** vier echte
-  George-Business-CSV-Exporte wurden lokal rein lesend mit diesem
-  Adapter verglichen — alle 44 Zeilen erhalten, vier Sammelsummen korrekt
+  Repositories, keine Echtdaten übertragen) — Verlauf:** Für Commit
+  6b95af9 bestanden: vier echte George-Business-CSV-Exporte lokal rein
+  lesend verglichen — alle 44 Zeilen erhalten, vier Sammelsummen korrekt
   erkannt, 40 Umsätze, alle vier Bankkontrollen (Anfangs-/Endsaldo)
-  stimmen centgenau. Das bestätigt das Spaltenschema und die
-  Grundklassifizierung gegen echte Daten — **keine Produktionsfreigabe**:
-  der Adapter bleibt eine manuell zu prüfende Vorschau ohne Anbindung an
-  Buchung/Versand/Mahnwesen, und das S/D-Profil selbst wurde nur an
-  diesen vier Dateien beobachtet, nicht umfassend gegen alle denkbaren
+  stimmen centgenau. Commit c317b6a hat denselben Vier-Dateien-Abgleich
+  NICHT bestanden: die reine Längenregel für "kaputtes Sammelprofil"
+  hat 15 echte, gültige Einzelumsätze (118-Zeichen-Format, siehe oben)
+  fälschlich als Prüffall zurückgestellt, statt sie als Kandidaten zu
+  erkennen. Mit dem 118-Zeichen-Einzelprofil korrigiert; der nächste
+  Commit wird erneut lokal gegen alle vier Dateien geprüft. Das
+  bestätigt das Spaltenschema und die Grundklassifizierung gegen echte
+  Daten — **keine Produktionsfreigabe**: der Adapter bleibt eine manuell
+  zu prüfende Vorschau ohne Anbindung an Buchung/Versand/Mahnwesen, und
+  beide ID-Profile (S/D und Einzelumsatz) wurden nur an diesen vier
+  Dateien beobachtet, nicht umfassend gegen alle denkbaren
   George-Exportvarianten abgesichert.
 - **Zahlungszuordnung erkennt bisher nur explizite Vertragsreferenzen:**
   Die Relevanzprüfung ungeklärter Zahlungseingänge erkennt bisher nur

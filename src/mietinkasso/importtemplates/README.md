@@ -134,7 +134,10 @@ genug für einen Versuch des 107-Zeichen-S/D-Profils ist, aber inhaltlich
 davon abweicht (falsches Konto/Währung/Padding/Jahr/Hex, abgeschnittener
 Suffix), wird NIE als gewöhnlicher Einzelumsatz durchgereicht, sondern
 selbst ein `PRUEFFALL` und "poisoned" jede sonst zufällig valide
-erscheinende Sammelgruppe mit gleichem Konto/Währung/Datum/Referenz.
+erscheinende Sammelgruppe mit gleichem Konto/Währung/Datum/Referenz —
+AUSSER sie entspricht exakt einem separat bestätigten anderen
+Einzelumsatz-ID-Format (aktuell: 118 Zeichen = IBAN+14 Nullen+Währung+
+17-stelliges opakes Präfix+64-stelliger Hex-Hash, KEIN S/D-Profil).
 
 `felder`/`sha256_zeile` je Ergebniszeile bewahren die EXAKTEN dekodierten
 CSV-Werte (kein `.strip()`) — Normalisierung für Konto-/Datums-/

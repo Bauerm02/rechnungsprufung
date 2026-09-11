@@ -63,6 +63,23 @@ def _sd_id_variante(
     return f"{konto_teil}{padding_teil}{waehrung}{praefix}{jahr:04d}{marker}{suffix}"
 
 
+def _einzel_id_118(
+    iban: str,
+    *,
+    waehrung: str = "EUR",
+    praefix: str = "0" * 17,
+    hash_suffix: str = "A" * 64,
+    eingebettetes_konto: str | None = None,
+) -> str:
+    """Baut eine synthetische 'Enthaltene Überweisung ID' nach dem
+    zweiten, separat bestätigten Einzelumsatz-Profil (118 Zeichen, KEIN
+    S/D-Profil): IBAN(20)+14 Nullen+Währung(3)+opakes Präfix(17
+    Ziffern)+Hex-Suffix(64)."""
+
+    konto_teil = eingebettetes_konto if eingebettetes_konto is not None else iban
+    return f"{konto_teil}{'0' * 14}{waehrung}{praefix}{hash_suffix}"
+
+
 def _zeile(**overrides: str) -> dict[str, str]:
     basis = {spalte: "" for spalte in ERWARTETE_SPALTEN}
     basis.update(
@@ -876,6 +893,55 @@ def test_zu_kurze_id_bleibt_andersartiges_einzelumsatz_format():
 
     preview = _preview([_zeile(Betrag="-30,00", **{"Enthaltene Überweisung ID": "REF-12345"})])
     assert len(preview.kandidaten) == 1
+
+
+# ---------------------------------------------------------------------------
+# 3. Gegenprobe: zweites, separat bestätigtes 118-Zeichen-Einzelumsatz-
+# ID-Format (KEIN S/D-Profil) - wurde vorher fälschlich als kaputtes
+# Sammelprofil geblockt, weil es lang genug für einen Profilversuch war.
+# ---------------------------------------------------------------------------
+
+
+def test_gueltige_118_zeichen_einzel_id_wird_kandidat():
+    preview = _preview([_zeile(Betrag="-30,00", **{"Enthaltene Überweisung ID": _einzel_id_118(KONTO_A)})])
+    assert len(preview.kandidaten) == 1
+    assert preview.pruefffaelle == []
+
+
+def test_gleiches_118_zeichen_einzel_id_duplikat_wird_blockiert():
+    doppelte_id = _einzel_id_118(KONTO_A)
+    preview = _preview(
+        [
+            _zeile(Betrag="-30,00", **{"Enthaltene Überweisung ID": doppelte_id}),
+            _zeile(Betrag="-40,00", **{"Enthaltene Überweisung ID": doppelte_id}),
+        ]
+    )
+    assert preview.kandidaten == []
+    assert len(preview.pruefffaelle) == 2
+
+
+def test_118_zeichen_id_mit_falschem_eingebettetem_konto_wird_blockiert():
+    preview = _preview(
+        [_zeile(Betrag="-30,00", **{"Enthaltene Überweisung ID": _einzel_id_118(KONTO_A, eingebettetes_konto=KONTO_B)})]
+    )
+    assert preview.kandidaten == []
+    assert len(preview.pruefffaelle) == 1
+
+
+def test_118_zeichen_id_mit_falscher_waehrung_wird_blockiert():
+    preview = _preview(
+        [_zeile(Betrag="-30,00", **{"Enthaltene Überweisung ID": _einzel_id_118(KONTO_A, waehrung="USD")})]
+    )
+    assert preview.kandidaten == []
+    assert len(preview.pruefffaelle) == 1
+
+
+def test_118_zeichen_id_mit_kaputtem_hex_wird_blockiert():
+    preview = _preview(
+        [_zeile(Betrag="-30,00", **{"Enthaltene Überweisung ID": _einzel_id_118(KONTO_A, hash_suffix="G" * 64)})]
+    )
+    assert preview.kandidaten == []
+    assert len(preview.pruefffaelle) == 1
 
 
 # ---------------------------------------------------------------------------

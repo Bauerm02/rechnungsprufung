@@ -77,9 +77,13 @@ normaler Einzelumsatz, und wird als Prüffall ausgewiesen (siehe
 außerdem jede Sammelgruppe mit gleichem (Konto, Währung, Datum,
 Buchungsreferenz): die übrigen, für sich genommen sauber aussehenden
 S/D-Mitglieder werden NICHT auf Basis der dadurch verkleinerten Gruppe
-validiert. Nur eine ID, die für dieses Profil erkennbar zu KURZ ist, gilt
-als andersartiges, unabhängiges Einzelumsatz-Format und wird normal
-(mit eigener Dublettenprüfung) behandelt.
+validiert. Nur eine ID, die für dieses Profil erkennbar zu KURZ ist, ODER die exakt
+einem separat bestätigten ANDEREN Einzelumsatz-ID-Format entspricht
+(siehe `_ist_beobachtetes_einzelprofil` - Eigene IBAN(20) + 14 Nullen +
+Währung(3) + opakes 17-stelliges Präfix + Hex-Suffix(64) = 118 Zeichen,
+KEIN S/D-Profil), gilt als andersartiges, unabhängiges Einzelumsatz-
+Format und wird normal (mit eigener Dublettenprüfung) behandelt. Jede
+sonstige lange, aber nicht eindeutig zuordenbare ID bleibt Prüffall.
 
 Unabhängige Identität (nach unabhängiger Gegenprobe ergänzt): eine Zeile
 ohne S/D-Sammelmarkierung braucht trotzdem MINDESTENS eine brauchbare
@@ -582,6 +586,25 @@ def _sieht_wie_sammel_id_versuch_aus(enthaltene_id: str) -> bool:
     return len(enthaltene_id) >= _SD_MINDESTLAENGE_FUER_PROFILVERSUCH
 
 
+#: Zweites, unabhängig beobachtetes ID-Format für GEWÖHNLICHE
+#: Einzelumsätze (KEIN S/D-Sammelprofil): Eigene IBAN(20) + 14 Nullen +
+#: Währung(3) + opakes numerisches Präfix(17 Ziffern, NICHT als
+#: Datum/Jahr interpretieren) + Hex-Suffix(64) = 118 Zeichen. Trifft laut
+#: Gegenprobe exakt auf reale Einzelumsatz-IDs zu, die sonst - weil lang
+#: genug für einen 107-Zeichen-Sammelprofilversuch - fälschlich als
+#: kaputtes Sammelprofil blockiert wurden.
+_EINZEL_PRAEFIX_LAENGE = 17
+_EINZEL_HASH_LAENGE = 64
+
+
+def _ist_beobachtetes_einzelprofil(eid: str, *, iban: str, waehrung: str) -> bool:
+    if len(iban) != _SD_IBAN_LAENGE or len(waehrung) != _SD_WAEHRUNG_LAENGE:
+        return False
+    kopf = iban + _SD_PADDING + waehrung
+    muster = re.escape(kopf) + rf"[0-9]{{{_EINZEL_PRAEFIX_LAENGE}}}[0-9A-F]{{{_EINZEL_HASH_LAENGE}}}"
+    return re.fullmatch(muster, eid) is not None
+
+
 def _validiere_basis(zeile_nr: int, csv_zeile: int, rohfelder: dict[str, str]) -> _ZeilenKontext:
     # `werte` ist eine für die fachliche Auswertung normalisierte Kopie
     # (getrimmt) - `rohfelder` bleibt für Audit/Hash unverändert (siehe
@@ -894,7 +917,15 @@ def erstelle_preview(
     for kontext in geprueft:
         eid = kontext.werte["Enthaltene Überweisung ID"]
         analyse = _sammel_id_analyse(eid, iban=kontext.eigene_iban, waehrung=kontext.waehrung, buchungsdatum=kontext.buchungsdatum)
-        ist_kaputtes_profil = analyse is None and bool(eid) and _sieht_wie_sammel_id_versuch_aus(eid)
+        ist_beobachtetes_einzelprofil = analyse is None and _ist_beobachtetes_einzelprofil(
+            eid, iban=kontext.eigene_iban, waehrung=kontext.waehrung
+        )
+        ist_kaputtes_profil = (
+            analyse is None
+            and bool(eid)
+            and _sieht_wie_sammel_id_versuch_aus(eid)
+            and not ist_beobachtetes_einzelprofil
+        )
         if analyse is None and not ist_kaputtes_profil:
             einzel_kontexte.append(kontext)
             continue
