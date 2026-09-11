@@ -61,6 +61,7 @@ def test_cli_gibt_bericht_aus_und_liefert_exitcode_0(tmp_path, capsys):
     assert "Kandidaten (1)" in ausgabe
     assert "45,50" in ausgabe
     assert "HINWEIS" in ausgabe
+    assert "Gesamtstatus: VOLLSTÄNDIG" in ausgabe
 
 
 def test_cli_lehnt_xlsx_mit_exitcode_2_ab(tmp_path, capsys):
@@ -99,7 +100,7 @@ def test_cli_erzeugt_keine_zusaetzlichen_dateien(tmp_path):
     assert vor_dem_lauf == nach_dem_lauf
 
 
-def test_cli_mit_saldenkontrolle_zeigt_abweichung(tmp_path, capsys):
+def test_cli_mit_saldenkontrolle_zeigt_abweichung_und_liefert_exitcode_ungleich_0(tmp_path, capsys):
     datei = tmp_path / "export.csv"
     _schreibe_csv(datei, [_basiszeile(Betrag="100,00")])
 
@@ -115,8 +116,34 @@ def test_cli_mit_saldenkontrolle_zeigt_abweichung(tmp_path, capsys):
     )
     ausgabe = capsys.readouterr().out
 
-    assert exit_code == 0
+    assert exit_code != 0
     assert "ABWEICHUNG" in ausgabe
+    assert "Gesamtstatus: UNVOLLSTÄNDIG" in ausgabe
+
+
+def test_cli_liefert_exitcode_ungleich_0_bei_pruefffaellen(tmp_path, capsys):
+    datei = tmp_path / "export.csv"
+    _schreibe_csv(
+        datei,
+        [
+            _basiszeile(Betrag="-10,00", **{"Enthaltene Überweisung ID": "DUP"}),
+            _basiszeile(Betrag="-20,00", **{"Enthaltene Überweisung ID": "DUP"}),
+        ],
+    )
+
+    exit_code = _MODUL.main(
+        [
+            "--datei", str(datei),
+            "--konto", "AT611000000000601001",
+            "--von", "01.01.2026",
+            "--bis", "31.01.2026",
+        ]
+    )
+    ausgabe = capsys.readouterr().out
+
+    assert exit_code != 0
+    assert "Prüffälle" in ausgabe
+    assert "Gesamtstatus: UNVOLLSTÄNDIG" in ausgabe
 
 
 def test_cli_ungueltiges_datumsargument_wird_von_argparse_abgelehnt(tmp_path):

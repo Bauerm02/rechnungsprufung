@@ -6,7 +6,7 @@ WICHTIG — Abgrenzung zu `bank/importer.py` und `bank/service.py`:
   verdrahtet. Es liest keine Datenbank, schreibt keine Datenbank, ordnet
   keine Zahlungen einem Vertrag zu und löst keinen Mahnlauf/Versand aus.
   Es ist ein reiner Format-/Struktur-Prüfschritt für einen echten
-  George-Business-CSV-Export, gedacht als Vorstufe VOR einem eventuen
+  George-Business-CSV-Export, gedacht als Vorstufe VOR einem eventuellen
   späteren, eigenen Import-Baustein.
 - Das bestehende konfigurierbare CSV-Format (`bank/importer.py::parse_csv`,
   `CsvSpaltenMapping`) bleibt unverändert und unberührt. Wer schreibende
@@ -24,20 +24,51 @@ UTF-8 mit optionalem BOM, Komma als Trennzeichen, gequotete Felder,
 Beträge in österreichischer Notation (Punkt=Tausender, Komma=Dezimal,
 genau zwei Nachkommastellen), Buchungsdatum als TT.MM.JJJJ, nur EUR.
 
-Sammel-Summenzeilen (kritischer Punkt): Der Export kann sowohl
-Sammelüberweisungs-Summenzeilen als auch deren Einzelposten enthalten,
-beide unter derselben "(Sammel-) Überweisung ID". Weder die
-"(Sammel-) Überweisung ID" noch die "Buchungsreferenz" sind daher ein
-eindeutiger Transaktionsschlüssel und werden hier NIEMALS pauschal zur
-Deduplizierung verwendet. Eine Zeile wird nur dann als Summenzeile
-ausgewiesen (und aus den buchbaren Kandidaten entfernt), wenn innerhalb
-derselben Sammelgruppe eine eindeutige Markierung ("S" für Summe, "D"
-für Detail — abgeleitet aus dem letzten Buchstaben vor einer optionalen
-Endziffernfolge in "Enthaltene Überweisung ID") UND eine centgenau
-exakte Detail-Summenprüfung vorliegen. Dieses Markierungsmerkmal ist
-eine BEOBACHTETE Struktur, keine verifizierte Anbieterzusage — jede
-Sammelgruppe, die sich nicht eindeutig und vollständig auflösen lässt,
-wird als Prüffall ausgewiesen statt geraten oder automatisch bereinigt.
+Sammel-Summenzeilen (kritischer Punkt, nach unabhängiger Codeprüfung
+korrigiert): Der Export kann sowohl Sammelüberweisungs-Summenzeilen als
+auch deren Einzelposten enthalten. Die sichtbare Spalte "(Sammel-)
+Überweisung ID" ist dabei KEIN zuverlässiger Gruppenschlüssel — die
+Summenzeile trägt laut Fachprüfung dieselbe ID wie NUR der erste
+Einzelposten; die übrigen Detailzeilen tragen jeweils EIGENE
+(Sammel-) Überweisung IDs. Weder diese Spalte noch die Buchungsreferenz
+sind daher allein ein eindeutiger Transaktions-/Gruppenschlüssel.
+
+Stattdessen wird eine Sammelgruppe über (Eigene IBAN, Währung,
+Buchungsdatum, eine ECHTE/brauchbare Buchungsreferenz) zusammengeführt
+und NUR dann als vollständig aufgelöst behandelt, wenn zusätzlich:
+
+1. jede beteiligte Zeile über "Enthaltene Überweisung ID" eindeutig als
+   Detail (D) oder Summe (S) erkennbar ist (siehe `_sammel_id_analyse` -
+   enges, strukturell bestätigtes 107-Zeichen-Profil, siehe unten),
+2. alle beteiligten Zeilen denselben eingebetteten 9-stelligen
+   "Gruppenpräfix" tragen (Konsistenzprüfung, siehe unten),
+3. die Summenzeile eine "(Sammel-) Überweisung ID" trägt, die mit der
+   ID MINDESTENS einer Detailzeile übereinstimmt (spiegelt "dieselbe ID
+   wie der erste Einzelposten" ab, ohne eine Zeilenreihenfolge
+   vorauszusetzen — Summen können vor oder nach den Details stehen),
+4. die Detailbeträge sich centgenau exakt auf die Summenzeile addieren.
+
+Jede Abweichung (fehlende Gegenstücke, uneindeutige Markierung,
+inkonsistentes Gruppenpräfix, abweichende Summe, eine isolierte S- oder
+D-Zeile ohne vollständige Gegengruppe) führt NICHT zu einer geratenen
+Klassifizierung, sondern zu einem Prüffall für die GESAMTE betroffene
+Gruppe.
+
+Enthaltene-Überweisung-ID-Schema (S/D), aus einer unabhängigen
+Strukturprüfung bestätigter LÄNGEN/AUFBAU, aber ohne echte Produktions-
+IDs verifiziert — siehe `docs/hausverwaltung/OFFENE_PUNKTE.md`:
+
+    [Eigene IBAN, 20 Zeichen][14 Nullen][Währung, 3 Zeichen]
+    [numerisches Präfix, 9 Ziffern][Jahr, 4 Ziffern][Marker S/D]
+    [Hex-Hash, 56 Zeichen]                                    = 107 Zeichen
+
+Das 9-stellige Präfix wird NICHT als Datum oder sonstiger Fachwert
+interpretiert, sondern ausschließlich als opaker Konsistenzwert
+innerhalb einer Gruppe verglichen. Jede ID, die nicht exakt in dieses
+enge Profil passt (Länge, Padding, Konto-/Währungs-/Jahresübereinstimmung
+mit der eigenen Zeile, Markerzeichen, Hex-Zeichensatz des Suffix), gilt
+als NICHT bestimmbar — die Zeile wird dann wie ein gewöhnlicher
+Einzelumsatz behandelt (mit eigener Dublettenprüfung), NIEMALS geraten.
 """
 
 from __future__ import annotations
@@ -45,10 +76,11 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from mietinkasso.domain.exceptions import MietinkassoError
 from mietinkasso.domain.money import to_cents
@@ -82,10 +114,32 @@ ERWARTETE_SPALTEN = (
 
 _UNTERSTUETZTE_WAEHRUNG = "EUR"
 _MAX_BETRAG_CENT = 2**63 - 1
+#: Ziffern VOR dem Komma - deutlich unter der Decimal-Standardpräzision
+#: (28 signifikante Stellen), damit ein absichtlich überlanger Betrag
+#: kontrolliert abgelehnt wird statt eine unbehandelte
+#: decimal.InvalidOperation auszulösen.
+_MAX_BETRAG_ZIFFERN_VOR_KOMMA = 17
 
 _OES_BETRAG_MUSTER = re.compile(r"^[+-]?(?:[0-9]{1,3}(?:\.[0-9]{3})*|[0-9]+),[0-9]{2}$")
 _DATUM_MUSTER = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
-_ENDMARKIERUNG_MUSTER = re.compile(r"([A-Za-z])[0-9]*$")
+
+#: Beobachtetes, unabhängig strukturell bestätigtes Sammel-S/D-ID-Profil
+#: (siehe Moduldocstring). NICHT als Kundendatum interpretieren.
+_SD_IBAN_LAENGE = 20
+_SD_PADDING = "0" * 14
+_SD_WAEHRUNG_LAENGE = 3
+_SD_PRAEFIX_LAENGE = 9
+_SD_JAHR_LAENGE = 4
+_SD_HASH_LAENGE = 56
+_SD_MARKER_POSITION = _SD_IBAN_LAENGE + len(_SD_PADDING) + _SD_WAEHRUNG_LAENGE + _SD_PRAEFIX_LAENGE + _SD_JAHR_LAENGE
+_SD_GESAMTLAENGE = _SD_MARKER_POSITION + 1 + _SD_HASH_LAENGE
+_HEX_MUSTER = re.compile(r"^[0-9A-F]+$")
+
+#: Werte, die NIEMALS als eindeutiger Schlüssel (Dublettenprüfung,
+#: Sammelgruppen-Referenz) verwendet werden dürfen - eine leere Spalte
+#: oder der Platzhalter "NOTPROVIDED" bedeuten "keine brauchbare ID",
+#: nicht "diese Zeilen gehören zusammen".
+_UNBRAUCHBARE_SCHLUESSELWERTE = {"", "NOTPROVIDED"}
 
 #: Fixer Hinweis, der in jeder Vorschau unverändert mitgeliefert wird —
 #: kein berechneter Wert, sondern eine bewusste Warnung gegen eine
@@ -102,16 +156,23 @@ WARNUNG_BANKVOLLSTAENDIGKEIT = (
 class GeorgeFormatFehlerError(MietinkassoError):
     """Die Datei entspricht strukturell nicht dem erwarteten
     George-Business-CSV-Export (falscher Dateityp, unlesbare Kodierung,
-    abweichende Kopfzeile). Wird abgelehnt statt spekulativ als CSV mit
-    Lücken weiterverarbeitet."""
+    leere/doppelte/abweichende Kopfzeile, defekte CSV-Struktur). Wird
+    abgelehnt statt spekulativ als CSV mit Lücken weiterverarbeitet."""
 
 
 @dataclass(frozen=True)
 class GeorgeKandidat:
     """Ein normalisierter, geprüfter Buchungskandidat (Einzelumsatz oder
     validierter Sammel-Detailposten). Noch keine Buchung, keine
-    Vertrags-/Mieterzuordnung — reine Vorschau."""
+    Vertrags-/Mieterzuordnung — reine Vorschau. Jeder Kandidat liegt auf
+    dem erwarteten Konto UND im erwarteten Zeitraum - andernfalls ist er
+    kein Kandidat, sondern ABGELEHNT/PRUEFFALL (siehe `erstelle_preview`).
 
+    `kandidaten_id` ist eine vom Inhalt (nicht von der Position in der
+    Datei) abgeleitete, stabile Kennung - bei geänderter Zeilenreihenfolge
+    in einer sonst inhaltsgleichen Datei bleibt sie unverändert."""
+
+    kandidaten_id: str
     zeile_nr: int
     eigene_iban: str
     eigener_kontoname: str
@@ -127,8 +188,6 @@ class GeorgeKandidat:
     auftraggeber_referenz: str | None
     sammel_id: str | None
     enthaltene_id: str | None
-    konto_stimmt_ueberein: bool
-    im_erwarteten_zeitraum: bool
 
 
 @dataclass(frozen=True)
@@ -138,20 +197,29 @@ class GeorgeZeilenErgebnis:
     Summenzeile, ein Prüffall oder abgelehnt ist. Nichts wird still
     weggelassen.
 
+    `zeile_nr` ist der logische Datenindex (1-basiert, ohne Kopfzeile und
+    ohne vollständig leere Zeilen) - `csv_zeile` ist davon bewusst
+    getrennt die PHYSISCHE Zeilennummer in der Rohdatei (inkl.
+    Kopfzeile), wie sie ein Mensch beim Öffnen der Datei sieht.
+
     status:
-      - "KANDIDAT": normalisierter, buchbarer Vorschau-Kandidat.
+      - "KANDIDAT": normalisierter, buchbarer Vorschau-Kandidat - liegt
+        auf dem erwarteten Konto und im erwarteten Zeitraum.
       - "SAMMEL_SUMME": strukturell eindeutig als Sammel-Summenzeile
         erkannt (Detailsumme stimmt exakt); bewusst kein Kandidat.
-      - "PRUEFFALL": Sammelgruppe/Zeile nicht eindeutig auflösbar;
-        erfordert manuelle Klärung, wird NICHT automatisch normalisiert.
-      - "ABGELEHNT": Zeile technisch ungültig (Format-/Wertefehler).
+      - "PRUEFFALL": Sammelgruppe/Dublette/Zeitraum nicht eindeutig oder
+        nicht im erwarteten Rahmen; erfordert manuelle Klärung, wird
+        NICHT automatisch normalisiert.
+      - "ABGELEHNT": Zeile technisch ungültig (Format-/Wertefehler) oder
+        gehört strukturell nicht zum erwarteten Konto.
     """
 
     zeile_nr: int
+    csv_zeile: int
     status: str
     grund: str | None
     sha256_zeile: str
-    roh_zeile: str
+    felder: dict[str, str]
     kandidat: GeorgeKandidat | None = None
 
 
@@ -191,25 +259,80 @@ class GeorgeBusinessPreview:
     def abgelehnt(self) -> list[GeorgeZeilenErgebnis]:
         return [z for z in self.zeilen if z.status == "ABGELEHNT"]
 
+    @property
+    def vollstaendig(self) -> bool:
+        """False, sobald IRGENDETWAS eine manuelle Klärung braucht:
+        Prüffälle, abgelehnte Zeilen, oder eine geprüfte Saldenkontrolle,
+        die nicht aufgeht. Ein rein rechnerisch aufgehender Saldo bei
+        gleichzeitig vorhandenen Prüffällen/Ablehnungen gilt NICHT als
+        vollständig - das wäre ein Erfolgssignal auf Basis fehlender
+        statt geprüfter Zeilen."""
+
+        if self.pruefffaelle or self.abgelehnt:
+            return False
+        if self.saldo_kontrolle is not None and not self.saldo_kontrolle.stimmt_ueberein:
+            return False
+        return True
+
 
 @dataclass(frozen=True)
 class _ZeilenKontext:
     zeile_nr: int
+    csv_zeile: int
     werte: dict[str, str]
+    eigene_iban: str
     betrag_cent: int
     waehrung: str
     buchungsdatum: date
     valuta: date | None
-    konto_stimmt_ueberein: bool
-    im_erwarteten_zeitraum: bool
+    feld_hash: str
 
 
-def _roh_zeile(werte: dict[str, str]) -> str:
-    return ",".join(f"{spalte}={werte.get(spalte, '')}" for spalte in ERWARTETE_SPALTEN)
+@dataclass(frozen=True)
+class _GruppenSchluessel:
+    eigene_iban: str
+    waehrung: str
+    buchungsdatum: date
+    buchungsreferenz: str
 
 
-def _sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def _sha256_bytes(rohbytes: bytes) -> str:
+    return hashlib.sha256(rohbytes).hexdigest()
+
+
+def _sha256_felder(felder: dict[str, str]) -> str:
+    # Kanonisches JSON statt einer selbstgebauten "key=value,key=value"-
+    # Verkettung: Ein Feldwert, der selbst ein Komma oder "Spalte=" enthält
+    # (z. B. Partner Name="alpha,Partner IBAN=beta"), kollidierte bei der
+    # alten Verkettung mit einer völlig anderen Zeile (Partner Name="alpha",
+    # Partner IBAN="beta,Partner IBAN=gamma"). json.dumps escaped jeden
+    # Feldwert eindeutig, sort_keys macht das Ergebnis ordnungsunabhängig.
+    kanonisch = json.dumps(felder, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(kanonisch.encode("utf-8")).hexdigest()
+
+
+def _sichere_felder(rohzeile: dict) -> dict[str, str]:
+    """Baut aus einer (ggf. strukturell kaputten) csv.DictReader-Zeile
+    defensiv einen reinen str->str-Dict für Audit-/Fehlerzwecke auf -
+    NIE für die eigentliche fachliche Auswertung. `None` (fehlendes Feld)
+    wird zu "", eine Liste (zu viele Felder, restkey=None) wird zu einem
+    Anzeige-String; nirgends wird `.strip()`/`.upper()` auf einem
+    Nicht-String aufgerufen (das war die AttributeError-Quelle)."""
+
+    ergebnis: dict[str, str] = {}
+    for spalte in ERWARTETE_SPALTEN:
+        wert = rohzeile.get(spalte)
+        if wert is None:
+            ergebnis[spalte] = ""
+        elif isinstance(wert, list):
+            ergebnis[spalte] = ",".join(str(v) for v in wert)
+        else:
+            ergebnis[spalte] = str(wert)
+    return ergebnis
+
+
+def _ist_brauchbarer_schluessel(text: str) -> bool:
+    return text.strip().upper() not in _UNBRAUCHBARE_SCHLUESSELWERTE
 
 
 def _pruefe_kein_xlsx(rohbytes: bytes) -> None:
@@ -217,7 +340,7 @@ def _pruefe_kein_xlsx(rohbytes: bytes) -> None:
     # der ZIP-Signatur. Eine .xlsx-Datei "irrtümlich" als Text/CSV zu
     # dekodieren würde Binärmüll oder eine leere/kaputte Kopfzeile
     # liefern statt eines klaren Fehlers — deshalb explizit vorab prüfen.
-    if rohbytes[:4] == b"PK\x03\x04" or rohbytes[:4] == b"PK\x05\x06" or rohbytes[:4] == b"PK\x07\x08":
+    if rohbytes[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
         raise GeorgeFormatFehlerError(
             "Diese Datei ist eine XLSX-/ZIP-Datei, kein CSV. Dieser Adapter liest ausschließlich den "
             "George-Business-CSV-Export; bitte als CSV exportieren."
@@ -233,28 +356,66 @@ def _dekodiere(rohbytes: bytes) -> str:
         ) from exc
 
 
-def _lese_csv_zeilen(text: str) -> list[tuple[int, dict[str, str]]]:
-    reader = csv.DictReader(io.StringIO(text))
-    spalten = tuple(reader.fieldnames or ())
-    if set(spalten) != set(ERWARTETE_SPALTEN):
-        fehlend = sorted(set(ERWARTETE_SPALTEN) - set(spalten))
-        zusaetzlich = sorted(set(spalten) - set(ERWARTETE_SPALTEN))
+def _lese_csv_zeilen(text: str) -> list[tuple[int, int, dict[str, str], str | None]]:
+    """Liest die Datenzeilen roh ein. Rückgabe je Zeile:
+    (zeile_nr, csv_zeile, felder, strukturfehler_oder_None).
+
+    Wenn `strukturfehler_oder_None` gesetzt ist, ist die Zeile technisch
+    kaputt (abweichende Feldanzahl) - `felder` enthält dann trotzdem eine
+    defensiv aufgebaute, NIE crashende Bestenfalls-Rekonstruktion für den
+    Audit-Trail, wird aber nicht fachlich weiterverarbeitet."""
+
+    try:
+        reader = csv.DictReader(io.StringIO(text), restval=None, strict=True)
+        spalten_liste = list(reader.fieldnames or [])
+    except csv.Error as exc:
+        raise GeorgeFormatFehlerError(f"Kopfzeile nicht lesbar (CSV-Struktur defekt): {exc}") from exc
+
+    if not spalten_liste:
+        raise GeorgeFormatFehlerError("Datei ist leer oder enthält keine lesbare Kopfzeile.")
+    if len(spalten_liste) != len(set(spalten_liste)):
+        duplikate = sorted({s for s in spalten_liste if spalten_liste.count(s) > 1})
+        raise GeorgeFormatFehlerError(f"Kopfzeile enthält doppelte Spalten: {duplikate}.")
+    if set(spalten_liste) != set(ERWARTETE_SPALTEN):
+        fehlend = sorted(set(ERWARTETE_SPALTEN) - set(spalten_liste))
+        zusaetzlich = sorted(set(spalten_liste) - set(ERWARTETE_SPALTEN))
         raise GeorgeFormatFehlerError(
             "Kopfzeile entspricht nicht dem erwarteten George-Business-CSV-Format. "
             f"Fehlende Spalten: {fehlend or '-'}; unerwartete Spalten: {zusaetzlich or '-'}."
         )
-    ergebnis: list[tuple[int, dict[str, str]]] = []
+
+    ergebnis: list[tuple[int, int, dict[str, str], str | None]] = []
     zeile_nr = 0
-    for rohzeile in reader:
-        # Vollständig leere Zeilen (z. B. eine schließende Leerzeile durch
-        # \r\n\r\n am Dateiende) sind kein Datensatz und keine
-        # Ausschlusskandidatin - werden übersprungen statt als kaputte
-        # Zeile ausgewiesen zu werden.
-        if all((wert or "").strip() == "" for wert in rohzeile.values()):
-            continue
-        zeile_nr += 1
-        werte = {spalte: (rohzeile.get(spalte) or "").strip() for spalte in ERWARTETE_SPALTEN}
-        ergebnis.append((zeile_nr, werte))
+    try:
+        for rohzeile in reader:
+            csv_zeile = reader.line_num
+            hat_ueberzaehlige_felder = None in rohzeile
+            werte_ohne_restkey = [wert for schluessel, wert in rohzeile.items() if schluessel is not None]
+
+            if not hat_ueberzaehlige_felder and all(wert is None for wert in werte_ohne_restkey):
+                # Vollständig leere physische Zeile (z. B. eine
+                # abschließende Leerzeile durch \r\n\r\n am Dateiende) -
+                # kein Datensatz, kein Fehler.
+                continue
+
+            zeile_nr += 1
+            if hat_ueberzaehlige_felder:
+                ergebnis.append((
+                    zeile_nr, csv_zeile, _sichere_felder(rohzeile),
+                    "Zeile hat mehr Felder als Spalten in der Kopfzeile; wird nicht stillschweigend gekürzt.",
+                ))
+                continue
+            if any(wert is None for wert in werte_ohne_restkey):
+                ergebnis.append((
+                    zeile_nr, csv_zeile, _sichere_felder(rohzeile),
+                    "Zeile hat weniger Felder als Spalten in der Kopfzeile; wird nicht stillschweigend aufgefüllt.",
+                ))
+                continue
+
+            werte = {spalte: rohzeile[spalte].strip() for spalte in ERWARTETE_SPALTEN}
+            ergebnis.append((zeile_nr, csv_zeile, werte, None))
+    except csv.Error as exc:
+        raise GeorgeFormatFehlerError(f"CSV-Struktur nicht lesbar (z. B. defekte Anführungszeichen): {exc}") from exc
     return ergebnis
 
 
@@ -265,7 +426,18 @@ def parse_oesterreichischen_betrag(text: str) -> int:
             "-123,45 mit genau zwei Nachkommastellen)."
         )
     normalisiert = text.replace(".", "").replace(",", ".")
-    cent = to_cents(Decimal(normalisiert))
+    ganzzahl_teil = normalisiert.lstrip("+-").split(".", 1)[0]
+    if len(ganzzahl_teil) > _MAX_BETRAG_ZIFFERN_VOR_KOMMA:
+        # Muss VOR jeder Decimal-Operation geprüft werden: die
+        # Standard-Decimal-Kontextpräzision (28 signifikante Stellen)
+        # würde bei einer absichtlich überlangen Zahl (z. B. 100 Ziffern)
+        # eine unbehandelte decimal.InvalidOperation auslösen statt einer
+        # kontrollierten Ablehnung.
+        raise ValueError(f"Betrag '{text}' überschreitet den zulässigen Speicherbereich.")
+    try:
+        cent = to_cents(Decimal(normalisiert))
+    except (InvalidOperation, ArithmeticError) as exc:
+        raise ValueError(f"Betrag '{text}' ist kein gültiger Geldbetrag.") from exc
     if abs(cent) > _MAX_BETRAG_CENT:
         raise ValueError(f"Betrag '{text}' überschreitet den zulässigen Speicherbereich.")
     return cent
@@ -280,20 +452,52 @@ def _parse_datum(text: str, feld: str) -> date:
         raise ValueError(f"{feld} '{text}' ist kein gültiges Kalenderdatum.") from exc
 
 
-def _endmarkierung(enthaltene_id: str) -> str | None:
-    if not enthaltene_id:
+def _sammel_id_analyse(
+    enthaltene_id: str,
+    *,
+    iban: str,
+    waehrung: str,
+    buchungsdatum: date,
+) -> tuple[str, str] | None:
+    """Liefert `(marker, gruppenpraefix)` NUR wenn `enthaltene_id` exakt
+    dem bestätigten 107-Zeichen-Profil entspricht (siehe Moduldocstring)
+    UND Konto/Währung/Jahr darin mit der eigenen Zeile übereinstimmen.
+    Sonst None - eine andersartige ID (normale Einzelumsätze haben ein
+    anderes Format) wird NIE geraten als S/D interpretiert."""
+
+    if len(enthaltene_id) != _SD_GESAMTLAENGE:
         return None
-    treffer = _ENDMARKIERUNG_MUSTER.search(enthaltene_id)
-    return treffer.group(1).upper() if treffer else None
+
+    iban_teil = enthaltene_id[:_SD_IBAN_LAENGE]
+    padding_start = _SD_IBAN_LAENGE
+    padding_teil = enthaltene_id[padding_start:padding_start + len(_SD_PADDING)]
+    waehrung_start = padding_start + len(_SD_PADDING)
+    waehrung_teil = enthaltene_id[waehrung_start:waehrung_start + _SD_WAEHRUNG_LAENGE]
+    praefix_start = waehrung_start + _SD_WAEHRUNG_LAENGE
+    praefix_teil = enthaltene_id[praefix_start:praefix_start + _SD_PRAEFIX_LAENGE]
+    jahr_teil = enthaltene_id[praefix_start + _SD_PRAEFIX_LAENGE:_SD_MARKER_POSITION]
+    marker = enthaltene_id[_SD_MARKER_POSITION]
+    hash_teil = enthaltene_id[_SD_MARKER_POSITION + 1:]
+
+    eigene_iban_kern = re.sub(r"\s", "", iban).upper()
+    if len(eigene_iban_kern) != _SD_IBAN_LAENGE or iban_teil.upper() != eigene_iban_kern:
+        return None
+    if padding_teil != _SD_PADDING:
+        return None
+    if waehrung_teil.upper() != waehrung.upper():
+        return None
+    if not praefix_teil.isdigit():
+        return None
+    if jahr_teil != f"{buchungsdatum.year:04d}":
+        return None
+    if marker not in ("S", "D"):
+        return None
+    if len(hash_teil) != _SD_HASH_LAENGE or not _HEX_MUSTER.fullmatch(hash_teil.upper()):
+        return None
+    return marker, praefix_teil
 
 
-def _validiere_basis(
-    zeile_nr: int,
-    werte: dict[str, str],
-    erwartetes_konto_iban: str,
-    von: date,
-    bis: date,
-) -> _ZeilenKontext:
+def _validiere_basis(zeile_nr: int, csv_zeile: int, werte: dict[str, str]) -> _ZeilenKontext:
     if not werte["Eigene IBAN"]:
         raise ValueError("Eigene IBAN fehlt.")
     if not werte["Betrag"]:
@@ -311,13 +515,14 @@ def _validiere_basis(
 
     return _ZeilenKontext(
         zeile_nr=zeile_nr,
+        csv_zeile=csv_zeile,
         werte=werte,
+        eigene_iban=werte["Eigene IBAN"],
         betrag_cent=betrag_cent,
         waehrung=werte["Währung"],
         buchungsdatum=buchungsdatum,
         valuta=valuta,
-        konto_stimmt_ueberein=(werte["Eigene IBAN"] == erwartetes_konto_iban),
-        im_erwarteten_zeitraum=(von <= buchungsdatum <= bis),
+        feld_hash=_sha256_felder(werte),
     )
 
 
@@ -328,6 +533,7 @@ def _optional(wert: str) -> str | None:
 def _baue_kandidat(kontext: _ZeilenKontext) -> GeorgeKandidat:
     w = kontext.werte
     return GeorgeKandidat(
+        kandidaten_id=kontext.feld_hash,
         zeile_nr=kontext.zeile_nr,
         eigene_iban=w["Eigene IBAN"],
         eigener_kontoname=w["Eigener Kontoname"],
@@ -343,18 +549,17 @@ def _baue_kandidat(kontext: _ZeilenKontext) -> GeorgeKandidat:
         auftraggeber_referenz=_optional(w["Auftraggeber-Referenz"]),
         sammel_id=_optional(w["(Sammel-) Überweisung ID"]),
         enthaltene_id=_optional(w["Enthaltene Überweisung ID"]),
-        konto_stimmt_ueberein=kontext.konto_stimmt_ueberein,
-        im_erwarteten_zeitraum=kontext.im_erwarteten_zeitraum,
     )
 
 
 def _ergebnis_kandidat(kontext: _ZeilenKontext) -> GeorgeZeilenErgebnis:
     return GeorgeZeilenErgebnis(
         zeile_nr=kontext.zeile_nr,
+        csv_zeile=kontext.csv_zeile,
         status="KANDIDAT",
         grund=None,
-        sha256_zeile=_sha256(_roh_zeile(kontext.werte)),
-        roh_zeile=_roh_zeile(kontext.werte),
+        sha256_zeile=kontext.feld_hash,
+        felder=kontext.werte,
         kandidat=_baue_kandidat(kontext),
     )
 
@@ -362,10 +567,11 @@ def _ergebnis_kandidat(kontext: _ZeilenKontext) -> GeorgeZeilenErgebnis:
 def _ergebnis_summenzeile(kontext: _ZeilenKontext, grund: str) -> GeorgeZeilenErgebnis:
     return GeorgeZeilenErgebnis(
         zeile_nr=kontext.zeile_nr,
+        csv_zeile=kontext.csv_zeile,
         status="SAMMEL_SUMME",
         grund=grund,
-        sha256_zeile=_sha256(_roh_zeile(kontext.werte)),
-        roh_zeile=_roh_zeile(kontext.werte),
+        sha256_zeile=kontext.feld_hash,
+        felder=kontext.werte,
         kandidat=_baue_kandidat(kontext),
     )
 
@@ -373,61 +579,66 @@ def _ergebnis_summenzeile(kontext: _ZeilenKontext, grund: str) -> GeorgeZeilenEr
 def _ergebnis_pruefffall(kontext: _ZeilenKontext, grund: str) -> GeorgeZeilenErgebnis:
     return GeorgeZeilenErgebnis(
         zeile_nr=kontext.zeile_nr,
+        csv_zeile=kontext.csv_zeile,
         status="PRUEFFALL",
         grund=grund,
-        sha256_zeile=_sha256(_roh_zeile(kontext.werte)),
-        roh_zeile=_roh_zeile(kontext.werte),
+        sha256_zeile=kontext.feld_hash,
+        felder=kontext.werte,
         kandidat=None,
     )
 
 
-def _ergebnis_abgelehnt(zeile_nr: int, werte: dict[str, str], grund: str) -> GeorgeZeilenErgebnis:
+def _ergebnis_abgelehnt(zeile_nr: int, csv_zeile: int, werte: dict[str, str], grund: str) -> GeorgeZeilenErgebnis:
     return GeorgeZeilenErgebnis(
         zeile_nr=zeile_nr,
+        csv_zeile=csv_zeile,
         status="ABGELEHNT",
         grund=grund,
-        sha256_zeile=_sha256(_roh_zeile(werte)),
-        roh_zeile=_roh_zeile(werte),
+        sha256_zeile=_sha256_felder(werte),
+        felder=werte,
         kandidat=None,
     )
 
 
 _UNVOLLSTAENDIGE_SAMMELGRUPPE_GRUND = (
-    "Sammelgruppe nicht eindeutig auflösbar (Markierung 'S'/'D' in 'Enthaltene Überweisung ID' fehlt, "
-    "ist nicht eindeutig, oder die Detailbeträge summieren sich nicht centgenau auf die Summenzeile). "
-    "Wird NICHT automatisch normalisiert oder bereinigt, sondern als Prüffall ausgewiesen."
+    "Sammelgruppe nicht eindeutig auflösbar (S/D-Markierung fehlt/uneindeutig, Gruppenpräfix "
+    "inkonsistent, keine gemeinsame '(Sammel-) Überweisung ID' mit einer Detailzeile, oder die "
+    "Detailbeträge summieren sich nicht centgenau auf die Summenzeile). Wird NICHT automatisch "
+    "normalisiert oder bereinigt, sondern als Prüffall ausgewiesen."
+)
+_SAMMEL_SUMME_GRUND = (
+    "Sammel-Summenzeile: S/D-Markierung, Gruppenpräfix, Sammel-ID-Bezug zu mindestens einer "
+    "Detailzeile und centgenaue Detailsumme stimmen exakt überein; strukturell eindeutig als Summe "
+    "erkannt und daher kein buchbarer Kandidat."
+)
+_FEHLENDE_REFERENZ_FUER_SD_GRUND = (
+    "Zeile trägt eine gültige S/D-Sammelmarkierung, aber keine brauchbare Buchungsreferenz zur "
+    "Gruppenbildung (leer oder NOTPROVIDED); die Sammelgruppe kann nicht validiert werden."
 )
 
 
-def _verarbeite_sammelgruppe(gruppe: list[_ZeilenKontext]) -> list[GeorgeZeilenErgebnis]:
-    if len(gruppe) == 1:
-        return [_ergebnis_kandidat(gruppe[0])]
+def _verarbeite_sd_gruppe(mitglieder: list[tuple[_ZeilenKontext, str, str]]) -> list[GeorgeZeilenErgebnis]:
+    # Reihenfolge in der Datei ist irrelevant (Summen können vor oder
+    # nach ihren Details stehen) - die Klassifizierung hängt nur vom
+    # Mengeninhalt der Gruppe ab, nie von der Position.
+    summenzeilen = [(k, p) for k, m, p in mitglieder if m == "S"]
+    detailzeilen = [(k, p) for k, m, p in mitglieder if m == "D"]
+    praefixe = {p for _, _, p in mitglieder}
 
-    markierungen = {k.zeile_nr: _endmarkierung(k.werte["Enthaltene Überweisung ID"]) for k in gruppe}
-    summenzeilen = [k for k in gruppe if markierungen[k.zeile_nr] == "S"]
-    detailzeilen = [k for k in gruppe if markierungen[k.zeile_nr] == "D"]
-    unklare = [k for k in gruppe if markierungen[k.zeile_nr] not in ("S", "D")]
-
-    eindeutig = (
+    gueltig = (
         len(summenzeilen) == 1
         and len(detailzeilen) >= 1
-        and not unklare
-        and len({k.werte["Eigene IBAN"] for k in gruppe}) == 1
-        and len({k.waehrung for k in gruppe}) == 1
-        and len({k.buchungsdatum for k in gruppe}) == 1
-        and sum(k.betrag_cent for k in detailzeilen) == summenzeilen[0].betrag_cent
+        and len(praefixe) == 1
+        and sum(k.betrag_cent for k, _ in detailzeilen) == summenzeilen[0][0].betrag_cent
+        and _ist_brauchbarer_schluessel(summenzeilen[0][0].werte["(Sammel-) Überweisung ID"])
+        and summenzeilen[0][0].werte["(Sammel-) Überweisung ID"]
+        in {k.werte["(Sammel-) Überweisung ID"] for k, _ in detailzeilen}
     )
-    if not eindeutig:
-        return [_ergebnis_pruefffall(k, _UNVOLLSTAENDIGE_SAMMELGRUPPE_GRUND) for k in gruppe]
+    if not gueltig:
+        return [_ergebnis_pruefffall(k, _UNVOLLSTAENDIGE_SAMMELGRUPPE_GRUND) for k, _, _ in mitglieder]
 
-    ergebnisse = [_ergebnis_kandidat(k) for k in detailzeilen]
-    ergebnisse.append(
-        _ergebnis_summenzeile(
-            summenzeilen[0],
-            "Sammel-Summenzeile: Detailbeträge derselben Sammelgruppe summieren sich centgenau exakt auf "
-            "diesen Betrag; strukturell eindeutig als Summe erkannt und daher kein buchbarer Kandidat.",
-        )
-    )
+    ergebnisse = [_ergebnis_kandidat(k) for k, _ in detailzeilen]
+    ergebnisse.append(_ergebnis_summenzeile(summenzeilen[0][0], _SAMMEL_SUMME_GRUND))
     return ergebnisse
 
 
@@ -445,12 +656,15 @@ def erstelle_preview(
     kein Versand, keine Buchung — reine In-Memory-Verarbeitung der
     übergebenen Bytes.
 
-    `erwartetes_konto_iban`/`von`/`bis` sind explizite Prüfparameter: JEDE
-    Zeile wird dagegen geprüft (siehe `GeorgeKandidat.konto_stimmt_ueberein`/
-    `im_erwarteten_zeitraum`), aber keine Zeile wird deshalb aus dem
-    Ergebnis entfernt - nur die Summenbildung (`eingaenge_cent`/
-    `ausgaenge_cent`) und die optionale Saldenkontrolle berücksichtigen
-    ausschließlich Zeilen, die auf beide Parameter passen.
+    `erwartetes_konto_iban`/`von`/`bis` sind explizite Prüfparameter:
+    JEDE Zeile wird dagegen geprüft, aber KEINE Zeile verschwindet
+    deshalb aus dem Ergebnis. Eine Zeile auf einem anderen Konto wird
+    ABGELEHNT (für diese Vorschau nicht relevant); eine Zeile auf dem
+    richtigen Konto, aber außerhalb des Zeitraums, wird ein PRUEFFALL
+    (könnte ein falscher Zeitraum oder eine echte Überraschung sein) -
+    beide werden NIE als KANDIDAT gezählt oder in die Summen
+    (`eingaenge_cent`/`ausgaenge_cent`) bzw. die Saldenkontrolle
+    einbezogen.
     """
 
     if bis < von:
@@ -466,38 +680,112 @@ def erstelle_preview(
     rohzeilen = _lese_csv_zeilen(text)
 
     ergebnisse_je_zeile: dict[int, GeorgeZeilenErgebnis] = {}
-    kontexte_je_sammel_id: dict[str, list[_ZeilenKontext]] = {}
-    einzel_kontexte: list[_ZeilenKontext] = []
+    geprueft: list[_ZeilenKontext] = []
 
-    for zeile_nr, werte in rohzeilen:
-        try:
-            kontext = _validiere_basis(zeile_nr, werte, erwartetes_konto_iban, von, bis)
-        except ValueError as exc:
-            ergebnisse_je_zeile[zeile_nr] = _ergebnis_abgelehnt(zeile_nr, werte, str(exc))
+    for zeile_nr, csv_zeile, werte, strukturfehler in rohzeilen:
+        if strukturfehler is not None:
+            ergebnisse_je_zeile[zeile_nr] = _ergebnis_abgelehnt(zeile_nr, csv_zeile, werte, strukturfehler)
             continue
-        sammel_id = werte["(Sammel-) Überweisung ID"]
-        if sammel_id:
-            kontexte_je_sammel_id.setdefault(sammel_id, []).append(kontext)
+        try:
+            kontext = _validiere_basis(zeile_nr, csv_zeile, werte)
+        except ValueError as exc:
+            ergebnisse_je_zeile[zeile_nr] = _ergebnis_abgelehnt(zeile_nr, csv_zeile, werte, str(exc))
+            continue
+
+        if kontext.eigene_iban != erwartetes_konto_iban:
+            ergebnisse_je_zeile[zeile_nr] = _ergebnis_abgelehnt(
+                zeile_nr, csv_zeile, werte,
+                f"Eigene IBAN '{kontext.eigene_iban}' weicht vom erwarteten Konto "
+                f"'{erwartetes_konto_iban}' ab; für diese Vorschau nicht relevant.",
+            )
+            continue
+        if not (von <= kontext.buchungsdatum <= bis):
+            ergebnisse_je_zeile[zeile_nr] = _ergebnis_pruefffall(
+                kontext,
+                f"Buchungsdatum {kontext.buchungsdatum:%d.%m.%Y} liegt außerhalb des angefragten "
+                f"Zeitraums {von:%d.%m.%Y}–{bis:%d.%m.%Y}.",
+            )
+            continue
+
+        geprueft.append(kontext)
+
+    # Dublettenprüfung 1: identische, brauchbare "Enthaltene Überweisung
+    # ID" auf demselben (bereits auf das erwartete Konto gefilterten)
+    # Kontingent darf nie mehrfach zu einem Kandidaten werden.
+    nach_enthaltener_id: dict[str, list[_ZeilenKontext]] = {}
+    ohne_brauchbare_id: list[_ZeilenKontext] = []
+    for kontext in geprueft:
+        eid = kontext.werte["Enthaltene Überweisung ID"]
+        if _ist_brauchbarer_schluessel(eid):
+            nach_enthaltener_id.setdefault(eid, []).append(kontext)
         else:
+            ohne_brauchbare_id.append(kontext)
+
+    ueberlebende: list[_ZeilenKontext] = []
+    for eid, gruppe in nach_enthaltener_id.items():
+        if len(gruppe) > 1:
+            for kontext in gruppe:
+                ergebnisse_je_zeile[kontext.zeile_nr] = _ergebnis_pruefffall(
+                    kontext,
+                    f"Identische 'Enthaltene Überweisung ID' ({eid}) mehrfach auf demselben Konto; "
+                    "wird nicht automatisch als getrennte Buchungen normalisiert.",
+                )
+        else:
+            ueberlebende.append(gruppe[0])
+
+    # Dublettenprüfung 2: identische Rohdatensätze OHNE brauchbare ID.
+    # Zwei echte, unterscheidbare Zahlungen mit zufällig gleichem Betrag
+    # bleiben erhalten, solange sich IRGENDEIN Feld unterscheidet - nur
+    # ein vollständig identischer Datensatz (alle Spalten) gilt als
+    # ambige Wiederholung.
+    nach_inhalt: dict[str, list[_ZeilenKontext]] = {}
+    for kontext in ohne_brauchbare_id:
+        nach_inhalt.setdefault(kontext.feld_hash, []).append(kontext)
+    for feld_hash, gruppe in nach_inhalt.items():
+        if len(gruppe) > 1:
+            for kontext in gruppe:
+                ergebnisse_je_zeile[kontext.zeile_nr] = _ergebnis_pruefffall(
+                    kontext,
+                    "Identischer Rohdatensatz mehrfach vorhanden, ohne brauchbare eindeutige ID; kann "
+                    "nicht sicher als getrennte Buchungen oder als Wiederholung unterschieden werden.",
+                )
+        else:
+            ueberlebende.append(gruppe[0])
+
+    # Sammelgruppen-Analyse (S/D) über die verbleibenden, nicht bereits
+    # als Dublette ausgewiesenen Kontexte.
+    einzel_kontexte: list[_ZeilenKontext] = []
+    sd_gruppen: dict[_GruppenSchluessel, list[tuple[_ZeilenKontext, str, str]]] = {}
+    for kontext in ueberlebende:
+        analyse = _sammel_id_analyse(
+            kontext.werte["Enthaltene Überweisung ID"],
+            iban=kontext.eigene_iban,
+            waehrung=kontext.waehrung,
+            buchungsdatum=kontext.buchungsdatum,
+        )
+        if analyse is None:
             einzel_kontexte.append(kontext)
+            continue
+        marker, praefix = analyse
+        referenz = kontext.werte["Buchungsreferenz"]
+        if not _ist_brauchbarer_schluessel(referenz):
+            ergebnisse_je_zeile[kontext.zeile_nr] = _ergebnis_pruefffall(kontext, _FEHLENDE_REFERENZ_FUER_SD_GRUND)
+            continue
+        schluessel = _GruppenSchluessel(kontext.eigene_iban, kontext.waehrung, kontext.buchungsdatum, referenz)
+        sd_gruppen.setdefault(schluessel, []).append((kontext, marker, praefix))
 
     for kontext in einzel_kontexte:
         ergebnisse_je_zeile[kontext.zeile_nr] = _ergebnis_kandidat(kontext)
 
-    for gruppe in kontexte_je_sammel_id.values():
-        for ergebnis in _verarbeite_sammelgruppe(gruppe):
+    for mitglieder in sd_gruppen.values():
+        for ergebnis in _verarbeite_sd_gruppe(mitglieder):
             ergebnisse_je_zeile[ergebnis.zeile_nr] = ergebnis
 
     zeilen = tuple(ergebnisse_je_zeile[nr] for nr in sorted(ergebnisse_je_zeile))
 
-    relevante_kandidaten = [
-        z.kandidat
-        for z in zeilen
-        if z.status == "KANDIDAT" and z.kandidat is not None
-        and z.kandidat.konto_stimmt_ueberein and z.kandidat.im_erwarteten_zeitraum
-    ]
-    eingaenge_cent = sum(k.betrag_cent for k in relevante_kandidaten if k.betrag_cent > 0)
-    ausgaenge_cent = sum(k.betrag_cent for k in relevante_kandidaten if k.betrag_cent < 0)
+    kandidaten_liste = [z.kandidat for z in zeilen if z.status == "KANDIDAT" and z.kandidat is not None]
+    eingaenge_cent = sum(k.betrag_cent for k in kandidaten_liste if k.betrag_cent > 0)
+    ausgaenge_cent = sum(k.betrag_cent for k in kandidaten_liste if k.betrag_cent < 0)
 
     saldo_kontrolle = None
     if anfangssaldo_cent is not None and endsaldo_cent is not None:
@@ -510,7 +798,7 @@ def erstelle_preview(
         )
 
     return GeorgeBusinessPreview(
-        datei_sha256=_sha256(text),
+        datei_sha256=_sha256_bytes(rohbytes),
         erwartetes_konto_iban=erwartetes_konto_iban,
         von=von,
         bis=bis,

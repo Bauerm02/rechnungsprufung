@@ -43,14 +43,22 @@ keine stillschweigend übersprungenen Punkte.
   Export rein lesend und klassifizieren jede Zeile (Kandidat/Sammel-
   Summenzeile/Prüffall/Abgelehnt) — es gibt KEINE Anbindung an
   `bank/service.py`, keine Buchung, keine Vertrags-/Mieterzuordnung.
-  Die Erkennung von Sammel-Summenzeilen stützt sich auf ein
-  BEOBACHTETES, NICHT gegen eine echte George-Exportdatei verifiziertes
-  Muster (`S`/`D` am Ende von "Enthaltene Überweisung ID"); jede Gruppe,
-  die sich damit nicht eindeutig und centgenau auflösen lässt, wird
-  bewusst als Prüffall ausgewiesen statt geraten. Bevor dieser Adapter
-  für irgendetwas über die manuelle Sichtprüfung hinaus verwendet wird,
-  muss das Muster gegen mindestens eine echte Exportdatei bestätigt
-  werden.
+  Nach unabhängiger Codeprüfung korrigiert: Sammelgruppen werden über
+  `(Eigene IBAN, Währung, Buchungsdatum, echte Buchungsreferenz)` plus
+  einem S/D-Markierungsprofil in "Enthaltene Überweisung ID"
+  zusammengeführt (die sichtbare `(Sammel-) Überweisung ID` ist laut
+  Fachprüfung KEIN zuverlässiger Gruppenschlüssel — die Summenzeile
+  teilt sie sich nur mit dem ersten Einzelposten). Das S/D-Profil selbst
+  (107 Zeichen: IBAN+Padding+Währung+9-stelliges Präfix+Jahr+Marker+
+  56-stelliger Hex-Hash) stammt aus einer unabhängigen
+  Strukturanalyse mit exakten Längenangaben, ist aber NOCH NICHT gegen
+  eine echte George-Produktionsdatei mit realen IDs verifiziert. Jede ID
+  außerhalb dieses engen Profils wird nie geraten, sondern wie ein
+  gewöhnlicher Einzelumsatz behandelt; jede nicht eindeutig auflösbare
+  Sammelgruppe wird komplett als Prüffall ausgewiesen. Bevor dieser
+  Adapter für irgendetwas über die manuelle Sichtprüfung hinaus verwendet
+  wird, muss das Profil gegen mindestens eine echte Exportdatei mit
+  echten IDs bestätigt werden.
 - **Zahlungszuordnung erkennt bisher nur explizite Vertragsreferenzen:**
   Die Relevanzprüfung ungeklärter Zahlungseingänge erkennt bisher nur
   explizite `VERTRAG:<id>`-Referenzen. Namenlose Eingänge/freie

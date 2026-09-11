@@ -83,17 +83,12 @@ def _eur(cent: int) -> str:
 def _zeile_bericht(zeile: GeorgeZeilenErgebnis) -> str:
     if zeile.kandidat is not None:
         k = zeile.kandidat
-        hinweise = []
-        if not k.konto_stimmt_ueberein:
-            hinweise.append("ANDERES KONTO")
-        if not k.im_erwarteten_zeitraum:
-            hinweise.append("AUSSERHALB ZEITRAUM")
-        hinweis_text = f" [{', '.join(hinweise)}]" if hinweise else ""
         return (
-            f"  Zeile {zeile.zeile_nr}: {zeile.status}{hinweis_text} — {k.buchungsdatum.strftime('%d.%m.%Y')} "
-            f"{_eur(k.betrag_cent)} Partner={k.partner_name or '-'} Ref={k.zahlungsreferenz or '-'}"
+            f"  Zeile {zeile.zeile_nr} (Datei-Zeile {zeile.csv_zeile}): {zeile.status} — "
+            f"{k.buchungsdatum.strftime('%d.%m.%Y')} {_eur(k.betrag_cent)} Partner={k.partner_name or '-'} "
+            f"Ref={k.zahlungsreferenz or '-'} Kandidaten-ID={k.kandidaten_id[:12]}…"
         )
-    return f"  Zeile {zeile.zeile_nr}: {zeile.status} — {zeile.grund}"
+    return f"  Zeile {zeile.zeile_nr} (Datei-Zeile {zeile.csv_zeile}): {zeile.status} — {zeile.grund}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -163,7 +158,19 @@ def main(argv: list[str] | None = None) -> int:
     for zeile in preview.kandidaten:
         print(_zeile_bericht(zeile))
 
-    return 0
+    if preview.vollstaendig:
+        print("\nGesamtstatus: VOLLSTÄNDIG (keine Prüffälle, keine Ablehnungen, Saldenkontrolle bestätigt oder nicht angefordert).")
+        return 0
+
+    gruende = []
+    if preview.pruefffaelle:
+        gruende.append(f"{len(preview.pruefffaelle)} Prüffall/Prüffälle")
+    if preview.abgelehnt:
+        gruende.append(f"{len(preview.abgelehnt)} abgelehnte Zeile(n)")
+    if preview.saldo_kontrolle is not None and not preview.saldo_kontrolle.stimmt_ueberein:
+        gruende.append("Saldenkontrolle weicht ab")
+    print(f"\nGesamtstatus: UNVOLLSTÄNDIG — {', '.join(gruende)}. Kein Erfolgssignal ohne manuelle Klärung.")
+    return 1
 
 
 if __name__ == "__main__":

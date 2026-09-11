@@ -78,20 +78,49 @@ Komma-getrennt, gequotete Felder. Beträge österreichisch (`1.234,56`,
 oder eine XLSX-Datei (ZIP-Signatur) wird abgelehnt statt spekulativ als
 CSV mit Lücken gelesen.
 
-**Sammel-Summenzeilen (wichtigste Einschränkung):** Der Export kann
-sowohl die Summenzeile einer Sammelüberweisung als auch deren
-Einzelposten enthalten, beide unter derselben `(Sammel-) Überweisung
-ID` — diese Spalte (und ebenso `Buchungsreferenz`) ist deshalb NIE ein
-eindeutiger Transaktionsschlüssel und wird nie pauschal zur
-Deduplizierung verwendet. Eine Zeile wird nur dann als Summenzeile
-ausgewiesen und aus den Kandidaten entfernt, wenn innerhalb derselben
-Sammelgruppe (a) jede Zeile über `Enthaltene Überweisung ID` eindeutig
-als Detail (`D`) oder Summe (`S`) erkennbar ist und (b) die Detailbeträge
-sich centgenau exakt auf die Summenzeile addieren. Dieses `S`/`D`-Muster
-ist eine **beobachtete, nicht verifizierte** Struktur — jede Gruppe, die
-sich nicht eindeutig auflösen lässt (fehlende Detailzeile, uneindeutige
-Markierung, abweichende Summe), erscheint vollständig als `PRUEFFALL`
-statt automatisch normalisiert oder bereinigt zu werden.
+**Sammel-Summenzeilen (wichtigste Einschränkung, nach unabhängiger
+Codeprüfung korrigiert):** Der Export kann sowohl die Summenzeile einer
+Sammelüberweisung als auch deren Einzelposten enthalten. Die sichtbare
+Spalte `(Sammel-) Überweisung ID` ist dabei **kein zuverlässiger
+Gruppenschlüssel** — die Summenzeile trägt laut Fachprüfung dieselbe ID
+wie NUR der erste Einzelposten, die übrigen Detailzeilen tragen jeweils
+eigene IDs. Weder diese Spalte noch `Buchungsreferenz` sind daher allein
+ein eindeutiger Transaktions-/Gruppenschlüssel und werden nie pauschal
+zur Deduplizierung verwendet.
+
+Eine Sammelgruppe wird stattdessen über `(Eigene IBAN, Währung,
+Buchungsdatum, eine ECHTE/brauchbare Buchungsreferenz)` zusammengeführt
+und nur dann als vollständig aufgelöst behandelt, wenn zusätzlich:
+
+1. jede beteiligte Zeile über `Enthaltene Überweisung ID` eindeutig als
+   Detail (`D`) oder Summe (`S`) erkennbar ist — nach einem unabhängig
+   strukturell bestätigten, aber ohne echte Produktions-IDs verifizierten
+   107-Zeichen-Profil: `Eigene IBAN(20) + 14 Nullen + Währung(3) +
+   numerisches Präfix(9, NICHT als Datum interpretiert) + Jahr(4) +
+   Marker(S/D) + Hex-Hash(56)`,
+2. alle beteiligten Zeilen dasselbe eingebettete 9-stellige
+   Gruppenpräfix tragen (Konsistenzprüfung),
+3. die Summenzeile eine `(Sammel-) Überweisung ID` trägt, die mit der ID
+   mindestens einer Detailzeile übereinstimmt,
+4. die Detailbeträge sich centgenau exakt auf die Summenzeile addieren.
+
+Summen können vor oder nach ihren Details in der Datei stehen — die
+Reihenfolge spielt keine Rolle. Jede Abweichung (fehlende Gegenstücke,
+uneindeutige Markierung, inkonsistentes Gruppenpräfix, abweichende
+Summe, eine isolierte S- oder D-Zeile ohne vollständige Gegengruppe)
+führt NICHT zu einer geratenen Klassifizierung, sondern die GESAMTE
+betroffene Gruppe erscheint als `PRUEFFALL`. Eigenständige normale
+Einzelumsätze (andere ID-Struktur) bleiben über eine inhaltsbasierte,
+stabile Kandidatenkennung (`kandidaten_id`) plus eigene Dublettenprüfung
+erhalten — identische `Enthaltene Überweisung ID` auf demselben Konto
+oder vollständig identische Rohdatensätze ohne brauchbare ID werden nie
+stillschweigend zusammengelegt, sondern ebenfalls als `PRUEFFALL`
+ausgewiesen.
+
+Zeilen auf einem anderen als dem angefragten Konto werden `ABGELEHNT`;
+Zeilen auf dem richtigen Konto, aber außerhalb des angefragten
+Zeitraums, werden `PRUEFFALL` — beide zählen nie als `KANDIDAT` und
+fließen nie in die Summenbildung oder Saldenkontrolle ein.
 
 **Weitere bewusste Grenzen:** `Zahlungsreferenz`/`Buchungs-Details`/
 `Auftraggeber-Referenz` werden ausschließlich als Anzeigetext behandelt,
