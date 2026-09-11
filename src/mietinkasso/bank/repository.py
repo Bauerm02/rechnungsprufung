@@ -59,6 +59,13 @@ class BankRepository:
         with self._session_factory() as session:
             return session.get(BankKontoTable, id)
 
+    def list_bank_konten(self, *, gesellschaft_id: str | None = None) -> list[BankKontoTable]:
+        with self._session_factory() as session:
+            statement = select(BankKontoTable).order_by(BankKontoTable.id)
+            if gesellschaft_id is not None:
+                statement = statement.where(BankKontoTable.gesellschaft_id == gesellschaft_id)
+            return list(session.execute(statement).scalars().all())
+
     def insert_transaktion_idempotent(
         self, row: BankTransaktionTable, *, session: Session | None = None
     ) -> BankTransaktionTable:

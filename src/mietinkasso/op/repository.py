@@ -58,14 +58,19 @@ class OPRepository:
         session.flush()
         return row
 
-    def find_eroeffnung(self, konto_id: str) -> OPPositionTable | None:
-        with self._session_factory() as session:
-            return session.execute(
+    def find_eroeffnung(self, konto_id: str, *, session: Session | None = None) -> OPPositionTable | None:
+        def _query(active_session: Session) -> OPPositionTable | None:
+            return active_session.execute(
                 select(OPPositionTable)
                 .where(OPPositionTable.konto_id == konto_id)
                 .where(OPPositionTable.typ == "EROEFFNUNG")
                 .where(OPPositionTable.status == OPPositionStatus.AKTIV.value)
             ).scalar_one_or_none()
+
+        if session is not None:
+            return _query(session)
+        with self._session_factory() as owned_session:
+            return _query(owned_session)
 
     def list_aktiv(self, konto_id: str) -> list[OPPositionTable]:
         with self._session_factory() as session:
@@ -90,14 +95,52 @@ class OPRepository:
         with self._session_factory() as session:
             return session.get(OPPositionTable, op_position_id)
 
-    def storno(self, *, original_id: int, neue_row: OPPositionTable | None, akteur: str) -> OPPositionTable | None:
+    def storno(
+        self, *, original_id: int, neue_row: OPPositionTable | None, akteur: str, vorgang_id: str | None = None
+    ) -> OPPositionTable | None:
         """Mark `original_id` STORNIERT and optionally insert a replacement
-        AKTIV row (the Korrektur). Never edits the original row's amount."""
+        AKTIV row (the Korrektur). Never edits the original row's amount.
+
+        Ein bereits STORNIERTES Original darf NICHT nochmals eine aktive
+        Ersatzzeile bekommen (das würde den Saldo verdoppeln - z. B. bei
+        einer doppelten Formularbestätigung im Backoffice). Nur ein exakt
+        identischer Retry (gleiche `vorgang_id`, gleicher `import_id`/
+        `quelle_hash` der neuen Zeile) wird als sicherer No-Op erkannt und
+        liefert die bereits angelegte Ersatzzeile zurück; jede Abweichung
+        (andere `vorgang_id`, anderer Inhalt, oder ein reiner Storno ohne
+        Ersatz gegen ein bereits MIT Ersatz storniertes Original) ist ein
+        `StornierungKonfliktError`."""
+
+        from mietinkasso.domain.exceptions import StornierungKonfliktError
 
         with self._session_factory() as session:
             original = session.get(OPPositionTable, original_id)
             if original is None:
                 raise ValueError(f"Unbekannte OPPosition {original_id}")
+
+            if original.status == OPPositionStatus.STORNIERT.value:
+                bestehender_ersatz = (
+                    session.get(OPPositionTable, original.storniert_durch_id)
+                    if original.storniert_durch_id is not None
+                    else None
+                )
+                if neue_row is None and bestehender_ersatz is None:
+                    return None  # reiner Storno, bereits erledigt -> No-op
+                if (
+                    neue_row is not None
+                    and bestehender_ersatz is not None
+                    and vorgang_id is not None
+                    and neue_row.import_id is not None
+                    and bestehender_ersatz.import_id == neue_row.import_id
+                    and bestehender_ersatz.quelle_hash == neue_row.quelle_hash
+                ):
+                    return bestehender_ersatz  # echter Retry (identischer Vorgang) -> No-op
+                raise StornierungKonfliktError(
+                    f"OPPosition {original_id} ist bereits storniert "
+                    f"(Ersatz: {original.storniert_durch_id}); eine erneute, abweichende "
+                    "Stornierung/Korrektur desselben Originals wird abgelehnt."
+                )
+
             if neue_row is not None:
                 session.add(neue_row)
                 session.flush()

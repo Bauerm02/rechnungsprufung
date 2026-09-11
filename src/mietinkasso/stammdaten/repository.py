@@ -38,6 +38,10 @@ class StammdatenRepository:
         with self._session_factory() as session:
             return session.get(GesellschaftTable, id)
 
+    def list_gesellschaften(self) -> list[GesellschaftTable]:
+        with self._session_factory() as session:
+            return list(session.execute(select(GesellschaftTable).order_by(GesellschaftTable.id)).scalars().all())
+
     # -- Objekt -----------------------------------------------------------
     def upsert_objekt(
         self, *, id: str, gesellschaft_id: str, bezeichnung: str, adresse: str | None = None, ausgeschlossen: bool = False
@@ -64,6 +68,13 @@ class StammdatenRepository:
     def get_objekt(self, id: str) -> ObjektTable | None:
         with self._session_factory() as session:
             return session.get(ObjektTable, id)
+
+    def list_objekte(self, *, gesellschaft_id: str | None = None) -> list[ObjektTable]:
+        with self._session_factory() as session:
+            statement = select(ObjektTable).order_by(ObjektTable.id)
+            if gesellschaft_id is not None:
+                statement = statement.where(ObjektTable.gesellschaft_id == gesellschaft_id)
+            return list(session.execute(statement).scalars().all())
 
     # -- Einheit ----------------------------------------------------------
     def upsert_einheit(
@@ -100,6 +111,11 @@ class StammdatenRepository:
     def get_einheit(self, id: str) -> EinheitTable | None:
         with self._session_factory() as session:
             return session.get(EinheitTable, id)
+
+    def list_einheiten_fuer_objekt(self, objekt_id: str) -> list[EinheitTable]:
+        with self._session_factory() as session:
+            statement = select(EinheitTable).where(EinheitTable.objekt_id == objekt_id).order_by(EinheitTable.id)
+            return list(session.execute(statement).scalars().all())
 
     def set_nutzungsstatus(self, *, einheit_id: str, nutzungsstatus: str) -> None:
         """Explicit, human-triggered status change. Never called by ledger
@@ -174,35 +190,63 @@ class StammdatenRepository:
         with self._session_factory() as session:
             return session.get(VertragTable, id)
 
-    def objekt_fuer_vertrag(self, vertrag_id: str) -> ObjektTable:
+    def list_vertraege_fuer_objekt(self, objekt_id: str) -> list[VertragTable]:
         with self._session_factory() as session:
-            vertrag = session.get(VertragTable, vertrag_id)
+            statement = (
+                select(VertragTable)
+                .join(EinheitTable, EinheitTable.id == VertragTable.einheit_id)
+                .where(EinheitTable.objekt_id == objekt_id)
+                .order_by(VertragTable.id)
+            )
+            return list(session.execute(statement).scalars().all())
+
+    def objekt_fuer_vertrag(self, vertrag_id: str, *, session: Session | None = None) -> ObjektTable:
+        """Mit einer übergebenen `session` wird ausschließlich SIE für die
+        Lesungen verwendet, statt eine eigene, separate Session zu öffnen.
+        Wichtig innerhalb einer größeren atomaren Mehrzeilen-Transaktion
+        (z. B. `op/eroeffnung_import.py::importiere_eroeffnung_csv_atomar`):
+        bei SQLite `:memory:`/`StaticPool` teilen sich mehrere Sessions
+        dieselbe physische Verbindung - eine separat geöffnete,
+        schreibfreie Hilfs-Session würde beim Schließen (impliziter
+        Rollback) die bereits geflushten, aber noch nicht committeten
+        Änderungen der ÄUSSEREN Transaktion mit zurückrollen. Deshalb hier
+        konsequent dieselbe Session weiterreichen, statt eine neue zu
+        öffnen."""
+
+        def _query(active_session: Session) -> ObjektTable:
+            vertrag = active_session.get(VertragTable, vertrag_id)
             if vertrag is None:
                 raise ValueError(f"Unbekannter Vertrag {vertrag_id}")
-            einheit = session.get(EinheitTable, vertrag.einheit_id)
+            einheit = active_session.get(EinheitTable, vertrag.einheit_id)
             if einheit is None:
                 raise ValueError(f"Unbekannte Einheit {vertrag.einheit_id}")
-            objekt = session.get(ObjektTable, einheit.objekt_id)
+            objekt = active_session.get(ObjektTable, einheit.objekt_id)
             if objekt is None:
                 raise ValueError(f"Unbekanntes Objekt {einheit.objekt_id}")
             return objekt
 
-    def pruefe_vertrag_nicht_ausgeschlossen(self, vertrag_id: str) -> None:
+        if session is not None:
+            return _query(session)
+        with self._session_factory() as owned_session:
+            return _query(owned_session)
+
+    def pruefe_vertrag_nicht_ausgeschlossen(self, vertrag_id: str, *, session: Session | None = None) -> None:
         """Zentrale, unumgängliche Durchsetzung von Fachregel 1 (Objekt 107
         ausgeschlossen): löst Konto/Vertrag -> Einheit -> Objekt frisch aus
         der DB auf und blockiert JEDEN schreibenden Finanzpfad, unabhängig
         von Rolle (auch ADMIN) - nicht nur eine isolierte Hilfsfunktion, die
-        ein Aufrufer vergessen könnte zu rufen."""
+        ein Aufrufer vergessen könnte zu rufen. `session`: siehe
+        `objekt_fuer_vertrag`."""
 
-        objekt = self.objekt_fuer_vertrag(vertrag_id)
+        objekt = self.objekt_fuer_vertrag(vertrag_id, session=session)
         if objekt.ausgeschlossen:
             raise ObjektAusgeschlossenError(
                 f"Vertrag {vertrag_id} gehört zu Objekt {objekt.id}, das von der Pilotphase "
                 "ausgeschlossen ist (z. B. 107 Sieben Dörfer)."
             )
 
-    def pruefe_konto_nicht_ausgeschlossen(self, konto: KontoTable) -> None:
-        self.pruefe_vertrag_nicht_ausgeschlossen(konto.vertrag_id)
+    def pruefe_konto_nicht_ausgeschlossen(self, konto: KontoTable, *, session: Session | None = None) -> None:
+        self.pruefe_vertrag_nicht_ausgeschlossen(konto.vertrag_id, session=session)
 
     def add_komponente(
         self,
@@ -327,11 +371,25 @@ class StammdatenRepository:
         with self._session_factory() as session:
             return session.execute(select(KontoTable).where(KontoTable.vertrag_id == vertrag_id)).scalar_one_or_none()
 
-    def set_eroeffnung_modus(self, *, konto_id: str, modus: str, stichtag: date) -> None:
-        with self._session_factory() as session:
+    def set_eroeffnung_modus(self, *, konto_id: str, modus: str, stichtag: date, session: Session | None = None) -> None:
+        """Mit einer übergebenen `session` wird diese Schreibung Teil einer
+        größeren, vom Aufrufer verwalteten Transaktion (z. B. der atomare
+        Mehrzeilen-Eröffnungsimport in `op/eroeffnung_import.py`) - flush
+        statt commit, damit ein späterer Fehler in derselben Datei auch
+        diese Änderung mit zurückrollt."""
+
+        if session is not None:
             row = session.get(KontoTable, konto_id)
             if row is None:
                 raise ValueError(f"Unbekanntes Konto {konto_id}")
             row.eroeffnung_modus = modus
             row.eroeffnung_stichtag = stichtag
-            session.commit()
+            session.flush()
+            return
+        with self._session_factory() as owned_session:
+            row = owned_session.get(KontoTable, konto_id)
+            if row is None:
+                raise ValueError(f"Unbekanntes Konto {konto_id}")
+            row.eroeffnung_modus = modus
+            row.eroeffnung_stichtag = stichtag
+            owned_session.commit()

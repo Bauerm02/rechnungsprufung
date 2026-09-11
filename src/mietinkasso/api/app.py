@@ -25,6 +25,7 @@ from datetime import date
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 
+from mietinkasso.backoffice.app import router as backoffice_router
 from mietinkasso.infrastructure.config import get_settings
 from mietinkasso.infrastructure.db.session import build_session_factory
 from mietinkasso.mahnwesen.repository import MahnFallRepository
@@ -33,6 +34,7 @@ from mietinkasso.op.service import OPService
 from mietinkasso.stammdaten.repository import StammdatenRepository
 
 app = FastAPI(title="Mietinkasso API", version="1")
+app.include_router(backoffice_router)
 
 _settings = get_settings()
 _session_factory = build_session_factory(_settings.database_url)
@@ -129,9 +131,13 @@ def dashboard() -> str:
         <li><code>GET /v1/mahnwesen/outbox/{{vertrag_id}}</code> — Mahnfälle (Preview/Outbox)</li>
       </ul>
       <p>Schreibende Vorgänge (Eröffnung, Vorschreibung, Bankimport, Mahnlauf)
-         laufen ausschließlich über die Service-Schicht (Worker/Scheduler
-         bzw. ein noch zu bauendes authentifiziertes Backoffice), nicht über
-         unauthentifizierte HTTP-Schreibendpunkte.</p>
+         laufen NICHT über unauthentifizierte HTTP-Schreibendpunkte, sondern
+         über die Service-Schicht direkt oder über das bedienbare
+         Backoffice unter <a href="/backoffice/login">/backoffice/</a>
+         (eigener, session-basierter Login, "closed by default" ohne
+         konfigurierten <code>MIETINKASSO_BACKOFFICE_PASSWORD_HASH</code>;
+         lokaler Pilot mit synthetischen Demodaten, kein Mehrbenutzer-
+         Onlinebetrieb).</p>
     </body>
     </html>
     """

@@ -2,8 +2,10 @@
 
 Diese Anleitung beschreibt den lokalen Entwicklungs-/Demobetrieb. Sie
 ist KEINE Produktions-Deployment-Anleitung — dafür fehlen laut Auftrag
-noch Auth/Login, Versandadapter und ein produktives Datenbank-Setup
-(siehe `OFFENE_PUNKTE.md`).
+noch ein Mehrbenutzer-/Rollen-Login, ein echter Versandadapter und ein
+produktives Datenbank-Setup (siehe `OFFENE_PUNKTE.md`). Seit dieser
+Runde existiert ein bedienbares Backoffice (Abschnitt 5b) mit EINEM
+lokalen Login für den Piloten.
 
 ## 1. Installation
 
@@ -28,6 +30,8 @@ Wichtigste Variablen:
 | `MIETINKASSO_MAHN_STUFE1_TAGE_NACH_FAELLIGKEIT` | `7` | Vorschlagswert für die Mahnpolicy, Stufe 1. |
 | `MIETINKASSO_MAHN_STUFE2_MINDESTTAGE_NACH_STUFE1` | `14` | Vorschlagswert für die Mahnpolicy, Stufe 2. |
 | `MIETINKASSO_API_TOKEN` | *(leer)* | Ohne diesen Wert antworten die Datenendpunkte von `api/app.py` mit 503 ("closed by default"). Gesetzt, verlangen sie einen passenden `X-API-Key`-Header. Ein geteilter Operator-Token, KEINE Mandantentrennung pro Endanwender. |
+| `MIETINKASSO_BACKOFFICE_USER` | `markus` | Login-Benutzername für das Backoffice (Abschnitt 5b). |
+| `MIETINKASSO_BACKOFFICE_PASSWORD_HASH` | *(leer)* | Ohne diesen Wert bleibt das gesamte Backoffice geschlossen (503, "closed by default"). Erzeugen mit `python -m mietinkasso.backoffice.security <passwort>`; NIE das Klartext-Passwort hier ablegen. |
 
 Es gibt bewusst **keine** KI-/LLM-Konfiguration (kein API-Key, kein
 Modellname) — der laufende Betrieb braucht keinen.
@@ -53,7 +57,8 @@ python -m pytest tests/mietinkasso -q      # nur Mietinkasso
 python -m pytest -q                         # ganzes Repo (inkl. invoice_automation)
 ```
 
-Stand: 70 Mietinkasso-Tests, 175 Tests gesamt, alle grün
+Stand: 105 Mietinkasso-Tests (inkl. Backoffice-Integrationstests gegen
+eine echte Datei-SQLite-DB), 210 Tests gesamt, alle grün
 (`python -m pytest -q`).
 
 ## 5. API/Dashboard lokal starten
@@ -76,11 +81,58 @@ uvicorn mietinkasso.api.app:app --reload --port 8001
   Token-geschützt.
 - `http://localhost:8001/docs` — automatische OpenAPI-Doku (FastAPI).
 
-Dies ist bewusst read-only. Schreibende Vorgänge (Eröffnung,
-Vorschreibung, Bankimport, Mahnlauf) laufen über die Service-Klassen in
-`op/`, `vorschreibung/`, `bank/`, `mahnwesen/` — angesteuert von einem
-Skript, einem Scheduler/Worker-Prozess oder später einem
-authentifizierten Backoffice, nicht von einem offenen HTTP-Endpunkt.
+Dies ist bewusst read-only. Schreibende Vorgänge über HTTP laufen
+ausschließlich über das Backoffice (5b), nie über einen offenen Endpunkt.
+
+## 5b. Backoffice (bedienbare Oberfläche) lokal starten
+
+```bash
+export MIETINKASSO_DATABASE_URL="sqlite:///./data/mietinkasso_demo.db"
+export MIETINKASSO_BACKOFFICE_USER="markus"
+export MIETINKASSO_BACKOFFICE_PASSWORD_HASH="$(python -m mietinkasso.backoffice.security 'ein-lokales-dev-passwort')"
+uvicorn mietinkasso.api.app:app --reload --host 127.0.0.1 --port 8001
+```
+
+Dann `http://127.0.0.1:8001/backoffice/login` im Browser öffnen
+(**Loopback/127.0.0.1, nicht 0.0.0.0** — kein Mehrbenutzer-
+Onlinebetrieb). Deckt die sechs beauftragten Arbeitsabläufe ab:
+
+1. **Dashboard** (`/backoffice/`) — Objekt wählen, Mietkontenübersicht;
+   Objekt 107 nur lesend, jede Schreibaktion dafür ist ausgegraut UND
+   serverseitig durch `ObjektAusgeschlossenError` blockiert.
+2. **Kontoauszug** (`/backoffice/konto/{konto_id}`) — Sollstellung/
+   Zahlung/Korrektur/Storno mit Beleg/Fälligkeit, Vertrag/Debitor/
+   Einheit getrennt ausgewiesen.
+3. **Eröffnungssalden** (`/backoffice/eroeffnung`) — CSV hochladen,
+   Vorschau (unklare/gesperrte/widersprüchliche Zeilen rot markiert),
+   erst nach ausdrücklicher Bestätigung atomarer Import
+   (`op/eroeffnung_import.py::importiere_eroeffnung_csv_atomar`) —
+   serverseitig erneut validiert, nicht der Vorschau vertraut.
+4. **Nachbuchung/Korrektur** — Formular je Konto (Nachbuchung) bzw. je
+   OP-Zeile (Storno/Korrektur), mit Pflicht-Vorgangs-ID; ein doppelt
+   abgeschicktes Formular mit derselben Vorgangs-ID bleibt ein
+   sicherer No-Op.
+5. **Bankimport** (`/backoffice/bank`) — CSV/CAMT hochladen, Vorschau
+   mit Zuordnungsvorschlägen, danach Import; Zuordnung selbst ist ein
+   separater, expliziter Schritt je Transaktion
+   (`/backoffice/bank/unzugeordnet`) sowie eine eigene
+   Bankvollständigkeits-Bestätigung (`/backoffice/bank/vollstaendigkeit`).
+6. **Vorschreibungsentwurf** (`/backoffice/vertrag/{id}/vorschreibung`)
+   — Netto/USt/Brutto je Bestandteil (HMZ/Küche/Stellplatz/BK/HK/
+   Sonstige), wirksame Indexversion, Sperre für historische/leerstehende
+   Fälle; Freigabe (Sollstellen) ist ein separater Schritt.
+7. **Mahnvorschau** (`/backoffice/vertrag/{id}/mahnvorschau`) — reine
+   Planungsansicht mit transparenten Sperrgründen (Bankvollständigkeit/
+   ungeklärte Eingänge werden serverseitig aus der DB abgeleitet, nie
+   aus einem Formularfeld); kein Button löst einen echten Mailversand
+   aus.
+
+Sicherheit: Session-Cookie trägt nur eine opake, zufällige ID
+(`backoffice/security.py::SessionStore`) — Zustand lebt ausschließlich
+im Server-Prozess (kein JWT, kein API-Token in HTML/URL/LocalStorage).
+Jede POST-Route verlangt ein gültiges `csrf_token`-Feld gegen die
+Session. Ohne `MIETINKASSO_BACKOFFICE_PASSWORD_HASH` bleibt das gesamte
+Backoffice mit 503 geschlossen.
 
 ## 6. Ein Monatslauf von Hand (Beispiel, Python-Shell)
 

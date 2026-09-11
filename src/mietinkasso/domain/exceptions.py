@@ -93,6 +93,23 @@ class BindungInkonsistentError(MietinkassoError):
     caller-supplied objects that could be stale or mismatched."""
 
 
+class UStSatzUngueltigError(MietinkassoError):
+    """A VertragsKomponente/VorschreibungPosition carries a
+    ust_satz_promille outside the fixed set of plausible Austrian
+    Vermietung rates (0/10/20%). Blocks the Vorschreibungsentwurf instead
+    of silently computing Netto/USt from an implausible source value."""
+
+
+class StornierungKonfliktError(MietinkassoError):
+    """`storniere_und_korrigiere`/`OPRepository.storno` wurde ein zweites
+    Mal für ein bereits STORNIERTES Original aufgerufen. Nur ein exakt
+    identischer Retry (gleiche `vorgang_id`, gleicher Inhalt - z. B. eine
+    doppelte Formularbestätigung) ist ein sicherer No-Op und liefert die
+    bereits angelegte Ersatzzeile zurück; jede Abweichung (anderer
+    Betrag/Grund/keine vorgang_id) wird als Konflikt abgelehnt, statt eine
+    ZWEITE aktive Ersatzzeile für dasselbe Original anzulegen."""
+
+
 class ObjektAusgeschlossenError(MietinkassoError):
     """Objekt 107 (Sieben Dörfer) is explicitly out of scope for the pilot.
     Enforced centrally (Konto -> Vertrag -> Einheit -> Objekt) on every

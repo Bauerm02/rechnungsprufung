@@ -11,10 +11,23 @@ from datetime import date
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import OPTyp, VorschreibungStatus
 from mietinkasso.domain.exceptions import BindungInkonsistentError, NachweisFehltError
+from mietinkasso.domain.money import zerlege_brutto_cent
 from mietinkasso.infrastructure.db.tables import KontoTable, VertragTable
 from mietinkasso.op.service import OPService
 from mietinkasso.stammdaten.repository import StammdatenRepository
 from mietinkasso.vorschreibung.repository import VorschreibungRepository
+
+#: Anzeigekategorie je Komponenten-`art` für die getrennte Aufschlüsselung
+#: der Vorschreibungs-Vorschau (Fachregel-Vorschau, kein Rechenwert).
+#: Alles außerhalb dieser Zuordnung landet unter "Sonstige" - stellt sicher,
+#: dass eine unbekannte/neue `art` sichtbar bleibt statt zu verschwinden.
+_ANZEIGEKATEGORIE_JE_ART = {
+    "HMZ": "Hauptmietzins",
+    "KUECHE": "Küche",
+    "PARKPLATZ": "Stellplatz",
+    "BK_VORAUSZAHLUNG": "BK",
+    "HEIZ_WW_VORAUSZAHLUNG": "HK",
+}
 
 
 def faelligkeitsdatum(monat: str, faelligkeit_tag: int) -> date:
@@ -29,6 +42,35 @@ class VorschreibungsErgebnis:
     vorschreibung_id: int
     status: str
     summe_cent: int
+
+
+@dataclass(frozen=True)
+class PositionsAufschluesselung:
+    art: str
+    kategorie: str
+    bezeichnung: str
+    brutto_cent: int
+    netto_cent: int
+    ust_cent: int
+    ust_satz_promille: int
+
+
+@dataclass(frozen=True)
+class VorschreibungsAufschluesselung:
+    """Getrennte Netto/USt/Brutto-Aufschlüsselung je Bestandteil (HMZ,
+    Küche, Stellplatz, BK, HK, Sonstige) für die Vorschau. Definition
+    (siehe `domain.money.zerlege_brutto_cent`): `betrag_cent` je Position
+    ist BRUTTO - das ist exakt der Betrag, der bei Sollstellung gebucht
+    wird; Netto/USt werden nur für den Ausweis zurückgerechnet, nie
+    stillschweigend zusätzlich aufgeschlagen. Ein `ust_satz_promille`
+    außerhalb der zulässigen Sätze blockiert die gesamte Aufschlüsselung
+    (`UStSatzUngueltigError`), statt eine Position stillschweigend falsch
+    auszuweisen."""
+
+    positionen: list[PositionsAufschluesselung]
+    summe_brutto_cent: int
+    summe_netto_cent: int
+    summe_ust_cent: int
 
 
 class VorschreibungService:
@@ -66,6 +108,36 @@ class VorschreibungService:
             bestehende_positionen = self._repository.list_positionen(vorschreibung.id)
         summe = sum(p.betrag_cent for p in bestehende_positionen)
         return VorschreibungsErgebnis(vorschreibung_id=vorschreibung.id, status=vorschreibung.status, summe_cent=summe)
+
+    def aufschluesselung(self, vorschreibung_id: int) -> VorschreibungsAufschluesselung:
+        """Liest die bereits angelegten Positionen einer Vorschreibung
+        (ENTWURF oder später) und schlüsselt sie Netto/USt/Brutto getrennt
+        auf, gruppiert nach Bestandteil. Blockiert (statt zu raten), wenn
+        eine Position einen inkonsistenten USt-Satz trägt."""
+
+        positionen = self._repository.list_positionen(vorschreibung_id)
+        aufgeschluesselt: list[PositionsAufschluesselung] = []
+        summe_brutto = summe_netto = summe_ust = 0
+        for position in positionen:
+            netto_cent, ust_cent = zerlege_brutto_cent(position.betrag_cent, position.ust_satz_promille)
+            aufgeschluesselt.append(
+                PositionsAufschluesselung(
+                    art=position.art,
+                    kategorie=_ANZEIGEKATEGORIE_JE_ART.get(position.art, "Sonstige"),
+                    bezeichnung=position.bezeichnung,
+                    brutto_cent=position.betrag_cent,
+                    netto_cent=netto_cent,
+                    ust_cent=ust_cent,
+                    ust_satz_promille=position.ust_satz_promille,
+                )
+            )
+            summe_brutto += position.betrag_cent
+            summe_netto += netto_cent
+            summe_ust += ust_cent
+        return VorschreibungsAufschluesselung(
+            positionen=aufgeschluesselt, summe_brutto_cent=summe_brutto, summe_netto_cent=summe_netto,
+            summe_ust_cent=summe_ust,
+        )
 
     def sollstellen(
         self, *, ctx: AuthContext, vertrag: VertragTable, konto: KontoTable, monat: str, heute: date | None = None

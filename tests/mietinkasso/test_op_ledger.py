@@ -10,6 +10,7 @@ from mietinkasso.domain.exceptions import (
     DoppelteEroeffnungsartError,
     ImportConflictError,
     ObjektAusgeschlossenError,
+    StornierungKonfliktError,
 )
 
 
@@ -339,3 +340,75 @@ def test_korrektur_ersetzt_original_ohne_historie_zu_ueberschreiben(op_service, 
     assert original_row.status == "STORNIERT"
     saldo = op_service.berechne_saldo(konto.id)
     assert saldo.saldo_cent == 65_000
+
+
+def test_doppelte_korrektur_desselben_originals_verdoppelt_nicht_den_saldo(op_service, basis_vertrag, ctx_factory):
+    """Regression (Codex-Gegenprobe): SOLL 10000 anlegen, dieselbe
+    original_id zweimal identisch auf neuer_betrag_cent=12000 korrigieren.
+    Ein bereits storniertes Original darf NICHT ein zweites Mal eine
+    aktive Ersatzzeile bekommen (Saldo darf nicht auf 24000 springen) -
+    ein echter Retry mit derselben vorgang_id ist ein sicherer No-Op,
+    jeder abweichende zweite Aufruf ein Konflikt."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    original = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=10_000,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
+        beleg_referenz="Miete August",
+    )
+
+    erster_aufruf = op_service.storniere_und_korrigiere(
+        ctx=ctx, konto=konto, original_id=original.id, aenderungsgrund="Tippfehler",
+        neuer_betrag_cent=12_000, vorgang_id="KORREKTUR-1",
+    )
+    assert op_service.berechne_saldo(konto.id).saldo_cent == 12_000
+
+    # Echter Retry (z. B. doppelte Formularbestätigung): gleiche vorgang_id,
+    # identischer Inhalt -> sicherer No-Op, KEINE zweite Ersatzzeile.
+    zweiter_aufruf_gleicher_vorgang = op_service.storniere_und_korrigiere(
+        ctx=ctx, konto=konto, original_id=original.id, aenderungsgrund="Tippfehler",
+        neuer_betrag_cent=12_000, vorgang_id="KORREKTUR-1",
+    )
+    assert zweiter_aufruf_gleicher_vorgang.id == erster_aufruf.id
+    assert op_service.berechne_saldo(konto.id).saldo_cent == 12_000
+
+    # Ein DRITTER, abweichender Versuch (andere vorgang_id) auf dasselbe
+    # bereits korrigierte Original ist ein Konflikt, kein stiller Erfolg.
+    with pytest.raises(StornierungKonfliktError):
+        op_service.storniere_und_korrigiere(
+            ctx=ctx, konto=konto, original_id=original.id, aenderungsgrund="Tippfehler",
+            neuer_betrag_cent=12_000, vorgang_id="KORREKTUR-ANDERS",
+        )
+    assert op_service.berechne_saldo(konto.id).saldo_cent == 12_000
+    assert len(op_service._op_repository.list_alle(konto.id)) == 2  # Original (storniert) + genau EINE Ersatzzeile
+
+
+def test_guthaben_eroeffnung_mindert_offene_forderung_und_faelligen_rest(op_service, basis_vertrag, ctx_factory):
+    """Regression (Codex-Gegenprobe): Eröffnung GESAMTSALDO -10000 Cent
+    (Guthaben) zum 31.08., danach SOLL 60000 Cent fällig 05.09.
+    berechne_saldo lieferte schon korrekt 50000, aber offene_forderungen
+    zeigte weiterhin den vollen Rest 60000 und faelliger_unstrittiger_rest
+    ignorierte das Guthaben ebenfalls - ein Guthaben (negativer Betrag in
+    einer forderungsseitigen Zeile) muss wie eine Zahlung/Gutschrift immer
+    mindern, unabhängig von der eigenen (oft unbekannten) Fälligkeit."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    op_service.eroeffnen_gesamtsaldo(
+        ctx=ctx, konto=konto, betrag_cent=-10_000, stichtag=date(2026, 8, 31),
+        import_id="ERO-GUTHABEN", akteur="test",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        beleg_referenz="Miete September",
+    )
+
+    saldo = op_service.berechne_saldo(konto.id, stichtag=date(2026, 9, 10))
+    assert saldo.saldo_cent == 50_000
+    assert saldo.faelliger_unstrittiger_rest_cent == 50_000  # Guthaben mindert den fälligen Rest, nicht nur den Saldo
+
+    forderungen = op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))
+    assert len(forderungen) == 1  # das Guthaben selbst ist KEINE eigene (negative) Forderung
+    assert forderungen[0].rest_cent == 50_000  # nicht die vollen 60000 - das Guthaben wurde bereits verrechnet

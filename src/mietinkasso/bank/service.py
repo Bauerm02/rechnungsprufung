@@ -83,6 +83,13 @@ class ZuordnungsErgebnis:
     op_position_id: int | None = None
 
 
+@dataclass(frozen=True)
+class ZuordnungsVorschauZeile:
+    roh: RohTransaktion
+    vorgeschlagenes_konto_id: str | None
+    grund: str
+
+
 class BankImportService:
     def __init__(
         self,
@@ -207,6 +214,25 @@ class BankImportService:
         return self._repository.insert_transaktion_idempotent(row, session=session)
 
     # -- Zuordnung (OP-Buchung + Zuordnung + Audit als EINE Transaktion) ----
+    def _resolve_konto_fuer_referenz(self, referenz: str | None) -> tuple[KontoTable | None, str]:
+        """Gemeinsame Auflösung "Referenz -> eindeutiges Zielkonto", die
+        sowohl der bereits persistierten automatischen Zuordnung als auch
+        der reinen Vorab-Vorschau (`vorschau_zuordnungsvorschlaege`) auf
+        noch NICHT importierten Rohzeilen zugrunde liegt. Ausschließlich
+        eine eindeutige `VERTRAG:<id>`-Kennung zählt; Name/Betrag allein
+        reichen nie."""
+
+        if not referenz:
+            return None, "Keine Referenz vorhanden; nur manuelle Zuordnung möglich."
+        treffer = _VERTRAG_REFERENZ.search(referenz)
+        if not treffer:
+            return None, "Referenz enthält keine eindeutige Vertragskennung; Name/Betrag allein reichen nicht."
+        vertrag_id = treffer.group(1)
+        konto = self._stammdaten_repository.get_konto_by_vertrag(vertrag_id)
+        if konto is None:
+            return None, f"Referenzierter Vertrag {vertrag_id} hat kein Konto."
+        return konto, "eindeutig"
+
     def _ist_automatisch_zuordenbar(self, transaktion: BankTransaktionTable) -> tuple[KontoTable | None, str]:
         """Reine Vorprüfung für den GRACEFUL-SKIP-Pfad von
         `automatisch_zuordnen` (kein DB-Schreibzugriff): entscheidet, ob
@@ -216,19 +242,41 @@ class BankImportService:
 
         if transaktion.betrag_cent <= 0:
             return None, "Nur Zahlungseingänge (positiver Betrag) werden automatisch zugeordnet."
-        if not transaktion.referenz:
-            return None, "Keine Referenz vorhanden; nur manuelle Zuordnung möglich."
-        treffer = _VERTRAG_REFERENZ.search(transaktion.referenz)
-        if not treffer:
-            return None, "Referenz enthält keine eindeutige Vertragskennung; Name/Betrag allein reichen nicht."
-        vertrag_id = treffer.group(1)
-        konto = self._stammdaten_repository.get_konto_by_vertrag(vertrag_id)
+        konto, grund = self._resolve_konto_fuer_referenz(transaktion.referenz)
         if konto is None:
-            return None, f"Referenzierter Vertrag {vertrag_id} hat kein Konto."
+            return None, grund
         verbleibend = transaktion.betrag_cent - self._repository.zugeordneter_betrag(transaktion.id)
         if verbleibend <= 0:
             return None, "Transaktion ist bereits vollständig zugeordnet."
         return konto, "eindeutig"
+
+    def vorschau_zuordnungsvorschlaege(self, rohdaten: list[RohTransaktion]) -> list["ZuordnungsVorschauZeile"]:
+        """Reine Lesevorschau auf NOCH NICHT importierten Rohzeilen (kein
+        DB-Schreibzugriff, keine persistierte Banktransaktion nötig):
+        schlägt je Zeile ein Zielkonto nach denselben Regeln wie
+        `automatisch_zuordnen` vor (nur eindeutige Vertragsreferenz,
+        niemals Name/Betrag). Die maßgebliche Zuordnung entsteht erst nach
+        ausdrücklicher Bestätigung, gegen die dann tatsächlich importierte
+        und persistierte Transaktion (`automatisch_zuordnen`/
+        `zuordnen_manuell`) - diese Vorschau ist nur Anzeige."""
+
+        ergebnisse: list[ZuordnungsVorschauZeile] = []
+        for roh in rohdaten:
+            if roh.betrag_cent <= 0:
+                ergebnisse.append(ZuordnungsVorschauZeile(roh, None, "Kein Zahlungseingang (Betrag <= 0)."))
+                continue
+            konto, grund = self._resolve_konto_fuer_referenz(roh.referenz)
+            ergebnisse.append(ZuordnungsVorschauZeile(roh, konto.id if konto is not None else None, grund))
+        return ergebnisse
+
+    def schlage_konto_vor(self, transaktion: BankTransaktionTable) -> tuple[KontoTable | None, str]:
+        """Reine Lesevorschau für eine BEREITS persistierte, aber noch
+        unzugeordnete Transaktion (z. B. für eine Backoffice-Liste
+        offener Zuordnungen) - bucht nichts."""
+
+        if transaktion.betrag_cent <= 0:
+            return None, "Nur Zahlungseingänge (positiver Betrag) können automatisch vorgeschlagen werden."
+        return self._resolve_konto_fuer_referenz(transaktion.referenz)
 
     def automatisch_zuordnen(self, *, ctx: AuthContext, transaktion: BankTransaktionTable) -> ZuordnungsErgebnis:
         konto, grund = self._ist_automatisch_zuordenbar(transaktion)

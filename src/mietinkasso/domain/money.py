@@ -53,3 +53,50 @@ def round_index_half_cent_down(amount: Decimal) -> Decimal:
 
 def sum_cents(values: list[int]) -> int:
     return sum(values) if values else 0
+
+
+#: Die in Österreich für Vermietung/Verpachtung tatsächlich relevanten
+#: UStG-Sätze - 0 % (unecht steuerbefreit / Kleinunternehmer), 10 %
+#: (ermäßigt, Wohnraum) und 20 % (Normalsatz, z. B. Garagen/Geschäftsraum).
+#: Jeder andere in einer Quelle auftauchende Wert ist keine plausible
+#: Interpretationsfrage, sondern eine inkonsistente Quelle und wird
+#: geblockt statt stillschweigend gerechnet (siehe `zerlege_brutto_cent`).
+ZULAESSIGE_UST_SAETZE_PROMILLE = frozenset({0, 10_000, 20_000})
+
+
+def zerlege_brutto_cent(brutto_cent: int, ust_satz_promille: int) -> tuple[int, int]:
+    """Zerlegt einen BRUTTO-Betrag (das, was tatsächlich vorgeschrieben/
+    gebucht wird) in (netto_cent, ust_cent) für den Beleg-Ausweis.
+
+    Definition (verbindlich für dieses Modul, siehe
+    `vorschreibung/service.py`): `VertragsKomponenteTable.betrag_cent` /
+    `VorschreibungPositionTable.betrag_cent` sind BRUTTO - das ist der
+    Betrag, der tatsächlich als SOLL gebucht wird (unverändert gegenüber
+    dem bisherigen Verhalten, das `betrag_cent` direkt aufsummiert und
+    bucht). `ust_satz_promille` dient AUSSCHLIESSLICH dazu, für den
+    Beleg/die Vorschau Netto und USt getrennt auszuweisen, wie es UStG
+    verlangt - er verändert NIEMALS den gebuchten/vorgeschriebenen
+    Gesamtbetrag.
+
+    Rundung: `netto_cent` wird kaufmännisch (ROUND_HALF_UP) auf ganze
+    Cent gerundet; `ust_cent` ist stets `brutto_cent - netto_cent`, damit
+    Netto + USt exakt wieder Brutto ergibt (kein Rundungsrest, der sich
+    über mehrere Positionen aufsummieren könnte).
+
+    Nur Decimal/Integer-Arithmetik, niemals Float.
+    """
+
+    if ust_satz_promille not in ZULAESSIGE_UST_SAETZE_PROMILLE:
+        from mietinkasso.domain.exceptions import UStSatzUngueltigError
+
+        raise UStSatzUngueltigError(
+            f"USt-Satz {ust_satz_promille} Promille ist keiner der in Österreich für Vermietung "
+            f"zulässigen Sätze ({sorted(ZULAESSIGE_UST_SAETZE_PROMILLE)}); inkonsistente Quelle wird "
+            "geblockt statt stillschweigend gerechnet."
+        )
+    if ust_satz_promille == 0:
+        return brutto_cent, 0
+    satz = Decimal(ust_satz_promille) / Decimal(100_000)  # z. B. 10000/100000 = 0.10
+    netto = (Decimal(brutto_cent) / (Decimal("1") + satz)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    netto_cent = int(netto)
+    return netto_cent, brutto_cent - netto_cent

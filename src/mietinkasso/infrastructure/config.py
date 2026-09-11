@@ -42,6 +42,18 @@ class Settings(BaseSettings):
     # bis jemand Auth einbaut").
     api_token: str | None = None
 
+    # Server-gerendertes Backoffice (bedienbarer Pilot-Arbeitsablauf, siehe
+    # backoffice/app.py): EIN lokaler Login für den Piloten (kein
+    # Mehrbenutzer-/Rollen-Management in MVP1 - das ist explizit eine
+    # spätere Inbetriebnahme, siehe OFFENE_PUNKTE.md). Ohne konfigurierten
+    # Passwort-Hash bleibt das Backoffice komplett geschlossen (503),
+    # exakt wie `api_token` oben - "closed by default". Der Hash wird mit
+    # `python -m mietinkasso.backoffice.security <passwort>` erzeugt und
+    # NIE als Klartext-Passwort hier abgelegt.
+    backoffice_user: str = "markus"
+    backoffice_password_hash: str | None = None
+    backoffice_session_ttl_minuten: int = 480
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

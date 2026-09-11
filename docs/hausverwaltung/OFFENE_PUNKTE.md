@@ -4,6 +4,37 @@ Stand: erste Lieferung (siehe REVIEW_ZUSAMMENFASSUNG.md für Baustand).
 Alles hier ist bewusst offen gelassen bzw. bewusst konservativ gebaut —
 keine stillschweigend übersprungenen Punkte.
 
+## Backoffice-Pilot (diese Runde) — technisch gesperrt, nicht nur dokumentiert
+
+- **Kein Mehrbenutzer-Onlinebetrieb:** EIN lokaler Login
+  (`MIETINKASSO_BACKOFFICE_USER`/`_PASSWORD_HASH`), Session-Store ist ein
+  reines In-Memory-Dict eines einzelnen Prozesses (`backoffice/security.py`)
+  — überlebt keinen Neustart, kein Worker-übergreifendes Teilen. Für
+  echten Mehrbenutzerbetrieb: externer Session-Store (Redis/DB) plus
+  echtes Rollen-/Gesellschafts-Login pro Anwender.
+- **Kein echter Versandadapter:** die Mahnvorschau ruft `versenden()`
+  ausschließlich mit `send_enabled=False` auf ("Sendebereitschaft
+  prüfen"); es gibt keinen Button/Pfad, der `send_enabled=True` setzt
+  oder einen realen Mail-Provider anspricht.
+- **Keine echten Bank-Credentials/EBICS:** Bankimport bleibt manueller
+  CSV/CAMT-Dateiupload, keine automatisierte Abholung.
+- **Zwei getrennte SQLAlchemy-Engines** (`api/app.py` und
+  `backoffice/app.py` bauen je eine eigene `session_factory` gegen
+  dieselbe `MIETINKASSO_DATABASE_URL`): für die dokumentierte Datei-
+  SQLite/PostgreSQL unproblematisch (mehrere Verbindungen auf dieselbe
+  DB sind Standard); `MIETINKASSO_DATABASE_URL=sqlite:///:memory:` NICHT
+  für den kombinierten Prozess verwenden, da dann zwei isolierte
+  In-Memory-Datenbanken entstünden.
+- **CSRF-Schutz** ist ein einfacher, sitzungsgebundener Zufalls-Token-
+  Vergleich (kein Double-Submit-Cookie, kein Origin-Header-Check
+  zusätzlich) — für den lokalen Ein-Operator-Pilot ausreichend, vor
+  Internet-Exposition zu härten.
+- **"Unsigniert" als Vertragszustand** ist in der Vorschreibungs-Vorschau
+  NICHT technisch geprüft (kein solches Feld im Schema) — nur
+  "historisch" (`gueltig_bis` überschritten) und "Leerstand"
+  (`Nutzungsstatus`) sperren die Freigabe. Eine echte
+  Unterschriften-/Signaturverfolgung ist nicht gebaut.
+
 ## Integration / Betrieb
 
 - **Quellenmapping (Codex-Aufgabe):** Zuordnung der realen 12

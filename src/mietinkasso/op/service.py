@@ -86,11 +86,18 @@ class OPService:
         stichtag: date,
         import_id: str,
         akteur: str,
+        session: Session | None = None,
     ) -> OPPositionTable:
+        """`session`: siehe `buchen` - übergeben, um diese Eröffnungszeile
+        Teil eines größeren, vom Aufrufer verwalteten Mehrzeilen-Imports zu
+        machen (z. B. eine ganze Eröffnungssalden-CSV-Datei atomar: eine
+        spätere Fehlerzeile rollt dann auch bereits verarbeitete frühere
+        Zeilen desselben Aufrufs zurück)."""
+
         require_gesellschaft_access(ctx, konto.gesellschaft_id)
         require_schreibrecht(ctx)
-        self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto)
-        self._pruefe_und_setze_eroeffnungsmodus(konto, "GESAMTSALDO", stichtag)
+        self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto, session=session)
+        self._pruefe_und_setze_eroeffnungsmodus(konto, "GESAMTSALDO", stichtag, session=session)
 
         # Eröffnung ist fachlich EINMALIG je Konto/Stichtag - unabhängig vom
         # import_id/Dateinamen der jeweiligen Quelle. Ein zweiter Import mit
@@ -98,7 +105,7 @@ class OPService:
         # Namen) ist ein Replay derselben Tatsache; ein zweiter Import mit
         # ABWEICHENDEM Betrag/Stichtag ist eine widersprüchliche
         # Wiedereröffnung und wird blockiert, statt den Saldo zu verdoppeln.
-        bestehende = self._op_repository.find_eroeffnung(konto.id)
+        bestehende = self._op_repository.find_eroeffnung(konto.id, session=session)
         if bestehende is not None:
             if bestehende.betrag_cent == betrag_cent and bestehende.belegdatum == stichtag:
                 return bestehende
@@ -126,7 +133,7 @@ class OPService:
             quelle_system="eroeffnung_gesamtsaldo",
         )
         try:
-            return self._op_repository.insert_idempotent(row)
+            return self._op_repository.insert_idempotent(row, session=session)
         except IntegrityError as exc:
             # Zweite, gleichzeitige Eröffnung desselben Kontos (Race) - vom
             # partiellen Unique-Index auf DB-Ebene abgefangen.
@@ -147,11 +154,14 @@ class OPService:
         faelligkeit: date | None,
         beleg_referenz: str,
         akteur: str,
+        session: Session | None = None,
     ) -> OPPositionTable:
+        """`session`: siehe `eroeffnen_gesamtsaldo`."""
+
         require_gesellschaft_access(ctx, konto.gesellschaft_id)
         require_schreibrecht(ctx)
-        self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto)
-        self._pruefe_und_setze_eroeffnungsmodus(konto, "EINZEL_OP", stichtag)
+        self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto, session=session)
+        self._pruefe_und_setze_eroeffnungsmodus(konto, "EINZEL_OP", stichtag, session=session)
         content_hash = compute_content_hash(
             {
                 "konto_id": konto.id,
@@ -176,11 +186,15 @@ class OPService:
             import_id=import_id,
             quelle_system="eroeffnung_einzel_op",
         )
-        return self._op_repository.insert_idempotent(row)
+        return self._op_repository.insert_idempotent(row, session=session)
 
-    def _pruefe_und_setze_eroeffnungsmodus(self, konto: KontoTable, modus: str, stichtag: date) -> None:
+    def _pruefe_und_setze_eroeffnungsmodus(
+        self, konto: KontoTable, modus: str, stichtag: date, *, session: Session | None = None
+    ) -> None:
         if konto.eroeffnung_modus is None:
-            self._stammdaten_repository.set_eroeffnung_modus(konto_id=konto.id, modus=modus, stichtag=stichtag)
+            self._stammdaten_repository.set_eroeffnung_modus(
+                konto_id=konto.id, modus=modus, stichtag=stichtag, session=session
+            )
             konto.eroeffnung_modus = modus
             konto.eroeffnung_stichtag = stichtag
             return
@@ -231,7 +245,7 @@ class OPService:
 
         require_gesellschaft_access(ctx, konto.gesellschaft_id)
         require_schreibrecht(ctx)
-        self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto)
+        self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto, session=session)
         if typ in (OPTyp.SOLL, OPTyp.GUTSCHRIFT):
             self.pruefe_kein_altjournal_in_gesamtsaldo(konto, belegdatum)
         content_hash = compute_content_hash(
@@ -273,7 +287,16 @@ class OPService:
         neuer_betrag_cent: int | None = None,
         neue_faelligkeit: date | None = None,
         heute: date | None = None,
+        vorgang_id: str | None = None,
     ) -> OPPositionTable | None:
+        """`vorgang_id`: vom Aufrufer vergebene Kennung für DIESE
+        Korrektur-Anfrage (z. B. gegen eine doppelte Formularbestätigung im
+        Backoffice). Ein zweiter Aufruf mit DERSELBEN `vorgang_id` (und
+        sonst identischem Inhalt) gegen ein bereits korrigiertes Original
+        ist ein sicherer No-Op; jeder andere zweite Aufruf auf ein bereits
+        storniertes Original wird als `StornierungKonfliktError`
+        abgelehnt, statt eine zweite aktive Ersatzzeile anzulegen."""
+
         require_gesellschaft_access(ctx, konto.gesellschaft_id)
         require_schreibrecht(ctx)
         heute = heute or date.today()
@@ -294,11 +317,28 @@ class OPService:
                 beleg_referenz=f"Korrektur zu #{original.id}: {original.beleg_referenz}",
                 aenderungsgrund=aenderungsgrund,
                 quelle_hash=compute_content_hash(
-                    {"korrektur_von": original.id, "betrag_cent": neuer_betrag_cent, "grund": aenderungsgrund}
+                    {
+                        "korrektur_von": original.id,
+                        "betrag_cent": neuer_betrag_cent,
+                        "faelligkeit": str(neue_faelligkeit) if neue_faelligkeit else None,
+                        "grund": aenderungsgrund,
+                    }
                 ),
                 quelle_system="korrektur",
+                import_id=f"KORREKTUR-{original_id}-{vorgang_id}" if vorgang_id is not None else None,
             )
-        return self._op_repository.storno(original_id=original_id, neue_row=neue_row, akteur=ctx.user_id)
+        return self._op_repository.storno(
+            original_id=original_id, neue_row=neue_row, akteur=ctx.user_id, vorgang_id=vorgang_id
+        )
+
+    def get_position(self, op_position_id: int) -> OPPositionTable | None:
+        return self._op_repository.get(op_position_id)
+
+    def bestehende_eroeffnung(self, konto_id: str) -> OPPositionTable | None:
+        return self._op_repository.find_eroeffnung(konto_id)
+
+    def list_alle_positionen(self, konto_id: str) -> list[OPPositionTable]:
+        return self._op_repository.list_alle(konto_id)
 
     # -- Saldo --------------------------------------------------------------
     def berechne_saldo(self, konto_id: str, *, stichtag: date | None = None) -> OPSaldo:
@@ -314,14 +354,23 @@ class OPService:
         # ("Saldo ohne bekannte Fälligkeit sichtbar, aber nicht automatisch
         # mahnen"). Zahlungen und Gutschriften mindern die Forderung immer,
         # sobald sie gebucht sind - eine Zahlung hat selbst keine eigene
-        # Fälligkeit und darf dafür nicht ausgeschlossen werden.
+        # Fälligkeit und darf dafür nicht ausgeschlossen werden. Ein
+        # GUTHABEN in einer eigentlich forderungsseitigen Zeile (z. B. ein
+        # negativer Eröffnungssaldo) ist wirtschaftlich dasselbe wie eine
+        # Zahlung/Gutschrift und mindert den fälligen Rest daher ebenfalls
+        # IMMER, unabhängig von der (bei EROEFFNUNG oft unbekannten)
+        # eigenen Fälligkeit - sonst bliebe ein Guthaben unberücksichtigt
+        # und ein späteres Soll würde in voller Höhe als fällig ausgewiesen.
         faellig_rest = 0
         for position in positionen:
             typ = OPTyp(position.typ)
+            effekt = _effect_cent(position)
             if typ in (OPTyp.GUTSCHRIFT, OPTyp.ZAHLUNG, OPTyp.KORREKTUR):
-                faellig_rest += _effect_cent(position)
+                faellig_rest += effekt
+            elif typ in _POSITIVE_TYPEN and effekt < 0:
+                faellig_rest += effekt
             elif position.faelligkeit_bekannt and position.faelligkeit is not None and position.faelligkeit <= heute:
-                faellig_rest += _effect_cent(position)
+                faellig_rest += effekt
 
         return OPSaldo(
             konto_id=konto_id,
@@ -341,7 +390,13 @@ class OPService:
 
         positionen = self._op_repository.list_aktiv(konto_id)
 
-        forderungs_rows = [p for p in positionen if OPTyp(p.typ) in _POSITIVE_TYPEN]
+        # Nur ECHTE Forderungen (positiver Betrag) zählen als Forderungszeile;
+        # eine "positive Typ"-Zeile mit NEGATIVEM Betrag (z. B. ein
+        # Guthaben-Eröffnungssaldo) ist ein Guthaben, keine Forderung, und
+        # landet stattdessen im Minderungs-Pool (siehe unten) - sonst würde
+        # sie weder als Forderung noch als Guthaben gezählt und würde
+        # spurlos verschwinden, ohne spätere Forderungen zu mindern.
+        forderungs_rows = [p for p in positionen if OPTyp(p.typ) in _POSITIVE_TYPEN and p.betrag_cent > 0]
         forderungs_rows.sort(key=lambda p: (p.faelligkeit or p.belegdatum, p.belegdatum, p.id))
 
         minderungs_pool = 0
@@ -349,6 +404,8 @@ class OPService:
             typ = OPTyp(p.typ)
             if typ in _NEGATIVE_TYPEN:
                 minderungs_pool += p.betrag_cent
+            elif typ in _POSITIVE_TYPEN and p.betrag_cent < 0:
+                minderungs_pool += -p.betrag_cent
             elif typ is OPTyp.KORREKTUR:
                 effekt = _effect_cent(p)
                 if effekt < 0:
