@@ -21,8 +21,23 @@ def eur(cent: int) -> str:
     return f"{cents_to_decimal(cent):,.2f}".replace(",", "§").replace(".", ",").replace("§", ".") + " €"
 
 
+#: Sichtbare Hauptnavigation für angemeldete Benutzer. Die Vorschreibungs-/
+#: Mahnvorschau-Wege brauchen einen konkreten Vertrag und werden deshalb
+#: kontextuell im Kontoauszug verlinkt (nicht hier) - alle anderen
+#: Arbeitsabläufe haben aber keinen Kontext und MÜSSEN hier auffindbar
+#: sein, sonst gibt es keinen sichtbaren Weg dorthin.
+_NAV_LINKS = [
+    ("/backoffice/", "Dashboard"),
+    ("/backoffice/eroeffnung", "Eröffnungsimport"),
+    ("/backoffice/bank", "Bankimport"),
+    ("/backoffice/bank/unzugeordnet", "Offene Zuordnungen"),
+    ("/backoffice/bank/vollstaendigkeit", "Bankvollständigkeit"),
+]
+
+
 def seite(*, titel: str, inhalt: str, user_id: str | None = None, csrf_token: str | None = None) -> str:
     logout_form = ""
+    nav = ""
     if user_id is not None:
         logout_form = f"""
         <span class="muted">angemeldet als {h(user_id)}</span>
@@ -30,18 +45,23 @@ def seite(*, titel: str, inhalt: str, user_id: str | None = None, csrf_token: st
           <input type="hidden" name="csrf_token" value="{h(csrf_token or '')}">
           <button type="submit">Abmelden</button>
         </form>"""
+        nav_links = "".join(f'<a href="{h(pfad)}">{h(label)}</a>' for pfad, label in _NAV_LINKS)
+        nav = f'<nav class="hauptnav">{nav_links}</nav>'
     return f"""<!doctype html>
 <html lang="de">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{h(titel)} — Mietinkasso Backoffice (PILOT)</title>
+<title>{h(titel)} — Hausverwaltung & Mietinkasso (PILOT)</title>
 <style>
   body {{ font-family: system-ui, -apple-system, sans-serif; margin: 0; background: #f5f6f8; color: #1a1a1a; }}
   header {{ background: #14213d; color: #fff; padding: 0.6rem 1.25rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; }}
   header a {{ color: #fff; text-decoration: none; font-weight: 600; }}
   header form button {{ background: transparent; border: 1px solid #fff; color: #fff; border-radius: 4px; padding: 0.2rem 0.6rem; }}
   .pilot-banner {{ background: #a15c00; color: #fff; text-align: center; padding: 0.3rem; font-size: 0.82rem; font-weight: 600; }}
+  nav.hauptnav {{ background: #1c2d54; padding: 0.5rem 1.25rem; display: flex; flex-wrap: wrap; gap: 1.1rem; }}
+  nav.hauptnav a {{ color: #e8ecf7; text-decoration: none; font-size: 0.88rem; font-weight: 600; }}
+  nav.hauptnav a:hover {{ text-decoration: underline; }}
   main {{ padding: 1.25rem; max-width: 1150px; margin: 0 auto; }}
   table {{ border-collapse: collapse; width: 100%; margin: 0.75rem 0; background: #fff; }}
   th, td {{ border: 1px solid #ddd; padding: 0.35rem 0.55rem; text-align: left; font-size: 0.88rem; vertical-align: top; }}
@@ -66,9 +86,10 @@ def seite(*, titel: str, inhalt: str, user_id: str | None = None, csrf_token: st
 <body>
 <div class="pilot-banner">PILOT-BETRIEB — nur synthetische Demodaten, kein realer Bank-/Mailversand, kein Mehrbenutzerbetrieb</div>
 <header>
-  <a href="/backoffice/">Mietinkasso Backoffice</a>
+  <a href="/backoffice/">Hausverwaltung & Mietinkasso</a>
   <div>{logout_form}</div>
 </header>
+{nav}
 <main>
 {inhalt}
 </main>

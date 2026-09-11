@@ -110,7 +110,7 @@ def dashboard() -> str:
     api_status = "konfiguriert (X-API-Key erforderlich)" if _settings.api_token else "NICHT konfiguriert -> Datenendpunkte 503"
     return f"""
     <html>
-    <head><title>Mietinkasso — Status</title>
+    <head><title>Hausverwaltung & Mietinkasso — Status</title>
     <style>
       body {{ font-family: system-ui, sans-serif; margin: 2rem; color: #1a1a1a; }}
       code {{ background: #f0f0f0; padding: 0.1rem 0.3rem; border-radius: 3px; }}
@@ -118,7 +118,7 @@ def dashboard() -> str:
     </style>
     </head>
     <body>
-      <h1>Mietinkasso — Betriebsstatus</h1>
+      <h1>Hausverwaltung & Mietinkasso — Betriebsstatus</h1>
       <p>Umgebung: <code>{_settings.environment}</code></p>
       <p>Versand aktiv (SEND_ENABLED): <span class="warn">{_settings.send_enabled}</span></p>
       <p>API-Token: <span class="warn">{api_status}</span></p>

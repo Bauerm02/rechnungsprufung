@@ -129,6 +129,45 @@ def test_login_und_dashboard_zeigt_objekte(backoffice_client):
     assert konto_id in dashboard.text
 
 
+def test_hauptnavigation_verlinkt_alle_kontextlosen_arbeitsablaeufe(backoffice_client):
+    """Regression (Bedienungsfehler-Meldung): nach der Anmeldung zeigte
+    das Dashboard nur die Objektwahl - Eröffnungsimport, Bankimport,
+    offene Zuordnungen und Bankvollständigkeit hatten keinen sichtbaren
+    Weg dorthin. Diese vier (kontextlosen, d. h. ohne Vertrag/Konto in
+    der URL) Arbeitsabläufe müssen im gemeinsamen Layout für jeden
+    angemeldeten Benutzer gut lesbar verlinkt sein, auf JEDER Seite -
+    nicht nur auf dem Dashboard. Vor der Anmeldung darf die Navigation
+    nicht erscheinen (keine funktionslosen Links auf der Login-Seite)."""
+
+    client, konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+
+    login_seite = client.get("/backoffice/login")
+    assert login_seite.status_code == 200
+    assert "/backoffice/eroeffnung" not in login_seite.text
+
+    _login(client)
+    erwartete_links = [
+        "/backoffice/eroeffnung",
+        "/backoffice/bank",
+        "/backoffice/bank/unzugeordnet",
+        "/backoffice/bank/vollstaendigkeit",
+    ]
+
+    dashboard = client.get("/backoffice/")
+    assert dashboard.status_code == 200
+    assert "Hausverwaltung &amp; Mietinkasso" in dashboard.text or "Hausverwaltung & Mietinkasso" in dashboard.text
+    for link in erwartete_links:
+        assert f'href="{link}"' in dashboard.text, f"Navigationslink {link} fehlt auf dem Dashboard"
+
+    # Die Navigation ist Teil des GEMEINSAMEN Layouts, nicht nur einer
+    # Seite - auf einer beliebigen anderen Seite (Kontoauszug) ebenfalls
+    # sichtbar.
+    kontoauszug = client.get(f"/backoffice/konto/{konto_id}")
+    assert kontoauszug.status_code == 200
+    for link in erwartete_links:
+        assert f'href="{link}"' in kontoauszug.text, f"Navigationslink {link} fehlt im Kontoauszug"
+
+
 def test_objekt_107_ist_im_dashboard_nur_lesend(backoffice_client):
     client, _konto_id, konto_gesperrt_id, _op_service = backoffice_client
     _login(client)
