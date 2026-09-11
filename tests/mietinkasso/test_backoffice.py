@@ -343,6 +343,96 @@ def test_bankimport_vorschau_import_und_zuordnung(backoffice_client):
     assert op_service.berechne_saldo(konto_id).saldo_cent == saldo_vorher - 60_000
 
 
+def _bank_datei_importieren(client, csrf, *, bank_konto_id, betrag_text, referenz=""):
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.bank.repository import BankRepository
+
+    BankRepository(build_session_factory(get_settings().database_url)).upsert_bank_konto(
+        id=bank_konto_id, gesellschaft_id="7DI", iban=f"AT{bank_konto_id[-10:]:0>10}", bezeichnung=bank_konto_id,
+    )
+    csv_text = f"betrag,datum,referenz\n{betrag_text},2026-04-06,{referenz}\n"
+    form = {
+        "csrf_token": csrf, "bank_konto_id": bank_konto_id, "format": "CSV",
+        "spalte_betrag": "betrag", "spalte_datum": "datum", "spalte_referenz": "referenz",
+        "spalte_eindeutig": "", "dezimaltrennzeichen": ".",
+    }
+    vorschau = client.post(
+        "/backoffice/bank/vorschau", data=form, files={"datei": ("bank.csv", csv_text.encode("utf-8"), "text/csv")},
+    )
+    marker = 'name="inhalt_b64" value="'
+    start = vorschau.text.index(marker) + len(marker)
+    ende = vorschau.text.index('"', start)
+    client.post("/backoffice/bank/importieren", data={**form, "inhalt_b64": vorschau.text[start:ende]})
+    offene = client.get("/backoffice/bank/unzugeordnet", params={"bank_konto_id": bank_konto_id})
+    return offene.text
+
+
+def test_manuelle_bankzuordnung_akzeptiert_vorbefuelltes_deutsches_zahlenformat(backoffice_client):
+    """Regression (Browser-Befund auf e16914d): die manuelle
+    Bankzuordnung befüllt das Betragsfeld selbst mit dem von `eur()`
+    erzeugten deutschen Format (z. B. "1.500,00" bei einer 1500-EUR-
+    Transaktion). Unverändert abgeschickt führte das zu einem
+    unbehandelten `decimal.InvalidOperation` (HTTP 500)."""
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    from datetime import date
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-1500", objekt_id="601", bezeichnung="Top 1500", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-1500", einheit_id="601-TOP-1500", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-1500"))
+
+    # Keine VERTRAG:-Referenz -> kein Automatik-Vorschlag, nur die manuelle Form.
+    seiten_text = _bank_datei_importieren(client, csrf, bank_konto_id="BK-TEST-1500", betrag_text="1500.00")
+    assert re.search(r"/backoffice/bank/\d+/automatisch-zuordnen", seiten_text) is None
+
+    treffer_betrag = re.search(r'name="betrag" placeholder="Betrag EUR" value="([^"]+)"', seiten_text)
+    assert treffer_betrag is not None
+    vorbefuellter_betrag = treffer_betrag.group(1)
+    assert vorbefuellter_betrag == "1.500,00"  # exakt das gemeldete Format
+
+    treffer_tx = re.search(r"/backoffice/bank/(\d+)/manuell-zuordnen", seiten_text)
+    assert treffer_tx is not None
+
+    saldo_vorher = op_service.berechne_saldo(konto.id).saldo_cent
+    zugeordnet = client.post(
+        f"/backoffice/bank/{treffer_tx.group(1)}/manuell-zuordnen",
+        data={"csrf_token": csrf, "konto_id": konto.id, "betrag": vorbefuellter_betrag, "vorgangs_id": "TEST-1500-UNVERAENDERT"},
+        follow_redirects=False,
+    )
+    assert zugeordnet.status_code == 303  # kein 500
+    assert op_service.berechne_saldo(konto.id).saldo_cent == saldo_vorher - 150_000  # korrekter Faktor, nicht 1,50 EUR
+
+
+def test_manuelle_bankzuordnung_lehnt_mehrdeutigen_betrag_ohne_serverfehler_ab(backoffice_client):
+    client, konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text = _bank_datei_importieren(client, csrf, bank_konto_id="BK-TEST-KAPUTT", betrag_text="300.00")
+    treffer_tx = re.search(r"/backoffice/bank/(\d+)/manuell-zuordnen", seiten_text)
+    assert treffer_tx is not None
+
+    saldo_vorher = op_service.berechne_saldo(konto_id).saldo_cent
+    antwort = client.post(
+        f"/backoffice/bank/{treffer_tx.group(1)}/manuell-zuordnen",
+        data={"csrf_token": csrf, "konto_id": konto_id, "betrag": "1,500.00", "vorgangs_id": "KAPUTTER-BETRAG-1"},
+    )
+    assert antwort.status_code == 400  # verständliche Fehlerseite, kein unbehandelter 500
+    assert op_service.berechne_saldo(konto_id).saldo_cent == saldo_vorher  # keine Teilbuchung
+
+
 def test_vorschreibung_vorschau_und_freigabe(backoffice_client):
     client, konto_id, _konto_gesperrt_id, op_service = backoffice_client
     _login(client)

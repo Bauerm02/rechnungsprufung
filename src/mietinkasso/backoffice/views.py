@@ -10,15 +10,60 @@ dieser Seite und wird bewusst nicht "optimiert" (kein ungeprüftes
 
 from __future__ import annotations
 
+from decimal import InvalidOperation
 from html import escape as h
 
-from mietinkasso.domain.money import cents_to_decimal
+from mietinkasso.domain.money import cents_to_decimal, to_cents
 
 
 def eur(cent: int) -> str:
     """Formatiert Cent als Euro-Text (Decimal, niemals Float) fürs Anzeigen."""
 
     return f"{cents_to_decimal(cent):,.2f}".replace(",", "§").replace(".", ",").replace("§", ".") + " €"
+
+
+def parse_eur_betrag(text: str | None) -> int:
+    """Parst einen im Formular eingegebenen EUR-Betrag robust zu Cent.
+
+    Akzeptiert sowohl das bisher unterstützte einfache Punkt-Dezimalformat
+    (z. B. "500.00", "500" - unverändert, keine Formularstelle verlässt
+    sich auf ein anderes Verhalten hierfür) als auch die deutsche
+    Notation mit Punkt als Tausender- und Komma als Dezimaltrennzeichen
+    (z. B. "1.500,00", "1500,00") - genau das Format, das `eur()` beim
+    Vorbefüllen von Formularfeldern erzeugt (z. B. der Restbetrag-
+    Vorschlag bei der manuellen Bankzuordnung). Ohne diese Funktion führte
+    ein unverändert abgeschicktes vorbefülltes Feld wie "1.500,00" zu
+    einer stillschweigend falschen Umrechnung ODER zu einem unbehandelten
+    `decimal.InvalidOperation` (HTTP 500).
+
+    Jede mehrdeutige (z. B. "1,500.00" im US-Format, das hier nicht
+    unterstützt wird) oder anderweitig kaputte Eingabe wird mit einer
+    verständlichen `ValueError` abgelehnt - nie mit einem 500 und nie mit
+    einem stillschweigend falschen Faktor."""
+
+    if text is None:
+        raise ValueError("Betrag darf nicht leer sein.")
+    original = text.strip()
+    if not original:
+        raise ValueError("Betrag darf nicht leer sein.")
+    bereinigt = original.replace("\xa0", "").replace(" ", "")
+    hat_komma = "," in bereinigt
+    hat_punkt = "." in bereinigt
+    if hat_komma and hat_punkt:
+        if bereinigt.rfind(",") < bereinigt.rfind("."):
+            raise ValueError(
+                f"Betrag '{original}' ist mehrdeutig (Punkt nach dem Komma) - bitte eindeutiges Format "
+                "verwenden (z. B. 1.500,00 oder 1500.00)."
+            )
+        normalisiert = bereinigt.replace(".", "").replace(",", ".")
+    elif hat_komma:
+        normalisiert = bereinigt.replace(",", ".")
+    else:
+        normalisiert = bereinigt
+    try:
+        return to_cents(normalisiert)
+    except (InvalidOperation, ArithmeticError, ValueError) as exc:
+        raise ValueError(f"Betrag '{original}' ist kein gültiger Geldbetrag.") from exc
 
 
 #: Sichtbare Hauptnavigation für angemeldete Benutzer. Die Vorschreibungs-/

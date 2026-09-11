@@ -40,13 +40,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from mietinkasso.audit.service import AuditService
 from mietinkasso.auth.service import AuthContext
 from mietinkasso.backoffice.security import SessionStore, pruefe_passwort
-from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, option, seite
+from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, option, parse_eur_betrag, seite
 from mietinkasso.bank.importer import CamtMehrteiligeBuchungError, CamtUnvollstaendigError, CsvSpaltenMapping, parse_camt053, parse_csv
 from mietinkasso.bank.repository import BankRepository
 from mietinkasso.bank.service import BankImportService
 from mietinkasso.domain.enums import OPTyp, Rolle
 from mietinkasso.domain.exceptions import MietinkassoError
-from mietinkasso.domain.money import to_cents
 from mietinkasso.index.repository import IndexRepository
 from mietinkasso.index.service import UNTERSTUETZTE_BERECHNUNGSPROFILE, IndexService
 from mietinkasso.infrastructure.config import get_settings
@@ -399,7 +398,7 @@ def nachbuchung_absenden(
         op_typ = OPTyp(typ)
         if op_typ not in (OPTyp.SOLL, OPTyp.GUTSCHRIFT):
             raise ValueError("Nur SOLL/GUTSCHRIFT sind über die manuelle Nachbuchung zulässig.")
-        betrag_cent = to_cents(betrag.strip().replace(",", "."))
+        betrag_cent = parse_eur_betrag(betrag)
         faelligkeit_datum = date.fromisoformat(faelligkeit) if faelligkeit else None
         position = _op_service.buchen(
             ctx=_ctx(session), konto=konto, typ=op_typ, betrag_cent=betrag_cent, belegdatum=belegdatum,
@@ -471,7 +470,7 @@ def korrektur_absenden(
     if konto is None:
         return _fehlerseite(session, "Korrektur", f"Konto {position.konto_id} nicht gefunden.")
     try:
-        neuer_betrag_cent = to_cents(neuer_betrag.strip().replace(",", ".")) if neuer_betrag and neuer_betrag.strip() else None
+        neuer_betrag_cent = parse_eur_betrag(neuer_betrag) if neuer_betrag and neuer_betrag.strip() else None
         neue_faelligkeit_datum = date.fromisoformat(neue_faelligkeit) if neue_faelligkeit else None
         ergebnis = _op_service.storniere_und_korrigiere(
             ctx=_ctx(session), konto=konto, original_id=op_id, aenderungsgrund=grund,
@@ -916,7 +915,7 @@ def bank_manuell_zuordnen(
     if konto is None:
         return _fehlerseite(session, "Zuordnung", f"Unbekanntes Konto {konto_id}.", f"/backoffice/bank/unzugeordnet?bank_konto_id={transaktion.bank_konto_id}")
     try:
-        betrag_cent = to_cents(betrag.strip().replace(",", "."))
+        betrag_cent = parse_eur_betrag(betrag)
         zuordnung = _bank_service.zuordnen_manuell(
             ctx=_ctx(session), transaktion=transaktion, konto=konto, betrag_cent=betrag_cent,
             beleg_referenz=f"Manuelle Zuordnung durch {session.user_id}", vorgang_id=vorgangs_id,
