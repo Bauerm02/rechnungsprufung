@@ -1,0 +1,127 @@
+"""Betriebskostenabrechnung (Fachregel 6).
+
+Eine WEG-Eigentümerabrechnung ist keine Mieterabrechnung: Rücklage,
+Finanzierung, Sonderumlage, Reparatur sowie Verwaltungs-/
+Abrechnungskosten werden nur dann auf Mieter umgelegt, wenn eine
+Position explizit als UMLAGEFAEHIG (mit Quelle+Profil) erfasst wurde.
+Alles andere bleibt EIGENTUEMER oder UNGEKLAERT und erzeugt nie einen
+Mieter-OP. Nachbelastung/Gutschrift werden erst nach FREIGEGEBEN
+gebucht - ein ENTWURF kann strukturell keine Forderung und damit auch
+keine Mahnung auslösen.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
+
+from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
+from mietinkasso.bk.repository import BKRepository
+from mietinkasso.domain.enums import BKAbrechnungStatus, BKPositionsart, OPTyp
+from mietinkasso.domain.money import round_money_half_up, to_cents
+from mietinkasso.infrastructure.db.tables import BKVertragsAnteilTable
+from mietinkasso.op.service import OPService
+
+
+class BKAbrechnungNichtFreigegebenError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class BKAnteilEingabe:
+    vertrag_id: str
+    anteil_prozent: Decimal
+    vorauszahlung_cent: int
+
+
+class BKService:
+    def __init__(self, repository: BKRepository, op_service: OPService):
+        self._repository = repository
+        self._op_service = op_service
+
+    def abrechnung_anlegen(self, *, objekt_id: str, abrechnungsjahr: int):
+        return self._repository.get_or_create_abrechnung(objekt_id=objekt_id, abrechnungsjahr=abrechnungsjahr)
+
+    def position_hinzufuegen(
+        self,
+        *,
+        bk_abrechnung_id: int,
+        bezeichnung: str,
+        betrag_cent: int,
+        art: BKPositionsart,
+        quelle: str,
+        profil_referenz: str,
+    ):
+        return self._repository.add_position(
+            bk_abrechnung_id=bk_abrechnung_id,
+            bezeichnung=bezeichnung,
+            betrag_cent=betrag_cent,
+            art=art.value,
+            quelle=quelle,
+            profil_referenz=profil_referenz,
+        )
+
+    def umlagefaehige_summe_cent(self, bk_abrechnung_id: int) -> int:
+        positionen = self._repository.list_positionen(bk_abrechnung_id)
+        return sum(p.betrag_cent for p in positionen if p.art == BKPositionsart.UMLAGEFAEHIG.value)
+
+    def anteile_berechnen(self, *, bk_abrechnung_id: int, eingaben: list[BKAnteilEingabe]) -> list[BKVertragsAnteilTable]:
+        umlagefaehig_cent = self.umlagefaehige_summe_cent(bk_abrechnung_id)
+        ergebnisse = []
+        for eingabe in eingaben:
+            umlage_cent = to_cents(round_money_half_up(Decimal(umlagefaehig_cent) * eingabe.anteil_prozent / 100))
+            ergebnis_cent = umlage_cent - eingabe.vorauszahlung_cent
+            anteil = BKVertragsAnteilTable(
+                bk_abrechnung_id=bk_abrechnung_id,
+                vertrag_id=eingabe.vertrag_id,
+                anteil_prozent=eingabe.anteil_prozent,
+                umlage_cent=umlage_cent,
+                vorauszahlung_cent=eingabe.vorauszahlung_cent,
+                ergebnis_cent=ergebnis_cent,
+            )
+            ergebnisse.append(self._repository.save_anteil(anteil))
+        return ergebnisse
+
+    def pruefen(self, bk_abrechnung_id: int):
+        return self._repository.set_status(bk_abrechnung_id, BKAbrechnungStatus.GEPRUEFT.value)
+
+    def freigeben(self, bk_abrechnung_id: int):
+        return self._repository.set_status(bk_abrechnung_id, BKAbrechnungStatus.FREIGEGEBEN.value)
+
+    def ergebnisse_buchen(self, *, ctx: AuthContext, bk_abrechnung_id: int, konten_je_vertrag: dict[str, object]):
+        """`konten_je_vertrag` mappt vertrag_id -> KontoTable. Bucht je Anteil
+        eine Nachbelastung (SOLL) oder Gutschrift (GUTSCHRIFT); nur möglich,
+        wenn die Abrechnung FREIGEGEBEN ist."""
+
+        abrechnung = self._repository.get_abrechnung(bk_abrechnung_id)
+        if abrechnung is None:
+            raise ValueError(f"Unbekannte BKAbrechnung {bk_abrechnung_id}")
+        if abrechnung.status != BKAbrechnungStatus.FREIGEGEBEN.value:
+            raise BKAbrechnungNichtFreigegebenError(
+                f"BKAbrechnung {bk_abrechnung_id} ist im Status {abrechnung.status}; "
+                "eine Nachbelastung/Gutschrift darf erst nach FREIGEGEBEN gebucht werden."
+            )
+        gebuchte = []
+        heute = date.today()
+        for anteil in self._repository.list_anteile(bk_abrechnung_id):
+            konto = konten_je_vertrag[anteil.vertrag_id]
+            require_gesellschaft_access(ctx, konto.gesellschaft_id)
+            require_schreibrecht(ctx)
+            if anteil.ergebnis_cent == 0:
+                continue
+            typ = OPTyp.SOLL if anteil.ergebnis_cent > 0 else OPTyp.GUTSCHRIFT
+            op_row = self._op_service.buchen(
+                ctx=ctx,
+                konto=konto,
+                typ=typ,
+                betrag_cent=abs(anteil.ergebnis_cent),
+                belegdatum=heute,
+                buchungsdatum=heute,
+                faelligkeit=heute,
+                beleg_referenz=f"BK-Abrechnung {bk_abrechnung_id} Jahresergebnis",
+                import_id=f"BK-{bk_abrechnung_id}-{anteil.vertrag_id}",
+                quelle_system="bk_abrechnung",
+            )
+            gebuchte.append(op_row)
+        return gebuchte
