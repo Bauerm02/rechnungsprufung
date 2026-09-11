@@ -37,6 +37,16 @@ nicht automatisch aus dem Vorzeichen erkannt, sondern erfordert eine
 explizite Zuordnung zur ursprünglichen Zahlung
 (`bank.service.BankImportService.verarbeite_ruecklastschrift`).
 
+**`buchungs_id` (→ `CsvSpaltenMapping.eindeutige_referenz`) ist die
+bankseitig eindeutige Transaktionskennung** und sollte, wenn die Bank so
+eine Spalte liefert, IMMER gemappt werden. Ohne sie behandelt der Import
+jede Zeile als "ohne eindeutige Kennung": ein zweiter Import mit
+identischem Konto/Datum/Betrag/Referenz (z. B. aus einem überlappenden
+Tagesexport) wird dann NICHT still zusammengelegt und NICHT still ein
+zweites Mal gebucht, sondern mit `MehrfachbuchungsKonfliktError`
+abgelehnt, weil eine echte zweite, zufällig identisch aussehende Zahlung
+nicht automatisch von einer Wiederholung unterschieden werden kann.
+
 ## CAMT.053
 
 Es gibt hier keine separate Beispieldatei; ein minimales, funktionsfähiges

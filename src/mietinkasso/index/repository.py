@@ -42,6 +42,10 @@ class IndexRepository:
             session.refresh(klausel)
             return klausel
 
+    def get_klausel(self, klausel_id: int) -> IndexKlauselTable | None:
+        with self._session_factory() as session:
+            return session.get(IndexKlauselTable, klausel_id)
+
     def freigeben(self, klausel_id: int, *, freigegeben_von: str) -> IndexKlauselTable:
         from datetime import datetime, timezone
 

@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-import os
 from datetime import date
 
 from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.bank.repository import BankRepository
 from mietinkasso.bank.service import BankImportService
-from mietinkasso.domain.enums import OPTyp
 from mietinkasso.infrastructure.config import Settings
-from mietinkasso.infrastructure.db.base import Base
 from mietinkasso.infrastructure.db.session import build_engine, create_all_tables
 from mietinkasso.jobs.runner import JobRunner
 from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
@@ -99,8 +96,10 @@ def test_standardfunktionen_laufen_komplett_ohne_ki_key(session_factory, stammda
     bank_service.automatisch_zuordnen(ctx=ctx, transaktion=transaktion)
 
     policy = mahn_policy_repo.freigeben(mahn_policy_repo.anlegen(status="ENTWURF").id)
-    ergebnis = mahn_service.planen(
-        ctx=ctx, vertrag=vertrag, konto=konto, policy=policy, heute=date(2026, 4, 20), bank_stand_alter_tage=0,
+    forderung = op_service.offene_forderungen(konto.id, heute=date(2026, 4, 20))[0]
+    ergebnis = mahn_service.plane_forderung(
+        ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung, policy=policy,
+        heute=date(2026, 4, 20), bank_stand_alter_tage=0,
     )
 
     # 600,00 Soll - 300,00 Zahlung = 300,00 offen -> Stufe 1 wird geplant, alles ohne einen einzigen KI-Aufruf

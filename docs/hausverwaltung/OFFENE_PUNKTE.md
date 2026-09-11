@@ -27,12 +27,40 @@ keine stillschweigend übersprungenen Punkte.
   angebunden; die Schnittstelle (`mahnwesen/service.py`) ist so
   geschnitten, dass ein Adapter andocken kann, ohne die Statuslogik zu
   ändern.
-- **Dokumentzustellung Vorschreibung:** `dokument_zustellen()` markiert
-  nur den Status; ein PDF-Rendering/Versand ist nicht Teil von MVP1.
+- **Dokumentzustellung Vorschreibung:** `dokument_zustellen()`/
+  `hauptbuch_exportieren()` verlangen zwar jetzt einen echten,
+  nicht-leeren Nachweis (`zustellnachweis`/`export_nachweis`) und lehnen
+  sonst ab — aber es gibt keinen Adapter, der diesen Nachweis tatsächlich
+  ERZEUGT (PDF-Rendering, Mailversand, Hauptbuch-Zielsystem). Der Nachweis
+  muss aktuell von außen (Mensch oder künftiger Adapter) beigebracht
+  werden.
 - **Auth/Login:** `auth/service.py` bildet Rollen- und
   Gesellschafts-Scoping als Autorisierungsschicht ab; ein echtes
   Login/Session-Handling (z. B. OAuth, Passwort-Reset) ist nicht Teil
   dieser Lieferung und muss vor Internet-Exposition ergänzt werden.
+  `api/app.py` ist bis dahin mit einem einzigen geteilten
+  `MIETINKASSO_API_TOKEN` (X-API-Key-Header) "closed by default"
+  abgesichert — das ist eine Übergangslösung für einen internen
+  Operator, KEINE Mandantentrennung pro Endanwender/Gesellschaft auf
+  HTTP-Ebene.
+- **Restliches Race-Fenster bei Bank-Zuordnungen:** `BankImportService`
+  validiert Gesellschaft/Betrag/Währung/Restbetrag VOR jeder OP-Buchung,
+  wodurch alle deterministischen Fehlerfälle (falscher Betrag,
+  Cross-Tenant, Fremdwährung) keine Ledger-Nebenwirkung mehr hinterlassen.
+  Weil OP-Buchung (`op_service.buchen`) und Zuordnungserstellung
+  (`bank_repo.create_zuordnung`) aber zwei getrennte DB-Transaktionen
+  sind (kein repository-übergreifendes Unit-of-Work), bleibt ein
+  theoretisches Race-Fenster bei ECHT GLEICHZEITIGEN konkurrierenden
+  Zuordnungsversuchen auf denselben Restbetrag derselben Transaktion.
+  Für einen Mehrbenutzerbetrieb mit hoher Nebenläufigkeit auf demselben
+  Bankkonto wäre ein DB-seitiger Lock oder eine echte
+  Cross-Repository-Transaktion der nächste Schritt.
+- **CAMT-Sammelbuchungen (mehrere TxDtls):** werden nur automatisch
+  aufgeteilt, wenn JEDE TxDtls einen eigenen Betrag trägt, der exakt auf
+  den Ntry-Gesamtbetrag aufsummiert; alles andere (unvollständige
+  Teilbeträge, abweichende Rundungsdifferenzen) wird bewusst mit
+  `CamtMehrteiligeBuchungError` zur manuellen Klärung verweigert statt
+  geraten.
 - **Company OS / 7d-invoice / jlb-cockpit:** Die Beziehung dieses
   Repos zu den auf jlb-hetzner geprüften Systemen ist laut Auftrag
   NICHT belegt und wurde hier nicht angenommen. Eine etwaige spätere
@@ -71,9 +99,10 @@ keine stillschweigend übersprungenen Punkte.
 
 ## Technisch (nächste Ausbaustufe, nicht MVP1-blockierend)
 
-- Kein REST/HTML-Frontend mit Authentifizierung, nur ein minimales
-  Read-Only-Dashboard (siehe `api/app.py`). Schreibende HTTP-Endpunkte
-  existieren absichtlich nicht.
+- Kein REST/HTML-Frontend mit echter Benutzer-Authentifizierung, nur ein
+  minimales Read-Only-Dashboard hinter einem geteilten API-Token (siehe
+  `api/app.py` und den Auth/Login-Punkt oben). Schreibende
+  HTTP-Endpunkte existieren absichtlich nicht.
 - `api/app.py` hat keine automatisierten HTTP-Tests: `fastapi.testclient.TestClient`
   bräuchte `httpx` als zusätzliche Abhängigkeit, die hier nicht
   eingeführt wurde. Stattdessen manuell smoke-getestet (`/health`, `/`,

@@ -110,6 +110,39 @@ def test_saldo_und_enthaltenes_altjournal_nicht_doppelt_gebucht(op_service, basi
         )
 
 
+def test_eroeffnung_gesamtsaldo_gleicher_fakt_mit_anderer_import_id_ist_replay(op_service, basis_vertrag, ctx_factory):
+    """Regression (Codex-Fund #3): zwei Importe mit identischem Konto/
+    Stichtag/Betrag aber UNTERSCHIEDLICHEN import_ids (z. B. zwei Dateien
+    mit verschiedenem Namen für dieselbe Eröffnung) dürfen die Eröffnung
+    NICHT verdoppeln - Eröffnung ist einmalig je Konto, nicht je Dateiname."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    op_service.eroeffnen_gesamtsaldo(
+        ctx=ctx, konto=konto, betrag_cent=60_000, stichtag=date(2026, 8, 31), import_id="A", akteur="test"
+    )
+    op_service.eroeffnen_gesamtsaldo(
+        ctx=ctx, konto=konto, betrag_cent=60_000, stichtag=date(2026, 8, 31), import_id="B", akteur="test"
+    )
+    saldo = op_service.berechne_saldo(konto.id)
+    assert saldo.saldo_cent == 60_000  # NICHT 120_000
+    assert len([p for p in saldo.positionen if p.typ == "EROEFFNUNG"]) == 1
+
+
+def test_eroeffnung_gesamtsaldo_widersprechender_zweitimport_wird_blockiert(op_service, basis_vertrag, ctx_factory):
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    op_service.eroeffnen_gesamtsaldo(
+        ctx=ctx, konto=konto, betrag_cent=60_000, stichtag=date(2026, 8, 31), import_id="A", akteur="test"
+    )
+    with pytest.raises(DoppelteEroeffnungsartError):
+        op_service.eroeffnen_gesamtsaldo(
+            ctx=ctx, konto=konto, betrag_cent=99_999, stichtag=date(2026, 8, 31), import_id="B", akteur="test"
+        )
+    saldo = op_service.berechne_saldo(konto.id)
+    assert saldo.saldo_cent == 60_000  # unverändert, der Zweitimport hat nichts gebucht
+
+
 def test_gesamtsaldo_und_einzel_op_gleichzeitig_ist_konflikt(op_service, basis_vertrag, ctx_factory):
     _, konto = basis_vertrag
     ctx = ctx_factory("7DI")

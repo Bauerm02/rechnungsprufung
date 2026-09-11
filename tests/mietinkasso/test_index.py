@@ -6,10 +6,10 @@ from decimal import Decimal
 import pytest
 
 from mietinkasso.domain.enums import IndexAnpassungStatus
-from mietinkasso.domain.exceptions import IndexKlauselFehltError
+from mietinkasso.domain.exceptions import CrossTenantError, IndexKlauselFehltError, RechtsprofilNichtImplementiertError
 from mietinkasso.domain.money import round_index_half_cent_down
 from mietinkasso.index.repository import IndexRepository
-from mietinkasso.index.service import IndexService
+from mietinkasso.index.service import EINFACHER_SCHWELLENVERGLEICH, IndexService
 
 
 @pytest.fixture
@@ -25,16 +25,18 @@ def test_halber_cent_wird_laut_par1_abs2_z3_abgerundet():
     assert round_index_half_cent_down(Decimal("10.004")) == Decimal("10.00")
 
 
-def test_fehlende_klausel_blockiert_erhoehung(index_service, basis_vertrag):
+def test_fehlende_klausel_blockiert_erhoehung(index_service, basis_vertrag, ctx_factory):
     vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
     with pytest.raises(IndexKlauselFehltError):
         index_service.berechne_vorschlag(
-            vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"), quelle_referenz="VPI"
+            ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"), quelle_referenz="VPI"
         )
 
 
-def test_bk_vorauszahlung_wird_nicht_indexiert(index_service, stammdaten_repo, basis_vertrag):
+def test_bk_vorauszahlung_wird_nicht_indexiert(index_service, stammdaten_repo, basis_vertrag, ctx_factory):
     vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
     stammdaten_repo.add_komponente(
         id="K-HMZ", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=50_000,
         indexierbar=True, gueltig_von=date(2024, 1, 1),
@@ -45,40 +47,169 @@ def test_bk_vorauszahlung_wird_nicht_indexiert(index_service, stammdaten_repo, b
         betrag_cent=12_000, indexierbar=True, gueltig_von=date(2024, 1, 1),
     )
     klausel = index_service.klausel_anlegen(
-        vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL", abschlussdatum=date(2024, 1, 1),
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
         basis_reihe="VPI2020", basis_wert=Decimal("100.0"), basis_monat="2024-01",
     )
     assert index_service._repository.freigegebene_klausel(vertrag.id) is None
 
-    index_service.klausel_freigeben(klausel.id, freigegeben_von="markus")
+    index_service.klausel_freigeben(klausel.id, ctx=ctx, freigegeben_von="markus")
 
     vorschlag = index_service.berechne_vorschlag(
-        vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"), quelle_referenz="VPI"
+        ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"), quelle_referenz="VPI"
     )
     # 10% auf 500,00 EUR HMZ = 50,00 EUR; BK 120,00 EUR bleibt unangetastet
     assert vorschlag.erhoehung_cent == 5_000
 
 
-def test_aenderung_nach_freigabe_invalidiert_offenen_vorschlag(index_service, stammdaten_repo, basis_vertrag):
+def test_aenderung_nach_freigabe_invalidiert_offenen_vorschlag(index_service, stammdaten_repo, basis_vertrag, ctx_factory):
     vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
     stammdaten_repo.add_komponente(
         id="K-HMZ", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=50_000,
         indexierbar=True, gueltig_von=date(2024, 1, 1),
     )
     klausel_v1 = index_service.klausel_anlegen(
-        vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL", abschlussdatum=date(2024, 1, 1),
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
         basis_reihe="VPI2020", basis_wert=Decimal("100.0"), basis_monat="2024-01",
     )
-    index_service.klausel_freigeben(klausel_v1.id, freigegeben_von="markus")
+    index_service.klausel_freigeben(klausel_v1.id, ctx=ctx, freigegeben_von="markus")
     vorschlag = index_service.berechne_vorschlag(
-        vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"), quelle_referenz="VPI"
+        ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"), quelle_referenz="VPI"
     )
     assert vorschlag.status == IndexAnpassungStatus.VORSCHLAG.value
 
     # Neue Version der Klausel ersetzt die freigegebene -> offener Vorschlag wird ungültig
     index_service.klausel_anlegen(
-        vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL", abschlussdatum=date(2024, 1, 1),
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
         basis_reihe="VPI2020", basis_wert=Decimal("102.0"), basis_monat="2025-01",
     )
     invalidiert = index_service._repository.get_anpassung(vorschlag.id)
     assert invalidiert.status == IndexAnpassungStatus.INVALIDIERT.value
+
+    # Ein bereits INVALIDIERTER Vorschlag darf nicht mehr freigegeben werden
+    with pytest.raises(ValueError):
+        index_service.anpassung_freigeben(vorschlag.id, ctx=ctx)
+
+
+def test_schwelle_wirkt_auf_betrag_der_veraenderung_auch_bei_senkung(index_service, stammdaten_repo, basis_vertrag, ctx_factory):
+    """Regression (Codex-Fund #7): Basis100, neu95 (-5%), Schwelle3,
+    HMZ 500 EUR -> erwartet -25 EUR, nicht 0. Die Schwelle darf keine
+    Senkungen unterdrücken, nur Veränderungen UNTER dem Schwellenbetrag."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id="K-HMZ", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=50_000,
+        indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    klausel = index_service.klausel_anlegen(
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+        basis_reihe="VPI2020", basis_wert=Decimal("100.0"), basis_monat="2024-01",
+        schwelle_prozent=Decimal("3"),
+    )
+    index_service.klausel_freigeben(klausel.id, ctx=ctx, freigegeben_von="markus")
+
+    vorschlag = index_service.berechne_vorschlag(
+        ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("95.0"), quelle_referenz="VPI"
+    )
+    assert vorschlag.veraenderung_prozent == Decimal("-5")
+    assert vorschlag.erhoehung_cent == -25_00
+
+
+def test_schwelle_grenzfall_ist_inklusive(index_service, stammdaten_repo, basis_vertrag, ctx_factory):
+    """Exakt die Schwelle (hier 3% bei 3% Veränderung) löst bereits aus."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id="K-HMZ", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=100_000,
+        indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    klausel = index_service.klausel_anlegen(
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+        basis_reihe="VPI2020", basis_wert=Decimal("100.0"), basis_monat="2024-01",
+        schwelle_prozent=Decimal("3"),
+    )
+    index_service.klausel_freigeben(klausel.id, ctx=ctx, freigegeben_von="markus")
+
+    genau_an_der_schwelle = index_service.berechne_vorschlag(
+        ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("103.0"), quelle_referenz="VPI"
+    )
+    assert genau_an_der_schwelle.erhoehung_cent == 3_000  # 3% von 1000,00 EUR
+
+    knapp_darunter = index_service.berechne_vorschlag(
+        ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("102.99"), quelle_referenz="VPI"
+    )
+    assert knapp_darunter.erhoehung_cent == 0
+
+
+def test_gesetzliche_daempfung_ist_schwelle_plus_haelfte_des_ueberschusses(index_service, stammdaten_repo, basis_vertrag, ctx_factory):
+    """Regression (Codex-Fund #7): Dämpfung ist kein harter Deckel bei
+    daempfung_prozent, sondern "Schwelle plus Hälfte des darüberliegenden
+    Anstiegs". Basis100, neu110 (+10%), Dämpfung3 -> effektiv 3 + (10-3)/2
+    = 6,5%."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id="K-HMZ", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=100_000,
+        indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    klausel = index_service.klausel_anlegen(
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+        basis_reihe="VPI2020", basis_wert=Decimal("100.0"), basis_monat="2024-01",
+        daempfung_prozent=Decimal("3"),
+    )
+    index_service.klausel_freigeben(klausel.id, ctx=ctx, freigegeben_von="markus")
+
+    vorschlag = index_service.berechne_vorschlag(
+        ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"), quelle_referenz="VPI"
+    )
+    assert vorschlag.veraenderung_prozent == Decimal("6.5")
+    assert vorschlag.erhoehung_cent == 6_500  # 6,5% von 1000,00 EUR
+
+
+def test_index_ist_fremder_gesellschaft_nicht_zugaenglich(index_service, basis_vertrag, ctx_factory):
+    """Regression (Abnahmesperre): Index-Service hatte zuvor KEINE
+    Auth-Prüfung - jede Gesellschaft konnte für jeden fremden Vertrag eine
+    IndexKlausel anlegen oder eine Anpassung berechnen."""
+
+    vertrag, _ = basis_vertrag
+    ctx_fremd = ctx_factory("ANDERE-GESELLSCHAFT")
+    with pytest.raises(CrossTenantError):
+        index_service.klausel_anlegen(
+            ctx=ctx_fremd, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+            berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+            basis_reihe="VPI2020", basis_wert=Decimal("100.0"), basis_monat="2024-01",
+        )
+    with pytest.raises(CrossTenantError):
+        index_service.berechne_vorschlag(
+            ctx=ctx_fremd, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"),
+            quelle_referenz="VPI",
+        )
+
+
+def test_nicht_implementiertes_rechtsprofil_wird_gesperrt(index_service, stammdaten_repo, basis_vertrag, ctx_factory):
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id="K-HMZ", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=50_000,
+        indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    klausel = index_service.klausel_anlegen(
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil="MIEWEG_2026_VOLLPROFIL_MIT_JAHRESDURCHSCHNITT",  # (noch) nicht implementiert
+        abschlussdatum=date(2024, 1, 1), basis_reihe="VPI2020", basis_wert=Decimal("100.0"), basis_monat="2024-01",
+    )
+    index_service.klausel_freigeben(klausel.id, ctx=ctx, freigegeben_von="markus")
+
+    with pytest.raises(RechtsprofilNichtImplementiertError):
+        index_service.berechne_vorschlag(
+            ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"), quelle_referenz="VPI"
+        )

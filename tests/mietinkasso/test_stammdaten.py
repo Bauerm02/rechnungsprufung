@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from mietinkasso.domain.enums import Nutzungsstatus, OPTyp
 from mietinkasso.stammdaten.service import ObjektAusgeschlossenError, StammdatenService
@@ -53,3 +54,23 @@ def test_objekt_107_ist_von_der_pilotphase_ausgeschlossen(stammdaten_repo):
         service.pruefe_objekt_erlaubt("107")
 
     service.pruefe_objekt_erlaubt("601")  # kein Fehler für Pilotobjekt
+
+
+def test_vertragskomponente_ist_unveraenderlich(stammdaten_repo, basis_vertrag):
+    """Regression (Abnahmesperre): eine einmal gebuchte Vertragskomponente
+    darf nicht nachträglich verändert werden (keine Update-Methode, gleiche
+    ID ein zweites Mal ist ein DB-Fehler statt eines stillen Overwrites)."""
+
+    vertrag, _ = basis_vertrag
+    stammdaten_repo.add_komponente(
+        id="K-UNVERAENDERLICH", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins",
+        betrag_cent=50_000, gueltig_von=date(2024, 1, 1),
+    )
+    assert not hasattr(stammdaten_repo, "update_komponente")
+    with pytest.raises(IntegrityError):
+        stammdaten_repo.add_komponente(
+            id="K-UNVERAENDERLICH", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Manipulierter Betrag",
+            betrag_cent=99_999, gueltig_von=date(2024, 1, 1),
+        )
+    komponente = stammdaten_repo.get_komponente("K-UNVERAENDERLICH")
+    assert komponente.betrag_cent == 50_000  # unverändert

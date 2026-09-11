@@ -10,6 +10,7 @@ from datetime import date
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import OPTyp, VorschreibungStatus
+from mietinkasso.domain.exceptions import BindungInkonsistentError, NachweisFehltError
 from mietinkasso.infrastructure.db.tables import KontoTable, VertragTable
 from mietinkasso.op.service import OPService
 from mietinkasso.stammdaten.repository import StammdatenRepository
@@ -70,6 +71,8 @@ class VorschreibungService:
     ) -> VorschreibungsErgebnis:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
+        if konto.vertrag_id != vertrag.id:
+            raise BindungInkonsistentError(f"Konto {konto.id} gehört zu Vertrag {konto.vertrag_id}, nicht zu {vertrag.id}.")
         heute = heute or date.today()
         vorschreibung = self._repository.get(vertrag.id, monat)
         if vorschreibung is None:
@@ -95,10 +98,26 @@ class VorschreibungService:
             )
         return VorschreibungsErgebnis(vorschreibung_id=vorschreibung.id, status=vorschreibung.status, summe_cent=summe)
 
-    def dokument_zustellen(self, *, vorschreibung_id: int) -> None:
+    def dokument_zustellen(self, *, ctx: AuthContext, vorschreibung_id: int, zustellnachweis: dict) -> None:
+        """`zustellnachweis` muss die tatsächliche Bestätigung eines
+        Versandadapters sein (z. B. {"kanal": "email", "provider_referenz":
+        "..."}), niemals ein Platzhalter. Ohne echten Nachweis wird der
+        Status NICHT auf ZUGESTELLT gesetzt - MVP1 hat keinen Adapter, also
+        ruft aktuell niemand diese Methode ohne einen von außen erbrachten
+        Nachweis auf (siehe OFFENE_PUNKTE.md)."""
+
         from datetime import datetime, timezone
 
+        if not zustellnachweis:
+            raise NachweisFehltError(
+                f"Vorschreibung {vorschreibung_id}: Dokumentzustellung ohne Zustellnachweis wird abgelehnt."
+            )
         vorschreibung = self._get_or_raise(vorschreibung_id)
+        vertrag = self._stammdaten_repository.get_vertrag(vorschreibung.vertrag_id)
+        if vertrag is None:
+            raise ValueError(f"Unbekannter Vertrag {vorschreibung.vertrag_id}")
+        require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
+        require_schreibrecht(ctx)
         if vorschreibung.status not in (VorschreibungStatus.SOLLGESTELLT.value, VorschreibungStatus.ZUGESTELLT.value):
             raise ValueError("Dokumentzustellung erst nach Sollstellung möglich.")
         if vorschreibung.dokument_zugestellt_am is None:
@@ -106,17 +125,38 @@ class VorschreibungService:
                 vorschreibung_id,
                 status=VorschreibungStatus.ZUGESTELLT.value,
                 dokument_zugestellt_am=datetime.now(timezone.utc),
+                zustellnachweis=zustellnachweis,
             )
 
-    def hauptbuch_exportieren(self, *, vorschreibung_id: int) -> None:
+    def hauptbuch_exportieren(self, *, ctx: AuthContext, vorschreibung_id: int, export_nachweis: dict) -> None:
+        """Wie `dokument_zustellen`: erfordert einen echten Nachweis (z. B.
+        {"zielsystem": "...", "export_referenz": "..."}) und erst NACH
+        ZUGESTELLT - ein Export direkt aus ENTWURF/SOLLGESTELLT wird
+        abgelehnt."""
+
         from datetime import datetime, timezone
 
+        if not export_nachweis:
+            raise NachweisFehltError(
+                f"Vorschreibung {vorschreibung_id}: Hauptbuch-Export ohne Exportnachweis wird abgelehnt."
+            )
         vorschreibung = self._get_or_raise(vorschreibung_id)
+        vertrag = self._stammdaten_repository.get_vertrag(vorschreibung.vertrag_id)
+        if vertrag is None:
+            raise ValueError(f"Unbekannter Vertrag {vorschreibung.vertrag_id}")
+        require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
+        require_schreibrecht(ctx)
+        if vorschreibung.status not in (VorschreibungStatus.ZUGESTELLT.value, VorschreibungStatus.EXPORTIERT.value):
+            raise ValueError(
+                f"Vorschreibung {vorschreibung_id} ist im Status {vorschreibung.status}; ein Hauptbuch-Export "
+                "ist erst nach ZUGESTELLT zulässig."
+            )
         if vorschreibung.hauptbuch_exportiert_am is None:
             self._repository.update_status(
                 vorschreibung_id,
                 status=VorschreibungStatus.EXPORTIERT.value,
                 hauptbuch_exportiert_am=datetime.now(timezone.utc),
+                export_nachweis=export_nachweis,
             )
 
     def _get_or_raise(self, vorschreibung_id: int):

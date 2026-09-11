@@ -25,7 +25,7 @@ from mietinkasso.auth.service import AuthContext  # noqa: E402
 from mietinkasso.bank.repository import BankRepository  # noqa: E402
 from mietinkasso.domain.enums import Nutzungsstatus, OPTyp, Rolle  # noqa: E402
 from mietinkasso.index.repository import IndexRepository  # noqa: E402
-from mietinkasso.index.service import IndexService  # noqa: E402
+from mietinkasso.index.service import EINFACHER_SCHWELLENVERGLEICH, IndexService  # noqa: E402
 from mietinkasso.infrastructure.config import get_settings  # noqa: E402
 from mietinkasso.infrastructure.db.session import build_session_factory, create_all_tables  # noqa: E402
 from mietinkasso.mahnwesen.repository import MahnPolicyRepository  # noqa: E402
@@ -151,12 +151,13 @@ def main() -> None:
 
     if index_service._repository.freigegebene_klausel("V-601-1") is None:
         klausel = index_service.klausel_anlegen(
-            vertrag_id="V-601-1", rechtsordnung="OESTERREICH_MRG_VOLL", abschlussdatum=date(2023, 1, 1),
+            ctx=ADMIN_CTX, vertrag_id="V-601-1", rechtsordnung="OESTERREICH_MRG_VOLL",
+            berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2023, 1, 1),
             basis_reihe="VPI2020 (synthetisch)", basis_wert=Decimal("100.0"), basis_monat="2023-01",
             schwelle_prozent=Decimal("0"), daempfung_prozent=Decimal("3"),
             indexierbare_komponenten=["HMZ"],
         )
-        index_service.klausel_freigeben(klausel.id, freigegeben_von="seed-script")
+        index_service.klausel_freigeben(klausel.id, ctx=ADMIN_CTX, freigegeben_von="seed-script")
 
     print("Seed abgeschlossen.")
     print("Pilotobjekte:", ", ".join(o["id"] for o in OBJEKTE if not o["ausgeschlossen"]))

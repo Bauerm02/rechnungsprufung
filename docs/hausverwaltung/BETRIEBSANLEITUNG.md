@@ -27,6 +27,7 @@ Wichtigste Variablen:
 | `MIETINKASSO_BANK_STAND_MAX_AGE_DAYS` | `2` | Maximales Alter des letzten Bankimports, damit ein Mahnlauf überhaupt planen darf. |
 | `MIETINKASSO_MAHN_STUFE1_TAGE_NACH_FAELLIGKEIT` | `7` | Vorschlagswert für die Mahnpolicy, Stufe 1. |
 | `MIETINKASSO_MAHN_STUFE2_MINDESTTAGE_NACH_STUFE1` | `14` | Vorschlagswert für die Mahnpolicy, Stufe 2. |
+| `MIETINKASSO_API_TOKEN` | *(leer)* | Ohne diesen Wert antworten die Datenendpunkte von `api/app.py` mit 503 ("closed by default"). Gesetzt, verlangen sie einen passenden `X-API-Key`-Header. Ein geteilter Operator-Token, KEINE Mandantentrennung pro Endanwender. |
 
 Es gibt bewusst **keine** KI-/LLM-Konfiguration (kein API-Key, kein
 Modellname) — der laufende Betrieb braucht keinen.
@@ -52,23 +53,27 @@ python -m pytest tests/mietinkasso -q      # nur Mietinkasso
 python -m pytest -q                         # ganzes Repo (inkl. invoice_automation)
 ```
 
-Stand dieses Checkpoints: 42 Mietinkasso-Tests, 147 Tests gesamt, alle
-grün (`python -m pytest -q`).
+Stand: 70 Mietinkasso-Tests, 175 Tests gesamt, alle grün
+(`python -m pytest -q`).
 
 ## 5. API/Dashboard lokal starten
 
 ```bash
 export MIETINKASSO_DATABASE_URL="sqlite:///./data/mietinkasso_demo.db"
+export MIETINKASSO_API_TOKEN="ein-lokales-dev-token"
 uvicorn mietinkasso.api.app:app --reload --port 8001
 ```
 
 - `http://localhost:8001/` — Status-Dashboard (Umgebung, `SEND_ENABLED`,
-  Pilot-/Ausschlussliste).
-- `http://localhost:8001/health`
+  Pilot-/Ausschlussliste). Offen, zeigt keine Kontodaten.
+- `http://localhost:8001/health` — offen, keine Kontodaten.
 - `http://localhost:8001/v1/konten/{konto_id}/op` — OP-Liste + Saldo
-  eines Kontos (z. B. `KTO-V-601-1` nach dem Seed-Lauf).
-- `http://localhost:8001/v1/mahnwesen/outbox/{vertrag_id}` — letzter
-  Mahnfall zu einem Vertrag.
+  eines Kontos (z. B. `KTO-V-601-1` nach dem Seed-Lauf). Verlangt Header
+  `X-API-Key: ein-lokales-dev-token`; ohne `MIETINKASSO_API_TOKEN` liefert
+  der Endpunkt 503.
+- `http://localhost:8001/v1/mahnwesen/outbox/{vertrag_id}` — alle
+  Mahnfälle zu einem Vertrag (eine Zeile je Forderung/Stufe). Ebenfalls
+  Token-geschützt.
 - `http://localhost:8001/docs` — automatische OpenAPI-Doku (FastAPI).
 
 Dies ist bewusst read-only. Schreibende Vorgänge (Eröffnung,

@@ -13,8 +13,10 @@ import json
 from dataclasses import dataclass
 from datetime import date
 
+from sqlalchemy.exc import IntegrityError
+
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
-from mietinkasso.domain.enums import OPPositionStatus, OPTyp
+from mietinkasso.domain.enums import OPTyp
 from mietinkasso.domain.exceptions import DoppelteEroeffnungsartError
 from mietinkasso.infrastructure.db.tables import KontoTable, OPPositionTable
 from mietinkasso.op.repository import OPRepository
@@ -48,6 +50,22 @@ class OPSaldo:
     positionen: list[OPPositionTable]
 
 
+@dataclass(frozen=True)
+class OffeneForderung:
+    """Eine einzelne, individuell verfolgbare Forderung (nicht der
+    Kontosaldo). `op_position_id` ist die stabile Identität, an die das
+    Mahnwesen seinen Stufe1->Stufe2-Zyklus bindet."""
+
+    op_position_id: int
+    art: str
+    betrag_cent: int
+    rest_cent: int
+    belegdatum: date
+    faelligkeit: date | None
+    faelligkeit_bekannt: bool
+    leistungsperiode: str | None
+
+
 class OPService:
     def __init__(
         self,
@@ -71,6 +89,23 @@ class OPService:
         require_gesellschaft_access(ctx, konto.gesellschaft_id)
         require_schreibrecht(ctx)
         self._pruefe_und_setze_eroeffnungsmodus(konto, "GESAMTSALDO", stichtag)
+
+        # Eröffnung ist fachlich EINMALIG je Konto/Stichtag - unabhängig vom
+        # import_id/Dateinamen der jeweiligen Quelle. Ein zweiter Import mit
+        # identischem Betrag/Stichtag (z. B. dieselbe Datei mit anderem
+        # Namen) ist ein Replay derselben Tatsache; ein zweiter Import mit
+        # ABWEICHENDEM Betrag/Stichtag ist eine widersprüchliche
+        # Wiedereröffnung und wird blockiert, statt den Saldo zu verdoppeln.
+        bestehende = self._op_repository.find_eroeffnung(konto.id)
+        if bestehende is not None:
+            if bestehende.betrag_cent == betrag_cent and bestehende.belegdatum == stichtag:
+                return bestehende
+            raise DoppelteEroeffnungsartError(
+                f"Konto {konto.id} wurde bereits mit Gesamtsaldo {bestehende.betrag_cent} Cent zum "
+                f"{bestehende.belegdatum} eröffnet (import_id={bestehende.import_id}). Eine widersprüchliche "
+                f"Wiedereröffnung mit {betrag_cent} Cent zum {stichtag} (import_id={import_id}) wird blockiert."
+            )
+
         content_hash = compute_content_hash(
             {"konto_id": konto.id, "modus": "GESAMTSALDO", "betrag_cent": betrag_cent, "stichtag": str(stichtag)}
         )
@@ -88,7 +123,14 @@ class OPService:
             import_id=import_id,
             quelle_system="eroeffnung_gesamtsaldo",
         )
-        return self._op_repository.insert_idempotent(row)
+        try:
+            return self._op_repository.insert_idempotent(row)
+        except IntegrityError as exc:
+            # Zweite, gleichzeitige Eröffnung desselben Kontos (Race) - vom
+            # partiellen Unique-Index auf DB-Ebene abgefangen.
+            raise DoppelteEroeffnungsartError(
+                f"Konto {konto.id}: gleichzeitige Eröffnung erkannt (DB-Constraint uq_op_eroeffnung_pro_konto)."
+            ) from exc
 
     def eroeffnen_einzel_op(
         self,
@@ -272,3 +314,49 @@ class OPService:
             faelliger_unstrittiger_rest_cent=max(faellig_rest, 0),
             positionen=positionen,
         )
+
+    # -- Forderungen (für das Mahnwesen) -------------------------------------
+    def offene_forderungen(self, konto_id: str, *, heute: date | None = None) -> list["OffeneForderung"]:
+        """Ordnet Zahlungen/Gutschriften den ältesten offenen Forderungen
+        FIFO zu, damit jede Forderung (Eröffnung/Soll/Rücklastschrift) ihren
+        EIGENEN Reststand und damit ihren eigenen Mahnzyklus hat - eine
+        Nettosumme über das ganze Konto ist keine Mahngrundlage (Fachregel:
+        Soll-/Habensalden je Forderung getrennt führen). Nur Forderungen mit
+        rest_cent > 0 werden zurückgegeben."""
+
+        positionen = self._op_repository.list_aktiv(konto_id)
+
+        forderungs_rows = [p for p in positionen if OPTyp(p.typ) in _POSITIVE_TYPEN]
+        forderungs_rows.sort(key=lambda p: (p.faelligkeit or p.belegdatum, p.belegdatum, p.id))
+
+        minderungs_pool = 0
+        for p in positionen:
+            typ = OPTyp(p.typ)
+            if typ in _NEGATIVE_TYPEN:
+                minderungs_pool += p.betrag_cent
+            elif typ is OPTyp.KORREKTUR:
+                effekt = _effect_cent(p)
+                if effekt < 0:
+                    minderungs_pool += -effekt
+
+        ergebnisse: list[OffeneForderung] = []
+        for p in forderungs_rows:
+            rest = p.betrag_cent
+            if minderungs_pool > 0:
+                abzug = min(minderungs_pool, rest)
+                rest -= abzug
+                minderungs_pool -= abzug
+            if rest > 0:
+                ergebnisse.append(
+                    OffeneForderung(
+                        op_position_id=p.id,
+                        art=p.typ,
+                        betrag_cent=p.betrag_cent,
+                        rest_cent=rest,
+                        belegdatum=p.belegdatum,
+                        faelligkeit=p.faelligkeit,
+                        faelligkeit_bekannt=p.faelligkeit_bekannt,
+                        leistungsperiode=p.leistungsperiode,
+                    )
+                )
+        return ergebnisse

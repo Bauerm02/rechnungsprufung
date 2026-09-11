@@ -41,3 +41,44 @@ class MahnstufeReihenfolgeError(MietinkassoError):
 
 class BankstandVeraltetError(MietinkassoError):
     """The bank data used for a Mahnlauf is older than the configured max age."""
+
+
+class MehrfachbuchungsKonfliktError(MietinkassoError):
+    """A bank row without a stable native transaction ID matches the natural
+    key (Konto/Datum/Betrag/Referenz) of an already-imported row. This could
+    be the same transaction re-appearing in an overlapping export, or two
+    genuinely different payments that happen to look identical - which one
+    it is can't be decided automatically, so the import is refused rather
+    than silently merged or silently duplicated."""
+
+
+class FremdwaehrungNichtUnterstuetztError(MietinkassoError):
+    """A bank row or manual allocation uses a currency other than the
+    Konto's ledger currency. MVP1 has no FX handling, so this blocks rather
+    than silently treating the amount as if it were EUR."""
+
+
+class ZuordnungUngueltigError(MietinkassoError):
+    """A requested Zuordnung/Zahlungszuordnung fails validation (amount,
+    remaining balance, Konto/Vertrag mismatch, wrong OP type, ...)."""
+
+
+class RechtsprofilNichtImplementiertError(MietinkassoError):
+    """An IndexKlausel references a Rechtsordnung/Berechnungsprofil this
+    codebase does not actually implement (e.g. April-Termine,
+    Jahresdurchschnittsbildung, anteilige Erstvalorisierung,
+    Altvertragsübergang). Blocks the calculation instead of silently
+    applying the generic threshold/damping formula and overclaiming legal
+    correctness."""
+
+
+class NachweisFehltError(MietinkassoError):
+    """A status transition that claims a real-world effect (Zustellung,
+    Hauptbuch-Export) was requested without the adapter confirmation/proof
+    that would make that claim true."""
+
+
+class BindungInkonsistentError(MietinkassoError):
+    """A Konto/Vertrag/Gesellschaft/MahnFall combination passed to a service
+    does not actually match what the database holds; refuses to act on
+    caller-supplied objects that could be stale or mismatched."""

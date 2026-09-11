@@ -46,6 +46,7 @@ class MahnStufe(int, enum.Enum):
 
 class MahnStatus(str, enum.Enum):
     GEPLANT = "GEPLANT"
+    IN_VERSAND = "IN_VERSAND"  # atomar beansprucht, Provider-Aufruf läuft/lief möglicherweise
     GESENDET = "GESENDET"
     UNSICHER = "UNSICHER"
     BLOCKIERT = "BLOCKIERT"

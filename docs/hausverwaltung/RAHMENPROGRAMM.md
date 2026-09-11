@@ -209,6 +209,18 @@ angehängt, mit Datum/Kontext, statt den Originaltext zu verändern.
   Repo-Root beschreiben Scope, Owner-Aufteilung, Synthetic-only-Regel
   und Send-off-Protokoll für diesen Auftrag.
 
+- **Unabhängige Abnahme (Codex, HEAD `38e8895`):** die 147 vorhandenen
+  Tests liefen grün, aber 8 zusätzliche fachliche Gegenproben von Codex
+  deckten reale Fehler auf (u. a. Mahnwesen-Doppelversand, ignorierte
+  Mahnfristen, doppelte Eröffnung, ungeprüfte Zuordnungsbeträge,
+  Cross-Tenant-Phantom-Buchung, Bank-Doppelimport bei überlappenden
+  Exports, falsche Index-Schwellen-/Dämpfungsformel) plus weitere
+  Abnahmesperren (Mahnstufen pro Vertrag statt pro Forderung, fehlende
+  Neuprüfung bei `versenden`, offene HTTP-Endpunkte, erfundene
+  Zustellungs-/Exportnachweise, fehlende Auth in Index/BK). Alle sind
+  behoben und mit Regressionstests belegt; Details in
+  `docs/hausverwaltung/REVIEW_ZUSAMMENFASSUNG.md`.
+
 Die vollständige, laufend aktualisierte Statusübersicht steht in
 `docs/hausverwaltung/REVIEW_ZUSAMMENFASSUNG.md`; offene technische
 Punkte in `docs/hausverwaltung/OFFENE_PUNKTE.md`.

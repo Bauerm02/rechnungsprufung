@@ -35,6 +35,13 @@ class Settings(BaseSettings):
     ausgeschlossene_objekte: tuple[str, ...] = ("107",)
     pilot_objekte: tuple[str, ...] = ("601", "616", "617", "619")
 
+    # Es gibt in MVP1 kein echtes Login/Session-Handling (siehe
+    # OFFENE_PUNKTE.md). Bis das existiert, ist api/app.py trotzdem NICHT
+    # offen: ohne konfigurierten Token antworten alle Datenendpunkte mit
+    # 503 statt Daten preiszugeben ("closed by default" statt "geöffnet,
+    # bis jemand Auth einbaut").
+    api_token: str | None = None
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

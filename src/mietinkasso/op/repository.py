@@ -45,6 +45,15 @@ class OPRepository:
             session.refresh(row)
             return row
 
+    def find_eroeffnung(self, konto_id: str) -> OPPositionTable | None:
+        with self._session_factory() as session:
+            return session.execute(
+                select(OPPositionTable)
+                .where(OPPositionTable.konto_id == konto_id)
+                .where(OPPositionTable.typ == "EROEFFNUNG")
+                .where(OPPositionTable.status == OPPositionStatus.AKTIV.value)
+            ).scalar_one_or_none()
+
     def list_aktiv(self, konto_id: str) -> list[OPPositionTable]:
         with self._session_factory() as session:
             statement = (

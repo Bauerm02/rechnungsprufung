@@ -25,6 +25,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     Numeric,
@@ -32,8 +33,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from mietinkasso.infrastructure.db.base import Base
 
@@ -146,7 +148,21 @@ class OPPositionTable(Base):
     for `status` transitioning AKTIV -> STORNIERT via a Korrektur row."""
 
     __tablename__ = "op_positionen"
-    __table_args__ = (UniqueConstraint("import_id", name="uq_op_import_id"),)
+    __table_args__ = (
+        UniqueConstraint("import_id", name="uq_op_import_id"),
+        # Eröffnung ist fachlich einmalig je Konto (Fachregel 2): höchstens
+        # eine AKTIVE EROEFFNUNG-Zeile pro Konto, unabhängig vom import_id/
+        # Dateinamen der jeweiligen Quelle. DB-seitig statt nur im Service
+        # erzwungen, damit auch ein zweiter Import mit abweichender
+        # import_id keine zweite Eröffnung erzeugen kann.
+        Index(
+            "uq_op_eroeffnung_pro_konto",
+            "konto_id",
+            unique=True,
+            sqlite_where=text("typ = 'EROEFFNUNG' AND status = 'AKTIV'"),
+            postgresql_where=text("typ = 'EROEFFNUNG' AND status = 'AKTIV'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     konto_id: Mapped[str] = mapped_column(ForeignKey("konten.id"), index=True)
@@ -180,7 +196,9 @@ class VorschreibungTable(Base):
     faelligkeit: Mapped[date | None] = mapped_column(Date, nullable=True)
     op_position_id: Mapped[int | None] = mapped_column(ForeignKey("op_positionen.id"), nullable=True)
     dokument_zugestellt_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    zustellnachweis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     hauptbuch_exportiert_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    export_nachweis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -206,7 +224,15 @@ class BankKontoTable(Base):
 
 class BankTransaktionTable(Base):
     __tablename__ = "bank_transaktionen"
-    __table_args__ = (UniqueConstraint("import_id", name="uq_bank_import_id"),)
+    __table_args__ = (
+        UniqueConstraint("import_id", name="uq_bank_import_id"),
+        # Nur relevant für Zeilen ohne bankseitig eindeutige Kennung
+        # (hat_native_id=False): verhindert, dass eine wirtschaftlich
+        # identisch aussehende Zeile aus einem überlappenden Re-Export
+        # unter einer NEUEN import_id (z. B. weil sie an anderer
+        # Zeilennummer steht) als zweite, echte Transaktion durchrutscht.
+        Index("ix_bank_fingerprint", "bank_konto_id", "fingerprint_hash"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     bank_konto_id: Mapped[str] = mapped_column(ForeignKey("bank_konten.id"), index=True)
@@ -220,12 +246,17 @@ class BankTransaktionTable(Base):
     quelle_typ: Mapped[str] = mapped_column(String(16))
     quelle_hash: Mapped[str] = mapped_column(String(128))
     import_id: Mapped[str] = mapped_column(String(128))
+    hat_native_id: Mapped[bool] = mapped_column(Boolean, default=False)
+    fingerprint_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     roh_zeile: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ZuordnungTable(Base):
     __tablename__ = "zuordnungen"
+    __table_args__ = (
+        UniqueConstraint("bank_transaktion_id", "op_position_id", name="uq_zuordnung_transaktion_op"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     bank_transaktion_id: Mapped[int] = mapped_column(ForeignKey("bank_transaktionen.id"), index=True)
@@ -242,6 +273,12 @@ class IndexKlauselTable(Base):
     vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
     version: Mapped[int] = mapped_column(Integer)
     rechtsordnung: Mapped[str] = mapped_column(String(48))
+    # Muss exakt einem tatsächlich implementierten Rechenprofil entsprechen
+    # (siehe index/service.py::UNTERSTUETZTE_BERECHNUNGSPROFILE); alles
+    # andere (insb. fehlende April-/Jahresdurchschnitts-/Erstvalorisierungs-
+    # /Altvertragsübergangslogik) bleibt gesperrt statt stillschweigend mit
+    # der einfachen Formel gerechnet zu werden.
+    berechnungsprofil: Mapped[str | None] = mapped_column(String(64), nullable=True)
     klausel_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     abschlussdatum: Mapped[date] = mapped_column(Date)
     basis_reihe: Mapped[str] = mapped_column(String(64))
@@ -333,6 +370,11 @@ class MahnFallTable(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
     gesellschaft_id: Mapped[str] = mapped_column(ForeignKey("gesellschaften.id"), index=True)
+    # Anker-OP (die Forderung), an die dieser Mahnzyklus gebunden ist. Eine
+    # NEUE Forderung (anderer op_position_id) bekommt ihren eigenen
+    # Stufe1->Stufe2-Zyklus, unabhängig davon, wie weit ältere Forderungen
+    # desselben Vertrags schon gediehen sind.
+    forderung_op_position_id: Mapped[int] = mapped_column(ForeignKey("op_positionen.id"), index=True)
     forderungsumfang_hash: Mapped[str] = mapped_column(String(64))
     stufe: Mapped[int] = mapped_column(Integer)
     outbox_key: Mapped[str] = mapped_column(String(256))
@@ -342,6 +384,7 @@ class MahnFallTable(Base):
     bank_stand_datum: Mapped[date] = mapped_column(Date)
     snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     geplant_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    versand_beansprucht_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     gesendet_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     letzter_versuch_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

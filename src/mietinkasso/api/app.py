@@ -6,13 +6,23 @@ op/vorschreibung/bank/mahnwesen und werden bewusst NICHT unauthentifiziert
 über HTTP freigegeben; dieses Modul liefert einen Health-Check und
 Read-Only-Übersichten, wie sie ein Worker/Scheduler-Betrieb (DB/Worker
 unabhängig vom Browser) zur Kontrolle braucht.
+
+Es gibt in MVP1 KEIN echtes Login/Session-Handling und keine
+Gesellschafts-Scoping auf HTTP-Ebene (das ist ein offener Punkt, siehe
+docs/hausverwaltung/OFFENE_PUNKTE.md). Bis das existiert, sind die
+Datenendpunkte "closed by default": ohne konfigurierten
+`MIETINKASSO_API_TOKEN` antworten sie mit 503, statt Kontodaten ohne
+jede Prüfung offenzulegen. Mit konfiguriertem Token ist das ein einzelner
+geteilter Operator-Schlüssel (ein `X-API-Key`-Header) - eine
+Übergangslösung für den internen Pilotbetrieb, KEINE
+Mandantentrennung pro Endanwender.
 """
 
 from __future__ import annotations
 
 from datetime import date
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 
 from mietinkasso.infrastructure.config import get_settings
@@ -31,12 +41,23 @@ _op_service = OPService(OPRepository(_session_factory), _stammdaten_repo)
 _mahn_repo = MahnFallRepository(_session_factory)
 
 
+def _require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+    if not _settings.api_token:
+        raise HTTPException(
+            status_code=503,
+            detail="MIETINKASSO_API_TOKEN ist nicht konfiguriert; Datenendpunkte bleiben geschlossen "
+            "(closed by default), bis echte Auth eingerichtet ist.",
+        )
+    if x_api_key != _settings.api_token:
+        raise HTTPException(status_code=401, detail="Ungültiger oder fehlender X-API-Key.")
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "environment": _settings.environment, "send_enabled": _settings.send_enabled}
 
 
-@app.get("/v1/konten/{konto_id}/op")
+@app.get("/v1/konten/{konto_id}/op", dependencies=[Depends(_require_api_key)])
 def op_liste(konto_id: str, stichtag: date | None = None) -> dict:
     konto = _stammdaten_repo.get_konto(konto_id)
     if konto is None:
@@ -62,26 +83,29 @@ def op_liste(konto_id: str, stichtag: date | None = None) -> dict:
     }
 
 
-@app.get("/v1/mahnwesen/outbox/{vertrag_id}")
+@app.get("/v1/mahnwesen/outbox/{vertrag_id}", dependencies=[Depends(_require_api_key)])
 def mahn_outbox(vertrag_id: str) -> dict:
-    letzter = _mahn_repo.letzter_mahnfall(vertrag_id)
-    if letzter is None:
-        return {"vertrag_id": vertrag_id, "letzter_fall": None}
+    faelle = _mahn_repo.list_fuer_vertrag(vertrag_id)
     return {
         "vertrag_id": vertrag_id,
-        "letzter_fall": {
-            "id": letzter.id,
-            "stufe": letzter.stufe,
-            "status": letzter.status,
-            "betrag_cent": letzter.betrag_cent,
-            "geplant_am": letzter.geplant_am.isoformat() if letzter.geplant_am else None,
-            "gesendet_am": letzter.gesendet_am.isoformat() if letzter.gesendet_am else None,
-        },
+        "faelle": [
+            {
+                "id": fall.id,
+                "forderung_op_position_id": fall.forderung_op_position_id,
+                "stufe": fall.stufe,
+                "status": fall.status,
+                "betrag_cent": fall.betrag_cent,
+                "geplant_am": fall.geplant_am.isoformat() if fall.geplant_am else None,
+                "gesendet_am": fall.gesendet_am.isoformat() if fall.gesendet_am else None,
+            }
+            for fall in faelle
+        ],
     }
 
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
+    api_status = "konfiguriert (X-API-Key erforderlich)" if _settings.api_token else "NICHT konfiguriert -> Datenendpunkte 503"
     return f"""
     <html>
     <head><title>Mietinkasso — Status</title>
@@ -95,13 +119,14 @@ def dashboard() -> str:
       <h1>Mietinkasso — Betriebsstatus</h1>
       <p>Umgebung: <code>{_settings.environment}</code></p>
       <p>Versand aktiv (SEND_ENABLED): <span class="warn">{_settings.send_enabled}</span></p>
+      <p>API-Token: <span class="warn">{api_status}</span></p>
       <p>Pilotobjekte: <code>{", ".join(_settings.pilot_objekte)}</code>
          &nbsp;|&nbsp; ausgeschlossen: <code>{", ".join(_settings.ausgeschlossene_objekte)}</code></p>
-      <h2>Read-Only-Endpunkte</h2>
+      <h2>Read-Only-Endpunkte (X-API-Key erforderlich)</h2>
       <ul>
-        <li><code>GET /health</code></li>
+        <li><code>GET /health</code> (offen, keine Kontodaten)</li>
         <li><code>GET /v1/konten/{{konto_id}}/op</code> — OP-Liste + Saldo</li>
-        <li><code>GET /v1/mahnwesen/outbox/{{vertrag_id}}</code> — letzter Mahnfall (Preview/Outbox)</li>
+        <li><code>GET /v1/mahnwesen/outbox/{{vertrag_id}}</code> — Mahnfälle (Preview/Outbox)</li>
       </ul>
       <p>Schreibende Vorgänge (Eröffnung, Vorschreibung, Bankimport, Mahnlauf)
          laufen ausschließlich über die Service-Schicht (Worker/Scheduler

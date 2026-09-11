@@ -8,6 +8,7 @@ import pytest
 from mietinkasso.bk.repository import BKRepository
 from mietinkasso.bk.service import BKAnteilEingabe, BKAbrechnungNichtFreigegebenError, BKService
 from mietinkasso.domain.enums import BKPositionsart
+from mietinkasso.domain.exceptions import BindungInkonsistentError, CrossTenantError
 from mietinkasso.op.repository import OPRepository
 from mietinkasso.op.service import OPService
 
@@ -15,29 +16,29 @@ from mietinkasso.op.service import OPService
 @pytest.fixture
 def bk_service(session_factory, stammdaten_repo) -> BKService:
     op_service = OPService(OPRepository(session_factory), stammdaten_repo)
-    return BKService(BKRepository(session_factory), op_service)
+    return BKService(BKRepository(session_factory), op_service, stammdaten_repo)
 
 
 def test_weg_ruecklage_erzeugt_keinen_automatischen_mieter_op(bk_service, basis_vertrag, ctx_factory):
     vertrag, konto = basis_vertrag
     ctx = ctx_factory("7DI")
-    abrechnung = bk_service.abrechnung_anlegen(objekt_id="601", abrechnungsjahr=2025)
+    abrechnung = bk_service.abrechnung_anlegen(ctx=ctx, objekt_id="601", abrechnungsjahr=2025)
     bk_service.position_hinzufuegen(
-        bk_abrechnung_id=abrechnung.id, bezeichnung="Instandhaltungsrücklage", betrag_cent=500_000,
+        ctx=ctx, bk_abrechnung_id=abrechnung.id, bezeichnung="Instandhaltungsrücklage", betrag_cent=500_000,
         art=BKPositionsart.EIGENTUEMER, quelle="WEG-Beschluss 2025-03", profil_referenz="WEG-EIGENTUEMER",
     )
     bk_service.position_hinzufuegen(
-        bk_abrechnung_id=abrechnung.id, bezeichnung="Hausbetreuung", betrag_cent=120_000,
+        ctx=ctx, bk_abrechnung_id=abrechnung.id, bezeichnung="Hausbetreuung", betrag_cent=120_000,
         art=BKPositionsart.UMLAGEFAEHIG, quelle="Belege 2025", profil_referenz="MRG-21-24",
     )
     assert bk_service.umlagefaehige_summe_cent(abrechnung.id) == 120_000  # Rücklage bleibt außen vor
 
     bk_service.anteile_berechnen(
-        bk_abrechnung_id=abrechnung.id,
+        ctx=ctx, bk_abrechnung_id=abrechnung.id,
         eingaben=[BKAnteilEingabe(vertrag_id=vertrag.id, anteil_prozent=Decimal("100"), vorauszahlung_cent=100_000)],
     )
-    bk_service.pruefen(abrechnung.id)
-    bk_service.freigeben(abrechnung.id)
+    bk_service.pruefen(abrechnung.id, ctx=ctx)
+    bk_service.freigeben(abrechnung.id, ctx=ctx)
     gebuchte = bk_service.ergebnisse_buchen(ctx=ctx, bk_abrechnung_id=abrechnung.id, konten_je_vertrag={vertrag.id: konto})
     assert len(gebuchte) == 1
     saldo = bk_service._op_service.berechne_saldo(konto.id)
@@ -50,13 +51,13 @@ def test_bk_entwurf_kann_nicht_gebucht_werden(bk_service, basis_vertrag, ctx_fac
 
     vertrag, konto = basis_vertrag
     ctx = ctx_factory("7DI")
-    abrechnung = bk_service.abrechnung_anlegen(objekt_id="601", abrechnungsjahr=2026)
+    abrechnung = bk_service.abrechnung_anlegen(ctx=ctx, objekt_id="601", abrechnungsjahr=2026)
     bk_service.position_hinzufuegen(
-        bk_abrechnung_id=abrechnung.id, bezeichnung="Hausbetreuung", betrag_cent=120_000,
+        ctx=ctx, bk_abrechnung_id=abrechnung.id, bezeichnung="Hausbetreuung", betrag_cent=120_000,
         art=BKPositionsart.UMLAGEFAEHIG, quelle="Belege 2026", profil_referenz="MRG-21-24",
     )
     bk_service.anteile_berechnen(
-        bk_abrechnung_id=abrechnung.id,
+        ctx=ctx, bk_abrechnung_id=abrechnung.id,
         eingaben=[BKAnteilEingabe(vertrag_id=vertrag.id, anteil_prozent=Decimal("100"), vorauszahlung_cent=0)],
     )
     with pytest.raises(BKAbrechnungNichtFreigegebenError):
@@ -64,3 +65,46 @@ def test_bk_entwurf_kann_nicht_gebucht_werden(bk_service, basis_vertrag, ctx_fac
 
     saldo = bk_service._op_service.berechne_saldo(konto.id)
     assert saldo.saldo_cent == 0  # kein OP, solange die Abrechnung ENTWURF ist
+
+
+def test_bk_ist_fremder_gesellschaft_nicht_zugaenglich(bk_service, basis_vertrag, ctx_factory):
+    """Regression: Index/BK hatten zuvor KEINE Auth-Prüfung - jede
+    Gesellschaft konnte für jedes Objekt eine BK-Abrechnung anlegen."""
+
+    ctx_fremd = ctx_factory("ANDERE-GESELLSCHAFT")
+    with pytest.raises(CrossTenantError):
+        bk_service.abrechnung_anlegen(ctx=ctx_fremd, objekt_id="601", abrechnungsjahr=2025)
+
+
+def test_bk_buchung_mit_falsch_zugeordnetem_konto_wird_abgelehnt(bk_service, stammdaten_repo, basis_vertrag, ctx_factory):
+    """Regression: `konten_je_vertrag` wurde bisher ungeprüft übernommen;
+    ein Konto, das zu einem ANDEREN Vertrag gehört, durfte durchrutschen."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.upsert_debitor(id="DEB-FREMD", name="Fremder Debitor")
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-FREMD", einheit_id=vertrag.einheit_id, debitor_id="DEB-FREMD", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    fremder_vertrag = stammdaten_repo.get_vertrag("V-601-FREMD")
+    fremdes_konto = stammdaten_repo.get_or_create_konto(vertrag=fremder_vertrag)
+
+    abrechnung = bk_service.abrechnung_anlegen(ctx=ctx, objekt_id="601", abrechnungsjahr=2025)
+    bk_service.position_hinzufuegen(
+        ctx=ctx, bk_abrechnung_id=abrechnung.id, bezeichnung="Hausbetreuung", betrag_cent=100_000,
+        art=BKPositionsart.UMLAGEFAEHIG, quelle="Belege 2025", profil_referenz="MRG-21-24",
+    )
+    bk_service.anteile_berechnen(
+        ctx=ctx, bk_abrechnung_id=abrechnung.id,
+        eingaben=[BKAnteilEingabe(vertrag_id=vertrag.id, anteil_prozent=Decimal("100"), vorauszahlung_cent=0)],
+    )
+    bk_service.pruefen(abrechnung.id, ctx=ctx)
+    bk_service.freigeben(abrechnung.id, ctx=ctx)
+
+    # konten_je_vertrag[vertrag.id] zeigt (versehentlich/böswillig) auf das FALSCHE Konto
+    with pytest.raises(BindungInkonsistentError):
+        bk_service.ergebnisse_buchen(ctx=ctx, bk_abrechnung_id=abrechnung.id, konten_je_vertrag={vertrag.id: fremdes_konto})
+
+    assert bk_service._op_service.berechne_saldo(konto.id).saldo_cent == 0
+    assert bk_service._op_service.berechne_saldo(fremdes_konto.id).saldo_cent == 0
