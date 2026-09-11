@@ -24,6 +24,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
@@ -37,7 +38,13 @@ from mietinkasso.domain.exceptions import (
     MehrfachbuchungsKonfliktError,
     ZuordnungUngueltigError,
 )
-from mietinkasso.infrastructure.db.tables import BankKontoTable, BankTransaktionTable, KontoTable, OPPositionTable
+from mietinkasso.infrastructure.db.tables import (
+    BankKontoTable,
+    BankTransaktionTable,
+    KontoTable,
+    OPPositionTable,
+    ZuordnungTable,
+)
 from mietinkasso.op.service import OPService
 from mietinkasso.stammdaten.repository import StammdatenRepository
 
@@ -336,10 +343,19 @@ class BankImportService:
         betrag_cent: int | None = None,
     ) -> OPPositionTable:
         """Bucht eine Rücklastschrift als eigene RUECKLASTSCHRIFT-Zeile.
-        Verlangt:
 
-        - `transaktion` ist ein ECHTER negativer Bankeingang (Belastung),
-          nicht irgendeine (insbesondere nicht dieselbe positive) Transaktion.
+        Codex-Rückprüfung: die Aufrufer-Objekte `transaktion`/
+        `original_op_position`/`konto` können vom Repository abgelöste,
+        veraltete oder manipulierte Python-Objekte sein (nur ihre IDs sind
+        vertrauenswürdig). Prüfung UND Buchung laufen deshalb in EINER
+        gesperrten DB-Transaktion, die Transaktion, Original-OP, Konto und
+        Bankkonto per ID frisch aus der DB lädt (`with_for_update`, wo
+        unterstützt) und ausschließlich auf Basis dieser frischen Zeilen
+        validiert:
+
+        - `transaktion` ist laut DB ein ECHTER negativer Bankeingang
+          (Belastung), nicht irgendeine (insbesondere nicht dieselbe
+          positive) Transaktion.
         - `transaktion` liegt auf dem GLEICHEN Bankkonto wie mindestens eine
           Zuordnung der ursprünglichen Zahlung (passendes Bankkonto).
         - Gesellschaft und Währung von Transaktion und Konto stimmen überein.
@@ -350,108 +366,143 @@ class BankImportService:
           Rückbuchungen).
         """
 
-        require_gesellschaft_access(ctx, konto.gesellschaft_id)
-        require_schreibrecht(ctx)
+        transaktion_id = transaktion.id
+        original_op_position_id = original_op_position.id
+        konto_id = konto.id
 
-        if original_op_position.konto_id != konto.id:
-            raise BindungInkonsistentError(
-                f"OPPosition {original_op_position.id} gehört zu Konto {original_op_position.konto_id}, "
-                f"nicht zu {konto.id}."
-            )
-        if OPTyp(original_op_position.typ) is not OPTyp.ZAHLUNG:
-            raise ZuordnungUngueltigError(
-                f"Rücklastschrift muss sich auf eine Zahlung beziehen, OPPosition {original_op_position.id} "
-                f"ist aber vom Typ {original_op_position.typ}."
-            )
-        if original_op_position.status != "AKTIV":
-            raise ZuordnungUngueltigError(
-                f"OPPosition {original_op_position.id} ist bereits storniert und kann nicht zurückgebucht werden."
-            )
-        zuordnungen = self._repository.list_zuordnungen_fuer_op(original_op_position.id)
-        if not zuordnungen:
-            raise ZuordnungUngueltigError(
-                f"Zur ursprünglichen Zahlung {original_op_position.id} existiert keine Bank-Zuordnung; "
-                "eine Rücklastschrift ohne belegte Ursprungszahlung wird abgelehnt."
-            )
+        with self._session_factory() as session:
+            try:
+                frisches_konto = session.get(KontoTable, konto_id)
+                if frisches_konto is None:
+                    raise ValueError(f"Unbekanntes Konto {konto_id}")
+                require_gesellschaft_access(ctx, frisches_konto.gesellschaft_id)
+                require_schreibrecht(ctx)
 
-        # Muss ein ECHTER negativer Eingang sein - nicht dieselbe (oder eine
-        # beliebige andere) positive Transaktion, die als "Rücklastschrift"
-        # untergeschoben wird.
-        if transaktion.betrag_cent >= 0:
-            raise ZuordnungUngueltigError(
-                f"Transaktion {transaktion.id} ist kein negativer Bankeingang (Betrag {transaktion.betrag_cent}); "
-                "eine Rücklastschrift erfordert eine tatsächliche Belastung."
-            )
+                frische_transaktion = session.get(BankTransaktionTable, transaktion_id, with_for_update=True)
+                if frische_transaktion is None:
+                    raise ValueError(f"Unbekannte Banktransaktion {transaktion_id}")
+                frisches_original_op = session.get(OPPositionTable, original_op_position_id, with_for_update=True)
+                if frisches_original_op is None:
+                    raise ValueError(f"Unbekannte OPPosition {original_op_position_id}")
 
-        bank_konto = self._repository.get_bank_konto(transaktion.bank_konto_id)
-        if bank_konto is None:
-            raise ValueError(f"Unbekanntes Bankkonto {transaktion.bank_konto_id}")
-        if bank_konto.gesellschaft_id != konto.gesellschaft_id:
-            raise CrossTenantError(
-                f"Rücklastschrift-Transaktion (Gesellschaft {bank_konto.gesellschaft_id}) darf nicht mit Konto "
-                f"{konto.id} (Gesellschaft {konto.gesellschaft_id}) verrechnet werden."
-            )
-        # Passendes Bankkonto: die Rücklastschrift muss auf demselben
-        # Bankkonto eingehen, auf dem auch die Ursprungszahlung verbucht wurde.
-        original_bank_konto_ids = set()
-        for zuordnung in zuordnungen:
-            original_transaktion = self._repository.get_transaktion(zuordnung.bank_transaktion_id)
-            if original_transaktion is not None:
-                original_bank_konto_ids.add(original_transaktion.bank_konto_id)
-        if transaktion.bank_konto_id not in original_bank_konto_ids:
-            raise ZuordnungUngueltigError(
-                f"Rücklastschrift-Transaktion {transaktion.id} liegt auf Bankkonto {transaktion.bank_konto_id}, "
-                f"die Ursprungszahlung aber auf {sorted(original_bank_konto_ids)}; passendes Bankkonto erforderlich."
-            )
-        if transaktion.waehrung != konto.waehrung:
-            raise FremdwaehrungNichtUnterstuetztError(
-                f"Rücklastschrift-Transaktion {transaktion.id} ({transaktion.waehrung}) und Konto {konto.id} "
-                f"({konto.waehrung}) haben unterschiedliche Währungen."
-            )
+                if frisches_original_op.konto_id != frisches_konto.id:
+                    raise BindungInkonsistentError(
+                        f"OPPosition {original_op_position_id} gehört zu Konto {frisches_original_op.konto_id}, "
+                        f"nicht zu {konto_id}."
+                    )
+                if OPTyp(frisches_original_op.typ) is not OPTyp.ZAHLUNG:
+                    raise ZuordnungUngueltigError(
+                        f"Rücklastschrift muss sich auf eine Zahlung beziehen, OPPosition "
+                        f"{original_op_position_id} ist aber vom Typ {frisches_original_op.typ}."
+                    )
+                if frisches_original_op.status != "AKTIV":
+                    raise ZuordnungUngueltigError(
+                        f"OPPosition {original_op_position_id} ist bereits storniert und kann nicht "
+                        "zurückgebucht werden."
+                    )
+                zuordnungen = list(
+                    session.execute(
+                        select(ZuordnungTable).where(ZuordnungTable.op_position_id == original_op_position_id)
+                    ).scalars().all()
+                )
+                if not zuordnungen:
+                    raise ZuordnungUngueltigError(
+                        f"Zur ursprünglichen Zahlung {original_op_position_id} existiert keine Bank-Zuordnung; "
+                        "eine Rücklastschrift ohne belegte Ursprungszahlung wird abgelehnt."
+                    )
 
-        ursprungsbetrag = abs(original_op_position.betrag_cent)
-        effektiver_betrag = betrag_cent if betrag_cent is not None else ursprungsbetrag
-        if effektiver_betrag <= 0:
-            raise ZuordnungUngueltigError("Rücklastschriftbetrag muss positiv sein.")
+                # Muss laut DB ein ECHTER negativer Eingang sein - nicht
+                # dieselbe (oder eine beliebige andere) positive Transaktion,
+                # die als "Rücklastschrift" untergeschoben wird.
+                if frische_transaktion.betrag_cent >= 0:
+                    raise ZuordnungUngueltigError(
+                        f"Transaktion {transaktion_id} ist laut DB kein negativer Bankeingang "
+                        f"(Betrag {frische_transaktion.betrag_cent}); eine Rücklastschrift erfordert eine "
+                        "tatsächliche Belastung."
+                    )
 
-        # Kumulative Rückbuchungsgrenze der Ursprungszahlung: nie mehr
-        # zurückbuchen als ursprünglich bezahlt wurde, auch nicht über
-        # mehrere Teil-Rücklastschriften hinweg.
-        bereits_zurueckgebucht = self._repository.kumulativ_zurueckgebucht(original_op_position.id)
-        verbleibende_ruecklastgrenze = ursprungsbetrag - bereits_zurueckgebucht
-        if effektiver_betrag > verbleibende_ruecklastgrenze:
-            raise ZuordnungUngueltigError(
-                f"Rücklastschriftbetrag {effektiver_betrag} überschreitet die verbleibende Rückbuchungsgrenze "
-                f"der Ursprungszahlung {original_op_position.id} ({verbleibende_ruecklastgrenze} von "
-                f"{ursprungsbetrag}, bereits {bereits_zurueckgebucht} zurückgebucht)."
-            )
+                bank_konto = session.get(BankKontoTable, frische_transaktion.bank_konto_id)
+                if bank_konto is None:
+                    raise ValueError(f"Unbekanntes Bankkonto {frische_transaktion.bank_konto_id}")
+                if bank_konto.gesellschaft_id != frisches_konto.gesellschaft_id:
+                    raise CrossTenantError(
+                        f"Rücklastschrift-Transaktion (Gesellschaft {bank_konto.gesellschaft_id}) darf nicht mit "
+                        f"Konto {konto_id} (Gesellschaft {frisches_konto.gesellschaft_id}) verrechnet werden."
+                    )
+                # Passendes Bankkonto: die Rücklastschrift muss auf demselben
+                # Bankkonto eingehen, auf dem auch die Ursprungszahlung verbucht wurde.
+                original_bank_konto_ids = set()
+                for zuordnung in zuordnungen:
+                    original_transaktion = session.get(BankTransaktionTable, zuordnung.bank_transaktion_id)
+                    if original_transaktion is not None:
+                        original_bank_konto_ids.add(original_transaktion.bank_konto_id)
+                if frische_transaktion.bank_konto_id not in original_bank_konto_ids:
+                    raise ZuordnungUngueltigError(
+                        f"Rücklastschrift-Transaktion {transaktion_id} liegt auf Bankkonto "
+                        f"{frische_transaktion.bank_konto_id}, die Ursprungszahlung aber auf "
+                        f"{sorted(original_bank_konto_ids)}; passendes Bankkonto erforderlich."
+                    )
+                if frische_transaktion.waehrung != frisches_konto.waehrung:
+                    raise FremdwaehrungNichtUnterstuetztError(
+                        f"Rücklastschrift-Transaktion {transaktion_id} ({frische_transaktion.waehrung}) und "
+                        f"Konto {konto_id} ({frisches_konto.waehrung}) haben unterschiedliche Währungen."
+                    )
 
-        # Verfügbarer Belastungsbetrag DIESER Transaktion: eine
-        # Sammel-Rücklastschrift kann mehrere Ursprungszahlungen abdecken,
-        # aber nie mehr als ihren eigenen (negativen) Betrag.
-        bereits_verwendet = self._repository.verwendeter_betrag_rueckbuchung(transaktion.id)
-        verfuegbar_auf_transaktion = abs(transaktion.betrag_cent) - bereits_verwendet
-        if effektiver_betrag > verfuegbar_auf_transaktion:
-            raise ZuordnungUngueltigError(
-                f"Rücklastschriftbetrag {effektiver_betrag} überschreitet den verfügbaren Belastungsbetrag der "
-                f"Transaktion {transaktion.id} ({verfuegbar_auf_transaktion} von {abs(transaktion.betrag_cent)}, "
-                f"bereits {bereits_verwendet} verwendet)."
-            )
+                ursprungsbetrag = abs(frisches_original_op.betrag_cent)
+                effektiver_betrag = betrag_cent if betrag_cent is not None else ursprungsbetrag
+                if effektiver_betrag <= 0:
+                    raise ZuordnungUngueltigError("Rücklastschriftbetrag muss positiv sein.")
 
-        return self._op_service.buchen(
-            ctx=ctx,
-            konto=konto,
-            typ=OPTyp.RUECKLASTSCHRIFT,
-            betrag_cent=effektiver_betrag,
-            belegdatum=transaktion.buchungsdatum,
-            buchungsdatum=transaktion.buchungsdatum,
-            faelligkeit=transaktion.buchungsdatum,
-            beleg_referenz=f"Rücklastschrift zu OP #{original_op_position.id}",
-            import_id=f"RUECKLASTSCHRIFT-{transaktion.id}-{original_op_position.id}",
-            quelle_system="bank_ruecklastschrift",
-            bank_transaktion_id=transaktion.id,
-            bezieht_sich_auf_id=original_op_position.id,
-        )
+                # Kumulative Rückbuchungsgrenze der Ursprungszahlung: nie mehr
+                # zurückbuchen als ursprünglich bezahlt wurde, auch nicht über
+                # mehrere Teil-Rücklastschriften hinweg.
+                bereits_zurueckgebucht = self._repository.kumulativ_zurueckgebucht(
+                    original_op_position_id, session=session
+                )
+                verbleibende_ruecklastgrenze = ursprungsbetrag - bereits_zurueckgebucht
+                if effektiver_betrag > verbleibende_ruecklastgrenze:
+                    raise ZuordnungUngueltigError(
+                        f"Rücklastschriftbetrag {effektiver_betrag} überschreitet die verbleibende "
+                        f"Rückbuchungsgrenze der Ursprungszahlung {original_op_position_id} "
+                        f"({verbleibende_ruecklastgrenze} von {ursprungsbetrag}, bereits "
+                        f"{bereits_zurueckgebucht} zurückgebucht)."
+                    )
+
+                # Verfügbarer Belastungsbetrag DIESER Transaktion: eine
+                # Sammel-Rücklastschrift kann mehrere Ursprungszahlungen
+                # abdecken, aber nie mehr als ihren eigenen (negativen) Betrag.
+                bereits_verwendet = self._repository.verwendeter_betrag_rueckbuchung(
+                    transaktion_id, session=session
+                )
+                verfuegbar_auf_transaktion = abs(frische_transaktion.betrag_cent) - bereits_verwendet
+                if effektiver_betrag > verfuegbar_auf_transaktion:
+                    raise ZuordnungUngueltigError(
+                        f"Rücklastschriftbetrag {effektiver_betrag} überschreitet den verfügbaren "
+                        f"Belastungsbetrag der Transaktion {transaktion_id} ({verfuegbar_auf_transaktion} von "
+                        f"{abs(frische_transaktion.betrag_cent)}, bereits {bereits_verwendet} verwendet)."
+                    )
+
+                op_row = self._op_service.buchen(
+                    ctx=ctx,
+                    konto=frisches_konto,
+                    typ=OPTyp.RUECKLASTSCHRIFT,
+                    betrag_cent=effektiver_betrag,
+                    belegdatum=frische_transaktion.buchungsdatum,
+                    buchungsdatum=frische_transaktion.buchungsdatum,
+                    faelligkeit=frische_transaktion.buchungsdatum,
+                    beleg_referenz=f"Rücklastschrift zu OP #{original_op_position_id}",
+                    import_id=f"RUECKLASTSCHRIFT-{transaktion_id}-{original_op_position_id}",
+                    quelle_system="bank_ruecklastschrift",
+                    bank_transaktion_id=transaktion_id,
+                    bezieht_sich_auf_id=original_op_position_id,
+                    session=session,
+                )
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            session.refresh(op_row)
+            return op_row
 
     # -- Bankvollständigkeit -------------------------------------------------
     def bankstand_alter_tage(self, bank_konto_id: str, *, heute: date | None = None) -> int | None:

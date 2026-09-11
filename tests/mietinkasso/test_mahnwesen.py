@@ -395,6 +395,34 @@ def test_empfaenger_entfernt_zwischen_planung_und_versand_stoppt(mahn_service, s
     assert "Empfänger" in ergebnis.grund
 
 
+def test_empfaenger_geaendert_zwischen_planung_und_versand_stoppt(mahn_service, stammdaten_repo, op_service, basis_vertrag, ctx_factory, freigegebene_policy):
+    """Regression (Codex-Rückprüfung #2): plane_forderung plant mit
+    mieter@example.at; danach wird nur die E-Mail des Debitors korrigiert
+    (nicht entfernt). Der Fresh-Load in `versenden` prüfte bislang nur
+    Nicht-Leerheit und hätte trotzdem mit der ALTEN, im Snapshot
+    eingefrorenen Adresse weiterversendet. Eine geänderte
+    Empfänger-Identität (Name/E-Mail) gegenüber dem freigegebenen Snapshot
+    muss den Versand blockieren, nicht stillschweigend durchlaufen."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    _mit_faelligem_soll(op_service, konto, ctx)
+    geplant = _planen(
+        mahn_service, ctx=ctx, vertrag=vertrag, konto=konto,
+        forderung=_einzige_forderung(op_service, konto, date(2026, 4, 20)), policy=freigegebene_policy, heute=date(2026, 4, 20),
+    )
+    stammdaten_repo.upsert_debitor(id=konto.debitor_id, name="Max Mustermieter", email="corrected@example.invalid")
+
+    emitted = []
+    ergebnis = _versenden(
+        mahn_service, ctx=ctx, mahnfall_id=geplant.mahnfall_id, heute=date(2026, 4, 20), send_enabled=True,
+        versand_fn=emitted.append,
+    )
+    assert ergebnis.status == "BLOCKIERT"
+    assert "Empfänger" in ergebnis.grund
+    assert emitted == []  # kein Mock-Aufruf, weder mit alter noch mit neuer Adresse
+
+
 def test_zwei_worker_versenden_nicht_doppelt(mahn_service, op_service, basis_vertrag, ctx_factory, freigegebene_policy):
     vertrag, konto = basis_vertrag
     ctx = ctx_factory("7DI")

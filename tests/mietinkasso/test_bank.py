@@ -16,6 +16,7 @@ from mietinkasso.domain.exceptions import (
     CrossTenantError,
     FremdwaehrungNichtUnterstuetztError,
     MehrfachbuchungsKonfliktError,
+    VorgangIdKonfliktError,
     ZuordnungUngueltigError,
 )
 from mietinkasso.op.repository import OPRepository
@@ -593,3 +594,75 @@ def test_vorgang_id_unterscheidet_retry_von_unabhaengiger_teilzuordnung(bank_ser
     )
     assert zuordnung_2.id != zuordnung_1.id
     assert bank_repo.zugeordneter_betrag(transaktion.id) == 400_00
+
+
+def test_ruecklastschrift_ignoriert_manipuliertes_python_objekt_und_laedt_frisch_aus_db(
+    bank_service, bank_repo, basis_vertrag, ctx_factory
+):
+    """Regression (Codex-Rückprüfung #1): nach regulärer Zuordnung wird NUR
+    das vom Repository abgelöste Python-Objekt für `transaktion` manipuliert
+    (tx.betrag_cent=-60000); die DB enthält weiterhin +60000. Die Prüfung
+    darf sich nicht auf das übergebene Objekt verlassen, sondern muss
+    Transaktion/Original-OP/Konto/Bankkonto per ID frisch und gesperrt aus
+    der DB laden."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    csv_text = f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n"
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+    transaktion = bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto, text=csv_text, mapping=mapping)[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=transaktion)
+    assert ergebnis.zugeordnet is True
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+
+    # Manipulation NUR am losgelösten Python-Objekt - die DB enthält
+    # weiterhin den echten, positiven Betrag.
+    transaktion.betrag_cent = -60_000
+
+    with pytest.raises(ZuordnungUngueltigError):
+        bank_service.verarbeite_ruecklastschrift(
+            ctx=ctx, transaktion=transaktion, original_op_position=zahlung_op, konto=konto,
+        )
+
+    assert bank_service._op_service.berechne_saldo(konto.id).saldo_cent == -60_000
+
+
+def test_vorgang_id_wiederverwendung_fuer_andere_transaktion_ist_konflikt_und_rollt_zurueck(
+    bank_service, bank_repo, basis_vertrag, ctx_factory
+):
+    """Regression (Codex-Rückprüfung #3): Bank A +60000 wird mit
+    vorgang_id='SAME-OPERATION' zugeordnet; danach wird dieselbe vorgang_id
+    für eine ANDERE, separate Transaktion (+5000) verwendet. Das darf nicht
+    die alte Zuordnung zurückliefern, während der neu gebuchte OP bestehen
+    bleibt - Wiederverwendung mit anderer Transaktion/Betrag muss ein
+    Konflikt sein, der die GESAMTE Buchung zurückrollt; ein echter
+    identischer Retry bleibt weiterhin ein No-op (siehe
+    `test_vorgang_id_unterscheidet_retry_von_unabhaengiger_teilzuordnung`)."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    tx_a = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n600.00,2026-04-06,A\n", mapping=mapping
+    )[0]
+    bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=tx_a, konto=konto, betrag_cent=60_000, beleg_referenz="A",
+        vorgang_id="SAME-OPERATION",
+    )
+
+    tx_b = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n50.00,2026-04-07,B\n", mapping=mapping
+    )[0]
+    with pytest.raises(VorgangIdKonfliktError):
+        bank_service.zuordnen_manuell(
+            ctx=ctx, transaktion=tx_b, konto=konto, betrag_cent=5_000, beleg_referenz="B",
+            vorgang_id="SAME-OPERATION",
+        )
+
+    assert bank_service._op_service.berechne_saldo(konto.id).saldo_cent == -60_000
+    assert bank_repo.zugeordneter_betrag(tx_b.id) == 0

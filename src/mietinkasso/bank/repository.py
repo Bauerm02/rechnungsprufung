@@ -10,6 +10,7 @@ from mietinkasso.domain.exceptions import (
     CrossTenantError,
     FremdwaehrungNichtUnterstuetztError,
     ImportConflictError,
+    VorgangIdKonfliktError,
     ZuordnungUngueltigError,
 )
 from mietinkasso.infrastructure.db.tables import (
@@ -19,6 +20,20 @@ from mietinkasso.infrastructure.db.tables import (
     OPPositionTable,
     ZuordnungTable,
 )
+
+
+def _vorgang_stimmt_ueberein(
+    bestehende_zuordnung: ZuordnungTable, bank_transaktion_id: int, op_position_id: int, betrag_cent: int
+) -> bool:
+    """True nur, wenn die bereits unter dieser `vorgang_id` gespeicherte
+    Zuordnung EXAKT dieselbe Operation ist (echter Retry) - nicht bloß
+    zufällig irgendeine Zuordnung mit demselben Vorgangs-Label."""
+
+    return (
+        bestehende_zuordnung.bank_transaktion_id == bank_transaktion_id
+        and bestehende_zuordnung.op_position_id == op_position_id
+        and bestehende_zuordnung.betrag_cent == betrag_cent
+    )
 
 
 class BankRepository:
@@ -217,11 +232,23 @@ class BankRepository:
                 owned_session.commit()
             except IntegrityError:
                 owned_session.rollback()
+                # Echte Nebenläufigkeit: zwei Prozesse haben den obigen
+                # Vorab-Check gleichzeitig passiert. Auch hier gilt derselbe
+                # Vergleich wie im Vorab-Check - ein Konflikt darf nicht
+                # unbemerkt als "es existiert ja schon etwas" durchgehen.
                 bestehende = owned_session.execute(
                     select(ZuordnungTable).where(ZuordnungTable.vorgang_id == vorgang_id)
                 ).scalar_one_or_none()
                 if bestehende is None:
                     raise
+                if not _vorgang_stimmt_ueberein(bestehende, bank_transaktion_id, op_position_id, betrag_cent):
+                    raise VorgangIdKonfliktError(
+                        f"vorgang_id '{vorgang_id}' wurde bereits für eine ANDERE Zuordnung verwendet "
+                        f"(Transaktion {bestehende.bank_transaktion_id}, OP {bestehende.op_position_id}, "
+                        f"Betrag {bestehende.betrag_cent}); angefordert wurde Transaktion "
+                        f"{bank_transaktion_id}, OP {op_position_id}, Betrag {betrag_cent}. Für eine tatsächlich "
+                        "neue, unabhängige Zuordnung muss eine NEUE, eindeutige vorgang_id vergeben werden."
+                    )
                 return bestehende
             owned_session.refresh(zuordnung)
             return zuordnung
@@ -239,7 +266,22 @@ class BankRepository:
             select(ZuordnungTable).where(ZuordnungTable.vorgang_id == vorgang_id)
         ).scalar_one_or_none()
         if bestehender_vorgang is not None:
-            return bestehender_vorgang  # Retry desselben Vorgangs -> No-Op
+            if _vorgang_stimmt_ueberein(bestehender_vorgang, bank_transaktion_id, op_position_id, betrag_cent):
+                return bestehender_vorgang  # Retry DESSELBEN Vorgangs -> No-Op
+            # Dieselbe vorgang_id wurde für eine ANDERE Transaktion/OP/Betrag
+            # verwendet - das ist kein Retry, sondern eine Verwechslung/ein
+            # Konflikt. Ohne diesen Vergleich würde die alte Zuordnung
+            # unverändert zurückgegeben, während ein zuvor in DERSELBEN
+            # Transaktion bereits gebuchter neuer OP (siehe
+            # `BankImportService._zuordnen_atomar`) stehen bliebe - der Fehler
+            # muss die GESAMTE aufrufende Transaktion zum Rollback bringen.
+            raise VorgangIdKonfliktError(
+                f"vorgang_id '{vorgang_id}' wurde bereits für eine ANDERE Zuordnung verwendet "
+                f"(Transaktion {bestehender_vorgang.bank_transaktion_id}, OP {bestehender_vorgang.op_position_id}, "
+                f"Betrag {bestehender_vorgang.betrag_cent}); angefordert wurde Transaktion {bank_transaktion_id}, "
+                f"OP {op_position_id}, Betrag {betrag_cent}. Für eine tatsächlich neue, unabhängige Zuordnung "
+                "muss eine NEUE, eindeutige vorgang_id vergeben werden."
+            )
 
         transaktion = session.get(BankTransaktionTable, bank_transaktion_id)
         if transaktion is None:

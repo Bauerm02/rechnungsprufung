@@ -312,11 +312,26 @@ class MahnwesenService:
                 f"(aktuell: {aktuelle_policy.version if aktuelle_policy else None}).",
             )
 
-        # Empfänger frisch prüfen statt dem Snapshot von der Planung zu vertrauen.
+        # Empfänger frisch prüfen UND gegen den bei der Planung freigegebenen
+        # Snapshot vergleichen: eine bloße Nicht-Leer-Prüfung würde eine
+        # zwischenzeitlich KORRIGIERTE/GEÄNDERTE Adresse (anderer Name oder
+        # andere E-Mail als zum Planungszeitpunkt) nicht bemerken und mit der
+        # ungeprüft neuen Adresse weiterversenden - eine Empfänger-Änderung
+        # nach der Planung braucht eine neue Freigabe, kein stillschweigendes
+        # Mitziehen.
         debitor = self._stammdaten_repository.get_debitor(konto.debitor_id)
         if debitor is None or not (debitor.email or "").strip():
             self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
             return VersandErgebnis("BLOCKIERT", f"Kein gültiger Empfänger (E-Mail) für Debitor {konto.debitor_id} mehr hinterlegt.")
+        geplante_email = mahnfall.snapshot.get("empfaenger_email")
+        geplanter_name = mahnfall.snapshot.get("empfaenger_name")
+        if debitor.email != geplante_email or debitor.name != geplanter_name:
+            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
+            return VersandErgebnis(
+                "BLOCKIERT",
+                f"Empfänger hat sich seit der Planung geändert (geplant: {geplanter_name!r} <{geplante_email!r}>, "
+                f"jetzt: {debitor.name!r} <{debitor.email!r}>); eine neue Freigabe/Planung ist erforderlich.",
+            )
 
         # Identitätsbasierte Neuprüfung: nicht nur "ist die Kontosumme noch
         # groß genug" (das würde eine andere, zufällig gleich große

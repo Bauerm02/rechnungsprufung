@@ -63,6 +63,15 @@ class ZuordnungUngueltigError(MietinkassoError):
     remaining balance, Konto/Vertrag mismatch, wrong OP type, ...)."""
 
 
+class VorgangIdKonfliktError(MietinkassoError):
+    """A `vorgang_id` was reused for a different bank_transaktion_id/
+    op_position_id/betrag_cent than the Zuordnung already stored under it.
+    A `vorgang_id` may only ever be replayed for the IDENTICAL operation
+    (safe retry); reuse for a different operation is a caller bug, not an
+    idempotent no-op, and must not silently return the old Zuordnung while
+    a newly booked OP position is left standing."""
+
+
 class RechtsprofilNichtImplementiertError(MietinkassoError):
     """An IndexKlausel references a Rechtsordnung/Berechnungsprofil this
     codebase does not actually implement (e.g. April-Termine,
