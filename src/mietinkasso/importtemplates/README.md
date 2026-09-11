@@ -55,6 +55,56 @@ RmtInf/AcctSvcrRef) steht direkt in
 `tests/mietinkasso/test_bank.py` (`CAMT_XML`), damit Vorlage und Test
 nie auseinanderlaufen.
 
+## George-Business-CSV (nur Vorschau, kein Import)
+
+`mietinkasso.bank.george_business_csv.erstelle_preview` liest den
+CSV-Kontoumsatz-Export von George Business rein lesend und liefert eine
+auditierbare Vorschau (`GeorgeZeilenErgebnis` je Datenzeile). Eigenes,
+unabhängiges CLI-Skript: `scripts/george_business_preview.py`. **Kein
+Datenbankimport, keine Bankverbindung, kein Versand, keine Buchung** —
+und bewusst getrennt vom bestehenden `bank.importer`/`bank.service`
+(CAMT.053/konfigurierbares CSV), das unverändert bleibt.
+
+Erwartete Spalten (exakt, siehe `ERWARTETE_SPALTEN`): `(Sammel-)
+Überweisung ID`, `Enthaltene Überweisung ID`, `Eigene IBAN`, `Eigener
+Kontoname`, `Buchungsdatum`, `Durchführungsdatum`, `Durchführungszeit`,
+`Kontoauszug / Rechnung`, `Partner Name`, `Partner IBAN`, `Partner BIC`,
+`Partner Kontonummer`, `Partner Bankleitzahl`, `Betrag`, `Währung`,
+`Buchungs-Details`, `Buchungsreferenz`, `Valutadatum`,
+`Zahlungsreferenz`, `Auftraggeber-Referenz`. UTF-8 mit optionalem BOM,
+Komma-getrennt, gequotete Felder. Beträge österreichisch (`1.234,56`,
+`-123,45`, immer genau zwei Nachkommastellen), `Buchungsdatum`/
+`Valutadatum` als `TT.MM.JJJJ`, nur `EUR`. Eine abweichende Kopfzeile
+oder eine XLSX-Datei (ZIP-Signatur) wird abgelehnt statt spekulativ als
+CSV mit Lücken gelesen.
+
+**Sammel-Summenzeilen (wichtigste Einschränkung):** Der Export kann
+sowohl die Summenzeile einer Sammelüberweisung als auch deren
+Einzelposten enthalten, beide unter derselben `(Sammel-) Überweisung
+ID` — diese Spalte (und ebenso `Buchungsreferenz`) ist deshalb NIE ein
+eindeutiger Transaktionsschlüssel und wird nie pauschal zur
+Deduplizierung verwendet. Eine Zeile wird nur dann als Summenzeile
+ausgewiesen und aus den Kandidaten entfernt, wenn innerhalb derselben
+Sammelgruppe (a) jede Zeile über `Enthaltene Überweisung ID` eindeutig
+als Detail (`D`) oder Summe (`S`) erkennbar ist und (b) die Detailbeträge
+sich centgenau exakt auf die Summenzeile addieren. Dieses `S`/`D`-Muster
+ist eine **beobachtete, nicht verifizierte** Struktur — jede Gruppe, die
+sich nicht eindeutig auflösen lässt (fehlende Detailzeile, uneindeutige
+Markierung, abweichende Summe), erscheint vollständig als `PRUEFFALL`
+statt automatisch normalisiert oder bereinigt zu werden.
+
+**Weitere bewusste Grenzen:** `Zahlungsreferenz`/`Buchungs-Details`/
+`Auftraggeber-Referenz` werden ausschließlich als Anzeigetext behandelt,
+nie als Anweisung ausgeführt — keine automatische Mieterlös-/
+Mieterkonto-Ableitung, keine Umbuchungs-/Darlehens-/Drittzahler-Logik.
+`erwartetes_konto_iban`/`von`/`bis` sind explizite Prüfparameter: jede
+Zeile wird dagegen geprüft, aber keine Zeile wird deshalb aus dem
+Ergebnis entfernt — nur Summenbildung und die optionale Saldenkontrolle
+(nur bei explizit angegebenem Anfangs- UND Endsaldo) berücksichtigen
+ausschließlich Zeilen, die auf beide Parameter passen. Das jüngste
+Buchungsdatum in der Datei ist kein Beweis für eine bis zum Abrufdatum
+lückenlose Bankanbindung (siehe `docs/hausverwaltung/OFFENE_PUNKTE.md`).
+
 ## Zinsliste (Vertragskomponenten) — noch kein automatischer Import
 
 Für die Übernahme bestehender Zinslisten in `VertragsKomponenteTable`

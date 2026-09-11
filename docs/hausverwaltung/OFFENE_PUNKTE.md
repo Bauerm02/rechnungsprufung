@@ -37,6 +37,20 @@ keine stillschweigend übersprungenen Punkte.
 
 ## Integration / Betrieb
 
+- **George-Business-CSV-Adapter ist nur eine Vorschau, kein Import:**
+  `mietinkasso/bank/george_business_csv.py` +
+  `scripts/george_business_preview.py` lesen einen George-Business-CSV-
+  Export rein lesend und klassifizieren jede Zeile (Kandidat/Sammel-
+  Summenzeile/Prüffall/Abgelehnt) — es gibt KEINE Anbindung an
+  `bank/service.py`, keine Buchung, keine Vertrags-/Mieterzuordnung.
+  Die Erkennung von Sammel-Summenzeilen stützt sich auf ein
+  BEOBACHTETES, NICHT gegen eine echte George-Exportdatei verifiziertes
+  Muster (`S`/`D` am Ende von "Enthaltene Überweisung ID"); jede Gruppe,
+  die sich damit nicht eindeutig und centgenau auflösen lässt, wird
+  bewusst als Prüffall ausgewiesen statt geraten. Bevor dieser Adapter
+  für irgendetwas über die manuelle Sichtprüfung hinaus verwendet wird,
+  muss das Muster gegen mindestens eine echte Exportdatei bestätigt
+  werden.
 - **Zahlungszuordnung erkennt bisher nur explizite Vertragsreferenzen:**
   Die Relevanzprüfung ungeklärter Zahlungseingänge erkennt bisher nur
   explizite `VERTRAG:<id>`-Referenzen. Namenlose Eingänge/freie
