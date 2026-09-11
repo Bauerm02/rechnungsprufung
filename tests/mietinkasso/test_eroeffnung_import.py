@@ -49,28 +49,44 @@ def test_einzel_op_vorlage_bucht_soll_und_zahlung(op_service, stammdaten_repo, b
     assert saldo.saldo_cent == 48_000 - 20_000
 
 
-def test_atomarer_import_gueltige_zeile_gefolgt_von_unbekanntem_konto_bucht_nichts(
-    session_factory, op_service, stammdaten_repo, basis_vertrag, ctx_factory
+@pytest.mark.parametrize(
+    "aufrufen",
+    [
+        pytest.param(
+            lambda session_factory=None, **kwargs: importiere_eroeffnung_csv(**kwargs), id="oeffentlicher_einstieg_importiere_eroeffnung_csv"
+        ),
+        pytest.param(
+            lambda session_factory, **kwargs: importiere_eroeffnung_csv_atomar(session_factory=session_factory, **kwargs),
+            id="interner_einstieg_importiere_eroeffnung_csv_atomar",
+        ),
+    ],
+)
+def test_gueltige_zeile_gefolgt_von_unbekanntem_konto_bucht_ueber_beide_einstiege_nichts(
+    aufrufen, session_factory, op_service, stammdaten_repo, basis_vertrag, ctx_factory
 ):
-    """Regression (Codex-Gegenprobe): eine gültige 100-EUR-Zeile gefolgt
-    von einer Zeile mit unbekanntem Konto darf NICHT die erste Zeile
-    stehen lassen - der gesamte Import ist EINE Transaktion. Deckt auch
-    ab, dass eine innerhalb des Imports geöffnete Stammdaten-Prüfung
-    (Objekt-107-Ausschluss) nicht versehentlich eine separate Session
-    öffnet, die bei SQLite :memory:/StaticPool die äußere, noch nicht
-    committete Buchung zurückrollen würde, ohne dass ein Fehler vorliegt -
-    hier MUSS der Fehler (unbekanntes Konto) selbst zum Rollback führen."""
+    """Regression (Codex-Gegenprobe, zweite Rückprüfung): der ÖFFENTLICHE
+    Einstieg `importiere_eroeffnung_csv` war weiterhin der alte,
+    NICHT-atomare Zeilenloop, während nur `_atomar` repariert wurde -
+    bestehende Aufrufer/Automationen erzeugten also weiterhin
+    Teilbuchungen. Beide Einstiege müssen bei einer gültigen Zeile
+    gefolgt von einem unbekannten Zweitkonto VOLLSTÄNDIG zurückrollen.
+    Deckt auch ab, dass eine innerhalb des Imports geöffnete
+    Stammdaten-Prüfung (Objekt-107-Ausschluss) nicht versehentlich eine
+    separate Session öffnet, die bei SQLite :memory:/StaticPool die
+    äußere, noch nicht committete Buchung zurückrollen würde, ohne dass
+    ein Fehler vorliegt - hier MUSS der Fehler (unbekanntes Konto) selbst
+    zum Rollback führen."""
 
     vertrag, konto = basis_vertrag
     ctx = ctx_factory("7DI")
     text = (
-        f"konto_id,modus,betrag,stichtag,import_id,beleg_referenz\n"
+        "konto_id,modus,betrag,stichtag,import_id,beleg_referenz\n"
         f"{konto.id},GESAMTSALDO,100.00,2026-01-01,ID-1,ok\n"
-        f"UNBEKANNT,GESAMTSALDO,50.00,2026-01-01,ID-2,unbekannt\n"
+        "UNBEKANNT,GESAMTSALDO,50.00,2026-01-01,ID-2,unbekannt\n"
     )
 
     with pytest.raises(ValueError):
-        importiere_eroeffnung_csv_atomar(
+        aufrufen(
             ctx=ctx, op_service=op_service, text=text, konten_je_id={konto.id: konto},
             akteur="test", session_factory=session_factory,
         )
@@ -81,13 +97,26 @@ def test_atomarer_import_gueltige_zeile_gefolgt_von_unbekanntem_konto_bucht_nich
     assert konto.eroeffnung_modus is None  # auch das übergebene Objekt bleibt unverändert
 
 
-def test_atomarer_import_zwei_einzel_op_mit_gleicher_import_id_bucht_nichts(
-    session_factory, op_service, stammdaten_repo, basis_vertrag, ctx_factory
+@pytest.mark.parametrize(
+    "aufrufen",
+    [
+        pytest.param(
+            lambda session_factory=None, **kwargs: importiere_eroeffnung_csv(**kwargs), id="oeffentlicher_einstieg_importiere_eroeffnung_csv"
+        ),
+        pytest.param(
+            lambda session_factory, **kwargs: importiere_eroeffnung_csv_atomar(session_factory=session_factory, **kwargs),
+            id="interner_einstieg_importiere_eroeffnung_csv_atomar",
+        ),
+    ],
+)
+def test_zwei_einzel_op_mit_gleicher_import_id_bucht_ueber_beide_einstiege_nichts(
+    aufrufen, session_factory, op_service, stammdaten_repo, basis_vertrag, ctx_factory
 ):
-    """Regression (Codex-Gegenprobe): zwei EINZEL_OP-Zeilen (100/200 EUR)
-    mit DERSELBEN import_id in einer Datei sind ein Konflikt (nicht ein
-    stiller Replay, da unterschiedlicher Betrag) und dürfen NICHTS
-    verbuchen - auch nicht die erste, an sich gültige Zeile."""
+    """Regression (Codex-Gegenprobe, zweite Rückprüfung): zwei
+    EINZEL_OP-Zeilen (100/200 EUR) mit DERSELBEN import_id in einer Datei
+    sind ein Konflikt (nicht ein stiller Replay, da unterschiedlicher
+    Betrag) und dürfen über BEIDE Einstiege NICHTS verbuchen - auch nicht
+    die erste, an sich gültige Zeile."""
 
     vertrag, konto = basis_vertrag
     ctx = ctx_factory("7DI")
@@ -98,7 +127,7 @@ def test_atomarer_import_zwei_einzel_op_mit_gleicher_import_id_bucht_nichts(
     )
 
     with pytest.raises(ImportConflictError):
-        importiere_eroeffnung_csv_atomar(
+        aufrufen(
             ctx=ctx, op_service=op_service, text=text, konten_je_id={konto.id: konto},
             akteur="test", session_factory=session_factory,
         )

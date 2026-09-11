@@ -172,15 +172,20 @@ keine stillschweigend übersprungenen Punkte.
 
 ## Technisch (nächste Ausbaustufe, nicht MVP1-blockierend)
 
-- Kein REST/HTML-Frontend mit echter Benutzer-Authentifizierung, nur ein
-  minimales Read-Only-Dashboard hinter einem geteilten API-Token (siehe
-  `api/app.py` und den Auth/Login-Punkt oben). Schreibende
-  HTTP-Endpunkte existieren absichtlich nicht.
-- `api/app.py` hat keine automatisierten HTTP-Tests: `fastapi.testclient.TestClient`
-  bräuchte `httpx` als zusätzliche Abhängigkeit, die hier nicht
-  eingeführt wurde. Stattdessen manuell smoke-getestet (`/health`, `/`,
-  Routing-Tabelle) gegen eine echte SQLite-DB. Sollte vor einem
-  produktiven Einsatz um echte HTTP-Tests ergänzt werden.
+- Überholt seit dem Backoffice-Piloten: Es gibt inzwischen ein
+  server-gerendertes, session-authentifiziertes Backoffice mit
+  schreibenden HTTP-Endpunkten unter `/backoffice/*`
+  (`backoffice/app.py`, EIN lokaler Login, "closed by default" ohne
+  `MIETINKASSO_BACKOFFICE_PASSWORD_HASH`) sowie automatisierte
+  HTTP-Integrationstests dafür (`tests/mietinkasso/test_backoffice.py`,
+  `fastapi.testclient.TestClient` gegen eine echte Datei-SQLite-DB;
+  `httpx`/`python-multipart` sind jetzt Abhängigkeiten). Die
+  Read-Only-Endpunkte unter `/v1/*` (`api/app.py`) bleiben unverändert
+  Token-geschützt und weiterhin ohne eigene HTTP-Tests - dort gilt der
+  alte Hinweis fort: sollte vor einem produktiven Einsatz ergänzt werden.
+  Weiterhin fehlt ein Mehrbenutzer-/Rollen-Login (siehe
+  "Backoffice-Pilot" oben) und ein REST/HTML-Frontend mit echter
+  Benutzerverwaltung außerhalb des lokalen Ein-Operator-Piloten.
 - Keine Observability (Metriken/Alerting) über structlog hinaus.
 - SQLite als Default-URL für Entwicklung/Tests; PostgreSQL wird über
   `MIETINKASSO_DATABASE_URL` unterstützt (SQLAlchemy-Engine ist

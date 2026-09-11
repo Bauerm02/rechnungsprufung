@@ -76,6 +76,10 @@ class OPService:
         self._op_repository = op_repository
         self._stammdaten_repository = stammdaten_repository
 
+    @property
+    def session_factory(self):
+        return self._op_repository.session_factory
+
     # -- Eröffnung ------------------------------------------------------
     def eroeffnen_gesamtsaldo(
         self,

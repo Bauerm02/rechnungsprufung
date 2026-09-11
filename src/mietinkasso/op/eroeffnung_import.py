@@ -87,28 +87,19 @@ def importiere_eroeffnung_csv(
     konten_je_id: dict[str, KontoTable],
     akteur: str,
 ) -> list[OPPositionTable]:
-    ergebnisse: list[OPPositionTable] = []
-    for zeile in parse_eroeffnung_csv(text):
-        konto = konten_je_id[zeile.konto_id]
-        if zeile.modus == "GESAMTSALDO":
-            ergebnisse.append(
-                op_service.eroeffnen_gesamtsaldo(
-                    ctx=ctx, konto=konto, betrag_cent=zeile.betrag_cent, stichtag=zeile.stichtag,
-                    import_id=zeile.import_id, akteur=akteur,
-                )
-            )
-        elif zeile.modus == "EINZEL_OP":
-            ergebnisse.append(
-                op_service.eroeffnen_einzel_op(
-                    ctx=ctx, konto=konto, stichtag=zeile.stichtag, import_id=zeile.import_id,
-                    typ=OPTyp(zeile.typ or "SOLL"), betrag_cent=zeile.betrag_cent,
-                    belegdatum=zeile.belegdatum or zeile.stichtag, faelligkeit=zeile.faelligkeit,
-                    beleg_referenz=zeile.beleg_referenz, akteur=akteur,
-                )
-            )
-        else:
-            raise ValueError(f"Unbekannter Eröffnungsmodus '{zeile.modus}' (erwartet GESAMTSALDO oder EINZEL_OP).")
-    return ergebnisse
+    """Öffentlicher Einstieg für bestehende Aufrufer/Automationen -
+    identische Signatur/Rückgabe wie bisher, aber intern seit der
+    Codex-Rückprüfung (die zeigte, dass dieser Einstieg weiterhin der
+    alte, NICHT-atomare Zeilenloop war, während nur
+    `importiere_eroeffnung_csv_atomar` repariert wurde) ein dünner
+    Wrapper um genau diese atomare Implementierung: eine unbekannte
+    Zweitzeile oder eine widersprüchliche Zeile mit bereits verwendeter
+    import_id rollt die GESAMTE Datei zurück, keine Teilbuchung."""
+
+    return importiere_eroeffnung_csv_atomar(
+        ctx=ctx, op_service=op_service, text=text, konten_je_id=konten_je_id, akteur=akteur,
+        session_factory=op_service.session_factory,
+    )
 
 
 def importiere_eroeffnung_csv_atomar(

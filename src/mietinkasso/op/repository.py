@@ -12,6 +12,10 @@ class OPRepository:
     def __init__(self, session_factory: sessionmaker[Session]):
         self._session_factory = session_factory
 
+    @property
+    def session_factory(self) -> sessionmaker[Session]:
+        return self._session_factory
+
     def find_by_import_id(self, import_id: str) -> OPPositionTable | None:
         with self._session_factory() as session:
             return session.execute(
