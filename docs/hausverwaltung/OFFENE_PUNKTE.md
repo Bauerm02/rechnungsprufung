@@ -43,22 +43,36 @@ keine stillschweigend übersprungenen Punkte.
   Export rein lesend und klassifizieren jede Zeile (Kandidat/Sammel-
   Summenzeile/Prüffall/Abgelehnt) — es gibt KEINE Anbindung an
   `bank/service.py`, keine Buchung, keine Vertrags-/Mieterzuordnung.
-  Nach unabhängiger Codeprüfung korrigiert: Sammelgruppen werden über
-  `(Eigene IBAN, Währung, Buchungsdatum, echte Buchungsreferenz)` plus
-  einem S/D-Markierungsprofil in "Enthaltene Überweisung ID"
-  zusammengeführt (die sichtbare `(Sammel-) Überweisung ID` ist laut
-  Fachprüfung KEIN zuverlässiger Gruppenschlüssel — die Summenzeile
-  teilt sie sich nur mit dem ersten Einzelposten). Das S/D-Profil selbst
-  (107 Zeichen: IBAN+Padding+Währung+9-stelliges Präfix+Jahr+Marker+
-  56-stelliger Hex-Hash) stammt aus einer unabhängigen
-  Strukturanalyse mit exakten Längenangaben, ist aber NOCH NICHT gegen
-  eine echte George-Produktionsdatei mit realen IDs verifiziert. Jede ID
-  außerhalb dieses engen Profils wird nie geraten, sondern wie ein
-  gewöhnlicher Einzelumsatz behandelt; jede nicht eindeutig auflösbare
-  Sammelgruppe wird komplett als Prüffall ausgewiesen. Bevor dieser
-  Adapter für irgendetwas über die manuelle Sichtprüfung hinaus verwendet
-  wird, muss das Profil gegen mindestens eine echte Exportdatei mit
-  echten IDs bestätigt werden.
+  Sammelgruppen werden über `(Eigene IBAN, Währung, Buchungsdatum, echte
+  Buchungsreferenz)` plus einem S/D-Markierungsprofil in "Enthaltene
+  Überweisung ID" zusammengeführt (die sichtbare `(Sammel-) Überweisung
+  ID` ist laut Fachprüfung KEIN zuverlässiger Gruppenschlüssel — die
+  Summenzeile teilt sie sich nur mit dem ersten Einzelposten). Das
+  S/D-Profil (107 Zeichen: IBAN+14 Nullen+Währung+9-stelliges Präfix+
+  Jahr+Marker+56-stelliger Hex-Hash) ist strukturell exakt bekannt; eine
+  ID, die lang genug für einen Profilversuch ist, aber inhaltlich davon
+  abweicht (falsches Konto/Währung/Padding/Jahr/Hex/abgeschnittener
+  Suffix), wird NIE als gewöhnlicher Einzelumsatz durchgereicht, sondern
+  als Prüffall ausgewiesen und "poisoned" jede sonst zufällig valide
+  erscheinende Restgruppe mit gleichem Konto/Währung/Datum/Referenz. Eine
+  Zeile ohne jede brauchbare ID (weder "Enthaltene Überweisung ID" noch
+  "(Sammel-) Überweisung ID") wird nie automatisch Kandidat — eine
+  Buchungsreferenz allein zählt nicht als eindeutiger Schlüssel, egal wie
+  viele Zeilen die Datei hat. Eine Datei ohne jede Datenzeile (nur
+  Kopfzeile) gilt nicht als bestätigt vollständig, sondern wird
+  abgelehnt.
+
+  **Formatbeleg (lokaler Vier-Dateien-Abgleich, außerhalb dieses
+  Repositories, keine Echtdaten übertragen):** vier echte
+  George-Business-CSV-Exporte wurden lokal rein lesend mit diesem
+  Adapter verglichen — alle 44 Zeilen erhalten, vier Sammelsummen korrekt
+  erkannt, 40 Umsätze, alle vier Bankkontrollen (Anfangs-/Endsaldo)
+  stimmen centgenau. Das bestätigt das Spaltenschema und die
+  Grundklassifizierung gegen echte Daten — **keine Produktionsfreigabe**:
+  der Adapter bleibt eine manuell zu prüfende Vorschau ohne Anbindung an
+  Buchung/Versand/Mahnwesen, und das S/D-Profil selbst wurde nur an
+  diesen vier Dateien beobachtet, nicht umfassend gegen alle denkbaren
+  George-Exportvarianten abgesichert.
 - **Zahlungszuordnung erkennt bisher nur explizite Vertragsreferenzen:**
   Die Relevanzprüfung ungeklärter Zahlungseingänge erkennt bisher nur
   explizite `VERTRAG:<id>`-Referenzen. Namenlose Eingänge/freie

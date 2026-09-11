@@ -45,7 +45,7 @@ def _basiszeile(**overrides: str) -> dict[str, str]:
 
 def test_cli_gibt_bericht_aus_und_liefert_exitcode_0(tmp_path, capsys):
     datei = tmp_path / "export.csv"
-    _schreibe_csv(datei, [_basiszeile()])
+    _schreibe_csv(datei, [_basiszeile(**{"Enthaltene Überweisung ID": "REF-CLI-001"})])
 
     exit_code = _MODUL.main(
         [
@@ -143,6 +143,38 @@ def test_cli_liefert_exitcode_ungleich_0_bei_pruefffaellen(tmp_path, capsys):
 
     assert exit_code != 0
     assert "Prüffälle" in ausgabe
+    assert "Gesamtstatus: UNVOLLSTÄNDIG" in ausgabe
+
+
+def test_cli_zeigt_saldenkontrolle_nicht_als_ok_wenn_trotz_passender_summe_pruefffaelle_vorhanden_sind(tmp_path, capsys):
+    """Befund 4 (2. Runde): eine rein rechnerisch aufgehende
+    Saldenkontrolle (0=0, weil beide Zeilen als Dubletten ausgeschlossen
+    wurden) darf nie als schlichtes 'OK' erscheinen, solange die Datei
+    Prüffälle enthält."""
+
+    datei = tmp_path / "export.csv"
+    _schreibe_csv(
+        datei,
+        [
+            _basiszeile(Betrag="-10,00", **{"Enthaltene Überweisung ID": "DUP"}),
+            _basiszeile(Betrag="-20,00", **{"Enthaltene Überweisung ID": "DUP"}),
+        ],
+    )
+
+    exit_code = _MODUL.main(
+        [
+            "--datei", str(datei),
+            "--konto", "AT611000000000601001",
+            "--von", "01.01.2026",
+            "--bis", "31.01.2026",
+            "--anfangssaldo", "0,00",
+            "--endsaldo", "0,00",
+        ]
+    )
+    ausgabe = capsys.readouterr().out
+
+    assert exit_code != 0
+    assert "rechnerisch OK, aber Datei UNVOLLSTÄNDIG" in ausgabe
     assert "Gesamtstatus: UNVOLLSTÄNDIG" in ausgabe
 
 

@@ -120,7 +120,26 @@ ausgewiesen.
 Zeilen auf einem anderen als dem angefragten Konto werden `ABGELEHNT`;
 Zeilen auf dem richtigen Konto, aber außerhalb des angefragten
 Zeitraums, werden `PRUEFFALL` — beide zählen nie als `KANDIDAT` und
-fließen nie in die Summenbildung oder Saldenkontrolle ein.
+fließen nie in die Summenbildung oder Saldenkontrolle ein. Eine Datei
+ganz ohne Datenzeile (nur Kopfzeile) gilt nicht als bestätigt
+vollständig und wird abgelehnt.
+
+Eine Zeile ohne S/D-Sammelmarkierung braucht trotzdem MINDESTENS eine
+brauchbare Kennung — `Enthaltene Überweisung ID` ODER `(Sammel-)
+Überweisung ID` — um automatisch `KANDIDAT` zu werden; sind BEIDE
+leer/`NOTPROVIDED`, wird die Zeile ein `PRUEFFALL` (eine
+`Buchungsreferenz` allein ist kein eindeutiger Schlüssel), unabhängig
+davon, ob die Datei eine oder mehrere Zeilen enthält. Eine ID, die lang
+genug für einen Versuch des 107-Zeichen-S/D-Profils ist, aber inhaltlich
+davon abweicht (falsches Konto/Währung/Padding/Jahr/Hex, abgeschnittener
+Suffix), wird NIE als gewöhnlicher Einzelumsatz durchgereicht, sondern
+selbst ein `PRUEFFALL` und "poisoned" jede sonst zufällig valide
+erscheinende Sammelgruppe mit gleichem Konto/Währung/Datum/Referenz.
+
+`felder`/`sha256_zeile` je Ergebniszeile bewahren die EXAKTEN dekodierten
+CSV-Werte (kein `.strip()`) — Normalisierung für Konto-/Datums-/
+Betragsvergleiche passiert getrennt nur für die fachliche Auswertung.
+`datei_sha256` ist der SHA256 der rohen Dateibytes.
 
 **Weitere bewusste Grenzen:** `Zahlungsreferenz`/`Buchungs-Details`/
 `Auftraggeber-Referenz` werden ausschließlich als Anzeigetext behandelt,

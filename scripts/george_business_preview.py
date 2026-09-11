@@ -128,7 +128,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Ausgänge (im Konto/Zeitraum): {_eur(preview.ausgaenge_cent)}")
     if preview.saldo_kontrolle is not None:
         sk = preview.saldo_kontrolle
-        status = "OK" if sk.stimmt_ueberein else "ABWEICHUNG"
+        if not sk.stimmt_ueberein:
+            status = "ABWEICHUNG"
+        elif preview.vollstaendig:
+            status = "OK"
+        else:
+            # Rechnerisch geht die Kontrolle auf, aber die Datei ist wegen
+            # Prüffällen/Ablehnungen unvollständig - ein "OK" hier allein
+            # wäre ein Erfolgssignal auf Basis fehlender statt geprüfter
+            # Zeilen. Niemals "OK" anzeigen, bevor der Gesamtstatus unten
+            # nicht ebenfalls VOLLSTÄNDIG ist.
+            status = "rechnerisch OK, aber Datei UNVOLLSTÄNDIG (siehe Prüffälle/Abgelehnt unten)"
         print(
             f"  Saldenkontrolle: Anfang {_eur(sk.anfangssaldo_cent)} + Eingänge + Ausgänge = "
             f"{_eur(sk.berechneter_endsaldo_cent)} vs. gemeldetes Ende {_eur(sk.endsaldo_cent)} -> {status}"

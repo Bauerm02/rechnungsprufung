@@ -64,11 +64,30 @@ IDs verifiziert — siehe `docs/hausverwaltung/OFFENE_PUNKTE.md`:
 
 Das 9-stellige Präfix wird NICHT als Datum oder sonstiger Fachwert
 interpretiert, sondern ausschließlich als opaker Konsistenzwert
-innerhalb einer Gruppe verglichen. Jede ID, die nicht exakt in dieses
-enge Profil passt (Länge, Padding, Konto-/Währungs-/Jahresübereinstimmung
-mit der eigenen Zeile, Markerzeichen, Hex-Zeichensatz des Suffix), gilt
-als NICHT bestimmbar — die Zeile wird dann wie ein gewöhnlicher
-Einzelumsatz behandelt (mit eigener Dublettenprüfung), NIEMALS geraten.
+innerhalb einer Gruppe verglichen.
+
+WICHTIG (nach unabhängiger Gegenprobe korrigiert): eine ID, die zwar
+lang genug ist, um plausibel ein VERSUCH dieses 107-Zeichen-Profils zu
+sein, aber inhaltlich davon abweicht (falsches Konto/Währung/Padding/
+Jahr/Markerzeichen/Hex-Suffix, abgeschnittener Suffix), wird NIEMALS
+stillschweigend wie ein gewöhnlicher, andersartiger Einzelumsatz
+behandelt — das wäre ein kaputtes/inkonsistentes Sammelprofil, kein
+normaler Einzelumsatz, und wird als Prüffall ausgewiesen (siehe
+`_sieht_wie_sammel_id_versuch_aus`). Ein solches Mitglied "poisoned"
+außerdem jede Sammelgruppe mit gleichem (Konto, Währung, Datum,
+Buchungsreferenz): die übrigen, für sich genommen sauber aussehenden
+S/D-Mitglieder werden NICHT auf Basis der dadurch verkleinerten Gruppe
+validiert. Nur eine ID, die für dieses Profil erkennbar zu KURZ ist, gilt
+als andersartiges, unabhängiges Einzelumsatz-Format und wird normal
+(mit eigener Dublettenprüfung) behandelt.
+
+Unabhängige Identität (nach unabhängiger Gegenprobe ergänzt): eine Zeile
+ohne S/D-Sammelmarkierung braucht trotzdem MINDESTENS eine brauchbare
+Kennung - "Enthaltene Überweisung ID" ODER "(Sammel-) Überweisung ID" -
+um automatisch Kandidat zu werden. Sind BEIDE leer/NOTPROVIDED, wird die
+Zeile ein Prüffall, unabhängig davon, ob die Datei eine oder mehrere
+Zeilen enthält; eine Buchungsreferenz allein zählt NICHT als eindeutiger
+Schlüssel (siehe `_hat_unabhaengige_identitaet`).
 """
 
 from __future__ import annotations
@@ -134,6 +153,15 @@ _SD_HASH_LAENGE = 56
 _SD_MARKER_POSITION = _SD_IBAN_LAENGE + len(_SD_PADDING) + _SD_WAEHRUNG_LAENGE + _SD_PRAEFIX_LAENGE + _SD_JAHR_LAENGE
 _SD_GESAMTLAENGE = _SD_MARKER_POSITION + 1 + _SD_HASH_LAENGE
 _HEX_MUSTER = re.compile(r"^[0-9A-F]+$")
+#: Längenbasiertes Shape-Signal, UNABHÄNGIG davon ob einzelne Segmente
+#: (Konto/Währung/Padding/Jahr/Hex) tatsächlich korrekt sind: Eine ID,
+#: die lang genug ist, um den vollen Kopfbereich des 107-Zeichen-Profils
+#: (bis inkl. Markerposition) zu tragen, gilt als VERSUCH dieses
+#: Profils - selbst wenn Konto/Währung/Padding/Jahr/Marker/Hash-Suffix
+#: falsch oder abgeschnitten sind. So ein Versuch wird NIE stillschweigend
+#: wie ein gewöhnlicher (kurzer, andersartiger) Einzelumsatz behandelt,
+#: sondern als Prüffall ausgewiesen (siehe `_INKONSISTENTES_SAMMELPROFIL_GRUND`).
+_SD_MINDESTLAENGE_FUER_PROFILVERSUCH = _SD_MARKER_POSITION + 1
 
 #: Werte, die NIEMALS als eindeutiger Schlüssel (Dublettenprüfung,
 #: Sammelgruppen-Referenz) verwendet werden dürfen - eine leere Spalte
@@ -199,8 +227,19 @@ class GeorgeZeilenErgebnis:
 
     `zeile_nr` ist der logische Datenindex (1-basiert, ohne Kopfzeile und
     ohne vollständig leere Zeilen) - `csv_zeile` ist davon bewusst
-    getrennt die PHYSISCHE Zeilennummer in der Rohdatei (inkl.
-    Kopfzeile), wie sie ein Mensch beim Öffnen der Datei sieht.
+    getrennt die PHYSISCHE Zeilennummer, an der der Datensatz laut
+    `csv.reader.line_num` ENDET (bei einem mehrzeiligen gequoteten Feld
+    also die letzte konsumierte physische Zeile, nicht die erste - in
+    diesem Format nicht erwartet, aber nicht stillschweigend falsch
+    benannt).
+
+    `felder` sind die EXAKTEN dekodierten CSV-Feldwerte der Originaldatei
+    (kein `.strip()`, keine sonstige Normalisierung) - `sha256_zeile` ist
+    darüber via kanonischem JSON gebildet. Bei einer strukturell kaputten
+    Zeile (Status ABGELEHNT wegen abweichender Feldanzahl) ist `felder`
+    stattdessen eine bestmögliche, NICHT notwendigerweise bytegenaue
+    Rekonstruktion (siehe `_sichere_felder`) - die Originaldatei bleibt
+    in diesem Fall maßgeblich.
 
     status:
       - "KANDIDAT": normalisierter, buchbarer Vorschau-Kandidat - liegt
@@ -280,6 +319,7 @@ class _ZeilenKontext:
     zeile_nr: int
     csv_zeile: int
     werte: dict[str, str]
+    rohfelder: dict[str, str]
     eigene_iban: str
     betrag_cent: int
     waehrung: str
@@ -317,7 +357,14 @@ def _sichere_felder(rohzeile: dict) -> dict[str, str]:
     NIE für die eigentliche fachliche Auswertung. `None` (fehlendes Feld)
     wird zu "", eine Liste (zu viele Felder, restkey=None) wird zu einem
     Anzeige-String; nirgends wird `.strip()`/`.upper()` auf einem
-    Nicht-String aufgerufen (das war die AttributeError-Quelle)."""
+    Nicht-String aufgerufen (das war die AttributeError-Quelle).
+
+    Bei einer strukturell kaputten Zeile (abweichende Feldanzahl) ist
+    dieses Ergebnis eine BESTMÖGLICHE, aber NICHT notwendigerweise
+    bytegenaue Rekonstruktion - insbesondere die zu einer Liste
+    zusammengefassten Überschussfelder sind eine Anzeigehilfe, keine
+    Behauptung vollständiger Originaltreue. Bei Zweifeln bleibt die
+    Originaldatei die maßgebliche Quelle, nicht dieser Rückgabewert."""
 
     ergebnis: dict[str, str] = {}
     for spalte in ERWARTETE_SPALTEN:
@@ -333,6 +380,19 @@ def _sichere_felder(rohzeile: dict) -> dict[str, str]:
 
 def _ist_brauchbarer_schluessel(text: str) -> bool:
     return text.strip().upper() not in _UNBRAUCHBARE_SCHLUESSELWERTE
+
+
+def _hat_unabhaengige_identitaet(kontext: _ZeilenKontext) -> bool:
+    """Eine Zeile braucht MINDESTENS eine unabhängige Kennung - eine
+    brauchbare 'Enthaltene Überweisung ID' ODER eine brauchbare
+    '(Sammel-) Überweisung ID' - um automatisch Kandidat zu werden.
+    Eine Buchungsreferenz allein zählt NICHT (siehe
+    `_KEINE_UNABHAENGIGE_IDENTITAET_GRUND`); das gilt unabhängig davon,
+    ob die Datei eine oder mehrere Zeilen enthält."""
+
+    return _ist_brauchbarer_schluessel(kontext.werte["Enthaltene Überweisung ID"]) or _ist_brauchbarer_schluessel(
+        kontext.werte["(Sammel-) Überweisung ID"]
+    )
 
 
 def _pruefe_kein_xlsx(rohbytes: bytes) -> None:
@@ -358,12 +418,25 @@ def _dekodiere(rohbytes: bytes) -> str:
 
 def _lese_csv_zeilen(text: str) -> list[tuple[int, int, dict[str, str], str | None]]:
     """Liest die Datenzeilen roh ein. Rückgabe je Zeile:
-    (zeile_nr, csv_zeile, felder, strukturfehler_oder_None).
+    (zeile_nr, csv_zeile, rohfelder, strukturfehler_oder_None).
+
+    `rohfelder` enthält die EXAKTEN dekodierten CSV-Feldwerte, INSBESONDERE
+    OHNE `.strip()` - führende/nachfolgende Leerzeichen im Original bleiben
+    erhalten, damit `felder`/`sha256_zeile` im Ergebnis die Originaldatei
+    unverändert abbilden. Normalisierung (z. B. für Konto-/Datums-/
+    Betragsvergleiche) passiert getrennt und NUR für die fachliche
+    Auswertung, siehe `_validiere_basis`.
+
+    `csv_zeile` ist die physische Zeilennummer, an der der Datensatz laut
+    `csv.reader.line_num` ENDET - bei einem (in diesem Format nicht
+    erwarteten) mehrzeiligen gequoteten Feld also die LETZTE konsumierte
+    physische Zeile, nicht die erste.
 
     Wenn `strukturfehler_oder_None` gesetzt ist, ist die Zeile technisch
-    kaputt (abweichende Feldanzahl) - `felder` enthält dann trotzdem eine
-    defensiv aufgebaute, NIE crashende Bestenfalls-Rekonstruktion für den
-    Audit-Trail, wird aber nicht fachlich weiterverarbeitet."""
+    kaputt (abweichende Feldanzahl) - `rohfelder` enthält dann trotzdem
+    eine defensiv aufgebaute, NIE crashende Bestenfalls-Rekonstruktion für
+    den Audit-Trail (siehe `_sichere_felder`), wird aber nicht fachlich
+    weiterverarbeitet; bei Zweifeln bleibt die Originaldatei maßgeblich."""
 
     try:
         reader = csv.DictReader(io.StringIO(text), restval=None, strict=True)
@@ -412,8 +485,8 @@ def _lese_csv_zeilen(text: str) -> list[tuple[int, int, dict[str, str], str | No
                 ))
                 continue
 
-            werte = {spalte: rohzeile[spalte].strip() for spalte in ERWARTETE_SPALTEN}
-            ergebnis.append((zeile_nr, csv_zeile, werte, None))
+            rohfelder = {spalte: rohzeile[spalte] for spalte in ERWARTETE_SPALTEN}
+            ergebnis.append((zeile_nr, csv_zeile, rohfelder, None))
     except csv.Error as exc:
         raise GeorgeFormatFehlerError(f"CSV-Struktur nicht lesbar (z. B. defekte Anführungszeichen): {exc}") from exc
     return ergebnis
@@ -497,7 +570,23 @@ def _sammel_id_analyse(
     return marker, praefix_teil
 
 
-def _validiere_basis(zeile_nr: int, csv_zeile: int, werte: dict[str, str]) -> _ZeilenKontext:
+def _sieht_wie_sammel_id_versuch_aus(enthaltene_id: str) -> bool:
+    """Rein längenbasiertes Shape-Signal (siehe
+    `_SD_MINDESTLAENGE_FUER_PROFILVERSUCH`): unterscheidet "diese ID
+    versucht erkennbar das 107-Zeichen-Sammelprofil zu sein, ist aber
+    inhaltlich kaputt (falsches Konto/Währung/Padding/Jahr/Hex,
+    abgeschnittener Hash-Suffix)" von "dies ist ein andersartiges,
+    unabhängiges Einzelumsatz-ID-Format". NUR für Werte gedacht, für die
+    `_sammel_id_analyse` bereits None geliefert hat."""
+
+    return len(enthaltene_id) >= _SD_MINDESTLAENGE_FUER_PROFILVERSUCH
+
+
+def _validiere_basis(zeile_nr: int, csv_zeile: int, rohfelder: dict[str, str]) -> _ZeilenKontext:
+    # `werte` ist eine für die fachliche Auswertung normalisierte Kopie
+    # (getrimmt) - `rohfelder` bleibt für Audit/Hash unverändert (siehe
+    # `_lese_csv_zeilen`).
+    werte = {spalte: rohfelder[spalte].strip() for spalte in ERWARTETE_SPALTEN}
     if not werte["Eigene IBAN"]:
         raise ValueError("Eigene IBAN fehlt.")
     if not werte["Betrag"]:
@@ -517,12 +606,13 @@ def _validiere_basis(zeile_nr: int, csv_zeile: int, werte: dict[str, str]) -> _Z
         zeile_nr=zeile_nr,
         csv_zeile=csv_zeile,
         werte=werte,
+        rohfelder=rohfelder,
         eigene_iban=werte["Eigene IBAN"],
         betrag_cent=betrag_cent,
         waehrung=werte["Währung"],
         buchungsdatum=buchungsdatum,
         valuta=valuta,
-        feld_hash=_sha256_felder(werte),
+        feld_hash=_sha256_felder(rohfelder),
     )
 
 
@@ -559,7 +649,7 @@ def _ergebnis_kandidat(kontext: _ZeilenKontext) -> GeorgeZeilenErgebnis:
         status="KANDIDAT",
         grund=None,
         sha256_zeile=kontext.feld_hash,
-        felder=kontext.werte,
+        felder=kontext.rohfelder,
         kandidat=_baue_kandidat(kontext),
     )
 
@@ -571,7 +661,7 @@ def _ergebnis_summenzeile(kontext: _ZeilenKontext, grund: str) -> GeorgeZeilenEr
         status="SAMMEL_SUMME",
         grund=grund,
         sha256_zeile=kontext.feld_hash,
-        felder=kontext.werte,
+        felder=kontext.rohfelder,
         kandidat=_baue_kandidat(kontext),
     )
 
@@ -583,19 +673,19 @@ def _ergebnis_pruefffall(kontext: _ZeilenKontext, grund: str) -> GeorgeZeilenErg
         status="PRUEFFALL",
         grund=grund,
         sha256_zeile=kontext.feld_hash,
-        felder=kontext.werte,
+        felder=kontext.rohfelder,
         kandidat=None,
     )
 
 
-def _ergebnis_abgelehnt(zeile_nr: int, csv_zeile: int, werte: dict[str, str], grund: str) -> GeorgeZeilenErgebnis:
+def _ergebnis_abgelehnt(zeile_nr: int, csv_zeile: int, rohfelder: dict[str, str], grund: str) -> GeorgeZeilenErgebnis:
     return GeorgeZeilenErgebnis(
         zeile_nr=zeile_nr,
         csv_zeile=csv_zeile,
         status="ABGELEHNT",
         grund=grund,
-        sha256_zeile=_sha256_felder(werte),
-        felder=werte,
+        sha256_zeile=_sha256_felder(rohfelder),
+        felder=rohfelder,
         kandidat=None,
     )
 
@@ -615,18 +705,44 @@ _FEHLENDE_REFERENZ_FUER_SD_GRUND = (
     "Zeile trägt eine gültige S/D-Sammelmarkierung, aber keine brauchbare Buchungsreferenz zur "
     "Gruppenbildung (leer oder NOTPROVIDED); die Sammelgruppe kann nicht validiert werden."
 )
+_INKONSISTENTES_SAMMELPROFIL_GRUND = (
+    "'Enthaltene Überweisung ID' ist lang genug, um ein Versuch des 107-Zeichen-Sammel-S/D-Profils zu "
+    "sein, erfüllt es aber nicht exakt (Konto/Währung/Padding/Jahr/Markerzeichen/Hex-Suffix stimmen "
+    "nicht oder der Suffix ist abgeschnitten). Wird NIE stillschweigend wie ein gewöhnlicher "
+    "Einzelumsatz durchgereicht, sondern als Prüffall ausgewiesen."
+)
+_KEINE_UNABHAENGIGE_IDENTITAET_GRUND = (
+    "Weder 'Enthaltene Überweisung ID' noch '(Sammel-) Überweisung ID' sind brauchbar (leer oder "
+    "NOTPROVIDED) - eine Buchungsreferenz allein ist kein eindeutiger Schlüssel. Ohne unabhängig "
+    "eindeutige Identität wird die Zeile nicht automatisch zum Kandidaten, sondern als Prüffall "
+    "ausgewiesen; das gilt unabhängig davon, ob die Datei eine oder mehrere Zeilen enthält."
+)
+_GRUPPE_DURCH_AUSSCHLUSS_UNVOLLSTAENDIG_GRUND = (
+    "Sammelgruppe (gleiches Konto/Währung/Datum/Buchungsreferenz) enthält ein Mitglied, das separat "
+    "als Dublette oder als inkonsistentes S/D-Profil ausgeschlossen wurde - die verbleibenden Zeilen "
+    "werden NICHT auf Basis einer dadurch verkleinerten Gruppe validiert, auch wenn ihre Summe für "
+    "sich genommen aufginge."
+)
 
 
-def _verarbeite_sd_gruppe(mitglieder: list[tuple[_ZeilenKontext, str, str]]) -> list[GeorgeZeilenErgebnis]:
+def _verarbeite_sd_gruppe(
+    mitglieder: list[tuple[_ZeilenKontext, str, str | None]],
+    dubletten_grund: dict[int, str],
+) -> list[GeorgeZeilenErgebnis]:
     # Reihenfolge in der Datei ist irrelevant (Summen können vor oder
     # nach ihren Details stehen) - die Klassifizierung hängt nur vom
     # Mengeninhalt der Gruppe ab, nie von der Position.
+    hat_kaputtes_mitglied = any(marker == "KAPUTT" for _, marker, _ in mitglieder)
+    hat_dublette = any(kontext.zeile_nr in dubletten_grund for kontext, _, _ in mitglieder)
+
     summenzeilen = [(k, p) for k, m, p in mitglieder if m == "S"]
     detailzeilen = [(k, p) for k, m, p in mitglieder if m == "D"]
-    praefixe = {p for _, _, p in mitglieder}
+    praefixe = {p for _, m, p in mitglieder if m in ("S", "D")}
 
     gueltig = (
-        len(summenzeilen) == 1
+        not hat_kaputtes_mitglied
+        and not hat_dublette
+        and len(summenzeilen) == 1
         and len(detailzeilen) >= 1
         and len(praefixe) == 1
         and sum(k.betrag_cent for k, _ in detailzeilen) == summenzeilen[0][0].betrag_cent
@@ -635,7 +751,21 @@ def _verarbeite_sd_gruppe(mitglieder: list[tuple[_ZeilenKontext, str, str]]) -> 
         in {k.werte["(Sammel-) Überweisung ID"] for k, _ in detailzeilen}
     )
     if not gueltig:
-        return [_ergebnis_pruefffall(k, _UNVOLLSTAENDIGE_SAMMELGRUPPE_GRUND) for k, _, _ in mitglieder]
+        ergebnisse = []
+        for kontext, marker, _ in mitglieder:
+            if kontext.zeile_nr in dubletten_grund:
+                ergebnisse.append(_ergebnis_pruefffall(kontext, dubletten_grund[kontext.zeile_nr]))
+            elif marker == "KAPUTT":
+                ergebnisse.append(_ergebnis_pruefffall(kontext, _INKONSISTENTES_SAMMELPROFIL_GRUND))
+            elif hat_kaputtes_mitglied or hat_dublette:
+                # Ein ANDERES Mitglied dieser Gruppe wurde als Dublette
+                # oder kaputtes Profil ausgeschlossen - auch die für sich
+                # genommen unauffälligen Mitglieder gelten deshalb als
+                # unvollständige Gruppe, nicht als isoliert bewertbar.
+                ergebnisse.append(_ergebnis_pruefffall(kontext, _GRUPPE_DURCH_AUSSCHLUSS_UNVOLLSTAENDIG_GRUND))
+            else:
+                ergebnisse.append(_ergebnis_pruefffall(kontext, _UNVOLLSTAENDIGE_SAMMELGRUPPE_GRUND))
+        return ergebnisse
 
     ergebnisse = [_ergebnis_kandidat(k) for k, _ in detailzeilen]
     ergebnisse.append(_ergebnis_summenzeile(summenzeilen[0][0], _SAMMEL_SUMME_GRUND))
@@ -678,23 +808,32 @@ def erstelle_preview(
     _pruefe_kein_xlsx(rohbytes)
     text = _dekodiere(rohbytes)
     rohzeilen = _lese_csv_zeilen(text)
+    if not rohzeilen:
+        # Eine Kopfzeile ohne jede Datenzeile ist keine bestätigte
+        # Vollständigkeit ("nichts zu beanstanden") - es gibt schlicht
+        # nichts, das geprüft werden konnte. Genau wie eine vollständig
+        # leere Datei wird das explizit abgelehnt statt stillschweigend
+        # als erfolgreiche (weil leere) Vorschau durchgereicht.
+        raise GeorgeFormatFehlerError(
+            "Datei enthält keine Datenzeilen (nur Kopfzeile); Vollständigkeit kann nicht bestätigt werden."
+        )
 
     ergebnisse_je_zeile: dict[int, GeorgeZeilenErgebnis] = {}
     geprueft: list[_ZeilenKontext] = []
 
-    for zeile_nr, csv_zeile, werte, strukturfehler in rohzeilen:
+    for zeile_nr, csv_zeile, rohfelder, strukturfehler in rohzeilen:
         if strukturfehler is not None:
-            ergebnisse_je_zeile[zeile_nr] = _ergebnis_abgelehnt(zeile_nr, csv_zeile, werte, strukturfehler)
+            ergebnisse_je_zeile[zeile_nr] = _ergebnis_abgelehnt(zeile_nr, csv_zeile, rohfelder, strukturfehler)
             continue
         try:
-            kontext = _validiere_basis(zeile_nr, csv_zeile, werte)
+            kontext = _validiere_basis(zeile_nr, csv_zeile, rohfelder)
         except ValueError as exc:
-            ergebnisse_je_zeile[zeile_nr] = _ergebnis_abgelehnt(zeile_nr, csv_zeile, werte, str(exc))
+            ergebnisse_je_zeile[zeile_nr] = _ergebnis_abgelehnt(zeile_nr, csv_zeile, rohfelder, str(exc))
             continue
 
         if kontext.eigene_iban != erwartetes_konto_iban:
             ergebnisse_je_zeile[zeile_nr] = _ergebnis_abgelehnt(
-                zeile_nr, csv_zeile, werte,
+                zeile_nr, csv_zeile, rohfelder,
                 f"Eigene IBAN '{kontext.eigene_iban}' weicht vom erwarteten Konto "
                 f"'{erwartetes_konto_iban}' ab; für diese Vorschau nicht relevant.",
             )
@@ -709,9 +848,12 @@ def erstelle_preview(
 
         geprueft.append(kontext)
 
-    # Dublettenprüfung 1: identische, brauchbare "Enthaltene Überweisung
-    # ID" auf demselben (bereits auf das erwartete Konto gefilterten)
-    # Kontingent darf nie mehrfach zu einem Kandidaten werden.
+    # --- Dublettenerkennung: liefert nur eine Menge markierter
+    # Zeilennummern -> Gründe, entfernt NICHTS aus der Betrachtung für
+    # die anschließende Sammelgruppen-Analyse (siehe unten) - eine
+    # separat als Dublette erkannte Zeile darf eine verbleibende
+    # Sammelgruppe nicht "zufällig" valide erscheinen lassen. ---
+    dubletten_grund: dict[int, str] = {}
     nach_enthaltener_id: dict[str, list[_ZeilenKontext]] = {}
     ohne_brauchbare_id: list[_ZeilenKontext] = []
     for kontext in geprueft:
@@ -720,20 +862,13 @@ def erstelle_preview(
             nach_enthaltener_id.setdefault(eid, []).append(kontext)
         else:
             ohne_brauchbare_id.append(kontext)
-
-    ueberlebende: list[_ZeilenKontext] = []
     for eid, gruppe in nach_enthaltener_id.items():
         if len(gruppe) > 1:
             for kontext in gruppe:
-                ergebnisse_je_zeile[kontext.zeile_nr] = _ergebnis_pruefffall(
-                    kontext,
+                dubletten_grund[kontext.zeile_nr] = (
                     f"Identische 'Enthaltene Überweisung ID' ({eid}) mehrfach auf demselben Konto; "
-                    "wird nicht automatisch als getrennte Buchungen normalisiert.",
+                    "wird nicht automatisch als getrennte Buchungen normalisiert."
                 )
-        else:
-            ueberlebende.append(gruppe[0])
-
-    # Dublettenprüfung 2: identische Rohdatensätze OHNE brauchbare ID.
     # Zwei echte, unterscheidbare Zahlungen mit zufällig gleichem Betrag
     # bleiben erhalten, solange sich IRGENDEIN Feld unterscheidet - nur
     # ein vollständig identischer Datensatz (alle Spalten) gilt als
@@ -744,41 +879,47 @@ def erstelle_preview(
     for feld_hash, gruppe in nach_inhalt.items():
         if len(gruppe) > 1:
             for kontext in gruppe:
-                ergebnisse_je_zeile[kontext.zeile_nr] = _ergebnis_pruefffall(
-                    kontext,
+                dubletten_grund[kontext.zeile_nr] = (
                     "Identischer Rohdatensatz mehrfach vorhanden, ohne brauchbare eindeutige ID; kann "
-                    "nicht sicher als getrennte Buchungen oder als Wiederholung unterschieden werden.",
+                    "nicht sicher als getrennte Buchungen oder als Wiederholung unterschieden werden."
                 )
-        else:
-            ueberlebende.append(gruppe[0])
 
-    # Sammelgruppen-Analyse (S/D) über die verbleibenden, nicht bereits
-    # als Dublette ausgewiesenen Kontexte.
+    # --- S/D-Sammelgruppen-Zugehörigkeit ÜBER ALLE geprüften Zeilen
+    # bestimmen (unabhängig von obiger Dublettenerkennung). Eine Zeile
+    # mit kaputtem Sammelprofil wird NIE zum gewöhnlichen Einzelumsatz -
+    # sie zählt als Gruppenmitglied ("KAPUTT") und poisoned damit jede
+    # sonst vielleicht zufällig valide erscheinende Restgruppe. ---
     einzel_kontexte: list[_ZeilenKontext] = []
-    sd_gruppen: dict[_GruppenSchluessel, list[tuple[_ZeilenKontext, str, str]]] = {}
-    for kontext in ueberlebende:
-        analyse = _sammel_id_analyse(
-            kontext.werte["Enthaltene Überweisung ID"],
-            iban=kontext.eigene_iban,
-            waehrung=kontext.waehrung,
-            buchungsdatum=kontext.buchungsdatum,
-        )
-        if analyse is None:
+    sd_gruppen: dict[_GruppenSchluessel, list[tuple[_ZeilenKontext, str, str | None]]] = {}
+    for kontext in geprueft:
+        eid = kontext.werte["Enthaltene Überweisung ID"]
+        analyse = _sammel_id_analyse(eid, iban=kontext.eigene_iban, waehrung=kontext.waehrung, buchungsdatum=kontext.buchungsdatum)
+        ist_kaputtes_profil = analyse is None and bool(eid) and _sieht_wie_sammel_id_versuch_aus(eid)
+        if analyse is None and not ist_kaputtes_profil:
             einzel_kontexte.append(kontext)
             continue
-        marker, praefix = analyse
         referenz = kontext.werte["Buchungsreferenz"]
         if not _ist_brauchbarer_schluessel(referenz):
-            ergebnisse_je_zeile[kontext.zeile_nr] = _ergebnis_pruefffall(kontext, _FEHLENDE_REFERENZ_FUER_SD_GRUND)
+            grund = _FEHLENDE_REFERENZ_FUER_SD_GRUND if analyse is not None else _INKONSISTENTES_SAMMELPROFIL_GRUND
+            ergebnisse_je_zeile[kontext.zeile_nr] = _ergebnis_pruefffall(kontext, grund)
             continue
         schluessel = _GruppenSchluessel(kontext.eigene_iban, kontext.waehrung, kontext.buchungsdatum, referenz)
-        sd_gruppen.setdefault(schluessel, []).append((kontext, marker, praefix))
+        if analyse is not None:
+            marker, praefix = analyse
+            sd_gruppen.setdefault(schluessel, []).append((kontext, marker, praefix))
+        else:
+            sd_gruppen.setdefault(schluessel, []).append((kontext, "KAPUTT", None))
 
     for kontext in einzel_kontexte:
-        ergebnisse_je_zeile[kontext.zeile_nr] = _ergebnis_kandidat(kontext)
+        if kontext.zeile_nr in dubletten_grund:
+            ergebnisse_je_zeile[kontext.zeile_nr] = _ergebnis_pruefffall(kontext, dubletten_grund[kontext.zeile_nr])
+        elif not _hat_unabhaengige_identitaet(kontext):
+            ergebnisse_je_zeile[kontext.zeile_nr] = _ergebnis_pruefffall(kontext, _KEINE_UNABHAENGIGE_IDENTITAET_GRUND)
+        else:
+            ergebnisse_je_zeile[kontext.zeile_nr] = _ergebnis_kandidat(kontext)
 
     for mitglieder in sd_gruppen.values():
-        for ergebnis in _verarbeite_sd_gruppe(mitglieder):
+        for ergebnis in _verarbeite_sd_gruppe(mitglieder, dubletten_grund):
             ergebnisse_je_zeile[ergebnis.zeile_nr] = ergebnis
 
     zeilen = tuple(ergebnisse_je_zeile[nr] for nr in sorted(ergebnisse_je_zeile))

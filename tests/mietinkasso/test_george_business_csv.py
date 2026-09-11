@@ -40,6 +40,29 @@ def _sd_id(iban: str, jahr: int, marker: str, praefix: str = "000000001", hash_s
     return f"{iban}{'0' * 14}EUR{praefix}{jahr:04d}{marker}{hash_suffix}"
 
 
+def _sd_id_variante(
+    iban: str,
+    jahr: int,
+    marker: str,
+    *,
+    praefix: str = "000000001",
+    hash_suffix: str | None = None,
+    hash_laenge: int = 56,
+    eingebettetes_konto: str | None = None,
+    waehrung: str = "EUR",
+    padding: str | None = None,
+) -> str:
+    """Wie `_sd_id`, aber erlaubt gezielt EINEN Aspekt des 107-Zeichen-
+    Profils zu verletzen (falsches Konto/Währung/Padding/Jahr/Hex,
+    abgeschnittener Suffix) - für die Regressionstests zu Befund 1
+    (kaputtes Sammelprofil darf nie normaler Einzelumsatz werden)."""
+
+    konto_teil = eingebettetes_konto if eingebettetes_konto is not None else iban
+    padding_teil = padding if padding is not None else "0" * 14
+    suffix = hash_suffix if hash_suffix is not None else "A" * hash_laenge
+    return f"{konto_teil}{padding_teil}{waehrung}{praefix}{jahr:04d}{marker}{suffix}"
+
+
 def _zeile(**overrides: str) -> dict[str, str]:
     basis = {spalte: "" for spalte in ERWARTETE_SPALTEN}
     basis.update(
@@ -137,8 +160,8 @@ def test_feldhash_kollidiert_nicht_bei_feldwerten_mit_kommas_und_gleichheitszeic
     machen - zwei inhaltlich unterschiedliche Zeilen erzeugten denselben
     Hash. Kanonisches JSON (json.dumps) darf das nicht mehr zulassen."""
 
-    zeile_a = _zeile(**{"Partner Name": "alpha,Partner IBAN=beta", "Partner IBAN": "gamma"})
-    zeile_b = _zeile(**{"Partner Name": "alpha", "Partner IBAN": "beta,Partner IBAN=gamma"})
+    zeile_a = _zeile(**{"Partner Name": "alpha,Partner IBAN=beta", "Partner IBAN": "gamma", "Enthaltene Überweisung ID": "ID-A"})
+    zeile_b = _zeile(**{"Partner Name": "alpha", "Partner IBAN": "beta,Partner IBAN=gamma", "Enthaltene Überweisung ID": "ID-B"})
 
     preview = _preview([zeile_a, zeile_b])
     assert len(preview.kandidaten) == 2
@@ -203,7 +226,7 @@ def test_zeile_mit_zu_wenigen_feldern_wird_abgelehnt_ohne_absturz():
 
 
 def test_akzeptiert_bom_komma_und_crlf_zeilenumbrueche():
-    rohbytes = _bytes([_zeile(Betrag="50,00")], bom=True)
+    rohbytes = _bytes([_zeile(Betrag="50,00", **{"Enthaltene Überweisung ID": "REF-BOM-TEST"})], bom=True)
     assert rohbytes.startswith(b"\xef\xbb\xbf")
     preview = erstelle_preview(rohbytes, erwartetes_konto_iban=KONTO_A, von=date(2026, 1, 1), bis=date(2026, 1, 31))
     assert len(preview.zeilen) == 1
@@ -274,8 +297,8 @@ def test_zeile_ausserhalb_des_erwarteten_zeitraums_wird_pruefffall_nicht_kandida
 def test_gleiche_referenz_auf_mehreren_konten_eine_wird_abgelehnt():
     preview = _preview(
         [
-            _zeile(Betrag="-50,00", Buchungsreferenz="REF-SHARED", **{"Eigene IBAN": KONTO_A}),
-            _zeile(Betrag="-50,00", Buchungsreferenz="REF-SHARED", **{"Eigene IBAN": KONTO_B}),
+            _zeile(Betrag="-50,00", Buchungsreferenz="REF-SHARED", **{"Eigene IBAN": KONTO_A, "Enthaltene Überweisung ID": "REF-KONTO-A"}),
+            _zeile(Betrag="-50,00", Buchungsreferenz="REF-SHARED", **{"Eigene IBAN": KONTO_B, "Enthaltene Überweisung ID": "REF-KONTO-B"}),
         ]
     )
     assert len(preview.kandidaten) == 1
@@ -288,27 +311,49 @@ def test_gleiche_referenz_auf_mehreren_konten_eine_wird_abgelehnt():
 # ---------------------------------------------------------------------------
 
 
-def test_einfacher_einzelumsatz_ohne_sammel_id_wird_kandidat():
+def test_einzelumsatz_mit_echter_id_wird_kandidat():
     preview = _preview(
-        [_zeile(Betrag="-45,50", **{"(Sammel-) Überweisung ID": "", "Enthaltene Überweisung ID": ""})]
+        [_zeile(Betrag="-45,50", **{"(Sammel-) Überweisung ID": "", "Enthaltene Überweisung ID": "REF-EINZEL-001"})]
     )
     assert len(preview.kandidaten) == 1
     kandidat = preview.kandidaten[0].kandidat
     assert kandidat.betrag_cent == -4_550
     assert kandidat.sammel_id is None
-    assert kandidat.enthaltene_id is None
+    assert kandidat.enthaltene_id == "REF-EINZEL-001"
+
+
+def test_zeile_ohne_jede_id_wird_nie_automatischer_kandidat():
+    """Nach unabhängiger Gegenprobe verschärft: fehlen SOWOHL 'Enthaltene
+    Überweisung ID' ALS AUCH '(Sammel-) Überweisung ID' (leer oder
+    NOTPROVIDED), gibt es keine unabhängig eindeutige Identität - eine
+    Buchungsreferenz allein reicht nicht. Gilt unabhängig von der
+    Zeilenanzahl der Datei; frühere Erwartung (automatischer Kandidat)
+    war zu lax und wurde entsprechend korrigiert."""
+
+    preview = _preview(
+        [_zeile(Betrag="-45,50", **{"(Sammel-) Überweisung ID": "", "Enthaltene Überweisung ID": ""})]
+    )
+    assert preview.kandidaten == []
+    assert len(preview.pruefffaelle) == 1
 
 
 def test_leere_und_notprovided_id_werden_nicht_als_eindeutiger_schluessel_verwendet():
+    """Nach unabhängiger Gegenprobe verschärft: beide Zeilen haben weder
+    eine brauchbare 'Enthaltene Überweisung ID' noch eine brauchbare
+    '(Sammel-) Überweisung ID' (NOTPROVIDED zählt nicht) - keine wird
+    automatischer Kandidat. Der ursprüngliche Kern der Regression bleibt
+    aber bestätigt: NOTPROVIDED führt NICHT dazu, dass beide Zeilen zu
+    EINEM Ergebnis zusammengelegt werden - es bleiben zwei getrennte
+    Prüffälle, keine stille Verschmelzung."""
+
     preview = _preview(
         [
             _zeile(Betrag="-10,00", Buchungsreferenz="NOTPROVIDED", **{"Enthaltene Überweisung ID": ""}),
             _zeile(Betrag="-20,00", Buchungsreferenz="NOTPROVIDED", **{"Enthaltene Überweisung ID": ""}),
         ]
     )
-    assert len(preview.kandidaten) == 2
-    betraege = sorted(k.kandidat.betrag_cent for k in preview.kandidaten)
-    assert betraege == [-2_000, -1_000]
+    assert preview.kandidaten == []
+    assert len(preview.pruefffaelle) == 2
 
 
 def test_id_ausserhalb_des_107_zeichen_profils_wird_nie_als_sd_geraten():
@@ -350,8 +395,8 @@ def test_identische_rohdatensaetze_ohne_brauchbare_id_werden_pruefffall():
 def test_unterscheidbare_echte_zahlungen_mit_gleicher_summe_bleiben_getrennt():
     preview = _preview(
         [
-            _zeile(Betrag="-50,00", Buchungsreferenz="REF-001", Zahlungsreferenz="Miete Jaenner"),
-            _zeile(Betrag="-50,00", Buchungsreferenz="REF-002", Zahlungsreferenz="Miete Jaenner"),
+            _zeile(Betrag="-50,00", Buchungsreferenz="REF-001", Zahlungsreferenz="Miete Jaenner", **{"Enthaltene Überweisung ID": "REF-001-ID"}),
+            _zeile(Betrag="-50,00", Buchungsreferenz="REF-002", Zahlungsreferenz="Miete Jaenner", **{"Enthaltene Überweisung ID": "REF-002-ID"}),
         ]
     )
     assert len(preview.kandidaten) == 2
@@ -359,14 +404,15 @@ def test_unterscheidbare_echte_zahlungen_mit_gleicher_summe_bleiben_getrennt():
 
 
 def test_kandidaten_id_bleibt_bei_dateireihenfolgeaenderung_stabil():
-    zeile_a = _zeile(Betrag="-10,00", Buchungsreferenz="REF-A")
-    zeile_b = _zeile(Betrag="-20,00", Buchungsreferenz="REF-B")
+    zeile_a = _zeile(Betrag="-10,00", Buchungsreferenz="REF-A", **{"Enthaltene Überweisung ID": "REF-A-ID"})
+    zeile_b = _zeile(Betrag="-20,00", Buchungsreferenz="REF-B", **{"Enthaltene Überweisung ID": "REF-B-ID"})
 
     vorwaerts = _preview([zeile_a, zeile_b])
     rueckwaerts = _preview([zeile_b, zeile_a])
 
     ids_vorwaerts = {k.kandidat.kandidaten_id for k in vorwaerts.kandidaten}
     ids_rueckwaerts = {k.kandidat.kandidaten_id for k in rueckwaerts.kandidaten}
+    assert len(ids_vorwaerts) == 2
     assert ids_vorwaerts == ids_rueckwaerts
 
 
@@ -649,7 +695,7 @@ def test_verschiedene_konten_mit_gleicher_referenz_bleiben_getrennt():
 
 
 def test_saldenkontrolle_nur_wenn_beide_werte_angegeben():
-    zeilen = [_zeile(Betrag="100,00")]
+    zeilen = [_zeile(Betrag="100,00", **{"Enthaltene Überweisung ID": "REF-SALDO-001"})]
     ohne_saldo = _preview(zeilen)
     assert ohne_saldo.saldo_kontrolle is None
 
@@ -747,3 +793,154 @@ def test_erstelle_preview_signatur_verlangt_kein_db_argument():
     for name in parameter:
         assert "session" not in name.lower()
         assert "repo" not in name.lower()
+
+
+# ---------------------------------------------------------------------------
+# Befund 1 (2. Runde): kaputtes/inkonsistentes Sammelprofil darf NIE
+# stillschweigend wie ein normaler Einzelumsatz durchgereicht werden.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kaputte_id",
+    [
+        pytest.param(_sd_id_variante(KONTO_A, 2025, "D"), id="falsches_jahr"),
+        pytest.param(_sd_id_variante(KONTO_A, 2026, "D", eingebettetes_konto=KONTO_B), id="falsches_konto"),
+        pytest.param(_sd_id_variante(KONTO_A, 2026, "D", waehrung="USD"), id="falsche_waehrung"),
+        pytest.param(_sd_id_variante(KONTO_A, 2026, "D", padding="1" * 14), id="falsches_padding"),
+        pytest.param(_sd_id_variante(KONTO_A, 2026, "D", hash_suffix="G" * 56), id="ungueltiges_hex"),
+        pytest.param(_sd_id_variante(KONTO_A, 2026, "D", hash_laenge=20), id="abgeschnittener_suffix"),
+    ],
+)
+def test_kaputtes_sammelprofil_wird_nie_stillschweigend_normaler_einzelumsatz(kaputte_id):
+    """Konkrete Regression: eine isolierte 107-Zeichen-D-ID mit falschem
+    Jahr (07.09.2026 vs. eingebettetem 2025) - sowie Varianten mit
+    falschem Konto/Währung/Padding/Hex/abgeschnittenem Suffix - wurden
+    zuvor als gewöhnlicher Einzelumsatz akzeptiert, weil
+    `_sammel_id_analyse` None lieferte und das direkt als "andere ID"
+    gewertet wurde. Jetzt: lang genug für einen Profilversuch -> Prüffall,
+    nie ein normaler Kandidat."""
+
+    preview = _preview(
+        [_zeile(Betrag="-30,00", Buchungsreferenz="EGAL", **{"Enthaltene Überweisung ID": kaputte_id})],
+        von=date(2026, 9, 1),
+        bis=date(2026, 9, 30),
+    )
+    assert preview.kandidaten == []
+    assert len(preview.pruefffaelle) == 1
+
+
+def test_kaputtes_gruppenmitglied_poisoned_sonst_valide_erscheinende_restgruppe():
+    """Ohne D1(-80) + S(-80) allein würde die Gruppe valide erscheinen
+    (Summe stimmt exakt) - aber ein drittes Mitglied mit kaputtem Profil
+    (gleiches Konto/Währung/Datum/Referenz) darf nicht einfach aus der
+    Gruppenprüfung verschwinden, während die übrigen zufällig aufgehen."""
+
+    referenz = "SAMMEL-POISON"
+    zeilen = [
+        _zeile(
+            Betrag="-80,00",
+            Buchungsreferenz=referenz,
+            **{
+                "(Sammel-) Überweisung ID": "ID-1",
+                "Enthaltene Überweisung ID": _sd_id(KONTO_A, 2026, "D", hash_suffix="A" * 56),
+            },
+        ),
+        _zeile(
+            Betrag="-999,00",
+            Buchungsreferenz=referenz,
+            **{
+                "(Sammel-) Überweisung ID": "ID-2",
+                "Enthaltene Überweisung ID": _sd_id_variante(KONTO_A, 2026, "D", waehrung="USD"),
+            },
+        ),
+        _zeile(
+            Betrag="-80,00",
+            Buchungsreferenz=referenz,
+            **{
+                "(Sammel-) Überweisung ID": "ID-1",
+                "Enthaltene Überweisung ID": _sd_id(KONTO_A, 2026, "S", hash_suffix="C" * 56),
+            },
+        ),
+    ]
+    preview = _preview(zeilen)
+    assert preview.kandidaten == []
+    assert preview.sammel_summen == []
+    assert len(preview.pruefffaelle) == 3
+
+
+def test_zu_kurze_id_bleibt_andersartiges_einzelumsatz_format():
+    """Gegenprobe zu obigen Tests: eine ID, die klar zu KURZ für einen
+    Profilversuch ist (typisches anderes, opakes Einzelumsatz-Format),
+    bleibt weiterhin ein gewöhnlicher Kandidat."""
+
+    preview = _preview([_zeile(Betrag="-30,00", **{"Enthaltene Überweisung ID": "REF-12345"})])
+    assert len(preview.kandidaten) == 1
+
+
+# ---------------------------------------------------------------------------
+# Befund 2 (2. Runde): leere Datenmenge ist keine bestätigte Vollständigkeit.
+# ---------------------------------------------------------------------------
+
+
+def test_datei_ohne_datenzeilen_wird_abgelehnt_statt_stillschweigend_vollstaendig():
+    kopf = ",".join(f'"{s}"' for s in ERWARTETE_SPALTEN)
+    text = kopf + "\r\n"
+    with pytest.raises(GeorgeFormatFehlerError):
+        erstelle_preview(text.encode("utf-8"), erwartetes_konto_iban=KONTO_A, von=date(2026, 1, 1), bis=date(2026, 1, 31))
+
+
+def test_datei_mit_nur_leerzeilen_nach_kopfzeile_wird_ebenfalls_abgelehnt():
+    kopf = ",".join(f'"{s}"' for s in ERWARTETE_SPALTEN)
+    text = kopf + "\r\n\r\n\r\n"
+    with pytest.raises(GeorgeFormatFehlerError):
+        erstelle_preview(text.encode("utf-8"), erwartetes_konto_iban=KONTO_A, von=date(2026, 1, 1), bis=date(2026, 1, 31))
+
+
+# ---------------------------------------------------------------------------
+# Befund 3 (2. Runde): felder/sha256_zeile aus exakten dekodierten Werten,
+# Normalisierung (Konto/Datum/Betrag) getrennt davon.
+# ---------------------------------------------------------------------------
+
+
+def test_felder_und_hash_bewahren_originale_leerzeichen_normalisierung_ist_getrennt():
+    zeile = _zeile(Betrag="  50,00  ", **{"Eigene IBAN": f"  {KONTO_A}  ", "Enthaltene Überweisung ID": "REF-WHITESPACE"})
+    preview = _preview([zeile])
+    ergebnis = preview.zeilen[0]
+
+    assert ergebnis.status == "KANDIDAT"
+    # Fachlogik nutzt eine NORMALISIERTE (getrimmte) Kopie:
+    assert ergebnis.kandidat.betrag_cent == 5_000
+    assert ergebnis.kandidat.eigene_iban == KONTO_A
+    # Audit-Trail (felder/Hash) bewahrt die EXAKTEN Originalwerte:
+    assert ergebnis.felder["Betrag"] == "  50,00  "
+    assert ergebnis.felder["Eigene IBAN"] == f"  {KONTO_A}  "
+
+
+def test_feldhash_unterscheidet_originale_mit_unterschiedlichen_leerzeichen():
+    """Regression: wurde vorher blind gestrippt, bevor Feld/Hash gebildet
+    wurden - zwei Originalzeilen, die sich NUR durch Leerraum
+    unterscheiden, ergaben denselben Hash."""
+
+    zeile_a = _zeile(Betrag="50,00", **{"Enthaltene Überweisung ID": "REF-LEERRAUM-A"})
+    zeile_b = _zeile(Betrag=" 50,00 ", **{"Enthaltene Überweisung ID": "REF-LEERRAUM-B"})
+    preview = _preview([zeile_a, zeile_b])
+    assert len(preview.kandidaten) == 2
+    hashes = {z.sha256_zeile for z in preview.kandidaten}
+    assert len(hashes) == 2
+
+
+# ---------------------------------------------------------------------------
+# Befund 4 (2. Runde): CLI/Modell dürfen "Saldenkontrolle OK" nie vor dem
+# Gesamtstatus VOLLSTÄNDIG zeigen (siehe auch test_george_business_preview_cli.py).
+# ---------------------------------------------------------------------------
+
+
+def test_vollstaendig_bleibt_false_bei_rein_rechnerisch_passender_saldenkontrolle_trotz_kaputtem_profil():
+    preview = _preview(
+        [_zeile(Betrag="-30,00", Buchungsreferenz="EGAL", **{"Enthaltene Überweisung ID": _sd_id_variante(KONTO_A, 2025, "D")})],
+        anfangssaldo_cent=0,
+        endsaldo_cent=0,
+    )
+    assert preview.saldo_kontrolle.stimmt_ueberein is True
+    assert preview.vollstaendig is False
