@@ -215,9 +215,11 @@ class OPService:
         aenderungsgrund: str,
         neuer_betrag_cent: int | None = None,
         neue_faelligkeit: date | None = None,
+        heute: date | None = None,
     ) -> OPPositionTable | None:
         require_gesellschaft_access(ctx, konto.gesellschaft_id)
         require_schreibrecht(ctx)
+        heute = heute or date.today()
         original = self._op_repository.get(original_id)
         if original is None or original.konto_id != konto.id:
             raise ValueError(f"OPPosition {original_id} gehört nicht zu Konto {konto.id}")
@@ -229,7 +231,7 @@ class OPService:
                 betrag_cent=neuer_betrag_cent,
                 leistungsperiode=original.leistungsperiode,
                 belegdatum=original.belegdatum,
-                buchungsdatum=date.today(),
+                buchungsdatum=heute,
                 faelligkeit=neue_faelligkeit if neue_faelligkeit is not None else original.faelligkeit,
                 faelligkeit_bekannt=(neue_faelligkeit or original.faelligkeit) is not None,
                 beleg_referenz=f"Korrektur zu #{original.id}: {original.beleg_referenz}",
@@ -248,11 +250,22 @@ class OPService:
             positionen = [p for p in positionen if p.buchungsdatum <= stichtag]
         saldo_cent = sum(_effect_cent(p) for p in positionen)
         heute = stichtag or date.today()
-        faellig_rest = sum(
-            _effect_cent(p)
-            for p in positionen
-            if p.faelligkeit_bekannt and p.faelligkeit is not None and p.faelligkeit <= heute
-        )
+
+        # Der "fällige unstrittige Rest" ist die Teilmenge des Saldos, die
+        # bemahnt werden darf: Forderungen (Eröffnung/Soll/Rücklastschrift)
+        # zählen nur mit bekannter, bereits verstrichener Fälligkeit
+        # ("Saldo ohne bekannte Fälligkeit sichtbar, aber nicht automatisch
+        # mahnen"). Zahlungen und Gutschriften mindern die Forderung immer,
+        # sobald sie gebucht sind - eine Zahlung hat selbst keine eigene
+        # Fälligkeit und darf dafür nicht ausgeschlossen werden.
+        faellig_rest = 0
+        for position in positionen:
+            typ = OPTyp(position.typ)
+            if typ in (OPTyp.GUTSCHRIFT, OPTyp.ZAHLUNG, OPTyp.KORREKTUR):
+                faellig_rest += _effect_cent(position)
+            elif position.faelligkeit_bekannt and position.faelligkeit is not None and position.faelligkeit <= heute:
+                faellig_rest += _effect_cent(position)
+
         return OPSaldo(
             konto_id=konto_id,
             saldo_cent=saldo_cent,

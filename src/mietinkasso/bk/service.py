@@ -14,12 +14,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.bk.repository import BKRepository
 from mietinkasso.domain.enums import BKAbrechnungStatus, BKPositionsart, OPTyp
-from mietinkasso.domain.money import round_money_half_up, to_cents
 from mietinkasso.infrastructure.db.tables import BKVertragsAnteilTable
 from mietinkasso.op.service import OPService
 
@@ -70,7 +69,10 @@ class BKService:
         umlagefaehig_cent = self.umlagefaehige_summe_cent(bk_abrechnung_id)
         ergebnisse = []
         for eingabe in eingaben:
-            umlage_cent = to_cents(round_money_half_up(Decimal(umlagefaehig_cent) * eingabe.anteil_prozent / 100))
+            umlage_cent_decimal = (Decimal(umlagefaehig_cent) * eingabe.anteil_prozent / 100).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+            umlage_cent = int(umlage_cent_decimal)
             ergebnis_cent = umlage_cent - eingabe.vorauszahlung_cent
             anteil = BKVertragsAnteilTable(
                 bk_abrechnung_id=bk_abrechnung_id,
@@ -89,7 +91,9 @@ class BKService:
     def freigeben(self, bk_abrechnung_id: int):
         return self._repository.set_status(bk_abrechnung_id, BKAbrechnungStatus.FREIGEGEBEN.value)
 
-    def ergebnisse_buchen(self, *, ctx: AuthContext, bk_abrechnung_id: int, konten_je_vertrag: dict[str, object]):
+    def ergebnisse_buchen(
+        self, *, ctx: AuthContext, bk_abrechnung_id: int, konten_je_vertrag: dict[str, object], heute: date | None = None
+    ):
         """`konten_je_vertrag` mappt vertrag_id -> KontoTable. Bucht je Anteil
         eine Nachbelastung (SOLL) oder Gutschrift (GUTSCHRIFT); nur möglich,
         wenn die Abrechnung FREIGEGEBEN ist."""
@@ -103,7 +107,7 @@ class BKService:
                 "eine Nachbelastung/Gutschrift darf erst nach FREIGEGEBEN gebucht werden."
             )
         gebuchte = []
-        heute = date.today()
+        heute = heute or date.today()
         for anteil in self._repository.list_anteile(bk_abrechnung_id):
             konto = konten_je_vertrag[anteil.vertrag_id]
             require_gesellschaft_access(ctx, konto.gesellschaft_id)

@@ -1,7 +1,8 @@
 # Offene Punkte — Mietinkasso-Modul
 
-Stand: Zwischen-Checkpoint (siehe REVIEW_ZUSAMMENFASSUNG.md für Baustand).
-Diese Liste wird bis zur finalen Übergabe weitergeführt.
+Stand: erste Lieferung (siehe REVIEW_ZUSAMMENFASSUNG.md für Baustand).
+Alles hier ist bewusst offen gelassen bzw. bewusst konservativ gebaut —
+keine stillschweigend übersprungenen Punkte.
 
 ## Integration / Betrieb
 
@@ -62,11 +63,28 @@ Diese Liste wird bis zur finalen Übergabe weitergeführt.
   diese sind vor Aktivierung von `SEND_ENABLED=true` fachlich
   freizugeben.
 
+- **Zinslisten-Import:** kein automatischer CSV/Excel-Parser für
+  `VertragsKomponenteTable` (HMZ/Küche/Parkplatz/BK-VZ/...); siehe
+  `importtemplates/README.md`. `StammdatenRepository.add_komponente`
+  nimmt die Felder bereits programmatisch entgegen, ein Parserlayer für
+  das reale Format fehlt bewusst, bis das Quellenmapping steht.
+
 ## Technisch (nächste Ausbaustufe, nicht MVP1-blockierend)
 
 - Kein REST/HTML-Frontend mit Authentifizierung, nur ein minimales
-  Read-Only-Dashboard (siehe `api/app.py`).
+  Read-Only-Dashboard (siehe `api/app.py`). Schreibende HTTP-Endpunkte
+  existieren absichtlich nicht.
+- `api/app.py` hat keine automatisierten HTTP-Tests: `fastapi.testclient.TestClient`
+  bräuchte `httpx` als zusätzliche Abhängigkeit, die hier nicht
+  eingeführt wurde. Stattdessen manuell smoke-getestet (`/health`, `/`,
+  Routing-Tabelle) gegen eine echte SQLite-DB. Sollte vor einem
+  produktiven Einsatz um echte HTTP-Tests ergänzt werden.
 - Keine Observability (Metriken/Alerting) über structlog hinaus.
 - SQLite als Default-URL für Entwicklung/Tests; PostgreSQL wird über
   `MIETINKASSO_DATABASE_URL` unterstützt (SQLAlchemy-Engine ist
   DB-agnostisch), aber nicht gegen ein echtes Postgres getestet.
+- `JobRunner` (generische Job-Sperre) ist ein Zusatzbaustein für Jobs
+  ohne natürliche Eindeutigkeit; die eigentliche Doppel-Buchungs-/
+  Doppel-Versand-Sicherheit kommt aus den DB-Unique-Constraints in
+  `vorschreibungen` (Vertrag+Monat) und `mahn_faelle` (outbox_key) plus
+  dem atomaren Compare-and-Swap in `MahnFallRepository.claim_fuer_versand`.

@@ -66,10 +66,11 @@ class VorschreibungService:
         return VorschreibungsErgebnis(vorschreibung_id=vorschreibung.id, status=vorschreibung.status, summe_cent=summe)
 
     def sollstellen(
-        self, *, ctx: AuthContext, vertrag: VertragTable, konto: KontoTable, monat: str
+        self, *, ctx: AuthContext, vertrag: VertragTable, konto: KontoTable, monat: str, heute: date | None = None
     ) -> VorschreibungsErgebnis:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
+        heute = heute or date.today()
         vorschreibung = self._repository.get(vertrag.id, monat)
         if vorschreibung is None:
             raise ValueError(f"Kein Entwurf für Vertrag {vertrag.id} / {monat} vorhanden.")
@@ -82,7 +83,7 @@ class VorschreibungService:
                 typ=OPTyp.SOLL,
                 betrag_cent=summe,
                 belegdatum=vorschreibung.faelligkeit,
-                buchungsdatum=date.today(),
+                buchungsdatum=heute,
                 faelligkeit=vorschreibung.faelligkeit,
                 beleg_referenz=f"Vorschreibung {monat}",
                 leistungsperiode=monat,

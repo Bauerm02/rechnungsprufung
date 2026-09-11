@@ -198,6 +198,10 @@ class StammdatenRepository:
             )
             session.commit()
 
+    def get_komponente(self, id: str) -> VertragsKomponenteTable | None:
+        with self._session_factory() as session:
+            return session.get(VertragsKomponenteTable, id)
+
     def list_aktive_komponenten(self, vertrag_id: str, stichtag: date) -> list[VertragsKomponenteTable]:
         with self._session_factory() as session:
             statement = (

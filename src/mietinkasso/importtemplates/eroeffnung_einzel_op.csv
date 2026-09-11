@@ -1,0 +1,3 @@
+konto_id,modus,typ,betrag,stichtag,belegdatum,faelligkeit,import_id,beleg_referenz
+KTO-V-616-1,EINZEL_OP,SOLL,480.00,2026-08-31,2026-07-01,2026-07-05,JOURNAL-KTO-V-616-1-2026-07,Miete Juli laut Journal (offen)
+KTO-V-616-1,EINZEL_OP,ZAHLUNG,200.00,2026-08-31,2026-07-15,,JOURNAL-KTO-V-616-1-2026-07-ZLG1,Teilzahlung laut Journal
