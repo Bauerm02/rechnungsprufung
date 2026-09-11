@@ -63,7 +63,7 @@ def test_standardfunktionen_laufen_komplett_ohne_ki_key(session_factory, stammda
     stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
     stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")
     stammdaten_repo.upsert_einheit(id="601-TOP9", objekt_id="601", bezeichnung="Top 9", nutzungsstatus="DAUERVERMIETUNG")
-    stammdaten_repo.upsert_debitor(id="DEB-9", name="Ohne-KI Mieterin")
+    stammdaten_repo.upsert_debitor(id="DEB-9", name="Ohne-KI Mieterin", email="ohne-ki@example.test")
     stammdaten_repo.upsert_vertrag(
         id="V-601-9", einheit_id="601-TOP9", debitor_id="DEB-9", gesellschaft_id="7DI",
         rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
@@ -80,7 +80,9 @@ def test_standardfunktionen_laufen_komplett_ohne_ki_key(session_factory, stammda
     bank_repo = BankRepository(session_factory)
     bank_service = BankImportService(bank_repo, stammdaten_repo, op_service)
     mahn_policy_repo = MahnPolicyRepository(session_factory)
-    mahn_service = MahnwesenService(MahnFallRepository(session_factory), stammdaten_repo, op_service)
+    mahn_service = MahnwesenService(
+        MahnFallRepository(session_factory), stammdaten_repo, op_service, mahn_policy_repo,
+    )
 
     ctx = ctx_factory("7DI")
     vorschreibung_service.entwurf_erstellen(ctx=ctx, vertrag=vertrag, monat="2026-04")
@@ -99,7 +101,7 @@ def test_standardfunktionen_laufen_komplett_ohne_ki_key(session_factory, stammda
     forderung = op_service.offene_forderungen(konto.id, heute=date(2026, 4, 20))[0]
     ergebnis = mahn_service.plane_forderung(
         ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung, policy=policy,
-        heute=date(2026, 4, 20), bank_stand_alter_tage=0,
+        heute=date(2026, 4, 20), bank_bestaetigt_bis=date(2026, 4, 20),
     )
 
     # 600,00 Soll - 300,00 Zahlung = 300,00 offen -> Stufe 1 wird geplant, alles ohne einen einzigen KI-Aufruf

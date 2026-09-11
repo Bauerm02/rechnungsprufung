@@ -70,6 +70,7 @@ class IndexService:
         basis_wert: Decimal,
         basis_monat: str,
         schwelle_prozent: Decimal = Decimal("0"),
+        schwelle_inklusive: bool = True,
         daempfung_prozent: Decimal | None = None,
         vertragliche_grenze_prozent: Decimal | None = None,
         indexierbare_komponenten: list[str] | None = None,
@@ -78,6 +79,7 @@ class IndexService:
         vertrag = self._vertrag_oder_fehler(vertrag_id)
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
+        self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag_id)
         version = self._repository.naechste_version(vertrag_id)
         klausel = IndexKlauselTable(
             vertrag_id=vertrag_id,
@@ -90,6 +92,7 @@ class IndexService:
             basis_wert=basis_wert,
             basis_monat=basis_monat,
             schwelle_prozent=schwelle_prozent,
+            schwelle_inklusive=schwelle_inklusive,
             daempfung_prozent=daempfung_prozent,
             vertragliche_grenze_prozent=vertragliche_grenze_prozent,
             indexierbare_komponenten=list(indexierbare_komponenten or []),
@@ -118,6 +121,7 @@ class IndexService:
         vertrag = self._vertrag_oder_fehler(vertrag_id)
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
+        self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag_id)
 
         klausel = self._repository.freigegebene_klausel(vertrag_id)
         if klausel is None:
@@ -144,10 +148,15 @@ class IndexService:
 
         # Schwelle wirkt auf den BETRAG der Veränderung (Betragsschwelle
         # absolut, nicht gerichtet): eine Senkung um 5% ist bei Schwelle 3%
-        # genauso wirksam wie eine Erhöhung um 5%. Inklusive Grenze: EXAKT
-        # die Schwelle löst bereits aus ("ab X%"), erst darunter (echt
-        # kleiner) wird auf 0 gekappt.
-        if abs(effektive_veraenderung) < klausel.schwelle_prozent:
+        # genauso wirksam wie eine Erhöhung um 5%. Inklusive/exklusive
+        # Grenze ist eine explizite Vertragsklausel: "ab X%" (inklusive)
+        # löst schon EXAKT bei der Schwelle aus, "über X%" (exklusiv)
+        # erst STRIKT darüber - viele reale Verträge verlangen Letzteres.
+        if klausel.schwelle_inklusive:
+            unterhalb_schwelle = abs(effektive_veraenderung) < klausel.schwelle_prozent
+        else:
+            unterhalb_schwelle = abs(effektive_veraenderung) <= klausel.schwelle_prozent
+        if unterhalb_schwelle:
             effektive_veraenderung = Decimal("0")
 
         indexierbare_basis_cent = self._indexierbare_basis_cent(vertrag_id, klausel, stichtag)
@@ -172,6 +181,7 @@ class IndexService:
                 "effektive_veraenderung_prozent": str(effektive_veraenderung),
                 "indexierbare_basis_cent": indexierbare_basis_cent,
                 "schwelle_prozent": str(klausel.schwelle_prozent),
+                "schwelle_inklusive": klausel.schwelle_inklusive,
                 "daempfung_prozent": str(klausel.daempfung_prozent) if klausel.daempfung_prozent is not None else None,
             },
         )

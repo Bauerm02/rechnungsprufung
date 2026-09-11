@@ -7,18 +7,25 @@ Ganzes. Ein neuer Rückstand (eine neue Forderung) beginnt seinen eigenen
 Zyklus, unabhängig davon, wie weit ältere Forderungen desselben Vertrags
 schon gediehen sind - die Nettosumme des Kontos ist keine Mahngrundlage.
 
-Ablauf: `plane_forderung()` prüft Sperren, Bankfrische, Policy-Freigabe,
-Wartefristen (Stufe1 X Tage nach Fälligkeit; Stufe2 erst nach gesendeter
-Stufe1 plus Mindestabstand) und legt bei Bedarf einen GEPLANT-Fall an
-(idempotent über outbox_key). `versenden()` lädt Vertrag/Konto/Policy
-serverseitig frisch nach (nie den Aufrufer-Objekten vertrauen), prüft
-UNMITTELBAR vor dem eigentlichen Versand nochmal ALLES (Sperren, frischer
-Bankstand, ob GENAU DIESE Forderung noch in mindestens der geplanten Höhe
-offen ist) und claimt den Fall atomar (GEPLANT->IN_VERSAND), bevor der
-Versand-Provider aufgerufen wird. Ein Provider-Timeout landet in
-UNSICHER und wird nie automatisch erneut versucht; ein Absturz zwischen
-Claim und Ergebnis bleibt IN_VERSAND und wird nur über die explizite
-Recovery-Funktion aufgelöst, nie automatisch erneut angestoßen.
+Ablauf: `plane_forderung()` prüft Sperren, eine BESTÄTIGTE
+Bankvollständigkeit (nicht bloß das Datum der letzten importierten
+Zeile - das beweist nur, dass irgendeine Zeile existiert, nicht dass der
+Import lückenlos war), ungeklärte/teilzugeordnete Bankeingänge, die
+diesen Vertrag betreffen, Policy-Freigabe, einen hinterlegten Empfänger
+und Wartefristen (Stufe1 X Tage nach Fälligkeit; Stufe2 erst nach
+gesendeter Stufe1 plus Mindestabstand) und legt bei Bedarf einen
+GEPLANT-Fall an (idempotent über outbox_key). `versenden()` lädt
+Vertrag/Konto/Policy/Empfänger serverseitig frisch nach (nie den
+Aufrufer-Objekten oder dem alten Planungs-Snapshot vertrauen), prüft
+UNMITTELBAR vor dem eigentlichen Versand nochmal ALLES (Sperren,
+Objektausschluss, frische Bankbestätigung, ungeklärte Eingänge, ob die
+Policy noch dieselbe freigegebene Version ist, ob GENAU DIESE Forderung
+noch in mindestens der geplanten Höhe offen ist) und claimt den Fall
+atomar (GEPLANT->IN_VERSAND), bevor der Versand-Provider aufgerufen
+wird. Ein Provider-Timeout landet in UNSICHER und wird nie automatisch
+erneut versucht; ein Absturz zwischen Claim und Ergebnis bleibt
+IN_VERSAND und wird nur über die explizite Recovery-Funktion aufgelöst,
+nie automatisch erneut angestoßen.
 """
 
 from __future__ import annotations
@@ -31,7 +38,7 @@ from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, r
 from mietinkasso.domain.enums import MahnStatus, MahnStufe
 from mietinkasso.domain.exceptions import BindungInkonsistentError, MahnstufeReihenfolgeError
 from mietinkasso.infrastructure.db.tables import KontoTable, MahnFallTable, MahnPolicyTable, VertragTable
-from mietinkasso.mahnwesen.repository import MahnFallRepository
+from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
 from mietinkasso.op.service import OffeneForderung, OPService, compute_content_hash
 from mietinkasso.stammdaten.repository import StammdatenRepository
 
@@ -78,12 +85,14 @@ class MahnwesenService:
         repository: MahnFallRepository,
         stammdaten_repository: StammdatenRepository,
         op_service: OPService,
+        mahn_policy_repository: MahnPolicyRepository,
         *,
         bank_stand_max_age_days: int = 2,
     ):
         self._repository = repository
         self._stammdaten_repository = stammdaten_repository
         self._op_service = op_service
+        self._mahn_policy_repository = mahn_policy_repository
         self._bank_stand_max_age_days = bank_stand_max_age_days
 
     def _naechste_stufe_fuer_forderung(self, forderung_op_position_id: int) -> MahnStufe | None:
@@ -98,6 +107,11 @@ class MahnwesenService:
             return None  # nach Stufe 2 nur noch interner Bearbeitungsfall
         return MahnStufe.STUFE_1
 
+    def _bankstand_veraltet(self, *, heute: date, bank_bestaetigt_bis: date | None) -> bool:
+        if bank_bestaetigt_bis is None:
+            return True
+        return (heute - bank_bestaetigt_bis).days > self._bank_stand_max_age_days
+
     def plane_forderung(
         self,
         *,
@@ -107,12 +121,14 @@ class MahnwesenService:
         forderung: OffeneForderung,
         policy: MahnPolicyTable,
         heute: date,
-        bank_stand_alter_tage: int | None,
+        bank_bestaetigt_bis: date | None,
+        ungeklaerte_eingaenge_vorhanden: bool = False,
     ) -> PlanungsErgebnis:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
         if konto.vertrag_id != vertrag.id:
             raise BindungInkonsistentError(f"Konto {konto.id} gehört nicht zu Vertrag {vertrag.id}.")
+        self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
         if policy.status != "FREIGEGEBEN":
             raise PolicyNichtFreigegebenError(
                 f"MahnPolicy Version {policy.version} ist im Status {policy.status}; nur eine FREIGEGEBENE "
@@ -124,10 +140,25 @@ class MahnwesenService:
             gruende = ", ".join(s.grund for s in aktive_sperren)
             return PlanungsErgebnis("BLOCKIERT", None, None, forderung.op_position_id, f"Aktive Sperre(n): {gruende}")
 
-        if bank_stand_alter_tage is None or bank_stand_alter_tage > self._bank_stand_max_age_days:
+        if self._bankstand_veraltet(heute=heute, bank_bestaetigt_bis=bank_bestaetigt_bis):
             return PlanungsErgebnis(
                 "BLOCKIERT", None, None, forderung.op_position_id,
-                f"Bankstand veraltet oder unbekannt (Alter: {bank_stand_alter_tage}, max {self._bank_stand_max_age_days} Tage).",
+                f"Keine ausreichend aktuelle BESTÄTIGTE Bankvollständigkeit vorhanden "
+                f"(bestätigt bis: {bank_bestaetigt_bis}, max {self._bank_stand_max_age_days} Tage alt). "
+                "Das Datum der letzten importierten Zeile allein beweist keine Vollständigkeit.",
+            )
+        if ungeklaerte_eingaenge_vorhanden:
+            return PlanungsErgebnis(
+                "BLOCKIERT", None, None, forderung.op_position_id,
+                "Es gibt ungeklärte oder nur teilzugeordnete Bankeingänge, die diesen Vertrag betreffen "
+                "könnten; Mahnung bleibt geschlossen, bis das aufgeklärt ist.",
+            )
+
+        debitor = self._stammdaten_repository.get_debitor(konto.debitor_id)
+        if debitor is None or not (debitor.email or "").strip():
+            return PlanungsErgebnis(
+                "BLOCKIERT", None, None, forderung.op_position_id,
+                f"Kein gültiger Empfänger (E-Mail) für Debitor {konto.debitor_id} hinterlegt.",
             )
 
         if not forderung.faelligkeit_bekannt or forderung.faelligkeit is None:
@@ -185,6 +216,8 @@ class MahnwesenService:
             snapshot={
                 "vertrag_id": vertrag.id,
                 "debitor_id": konto.debitor_id,
+                "empfaenger_email": debitor.email,
+                "empfaenger_name": debitor.name,
                 "forderung_op_position_id": forderung.op_position_id,
                 "betrag_cent": forderung.rest_cent,
                 "stufe": stufe.value,
@@ -203,13 +236,14 @@ class MahnwesenService:
         konto: KontoTable,
         policy: MahnPolicyTable,
         heute: date,
-        bank_stand_alter_tage: int | None,
+        bank_bestaetigt_bis: date | None,
+        ungeklaerte_eingaenge_vorhanden: bool = False,
     ) -> list[PlanungsErgebnis]:
         forderungen = self._op_service.offene_forderungen(konto.id, heute=heute)
         return [
             self.plane_forderung(
                 ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung, policy=policy, heute=heute,
-                bank_stand_alter_tage=bank_stand_alter_tage,
+                bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
             )
             for forderung in forderungen
         ]
@@ -220,20 +254,22 @@ class MahnwesenService:
         ctx: AuthContext,
         mahnfall_id: int,
         heute: date,
-        bank_stand_alter_tage: int | None,
+        bank_bestaetigt_bis: date | None,
+        ungeklaerte_eingaenge_vorhanden: bool,
         send_enabled: bool,
         versand_fn: Callable[[dict], None],
     ) -> VersandErgebnis:
-        """`bank_stand_alter_tage` MUSS unmittelbar vor diesem Aufruf frisch
-        ermittelt werden (z. B. via `BankImportService.bankstand_alter_tage`)
-        - ein beim Planen gemessener, inzwischen veralteter Wert darf hier
-        nicht wiederverwendet werden."""
+        """`bank_bestaetigt_bis`/`ungeklaerte_eingaenge_vorhanden` MÜSSEN
+        unmittelbar vor diesem Aufruf frisch ermittelt werden - ein bei der
+        Planung gemessener, inzwischen veralteter Wert darf hier nicht
+        wiederverwendet werden."""
 
         mahnfall = self._repository.get(mahnfall_id)
         if mahnfall is None:
             raise ValueError(f"Unbekannter MahnFall {mahnfall_id}")
 
-        # Serverseitig neu laden statt Aufrufer-Objekten zu vertrauen.
+        # Serverseitig neu laden statt Aufrufer-Objekten oder dem alten
+        # Planungs-Snapshot zu vertrauen.
         vertrag = self._stammdaten_repository.get_vertrag(mahnfall.vertrag_id)
         konto = self._stammdaten_repository.get_konto_by_vertrag(mahnfall.vertrag_id)
         _validiere_bindung(mahnfall, vertrag, konto)
@@ -244,18 +280,43 @@ class MahnwesenService:
         if mahnfall.status != MahnStatus.GEPLANT.value:
             return VersandErgebnis("BEREITS_VERARBEITET", f"Status ist bereits {mahnfall.status}; kein Doppelversand.")
 
+        self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
+
         aktive_sperren = self._stammdaten_repository.aktive_sperren(vertrag.id)
         if aktive_sperren:
             self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
             return VersandErgebnis("BLOCKIERT", "Sperre wurde nach der Planung gesetzt.")
 
-        if bank_stand_alter_tage is None or bank_stand_alter_tage > self._bank_stand_max_age_days:
+        if self._bankstand_veraltet(heute=heute, bank_bestaetigt_bis=bank_bestaetigt_bis):
             self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
             return VersandErgebnis(
                 "BLOCKIERT",
-                f"Bankstand ist beim Versand veraltet oder unbekannt (Alter: {bank_stand_alter_tage}, "
-                f"max {self._bank_stand_max_age_days} Tage).",
+                f"Keine ausreichend aktuelle BESTÄTIGTE Bankvollständigkeit beim Versand "
+                f"(bestätigt bis: {bank_bestaetigt_bis}, max {self._bank_stand_max_age_days} Tage alt).",
             )
+        if ungeklaerte_eingaenge_vorhanden:
+            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
+            return VersandErgebnis(
+                "BLOCKIERT", "Ungeklärte/teilzugeordnete Bankeingänge sind zwischen Planung und Versand aufgetaucht."
+            )
+
+        # Policy frisch prüfen: wurde sie seit der Planung zurückgezogen
+        # oder durch eine neue Version ersetzt, wird NICHT mit der alten,
+        # zum Planungszeitpunkt gültigen Policy weiterversendet.
+        aktuelle_policy = self._mahn_policy_repository.aktuelle_freigegebene()
+        if aktuelle_policy is None or aktuelle_policy.version != mahnfall.policy_version:
+            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
+            return VersandErgebnis(
+                "BLOCKIERT",
+                f"Policy-Version {mahnfall.policy_version} ist nicht mehr die aktuell freigegebene Policy "
+                f"(aktuell: {aktuelle_policy.version if aktuelle_policy else None}).",
+            )
+
+        # Empfänger frisch prüfen statt dem Snapshot von der Planung zu vertrauen.
+        debitor = self._stammdaten_repository.get_debitor(konto.debitor_id)
+        if debitor is None or not (debitor.email or "").strip():
+            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
+            return VersandErgebnis("BLOCKIERT", f"Kein gültiger Empfänger (E-Mail) für Debitor {konto.debitor_id} mehr hinterlegt.")
 
         # Identitätsbasierte Neuprüfung: nicht nur "ist die Kontosumme noch
         # groß genug" (das würde eine andere, zufällig gleich große

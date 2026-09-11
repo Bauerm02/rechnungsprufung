@@ -18,7 +18,7 @@ class OPRepository:
                 select(OPPositionTable).where(OPPositionTable.import_id == import_id)
             ).scalar_one_or_none()
 
-    def insert_idempotent(self, row: OPPositionTable) -> OPPositionTable:
+    def insert_idempotent(self, row: OPPositionTable, *, session: Session | None = None) -> OPPositionTable:
         """Insert `row`, unless its import_id already exists.
 
         - Same import_id + same quelle_hash -> replay, return the existing
@@ -26,24 +26,37 @@ class OPRepository:
         - Same import_id + different quelle_hash -> real conflict.
         - No import_id -> always inserted (manual/system-internal postings
           that do not claim idempotency, e.g. Storno rows).
-        """
 
-        with self._session_factory() as session:
-            if row.import_id is not None:
-                existing = session.execute(
-                    select(OPPositionTable).where(OPPositionTable.import_id == row.import_id)
-                ).scalar_one_or_none()
-                if existing is not None:
-                    if existing.quelle_hash != row.quelle_hash:
-                        raise ImportConflictError(
-                            f"import_id '{row.import_id}' bereits mit anderem Inhalt vorhanden "
-                            f"(gespeichert: {existing.quelle_hash}, neu: {row.quelle_hash})."
-                        )
-                    return existing
-            session.add(row)
-            session.commit()
-            session.refresh(row)
-            return row
+        Pass an existing `session` to make this insert part of a larger,
+        caller-managed transaction (e.g. OP-Buchung + Zuordnung + Audit in
+        einer DB-Transaktion) - in that case this method flushes but does
+        NOT commit; the caller commits/rolls back everything together.
+        Without a `session`, this method opens and commits its own
+        transaction as before."""
+
+        if session is not None:
+            return self._insert_idempotent(session, row)
+        with self._session_factory() as owned_session:
+            result = self._insert_idempotent(owned_session, row)
+            owned_session.commit()
+            owned_session.refresh(result)
+            return result
+
+    def _insert_idempotent(self, session: Session, row: OPPositionTable) -> OPPositionTable:
+        if row.import_id is not None:
+            existing = session.execute(
+                select(OPPositionTable).where(OPPositionTable.import_id == row.import_id)
+            ).scalar_one_or_none()
+            if existing is not None:
+                if existing.quelle_hash != row.quelle_hash:
+                    raise ImportConflictError(
+                        f"import_id '{row.import_id}' bereits mit anderem Inhalt vorhanden "
+                        f"(gespeichert: {existing.quelle_hash}, neu: {row.quelle_hash})."
+                    )
+                return existing
+        session.add(row)
+        session.flush()
+        return row
 
     def find_eroeffnung(self, konto_id: str) -> OPPositionTable | None:
         with self._session_factory() as session:

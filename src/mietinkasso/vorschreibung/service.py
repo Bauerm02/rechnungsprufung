@@ -46,6 +46,7 @@ class VorschreibungService:
         self, *, ctx: AuthContext, vertrag: VertragTable, monat: str
     ) -> VorschreibungsErgebnis:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
+        self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
         faelligkeit = faelligkeitsdatum(monat, vertrag.faelligkeit_tag)
         vorschreibung = self._repository.get_or_create_entwurf(
             vertrag_id=vertrag.id, monat=monat, faelligkeit=faelligkeit

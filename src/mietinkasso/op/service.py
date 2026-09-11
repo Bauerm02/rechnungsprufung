@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import OPTyp
@@ -88,6 +89,7 @@ class OPService:
     ) -> OPPositionTable:
         require_gesellschaft_access(ctx, konto.gesellschaft_id)
         require_schreibrecht(ctx)
+        self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto)
         self._pruefe_und_setze_eroeffnungsmodus(konto, "GESAMTSALDO", stichtag)
 
         # Eröffnung ist fachlich EINMALIG je Konto/Stichtag - unabhängig vom
@@ -148,6 +150,7 @@ class OPService:
     ) -> OPPositionTable:
         require_gesellschaft_access(ctx, konto.gesellschaft_id)
         require_schreibrecht(ctx)
+        self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto)
         self._pruefe_und_setze_eroeffnungsmodus(konto, "EINZEL_OP", stichtag)
         content_hash = compute_content_hash(
             {
@@ -216,9 +219,19 @@ class OPService:
         leistungsperiode: str | None = None,
         import_id: str | None = None,
         quelle_system: str | None = None,
+        bank_transaktion_id: int | None = None,
+        bezieht_sich_auf_id: int | None = None,
+        session: Session | None = None,
     ) -> OPPositionTable:
+        """`session`: siehe `OPRepository.insert_idempotent` - übergeben,
+        um diese Buchung Teil einer größeren, vom Aufrufer verwalteten
+        Transaktion zu machen (z. B. Bank-Zuordnung: OP-Buchung +
+        Zuordnung + Audit in einer DB-Transaktion mit gemeinsamem
+        Rollback)."""
+
         require_gesellschaft_access(ctx, konto.gesellschaft_id)
         require_schreibrecht(ctx)
+        self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto)
         if typ in (OPTyp.SOLL, OPTyp.GUTSCHRIFT):
             self.pruefe_kein_altjournal_in_gesamtsaldo(konto, belegdatum)
         content_hash = compute_content_hash(
@@ -245,8 +258,10 @@ class OPService:
             quelle_hash=content_hash,
             import_id=import_id,
             quelle_system=quelle_system,
+            bank_transaktion_id=bank_transaktion_id,
+            bezieht_sich_auf_id=bezieht_sich_auf_id,
         )
-        return self._op_repository.insert_idempotent(row)
+        return self._op_repository.insert_idempotent(row, session=session)
 
     def storniere_und_korrigiere(
         self,

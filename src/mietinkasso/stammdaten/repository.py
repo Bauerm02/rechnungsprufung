@@ -6,6 +6,7 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from mietinkasso.domain.exceptions import ObjektAusgeschlossenError
 from mietinkasso.infrastructure.db.tables import (
     DebitorTable,
     EinheitTable,
@@ -124,6 +125,10 @@ class StammdatenRepository:
                 row.adresse = adresse
             session.commit()
 
+    def get_debitor(self, id: str) -> DebitorTable | None:
+        with self._session_factory() as session:
+            return session.get(DebitorTable, id)
+
     # -- Vertrag ------------------------------------------------------------
     def upsert_vertrag(
         self,
@@ -168,6 +173,36 @@ class StammdatenRepository:
     def get_vertrag(self, id: str) -> VertragTable | None:
         with self._session_factory() as session:
             return session.get(VertragTable, id)
+
+    def objekt_fuer_vertrag(self, vertrag_id: str) -> ObjektTable:
+        with self._session_factory() as session:
+            vertrag = session.get(VertragTable, vertrag_id)
+            if vertrag is None:
+                raise ValueError(f"Unbekannter Vertrag {vertrag_id}")
+            einheit = session.get(EinheitTable, vertrag.einheit_id)
+            if einheit is None:
+                raise ValueError(f"Unbekannte Einheit {vertrag.einheit_id}")
+            objekt = session.get(ObjektTable, einheit.objekt_id)
+            if objekt is None:
+                raise ValueError(f"Unbekanntes Objekt {einheit.objekt_id}")
+            return objekt
+
+    def pruefe_vertrag_nicht_ausgeschlossen(self, vertrag_id: str) -> None:
+        """Zentrale, unumgängliche Durchsetzung von Fachregel 1 (Objekt 107
+        ausgeschlossen): löst Konto/Vertrag -> Einheit -> Objekt frisch aus
+        der DB auf und blockiert JEDEN schreibenden Finanzpfad, unabhängig
+        von Rolle (auch ADMIN) - nicht nur eine isolierte Hilfsfunktion, die
+        ein Aufrufer vergessen könnte zu rufen."""
+
+        objekt = self.objekt_fuer_vertrag(vertrag_id)
+        if objekt.ausgeschlossen:
+            raise ObjektAusgeschlossenError(
+                f"Vertrag {vertrag_id} gehört zu Objekt {objekt.id}, das von der Pilotphase "
+                "ausgeschlossen ist (z. B. 107 Sieben Dörfer)."
+            )
+
+    def pruefe_konto_nicht_ausgeschlossen(self, konto: KontoTable) -> None:
+        self.pruefe_vertrag_nicht_ausgeschlossen(konto.vertrag_id)
 
     def add_komponente(
         self,

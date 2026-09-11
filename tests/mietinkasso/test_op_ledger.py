@@ -4,8 +4,43 @@ from datetime import date
 
 import pytest
 
-from mietinkasso.domain.enums import OPTyp
-from mietinkasso.domain.exceptions import CrossTenantError, DoppelteEroeffnungsartError, ImportConflictError
+from mietinkasso.domain.enums import OPTyp, Rolle
+from mietinkasso.domain.exceptions import (
+    CrossTenantError,
+    DoppelteEroeffnungsartError,
+    ImportConflictError,
+    ObjektAusgeschlossenError,
+)
+
+
+def test_eroeffnen_gesamtsaldo_sperrt_objekt_107_auch_fuer_admin(op_service, stammdaten_repo, ctx_factory):
+    """Regression (Codex-Rückprüfung): `pruefe_objekt_erlaubt` existierte
+    zuvor nur als isolierte, nie aufgerufene Hilfsfunktion. Codex' Gegenprobe
+    legte Objekt 107 mit ausgeschlossen=True an und rief
+    OPService.eroeffnen_gesamtsaldo(50000) auf - es wurden trotzdem 500 EUR
+    gebucht. Der Ausschluss muss zentral aus dem persistierten
+    Konto->Vertrag->Einheit->Objekt erzwungen werden, rollenunabhängig
+    (ADMIN eingeschlossen)."""
+
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_objekt(id="107", gesellschaft_id="7DI", bezeichnung="Sieben Dörfer", ausgeschlossen=True)
+    stammdaten_repo.upsert_einheit(id="107-TOP1", objekt_id="107", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-107", name="Mieterin 107")
+    stammdaten_repo.upsert_vertrag(
+        id="V-107-1", einheit_id="107-TOP1", debitor_id="DEB-107", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    vertrag = stammdaten_repo.get_vertrag("V-107-1")
+    konto = stammdaten_repo.get_or_create_konto(vertrag=vertrag)
+    ctx_admin = ctx_factory("7DI", rolle=Rolle.ADMIN)
+
+    with pytest.raises(ObjektAusgeschlossenError):
+        op_service.eroeffnen_gesamtsaldo(
+            ctx=ctx_admin, konto=konto, betrag_cent=50_000, stichtag=date(2026, 1, 1),
+            import_id="ERO-107", akteur="admin-gegenprobe",
+        )
+
+    assert op_service.berechne_saldo(konto.id).saldo_cent == 0
 
 
 def test_eroeffnung_soll_zahlung_ergibt_erwarteten_saldo(op_service, basis_vertrag, ctx_factory):

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from mietinkasso.domain.exceptions import MietinkassoError
+from mietinkasso.domain.exceptions import ObjektAusgeschlossenError
 from mietinkasso.stammdaten.repository import StammdatenRepository
 
-
-class ObjektAusgeschlossenError(MietinkassoError):
-    """Objekt 107 (Sieben Dörfer) is explicitly out of scope for the pilot."""
+__all__ = ["ObjektAusgeschlossenError", "StammdatenService"]
 
 
 class StammdatenService:

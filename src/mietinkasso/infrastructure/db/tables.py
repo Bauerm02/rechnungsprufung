@@ -182,6 +182,14 @@ class OPPositionTable(Base):
         ForeignKey("op_positionen.id"), nullable=True
     )
     quelle_system: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Herkunfts-/Bezugstracking für Bankbuchungen: welche Banktransaktion hat
+    # diese Zeile erzeugt (ZAHLUNG/RUECKLASTSCHRIFT), und auf welche andere
+    # OP-Zeile bezieht sie sich (z. B. RUECKLASTSCHRIFT -> die zurückgebuchte
+    # ZAHLUNG). Ermöglicht die kumulative Rückbuchungsgrenze je Ursprungs-
+    # zahlung und die verfügbare Belastungshöhe je Rücklastschrift-Transaktion
+    # exakt nachzurechnen, statt sie zu erraten.
+    bank_transaktion_id: Mapped[int | None] = mapped_column(ForeignKey("bank_transaktionen.id"), nullable=True, index=True)
+    bezieht_sich_auf_id: Mapped[int | None] = mapped_column(ForeignKey("op_positionen.id"), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -255,7 +263,13 @@ class BankTransaktionTable(Base):
 class ZuordnungTable(Base):
     __tablename__ = "zuordnungen"
     __table_args__ = (
-        UniqueConstraint("bank_transaktion_id", "op_position_id", name="uq_zuordnung_transaktion_op"),
+        # Die Idempotenz hängt an einer vom Aufrufer explizit vergebenen
+        # Vorgangs-ID, NICHT an (Transaktion, OP, Betrag): zwei echte,
+        # unabhängige Teilzuordnungen mit zufällig identischem Betrag auf
+        # dieselbe (Transaktion, OP)-Kombination müssen möglich sein, ein
+        # bloßer Retry derselben Anfrage (gleiche Vorgangs-ID) darf aber
+        # nie ein zweites Mal buchen.
+        UniqueConstraint("vorgang_id", name="uq_zuordnung_vorgang_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -263,7 +277,24 @@ class ZuordnungTable(Base):
     op_position_id: Mapped[int] = mapped_column(ForeignKey("op_positionen.id"), index=True)
     betrag_cent: Mapped[int] = mapped_column(Integer)
     match_typ: Mapped[str] = mapped_column(String(32))
+    vorgang_id: Mapped[str] = mapped_column(String(128))
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class BankVollstaendigkeitTable(Base):
+    """Explizite Bestätigung "Bankstand ist vollständig bis Datum X" je
+    Bankkonto - im Unterschied zum bloßen Datum der letzten importierten
+    Zeile (das nur beweist, dass IRGENDEINE Zeile bis dahin existiert,
+    nicht dass der Import lückenlos/vollständig war). Nur eine solche
+    Bestätigung darf das Mahnwesen als "Bank ist aktuell" akzeptieren."""
+
+    __tablename__ = "bank_vollstaendigkeit"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    bank_konto_id: Mapped[str] = mapped_column(ForeignKey("bank_konten.id"), index=True)
+    bestaetigt_bis: Mapped[date] = mapped_column(Date)
+    bestaetigt_von: Mapped[str] = mapped_column(String(128))
+    bestaetigt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class IndexKlauselTable(Base):
@@ -286,6 +317,11 @@ class IndexKlauselTable(Base):
     basis_monat: Mapped[str] = mapped_column(String(7))
     letzte_anpassung_monat: Mapped[str | None] = mapped_column(String(7), nullable=True)
     schwelle_prozent: Mapped[Decimal] = mapped_column(Numeric(6, 3), default=Decimal("0"))
+    # Viele reale Verträge verlangen "streng über 3%"/"über 2%" statt "ab
+    # 3%"/"ab 2%" - das ist keine reine Rundungsfrage, sondern eine explizit
+    # zu erfassende Vertragsklausel. True = Grenzfall (Veränderung == Schwelle)
+    # löst aus; False = Grenzfall löst NICHT aus, erst strikt darüber.
+    schwelle_inklusive: Mapped[bool] = mapped_column(Boolean, default=True)
     daempfung_prozent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
     vertragliche_grenze_prozent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
     indexierbare_komponenten: Mapped[list] = mapped_column(JSON, default=list)

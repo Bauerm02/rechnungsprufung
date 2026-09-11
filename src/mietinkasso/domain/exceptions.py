@@ -82,3 +82,12 @@ class BindungInkonsistentError(MietinkassoError):
     """A Konto/Vertrag/Gesellschaft/MahnFall combination passed to a service
     does not actually match what the database holds; refuses to act on
     caller-supplied objects that could be stale or mismatched."""
+
+
+class ObjektAusgeschlossenError(MietinkassoError):
+    """Objekt 107 (Sieben Dörfer) is explicitly out of scope for the pilot.
+    Enforced centrally (Konto -> Vertrag -> Einheit -> Objekt) on every
+    writing financial path (Eröffnung, Nachbuchung/Zahlungszuordnung,
+    Vorschreibung, BK, Index, Mahnwesen), not just as an isolated helper a
+    caller could forget to invoke - and unconditionally for every role,
+    ADMIN included."""

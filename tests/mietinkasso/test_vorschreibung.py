@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from mietinkasso.domain.exceptions import BindungInkonsistentError, NachweisFehltError
+from mietinkasso.domain.exceptions import BindungInkonsistentError, NachweisFehltError, ObjektAusgeschlossenError
 from mietinkasso.op.repository import OPRepository
 from mietinkasso.op.service import OPService
 from mietinkasso.vorschreibung.repository import VorschreibungRepository
@@ -37,6 +37,27 @@ def vertrag_mit_komponenten(stammdaten_repo, basis_vertrag):
         betrag_cent=12_000, ust_satz_promille=10000, gueltig_von=date(2024, 1, 1),
     )
     return vertrag, konto
+
+
+def test_vorschreibung_sperrt_objekt_107(vorschreibung_service, stammdaten_repo, ctx_factory):
+    """Regression (Codex-Rückprüfung): der Objekt-107-Ausschluss muss auch
+    bei der Vorschreibungserstellung greifen, auch für ADMIN."""
+
+    from mietinkasso.domain.enums import Rolle
+
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_objekt(id="107", gesellschaft_id="7DI", bezeichnung="Sieben Dörfer", ausgeschlossen=True)
+    stammdaten_repo.upsert_einheit(id="107-TOP1", objekt_id="107", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-107", name="Mieterin 107")
+    stammdaten_repo.upsert_vertrag(
+        id="V-107-1", einheit_id="107-TOP1", debitor_id="DEB-107", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    vertrag = stammdaten_repo.get_vertrag("V-107-1")
+    ctx_admin = ctx_factory("7DI", rolle=Rolle.ADMIN)
+
+    with pytest.raises(ObjektAusgeschlossenError):
+        vorschreibung_service.entwurf_erstellen(ctx=ctx_admin, vertrag=vertrag, monat="2026-04")
 
 
 def test_kueche_und_parkplatz_sind_in_vorschreibung_enthalten(vorschreibung_service, vertrag_mit_komponenten, ctx_factory):

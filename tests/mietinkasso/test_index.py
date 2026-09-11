@@ -6,7 +6,12 @@ from decimal import Decimal
 import pytest
 
 from mietinkasso.domain.enums import IndexAnpassungStatus
-from mietinkasso.domain.exceptions import CrossTenantError, IndexKlauselFehltError, RechtsprofilNichtImplementiertError
+from mietinkasso.domain.exceptions import (
+    CrossTenantError,
+    IndexKlauselFehltError,
+    ObjektAusgeschlossenError,
+    RechtsprofilNichtImplementiertError,
+)
 from mietinkasso.domain.money import round_index_half_cent_down
 from mietinkasso.index.repository import IndexRepository
 from mietinkasso.index.service import EINFACHER_SCHWELLENVERGLEICH, IndexService
@@ -146,6 +151,64 @@ def test_schwelle_grenzfall_ist_inklusive(index_service, stammdaten_repo, basis_
         ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("102.99"), quelle_referenz="VPI"
     )
     assert knapp_darunter.erhoehung_cent == 0
+
+
+def test_schwelle_exklusiv_loest_erst_ueber_der_grenze_aus(index_service, stammdaten_repo, basis_vertrag, ctx_factory):
+    """Codex-Rückprüfung: viele reale Verträge verlangen strikt "über X%"
+    (exklusiv), nicht "ab X%" (inklusiv). `schwelle_inklusive=False` muss
+    exakt an der Grenze NICHT auslösen, knapp darüber schon."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id="K-HMZ", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=100_000,
+        indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    klausel = index_service.klausel_anlegen(
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+        basis_reihe="VPI2020", basis_wert=Decimal("100.0"), basis_monat="2024-01",
+        schwelle_prozent=Decimal("3"), schwelle_inklusive=False,
+    )
+    assert klausel.schwelle_inklusive is False
+    index_service.klausel_freigeben(klausel.id, ctx=ctx, freigegeben_von="markus")
+
+    genau_an_der_schwelle = index_service.berechne_vorschlag(
+        ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("103.0"), quelle_referenz="VPI"
+    )
+    assert genau_an_der_schwelle.erhoehung_cent == 0  # exakt 3% löst bei EXKLUSIVER Schwelle noch nicht aus
+
+    knapp_darueber = index_service.berechne_vorschlag(
+        ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("103.01"), quelle_referenz="VPI"
+    )
+    assert knapp_darueber.erhoehung_cent > 0
+
+
+def test_index_sperrt_objekt_107(index_service, stammdaten_repo, ctx_factory):
+    """Regression (Codex-Rückprüfung): der Objekt-107-Ausschluss muss auch
+    im Index-Service greifen, nicht nur bei der OP-Buchung."""
+
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_objekt(id="107", gesellschaft_id="7DI", bezeichnung="Sieben Dörfer", ausgeschlossen=True)
+    stammdaten_repo.upsert_einheit(id="107-TOP1", objekt_id="107", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-107", name="Mieterin 107")
+    stammdaten_repo.upsert_vertrag(
+        id="V-107-1", einheit_id="107-TOP1", debitor_id="DEB-107", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    ctx = ctx_factory("7DI")
+
+    with pytest.raises(ObjektAusgeschlossenError):
+        index_service.klausel_anlegen(
+            ctx=ctx, vertrag_id="V-107-1", rechtsordnung="OESTERREICH_MRG_VOLL",
+            berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+            basis_reihe="VPI2020", basis_wert=Decimal("100.0"), basis_monat="2024-01",
+        )
+    with pytest.raises(ObjektAusgeschlossenError):
+        index_service.berechne_vorschlag(
+            ctx=ctx, vertrag_id="V-107-1", stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"),
+            quelle_referenz="VPI",
+        )
 
 
 def test_gesetzliche_daempfung_ist_schwelle_plus_haelfte_des_ueberschusses(index_service, stammdaten_repo, basis_vertrag, ctx_factory):

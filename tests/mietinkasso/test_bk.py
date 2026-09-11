@@ -7,8 +7,8 @@ import pytest
 
 from mietinkasso.bk.repository import BKRepository
 from mietinkasso.bk.service import BKAnteilEingabe, BKAbrechnungNichtFreigegebenError, BKService
-from mietinkasso.domain.enums import BKPositionsart
-from mietinkasso.domain.exceptions import BindungInkonsistentError, CrossTenantError
+from mietinkasso.domain.enums import BKPositionsart, Rolle
+from mietinkasso.domain.exceptions import BindungInkonsistentError, CrossTenantError, ObjektAusgeschlossenError
 from mietinkasso.op.repository import OPRepository
 from mietinkasso.op.service import OPService
 
@@ -74,6 +74,18 @@ def test_bk_ist_fremder_gesellschaft_nicht_zugaenglich(bk_service, basis_vertrag
     ctx_fremd = ctx_factory("ANDERE-GESELLSCHAFT")
     with pytest.raises(CrossTenantError):
         bk_service.abrechnung_anlegen(ctx=ctx_fremd, objekt_id="601", abrechnungsjahr=2025)
+
+
+def test_bk_sperrt_objekt_107(bk_service, stammdaten_repo, ctx_factory):
+    """Regression (Codex-Rückprüfung): der Objekt-107-Ausschluss muss auch
+    im BK-Service greifen, auch für ADMIN."""
+
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_objekt(id="107", gesellschaft_id="7DI", bezeichnung="Sieben Dörfer", ausgeschlossen=True)
+    ctx_admin = ctx_factory("7DI", rolle=Rolle.ADMIN)
+
+    with pytest.raises(ObjektAusgeschlossenError):
+        bk_service.abrechnung_anlegen(ctx=ctx_admin, objekt_id="107", abrechnungsjahr=2025)
 
 
 def test_bk_buchung_mit_falsch_zugeordnetem_konto_wird_abgelehnt(bk_service, stammdaten_repo, basis_vertrag, ctx_factory):

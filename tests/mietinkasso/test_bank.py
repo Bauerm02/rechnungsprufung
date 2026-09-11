@@ -121,7 +121,8 @@ def test_cross_tenant_zuordnung_wird_db_seitig_blockiert(bank_service, bank_repo
 
     with pytest.raises(CrossTenantError):
         bank_repo.create_zuordnung(
-            bank_transaktion_id=transaktion.id, op_position_id=_dummy_op_position(bank_service, konto_mabau, ctx_factory), betrag_cent=60_000, match_typ="MANUELL"
+            bank_transaktion_id=transaktion.id, op_position_id=_dummy_op_position(bank_service, konto_mabau, ctx_factory),
+            betrag_cent=60_000, match_typ="MANUELL", vorgang_id="TEST-VORGANG-1",
         )
 
 
@@ -306,7 +307,8 @@ def test_zuordnen_manuell_lehnt_betrag_ueber_transaktionshoehe_ab(bank_service, 
 
     with pytest.raises(ZuordnungUngueltigError):
         bank_service.zuordnen_manuell(
-            ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=100_000, beleg_referenz="Fehlerhafte Zuordnung"
+            ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=100_000, beleg_referenz="Fehlerhafte Zuordnung",
+            vorgang_id="VORGANG-ABLEHNUNG",
         )
     assert bank_service._op_service.berechne_saldo(konto.id).saldo_cent == 0  # keine Nebenwirkung
 
@@ -320,15 +322,22 @@ def test_zuordnen_manuell_teilzuordnung_laesst_rest_unzugeordnet(bank_service, b
     mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
     transaktion = bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto, text=csv_text, mapping=mapping)[0]
 
-    bank_service.zuordnen_manuell(ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=400_00, beleg_referenz="Teilzuordnung")
+    bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=400_00, beleg_referenz="Teilzuordnung",
+        vorgang_id="VORGANG-1",
+    )
     assert bank_repo.zugeordneter_betrag(transaktion.id) == 400_00
 
     with pytest.raises(ZuordnungUngueltigError):
         bank_service.zuordnen_manuell(
-            ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=300_00, beleg_referenz="Zu viel für den Rest"
+            ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=300_00, beleg_referenz="Zu viel für den Rest",
+            vorgang_id="VORGANG-2-ZU-VIEL",
         )
     # verbleibender Rest (200,00 EUR) darf zugeordnet werden
-    bank_service.zuordnen_manuell(ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=200_00, beleg_referenz="Rest")
+    bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=200_00, beleg_referenz="Rest",
+        vorgang_id="VORGANG-3-REST",
+    )
     assert bank_repo.zugeordneter_betrag(transaktion.id) == 600_00
 
 
@@ -360,8 +369,227 @@ def test_cross_tenant_zuordnung_hat_keine_op_nebenwirkung_ueber_service(bank_ser
 
     with pytest.raises(CrossTenantError):
         bank_service.zuordnen_manuell(
-            ctx=ctx_mabau, transaktion=transaktion, konto=konto_mabau, betrag_cent=600_00, beleg_referenz="Unbefugt"
+            ctx=ctx_mabau, transaktion=transaktion, konto=konto_mabau, betrag_cent=600_00, beleg_referenz="Unbefugt",
+            vorgang_id="VORGANG-CROSS-TENANT",
         )
 
     # Keine Phantom-Zahlung wurde für konto_mabau gebucht.
     assert bank_service._op_service.berechne_saldo(konto_mabau.id).saldo_cent == 0
+
+
+def test_zuordnung_fehler_nach_op_buchung_rollt_alles_zurueck(bank_service, basis_vertrag, ctx_factory, monkeypatch):
+    """Regression (Codex-Rückprüfung Bug 1): create_zuordnung wirft NACH
+    erfolgreicher OP-Buchung einen unerwarteten Fehler (z. B. einen
+    Speicher-/Absturzfehler). OP-Buchung und Zuordnung laufen in EINER
+    DB-Transaktion; der Fehler darf daher nicht dazu führen, dass die
+    Zahlung im Ledger stehen bleibt, ohne dass eine Zuordnung existiert."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_service._repository.upsert_bank_konto(
+        id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI"
+    )
+    bank_konto = bank_service._repository.get_bank_konto("BK-7DI-1")
+    csv_text = "betrag,datum,referenz\n600.00,2026-04-06,sonstiges\n"
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+    transaktion = bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto, text=csv_text, mapping=mapping)[0]
+
+    def _simulierter_absturz(*args, **kwargs):
+        raise RuntimeError("simulierter Speicher-/Absturzfehler nach erfolgreicher OP-Buchung")
+
+    monkeypatch.setattr(bank_service._repository, "create_zuordnung", _simulierter_absturz)
+
+    with pytest.raises(RuntimeError):
+        bank_service.zuordnen_manuell(
+            ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=60_000, beleg_referenz="Absturztest",
+            vorgang_id="VORGANG-ABSTURZ",
+        )
+
+    # Kein Teilzustand: weder Saldo-Auswirkung noch eine hängende Zuordnung.
+    assert bank_service._op_service.berechne_saldo(konto.id).saldo_cent == 0
+    assert bank_service._repository.zugeordneter_betrag(transaktion.id) == 0
+
+
+def test_ruecklastschrift_lehnt_dieselbe_positive_transaktion_ab(bank_service, bank_repo, basis_vertrag, ctx_factory):
+    """Regression (Codex-Rückprüfung Bug 2): dieselbe positive Bankzahlung,
+    die bereits als Zahlung zugeordnet wurde, darf NICHT nochmal als
+    (angebliche) Rücklastschrift-Transaktion übergeben und akzeptiert
+    werden."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    csv_text = f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n"
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+    transaktion = bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto, text=csv_text, mapping=mapping)[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=transaktion)
+    assert ergebnis.zugeordnet is True
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+
+    with pytest.raises(ZuordnungUngueltigError):
+        bank_service.verarbeite_ruecklastschrift(
+            ctx=ctx, transaktion=transaktion, original_op_position=zahlung_op, konto=konto,
+        )
+
+    # Saldo unverändert (-600,00 aus der einen echten Zahlung) - keine "Rücklastschrift" aus dem Nichts.
+    assert bank_service._op_service.berechne_saldo(konto.id).saldo_cent == -60_000
+
+
+def test_ruecklastschrift_lehnt_falsches_bankkonto_ab(bank_service, bank_repo, basis_vertrag, ctx_factory):
+    """Eine echte negative Transaktion auf einem ANDEREN Bankkonto als dem
+    der Ursprungszahlung darf nicht als deren Rücklastschrift durchgehen."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI Haupt")
+    bank_repo.upsert_bank_konto(id="BK-7DI-2", gesellschaft_id="7DI", iban="AT000000000000000001", bezeichnung="7DI Neben")
+    bank_konto_1 = bank_repo.get_bank_konto("BK-7DI-1")
+    bank_konto_2 = bank_repo.get_bank_konto("BK-7DI-2")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    csv_zahlung = f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n"
+    transaktion = bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto_1, text=csv_zahlung, mapping=mapping)[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=transaktion)
+    assert ergebnis.zugeordnet is True
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+
+    csv_rueck = f"betrag,datum,referenz\n-600.00,2026-04-10,RUECKLASTSCHRIFT VERTRAG:{vertrag.id}\n"
+    rueck_transaktion = bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto_2, text=csv_rueck, mapping=mapping)[0]
+
+    with pytest.raises(ZuordnungUngueltigError):
+        bank_service.verarbeite_ruecklastschrift(
+            ctx=ctx, transaktion=rueck_transaktion, original_op_position=zahlung_op, konto=konto,
+        )
+
+
+def test_ruecklastschrift_kumulative_ruecklastgrenze_der_ursprungszahlung(bank_service, bank_repo, basis_vertrag, ctx_factory):
+    """Mehrere Teil-Rücklastschriften dürfen in Summe nie mehr zurückbuchen
+    als ursprünglich bezahlt wurde."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    csv_zahlung = f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n"
+    transaktion = bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto, text=csv_zahlung, mapping=mapping)[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=transaktion)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+
+    csv_rueck_1 = f"betrag,datum,referenz\n-1000.00,2026-04-10,RUECKLASTSCHRIFT-1 VERTRAG:{vertrag.id}\n"
+    rueck_1 = bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto, text=csv_rueck_1, mapping=mapping)[0]
+    bank_service.verarbeite_ruecklastschrift(
+        ctx=ctx, transaktion=rueck_1, original_op_position=zahlung_op, konto=konto, betrag_cent=400_00,
+    )
+
+    csv_rueck_2 = f"betrag,datum,referenz\n-1000.00,2026-04-11,RUECKLASTSCHRIFT-2 VERTRAG:{vertrag.id}\n"
+    rueck_2 = bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto, text=csv_rueck_2, mapping=mapping)[0]
+    with pytest.raises(ZuordnungUngueltigError):
+        # 400,00 bereits zurückgebucht + 300,00 würde 600,00 (Ursprungsbetrag) überschreiten.
+        bank_service.verarbeite_ruecklastschrift(
+            ctx=ctx, transaktion=rueck_2, original_op_position=zahlung_op, konto=konto, betrag_cent=300_00,
+        )
+    # Der verbleibende Rest (200,00) darf hingegen noch zurückgebucht werden.
+    bank_service.verarbeite_ruecklastschrift(
+        ctx=ctx, transaktion=rueck_2, original_op_position=zahlung_op, konto=konto, betrag_cent=200_00,
+    )
+
+
+def test_ruecklastschrift_verfuegbarer_belastungsbetrag_der_transaktion(bank_service, bank_repo, stammdaten_repo, ctx_factory):
+    """Eine Sammel-Rücklastschrift darf über mehrere Ursprungszahlungen
+    hinweg nie mehr verwenden, als ihr eigener (negativer) Betrag hergibt."""
+
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")
+    stammdaten_repo.upsert_einheit(id="601-TOP1", objekt_id="601", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_einheit(id="601-TOP2", objekt_id="601", bezeichnung="Top 2", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-A", name="Mieterin A")
+    stammdaten_repo.upsert_debitor(id="DEB-B", name="Mieter B")
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-A", einheit_id="601-TOP1", debitor_id="DEB-A", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-B", einheit_id="601-TOP2", debitor_id="DEB-B", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    vertrag_a = stammdaten_repo.get_vertrag("V-601-A")
+    vertrag_b = stammdaten_repo.get_vertrag("V-601-B")
+    konto_a = stammdaten_repo.get_or_create_konto(vertrag=vertrag_a)
+    konto_b = stammdaten_repo.get_or_create_konto(vertrag=vertrag_b)
+
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung_a = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto,
+        text=f"betrag,datum,referenz\n400.00,2026-04-06,VERTRAG:{vertrag_a.id}\n", mapping=mapping,
+    )[0]
+    ergebnis_a = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung_a)
+    op_a = bank_service._op_service._op_repository.get(ergebnis_a.op_position_id)
+
+    zahlung_b = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto,
+        text=f"betrag,datum,referenz\n400.00,2026-04-06,VERTRAG:{vertrag_b.id}\n", mapping=mapping,
+    )[0]
+    ergebnis_b = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung_b)
+    op_b = bank_service._op_service._op_repository.get(ergebnis_b.op_position_id)
+
+    # Eine einzige Sammel-Rücklastschrift über 500,00 EUR soll beide Zahlungen abdecken.
+    sammel_rueck = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto,
+        text="betrag,datum,referenz\n-500.00,2026-04-10,SAMMEL-RUECKLASTSCHRIFT\n", mapping=mapping,
+    )[0]
+    bank_service.verarbeite_ruecklastschrift(
+        ctx=ctx, transaktion=sammel_rueck, original_op_position=op_a, konto=konto_a, betrag_cent=400_00,
+    )
+    with pytest.raises(ZuordnungUngueltigError):
+        # 400,00 bereits von dieser Transaktion verwendet + 100,00 würde ihren eigenen Betrag (500,00) NICHT
+        # überschreiten - wohl aber, wenn wir stattdessen 200,00 für Konto B verlangen.
+        bank_service.verarbeite_ruecklastschrift(
+            ctx=ctx, transaktion=sammel_rueck, original_op_position=op_b, konto=konto_b, betrag_cent=200_00,
+        )
+    # Der tatsächlich noch verfügbare Rest (100,00) darf hingegen verwendet werden.
+    bank_service.verarbeite_ruecklastschrift(
+        ctx=ctx, transaktion=sammel_rueck, original_op_position=op_b, konto=konto_b, betrag_cent=100_00,
+    )
+
+
+def test_vorgang_id_unterscheidet_retry_von_unabhaengiger_teilzuordnung(bank_service, bank_repo, basis_vertrag, ctx_factory):
+    """Regression: derselbe `vorgang_id`-Wert (Retry, z. B. nach einem
+    Netzwerk-Timeout) darf keine zweite Zuordnung erzeugen; ein NEUER Wert
+    für eine echte, unabhängige zweite Teilzuordnung mit zufällig
+    identischem Betrag hingegen schon."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    csv_text = "betrag,datum,referenz\n600.00,2026-04-06,sonstiges\n"
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+    transaktion = bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto, text=csv_text, mapping=mapping)[0]
+
+    zuordnung_1 = bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=200_00, beleg_referenz="Teilzahlung 1",
+        vorgang_id="VORGANG-RETRY-TEST",
+    )
+    # Retry mit DERSELBEN vorgang_id -> No-Op, keine zweite Buchung.
+    zuordnung_retry = bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=200_00, beleg_referenz="Teilzahlung 1",
+        vorgang_id="VORGANG-RETRY-TEST",
+    )
+    assert zuordnung_retry.id == zuordnung_1.id
+    assert bank_repo.zugeordneter_betrag(transaktion.id) == 200_00
+
+    # Eine ECHTE zweite, unabhängige Teilzuordnung mit zufällig identischem
+    # Betrag (neue vorgang_id) muss hingegen als eigene Buchung durchgehen.
+    zuordnung_2 = bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=200_00, beleg_referenz="Teilzahlung 2",
+        vorgang_id="VORGANG-UNABHAENGIG",
+    )
+    assert zuordnung_2.id != zuordnung_1.id
+    assert bank_repo.zugeordneter_betrag(transaktion.id) == 400_00

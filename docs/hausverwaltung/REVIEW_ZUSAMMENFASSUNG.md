@@ -134,15 +134,132 @@ Weitere beim Lesen gefundene Abnahmesperren, ebenfalls behoben:
   eines stillen Overwrites auslöst. Siehe
   `test_vertragskomponente_ist_unveraenderlich`.
 
-**Bekannte Restlücke (ehrlich benannt, nicht "gelöst"):** die
-Vorab-Validierung in `bank/service.py` (Gesellschaft/Betrag/Währung vor
-`op_service.buchen()`) schließt die GEMELDETEN, deterministischen
-Fehlerfälle vollständig; ein winziges Race-Fenster zwischen dieser
-Prüfung und dem eigentlichen Buchen bleibt bestehen, weil OP-Buchung und
-Zuordnungserstellung zwei getrennte DB-Transaktionen sind (kein
-gemeinsames Unit-of-Work über Repositories hinweg). Für einen echten
-Mehrbenutzerbetrieb mit konkurrierenden Zuordnungsversuchen auf
-demselben Konto ist das ein Ausbaupunkt, siehe `OFFENE_PUNKTE.md`.
+**Bekannte Restlücke (Stand Runde 1, in Runde 2 behoben):** die oben
+beschriebene Vorab-Validierung schloss die GEMELDETEN, deterministischen
+Fehlerfälle vollständig, aber OP-Buchung und Zuordnungserstellung liefen
+noch in zwei getrennten DB-Transaktionen. Genau dieses Fenster hat
+Codex' zweite Rückprüfung als reproduzierbaren Bug demonstriert (siehe
+"Korrekturrunde 2" unten) — inzwischen behoben.
+
+## Korrekturrunde 2 nach zweiter Codex-Rückprüfung (HEAD 048da6b geprüft)
+
+Codex hat den nach Runde 1 gepushten Stand (Commit `048da6b`) erneut
+unabhängig gegengeprüft: 175 Repo-Tests liefen grün und die 8
+ursprünglichen Gegenproben aus Runde 1 bestanden ebenfalls, aber zwei
+weitere, unabhängige Gegenproben fanden reproduzierbare Kernfehler, plus
+mehrere gezielte Restpunkte aus dem Quellcode und ein zusätzlicher
+fachlicher Befund zur Objekt-107-Ausschlussregel. Alle sind in dieser
+Runde behoben, mit neuen Regressionstests belegt:
+
+1. **Bug 1 — kein Rollback bei Fehler NACH der OP-Buchung:** Codex ließ
+   `bank_repo.create_zuordnung` nach erfolgreichem `OPService.buchen`
+   einen simulierten `RuntimeError` werfen; der Kontosaldo blieb bei
+   -60000 stehen, statt auf 0 zurückzurollen — reproduzierbar bereits in
+   einem einzelnen Prozess, kein nur theoretisches
+   Parallelitätsproblem. Behoben, indem OP-Buchung, Zuordnung und
+   Audit-Eintrag jetzt in EINER gemeinsamen DB-Transaktion laufen
+   (`BankImportService._zuordnen_atomar`, ebenso `_importiere_atomar`
+   für Datei-Importe): jeder Fehler — auch ein unerwarteter — rollt die
+   GESAMTE Transaktion zurück; nichts Teilweises bleibt hängen. Konto,
+   Transaktion und Original-OP werden dabei serverseitig frisch aus der
+   DB geladen. Siehe `test_zuordnung_fehler_nach_op_buchung_rollt_alles_zurueck`
+   in `tests/mietinkasso/test_bank.py`. Verbleibende, ehrlich benannte
+   Restlücke bei echter Nebenläufigkeit unter einer produktiven
+   Mehrbenutzer-DB: `OFFENE_PUNKTE.md`.
+2. **Bug 2 — dieselbe Zahlungstransaktion ließ sich als eigene
+   Rücklastschrift durchschmuggeln:** derselbe positive 60000-Cent-
+   Bankeingang wurde zuerst als Zahlung zugeordnet und dann unverändert
+   als `transaktion` an `verarbeite_ruecklastschrift` übergeben — er
+   wurde akzeptiert, der Saldo stieg von -60000 auf 0. Die Methode
+   validierte bislang nur den Zustand der URSPRÜNGLICHEN Zahlung, nie
+   die tatsächliche Beschaffenheit der übergebenen `transaktion`.
+   `verarbeite_ruecklastschrift` verlangt jetzt: einen tatsächlich
+   negativen Bankeingang, ein zur Ursprungszahlung passendes Bankkonto
+   (über deren Zuordnungskette ermittelt), übereinstimmende
+   Gesellschaft/Währung, eine kumulative Rückbuchungsgrenze der
+   Ursprungszahlung (`kumulativ_zurueckgebucht`, nie mehr zurückbuchen
+   als ursprünglich bezahlt, auch nicht über mehrere
+   Teil-Rücklastschriften) sowie einen begrenzten verfügbaren
+   Belastungsbetrag der Rücklastschrift-Transaktion selbst
+   (`verwendeter_betrag_rueckbuchung`, damit eine Sammel-Rücklastschrift
+   mehrere Ursprungszahlungen abdecken kann, aber nie mehr als ihren
+   eigenen Betrag). Siehe `test_ruecklastschrift_lehnt_dieselbe_positive_transaktion_ab`,
+   `test_ruecklastschrift_lehnt_falsches_bankkonto_ab`,
+   `test_ruecklastschrift_kumulative_ruecklastgrenze_der_ursprungszahlung`,
+   `test_ruecklastschrift_verfuegbarer_belastungsbetrag_der_transaktion`.
+3. **Retries vs. echte Teilzuordnungen mit identischem Betrag nicht
+   unterscheidbar:** die bisherige Idempotenz hing an
+   `(bank_transaktion_id, op_position_id)`, was zwei genuine, unabhängige
+   Teilzuordnungen mit zufällig gleichem Betrag technisch unmöglich
+   machte. `ZuordnungTable` hat jetzt eine vom Aufrufer explizit
+   vergebene, eindeutige `vorgang_id` als alleinigen Idempotenzschlüssel:
+   derselbe Wert (Retry, z. B. nach Netzwerk-Timeout) ist ein sicherer
+   No-Op, ein neuer Wert erzeugt garantiert eine eigene Buchung.
+   `zuordnen_manuell` verlangt `vorgang_id` jetzt als Pflichtparameter.
+   Siehe `test_vorgang_id_unterscheidet_retry_von_unabhaengiger_teilzuordnung`.
+4. **Datei-Importe konnten unsichtbare Teilergebnisse hinterlassen:**
+   CAMT.053-/CSV-Importe laufen jetzt vollständig atomar je Aufruf
+   (`_importiere_atomar`, eine Session/Transaktion für die gesamte
+   Datei): scheitert eine Zeile, wird der GESAMTE Lauf zurückgerollt und
+   der ursprüngliche Fehlertyp (nicht verschluckt, nur um Zeilenkontext
+   angereichert) weitergereicht; ein erneuter, korrigierter Lauf ist
+   dank Idempotenz immer gefahrlos möglich.
+5. **Index kannte nur eine inklusive Schwelle:** viele reale Verträge
+   verlangen strikt "über 3 %"/"über 2 %" (exklusiv), nicht "ab 3 %"
+   (inklusiv). `IndexKlauselTable` hat jetzt ein explizites
+   `schwelle_inklusive: bool`-Feld (Default `True`, rückwärtskompatibel);
+   `IndexService` prüft je nach Flag `<` oder `<=` gegen die Schwelle und
+   nimmt den Wert in den Snapshot auf. Grenzfall-Tests für beide
+   Varianten in `tests/mietinkasso/test_index.py`.
+6. **Bankfrische aus dem letzten Buchungsdatum bewies keine
+   Exportvollständigkeit:** `bankstand_alter_tage` zeigt nur das Datum
+   der letzten IRGENDEINER importierten Zeile — ein lückenhafter Import
+   kann trotzdem aktuell aussehen. Neue `BankVollstaendigkeitTable` plus
+   `bestaetige_bankvollstaendigkeit`/`bankvollstaendigkeit_bestaetigt_bis`
+   bilden eine EXPLIZITE menschliche/prozessuale Bestätigung
+   "lückenlos bis Datum X" ab; das Mahnwesen (`plane_forderung`,
+   `versenden`) verlangt jetzt `bank_bestaetigt_bis` statt eines reinen
+   Alters-Grenzwerts und blockiert zusätzlich bei relevanten,
+   auf den Vertrag referenzierten, aber noch unvollständig zugeordneten
+   Bankeingängen (`hat_ungeklaerte_relevante_eingaenge`). Siehe
+   `test_fehlende_bankbestaetigung_blockiert_mahnung`,
+   `test_ungeklaerte_eingaenge_blockieren_mahnung`,
+   `test_ungeklaerte_eingaenge_stoppen_versand`.
+7. **`versenden` prüfte Policy und Empfänger nicht frisch:** zwischen
+   Planung und Versand konnte die Policy zurückgezogen oder der
+   Empfänger entfernt werden, ohne dass der Versand das bemerkte.
+   `versenden` lädt jetzt die aktuell freigegebene Policy und den
+   Debitor samt E-Mail-Adresse UNMITTELBAR vor dem Versand neu und
+   blockiert bei Policy-Wechsel bzw. fehlendem Empfänger. Siehe
+   `test_policy_wechsel_zwischen_planung_und_versand_stoppt`,
+   `test_empfaenger_entfernt_zwischen_planung_und_versand_stoppt`,
+   `test_fehlender_empfaenger_blockiert_mahnung`.
+8. **Objekt-107-Ausschluss war nur eine isolierte, nie aufgerufene
+   Hilfsfunktion:** Codex' Gegenprobe legte Objekt 107 mit
+   `ausgeschlossen=True` an und buchte über
+   `OPService.eroeffnen_gesamtsaldo(50000)` trotzdem 500 € — auch als
+   ADMIN. `pruefe_objekt_erlaubt` wurde von keinem buchenden Service
+   aufgerufen. Der Ausschluss wird jetzt zentral und rollenunabhängig
+   (ADMIN eingeschlossen) aus dem PERSISTIERTEN Konto→Vertrag→
+   Einheit→Objekt aufgelöst (`StammdatenRepository.objekt_fuer_vertrag`/
+   `pruefe_vertrag_nicht_ausgeschlossen`/`pruefe_konto_nicht_ausgeschlossen`,
+   frisch aus der DB, nicht aus vom Aufrufer übergebenen Objekten) und in
+   JEDEN schreibenden Finanzpfad verdrahtet: `OPService.buchen`/
+   `eroeffnen_gesamtsaldo`/`eroeffnen_einzel_op` (deckt damit
+   transitiv auch Bankzuordnung und BK-Buchung ab, weil beide über
+   `op_service.buchen` laufen), `VorschreibungService.entwurf_erstellen`,
+   `IndexService.klausel_anlegen`/`berechne_vorschlag`,
+   `BKService.abrechnung_anlegen`, `MahnwesenService.plane_forderung`/
+   `versenden`. Siehe `test_objekt_107_wird_auch_im_mahnwesen_ausgeschlossen`
+   sowie die `ObjektAusgeschlossenError`-Tests in `test_stammdaten.py`,
+   `test_index.py`, `test_bk.py`, `test_vorschreibung.py`.
+
+`OFFENE_PUNKTE.md` wurde entsprechend korrigiert: die dort zuvor
+enthaltene, widersprüchliche Aussage, MieWeG-2026-Detailregeln seien
+"als Parameter der Klausel abbildbar", ist ersetzt durch die korrekte
+Aussage, dass NUR `EINFACHER_SCHWELLENVERGLEICH` implementiert ist und
+jedes andere `berechnungsprofil` technisch mit
+`RechtsprofilNichtImplementiertError` gesperrt bleibt.
 
 ## Repo-Befund (vor Implementierung)
 
@@ -181,8 +298,8 @@ demselben Konto ist das ein Ausbaupunkt, siehe `OFFENE_PUNKTE.md`.
 ## Testergebnis
 
 ```
-python -m pytest tests/mietinkasso -q    # 70 passed
-python -m pytest -q                       # 175 passed (105 invoice_automation + 70 mietinkasso)
+python -m pytest tests/mietinkasso -q    # 88 passed (Stand Korrekturrunde 2)
+python -m pytest -q                       # 193 passed (105 invoice_automation + 88 mietinkasso)
 ```
 
 Die bestehende `invoice_automation`-Testsuite ist unverändert grün

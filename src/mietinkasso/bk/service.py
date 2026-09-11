@@ -19,7 +19,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.bk.repository import BKRepository
 from mietinkasso.domain.enums import BKAbrechnungStatus, BKPositionsart, OPTyp
-from mietinkasso.domain.exceptions import BindungInkonsistentError
+from mietinkasso.domain.exceptions import BindungInkonsistentError, ObjektAusgeschlossenError
 from mietinkasso.infrastructure.db.tables import BKVertragsAnteilTable
 from mietinkasso.op.service import OPService
 from mietinkasso.stammdaten.repository import StammdatenRepository
@@ -57,6 +57,10 @@ class BKService:
             raise ValueError(f"Unbekanntes Objekt {objekt_id}")
         require_gesellschaft_access(ctx, objekt.gesellschaft_id)
         require_schreibrecht(ctx)
+        if objekt.ausgeschlossen:
+            raise ObjektAusgeschlossenError(
+                f"Objekt {objekt_id} ist von der Pilotphase ausgeschlossen; keine BK-Abrechnung möglich."
+            )
         return self._repository.get_or_create_abrechnung(objekt_id=objekt_id, abrechnungsjahr=abrechnungsjahr)
 
     def position_hinzufuegen(
