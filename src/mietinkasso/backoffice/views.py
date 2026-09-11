@@ -10,6 +10,7 @@ dieser Seite und wird bewusst nicht "optimiert" (kein ungeprüftes
 
 from __future__ import annotations
 
+import re
 from decimal import InvalidOperation
 from html import escape as h
 
@@ -46,24 +47,27 @@ def parse_eur_betrag(text: str | None) -> int:
     original = text.strip()
     if not original:
         raise ValueError("Betrag darf nicht leer sein.")
-    bereinigt = original.replace("\xa0", "").replace(" ", "")
-    hat_komma = "," in bereinigt
-    hat_punkt = "." in bereinigt
-    if hat_komma and hat_punkt:
-        if bereinigt.rfind(",") < bereinigt.rfind("."):
-            raise ValueError(
-                f"Betrag '{original}' ist mehrdeutig (Punkt nach dem Komma) - bitte eindeutiges Format "
-                "verwenden (z. B. 1.500,00 oder 1500.00)."
-            )
-        normalisiert = bereinigt.replace(".", "").replace(",", ".")
-    elif hat_komma:
-        normalisiert = bereinigt.replace(",", ".")
+    # Grouping must be validated BEFORE separators are removed. Otherwise
+    # "1.50,00" silently becomes 150 EUR, and "1.500" becomes 1.50 EUR
+    # even though a German-speaking operator may mean 1,500 EUR.
+    deutsches_format = r"[+-]?(?:[0-9]+|[0-9]{1,3}(?:\.[0-9]{3})+),[0-9]{1,2}"
+    einfaches_format = r"[+-]?[0-9]+(?:\.[0-9]{1,2})?"
+    if re.fullmatch(deutsches_format, original):
+        normalisiert = original.replace(".", "").replace(",", ".")
+    elif re.fullmatch(einfaches_format, original):
+        normalisiert = original
     else:
-        normalisiert = bereinigt
+        raise ValueError(
+            f"Betrag '{original}' ist ungültig oder mehrdeutig. "
+            "Bitte z. B. 1.500,00 oder 1500.00 verwenden, mit höchstens zwei Nachkommastellen."
+        )
     try:
-        return to_cents(normalisiert)
+        cent = to_cents(normalisiert)
     except (InvalidOperation, ArithmeticError, ValueError) as exc:
         raise ValueError(f"Betrag '{original}' ist kein gültiger Geldbetrag.") from exc
+    if abs(cent) > 2**63 - 1:
+        raise ValueError("Betrag überschreitet den zulässigen Speicherbereich.")
+    return cent
 
 
 #: Sichtbare Hauptnavigation für angemeldete Benutzer. Die Vorschreibungs-/

@@ -1,6 +1,6 @@
 # Offene Punkte — Mietinkasso-Modul
 
-Stand: erste Lieferung (siehe REVIEW_ZUSAMMENFASSUNG.md für Baustand).
+Stand: lokaler synthetischer Backoffice-Pilot, 11.09.2026; keine Produktionsfreigabe.
 Alles hier ist bewusst offen gelassen bzw. bewusst konservativ gebaut —
 keine stillschweigend übersprungenen Punkte.
 
@@ -37,6 +37,14 @@ keine stillschweigend übersprungenen Punkte.
 
 ## Integration / Betrieb
 
+- **Zahlungszuordnung erkennt bisher nur explizite Vertragsreferenzen:**
+  Die Relevanzprüfung ungeklärter Zahlungseingänge erkennt bisher nur
+  explizite `VERTRAG:<id>`-Referenzen. Namenlose Eingänge/freie
+  Referenzen werden nicht als möglicherweise zugehörig erkannt. Vor
+  automatischem Produktiv-Mahnversand echte Exportfelder/Vertragskennungen
+  abgleichen und ungeklärte Eingänge vollständig klassifizieren oder
+  betroffene Mahnläufe sperren. Exportvollständigkeit allein löst die
+  Zuordnungsfrage nicht. Dieser Punkt bleibt Produktionsblocker.
 - **Quellenmapping (Codex-Aufgabe):** Zuordnung der realen 12
   PDF-Quelldokumente (Deb-/Kred-/Sachkontensalden, Journal,
   Stammblätter, Zinslisten, Kaution) auf die hier definierten

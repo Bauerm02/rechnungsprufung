@@ -26,6 +26,9 @@ from mietinkasso.backoffice.views import eur, parse_eur_betrag
         ("1500", 150_000),  # bisher akzeptiert: reine Ganzzahl
         ("0,05", 5),
         ("  1.234,56  ", 123_456),  # umgebende Leerzeichen werden toleriert
+        ("1.234.567,89", 123_456_789),  # mehrstellige Tausendergruppierung
+        ("-1.500,00", -150_000),  # negativer Betrag (z. B. Korrektur nach unten)
+        ("1.5", 150),  # einfaches Format mit einer Nachkommastelle
     ],
 )
 def test_parse_eur_betrag_akzeptiert_deutsche_und_einfache_notation(eingabe, erwartete_cent):
@@ -52,6 +55,15 @@ def test_parse_eur_betrag_rundtrip_mit_eur_formatierung():
         "1.500.00",  # zwei Punkte ohne Komma - kaputt
         "12,34,56",  # mehrere Kommas - kaputt
         "€ 100",
+        "1.500",  # ohne Komma mehrdeutig: Tausenderpunkt oder Dezimalpunkt?
+        "1,500",  # ohne führende Zifferngruppierung mehrdeutig
+        "1.50,00",  # unvollständige Tausendergruppierung vor dem Komma
+        "1234.567,89",  # erste Gruppe hat vier statt drei Ziffern
+        "1 5,00",  # Leerzeichen innerhalb des Betrags
+        "1e3",  # wissenschaftliche Notation
+        "NaN",
+        "Infinity",
+        "999999999999999999999.99",  # überschreitet den zulässigen Speicherbereich
     ],
 )
 def test_parse_eur_betrag_lehnt_mehrdeutige_oder_kaputte_eingaben_verstaendlich_ab(eingabe):
