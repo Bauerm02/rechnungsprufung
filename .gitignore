@@ -7,4 +7,5 @@ data/
 
 # ebics-downloader (PHP/Composer) - composer.lock wird committet, vendor/ nicht
 ebics-downloader/vendor/
+ebics-downloader/.phpunit.result.cache
 
