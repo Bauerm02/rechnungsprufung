@@ -1,14 +1,19 @@
 # AGENTS.md — Arbeitsregeln für dieses Repository
 
-Dieses Repository enthält zwei unabhängige, absichtlich getrennte Codebasen:
+Dieses Repository enthält drei unabhängige, absichtlich getrennte Codebasen:
 
 - `src/invoice_automation/` — Kreditoren-/Eingangsrechnungs-Automatisierung
   (Migration von Zapier). Siehe `README.md`.
 - `src/mietinkasso/` — Hausverwaltung & Mietinkasso (Auftrag
   `HV-20260911-MVP1`). Siehe `docs/hausverwaltung/RAHMENPROGRAMM.md`.
+- `ebics-downloader/` — eigenständiger PHP/Composer-Baum, EBICS-
+  Downloadclient für camt.053-Kontoauszüge (Auftrag
+  `HV-20260912-ECHTBETRIEB`, Paket D). Siehe `ebics-downloader/README.md`.
+  Eigene Tests (`ebics-downloader/vendor/bin/phpunit`), eigenes
+  `composer.json` — läuft vollständig getrennt von Python/`pyproject.toml`.
 
-Die beiden Module importieren sich gegenseitig nicht. Wer an einem
-Modul arbeitet, lässt das andere unangetastet, außer eine Änderung ist
+Die Module importieren sich gegenseitig nicht. Wer an einem Modul
+arbeitet, lässt die anderen unangetastet, außer eine Änderung ist
 ausdrücklich repository-weit (z. B. `pyproject.toml`, CI).
 
 ## Auftrag HV-20260911-MVP1 (Hausverwaltung & Mietinkasso)

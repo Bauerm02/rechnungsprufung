@@ -1,0 +1,45 @@
+{
+    "name": "sieben-doerfer/ebics-downloader",
+    "description": "Schmaler, isolierter EBICS-Downloadclient (Paket D1) - ausschliesslich Konfigurationspruefung + Download bestaetigter camt.053-Formate. Vollstaendig getrennt von der Mietinkasso-Datenbank. Kein Zahlungsverkehr, keine Schluesselerzeugung.",
+    "type": "project",
+    "license": "proprietary",
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/ebics-api/ebics-client-php.git"
+        }
+    ],
+    "require": {
+        "php": "^8.5",
+        "ext-bcmath": "*",
+        "ext-curl": "*",
+        "ext-dom": "*",
+        "ext-json": "*",
+        "ext-libxml": "*",
+        "ext-openssl": "*",
+        "ext-zip": "*",
+        "ext-zlib": "*",
+        "ebics-api/ebics-client-php": "3.2.1"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "EbicsDownloader\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "EbicsDownloader\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true,
+        "platform": {
+            "php": "8.5.0"
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

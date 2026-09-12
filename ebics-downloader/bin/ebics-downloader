@@ -1,0 +1,42 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Einziger CLI-Einstiegspunkt. Zwei Unterbefehle:
+ *
+ *   ebics-downloader check-config <profil.json>
+ *       Rein strukturelle Prüfung, kein Netzwerkzugriff, toleriert
+ *       enabled=false und Platzhalterwerte.
+ *
+ *   ebics-downloader download <profil.json> [--von=YYYY-MM-DD] [--bis=YYYY-MM-DD]
+ *       Echter, einmaliger EBICS-Downloadversuch. Verlangt ein
+ *       vollständig ausgefülltes, aktiviertes Profil (assertRunnable()).
+ *
+ * KEINE öffentliche HTTP-Schnittstelle, KEIN Dauerprozess - jeder Aufruf
+ * ist ein einzelner, abgeschlossener Kommandozeilenlauf.
+ */
+
+require dirname(__DIR__) . '/vendor/autoload.php';
+
+use EbicsDownloader\Cli\CheckConfigCommand;
+use EbicsDownloader\Cli\DownloadCommand;
+
+$befehl = $argv[1] ?? null;
+$profilPfad = $argv[2] ?? null;
+
+if ($befehl === null || $profilPfad === null || !in_array($befehl, ['check-config', 'download'], true)) {
+    fwrite(STDERR, "Verwendung:\n");
+    fwrite(STDERR, "  ebics-downloader check-config <profil.json>\n");
+    fwrite(STDERR, "  ebics-downloader download <profil.json> [--von=YYYY-MM-DD] [--bis=YYYY-MM-DD]\n");
+    exit(64);
+}
+
+$restArgumente = array_slice($argv, 3);
+
+if ($befehl === 'check-config') {
+    exit((new CheckConfigCommand())->ausfuehren($profilPfad));
+}
+
+exit((new DownloadCommand())->ausfuehren($profilPfad, $restArgumente));

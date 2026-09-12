@@ -1,0 +1,20 @@
+[Unit]
+Description=EBICS-Downloadclient (Paket D1) fuer Profil %i - EINMALIGER Abruf, kein Dauerprozess
+# NICHT installieren/aktivieren, ohne dass ein Mensch (Codex/Markus) das
+# echte %i-Profil, den Container und die Mount-Pfade geprueft hat. Diese
+# Datei ist ausschliesslich eine Vorlage (siehe README.md).
+
+[Service]
+Type=oneshot
+# %i = Profilname, z. B. "volksbank" -> /etc/ebics-downloader/volksbank.json
+ExecStart=/usr/bin/docker run --rm \
+    --read-only \
+    -v /etc/ebics-downloader/%i.json:/app/privat/profile.json:ro \
+    -v /etc/ebics-downloader/%i-schluessel:/app/privat/schluessel:ro \
+    -v /var/lib/ebics-downloader/%i:/app/privat/daten:rw \
+    sieben-doerfer/ebics-downloader:latest \
+    download /app/privat/profile.json
+
+# Keine Netzwerkfreigabe ausser fuer die eine konfigurierte Bank-URL -
+# ein Reverse-Proxy/Egress-Filter auf Hostebene wird hier bewusst NICHT
+# mitgeliefert (haengt vom konkreten Hetzner-Setup ab, siehe README.md).

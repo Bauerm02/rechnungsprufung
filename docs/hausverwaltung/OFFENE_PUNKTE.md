@@ -827,3 +827,45 @@ Server getestet. Konkret offen/einzuhalten:
   Doppel-Versand-Sicherheit kommt aus den DB-Unique-Constraints in
   `vorschreibungen` (Vertrag+Monat) und `mahn_faelle` (outbox_key) plus
   dem atomaren Compare-and-Swap in `MahnFallRepository.claim_fuer_versand`.
+
+## Paket D — EBICS-Downloadclient (Nutzerauftrag 12.09., eigenständiges PHP-Modul)
+
+Vollständig separates Modul `ebics-downloader/` (eigener Composer-Baum,
+eigene Tests, kein Import von/nach `src/mietinkasso/` oder
+`src/invoice_automation/`) - ein isolierter EBICS-Downloadclient für
+camt.053-Kontoauszüge auf Basis der MIT-lizenzierten Bibliothek
+`ebics-api/ebics-client-php`. Vollständige Betriebsgrenzen, offene
+Punkte und Architektur stehen in `ebics-downloader/README.md`
+(Abschnitt „Betriebsgrenzen“) und `ebics-downloader/docs/ONBOARDING_EBICS.md`
+- hier nur die Kurzfassung für den Querverweis aus dem
+Mietinkasso-Kontext:
+
+- **Kein Cutover.** Dieses Paket liefert ausschließlich ein
+  Übergabeverzeichnis (`release_dir`) mit geprüften, nach Objekt
+  getrennten camt.053-Einzelstatements. Ein automatischer Import
+  dieser Dateien in `src/mietinkasso/` (Ablösung der bestehenden
+  40 synthetischen CSV-Bewegungen im Demo-Seed als Bankquelle) ist
+  ausdrücklich NICHT Teil dieses Auftrags und erfordert einen eigenen,
+  separat zu beauftragenden und unabhängig zu prüfenden Schritt.
+- **Kein echter Bankkontakt in dieser Sitzung.** 80 synthetische
+  PHPUnit-Tests decken Konfigurationsvalidierung, Keyring-Guard,
+  CAMT-Sicherheitsschicht (DTD/Entity, ZIP-Grenzen/Pfadtraversal/
+  Symlink, IBAN-Trennung) und Replay/Konflikt/Prozesssperre ab - das
+  ist KEINE Live-Bank-Abnahme.
+- **Docker-Image ungetestet** (kein Docker-Daemon in dieser
+  Entwicklungssitzung verfügbar) und ein in dieser Sitzung verifiziertes
+  echtes Upstream-Problem bei `ebics-api/ebics-client-php` 3.2.1
+  (Packagist-Commit-Referenz veraltet, Composer-Fix über einen
+  direkten VCS-Repository-Eintrag) - Details in
+  `ebics-downloader/README.md`.
+- **Restrisiko Dekompressionsbombe** vor dem eigenen `ackClosure`-Hook,
+  da die bibliothekseigene Transportdekompression zwingend davor
+  läuft - dokumentiert und über einen HTTP-Transportgrößen-Cap
+  (`Http\SizeCappedCurlHttpClientFactory`) so weit wie mit der
+  öffentlichen Bibliotheks-API möglich begrenzt, aber nicht
+  vollständig ausschließbar.
+- **Onboarding-Reihenfolge:** bestehende, bereits verschlüsselte
+  Teilnehmer-Keyrings (Volksbank/Raiffeisen Wien laut Markus bereits
+  vorhanden) haben Vorrang vor jeder Neuanlage; ein tatsächliches
+  Onboarding führt ausschließlich ein Mensch durch (Claude hat keinen
+  Bankzugriff).

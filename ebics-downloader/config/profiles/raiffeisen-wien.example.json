@@ -1,0 +1,57 @@
+{
+  "_hinweis": "GENERISCHES BEISPIEL - enthaelt AUSSCHLIESSLICH PLATZHALTER, siehe volksbank.example.json fuer die ausfuehrliche Erklaerung. Dieses zweite Beispiel zeigt zusaetzlich den EBICS-2.5/FDL-Ausweichweg (ebics_version=H004): NUR verwenden, wenn die Bank EBICS 3.0/H005-BTD tatsaechlich nicht unterstuetzt UND das bankseitig bestaetigt ist - niemals als impliziter Default.",
+  "profile": "raiffeisen-wien-teilnehmer",
+  "enabled": false,
+  "ebics_version": "H004",
+  "host_id": "PLATZHALTER_HOST_ID",
+  "bank_url": "https://PLATZHALTER-EBICS.RAIFFEISEN.INVALID/ebics",
+  "partner_id": "PLATZHALTER_PARTNER_ID",
+  "user_id": "PLATZHALTER_USER_ID",
+  "bank_fingerprint_sha256": {
+    "signature_x": "PLATZHALTER_SHA256_BANK_SIGNATUR_X_BEIM_ONBOARDING_VERIFIZIEREN",
+    "signature_e": "PLATZHALTER_SHA256_BANK_SIGNATUR_E_BEIM_ONBOARDING_VERIFIZIEREN"
+  },
+  "keyring": {
+    "path": "/PLATZHALTER/privater/pfad/raiffeisen-wien/keyring.json",
+    "passphrase_file": "/PLATZHALTER/privater/pfad/raiffeisen-wien/passphrase.txt"
+  },
+  "btd": {
+    "service_name": "PLATZHALTER_SERVICE_NAME_WIRD_BEI_H004_NICHT_VERWENDET",
+    "scope": null,
+    "service_option": null,
+    "container_type": null,
+    "msg_name": "camt.053",
+    "msg_name_variant": null,
+    "msg_name_version": null,
+    "msg_name_format": null
+  },
+  "fdl_fallback": {
+    "enabled": true,
+    "file_format": "camt.053"
+  },
+  "allowed_accounts": [
+    { "objekt": "601", "iban": "PLATZHALTER_IBAN_601" },
+    { "objekt": "616", "iban": "PLATZHALTER_IBAN_616" },
+    { "objekt": "617", "iban": "PLATZHALTER_IBAN_617" }
+  ],
+  "blocked_objekte": ["107"],
+  "archive_dir": "/PLATZHALTER/privat/ebics-downloader/raiffeisen-wien/archiv",
+  "quarantine_dir": "/PLATZHALTER/privat/ebics-downloader/raiffeisen-wien/quarantaene",
+  "release_dir": "/PLATZHALTER/privat/ebics-downloader/raiffeisen-wien/freigegeben",
+  "ledger_path": "/PLATZHALTER/privat/ebics-downloader/raiffeisen-wien/ledger.json",
+  "lock_file": "/PLATZHALTER/privat/ebics-downloader/raiffeisen-wien/lock",
+  "limits": {
+    "max_response_bytes": 52428800,
+    "max_zip_entries": 50,
+    "max_entry_bytes": 20971520,
+    "http_timeout_seconds": 120,
+    "max_retries": 0,
+    "lock_timeout_seconds": 10
+  },
+  "tls": {
+    "verify_peer": true,
+    "verify_host": true,
+    "allow_redirects": false,
+    "ca_bundle_path": null
+  }
+}

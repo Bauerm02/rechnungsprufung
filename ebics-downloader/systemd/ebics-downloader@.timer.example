@@ -1,0 +1,10 @@
+[Unit]
+Description=Taeglicher EBICS-Abruf fuer Profil %i (Vorlage - NICHT aktiviert)
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+Unit=ebics-downloader@%i.service
+
+[Install]
+WantedBy=timers.target
