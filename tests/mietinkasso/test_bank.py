@@ -385,6 +385,34 @@ def test_camt053_fehlende_iban_lehnt_gesamten_import_ab(bank_service, bank_repo,
     assert bank_repo.list_unzugeordnet("BK-7DI-1") == []
 
 
+def test_camt053_ntry_ausserhalb_des_geprueften_stmt_lehnt_gesamten_import_ab(bank_service, bank_repo, ctx_factory):
+    """Codex-Rückprüfung (fa768be): `_pruefe_stmt_konten` validierte bisher
+    JEDEN Stmt/Acct, aber die eigentliche Ntry-Sammlung lief weiterhin
+    über `root.iter()` und fand damit auch eine Ntry, die GAR NICHT
+    innerhalb eines geprüften Stmt liegt (hier: eine Ntry auf Ebene von
+    BkToCstmrStmt, ein Geschwisterelement von Stmt statt dessen Kind) -
+    diese Bewegung wurde bisher trotz "bestandener" Kontoprüfung ohne
+    geprüfte Kontobindung importiert. Muss den GESAMTEN Import ablehnen,
+    NULL Transaktionen übrig."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    ntry_ausserhalb_stmt = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">'
+        '<BkToCstmrStmt>'
+        '<Stmt><Acct><Id><IBAN>AT000000000000000000</IBAN></Id></Acct></Stmt>'
+        '<Ntry><Amt Ccy="EUR">10.00</Amt><CdtDbtInd>CRDT</CdtDbtInd>'
+        '<BookgDt><Dt>2026-04-01</Dt></BookgDt></Ntry>'
+        '</BkToCstmrStmt></Document>'
+    )
+    with pytest.raises(CamtKontoMismatchError, match="außerhalb"):
+        bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=ntry_ausserhalb_stmt.encode("utf-8"))
+    assert bank_repo.list_unzugeordnet("BK-7DI-1") == []
+
+
 def test_zuordnen_manuell_lehnt_betrag_ueber_transaktionshoehe_ab(bank_service, bank_repo, basis_vertrag, ctx_factory):
     """Regression (Codex-Fund #4): 1000 EUR aus einer 600 EUR Zahlung
     zuzuordnen (und damit -1000 EUR zu buchen) muss abgelehnt werden."""

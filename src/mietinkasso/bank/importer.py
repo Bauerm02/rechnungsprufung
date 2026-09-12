@@ -84,6 +84,10 @@ def _direct_child(element: ET.Element, localname: str) -> ET.Element | None:
     return None
 
 
+def _direct_children(element: ET.Element, localname: str) -> list[ET.Element]:
+    return [child for child in element if _localname(child.tag) == localname]
+
+
 def _find_text(element: ET.Element, localname: str) -> str | None:
     for child in element.iter():
         if _localname(child.tag) == localname and child.text:
@@ -109,13 +113,37 @@ def _normalisiere_iban(iban: str | None) -> str:
     return (iban or "").strip().upper().replace(" ", "")
 
 
-def _pruefe_stmt_konten(root: ET.Element, erwartete_iban: str) -> None:
+def _eindeutige_iban(acct: ET.Element) -> str | None:
+    """Verlangt eine EINDEUTIGE IBAN im Acct-Block - anders als `_find_text`
+    (nimmt den ersten Treffer) wird MEHR als eine gefundene IBAN-Angabe als
+    nicht eindeutig zuordenbar abgelehnt, statt stillschweigend die erste
+    zu verwenden."""
+
+    ibans = [
+        (child.text or "").strip()
+        for child in acct.iter()
+        if _localname(child.tag) == "IBAN" and (child.text or "").strip()
+    ]
+    eindeutige_werte = sorted(set(ibans))
+    if len(eindeutige_werte) > 1:
+        raise CamtKontoMismatchError(
+            f"Acct-Block enthält mehrere unterschiedliche IBAN-Angaben ({eindeutige_werte}); nicht eindeutig "
+            "zuordenbar - Import abgelehnt."
+        )
+    return ibans[0] if ibans else None
+
+
+def _pruefe_stmt_konten(root: ET.Element, erwartete_iban: str) -> list[ET.Element]:
     """Validiert JEDEN `Stmt`/`Acct`-Block gegen das explizit ausgewählte
     Bankkonto, BEVOR auch nur eine `Ntry` gelesen wird - siehe
     `CamtKontoMismatchError`. Ein fehlendes `Stmt`-Element (untypisch für
     eine echte CAMT.053-Datei) wird ebenfalls abgelehnt statt stillschweigend
     durchgereicht, damit eine strukturell unerwartete Datei nie ungeprüft
-    Kontenzuordnungen auslöst."""
+    Kontenzuordnungen auslöst. Liefert die Liste der validierten `Stmt`-
+    Elemente zurück, damit der Aufrufer AUSSCHLIESSLICH deren direkte
+    `Ntry`-Kinder einliest (siehe `parse_camt053`) - eine `Ntry` außerhalb
+    jedes validierten `Stmt`, oder tiefer verschachtelt als ein direktes
+    Kind, würde sonst trotz bestandener Kontoprüfung mitgelesen."""
 
     erwartete_iban_norm = _normalisiere_iban(erwartete_iban)
     if not erwartete_iban_norm:
@@ -129,8 +157,13 @@ def _pruefe_stmt_konten(root: ET.Element, erwartete_iban: str) -> None:
 
     gefundene_ibans: set[str] = set()
     for stmt in stmt_elemente:
-        acct = _direct_child(stmt, "Acct")
-        iban = _find_text(acct, "IBAN") if acct is not None else None
+        accts = _direct_children(stmt, "Acct")
+        if len(accts) > 1:
+            raise CamtKontoMismatchError(
+                "CAMT.053-Statement enthält mehrere Acct-Blöcke; nicht eindeutig zuordenbar - Import abgelehnt."
+            )
+        acct = accts[0] if accts else None
+        iban = _eindeutige_iban(acct) if acct is not None else None
         iban_norm = _normalisiere_iban(iban)
         if not iban_norm:
             raise CamtKontoMismatchError(
@@ -151,6 +184,33 @@ def _pruefe_stmt_konten(root: ET.Element, erwartete_iban: str) -> None:
         raise CamtKontoMismatchError(
             f"CAMT.053-Datei enthält kein Statement für das ausgewählte Konto {erwartete_iban_norm}."
         )
+    return stmt_elemente
+
+
+def _pruefe_und_sammle_direkte_ntry(root: ET.Element, stmt_elemente: list[ET.Element]) -> list[ET.Element]:
+    """Sammelt AUSSCHLIESSLICH `Ntry`-Elemente, die DIREKTE Kinder eines
+    bereits gegen das ausgewählte Konto validierten `Stmt` sind (siehe
+    `_pruefe_stmt_konten`). Jede `Ntry` irgendwo sonst im Dokument -
+    außerhalb jedes `Stmt` (z. B. fälschlich auf `BkToCstmrStmt`-Ebene)
+    oder tiefer verschachtelt als ein direktes `Stmt`-Kind - lehnt den
+    GESAMTEN Import ab, statt sie unvalidiert mitzulesen (Codex-Fund:
+    `root.iter()` fand bisher JEDE `Ntry` im Dokument, unabhängig davon,
+    ob sie überhaupt zu einem geprüften `Stmt` gehörte)."""
+
+    valide: list[ET.Element] = []
+    valide_ids: set[int] = set()
+    for stmt in stmt_elemente:
+        for ntry in _direct_children(stmt, "Ntry"):
+            valide.append(ntry)
+            valide_ids.add(id(ntry))
+
+    alle_ntry = [el for el in root.iter() if _localname(el.tag) == "Ntry"]
+    if any(id(el) not in valide_ids for el in alle_ntry):
+        raise CamtKontoMismatchError(
+            "CAMT.053-Datei enthält mindestens eine Ntry außerhalb (oder tiefer verschachtelt als ein "
+            "direktes Kind) eines geprüften Stmt-Blocks - Import abgelehnt, keine ungeprüfte Kontobindung."
+        )
+    return valide
 
 
 def parse_camt053(xml_bytes: bytes, *, erwartete_iban: str) -> list[RohTransaktion]:
@@ -162,12 +222,10 @@ def parse_camt053(xml_bytes: bytes, *, erwartete_iban: str) -> list[RohTransakti
     Einlesen einer `Ntry` vollständig abgelehnt."""
 
     root = ET.fromstring(xml_bytes)
-    _pruefe_stmt_konten(root, erwartete_iban)
+    stmt_elemente = _pruefe_stmt_konten(root, erwartete_iban)
+    valide_ntry = _pruefe_und_sammle_direkte_ntry(root, stmt_elemente)
     ergebnisse: list[RohTransaktion] = []
-    for entry in root.iter():
-        if _localname(entry.tag) != "Ntry":
-            continue
-
+    for entry in valide_ntry:
         amt_element = None
         for child in entry.iter():
             if _localname(child.tag) == "Amt":
