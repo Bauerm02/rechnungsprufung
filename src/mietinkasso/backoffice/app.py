@@ -64,6 +64,11 @@ from mietinkasso.vorschreibung.service import VorschreibungService, faelligkeits
 router = APIRouter(prefix="/backoffice", tags=["backoffice"])
 
 _settings = get_settings()
+# Nur für die Banner-/Titel-Anzeige (views.py::betriebsmodus_banner) -
+# reine Anzeigeentscheidung, kein neues Datenmodell, keine automatische
+# Freigabe von irgendetwas. `environment` ist bereits vorhandene
+# Konfiguration (infrastructure/config.py), kein neues Feld.
+_PRODUKTIV = _settings.environment == "production"
 _session_factory = build_session_factory(_settings.database_url)
 _stammdaten_repo = StammdatenRepository(_session_factory)
 _op_repo = OPRepository(_session_factory)
@@ -148,12 +153,19 @@ def _verify_csrf(session, csrf_token: str) -> None:
 
 
 def _layout(request: Request, session, titel: str, inhalt: str) -> HTMLResponse:
-    return HTMLResponse(seite(titel=titel, inhalt=inhalt, user_id=session.user_id if session else None, csrf_token=session.csrf_token if session else None))
+    return HTMLResponse(seite(
+        titel=titel, inhalt=inhalt, user_id=session.user_id if session else None,
+        csrf_token=session.csrf_token if session else None,
+        produktiv=_PRODUKTIV, send_enabled=_settings.send_enabled,
+    ))
 
 
 def _fehlerseite(session, titel: str, meldung: str, zurueck_href: str = "/backoffice/") -> HTMLResponse:
     inhalt = flash_error(meldung) + f'<p><a href="{h(zurueck_href)}">&larr; zurück</a></p>'
-    return HTMLResponse(seite(titel=titel, inhalt=inhalt, user_id=session.user_id, csrf_token=session.csrf_token), status_code=400)
+    return HTMLResponse(seite(
+        titel=titel, inhalt=inhalt, user_id=session.user_id, csrf_token=session.csrf_token,
+        produktiv=_PRODUKTIV, send_enabled=_settings.send_enabled,
+    ), status_code=400)
 
 
 def _ist_objekt_gesperrt(objekt_id: str) -> bool:
@@ -187,7 +199,7 @@ def login_formular(request: Request, fehler: str | None = None) -> HTMLResponse:
         <button type="submit">Anmelden</button>
       </form>
     </div>"""
-    return HTMLResponse(seite(titel="Anmeldung", inhalt=inhalt))
+    return HTMLResponse(seite(titel="Anmeldung", inhalt=inhalt, produktiv=_PRODUKTIV, send_enabled=_settings.send_enabled))
 
 
 @router.post("/login")

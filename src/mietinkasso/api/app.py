@@ -28,6 +28,7 @@ from fastapi.responses import HTMLResponse
 from mietinkasso.backoffice.app import router as backoffice_router
 from mietinkasso.infrastructure.config import get_settings, pruefe_produktionskonfiguration
 from mietinkasso.infrastructure.db.session import build_session_factory
+from mietinkasso.infrastructure.readiness import datenbank_lesend_erreichbar
 from mietinkasso.mahnwesen.repository import MahnFallRepository
 from mietinkasso.op.repository import OPRepository
 from mietinkasso.op.service import OPService
@@ -59,7 +60,25 @@ def _require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-K
 
 @app.get("/health")
 def health() -> dict:
+    """Liveness: der Prozess läuft und antwortet - bewusst OHNE
+    Datenbankzugriff, damit ein Orchestrator einen Prozess mit
+    hängender DB-Verbindung nicht mit einem hängenden Health-Check
+    verwechselt (dafür gibt es `/ready`)."""
+
     return {"status": "ok", "environment": _settings.environment, "send_enabled": _settings.send_enabled}
+
+
+@app.get("/ready")
+def readiness() -> dict:
+    """Readiness: bestätigt LESEND, dass die konfigurierte Datenbank
+    tatsächlich erreichbar ist (`SELECT 1`) - keine Kontodaten, kein
+    Auth nötig (dieselbe Offenheit wie `/health`, nur mit echtem
+    DB-Zugriff). Ein Reverse-Proxy/Orchestrator soll erst dann Traffic
+    zustellen, wenn dies 200 liefert."""
+
+    if not datenbank_lesend_erreichbar(_session_factory):
+        raise HTTPException(status_code=503, detail="Datenbank nicht erreichbar.")
+    return {"status": "ready"}
 
 
 @app.get("/v1/konten/{konto_id}/op", dependencies=[Depends(_require_api_key)])

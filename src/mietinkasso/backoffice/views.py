@@ -85,7 +85,35 @@ _NAV_LINKS = [
 ]
 
 
-def seite(*, titel: str, inhalt: str, user_id: str | None = None, csrf_token: str | None = None) -> str:
+def betriebsmodus_banner(*, produktiv: bool, send_enabled: bool) -> str:
+    """Reine Anzeigeentscheidung (kein neues Datenmodell, keine
+    automatische Freigabe von irgendetwas) - liest ausschließlich die
+    bereits vorhandene `environment`/`send_enabled`-Konfiguration und
+    entscheidet NUR, welcher Banner-Text angezeigt wird. `produktiv`
+    kommt vom Aufrufer (`backoffice/app.py`, aus `settings.environment
+    == "production"`); diese Funktion selbst liest/ändert keinen
+    Zustand."""
+
+    if not produktiv:
+        return "PILOT-BETRIEB — nur synthetische Demodaten, kein realer Bank-/Mailversand, kein Mehrbenutzerbetrieb"
+    mailversand = "AKTIV" if send_enabled else "AUS (SEND_ENABLED=false)"
+    return (
+        f"ECHTBETRIEB — reale Hausverwaltungsdaten. Mailversand: {mailversand}. "
+        "Automatischer Bankabgleich: AUS (EBS/EBICS ausstehend)."
+    )
+
+
+def seite(
+    *,
+    titel: str,
+    inhalt: str,
+    user_id: str | None = None,
+    csrf_token: str | None = None,
+    produktiv: bool = False,
+    send_enabled: bool = False,
+) -> str:
+    banner_text = betriebsmodus_banner(produktiv=produktiv, send_enabled=send_enabled)
+    titel_suffix = "ECHTBETRIEB" if produktiv else "PILOT"
     logout_form = ""
     nav = ""
     if user_id is not None:
@@ -102,7 +130,7 @@ def seite(*, titel: str, inhalt: str, user_id: str | None = None, csrf_token: st
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{h(titel)} — Hausverwaltung & Mietinkasso (PILOT)</title>
+<title>{h(titel)} — Hausverwaltung & Mietinkasso ({titel_suffix})</title>
 <style>
   body {{ font-family: system-ui, -apple-system, sans-serif; margin: 0; background: #f5f6f8; color: #1a1a1a; }}
   header {{ background: #14213d; color: #fff; padding: 0.6rem 1.25rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; }}
@@ -134,7 +162,7 @@ def seite(*, titel: str, inhalt: str, user_id: str | None = None, csrf_token: st
 </style>
 </head>
 <body>
-<div class="pilot-banner">PILOT-BETRIEB — nur synthetische Demodaten, kein realer Bank-/Mailversand, kein Mehrbenutzerbetrieb</div>
+<div class="pilot-banner">{h(banner_text)}</div>
 <header>
   <a href="/backoffice/">Hausverwaltung & Mietinkasso</a>
   <div>{logout_form}</div>

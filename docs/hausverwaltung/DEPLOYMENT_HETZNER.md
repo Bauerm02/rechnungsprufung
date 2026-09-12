@@ -129,32 +129,100 @@ globale Sperre — bewusst nicht IP-basiert, siehe
 `backoffice/security.py::LoginRateLimiter`) und prüft den
 Origin-/Referer-Header gegen Login-CSRF.
 
-## 6. Health-Check ohne Kundendaten
+## 5b. Docker (Alternative zu venv+systemd)
 
-`GET /health` (siehe `api/app.py`) ist absichtlich ohne Auth erreichbar
-und liefert ausschließlich `{"status": "ok", "environment": ...,
-"send_enabled": ...}` — keine Konto-/Vertrags-/Personendaten. Geeignet
-für einen externen Uptime-Check oder `systemd`'s eigenen Healthcheck,
-ohne dass dafür ein API-Token verteilt werden muss.
+`Dockerfile.mietinkasso` (Repo-Wurzel) baut ein eigenständiges Image
+NUR für `mietinkasso.api.app:app` — komplett getrennt vom
+Wurzel-`Dockerfile` (Rechnungsmodul `invoice_automation`, unangetastet).
+
+```bash
+docker build -f Dockerfile.mietinkasso -t mietinkasso-hausverwaltung .
+
+mkdir -p /run/mietinkasso /var/lib/mietinkasso-hausverwaltung
+docker run -d --name mietinkasso-hausverwaltung \
+    --env-file /etc/mietinkasso-hausverwaltung/env \
+    -v /run/mietinkasso:/run/mietinkasso \
+    -v /var/lib/mietinkasso-hausverwaltung:/var/lib/mietinkasso-hausverwaltung \
+    --restart unless-stopped \
+    mietinkasso-hausverwaltung
+```
+
+Kein `-p`/Port-Mapping — Caddy erreicht den Container über den
+gemeinsamen `/run/mietinkasso`-Socket-Mount (Bind-Mount-Verzeichnis),
+exakt wie beim venv+systemd-Betrieb; **keine Port80/443-Belegung**
+durch diesen Container. `--env-file` liefert
+`MIETINKASSO_DATABASE_URL`/Passwort-Hash/etc. — keine Defaults im
+Image, die auf eine Demo-Datenbank zeigen könnten. Ein Neustart des
+Containers ersetzt keine Daten (die SQLite-Datei liegt im gemounteten
+Volume, nicht im Container-Dateisystem).
+
+## 6. Health-Check und Readiness (kein Auth, keine Kundendaten)
+
+- `GET /health` — Liveness: der Prozess läuft und antwortet, OHNE
+  Datenbankzugriff. Liefert `{"status": "ok", "environment": ...,
+  "send_enabled": ...}`.
+- `GET /ready` — Readiness: bestätigt LESEND (`SELECT 1`), dass die
+  konfigurierte Datenbank tatsächlich erreichbar ist. Liefert 200
+  `{"status": "ready"}` oder 503, wenn die DB nicht antwortet — keine
+  Konto-/Vertrags-/Personendaten in der Antwort.
+
+Ein Reverse-Proxy/Orchestrator sollte `/ready` als Readiness-Probe
+verwenden (erst Traffic zustellen, wenn 200), `/health` als reine
+Liveness-Probe (Prozess neu starten, wenn dies nicht mehr antwortet).
+Beide brauchen keinen API-Token.
 
 ## 7. Backup/Restore
 
-**SQLite (Pilotgröße):**
-```bash
-# Backup (Prozess kurz stoppen ODER sqlite3 .backup für einen
-# konsistenten Snapshot ohne Downtime):
-sqlite3 /var/lib/mietinkasso-hausverwaltung/produktiv.db ".backup /pfad/backup/produktiv-$(date +%F).db"
+**SQLite — konsistentes Backup-API, Integritätsprüfung,
+Wiederherstellungsprobe (`scripts/backup_sqlite.py`):**
 
-# Restore: Prozess stoppen, Datei ersetzen, Prozess wieder starten.
-systemctl stop mietinkasso-hausverwaltung
-cp /pfad/backup/produktiv-2026-09-01.db /var/lib/mietinkasso-hausverwaltung/produktiv.db
-systemctl start mietinkasso-hausverwaltung
+```bash
+python scripts/backup_sqlite.py \
+    --database-url sqlite:////var/lib/mietinkasso-hausverwaltung/produktiv.db \
+    --backup-verzeichnis /pfad/ausserhalb/repo/backups \
+    --aufbewahrung-tage 30
+```
+
+Ein einzelner Lauf (`src/mietinkasso/infrastructure/backup.py::sichern`)
+führt VIER Schritte durch, die ALLE bestehen müssen, bevor ein Backup
+als erfolgreich gilt:
+
+1. **Online-Backup** über die SQLite Online Backup API
+   (`sqlite3.Connection.backup`, NICHT `cp`/`shutil.copy`) — liefert
+   einen konsistenten Snapshot auch während einer laufenden
+   Schreibtransaktion auf der Quelle, statt eine möglicherweise
+   strukturell kaputte Kopie mitten in einem Schreibvorgang zu ziehen.
+   Kein Downtime-Fenster nötig.
+2. **Integritätsprüfung** des NEUEN Backups (`PRAGMA integrity_check`).
+3. **Wiederherstellungsprobe**: das Backup wird in eine GETRENNTE,
+   temporäre Kopie dupliziert, DIESE geprüft, dann gelöscht — beweist,
+   dass sich aus der Backup-Datei tatsächlich eine eigenständige
+   Datenbank lesen lässt. Die echte Produktions-DB wird dabei zu keinem
+   Zeitpunkt geschrieben oder ersetzt (nur lesend geöffnet, SQLite-URI
+   `mode=ro`).
+4. **Aufbewahrung**: eigene, nach Zeitstempel benannte Backups
+   (`mietinkasso-<UTC-Zeitstempel>.db`) jenseits von
+   `--aufbewahrung-tage` werden gelöscht — NIE eine fremde/unbekannte
+   Datei im selben Verzeichnis.
+
+**Genau EIN Backupjob** (Timer-Vorlage): siehe
+`docs/hausverwaltung/deploy/mietinkasso-backup.service.example` +
+`.timer.example` (täglich 03:15, `Persistent=true` holt einen
+verpassten Lauf beim nächsten Boot nach). Kein zweiter, konkurrierender
+Cron-/Timer-Eintrag für denselben Job.
+
+**Restore:**
+```bash
+systemctl stop mietinkasso-hausverwaltung   # oder: docker stop mietinkasso-hausverwaltung
+cp /pfad/backups/mietinkasso-20260901T031500Z.db /var/lib/mietinkasso-hausverwaltung/produktiv.db
+systemctl start mietinkasso-hausverwaltung  # oder: docker start mietinkasso-hausverwaltung
 ```
 
 **PostgreSQL (falls stattdessen gewählt):** Standard `pg_dump`/
 `pg_restore` gegen die in `MIETINKASSO_DATABASE_URL` konfigurierte DB —
-keine mietinkasso-spezifische Logik nötig, da SQLAlchemy DB-agnostisch
-arbeitet (siehe OFFENE_PUNKTE.md).
+`scripts/backup_sqlite.py` gilt NUR für Datei-SQLite und lehnt eine
+PostgreSQL-URL ab; keine mietinkasso-spezifische Logik nötig, da
+SQLAlchemy DB-agnostisch arbeitet (siehe OFFENE_PUNKTE.md).
 
 ## 8. Einzelinstanz-/Transaktionsschutz (bereits vorhandene Grundlage)
 

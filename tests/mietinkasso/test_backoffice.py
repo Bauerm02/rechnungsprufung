@@ -118,6 +118,16 @@ def _csrf_token(client) -> str:
     return seite.text[start:ende]
 
 
+def test_ready_endpunkt_ist_offen_und_liest_db(backoffice_client):
+    """`/ready` (Paket A) ist wie `/health` ohne Auth erreichbar, prüft
+    aber tatsächlich lesend die DB - keine Kontodaten in der Antwort."""
+
+    client, *_ = backoffice_client
+    antwort = client.get("/ready")
+    assert antwort.status_code == 200
+    assert antwort.json() == {"status": "ready"}
+
+
 def test_ohne_login_wird_auf_login_umgeleitet(backoffice_client):
     client, konto_id, _konto_gesperrt_id, _op_service = backoffice_client
     antwort = client.get("/backoffice/", follow_redirects=False)
@@ -153,6 +163,21 @@ def test_login_und_dashboard_zeigt_objekte(backoffice_client):
     assert dashboard.status_code == 200
     assert "Am Corso" in dashboard.text
     assert konto_id in dashboard.text
+
+
+def test_dashboard_zeigt_pilot_banner_in_development_umgebung(backoffice_client):
+    """Diese Fixture importiert `api.app` mit `MIETINKASSO_ENVIRONMENT`
+    unausgesprochen auf dem Default "development" - der Banner muss
+    dafür den Demo-Text zeigen (der Echtbetrieb-Zweig wird auf der
+    reinen Funktion in test_backoffice_betriebsmodus.py getestet, siehe
+    dortige Erklärung zum Modul-Caching)."""
+
+    client, *_ = backoffice_client
+    _login(client)
+    dashboard = client.get("/backoffice/")
+    assert "PILOT-BETRIEB" in dashboard.text
+    assert "synthetische Demodaten" in dashboard.text
+    assert "ECHTBETRIEB" not in dashboard.text
 
 
 def test_dashboard_zeigt_einheiten_ohne_vertrag(backoffice_client):

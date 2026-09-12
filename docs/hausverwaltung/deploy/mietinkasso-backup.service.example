@@ -1,0 +1,35 @@
+# Vorlage für GENAU EINEN Backupjob (Auftrag 12.09., Paket A).
+# NIEMALS mit echten Pfaden in Git committen - dies ist nur die
+# Struktur. Die reale Datei lebt außerhalb dieses Repos, z. B. unter
+# /etc/systemd/system/mietinkasso-backup.service, und wird zusammen mit
+# der zugehörigen .timer-Datei von Codex auf dem bestehenden
+# Hetzner-Server angelegt/aktiviert.
+#
+# Oneshot-Service, ausgelöst durch mietinkasso-backup.timer - läuft NIE
+# parallel zu sich selbst (systemd startet einen bereits laufenden
+# Oneshot-Service nicht doppelt) und ist der EINE, alleinige Backupjob
+# für dieses Modul (kein zweiter, konkurrierender Cron-/Timer-Eintrag).
+
+[Unit]
+Description=Mietinkasso Hausverwaltung - SQLite-Sicherung (Backup)
+After=mietinkasso-hausverwaltung.service
+
+[Service]
+Type=oneshot
+User=mietinkasso-hausverwaltung
+Group=mietinkasso-hausverwaltung
+
+# Enthält MIETINKASSO_DATABASE_URL, BACKUP_VERZEICHNIS, AUFBEWAHRUNG_TAGE
+# - außerhalb von Git, siehe env.production.example als Vorlage für den
+# Aufbau (eigene, separate Datei für den Backupjob empfohlen).
+EnvironmentFile=/etc/mietinkasso-hausverwaltung/backup-env
+
+ExecStart=/opt/mietinkasso-hausverwaltung/venv/bin/python \
+    /opt/mietinkasso-hausverwaltung/app/scripts/backup_sqlite.py \
+    --database-url ${MIETINKASSO_DATABASE_URL} \
+    --backup-verzeichnis ${BACKUP_VERZEICHNIS} \
+    --aufbewahrung-tage ${AUFBEWAHRUNG_TAGE}
+
+# Ein fehlgeschlagenes Backup soll sichtbar sein (journalctl -u
+# mietinkasso-backup.service) - kein automatischer Retry hier, damit
+# ein wiederholt fehlschlagender Job nicht unbemerkt bleibt.

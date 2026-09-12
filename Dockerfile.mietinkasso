@@ -1,0 +1,41 @@
+# Eigenständiges Image für das Hausverwaltung & Mietinkasso-Modul
+# (Auftrag 12.09., Paket A). Getrennt vom Repo-Wurzel-`Dockerfile`
+# (Rechnungsmodul `invoice_automation`, unverändert) - dieses Image
+# startet NUR `mietinkasso.api.app:app`.
+#
+# Bewusst KEIN Port80/443, kein `-p`/`EXPOSE`-TCP-Port: der Prozess
+# bindet über `--uds` an einen Unix-Domain-Socket, den der bereits
+# laufende Caddy-Reverse-Proxy anspricht (siehe DEPLOYMENT_HETZNER.md,
+# Abschnitt "Docker"). Ein neuer öffentlicher Port wird dafür nicht
+# belegt.
+#
+# Build:  docker build -f Dockerfile.mietinkasso -t mietinkasso-hausverwaltung .
+# Run:    siehe DEPLOYMENT_HETZNER.md Abschnitt "Docker" für das
+#         vollständige Beispiel (Volumes für DB/Socket, --env-file).
+
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY src ./src
+
+RUN python -m pip install --upgrade pip && \
+    python -m pip install .
+
+# Kein Root-Prozess.
+RUN useradd --create-home --uid 10001 mietinkasso
+USER mietinkasso
+
+# EIN Worker ist Pflicht, kein Skalierungsparameter: der In-Memory-
+# Login-Session-Store (backoffice/security.py) ist auf genau einen
+# Prozess ausgelegt (siehe OFFENE_PUNKTE.md, "Kein Mehrbenutzer-
+# Onlinebetrieb"). `MIETINKASSO_DATABASE_URL`, der Passwort-Hash und
+# alle sonstigen Secrets MÜSSEN beim `docker run`/in der Compose-/
+# Unit-Datei über `--env-file`/`EnvironmentFile=` gesetzt werden - es
+# gibt hier bewusst KEINEN Default, der auf eine Demo-Datenbank zeigen
+# könnte.
+CMD ["uvicorn", "mietinkasso.api.app:app", "--uds", "/run/mietinkasso/uvicorn.sock", "--workers", "1"]

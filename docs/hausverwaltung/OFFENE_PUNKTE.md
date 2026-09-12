@@ -4,6 +4,55 @@ Stand: lokaler synthetischer Backoffice-Pilot, 11.09.2026; keine Produktionsfrei
 Alles hier ist bewusst offen gelassen bzw. bewusst konservativ gebaut —
 keine stillschweigend übersprungenen Punkte.
 
+## Paket A — produktionsgeeigneter Start (Nutzerauftrag 12.09., Nachmittag)
+
+Codex ist für den geschützten Onlinebetrieb auf dem bestehenden
+Hetzner-Server ausdrücklich autorisiert; dieser Abschnitt listet, was
+Paket A liefert und WAS ES BEWUSST NICHT TUT (Risiken für die
+Rückprüfung):
+
+- **Kein Auto-Deploy, kein Serverzugriff durch Claude:** alle
+  Artefakte (`Dockerfile.mietinkasso`, `scripts/backup_sqlite.py`,
+  Timer-/Service-Vorlagen) sind Vorlagen/Code - niemand hat sie gegen
+  den echten Hetzner-Server ausgeführt. Codex muss den ersten
+  `backup_sqlite.py`-Lauf, den ersten Container-/systemd-Start und die
+  Caddy-Anbindung real verifizieren.
+- **Backup deckt nur Datei-SQLite ab:** `infrastructure/backup.py`
+  lehnt PostgreSQL/`:memory:` bewusst ab (eigenes, DB-seitiges
+  Verfahren nötig, z. B. `pg_dump`). Falls Codex PostgreSQL statt
+  SQLite einsetzt, ist der neue Backupjob NICHT anwendbar und muss
+  ersetzt werden.
+- **Backup-Wiederherstellungsprobe prüft Lesbarkeit, nicht
+  Anwendungs-Constraints:** `PRAGMA integrity_check` +
+  "sqlite_master lesbar" beweisen eine strukturell intakte SQLite-
+  Datei, aber KEINE vollständige Restore-Drill-Automatisierung (echtes
+  Wiedereinspielen in einen laufenden Prozess, Vergleich der
+  Zeilenzahlen o. Ä.) - das bleibt ein manueller/Codex-seitiger Schritt
+  vor dem ersten produktiven Ernstfall.
+- **Genau ein Backupjob/Timer wie beauftragt** - keine automatische
+  Offsite-Replikation, keine Verschlüsselung der Backup-Dateien selbst
+  (Dateisystemrechte/Backup-Zielspeicher müssen das absichern).
+- **`/ready` bestätigt nur DB-Erreichbarkeit**, keine
+  Anwendungs-Vollständigkeit (z. B. fehlende Tabellen nach einem
+  abgebrochenen Migrationslauf würden `/ready` nicht zwingend als
+  Fehler zeigen, solange `SELECT 1` funktioniert).
+- **Betriebsmodus-Banner ist eine reine Anzeigeentscheidung**
+  (`backoffice/views.py::betriebsmodus_banner`, gesteuert über die
+  bereits vorhandene `MIETINKASSO_ENVIRONMENT`-Variable) - er
+  aktiviert/entsperrt NICHTS automatisch. Ein falsch gesetztes
+  `MIETINKASSO_ENVIRONMENT` (z. B. `production`, obwohl noch
+  Demo-Daten in der DB stehen) zeigt einen falschen Banner, ändert aber
+  keine Fachlogik.
+- **Dockerfile ist ungetestet gegen den echten Hetzner-Container:**
+  lokal nur auf Korrektheit der `pip install .`-Abhängigkeiten und
+  Struktur geprüft (kein Docker-Daemon in dieser Sitzung verfügbar) -
+  Codex muss den Build/Start real verifizieren, bevor er produktiv
+  läuft.
+- **Bestehende Konfiguration bleibt kompatibel:** keine neue Pflicht-
+  Umgebungsvariable, keine geänderten Defaults in
+  `infrastructure/config.py` - alle bestehenden Dev-/Test-/Demo-Abläufe
+  (`Betriebsanleitung.md`) funktionieren unverändert.
+
 ## Echtbetrieb-Intake (HV-20260912-ECHTBETRIEB, 12.09.2026)
 
 - **Quellenmapping bleibt vollständig bei Codex:** `src/mietinkasso/intake/`

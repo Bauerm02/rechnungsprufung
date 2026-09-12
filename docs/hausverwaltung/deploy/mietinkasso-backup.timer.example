@@ -1,0 +1,21 @@
+# Vorlage für den Timer zu mietinkasso-backup.service (Auftrag 12.09.,
+# Paket A). NIEMALS mit echten Werten committen - nur die Struktur.
+# GENAU EIN Timer für GENAU EINEN Backupjob - keinen zweiten
+# Timer/Cron-Eintrag für denselben Service parallel aktivieren.
+
+[Unit]
+Description=Taeglicher Zeitplan fuer die Mietinkasso-SQLite-Sicherung
+
+[Timer]
+# Täglich um 03:15 lokaler Zeit - außerhalb der üblichen
+# Bürobetriebszeit, nach den meisten Buchungen des Tages.
+OnCalendar=*-*-* 03:15:00
+# Falls der Server zum geplanten Zeitpunkt aus war (Wartung/Neustart):
+# beim nächsten Boot nachholen, statt einen Tag ganz auszulassen.
+Persistent=true
+# Verhindert, dass mehrere Timer-Systeme exakt zur selben Sekunde
+# feuern, falls dieses Muster mehrfach verwendet würde.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
