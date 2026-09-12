@@ -955,6 +955,62 @@ def test_mieweg_vorschau_beide_spuren_ergeben_massgeblichen_betrag(backoffice_cl
     assert "1.010,00" in historie.text  # gesetzliche Grenze bleibt sichtbar (2% * 6/12 Anteiligkeit auf 1.000 EUR)
 
 
+def test_mieweg_vorschau_zeigt_aktuell_verrechneten_betrag_in_der_historie(backoffice_client):
+    """Bugfund (zweite unabhängige Abnahme, 4fba1fe): der Service
+    speicherte `aktuell_verrechneter_betrag_cent` nur in `eingaben_json`,
+    `_mieweg_vorschau_zeile_html` las ihn aber aus `ergebnis_json` - die
+    Spalte "Aktuell verrechnet" zeigte deshalb immer einen Strich. Dieser
+    Test weist einen bekannten synthetischen aktuellen Mietbetrag
+    tatsächlich sichtbar in der gerenderten Historie-Tabelle nach."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-AKTUELLVERR", objekt_id="601", bezeichnung="Top AktuellVerr", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-AKTUELLVERR", einheit_id="601-TOP-AKTUELLVERR", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    stammdaten.add_komponente(
+        id="K-601-AKTUELLVERR", vertrag_id="V-601-AKTUELLVERR", art="HMZ", bezeichnung="Hauptmietzins",
+        betrag_cent=100_000, ust_satz_promille=10_000, gueltig_von=date(2024, 1, 1), indexierbar=True,
+    )
+
+    erstellt = client.post(
+        "/backoffice/vertrag/V-601-AKTUELLVERR/mieweg-vorschau/erstellen",
+        data={
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "ist_wohnungsnutzung": "1", "bezugsjahr": "2024", "bezugsmonat": "6",
+            "ziel_bewertungsjahr": "2025", "basis_betrag": "1.000,00",
+            "basis_komponenten_ids": ["K-601-AKTUELLVERR"],
+            "vpi_zeilen": "2023;100.0;Statistik Austria VPI 2020;2026-01-15\n2024;102.0;Statistik Austria VPI 2020;2026-01-15",
+            "vertraglicher_betrag": "1.005,00",
+            "vertraglicher_quellenbeleg": "Mietvertrag-2024.pdf, Wertsicherungsklausel",
+            "vertraglicher_termin": "2025-04-01",
+            "aktuell_verrechneter_betrag": "999,00",
+            "aktuell_verrechnet_quellenbeleg": "Vorschreibung-2025-01.pdf",
+            "aktuell_verrechnet_stichtag": "2025-01-01",
+            "zustellnachweis_referenz": "Zustellnachweis-2025-04.pdf",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert erstellt.status_code == 303
+
+    historie = client.get("/backoffice/vertrag/V-601-AKTUELLVERR/mieweg-vorschau")
+    assert historie.status_code == 200
+    # Exakte Tabellenzellen (Spalten "Aktuell verrechnet"/"Ausführbare
+    # Erhöhung" direkt hintereinander) statt einer losen Teilstring-Suche,
+    # damit ein zufälliger Treffer an anderer Stelle der Seite
+    # ausgeschlossen ist. Ausführbare Erhöhung: 1.005,00 - 999,00 = 6,00.
+    assert "<td>999,00 €</td><td>6,00 €</td>" in historie.text
+
+
 def test_mieweg_vorschau_fehlende_vpi_daten_ergeben_pruefbedarf_kein_erfundener_wert(backoffice_client):
     client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
     _login(client)

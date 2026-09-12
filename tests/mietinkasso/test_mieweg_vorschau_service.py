@@ -156,6 +156,70 @@ def test_vertragsspur_ohne_quellenbeleg_wird_abgelehnt(vorschau_service, basis_v
         )
 
 
+def test_negativer_vertraglich_zulaessiger_betrag_wird_abgelehnt(vorschau_service, basis_vertrag, ctx_factory):
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    with pytest.raises(ValueError, match="negativ"):
+        vorschau_service.vorschau_erstellen(
+            ctx=ctx, vertrag=vertrag,
+            **{
+                **_basis_kwargs(),
+                "vertraglich_zulaessiger_betrag_cent": -1,
+                "vertraglicher_quellenbeleg": "Mietvertrag-2024.pdf",
+            },
+        )
+
+
+def test_negativer_aktuell_verrechneter_betrag_wird_abgelehnt(vorschau_service, basis_vertrag, ctx_factory):
+    """Zweite unabhängige Abnahme: ein negativer 'Ist'-Betrag hätte in
+    max(0, massgeblich - aktuell_verrechnet) eine fiktive, riesige
+    Erhöhung erzeugen können (Subtraktion einer negativen Zahl)."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    with pytest.raises(ValueError, match="negativ"):
+        vorschau_service.vorschau_erstellen(
+            ctx=ctx, vertrag=vertrag,
+            **{
+                **_basis_kwargs(),
+                "aktuell_verrechneter_betrag_cent": -100_000,
+                "aktuell_verrechnet_quellenbeleg": "Vorschreibung-2025-01.pdf",
+            },
+        )
+
+
+def test_null_als_aktuell_verrechneter_betrag_ist_bewusst_zulaessig(
+    vorschau_service, stammdaten_repo, basis_vertrag, ctx_factory,
+):
+    """Null ist ein gültiger, expliziter Wert (z. B. tatsächlich noch nie
+    verrechnet) und darf NICHT mit 'nicht erfasst' (None) verwechselt
+    werden - die Prüfung erfolgt über `is not None`, nicht über
+    Wahrheitswert."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id="K-HMZ-NULL", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins",
+        betrag_cent=100_000, ust_satz_promille=10_000, gueltig_von=date(2024, 1, 1), indexierbar=True,
+    )
+    vorschau = vorschau_service.vorschau_erstellen(
+        ctx=ctx, vertrag=vertrag,
+        **{
+            **_basis_kwargs(),
+            "basis_komponenten_ids": ["K-HMZ-NULL"],
+            "vertraglich_zulaessiger_betrag_cent": 100_500,
+            "vertraglicher_quellenbeleg": "Mietvertrag-2024.pdf",
+            "vertraglicher_fruehestmoeglicher_termin": date(2025, 4, 1),
+            "zustellnachweis_referenz": "Zustellnachweis-2025-04.pdf",
+            "aktuell_verrechneter_betrag_cent": 0,
+            "aktuell_verrechnet_quellenbeleg": "Vorschreibung-2025-01.pdf",
+            "aktuell_verrechnet_stichtag": date(2025, 1, 1),
+        },
+    )
+    ergebnis = json.loads(vorschau.ergebnis_json)
+    assert ergebnis["ausfuehrbare_erhoehung_cent"] == 100_500
+
+
 def test_nur_gesetzliche_spur_vorhanden_ergibt_offenen_massgeblichen_betrag(vorschau_service, basis_vertrag, ctx_factory):
     """Fehlende Belege müssen Prüfbedarf ergeben - eine vollständige
     gesetzliche Berechnung allein darf NIE als maßgeblicher Höchstbetrag
@@ -218,14 +282,19 @@ def test_ohne_aktuell_verrechneten_betrag_bleibt_ausfuehrbare_erhoehung_offen(
 
 
 def test_ausfuehrbare_erhoehung_ist_differenz_zum_aktuell_verrechneten_betrag(
-    vorschau_service, basis_vertrag, ctx_factory,
+    vorschau_service, stammdaten_repo, basis_vertrag, ctx_factory,
 ):
     vertrag, _ = basis_vertrag
     ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id="K-HMZ-AUSFUEHRBAR", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins",
+        betrag_cent=100_000, ust_satz_promille=10_000, gueltig_von=date(2024, 1, 1), indexierbar=True,
+    )
     vorschau = vorschau_service.vorschau_erstellen(
         ctx=ctx, vertrag=vertrag,
         **{
             **_basis_kwargs(),
+            "basis_komponenten_ids": ["K-HMZ-AUSFUEHRBAR"],
             "vertraglich_zulaessiger_betrag_cent": 100_500,
             "vertraglicher_quellenbeleg": "Mietvertrag-2024.pdf",
             "vertraglicher_fruehestmoeglicher_termin": date(2025, 4, 1),
@@ -237,12 +306,13 @@ def test_ausfuehrbare_erhoehung_ist_differenz_zum_aktuell_verrechneten_betrag(
     )
     ergebnis = json.loads(vorschau.ergebnis_json)
     assert vorschau.massgeblicher_hoechstbetrag_cent == 100_500
-    assert ergebnis["ausfuehrbare_erhoehung_cent"] == 700  # 100_500 - 99_800
+    assert ergebnis["rechnerische_differenz_cent"] == 700  # 100_500 - 99_800
+    assert ergebnis["ausfuehrbare_erhoehung_cent"] == 700
     assert vorschau.vollstaendig is True
 
 
 def test_ausfuehrbare_erhoehung_wird_nie_negativ_wenn_bereits_verrechnet_ueber_hoechstbetrag(
-    vorschau_service, basis_vertrag, ctx_factory,
+    vorschau_service, stammdaten_repo, basis_vertrag, ctx_factory,
 ):
     """Ist der aktuell verrechnete Betrag bereits gleich oder höher als der
     maßgebliche Höchstbetrag, ist dieser Erhöhungsschritt ausgeschöpft -
@@ -250,10 +320,15 @@ def test_ausfuehrbare_erhoehung_wird_nie_negativ_wenn_bereits_verrechnet_ueber_h
 
     vertrag, _ = basis_vertrag
     ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id="K-HMZ-AUSGESCHOEPFT", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins",
+        betrag_cent=100_000, ust_satz_promille=10_000, gueltig_von=date(2024, 1, 1), indexierbar=True,
+    )
     vorschau = vorschau_service.vorschau_erstellen(
         ctx=ctx, vertrag=vertrag,
         **{
             **_basis_kwargs(),
+            "basis_komponenten_ids": ["K-HMZ-AUSGESCHOEPFT"],
             "vertraglich_zulaessiger_betrag_cent": 100_500,
             "vertraglicher_quellenbeleg": "Mietvertrag-2024.pdf",
             "vertraglicher_fruehestmoeglicher_termin": date(2025, 4, 1),
@@ -265,6 +340,44 @@ def test_ausfuehrbare_erhoehung_wird_nie_negativ_wenn_bereits_verrechnet_ueber_h
     )
     ergebnis = json.loads(vorschau.ergebnis_json)
     assert ergebnis["ausfuehrbare_erhoehung_cent"] == 0
+
+
+def test_ausfuehrbare_erhoehung_bleibt_offen_wenn_stichtag_fehlt_trotz_sonst_vollstaendiger_daten(
+    vorschau_service, stammdaten_repo, basis_vertrag, ctx_factory,
+):
+    """Konkreter Reproduktionsfall der zweiten unabhängigen Abnahme:
+    historisch 100.000, Vertragsmaximum 101.000, aktuell verrechnet
+    100.000 (Differenz 1.000) - OHNE Stichtag für den aktuell
+    verrechneten Betrag bleibt das Ergebnis Prüfbedarf. Die rechnerische
+    Differenz darf informativ sichtbar bleiben, `ausfuehrbare_
+    erhoehung_cent` MUSS aber `None` sein - keine Behauptung von
+    Ausführbarkeit ohne vollständige Nachweise."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id="K-HMZ-KEIN-STICHTAG", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins",
+        betrag_cent=100_000, ust_satz_promille=10_000, gueltig_von=date(2024, 1, 1), indexierbar=True,
+    )
+    vorschau = vorschau_service.vorschau_erstellen(
+        ctx=ctx, vertrag=vertrag,
+        **{
+            **_basis_kwargs(),
+            "basis_komponenten_ids": ["K-HMZ-KEIN-STICHTAG"],
+            "vertraglich_zulaessiger_betrag_cent": 101_000,
+            "vertraglicher_quellenbeleg": "Mietvertrag-2024.pdf",
+            "vertraglicher_fruehestmoeglicher_termin": date(2025, 4, 1),
+            "zustellnachweis_referenz": "Zustellnachweis-2025-04.pdf",
+            "aktuell_verrechneter_betrag_cent": 100_000,
+            "aktuell_verrechnet_quellenbeleg": "Vorschreibung-2025-01.pdf",
+            "aktuell_verrechnet_stichtag": None,
+        },
+    )
+    ergebnis = json.loads(vorschau.ergebnis_json)
+    assert vorschau.vollstaendig is False
+    assert ergebnis["rechnerische_differenz_cent"] == 1_000
+    assert ergebnis["ausfuehrbare_erhoehung_cent"] is None
+    assert any("Stichtag" in h for h in ergebnis["offene_nachweise"])
 
 
 def test_aktuell_verrechneter_betrag_ohne_quellenbeleg_wird_abgelehnt(
@@ -284,7 +397,7 @@ def test_vertraglicher_termin_im_selben_jahr_vor_april_ergibt_gesetzlichen_termi
 ):
     """Ein vertraglicher Termin VOR dem gesetzlichen 1. April desselben
     Ziel-Bewertungsjahres ändert nichts - maßgeblich bleibt der 1. April,
-    da nur er ein gültiger MieWeG-Anpassungstermin ist (§1 Abs3)."""
+    da nur er ein gültiger MieWeG-Anpassungstermin ist (§1 Abs4)."""
 
     vertrag, _ = basis_vertrag
     ctx = ctx_factory("7DI")
@@ -311,7 +424,7 @@ def test_vertraglicher_termin_in_anderem_jahr_wird_nicht_stillschweigend_ueberno
     Fassung gab hier fälschlich den rohen vertraglichen Termin
     (2026-04-01) direkt aus, obwohl nur bis 2025 gerechnet wurde. Auch
     ein NICHT-April-Termin (hier: ein vertraglicher September-Termin)
-    darf nie unverändert als Ergebnis erscheinen (§1 Abs3: nur der
+    darf nie unverändert als Ergebnis erscheinen (§1 Abs4: nur der
     1. April ist ein gültiger Anpassungstermin)."""
 
     vertrag, _ = basis_vertrag
@@ -409,6 +522,56 @@ def test_nicht_indexierbare_komponente_wird_abgelehnt(vorschau_service, stammdat
     with pytest.raises(ValueError, match="indexierbar"):
         vorschau_service.vorschau_erstellen(
             ctx=ctx, vertrag=vertrag, **{**_basis_kwargs(), "basis_komponenten_ids": ["K-GARAGE"]},
+        )
+
+
+def test_leere_komponentenliste_verhindert_vollstaendiges_ergebnis(
+    vorschau_service, basis_vertrag, ctx_factory,
+):
+    """Zweite unabhängige Abnahme: `any([])`/`len([]) != len(set([]))`
+    sind beide `False` - eine leere `basis_komponenten_ids`-Liste rutschte
+    bislang durch alle Komponentenprüfungen und konnte trotzdem
+    `vollstaendig=True` ergeben, obwohl `basis_betrag_cent` an keine
+    nachvollziehbare Stammdatenkomponente gebunden war. Eine tatsächlich
+    durchgeführte numerische Berechnung (alle anderen Angaben vollständig)
+    muss deshalb trotzdem offen (Prüfbedarf) bleiben."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    vorschau = vorschau_service.vorschau_erstellen(
+        ctx=ctx, vertrag=vertrag,
+        **{
+            **_basis_kwargs(),
+            "basis_komponenten_ids": [],
+            "vertraglich_zulaessiger_betrag_cent": 100_500,
+            "vertraglicher_quellenbeleg": "Mietvertrag-2024.pdf",
+            "vertraglicher_fruehestmoeglicher_termin": date(2025, 4, 1),
+            "zustellnachweis_referenz": "Zustellnachweis-2025-04.pdf",
+            "aktuell_verrechneter_betrag_cent": 100_000,
+            "aktuell_verrechnet_quellenbeleg": "Vorschreibung-2025-01.pdf",
+            "aktuell_verrechnet_stichtag": date(2025, 1, 1),
+        },
+    )
+    ergebnis = json.loads(vorschau.ergebnis_json)
+    assert vorschau.vollstaendig is False
+    assert ergebnis["ausfuehrbare_erhoehung_cent"] is None
+    assert any("Keine Komponenten referenziert" in h for h in ergebnis["offene_nachweise"])
+
+
+@pytest.mark.parametrize("versorgerart", ["WASSER", "STROM"])
+def test_versorger_komponenten_werden_trotz_indexierbar_flag_ausgeschlossen(
+    vorschau_service, stammdaten_repo, basis_vertrag, ctx_factory, versorgerart,
+):
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id=f"K-{versorgerart}", vertrag_id=vertrag.id, art=versorgerart, bezeichnung="Versorger",
+        betrag_cent=3_000, ust_satz_promille=20_000, gueltig_von=date(2024, 1, 1), indexierbar=True,
+    )
+    with pytest.raises(ValueError, match="NIE automatisch indexiert"):
+        vorschau_service.vorschau_erstellen(
+            ctx=ctx, vertrag=vertrag,
+            **{**_basis_kwargs(), "basis_komponenten_ids": [f"K-{versorgerart}"], "basis_betrag_cent": 3_000},
         )
 
 
@@ -596,7 +759,7 @@ def test_referenzierte_komponente_muss_zum_bezugszeitpunkt_bereits_bestanden_hab
 
 
 def test_ueberlappende_folgevorschau_wird_als_offener_nachweis_markiert(
-    vorschau_service, basis_vertrag, ctx_factory,
+    vorschau_service, stammdaten_repo, basis_vertrag, ctx_factory,
 ):
     """Kernfall der Doppelzählungs-Schutzlogik: eine bereits vollständig
     berechnete Vorschau (Version 1, Bezugsjahr 2024 -> Ziel 2025) deckt den
@@ -610,8 +773,13 @@ def test_ueberlappende_folgevorschau_wird_als_offener_nachweis_markiert(
 
     vertrag, _ = basis_vertrag
     ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id="K-HMZ-UEBERLAPPUNG", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins",
+        betrag_cent=100_000, ust_satz_promille=10_000, gueltig_von=date(2024, 1, 1), indexierbar=True,
+    )
     vollstaendige_kwargs = {
         **_basis_kwargs(),
+        "basis_komponenten_ids": ["K-HMZ-UEBERLAPPUNG"],
         "vertraglich_zulaessiger_betrag_cent": 100_500,
         "vertraglicher_quellenbeleg": "Mietvertrag-2024.pdf, Wertsicherungsklausel",
         "vertraglicher_fruehestmoeglicher_termin": date(2025, 4, 1),

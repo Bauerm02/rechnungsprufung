@@ -71,12 +71,14 @@ _NIE_INDEXIERBARE_ARTEN = frozenset({
     "BK_VZ",
     "HK_VZ",
     "BK_PARKPLATZ",
+    "WASSER",
+    "STROM",
 })
 
 
 def _naechster_gueltiger_april(datum: date) -> date:
     """MieWeG-Anpassungen sind ausschließlich zu einem 1. April wirksam
-    (§ 1 Abs 3) - rundet ein beliebiges Datum auf den nächsten gültigen
+    (§ 1 Abs 4) - rundet ein beliebiges Datum auf den nächsten gültigen
     1. April auf. Ein bereits gültiger 1. April bleibt unverändert."""
 
     kandidat = date(datum.year, 4, 1)
@@ -149,6 +151,25 @@ class MieWegVorschauService:
             raise ValueError(
                 f"Für Altverträge ist die erste Modellbewertung frühestens April "
                 f"{_ALTVERTRAG_ERSTE_MODELLBEWERTUNG_JAHR} möglich, angefragt wurde {ziel_bewertungsjahr}."
+            )
+        # Zweite unabhängige Abnahme (Folgeauftrag Markus): ein negativer
+        # "Ist"-Betrag (aktuell verrechnet) oder ein negativer
+        # vertraglicher Zielbetrag wurde bisher anstandslos akzeptiert
+        # und konnte eine fiktive, riesige "Erhöhung" erzeugen (ein
+        # negativer aktuell verrechneter Betrag hätte in `max(0,
+        # massgeblich - aktuell_verrechnet)` den Subtrahenden künstlich
+        # vergrößert). Null bleibt bewusst zulässig (kein Ersatz für
+        # "nicht erfasst" - das ist weiterhin `None`, geprüft über
+        # `is not None`, nicht über Wahrheitswert).
+        if aktuell_verrechneter_betrag_cent is not None and aktuell_verrechneter_betrag_cent < 0:
+            raise ValueError(
+                f"aktuell_verrechneter_betrag_cent ({aktuell_verrechneter_betrag_cent}) ist negativ - "
+                "kein plausibler tatsächlich verrechneter Betrag."
+            )
+        if vertraglich_zulaessiger_betrag_cent is not None and vertraglich_zulaessiger_betrag_cent < 0:
+            raise ValueError(
+                f"vertraglich_zulaessiger_betrag_cent ({vertraglich_zulaessiger_betrag_cent}) ist negativ - "
+                "kein plausibler vertraglicher Zielbetrag."
             )
 
         # Nur explizit vertragsindexierte Komponenten (Fachregel: "z.B.
@@ -253,6 +274,21 @@ class MieWegVorschauService:
                 "Ziel-Bewertungsjahr und/oder Basisbetrag fehlen) - nur als Entwurf gespeichert."
             )
         else:
+            # Zweite unabhängige Abnahme (Folgeauftrag Markus): `any([])`
+            # und `len([]) != len(set([]))` sind beide `False` - eine
+            # LEERE `basis_komponenten_ids`-Liste rutschte bislang durch
+            # ALLE Komponentenprüfungen und ließ `basis_betrag_cent` als
+            # völlig freien, nicht rückführbaren Wert stehen, der dennoch
+            # zu `vollstaendig=True` führen konnte. Für eine tatsächlich
+            # durchgeführte numerische Berechnung wird deshalb eine ECHTE,
+            # nichtleere Komponentenliste verlangt - ein unvollständiger
+            # Entwurf (z. B. fehlendes Bezugsjahr, siehe `blockiert_grund`
+            # oben) bleibt davon unberührt und darf weiterhin offen sein.
+            if not basis_komponenten_ids:
+                offene_nachweise.append(
+                    "Keine Komponenten referenziert (basis_komponenten_ids ist leer) - eine numerische "
+                    "Berechnung ohne strukturierte, nachvollziehbare Komponentenbindung bleibt Prüfbedarf."
+                )
             effektiver_monat = 12 if letzte_basis_war_jahresdurchschnitt else bezugsmonat
             vpi_decimal = {jahr: Decimal(eintrag.wert) for jahr, eintrag in vpi_jahresdurchschnitte.items()}
             gesetzliches_ergebnis = berechne_gesetzliche_hoechstgrenze(
@@ -369,7 +405,7 @@ class MieWegVorschauService:
             #
             # KORRIGIERT (Folgeauftrag Markus): das reine Maximum zweier
             # Daten kann einen NICHT-April-Termin liefern (z. B. ein
-            # vertraglicher September-Termin), obwohl § 1 Abs 3 MieWeG
+            # vertraglicher September-Termin), obwohl § 1 Abs 4 MieWeG
             # ausschließlich den 1. April als Anpassungsstichtag zulässt.
             # Der kombinierte Termin wird deshalb auf den nächsten
             # gültigen 1. April aufgerundet; landet dieser dadurch in
@@ -407,9 +443,29 @@ class MieWegVorschauService:
         # schritt bereits ausgeschöpft ist, nicht dass rückwirkend
         # gesenkt werden müsste (das wäre eine eigene, hier nicht
         # beauftragte Fachfrage).
-        ausfuehrbare_erhoehung_cent: int | None = None
+        #
+        # KORRIGIERT (zweite unabhängige Abnahme, Folgeauftrag Markus):
+        # `ausfuehrbare_erhoehung_cent` wurde bisher allein aus den beiden
+        # Beträgen berechnet, OHNE zu prüfen, ob das Gesamtergebnis
+        # überhaupt vollständig ist - ein fehlender Stichtag, ein
+        # fehlender Zustellnachweis, ein in ein anderes Jahr
+        # verschobener Termin oder eine leere Komponentenauswahl hatten
+        # alle bereits einen `offene_nachweise`-Eintrag erzeugt
+        # (`vollstaendig=False`), aber die Zahl wurde trotzdem als
+        # scheinbar belastbares Ergebnis ausgegeben. Jetzt getrennt:
+        # `rechnerische_differenz_cent` ist eine rein informative
+        # Vorschauzahl (sobald beide Beträge numerisch vorliegen), OHNE
+        # Aussage über Vollständigkeit; `ausfuehrbare_erhoehung_cent`
+        # wird NUR gesetzt, wenn ZU DIESEM ZEITPUNKT keinerlei offener
+        # Nachweis mehr aussteht (also alle Vorbedingungen dieser
+        # Vorschau erfüllt sind) - keine Freigabe, keine Behauptung von
+        # Ausführbarkeit ohne vollständige Nachweise.
+        rechnerische_differenz_cent: int | None = None
         if massgeblicher_hoechstbetrag_cent is not None and aktuell_verrechneter_betrag_cent is not None:
-            ausfuehrbare_erhoehung_cent = max(0, massgeblicher_hoechstbetrag_cent - aktuell_verrechneter_betrag_cent)
+            rechnerische_differenz_cent = max(0, massgeblicher_hoechstbetrag_cent - aktuell_verrechneter_betrag_cent)
+        ausfuehrbare_erhoehung_cent: int | None = (
+            rechnerische_differenz_cent if not offene_nachweise else None
+        )
 
         eingaben = {
             "rechtsordnung": rechtsordnung,
@@ -442,6 +498,17 @@ class MieWegVorschauService:
             "gesetzlicher_termin": gesetzlicher_termin.isoformat() if gesetzlicher_termin else None,
             "vertraglich_zulaessiger_betrag_cent": vertraglich_zulaessiger_betrag_cent,
             "massgeblicher_hoechstbetrag_cent": massgeblicher_hoechstbetrag_cent,
+            # Dupliziert aus `eingaben` (wie `vertraglich_zulaessiger_
+            # betrag_cent` oben) - ausschließlich für bequemen Lesezugriff
+            # auf das Ergebnis (z. B. `backoffice/app.py::
+            # _mieweg_vorschau_zeile_html`), OHNE `eingaben_json`
+            # zusätzlich parsen zu müssen. Bugfund (zweite unabhängige
+            # Abnahme): dieses Feld fehlte hier ursprünglich, obwohl die
+            # Backoffice-Anzeige es bereits aus `ergebnis_json` gelesen
+            # hat - die Spalte "Aktuell verrechnet" zeigte deshalb immer
+            # einen Strich.
+            "aktuell_verrechneter_betrag_cent": aktuell_verrechneter_betrag_cent,
+            "rechnerische_differenz_cent": rechnerische_differenz_cent,
             "ausfuehrbare_erhoehung_cent": ausfuehrbare_erhoehung_cent,
             "fruehester_termin_gesamt": fruehester_termin_gesamt.isoformat() if fruehester_termin_gesamt else None,
             "fehlende_jahre": gesetzliches_ergebnis.fehlende_jahre if gesetzliches_ergebnis is not None else [],

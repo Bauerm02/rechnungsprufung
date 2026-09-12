@@ -342,7 +342,7 @@ kein Versand ergänzt.
    oder einen Termin in einem nicht berechneten Jahr liefern.** Das
    reine `max(gesetzlicher Termin, vertraglicher Termin)` konnte z. B.
    einen vertraglichen September-Termin unverändert ausgeben, obwohl
-   § 1 Abs 3 nur den 1. April als Anpassungsstichtag zulässt. Korrigiert:
+   § 1 Abs 4 nur den 1. April als Anpassungsstichtag zulässt. Korrigiert:
    der kombinierte Termin wird auf den nächsten gültigen 1. April
    aufgerundet; landet dieser dadurch in einem ANDEREN Jahr als dem
    berechneten `ziel_bewertungsjahr` (das würde zusätzliche, hier nicht
@@ -412,6 +412,45 @@ kein Versand ergänzt.
    dokumentiert ist) ist NICHT gebaut - das würde eine neue Abhängigkeit
    dieses Moduls auf `index/repository.py` erfordern, die außerhalb
    dieses eng gefassten Folgeauftrags nicht ergänzt wurde.
+
+**Dritte, unabhängige Gegenprobe (14 synthetische Fälle, 9/14 bestanden,
+5 konkrete Lücken behoben):**
+
+8. `basis_komponenten_ids=[]` rutschte durch alle Komponentenprüfungen
+   (`any([])`/`len([]) != len(set([]))` sind beide `False`) und konnte
+   trotzdem `vollstaendig=True` ergeben - eine tatsächlich durchgeführte
+   numerische Berechnung verlangt jetzt eine ECHTE, nichtleere
+   Komponentenliste (offener Nachweis, kein Hartstopp für unvollständige
+   Entwürfe).
+9. `WASSER`/`STROM` fehlten in `_NIE_INDEXIERBARE_ARTEN` und wurden bei
+   fälschlich gesetztem `indexierbar=True` akzeptiert - ergänzt.
+10. `ausfuehrbare_erhoehung_cent` wurde bislang unabhängig von
+    `offene_nachweise` berechnet - ein fehlender Stichtag, ein
+    fehlender Zustellnachweis oder ein in ein anderes Jahr verschobener
+    Termin machten das Ergebnis zwar `vollstaendig=False`, die
+    "ausführbare Erhöhung" wurde aber trotzdem beziffert ausgegeben.
+    Jetzt getrennt: `rechnerische_differenz_cent` (informativ, immer
+    sichtbar sobald beide Beträge vorliegen) und
+    `ausfuehrbare_erhoehung_cent` (NUR gesetzt, wenn keinerlei offener
+    Nachweis mehr aussteht - keine Behauptung von Ausführbarkeit ohne
+    vollständige Nachweise).
+11. Ein negativer `aktuell_verrechneter_betrag_cent` oder
+    `vertraglich_zulaessiger_betrag_cent` wurde akzeptiert und hätte
+    eine fiktive, überhöhte "Erhöhung" erzeugen können - beide werden
+    jetzt bei negativem Wert hart abgelehnt; Null bleibt bewusst
+    zulässig (Prüfung über `is not None`, nicht über Wahrheitswert).
+12. Zitatkorrektur: der Grund für "nur der 1. April ist ein gültiger
+    Anpassungstermin" ist § 1 Abs 4 MieWeG, nicht Abs 3 (in Code-
+    Kommentaren, Docstrings und dieser Doku korrigiert).
+13. **UI-Folgefund (kein Berechnungsfehler):** `backoffice/app.py::
+    _mieweg_vorschau_zeile_html` las `aktuell_verrechneter_betrag_cent`
+    aus `ergebnis_json`, der Service hatte dieses Feld dort aber nicht
+    gespeichert (nur in `eingaben_json`) - die Spalte "Aktuell
+    verrechnet" zeigte deshalb immer einen Strich, obwohl der Wert
+    korrekt verarbeitet wurde. Ergänzt in `ergebnis_json` (dupliziert
+    wie `vertraglich_zulaessiger_betrag_cent`); mit einem HTTP-Test
+    abgesichert, der einen bekannten synthetischen Betrag tatsächlich
+    in der gerenderten Tabelle nachweist.
 
 ### Bedienung
 
