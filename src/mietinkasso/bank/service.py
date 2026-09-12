@@ -381,6 +381,170 @@ class BankImportService:
             session.refresh(zuordnung)
             return op_row, zuordnung
 
+    def verknuepfe_mit_bestehender_zahlung(
+        self,
+        *,
+        ctx: AuthContext,
+        transaktion: BankTransaktionTable,
+        op_position: OPPositionTable,
+        konto: KontoTable,
+        betrag_cent: int,
+        vorgang_id: str,
+    ) -> ZuordnungTable:
+        """Verknüpft eine bereits eingelesene Rohtransaktion mit einer
+        EXPLIZIT gewählten, bereits BESTEHENDEN ZAHLUNG-OP-Position -
+        bucht KEINE neue OP-Zeile (im Unterschied zu `zuordnen_manuell`/
+        `automatisch_zuordnen`, die beide eine neue ZAHLUNG erzeugen und
+        dann DIESE neue Zeile zuordnen).
+
+        Gedacht für den Fall, dass ein Zahlungseingang bereits VOR dem
+        echten Bankfeed (z. B. über den Intake oder eine frühere manuelle
+        Buchung) als ZAHLUNG gebucht wurde: eine später eingelesene
+        Rohtransaktion bestätigt/erklärt diese bereits existierende
+        Zahlung, statt sie ein zweites Mal gutzuschreiben (Fachregel:
+        bestehende Mieterkonto-Buchungen dürfen bei einem späteren
+        Rohbankimport nicht doppelt gutgeschrieben werden).
+
+        Prüfung UND Verknüpfung laufen in EINER gesperrten DB-Transaktion,
+        Transaktion/OP/Konto werden per ID frisch aus der DB geladen
+        (`with_for_update`, wo unterstützt) - dieselbe Vorsicht wie bei
+        `verarbeite_ruecklastschrift`, da die Aufrufer-Objekte veraltet
+        sein können:
+
+        - `op_position` muss laut DB eine AKTIVE ZAHLUNG sein und zum
+          übergebenen `konto` gehören.
+        - Gesellschaft/Währung von Transaktion und Konto müssen
+          übereinstimmen (`BankRepository.create_zuordnung` prüft dies
+          zusätzlich autoritativ).
+        - `betrag_cent` darf weder den noch nicht zugeordneten Restbetrag
+          der TRANSAKTION noch den noch nicht "erklärten" Restbetrag der
+          ZAHLUNG selbst überschreiten (beide Seiten getrennt begrenzt).
+        - Ein Link-Duplikat (dasselbe Transaktion/OP-Paar unter einer
+          ANDEREN `vorgang_id`) wird abgelehnt; ein exakter Retry MIT
+          derselben `vorgang_id` bleibt ein sicherer No-Op
+          (`BankRepository.create_zuordnung`).
+        - Bestehende Ledger-Zeilen bleiben unverändert (append-only) -
+          diese Methode fügt ausschließlich eine neue `ZuordnungTable`-
+          Zeile hinzu, nie eine neue/geänderte `OPPositionTable`-Zeile."""
+
+        transaktion_id = transaktion.id
+        op_position_id = op_position.id
+        konto_id = konto.id
+
+        with self._session_factory() as session:
+            try:
+                frisches_konto = session.get(KontoTable, konto_id)
+                if frisches_konto is None:
+                    raise ValueError(f"Unbekanntes Konto {konto_id}")
+                require_gesellschaft_access(ctx, frisches_konto.gesellschaft_id)
+                require_schreibrecht(ctx)
+
+                frische_transaktion = session.get(BankTransaktionTable, transaktion_id, with_for_update=True)
+                if frische_transaktion is None:
+                    raise ValueError(f"Unbekannte Banktransaktion {transaktion_id}")
+                frische_op = session.get(OPPositionTable, op_position_id, with_for_update=True)
+                if frische_op is None:
+                    raise ValueError(f"Unbekannte OPPosition {op_position_id}")
+
+                # Ein exakter Retry DERSELBEN vorgang_id ist ein sicherer
+                # No-Op - VOR den Restbetrags-Prüfungen unten geprüft, sonst
+                # würde die bereits durch DIESEN Vorgang belegte Menge den
+                # Retry selbst als "überschreitet den Restbetrag" ablehnen.
+                # Ein Konflikt (andere vorgang_id-Zuordnung mit abweichendem
+                # Inhalt) wird weiterhin autoritativ von
+                # `BankRepository.create_zuordnung` unten erkannt.
+                bestehender_vorgang = session.execute(
+                    select(ZuordnungTable).where(ZuordnungTable.vorgang_id == vorgang_id)
+                ).scalar_one_or_none()
+                if (
+                    bestehender_vorgang is not None
+                    and bestehender_vorgang.bank_transaktion_id == transaktion_id
+                    and bestehender_vorgang.op_position_id == op_position_id
+                    and bestehender_vorgang.betrag_cent == betrag_cent
+                ):
+                    session.commit()
+                    return bestehender_vorgang
+
+                if frische_op.konto_id != frisches_konto.id:
+                    raise BindungInkonsistentError(
+                        f"OPPosition {op_position_id} gehört zu Konto {frische_op.konto_id}, nicht zu {konto_id}."
+                    )
+                if OPTyp(frische_op.typ) is not OPTyp.ZAHLUNG:
+                    raise ZuordnungUngueltigError(
+                        f"Verknüpfung mit einer bestehenden Zahlung setzt eine ZAHLUNG-OP voraus; "
+                        f"OPPosition {op_position_id} ist vom Typ {frische_op.typ}."
+                    )
+                if frische_op.status != "AKTIV":
+                    raise ZuordnungUngueltigError(
+                        f"OPPosition {op_position_id} ist storniert und kann nicht verknüpft werden."
+                    )
+                if frische_transaktion.betrag_cent <= 0:
+                    raise ZuordnungUngueltigError(
+                        "Nur ein tatsächlicher Zahlungseingang (positiver Transaktionsbetrag) kann mit einer "
+                        "bestehenden Zahlung verknüpft werden."
+                    )
+
+                bank_konto = session.get(BankKontoTable, frische_transaktion.bank_konto_id)
+                if bank_konto is None:
+                    raise ValueError(f"Unbekanntes Bankkonto {frische_transaktion.bank_konto_id}")
+                if bank_konto.gesellschaft_id != frisches_konto.gesellschaft_id:
+                    raise CrossTenantError(
+                        f"Banktransaktion (Gesellschaft {bank_konto.gesellschaft_id}) darf nicht mit Konto "
+                        f"{konto_id} (Gesellschaft {frisches_konto.gesellschaft_id}) verknüpft werden."
+                    )
+                if frische_transaktion.waehrung != frisches_konto.waehrung:
+                    raise FremdwaehrungNichtUnterstuetztError(
+                        f"Transaktion {transaktion_id} ({frische_transaktion.waehrung}) und Konto {konto_id} "
+                        f"({frisches_konto.waehrung}) haben unterschiedliche Währungen."
+                    )
+                if betrag_cent <= 0:
+                    raise ZuordnungUngueltigError("Verknüpfungsbetrag muss positiv sein.")
+
+                zugeordnet_transaktion = self._repository.zugeordneter_betrag(transaktion_id, session=session)
+                verbleibend_transaktion = frische_transaktion.betrag_cent - zugeordnet_transaktion
+                if betrag_cent > verbleibend_transaktion:
+                    raise ZuordnungUngueltigError(
+                        f"Verknüpfungsbetrag {betrag_cent} überschreitet den verbleibenden, noch nicht "
+                        f"zugeordneten Betrag der Transaktion {transaktion_id} ({verbleibend_transaktion} von "
+                        f"{frische_transaktion.betrag_cent})."
+                    )
+
+                bereits_verknuepft_op = self._repository.verknuepfter_betrag_fuer_op(op_position_id, session=session)
+                verbleibend_op = abs(frische_op.betrag_cent) - bereits_verknuepft_op
+                if betrag_cent > verbleibend_op:
+                    raise ZuordnungUngueltigError(
+                        f"Verknüpfungsbetrag {betrag_cent} überschreitet den noch nicht erklärten Restbetrag der "
+                        f"Zahlung {op_position_id} ({verbleibend_op} von {abs(frische_op.betrag_cent)})."
+                    )
+
+                bestehende_links = session.execute(
+                    select(ZuordnungTable)
+                    .where(ZuordnungTable.bank_transaktion_id == transaktion_id)
+                    .where(ZuordnungTable.op_position_id == op_position_id)
+                ).scalars().all()
+                for link in bestehende_links:
+                    if link.vorgang_id != vorgang_id:
+                        raise ZuordnungUngueltigError(
+                            f"Transaktion {transaktion_id} ist bereits mit OPPosition {op_position_id} verknüpft "
+                            f"(Zuordnung #{link.id}, vorgang_id '{link.vorgang_id}') - ein Link-Duplikat mit "
+                            f"neuer vorgang_id '{vorgang_id}' wird abgelehnt."
+                        )
+
+                zuordnung = self._repository.create_zuordnung(
+                    bank_transaktion_id=transaktion_id,
+                    op_position_id=op_position_id,
+                    betrag_cent=betrag_cent,
+                    match_typ=ZahlungsMatchTyp.MANUELL.value,
+                    vorgang_id=vorgang_id,
+                    session=session,
+                )
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            session.refresh(zuordnung)
+            return zuordnung
+
     def verarbeite_ruecklastschrift(
         self,
         *,

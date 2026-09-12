@@ -129,6 +129,50 @@ class SperreTable(Base):
     kommentar: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class VertragPruefungTable(Base):
+    """Versionierte, nachvollziehbare Vertragsprüfung (Auftrag 12.09.,
+    Paket B): jede Prüfung ist eine neue, unveränderliche Version mit
+    Pflicht-Quellenbeleg ("keine beleglose Klassifizierung") - nur
+    `fachstatus == GEPRUEFT` schreibt die gewählte `rechtsordnung`
+    tatsächlich auf `VertragTable.rechtsordnung` zurück
+    (`vertragspruefung/service.py`), ein `ENTWURF` bleibt wirkungslos
+    sichtbar."""
+
+    __tablename__ = "vertrag_pruefungen"
+    __table_args__ = (UniqueConstraint("vertrag_id", "version", name="uq_vertrag_pruefung_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    rechtsordnung: Mapped[str] = mapped_column(String(48))
+    fachstatus: Mapped[str] = mapped_column(String(16))
+    quellenbeleg_referenz: Mapped[str] = mapped_column(String(256))
+    kommentar: Mapped[str | None] = mapped_column(Text, nullable=True)
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class IndexPruefbedarfTable(Base):
+    """Bewusst von `IndexKlauselTable` GETRENNTE Ablage für unvollständige
+    Indexangaben (Auftrag 12.09., Paket B) - alle Fachfelder sind
+    nullable, es gibt HIER keinen Freigabemechanismus/keine Wirkung auf
+    Buchungen. Eine spätere, tatsächlich vollständige Klausel entsteht
+    weiterhin ausschließlich über `index/service.py::klausel_anlegen`
+    (dort bleiben alle Pflichtfelder unverändert Pflicht)."""
+
+    __tablename__ = "index_pruefbedarf"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    rechtsordnung: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    basis_reihe: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    basis_wert: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
+    basis_monat: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    kommentar: Mapped[str | None] = mapped_column(Text, nullable=True)
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class KontoTable(Base):
     """One Mietkonto per Vertrag. Deliberately its own ID space."""
 

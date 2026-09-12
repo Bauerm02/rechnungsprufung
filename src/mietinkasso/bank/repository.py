@@ -353,6 +353,27 @@ class BankRepository:
                 .all()
             )
 
+    def verknuepfter_betrag_fuer_op(self, op_position_id: int, *, session: Session | None = None) -> int:
+        """Summe aller AKTUELL bestehenden Zuordnungen zu dieser
+        OP-Position - der bereits über eine Bank-Zuordnung "erklärte"
+        Anteil einer Zahlung. Begrenzt, wie viel eine weitere
+        Verknüpfung (`BankImportService.verknuepfe_mit_bestehender_zahlung`)
+        noch abdecken darf, ohne die Zahlung mit mehr Bankvolumen zu
+        "erklären", als sie wert ist."""
+
+        def _query(active_session: Session) -> int:
+            summe = active_session.execute(
+                select(func.coalesce(func.sum(ZuordnungTable.betrag_cent), 0)).where(
+                    ZuordnungTable.op_position_id == op_position_id
+                )
+            ).scalar_one()
+            return int(summe)
+
+        if session is not None:
+            return _query(session)
+        with self._session_factory() as owned_session:
+            return _query(owned_session)
+
     def list_zuordnungen_fuer_op(self, op_position_id: int) -> list[ZuordnungTable]:
         with self._session_factory() as session:
             return list(

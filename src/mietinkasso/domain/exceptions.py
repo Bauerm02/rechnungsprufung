@@ -119,6 +119,14 @@ class IntakeNichtAnwendbarError(MietinkassoError):
     geschrieben - "Ein Fehler => gesamter Lauf unverändert"."""
 
 
+class QuellenbelegFehltError(MietinkassoError):
+    """Eine Vertragsprüfung/Klassifizierung ohne Quellenbeleg-Referenz
+    wurde abgelehnt - "keine beleglose Klassifizierung" (Auftrag 12.09.,
+    Paket B): jede Prüfung/Sperren-Aufhebung muss nachvollziehbar auf
+    ein konkretes Dokument/eine konkrete Referenz zurückgeführt werden
+    können, nie ein bloßer Klick ohne Begründung."""
+
+
 class RechtsordnungUngeklaertError(MietinkassoError):
     """Ein Vertrag trägt (noch) die Rechtsordnung UNGEKLAERT. Blockiert
     Sollstellung/Index-Anpassung explizit, statt eine der anderen

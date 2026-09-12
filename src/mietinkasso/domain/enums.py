@@ -117,6 +117,16 @@ def rechtsordnung_geklaert(rechtsordnung: str) -> bool:
     return rechtsordnung != Rechtsordnung.UNGEKLAERT.value
 
 
+class VertragPruefungStatus(str, enum.Enum):
+    """Fachstatus einer versionierten Vertragsprüfung (siehe
+    `vertragspruefung/service.py`). Nur `GEPRUEFT` schreibt die gewählte
+    Rechtsordnung tatsächlich auf den Vertrag zurück (Freigabe);
+    `ENTWURF` bleibt ein reiner, sichtbarer Vorschlag ohne Wirkung."""
+
+    ENTWURF = "ENTWURF"
+    GEPRUEFT = "GEPRUEFT"
+
+
 class Rolle(str, enum.Enum):
     ADMIN = "ADMIN"
     BUCHHALTUNG = "BUCHHALTUNG"

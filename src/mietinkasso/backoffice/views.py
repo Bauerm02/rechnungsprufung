@@ -85,20 +85,42 @@ _NAV_LINKS = [
 ]
 
 
-def betriebsmodus_banner(*, produktiv: bool, send_enabled: bool) -> str:
+#: NUR diese Umgebungswerte gelten als "wir wissen sicher, dass hier
+#: ausschließlich synthetische Demodaten liegen" - jeder ANDERE Wert
+#: (production, staging, ein Zwischenschritt wie
+#: "local_realdata_staged", oder irgendein unbekannter Wert) behauptet
+#: NIE synthetische Daten, sondern zeigt den Echtbetrieb-Banner.
+#: Codex-Rückprüfung (Paket A): die vorherige Logik prüfte umgekehrt
+#: ("Echtbetrieb nur bei genau 'production'") und hätte einen
+#: Zwischenschritt mit bereits echten, gestagten Daten fälschlich als
+#: "nur synthetische Demodaten" ausgewiesen - sicherer ist, im Zweifel
+#: NICHT zu behaupten, es seien Demodaten.
+_BEKANNTE_DEMO_UMGEBUNGEN = frozenset({"development", "test", "ci"})
+
+
+def ist_bekannte_demo_umgebung(environment: str) -> bool:
+    """Reine Klassifizierung (kein Zustand, kein Seiteneffekt) - von
+    `betriebsmodus_banner` UND von `backoffice/app.py` für die
+    Autozuordnungs-Routensperre benutzt, damit beide Stellen exakt
+    dieselbe Definition von "Demo-Umgebung" verwenden."""
+
+    return environment in _BEKANNTE_DEMO_UMGEBUNGEN
+
+
+def betriebsmodus_banner(*, environment: str, send_enabled: bool) -> str:
     """Reine Anzeigeentscheidung (kein neues Datenmodell, keine
     automatische Freigabe von irgendetwas) - liest ausschließlich die
     bereits vorhandene `environment`/`send_enabled`-Konfiguration und
-    entscheidet NUR, welcher Banner-Text angezeigt wird. `produktiv`
-    kommt vom Aufrufer (`backoffice/app.py`, aus `settings.environment
-    == "production"`); diese Funktion selbst liest/ändert keinen
-    Zustand."""
+    entscheidet NUR, welcher Banner-Text angezeigt wird. Diese Funktion
+    selbst liest/ändert keinen Zustand."""
 
-    if not produktiv:
+    if ist_bekannte_demo_umgebung(environment):
         return "PILOT-BETRIEB — nur synthetische Demodaten, kein realer Bank-/Mailversand, kein Mehrbenutzerbetrieb"
+    # Escaping passiert erst beim Rendern in `seite()` (`h(banner_text)`) -
+    # diese Funktion liefert reinen Text, kein HTML.
     mailversand = "AKTIV" if send_enabled else "AUS (SEND_ENABLED=false)"
     return (
-        f"ECHTBETRIEB — reale Hausverwaltungsdaten. Mailversand: {mailversand}. "
+        f"ECHTBETRIEB ({environment}) — reale Hausverwaltungsdaten. Mailversand: {mailversand}. "
         "Automatischer Bankabgleich: AUS (EBS/EBICS ausstehend)."
     )
 
@@ -109,11 +131,11 @@ def seite(
     inhalt: str,
     user_id: str | None = None,
     csrf_token: str | None = None,
-    produktiv: bool = False,
+    environment: str = "development",
     send_enabled: bool = False,
 ) -> str:
-    banner_text = betriebsmodus_banner(produktiv=produktiv, send_enabled=send_enabled)
-    titel_suffix = "ECHTBETRIEB" if produktiv else "PILOT"
+    banner_text = betriebsmodus_banner(environment=environment, send_enabled=send_enabled)
+    titel_suffix = "PILOT" if ist_bekannte_demo_umgebung(environment) else "ECHTBETRIEB"
     logout_form = ""
     nav = ""
     if user_id is not None:

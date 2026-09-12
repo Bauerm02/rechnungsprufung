@@ -651,6 +651,264 @@ def _konto_by_id(konto_id: str):
     return StammdatenRepository(build_session_factory(get_settings().database_url)).get_konto(konto_id)
 
 
+def test_vertragspruefung_entwurf_wirkt_nicht_erst_gepruefte_version_setzt_rechtsordnung(backoffice_client):
+    """Paket B, Punkt 1: eine ENTWURF-Prüfung ist sichtbar/gespeichert,
+    ändert aber nicht die wirksame Rechtsordnung des Vertrags - erst
+    eine GEPRUEFT-Version schreibt sie zurück. Ohne Quellenbeleg-
+    Referenz wird nichts gespeichert (keine beleglose Klassifizierung)."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-PRUEF", objekt_id="601", bezeichnung="Top Prüfung", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-PRUEF", einheit_id="601-TOP-PRUEF", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="UNGEKLAERT", gueltig_von=date(2024, 1, 1),
+    )
+
+    seite = client.get("/backoffice/vertrag/V-601-PRUEF/pruefung")
+    assert seite.status_code == 200
+    assert "UNGEKLAERT" in seite.text
+
+    ohne_beleg = client.post(
+        "/backoffice/vertrag/V-601-PRUEF/pruefung/anlegen",
+        data={
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "fachstatus": "ENTWURF",
+            "quellenbeleg_referenz": "   ", "csrf_token": csrf,
+        },
+    )
+    assert ohne_beleg.status_code == 400
+    assert "Quellenbeleg" in ohne_beleg.text
+    assert stammdaten.get_vertrag("V-601-PRUEF").rechtsordnung == "UNGEKLAERT"
+
+    entwurf = client.post(
+        "/backoffice/vertrag/V-601-PRUEF/pruefung/anlegen",
+        data={
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "fachstatus": "ENTWURF",
+            "quellenbeleg_referenz": "Mietvertrag.pdf, S. 1", "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert entwurf.status_code == 303
+    assert stammdaten.get_vertrag("V-601-PRUEF").rechtsordnung == "UNGEKLAERT"  # ENTWURF bleibt wirkungslos
+
+    gepr = client.post(
+        "/backoffice/vertrag/V-601-PRUEF/pruefung/anlegen",
+        data={
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "fachstatus": "GEPRUEFT",
+            "quellenbeleg_referenz": "Mietvertrag.pdf, S. 1", "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert gepr.status_code == 303
+    assert stammdaten.get_vertrag("V-601-PRUEF").rechtsordnung == "OESTERREICH_MRG_VOLL"
+
+    historie = client.get("/backoffice/vertrag/V-601-PRUEF/pruefung")
+    assert historie.text.count("Mietvertrag.pdf, S. 1") >= 2  # beide Versionen in der Historie
+
+
+def test_sperre_aufheben_braucht_begruendung_und_wirkt_nur_auf_die_gewaehlte_sperre(backoffice_client):
+    """Paket B, Punkt 1: Sperren-Aufhebung ist immer einzeln und braucht
+    eine Begründung - RATENPLAN/RECHTSANWALT sind dabei nicht
+    privilegiert, aber auch nicht ausgeschlossen; die jeweils ANDERE
+    aktive Sperre bleibt beim Aufheben der einen unangetastet."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-SPERRE", objekt_id="601", bezeichnung="Top Sperre", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-SPERRE", einheit_id="601-TOP-SPERRE", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    ratenplan_id = stammdaten.sperre_setzen(vertrag_id="V-601-SPERRE", grund="RATENPLAN", kommentar="Ratenplan vereinbart")
+    stammdaten.sperre_setzen(vertrag_id="V-601-SPERRE", grund="RECHTSANWALT", kommentar="RA beauftragt")
+
+    ohne_begruendung = client.post(
+        f"/backoffice/vertrag/V-601-SPERRE/sperre/{ratenplan_id}/aufheben",
+        data={"begruendung": "   ", "csrf_token": csrf},
+    )
+    assert ohne_begruendung.status_code == 400
+    assert len(stammdaten.aktive_sperren("V-601-SPERRE")) == 2  # beide weiterhin aktiv
+
+    aufgehoben = client.post(
+        f"/backoffice/vertrag/V-601-SPERRE/sperre/{ratenplan_id}/aufheben",
+        data={"begruendung": "Rate vollständig bezahlt, Beleg Kontoauszug 04/2026", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert aufgehoben.status_code == 303
+
+    verbleibende = stammdaten.aktive_sperren("V-601-SPERRE")
+    assert len(verbleibende) == 1
+    assert verbleibende[0].grund == "RECHTSANWALT"  # nur die gewählte Sperre wurde aufgehoben
+
+
+def test_index_pruefbedarf_speichert_auch_unvollstaendige_angaben_ohne_freigabe(backoffice_client):
+    """Paket B, Punkt 1: auch unvollständige Indexangaben sind als reiner
+    Entwurf/Prüfbedarf speicherbar - keine Pflichtfelder, keine Freigabe,
+    keine Berührung der bestehenden `IndexKlauselTable`."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-INDEX", objekt_id="601", bezeichnung="Top Index", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-INDEX", einheit_id="601-TOP-INDEX", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+
+    unvollstaendig = client.post(
+        "/backoffice/vertrag/V-601-INDEX/index-pruefbedarf/anlegen",
+        data={
+            "rechtsordnung": "", "basis_reihe": "", "basis_wert": "ungültig-kein-wert",
+            "basis_monat": "", "kommentar": "nur Notiz, noch nicht geprüft", "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert unvollstaendig.status_code == 303  # kein Fehler trotz leerer/ungültiger Felder
+
+    seite = client.get("/backoffice/vertrag/V-601-INDEX/pruefung")
+    assert "nur Notiz, noch nicht geprüft" in seite.text
+
+
+def test_bank_verknuepfen_bindet_rohtransaktion_an_bestehende_zahlung_ohne_neue_op(backoffice_client):
+    """Paket B, Punkt 2: eine bereits VOR dem Bankfeed gebuchte ZAHLUNG-OP
+    wird mit einer später eingelesenen Rohtransaktion verknüpft, OHNE
+    einen zweiten Zahlungseintrag zu erzeugen (keine doppelte
+    Gutschrift). Ein exakter Replay derselben Vorgangs-ID bleibt
+    wirkungslos, ein Link-Duplikat unter einer anderen Vorgangs-ID wird
+    abgelehnt."""
+
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-VERKN", objekt_id="601", bezeichnung="Top Verknüpfung", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-VERKN", einheit_id="601-TOP-VERKN", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-VERKN"))
+
+    # Zahlung und Transaktion bewusst GRÖSSER als der erste Verknüpfungs-
+    # betrag gewählt: so bleibt auf beiden Seiten (Transaktion UND OP)
+    # genug Restbetrag übrig, damit ein späterer Link-Duplikat-Versuch
+    # tatsächlich am Duplikat-Check scheitert - und nicht schon vorher,
+    # unspezifischer, am (ebenfalls geprüften) Restbetrags-Check.
+    zahlung = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=90_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=None,
+        beleg_referenz="Vorab erfasste Zahlung (vor Bankfeed)",
+    )
+
+    seiten_text = _bank_datei_importieren(client, csrf, bank_konto_id="BK-TEST-VERKN", betrag_text="900.00")
+    treffer_tx = re.search(r"/backoffice/bank/(\d+)/verknuepfen", seiten_text)
+    assert treffer_tx is not None
+    transaktion_id = treffer_tx.group(1)
+
+    formular = client.get(f"/backoffice/bank/{transaktion_id}/verknuepfen")
+    assert formular.status_code == 200
+
+    saldo_vorher = op_service.berechne_saldo(konto.id).saldo_cent
+    verknuepft = client.post(
+        f"/backoffice/bank/{transaktion_id}/verknuepfen",
+        data={
+            "op_position_id": str(zahlung.id), "konto_id": konto.id, "betrag": "450,00",
+            "vorgangs_id": "VERKNUEPFT-TEST-1", "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert verknuepft.status_code == 303
+    # Verknüpfung bucht keine neue OP-Zeile - die ZAHLUNG war bereits
+    # vorher gebucht, der Saldo darf sich NICHT ein zweites Mal ändern.
+    assert op_service.berechne_saldo(konto.id).saldo_cent == saldo_vorher
+
+    replay = client.post(
+        f"/backoffice/bank/{transaktion_id}/verknuepfen",
+        data={
+            "op_position_id": str(zahlung.id), "konto_id": konto.id, "betrag": "450,00",
+            "vorgangs_id": "VERKNUEPFT-TEST-1", "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert replay.status_code == 303  # exakter Replay derselben Vorgangs-ID bleibt wirkungslos
+
+    konflikt = client.post(
+        f"/backoffice/bank/{transaktion_id}/verknuepfen",
+        data={
+            "op_position_id": str(zahlung.id), "konto_id": konto.id, "betrag": "100,00",
+            "vorgangs_id": "VERKNUEPFT-TEST-ANDERE-ID", "csrf_token": csrf,
+        },
+    )
+    assert konflikt.status_code == 400
+    assert "Link-Duplikat" in konflikt.text
+
+
+def test_automatische_bankzuordnung_route_ist_ausserhalb_bekannter_demo_umgebungen_gesperrt(backoffice_client, monkeypatch):
+    """Codex-Rückprüfung (Paket A/B): eine ausgeblendete Schaltfläche
+    allein ist kein Schutz - die POST-Route selbst muss außerhalb
+    bekannter Demo-Umgebungen (also im Echtbetrieb) die Ausführung
+    verweigern, unabhängig von der angefragten Transaktions-ID."""
+
+    import mietinkasso.backoffice.app as backoffice_app
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    monkeypatch.setattr(backoffice_app, "_DEMO_UMGEBUNG", False)
+    gesperrt = client.post("/backoffice/bank/999999/automatisch-zuordnen", data={"csrf_token": csrf})
+    assert gesperrt.status_code == 403
+
+
+def test_bankseite_zeigt_keine_automatik_schaltflaeche_ausserhalb_der_demo_umgebung(backoffice_client, monkeypatch):
+    """Ergänzt den vorigen Test um die UI-Seite: außerhalb bekannter
+    Demo-Umgebungen darf weder der Vorschlagstext noch die Schaltfläche
+    für die automatische Zuordnung erscheinen, nur der Hinweis auf die
+    zurückgestellte automatische Bankzuordnung."""
+
+    import mietinkasso.backoffice.app as backoffice_app
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text_in_demo = _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-TEST-GATING", betrag_text="600.00", referenz="VERTRAG:V-601-1",
+    )
+    assert re.search(r"/backoffice/bank/\d+/automatisch-zuordnen", seiten_text_in_demo) is not None
+
+    monkeypatch.setattr(backoffice_app, "_DEMO_UMGEBUNG", False)
+    seite_ohne_demo = client.get("/backoffice/bank/unzugeordnet", params={"bank_konto_id": "BK-TEST-GATING"})
+    assert seite_ohne_demo.status_code == 200
+    assert "automatisch-zuordnen" not in seite_ohne_demo.text
+    assert "Automatische Zuordnung zurückgestellt" in seite_ohne_demo.text
+
+
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
     unten) - der Login-Ratelimiter ist ein globaler, prozessweiter

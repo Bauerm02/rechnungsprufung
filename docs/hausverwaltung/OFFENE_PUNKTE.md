@@ -53,6 +53,96 @@ Rückprüfung):
   `infrastructure/config.py` - alle bestehenden Dev-/Test-/Demo-Abläufe
   (`Betriebsanleitung.md`) funktionieren unverändert.
 
+## Paket B — Vertragsprüfung, Sperren-Aufhebung, manueller Bankabgleich (Nutzerauftrag 12.09., Anschluss an Paket A)
+
+Umfasst NUR die drei explizit beauftragten Punkte; das vollständige
+MieWeG-Profil und die Mail-/Jobpipeline sind ausdrücklich NICHT Teil
+davon (folgen erst nach Rückmeldung des Nutzers).
+
+- **Vertragsprüfseite (`/backoffice/vertrag/{id}/pruefung`):** jede
+  Prüfung ist eine neue, unveränderliche, versionierte Zeile
+  (`VertragPruefungTable`, `UniqueConstraint(vertrag_id, version)`) mit
+  Pflicht-Quellenbeleg-Referenz (`QuellenbelegFehltError` ohne Beleg —
+  keine beleglose Klassifizierung) und explizitem Rechtsprofil
+  (`domain/enums.py::Rechtsordnung`, inkl. `UNGEKLAERT`). NUR
+  `fachstatus == GEPRUEFT` schreibt die gewählte Rechtsordnung
+  tatsächlich auf den Vertrag zurück (`upsert_vertrag`); ein `ENTWURF`
+  bleibt sichtbar/gespeichert, aber wirkungslos für Mahnung/Index/
+  Sollstellung. Es gibt (bewusst) keine automatische Freigabe und kein
+  neues Datenmodell für den Vertrag selbst — nur diese zusätzliche,
+  rein additive Audit-Tabelle.
+- **Sperren-Aufhebung ist strukturell IMMER einzeln:** `sperre_aufheben`
+  (Service) nimmt genau EINE `sperre_id` entgegen, verlangt eine
+  nicht-leere Begründung (sonst `QuellenbelegFehltError`), prüft die
+  Zugehörigkeit zum Vertrag (`BindungInkonsistentError` sonst) und dass
+  sie nicht bereits aufgehoben ist. Es existiert an keiner Stelle im
+  Modul ein Sammel-/Automatik-Aufhebungspfad — RATENPLAN/RECHTSANWALT
+  sind dabei nicht privilegiert, aber auch nicht ausgenommen: jede
+  Aufhebung braucht denselben Beleg/dieselbe Begründung, protokolliert
+  im Audit-Log.
+- **Index-Prüfbedarf (`IndexPruefbedarfTable`) ist bewusst eine eigene,
+  UNVERBUNDENE Tabelle**, nicht eine Lockerung von `IndexKlauselTable`:
+  alle Felder nullable, keine Pflichtfeld-Prüfung, kein
+  Freigabemechanismus, keine Wirkung auf `IndexKlauselTable`/Buchungen.
+  Grund: SQLite kann NOT-NULL-Constraints nicht ohne vollständigen
+  Tabellen-Rebuild lockern, und das hätte ein unnötiges Migrationsrisiko
+  für eine ggf. bereits befüllte Tabelle bedeutet. Eine echte,
+  freigebbare Indexklausel entsteht weiterhin ausschließlich über den
+  bestehenden `index/service.py::klausel_anlegen`-Weg mit unveränderten
+  Pflichtfeldern.
+- **Manueller Bankabgleich ohne Zweitbuchung
+  (`/backoffice/bank/{id}/verknuepfen`,
+  `BankImportService.verknuepfe_mit_bestehender_zahlung`):** verknüpft
+  eine eingelesene Rohtransaktion mit einer EXPLIZIT gewählten, bereits
+  bestehenden ZAHLUNG-OP, ohne eine zweite OP-Zeile zu buchen — die
+  Fachregel "bestehende Mieterkonto-Buchungen dürfen bei einem späteren
+  Rohbankimport nicht doppelt gutgeschrieben werden" ist damit
+  eingehalten. Kein neues Linktabellen-Konstrukt nötig: die bereits
+  bestehende generische `ZuordnungTable` (Bank-Transaktion ↔ OP-Position)
+  wird wiederverwendet, ergänzt um eine kleine additive Prüfmethode
+  (`BankRepository.verknuepfter_betrag_fuer_op`, prüft den noch nicht
+  "erklärten" Restbetrag der ZAHLUNG selbst — die bestehende
+  `create_zuordnung` prüfte bisher nur den Restbetrag der TRANSAKTION).
+  Geprüft werden atomar (frisch per ID geladen, `with_for_update`):
+  Gesellschaft, Konto, Währung, beide Restbeträge getrennt, sowie ein
+  Link-Duplikat (dasselbe Transaktion/OP-Paar unter einer ANDEREN
+  `vorgang_id`). Ein exakter Retry MIT derselben `vorgang_id` bleibt ein
+  sicherer No-Op — geprüft VOR den Restbetrags-Validierungen (sonst
+  würde der bereits durch denselben Vorgang belegte Betrag den Retry
+  selbst als "über dem Restbetrag" ablehnen). Bestehende Ledger-Zeilen
+  bleiben unverändert (append-only).
+- **Automatische Zuordnung bleibt Nutzer-seitig zurückgestellt, jetzt
+  auch route-seitig hart geschlossen — nicht nur ausgeblendet:** die
+  POST-Route `/backoffice/bank/{id}/automatisch-zuordnen` verweigert die
+  Ausführung (HTTP 403) außerhalb bekannter Demo-Umgebungen
+  (`ist_bekannte_demo_umgebung`), unabhängig davon, ob im UI ein Button
+  dafür sichtbar war — die reine Anzeige-Ausblendung (bereits Teil des
+  Banner-Fixes aus Paket A) wäre allein kein Schutz gegen einen direkten
+  POST, wie von Codex bei der Paket-A-Rückprüfung angemerkt. Manuelle
+  Zuordnung (`/manuell-zuordnen`) und die neue Verknüpfung
+  (`/verknuepfen`) bleiben in jeder Umgebung möglich. Ein reiner
+  Raw-Import bestätigt weiterhin NIE Vollständigkeit (siehe
+  "Bankvollständigkeit" unten).
+- **Was Paket B bewusst NICHT tut:** kein vollständiges MieWeG-
+  Berechnungsprofil (siehe "Index-Rechtsprofile" unten, unverändert),
+  keine Mailpipeline/Jobs (Paket C, noch nicht begonnen), keine
+  automatische Bankabholung/-zuordnung (weiterhin bis EBS/EBICS
+  zurückgestellt), keine Änderung an `src/invoice_automation/`.
+- Regressionstests: `tests/mietinkasso/test_vertragspruefung.py` (14
+  Tests: Prüfung/Freigabe, Sperren-Aufhebung, Index-Prüfbedarf), neue
+  Fälle in `tests/mietinkasso/test_bank.py` (9 Tests für
+  `verknuepfe_mit_bestehender_zahlung`, inkl. Replay/Konflikt/
+  Restbetrags-Grenzen) sowie Backoffice-HTTP-Integrationstests in
+  `tests/mietinkasso/test_backoffice.py` (Vertragsprüfseite ENTWURF vs.
+  GEPRUEFT, Sperren-Aufhebung mit/ohne Begründung, Index-Prüfbedarf,
+  Bank-Verknüpfung inkl. Replay/Link-Duplikat, sowie der route-seitige
+  403-Block der automatischen Zuordnung außerhalb bekannter
+  Demo-Umgebungen über `monkeypatch` auf `backoffice/app.py::_DEMO_UMGEBUNG`
+  — ein direkter End-to-End-Test mit echtem
+  `MIETINKASSO_ENVIRONMENT=production`-Prozessstart ist wegen der
+  bereits in Paket A dokumentierten Modul-Import-Einmaligkeit von
+  `api.app`/`backoffice.app` pro Testprozess nicht praktikabel).
+
 ## Echtbetrieb-Intake (HV-20260912-ECHTBETRIEB, 12.09.2026)
 
 - **Quellenmapping bleibt vollständig bei Codex:** `src/mietinkasso/intake/`

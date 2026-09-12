@@ -13,6 +13,7 @@ from mietinkasso.bank.repository import BankRepository
 from mietinkasso.bank.service import BankImportService
 from mietinkasso.domain.enums import OPTyp
 from mietinkasso.domain.exceptions import (
+    BindungInkonsistentError,
     CrossTenantError,
     FremdwaehrungNichtUnterstuetztError,
     MehrfachbuchungsKonfliktError,
@@ -666,3 +667,198 @@ def test_vorgang_id_wiederverwendung_fuer_andere_transaktion_ist_konflikt_und_ro
 
     assert bank_service._op_service.berechne_saldo(konto.id).saldo_cent == -60_000
     assert bank_repo.zugeordneter_betrag(tx_b.id) == 0
+
+
+# ---------------------------------------------------------------------------
+# Verknüpfung mit bestehender Zahlung (Auftrag 12.09., Paket B, Punkt 2):
+# eine Rohtransaktion wird mit einer BEREITS BESTEHENDEN ZAHLUNG-OP verlinkt,
+# OHNE einen zweiten Zahlungseintrag zu buchen - Fachregel: bestehende
+# Mieterkonto-Buchungen dürfen bei einem späteren Rohbankimport nicht
+# doppelt gutgeschrieben werden.
+# ---------------------------------------------------------------------------
+
+
+def _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx, *, betrag_text: str, referenz: str, bank_konto_id="BK-7DI-1"):
+    if bank_repo.get_bank_konto(bank_konto_id) is None:
+        bank_repo.upsert_bank_konto(id=bank_konto_id, gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto(bank_konto_id)
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+    csv_text = f"betrag,datum,referenz\n{betrag_text},2026-04-06,{referenz}\n"
+    return bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto, text=csv_text, mapping=mapping)[0]
+
+
+def test_verknuepfen_erzeugt_keine_neue_op_und_veraendert_saldo_nicht(bank_service, bank_repo, op_service, basis_vertrag, ctx_factory):
+    """Der zentrale Fall: eine ZAHLUNG wurde bereits VOR dem Bankfeed
+    gebucht (z. B. manuell/Intake) - die spätere Rohtransaktion bestätigt
+    sie nur, statt sie ein zweites Mal gutzuschreiben."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bestehende_zahlung = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=None,
+        beleg_referenz="Vor dem Bankfeed manuell erfasste Zahlung",
+    )
+    saldo_vorher = op_service.berechne_saldo(konto.id).saldo_cent
+    transaktion = _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx, betrag_text="600.00", referenz="egal")
+
+    zuordnung = bank_service.verknuepfe_mit_bestehender_zahlung(
+        ctx=ctx, transaktion=transaktion, op_position=bestehende_zahlung, konto=konto, betrag_cent=60_000,
+        vorgang_id="VERKNUEPFT-1",
+    )
+
+    assert zuordnung.op_position_id == bestehende_zahlung.id
+    assert op_service.berechne_saldo(konto.id).saldo_cent == saldo_vorher  # KEINE Doppelgutschrift
+    assert len(op_service.list_alle_positionen(konto.id)) == 1  # weiterhin nur die EINE ursprüngliche Zahlung
+    assert bank_repo.zugeordneter_betrag(transaktion.id) == 60_000
+
+
+def test_verknuepfen_replay_derselben_vorgang_id_ist_wirkungslos(bank_service, bank_repo, op_service, basis_vertrag, ctx_factory):
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    zahlung = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=None, beleg_referenz="Zahlung",
+    )
+    transaktion = _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx, betrag_text="600.00", referenz="egal")
+
+    erste = bank_service.verknuepfe_mit_bestehender_zahlung(
+        ctx=ctx, transaktion=transaktion, op_position=zahlung, konto=konto, betrag_cent=60_000, vorgang_id="RETRY-1",
+    )
+    zweite = bank_service.verknuepfe_mit_bestehender_zahlung(
+        ctx=ctx, transaktion=transaktion, op_position=zahlung, konto=konto, betrag_cent=60_000, vorgang_id="RETRY-1",
+    )
+    assert erste.id == zweite.id
+    assert bank_repo.zugeordneter_betrag(transaktion.id) == 60_000  # keine Verdopplung
+
+
+def test_verknuepfen_link_duplikat_mit_anderer_vorgang_id_wird_abgelehnt(bank_service, bank_repo, op_service, basis_vertrag, ctx_factory):
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    zahlung = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=None, beleg_referenz="Zahlung",
+    )
+    transaktion = _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx, betrag_text="600.00", referenz="egal")
+    bank_service.verknuepfe_mit_bestehender_zahlung(
+        ctx=ctx, transaktion=transaktion, op_position=zahlung, konto=konto, betrag_cent=30_000, vorgang_id="ERSTE-VERKNUEPFUNG",
+    )
+    with pytest.raises(ZuordnungUngueltigError, match="Link-Duplikat"):
+        bank_service.verknuepfe_mit_bestehender_zahlung(
+            ctx=ctx, transaktion=transaktion, op_position=zahlung, konto=konto, betrag_cent=30_000,
+            vorgang_id="ZWEITE-VERKNUEPFUNG-DESSELBEN-PAARS",
+        )
+    assert bank_repo.zugeordneter_betrag(transaktion.id) == 30_000  # unverändert, kein zweiter Link
+
+
+def test_verknuepfen_betrag_ueber_restbetrag_der_zahlung_wird_abgelehnt(bank_service, bank_repo, op_service, basis_vertrag, ctx_factory):
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    zahlung = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=None, beleg_referenz="Zahlung",
+    )
+    transaktion = _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx, betrag_text="900.00", referenz="egal")
+    with pytest.raises(ZuordnungUngueltigError, match="Restbetrag der"):
+        bank_service.verknuepfe_mit_bestehender_zahlung(
+            ctx=ctx, transaktion=transaktion, op_position=zahlung, konto=konto, betrag_cent=90_000,
+            vorgang_id="ZU-VIEL-FUER-DIE-ZAHLUNG",
+        )
+    assert bank_repo.zugeordneter_betrag(transaktion.id) == 0
+
+
+def test_verknuepfen_betrag_ueber_restbetrag_der_transaktion_wird_abgelehnt(bank_service, bank_repo, op_service, basis_vertrag, ctx_factory):
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    zahlung = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=90_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=None, beleg_referenz="Zahlung",
+    )
+    transaktion = _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx, betrag_text="600.00", referenz="egal")
+    with pytest.raises(ZuordnungUngueltigError, match="verbleibenden"):
+        bank_service.verknuepfe_mit_bestehender_zahlung(
+            ctx=ctx, transaktion=transaktion, op_position=zahlung, konto=konto, betrag_cent=90_000,
+            vorgang_id="ZU-VIEL-FUER-DIE-TRANSAKTION",
+        )
+
+
+def test_verknuepfen_falscher_optyp_wird_abgelehnt(bank_service, bank_repo, op_service, basis_vertrag, ctx_factory):
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    soll = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=date(2026, 4, 5), beleg_referenz="Miete",
+    )
+    transaktion = _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx, betrag_text="600.00", referenz="egal")
+    with pytest.raises(ZuordnungUngueltigError, match="ZAHLUNG-OP"):
+        bank_service.verknuepfe_mit_bestehender_zahlung(
+            ctx=ctx, transaktion=transaktion, op_position=soll, konto=konto, betrag_cent=60_000, vorgang_id="FALSCHER-TYP",
+        )
+
+
+def test_verknuepfen_storniertes_op_wird_abgelehnt(bank_service, bank_repo, op_service, basis_vertrag, ctx_factory):
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    zahlung = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=None, beleg_referenz="Zahlung",
+    )
+    op_service.storniere_und_korrigiere(ctx=ctx, konto=konto, original_id=zahlung.id, aenderungsgrund="Fehlbuchung")
+    transaktion = _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx, betrag_text="600.00", referenz="egal")
+    with pytest.raises(ZuordnungUngueltigError, match="storniert"):
+        bank_service.verknuepfe_mit_bestehender_zahlung(
+            ctx=ctx, transaktion=transaktion, op_position=zahlung, konto=konto, betrag_cent=60_000, vorgang_id="STORNIERT",
+        )
+
+
+def test_verknuepfen_falsches_konto_wird_abgelehnt(bank_service, bank_repo, op_service, stammdaten_repo, basis_vertrag, ctx_factory):
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    zahlung = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=None, beleg_referenz="Zahlung",
+    )
+    stammdaten_repo.upsert_einheit(id="601-TOP9", objekt_id="601", bezeichnung="Top 9", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-ANDERE", name="Andere Mieterin")
+    stammdaten_repo.upsert_vertrag(
+        id="V-ANDERER", einheit_id="601-TOP9", debitor_id="DEB-ANDERE", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    anderer_vertrag = stammdaten_repo.get_vertrag("V-ANDERER")
+    anderes_konto = stammdaten_repo.get_or_create_konto(vertrag=anderer_vertrag)
+    transaktion = _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx, betrag_text="600.00", referenz="egal")
+
+    with pytest.raises(BindungInkonsistentError):
+        bank_service.verknuepfe_mit_bestehender_zahlung(
+            ctx=ctx, transaktion=transaktion, op_position=zahlung, konto=anderes_konto, betrag_cent=60_000,
+            vorgang_id="FALSCHES-KONTO",
+        )
+
+
+def test_verknuepfen_zwei_transaktionen_koennen_eine_zahlung_gemeinsam_erklaeren(bank_service, bank_repo, op_service, basis_vertrag, ctx_factory):
+    """Zwei ECHTE, unabhängige Teilbeträge (z. B. weil eine Sammelzahlung
+    auf zwei Bankzeilen aufgeteilt eingegangen ist) dürfen gemeinsam,
+    aber nie über den Restbetrag der Zahlung hinaus, verknüpft werden."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    zahlung = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=None, beleg_referenz="Zahlung",
+    )
+    tx_a = _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx, betrag_text="300.00", referenz="teil-a")
+    tx_b = _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx, betrag_text="300.00", referenz="teil-b")
+
+    bank_service.verknuepfe_mit_bestehender_zahlung(
+        ctx=ctx, transaktion=tx_a, op_position=zahlung, konto=konto, betrag_cent=30_000, vorgang_id="TEIL-A",
+    )
+    bank_service.verknuepfe_mit_bestehender_zahlung(
+        ctx=ctx, transaktion=tx_b, op_position=zahlung, konto=konto, betrag_cent=30_000, vorgang_id="TEIL-B",
+    )
+    assert len(op_service.list_alle_positionen(konto.id)) == 1  # weiterhin nur die eine ursprüngliche Zahlung
+
+    tx_c = _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx, betrag_text="100.00", referenz="ueberschuss")
+    with pytest.raises(ZuordnungUngueltigError, match="Restbetrag der"):
+        bank_service.verknuepfe_mit_bestehender_zahlung(
+            ctx=ctx, transaktion=tx_c, op_position=zahlung, konto=konto, betrag_cent=10_000, vorgang_id="TEIL-C-ZU-VIEL",
+        )

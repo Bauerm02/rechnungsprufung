@@ -32,7 +32,7 @@ Mehrbenutzer-Onlinebetrieb). Jede POST-Route verlangt ein gültiges
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from html import escape as h
 from urllib.parse import urlparse
 
@@ -42,7 +42,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from mietinkasso.audit.service import AuditService
 from mietinkasso.auth.service import AuthContext
 from mietinkasso.backoffice.security import LoginRateLimiter, SessionStore, pruefe_passwort
-from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, option, parse_eur_betrag, seite
+from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, ist_bekannte_demo_umgebung, option, parse_eur_betrag, seite
 from mietinkasso.bank.importer import CamtMehrteiligeBuchungError, CamtUnvollstaendigError, CsvSpaltenMapping, parse_camt053, parse_csv
 from mietinkasso.bank.repository import BankRepository
 from mietinkasso.bank.service import BankImportService
@@ -58,17 +58,23 @@ from mietinkasso.op.eroeffnung_import import importiere_eroeffnung_csv_atomar, p
 from mietinkasso.op.repository import OPRepository
 from mietinkasso.op.service import OPService
 from mietinkasso.stammdaten.repository import StammdatenRepository
+from mietinkasso.vertragspruefung.repository import IndexPruefbedarfRepository, VertragPruefungRepository
+from mietinkasso.vertragspruefung.service import VertragspruefungService
 from mietinkasso.vorschreibung.repository import VorschreibungRepository
 from mietinkasso.vorschreibung.service import VorschreibungService, faelligkeitsdatum
 
 router = APIRouter(prefix="/backoffice", tags=["backoffice"])
 
 _settings = get_settings()
-# Nur für die Banner-/Titel-Anzeige (views.py::betriebsmodus_banner) -
-# reine Anzeigeentscheidung, kein neues Datenmodell, keine automatische
-# Freigabe von irgendetwas. `environment` ist bereits vorhandene
-# Konfiguration (infrastructure/config.py), kein neues Feld.
-_PRODUKTIV = _settings.environment == "production"
+# Für Banner-/Titel-Anzeige (views.py::betriebsmodus_banner) UND für die
+# Autozuordnungs-Routensperre unten - dieselbe Klassifizierung an BEIDEN
+# Stellen (views.py::ist_bekannte_demo_umgebung), damit sie nie
+# auseinanderlaufen können. Codex-Rückprüfung (Paket A): NUR bekannte
+# Demo-Umgebungen (development/test/ci) gelten als sicher synthetisch -
+# jede andere (production, staging, ein Zwischenschritt wie
+# "local_realdata_staged") wird als Echtbetrieb behandelt, auch wenn sie
+# nicht exakt "production" heißt.
+_DEMO_UMGEBUNG = ist_bekannte_demo_umgebung(_settings.environment)
 _session_factory = build_session_factory(_settings.database_url)
 _stammdaten_repo = StammdatenRepository(_session_factory)
 _op_repo = OPRepository(_session_factory)
@@ -82,6 +88,9 @@ _mahn_policy_repo = MahnPolicyRepository(_session_factory)
 _mahn_service = MahnwesenService(_mahn_fall_repo, _stammdaten_repo, _op_service, _mahn_policy_repo, bank_stand_max_age_days=_settings.bank_stand_max_age_days)
 _index_repo = IndexRepository(_session_factory)
 _index_service = IndexService(_index_repo, _stammdaten_repo)
+_vertragspruefung_repo = VertragPruefungRepository(_session_factory)
+_index_pruefbedarf_repo = IndexPruefbedarfRepository(_session_factory)
+_vertragspruefung_service = VertragspruefungService(_vertragspruefung_repo, _index_pruefbedarf_repo, _stammdaten_repo)
 _audit_service = AuditService(_session_factory)
 
 _sessions = SessionStore(ttl_sekunden=_settings.backoffice_session_ttl_minuten * 60)
@@ -156,7 +165,7 @@ def _layout(request: Request, session, titel: str, inhalt: str) -> HTMLResponse:
     return HTMLResponse(seite(
         titel=titel, inhalt=inhalt, user_id=session.user_id if session else None,
         csrf_token=session.csrf_token if session else None,
-        produktiv=_PRODUKTIV, send_enabled=_settings.send_enabled,
+        environment=_settings.environment, send_enabled=_settings.send_enabled,
     ))
 
 
@@ -164,7 +173,7 @@ def _fehlerseite(session, titel: str, meldung: str, zurueck_href: str = "/backof
     inhalt = flash_error(meldung) + f'<p><a href="{h(zurueck_href)}">&larr; zurück</a></p>'
     return HTMLResponse(seite(
         titel=titel, inhalt=inhalt, user_id=session.user_id, csrf_token=session.csrf_token,
-        produktiv=_PRODUKTIV, send_enabled=_settings.send_enabled,
+        environment=_settings.environment, send_enabled=_settings.send_enabled,
     ), status_code=400)
 
 
@@ -199,7 +208,7 @@ def login_formular(request: Request, fehler: str | None = None) -> HTMLResponse:
         <button type="submit">Anmelden</button>
       </form>
     </div>"""
-    return HTMLResponse(seite(titel="Anmeldung", inhalt=inhalt, produktiv=_PRODUKTIV, send_enabled=_settings.send_enabled))
+    return HTMLResponse(seite(titel="Anmeldung", inhalt=inhalt, environment=_settings.environment, send_enabled=_settings.send_enabled))
 
 
 @router.post("/login")
@@ -424,7 +433,8 @@ def kontoauszug(request: Request, konto_id: str, session=Depends(_current_sessio
         links = f"""
         <p>
           <a href="/backoffice/vertrag/{h(vertrag.id)}/vorschreibung">Vorschreibungsentwurf</a> &nbsp;|&nbsp;
-          <a href="/backoffice/vertrag/{h(vertrag.id)}/mahnvorschau">Mahnvorschau</a>
+          <a href="/backoffice/vertrag/{h(vertrag.id)}/mahnvorschau">Mahnvorschau</a> &nbsp;|&nbsp;
+          <a href="/backoffice/vertrag/{h(vertrag.id)}/pruefung">Vertragsprüfung</a>
         </p>"""
 
     return _layout(request, session, f"Kontoauszug {konto_id}", banner + stammdaten_karte + sperren_karte + op_tabelle + links)
@@ -935,21 +945,31 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
 
         zeilen = []
         for tx in transaktionen:
-            vorschlag_konto, vorschlag_grund = _bank_service.schlage_konto_vor(tx)
             zugeordnet = _bank_repo.zugeordneter_betrag(tx.id)
             rest = tx.betrag_cent - zugeordnet
             vorschlag_form = ""
-            if vorschlag_konto is not None:
-                vorschlag_form = f"""
-                <form method="post" action="/backoffice/bank/{tx.id}/automatisch-zuordnen" class="inline">
-                  {csrf_feld(session.csrf_token)}
-                  <button type="submit">Vorschlag übernehmen ({h(vorschlag_konto.id)})</button>
-                </form>"""
+            # Automatische Zuordnung ist nutzerseitig zurückgestellt (bis
+            # EBS/EBICS) - außerhalb bekannter Demo-Umgebungen weder
+            # Vorschlagstext noch Schaltfläche anzeigen. Die Anzeige allein
+            # wäre KEIN Schutz - die POST-Route selbst verweigert die
+            # Ausführung ebenfalls (siehe bank_automatisch_zuordnen unten).
+            vorschlag_grund_html = ""
+            if _DEMO_UMGEBUNG:
+                vorschlag_konto, vorschlag_grund = _bank_service.schlage_konto_vor(tx)
+                vorschlag_grund_html = h(vorschlag_grund)
+                if vorschlag_konto is not None:
+                    vorschlag_form = f"""
+                    <form method="post" action="/backoffice/bank/{tx.id}/automatisch-zuordnen" class="inline">
+                      {csrf_feld(session.csrf_token)}
+                      <button type="submit">Vorschlag übernehmen ({h(vorschlag_konto.id)})</button>
+                    </form>"""
+            else:
+                vorschlag_grund_html = '<span class="muted">Automatische Zuordnung zurückgestellt (EBS/EBICS ausstehend).</span>'
             zeilen.append(f"""
             <tr>
               <td>#{tx.id}</td><td>{eur(tx.betrag_cent)}</td><td>{tx.buchungsdatum.isoformat()}</td>
               <td>{h(tx.referenz or '')}</td><td>{eur(rest)} offen</td>
-              <td>{h(vorschlag_grund)}{vorschlag_form}</td>
+              <td>{vorschlag_grund_html}{vorschlag_form}</td>
               <td>
                 <form method="post" action="/backoffice/bank/{tx.id}/manuell-zuordnen">
                   {csrf_feld(session.csrf_token)}
@@ -958,6 +978,7 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
                   <input type="text" name="vorgangs_id" placeholder="Vorgangs-ID" value="MANUELL-{tx.id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}" required>
                   <button type="submit">Manuell zuordnen</button>
                 </form>
+                <a href="/backoffice/bank/{tx.id}/verknuepfen">Mit bestehender Zahlung verknüpfen</a>
               </td>
             </tr>""")
         tabelle = f"""
@@ -973,6 +994,16 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
 @router.post("/bank/{transaktion_id}/automatisch-zuordnen")
 def bank_automatisch_zuordnen(request: Request, transaktion_id: int, csrf_token: str = Form(...), session=Depends(_current_session)):
     _verify_csrf(session, csrf_token)
+    if not _DEMO_UMGEBUNG:
+        # Nutzerseitig zurückgestellt (bis EBS/EBICS) - die Route führt in
+        # jeder NICHT bekannten Demo-Umgebung NICHTS aus, unabhängig davon,
+        # ob im UI eine Schaltfläche dafür sichtbar war (die Anzeige allein
+        # wäre kein Schutz gegen einen direkten POST).
+        raise HTTPException(
+            status_code=403,
+            detail="Automatische Bankzuordnung ist zurückgestellt (EBS/EBICS ausstehend) und in dieser "
+            "Umgebung deaktiviert.",
+        )
     transaktion = _bank_repo.get_transaktion(transaktion_id)
     if transaktion is None:
         return _fehlerseite(session, "Zuordnung", f"Unbekannte Transaktion {transaktion_id}.", "/backoffice/bank/unzugeordnet")
@@ -1384,3 +1415,309 @@ def mahnpolicy_freigeben(request: Request, policy_id: int, csrf_token: str = For
     inhalt = flash_ok(f"Policy-Version {policy.version} freigegeben.")
     inhalt += '<p><a href="/backoffice/mahnwesen/policy">&larr; zurück</a></p>'
     return _layout(request, session, "Mahnstufen-Konfiguration", inhalt)
+
+
+# -- Verknüpfung mit bestehender Zahlung (kein neuer Zahlungseintrag) --------------
+
+
+@router.get("/bank/{transaktion_id}/verknuepfen", response_class=HTMLResponse)
+def bank_verknuepfen_formular(request: Request, transaktion_id: int, session=Depends(_current_session)) -> HTMLResponse:
+    transaktion = _bank_repo.get_transaktion(transaktion_id)
+    if transaktion is None:
+        return _fehlerseite(session, "Verknüpfung", f"Unbekannte Transaktion {transaktion_id}.", "/backoffice/bank/unzugeordnet")
+    rest = transaktion.betrag_cent - _bank_repo.zugeordneter_betrag(transaktion_id)
+    vorgang_vorschlag = f"VERKNUEPFT-{transaktion_id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    inhalt = f"""
+    <div class="card" style="max-width:560px;">
+      <h1>Mit bestehender Zahlung verknüpfen — Transaktion #{transaktion_id}</h1>
+      <p>Betrag: {eur(transaktion.betrag_cent)} &nbsp;|&nbsp; noch nicht zugeordnet: {eur(rest)}</p>
+      <p class="muted">Verlinkt diese Rohtransaktion mit einer BEREITS gebuchten ZAHLUNG-Position (z. B.
+         eine vor dem Bankfeed manuell erfasste Zahlung), OHNE einen zweiten Zahlungseintrag zu erzeugen -
+         damit bestehende Mieterkonto-Buchungen bei diesem Rohbankimport nicht doppelt gutgeschrieben
+         werden. Die OP-ID der bestehenden Zahlung steht im Kontoauszug des betroffenen Kontos
+         (Spalte &quot;#&quot;).</p>
+      <form method="post" action="/backoffice/bank/{transaktion_id}/verknuepfen">
+        {csrf_feld(session.csrf_token)}
+        <label>Bestehende ZAHLUNG-OP-ID</label>
+        <input type="number" name="op_position_id" required>
+        <label>Konto-ID (zur Bestätigung/Mandantenprüfung)</label>
+        <input type="text" name="konto_id" required>
+        <label>Verknüpfungsbetrag (EUR)</label>
+        <input type="text" name="betrag" value="{eur(rest).split()[0]}" required>
+        <label>Vorgangs-ID (eindeutig; ein Retry mit derselben ID ist ein sicherer No-Op)</label>
+        <input type="text" name="vorgangs_id" value="{vorgang_vorschlag}" required>
+        <button type="submit">Verknüpfen</button>
+      </form>
+    </div>"""
+    return _layout(request, session, "Verknüpfung", inhalt)
+
+
+@router.post("/bank/{transaktion_id}/verknuepfen")
+def bank_verknuepfen(
+    request: Request,
+    transaktion_id: int,
+    op_position_id: int = Form(...),
+    konto_id: str = Form(...),
+    betrag: str = Form(...),
+    vorgangs_id: str = Form(...),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    transaktion = _bank_repo.get_transaktion(transaktion_id)
+    if transaktion is None:
+        return _fehlerseite(session, "Verknüpfung", f"Unbekannte Transaktion {transaktion_id}.", "/backoffice/bank/unzugeordnet")
+    konto = _stammdaten_repo.get_konto(konto_id)
+    if konto is None:
+        return _fehlerseite(session, "Verknüpfung", f"Unbekanntes Konto {konto_id}.", f"/backoffice/bank/{transaktion_id}/verknuepfen")
+    op_position = _op_service.get_position(op_position_id)
+    if op_position is None:
+        return _fehlerseite(session, "Verknüpfung", f"Unbekannte OP-Position {op_position_id}.", f"/backoffice/bank/{transaktion_id}/verknuepfen")
+    try:
+        betrag_cent = parse_eur_betrag(betrag)
+        zuordnung = _bank_service.verknuepfe_mit_bestehender_zahlung(
+            ctx=_ctx(session), transaktion=transaktion, op_position=op_position, konto=konto,
+            betrag_cent=betrag_cent, vorgang_id=vorgangs_id,
+        )
+        _audit_service.log(
+            entity_typ="zuordnung", entity_id=str(zuordnung.id), aktion="mit_bestehender_zahlung_verknuepft",
+            akteur=session.user_id,
+            payload={"transaktion_id": transaktion_id, "op_position_id": op_position_id, "betrag_cent": betrag_cent, "vorgangs_id": vorgangs_id},
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Verknüpfung", str(exc), f"/backoffice/bank/unzugeordnet?bank_konto_id={transaktion.bank_konto_id}")
+    return RedirectResponse(url=f"/backoffice/bank/unzugeordnet?bank_konto_id={transaktion.bank_konto_id}&zugeordnet=1", status_code=303)
+
+
+# -- Vertragsprüfung (Auftrag 12.09., Paket B) -------------------------------------
+
+
+_RECHTSORDNUNGEN_FUER_AUSWAHL = [
+    "OESTERREICH_MRG_VOLL", "OESTERREICH_MRG_TEIL", "OESTERREICH_MRG_FREI",
+    "OESTERREICH_WGG", "OESTERREICH_GEWERBE", "DEUTSCHLAND", "UNGEKLAERT",
+]
+
+
+def _pruefung_zeile_html(p) -> str:
+    return (
+        "<tr>"
+        f"<td>{p.version}</td><td>{h(p.rechtsordnung)}</td><td>{h(p.fachstatus)}</td>"
+        f"<td>{h(p.quellenbeleg_referenz)}</td><td>{h(p.kommentar or '')}</td>"
+        f"<td>{h(p.erstellt_von)}</td><td>{p.erstellt_am.isoformat() if p.erstellt_am else ''}</td>"
+        "</tr>"
+    )
+
+
+def _sperre_zeile_html(s, *, vertrag_id: str, csrf_token: str) -> str:
+    return f"""
+    <tr>
+      <td>{h(s.grund)}</td><td>{s.gesetzt_am.isoformat() if s.gesetzt_am else ''}</td><td>{h(s.kommentar or '')}</td>
+      <td>
+        <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/sperre/{s.id}/aufheben">
+          {csrf_feld(csrf_token)}
+          <input type="text" name="begruendung" placeholder="Begründung/Beleg (Pflicht)" required>
+          <button type="submit" class="secondary">Aufheben</button>
+        </form>
+      </td>
+    </tr>"""
+
+
+def _index_pruefbedarf_zeile_html(e) -> str:
+    return (
+        "<tr>"
+        f"<td>{h(e.rechtsordnung or '-')}</td><td>{h(e.basis_reihe or '-')}</td>"
+        f"<td>{h(str(e.basis_wert)) if e.basis_wert is not None else '-'}</td><td>{h(e.basis_monat or '-')}</td>"
+        f"<td>{h(e.kommentar or '')}</td><td>{h(e.erstellt_von)}</td>"
+        f"<td>{e.erstellt_am.isoformat() if e.erstellt_am else ''}</td>"
+        "</tr>"
+    )
+
+
+@router.get("/vertrag/{vertrag_id}/pruefung", response_class=HTMLResponse)
+def vertragspruefung_uebersicht(request: Request, vertrag_id: str, session=Depends(_current_session)) -> HTMLResponse:
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Vertragsprüfung", f"Unbekannter Vertrag {vertrag_id}.")
+    if _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Vertragsprüfung", "Objekt ist gesperrt; keine Prüfung möglich.")
+
+    rechtsordnung_optionen = "".join(
+        option(r, r, selected=(r == vertrag.rechtsordnung)) for r in _RECHTSORDNUNGEN_FUER_AUSWAHL
+    )
+    historie = _vertragspruefung_service.liste_pruefungen(vertrag_id)
+    historie_html = "".join(_pruefung_zeile_html(p) for p in historie) or '<tr><td colspan=7 class="muted">Noch keine Prüfung erfasst.</td></tr>'
+
+    aktive_sperren = _stammdaten_repo.aktive_sperren(vertrag_id)
+    sperren_html = "".join(_sperre_zeile_html(s, vertrag_id=vertrag_id, csrf_token=session.csrf_token) for s in aktive_sperren)
+    sperren_html = sperren_html or '<tr><td colspan=4 class="muted">Keine aktiven Sperren.</td></tr>'
+
+    pruefbedarf = _vertragspruefung_service.liste_index_pruefbedarf(vertrag_id)
+    pruefbedarf_html = "".join(_index_pruefbedarf_zeile_html(e) for e in pruefbedarf) or '<tr><td colspan=7 class="muted">Noch kein Prüfbedarf gespeichert.</td></tr>'
+
+    inhalt = f"""
+    <div class="card">
+      <h1>Vertragsprüfung — {h(vertrag_id)}</h1>
+      <p>Aktuelle Rechtsordnung (wirksam): <strong>{h(vertrag.rechtsordnung)}</strong></p>
+    </div>
+
+    <div class="card">
+      <h2>Neue Prüfung erfassen</h2>
+      <p class="muted">Jede Prüfung ist eine neue, unveränderliche Version. Nur Fachstatus GEPRUEFT schreibt
+         die Rechtsordnung tatsächlich auf den Vertrag zurück (Freigabe) - ein ENTWURF bleibt sichtbar,
+         aber wirkungslos. Ohne Quellenbeleg-Referenz wird nichts gespeichert (keine beleglose
+         Klassifizierung).</p>
+      <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/pruefung/anlegen">
+        {csrf_feld(session.csrf_token)}
+        <label>Rechtsprofil (Rechtsordnung)</label>
+        <select name="rechtsordnung" required>{rechtsordnung_optionen}</select>
+        <label>Fachstatus</label>
+        <select name="fachstatus" required>
+          <option value="ENTWURF">ENTWURF (nur speichern, keine Freigabe)</option>
+          <option value="GEPRUEFT">GEPRUEFT (schreibt die Rechtsordnung auf den Vertrag zurück)</option>
+        </select>
+        <label>Quellenbeleg-Referenz (Pflicht)</label>
+        <input type="text" name="quellenbeleg_referenz" placeholder="z. B. Mietvertrag-2024.pdf, S. 3" required>
+        <label>Kommentar</label>
+        <input type="text" name="kommentar">
+        <button type="submit">Speichern</button>
+      </form>
+      <h3>Prüfhistorie</h3>
+      <table>
+        <tr><th>Version</th><th>Rechtsordnung</th><th>Fachstatus</th><th>Quellenbeleg</th><th>Kommentar</th><th>Von</th><th>Am</th></tr>
+        {historie_html}
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Aktive Sperren</h2>
+      <p class="muted">Jede Aufhebung ist einzeln und braucht eine Begründung - kein Sammel-/Automatik-Pfad,
+         auch nicht für RATENPLAN/RECHTSANWALT.</p>
+      <table>
+        <tr><th>Grund</th><th>Gesetzt am</th><th>Kommentar</th><th>Aktion</th></tr>
+        {sperren_html}
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Index-Prüfbedarf (Entwurf, ohne Freigabe)</h2>
+      <p class="muted">Auch unvollständige Indexangaben sind hier speicherbar - alle Felder optional,
+         keine Verbindung zu einer freigebbaren Indexklausel; eine echte Klausel entsteht weiterhin nur
+         über den bestehenden Index-Weg.</p>
+      <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/index-pruefbedarf/anlegen">
+        {csrf_feld(session.csrf_token)}
+        <label>Rechtsordnung (optional)</label>
+        <select name="rechtsordnung"><option value="">-- keine Angabe --</option>{rechtsordnung_optionen}</select>
+        <label>Basisreihe (optional)</label>
+        <input type="text" name="basis_reihe">
+        <label>Basiswert (optional)</label>
+        <input type="text" name="basis_wert">
+        <label>Basismonat (optional, JJJJ-MM)</label>
+        <input type="text" name="basis_monat">
+        <label>Kommentar</label>
+        <input type="text" name="kommentar">
+        <button type="submit">Als Prüfbedarf speichern</button>
+      </form>
+      <table>
+        <tr><th>Rechtsordnung</th><th>Basisreihe</th><th>Basiswert</th><th>Basismonat</th><th>Kommentar</th><th>Von</th><th>Am</th></tr>
+        {pruefbedarf_html}
+      </table>
+    </div>
+    <p><a href="/backoffice/konto/{h(_stammdaten_repo.get_konto_by_vertrag(vertrag_id).id) if _stammdaten_repo.get_konto_by_vertrag(vertrag_id) else ''}">&larr; zurück zum Kontoauszug</a></p>
+    """
+    return _layout(request, session, "Vertragsprüfung", inhalt)
+
+
+@router.post("/vertrag/{vertrag_id}/pruefung/anlegen")
+def vertragspruefung_anlegen(
+    request: Request,
+    vertrag_id: str,
+    rechtsordnung: str = Form(...),
+    fachstatus: str = Form(...),
+    quellenbeleg_referenz: str = Form(...),
+    kommentar: str = Form(""),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Vertragsprüfung", f"Unbekannter Vertrag {vertrag_id}.")
+    try:
+        pruefung = _vertragspruefung_service.pruefung_anlegen(
+            ctx=_ctx(session), vertrag=vertrag, rechtsordnung=rechtsordnung, fachstatus=fachstatus,
+            quellenbeleg_referenz=quellenbeleg_referenz, kommentar=kommentar or None, akteur=session.user_id,
+        )
+        _audit_service.log(
+            entity_typ="vertrag_pruefung", entity_id=f"{vertrag_id}:{pruefung.version}", aktion=fachstatus,
+            akteur=session.user_id,
+            payload={"rechtsordnung": rechtsordnung, "quellenbeleg_referenz": quellenbeleg_referenz, "kommentar": kommentar},
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Vertragsprüfung", str(exc), f"/backoffice/vertrag/{vertrag_id}/pruefung")
+    return RedirectResponse(url=f"/backoffice/vertrag/{vertrag_id}/pruefung", status_code=303)
+
+
+@router.post("/vertrag/{vertrag_id}/sperre/{sperre_id}/aufheben")
+def vertragspruefung_sperre_aufheben(
+    request: Request,
+    vertrag_id: str,
+    sperre_id: int,
+    begruendung: str = Form(...),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Vertragsprüfung", f"Unbekannter Vertrag {vertrag_id}.")
+    try:
+        sperre = _vertragspruefung_service.sperre_aufheben(
+            ctx=_ctx(session), vertrag=vertrag, sperre_id=sperre_id, begruendung=begruendung, akteur=session.user_id,
+        )
+        _audit_service.log(
+            entity_typ="sperre", entity_id=str(sperre_id), aktion="aufgehoben", akteur=session.user_id,
+            payload={"vertrag_id": vertrag_id, "grund": sperre.grund, "begruendung": begruendung},
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Vertragsprüfung", str(exc), f"/backoffice/vertrag/{vertrag_id}/pruefung")
+    return RedirectResponse(url=f"/backoffice/vertrag/{vertrag_id}/pruefung", status_code=303)
+
+
+@router.post("/vertrag/{vertrag_id}/index-pruefbedarf/anlegen")
+def vertragspruefung_index_pruefbedarf_anlegen(
+    request: Request,
+    vertrag_id: str,
+    rechtsordnung: str = Form(""),
+    basis_reihe: str = Form(""),
+    basis_wert: str = Form(""),
+    basis_monat: str = Form(""),
+    kommentar: str = Form(""),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Vertragsprüfung", f"Unbekannter Vertrag {vertrag_id}.")
+    # Basiswert ist ein reiner Indexwert (kein Geldbetrag) - eigene, tolerante
+    # Umwandlung statt der EUR-Betragsvalidierung; leer/ungültig -> None
+    # (bewusst unvollständig speicherbar, kein Fehler).
+    basis_wert_decimal = None
+    if (basis_wert or "").strip():
+        try:
+            basis_wert_decimal = Decimal(basis_wert.strip().replace(",", "."))
+        except InvalidOperation:
+            basis_wert_decimal = None
+    try:
+        _vertragspruefung_service.index_pruefbedarf_speichern(
+            ctx=_ctx(session), vertrag=vertrag, rechtsordnung=rechtsordnung or None,
+            basis_reihe=basis_reihe or None, basis_wert=basis_wert_decimal, basis_monat=basis_monat or None,
+            kommentar=kommentar or None, akteur=session.user_id,
+        )
+        _audit_service.log(
+            entity_typ="index_pruefbedarf", entity_id=vertrag_id, aktion="angelegt", akteur=session.user_id,
+            payload={"rechtsordnung": rechtsordnung, "basis_reihe": basis_reihe, "basis_monat": basis_monat},
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Vertragsprüfung", str(exc), f"/backoffice/vertrag/{vertrag_id}/pruefung")
+    return RedirectResponse(url=f"/backoffice/vertrag/{vertrag_id}/pruefung", status_code=303)

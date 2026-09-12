@@ -454,6 +454,10 @@ class StammdatenRepository:
         with self._session_factory() as owned_session:
             return _lesen(owned_session)
 
+    def get_sperre(self, sperre_id: int) -> SperreTable | None:
+        with self._session_factory() as session:
+            return session.get(SperreTable, sperre_id)
+
     # -- Konto ------------------------------------------------------------
     def get_or_create_konto(self, *, vertrag: VertragTable, session: Session | None = None) -> KontoTable:
         """`session`: siehe `upsert_gesellschaft`."""
