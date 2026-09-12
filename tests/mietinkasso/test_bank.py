@@ -5,6 +5,7 @@ from datetime import date
 import pytest
 
 from mietinkasso.bank.importer import (
+    CamtKontoMismatchError,
     CamtMehrteiligeBuchungError,
     CamtUnvollstaendigError,
     CsvSpaltenMapping,
@@ -39,6 +40,7 @@ CAMT_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
   <BkToCstmrStmt>
     <Stmt>
+      <Acct><Id><IBAN>AT000000000000000000</IBAN></Id></Acct>
       <Ntry>
         <Amt Ccy="EUR">600.00</Amt>
         <CdtDbtInd>CRDT</CdtDbtInd>
@@ -251,6 +253,7 @@ def test_camt053_mehrteilige_ntry_wird_nicht_der_ersten_referenz_zugeordnet(bank
 <Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
   <BkToCstmrStmt>
     <Stmt>
+      <Acct><Id><IBAN>AT000000000000000000</IBAN></Id></Acct>
       <Ntry>
         <Amt Ccy="EUR">1000.00</Amt>
         <CdtDbtInd>CRDT</CdtDbtInd>
@@ -275,7 +278,7 @@ def test_camt053_fehlendes_pflichtfeld_wird_nicht_still_uebersprungen(bank_servi
 
     ohne_buchungsdatum = """<?xml version="1.0" encoding="UTF-8"?>
 <Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
-  <BkToCstmrStmt><Stmt><Ntry>
+  <BkToCstmrStmt><Stmt><Acct><Id><IBAN>AT000000000000000000</IBAN></Id></Acct><Ntry>
     <Amt Ccy="EUR">100.00</Amt>
     <CdtDbtInd>CRDT</CdtDbtInd>
   </Ntry></Stmt></BkToCstmrStmt>
@@ -293,6 +296,93 @@ def test_camt053_fremdwaehrung_wird_blockiert(bank_service, bank_repo, ctx_facto
     fremdwaehrung = CAMT_XML.replace('Ccy="EUR"', 'Ccy="USD"')
     with pytest.raises(FremdwaehrungNichtUnterstuetztError):
         bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=fremdwaehrung.encode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# CAMT.053 Konto-Validierung (Nutzerauftrag vor Paket C): EBICS-C53 kann
+# kundenweite Sammeldateien mit MEHREREN Konten liefern - kein Stmt/Acct
+# darf pauschal dem ausgewählten Bankkonto zugeordnet werden.
+# ---------------------------------------------------------------------------
+
+
+def test_camt053_korrektes_konto_wird_importiert(bank_service, bank_repo, ctx_factory):
+    """Positivfall: ein einzelnes Stmt mit exakt der ausgewählten IBAN wird
+    unverändert importiert (Regressionsschutz gegen eine zu strenge
+    Konto-Validierung)."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=CAMT_XML.encode("utf-8"))
+    assert len(transaktionen) == 1
+
+
+def test_camt053_fremdes_konto_im_zweiten_stmt_lehnt_gesamten_import_ab(bank_service, bank_repo, ctx_factory):
+    """EBICS-C53-Gefahr: eine Datei mit ZWEI Stmt-Blöcken, von denen nur der
+    ERSTE zum ausgewählten Konto gehört, darf NICHT teilweise (nur der
+    passende Stmt) importiert werden - der GESAMTE Import wird abgelehnt,
+    es bleiben NULL Transaktionen zurück."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    gemischte_datei = """<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
+  <BkToCstmrStmt>
+    <Stmt>
+      <Acct><Id><IBAN>AT000000000000000000</IBAN></Id></Acct>
+      <Ntry>
+        <Amt Ccy="EUR">100.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <BookgDt><Dt>2026-04-06</Dt></BookgDt>
+        <NtryDtls><TxDtls><AcctSvcrRef>REF-RICHTIG</AcctSvcrRef></TxDtls></NtryDtls>
+      </Ntry>
+    </Stmt>
+    <Stmt>
+      <Acct><Id><IBAN>AT999999999999999999</IBAN></Id></Acct>
+      <Ntry>
+        <Amt Ccy="EUR">200.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <BookgDt><Dt>2026-04-06</Dt></BookgDt>
+        <NtryDtls><TxDtls><AcctSvcrRef>REF-FREMD</AcctSvcrRef></TxDtls></NtryDtls>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>
+"""
+    with pytest.raises(CamtKontoMismatchError, match="AT999999999999999999"):
+        bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=gemischte_datei.encode("utf-8"))
+    assert bank_repo.list_unzugeordnet("BK-7DI-1") == []  # NICHTS wurde übernommen, auch nicht der passende Stmt
+
+
+def test_camt053_fehlende_iban_lehnt_gesamten_import_ab(bank_service, bank_repo, ctx_factory):
+    """Ein Stmt ohne (oder mit leerer) IBAN im Acct-Block wird abgelehnt -
+    keine pauschale Zuordnung ohne geprüfte Kontokennung, auch wenn die
+    Datei nur ein einziges Konto/Stmt enthält."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    ohne_iban = """<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
+  <BkToCstmrStmt>
+    <Stmt>
+      <Acct><Id><Othr><Id>INTERNE-KONTOKENNUNG</Id></Othr></Id></Acct>
+      <Ntry>
+        <Amt Ccy="EUR">100.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <BookgDt><Dt>2026-04-06</Dt></BookgDt>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>
+"""
+    with pytest.raises(CamtKontoMismatchError, match="IBAN"):
+        bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=ohne_iban.encode("utf-8"))
+    assert bank_repo.list_unzugeordnet("BK-7DI-1") == []
 
 
 def test_zuordnen_manuell_lehnt_betrag_ueber_transaktionshoehe_ab(bank_service, bank_repo, basis_vertrag, ctx_factory):

@@ -109,7 +109,11 @@ class BankImportService:
     ) -> list[BankTransaktionTable]:
         require_gesellschaft_access(ctx, bank_konto.gesellschaft_id)
         require_schreibrecht(ctx)
-        rohdaten = parse_camt053(xml_bytes)
+        # erwartete_iban erzwingt, dass jedes Stmt/Acct in der Datei zum
+        # explizit ausgewählten Bankkonto passt (siehe
+        # CamtKontoMismatchError) - kein fremdes/gemischtes Konto wird
+        # pauschal diesem Bankkonto zugeordnet.
+        rohdaten = parse_camt053(xml_bytes, erwartete_iban=bank_konto.iban)
         return self._importiere_atomar(rohdaten, bank_konto, "CAMT053")
 
     def importiere_csv(

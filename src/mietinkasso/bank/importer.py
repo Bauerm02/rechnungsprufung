@@ -42,6 +42,24 @@ class CamtMehrteiligeBuchungError(Exception):
     sondern zur manuellen Klärung verweigert."""
 
 
+class CamtKontoMismatchError(Exception):
+    """Mindestens ein `Stmt`/`Acct`-Block der CAMT.053-Datei führt keine
+    IBAN oder eine ANDERE IBAN als das explizit für diesen Import
+    ausgewählte Bankkonto. Der GESAMTE Import wird abgelehnt, BEVOR
+    irgendeine Zeile eingelesen wird - kein stilles Herausfiltern
+    fremder Konten, keine pauschale Zuordnung einer gemischten
+    Mehrkonten-Datei auf das ausgewählte Konto.
+
+    Hintergrund: eine künftige EBICS-C53-Anbindung kann kundenweite
+    Sammeldateien mit MEHREREN Konten in einer Antwort liefern (mehrere
+    `Stmt`/`Acct`-Blöcke mit unterschiedlicher IBAN in einer einzigen
+    CAMT.053-Datei) - ohne diese Prüfung könnten Umsätze eines fremden
+    Kontos fälschlich dem hier ausgewählten Mietkonto gutgeschrieben
+    werden. Der aktuelle Ein-Konto-Dateiupload bleibt unverändert;
+    dieser Import lehnt lediglich Dateien ab, die (auch versehentlich)
+    mehr als das ausgewählte Konto enthalten."""
+
+
 @dataclass(frozen=True)
 class RohTransaktion:
     betrag_cent: int
@@ -87,8 +105,64 @@ def _pruefe_waehrung(waehrung: str, kontext: str) -> None:
         )
 
 
-def parse_camt053(xml_bytes: bytes) -> list[RohTransaktion]:
+def _normalisiere_iban(iban: str | None) -> str:
+    return (iban or "").strip().upper().replace(" ", "")
+
+
+def _pruefe_stmt_konten(root: ET.Element, erwartete_iban: str) -> None:
+    """Validiert JEDEN `Stmt`/`Acct`-Block gegen das explizit ausgewählte
+    Bankkonto, BEVOR auch nur eine `Ntry` gelesen wird - siehe
+    `CamtKontoMismatchError`. Ein fehlendes `Stmt`-Element (untypisch für
+    eine echte CAMT.053-Datei) wird ebenfalls abgelehnt statt stillschweigend
+    durchgereicht, damit eine strukturell unerwartete Datei nie ungeprüft
+    Kontenzuordnungen auslöst."""
+
+    erwartete_iban_norm = _normalisiere_iban(erwartete_iban)
+    if not erwartete_iban_norm:
+        raise CamtKontoMismatchError("Kein IBAN für das ausgewählte Bankkonto hinterlegt; Import abgelehnt.")
+
+    stmt_elemente = [el for el in root.iter() if _localname(el.tag) == "Stmt"]
+    if not stmt_elemente:
+        raise CamtKontoMismatchError(
+            "CAMT.053-Datei enthält kein Stmt-Element; Kontozugehörigkeit nicht prüfbar - Import abgelehnt."
+        )
+
+    gefundene_ibans: set[str] = set()
+    for stmt in stmt_elemente:
+        acct = _direct_child(stmt, "Acct")
+        iban = _find_text(acct, "IBAN") if acct is not None else None
+        iban_norm = _normalisiere_iban(iban)
+        if not iban_norm:
+            raise CamtKontoMismatchError(
+                "CAMT.053-Statement ohne (oder mit leerer) IBAN im Acct-Block gefunden; der gesamte Import "
+                "wird abgelehnt - keine pauschale Zuordnung ohne geprüfte Kontokennung."
+            )
+        gefundene_ibans.add(iban_norm)
+
+    fremde_ibans = gefundene_ibans - {erwartete_iban_norm}
+    if fremde_ibans:
+        raise CamtKontoMismatchError(
+            f"CAMT.053-Datei enthält Statement(s) für nicht ausgewählte(s) Konto(en) {sorted(fremde_ibans)} "
+            f"(ausgewähltes Konto: {erwartete_iban_norm}) - der GESAMTE Import wird abgelehnt, auch wenn "
+            "daneben Statements für das richtige Konto enthalten sind (keine gemischte Mehrkonten-Datei wird "
+            "pauschal einem einzelnen Konto zugeordnet)."
+        )
+    if erwartete_iban_norm not in gefundene_ibans:
+        raise CamtKontoMismatchError(
+            f"CAMT.053-Datei enthält kein Statement für das ausgewählte Konto {erwartete_iban_norm}."
+        )
+
+
+def parse_camt053(xml_bytes: bytes, *, erwartete_iban: str) -> list[RohTransaktion]:
+    """`erwartete_iban`: die IBAN des für DIESEN Import explizit
+    ausgewählten Bankkontos - Pflichtparameter (kein Default), damit kein
+    Aufrufer die Kontenprüfung versehentlich auslässt. Siehe
+    `CamtKontoMismatchError`/`_pruefe_stmt_konten`: jede Datei mit einem
+    fehlenden, fremden oder zusätzlichen (gemischten) Konto wird VOR jedem
+    Einlesen einer `Ntry` vollständig abgelehnt."""
+
     root = ET.fromstring(xml_bytes)
+    _pruefe_stmt_konten(root, erwartete_iban)
     ergebnisse: list[RohTransaktion] = []
     for entry in root.iter():
         if _localname(entry.tag) != "Ntry":

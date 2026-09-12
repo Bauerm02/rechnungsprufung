@@ -455,19 +455,46 @@ Server getestet. Konkret offen/einzuhalten:
   - er darf NIEMALS eine gemischte, mehrere Konten enthaltende CAMT-
   Datei pauschal einem einzelnen, vom Operator ausgewählten Mietkonto
   zuordnen (sonst würden Umsätze eines fremden/falschen Kontos
-  fälschlich diesem Bankkonto gutgeschrieben). Konkret geprüft:
-  `bank/importer.py::parse_camt053` sucht `Ntry`-Elemente aktuell über
+  fälschlich diesem Bankkonto gutgeschrieben).
+
+  **Schutzkorrektur ergänzt (Nutzerauftrag, vor Paket C):**
+  `bank/importer.py::parse_camt053` sammelte `Ntry`-Elemente bisher über
   `root.iter()` GLOBAL im gesamten Dokument, OHNE jemals festzuhalten,
   aus welchem `Stmt`/`Acct`/welcher IBAN ein `Ntry` stammt - bei einer
-  mehrere Konten enthaltenden Datei würden alle Umsätze aller Konten
-  ununterscheidbar in eine einzige flache Liste gemischt. Vor einer
-  echten EBICS-C53-Anbindung MUSS der Parser (oder ein vorgeschalteter
-  Adapter) zuerst je `Stmt`/`Acct` gruppieren, dessen IBAN gegen die
-  Allowlist prüfen und nur die zugelassenen Konten überhaupt an den
-  bestehenden Import weiterreichen - diese Aufteilung existiert heute
-  NICHT und ist für reine Einzelkonto-CAMT/CSV-Dateiuploads (aktueller
-  Stand) auch nicht nötig. Diese Session hat KEINE EBICS-Anbindung
-  implementiert (weiterhin nur manueller CAMT/CSV-Dateiupload).
+  mehrere Konten enthaltenden Datei wären alle Umsätze aller Konten
+  ununterscheidbar in eine einzige flache Liste gemischt worden. Jetzt
+  verlangt `parse_camt053` einen Pflichtparameter `erwartete_iban` (die
+  IBAN des für DIESEN Import explizit ausgewählten Bankkontos) und
+  prüft VOR dem Einlesen jeder `Ntry` über `_pruefe_stmt_konten`, dass
+  JEDES `Stmt`/`Acct` in der Datei genau diese IBAN führt - fehlt eine
+  IBAN, gehört sie zu einem anderen Konto, oder enthält die Datei
+  mehrere unterschiedliche Konten (auch wenn eines davon das richtige
+  ist), wird der GESAMTE Import mit `CamtKontoMismatchError` abgelehnt,
+  BEVOR irgendeine Zeile eingelesen oder in die DB geschrieben wird -
+  kein stilles Herausfiltern des fremden Kontos, keine Teilübernahme
+  des passenden Stmt. Gilt für beide Aufrufer (`BankImportService.
+  importiere_camt053` und die reine Vorschau `/backoffice/bank/vorschau`).
+  Regressionstests in `tests/mietinkasso/test_bank.py`:
+  `test_camt053_korrektes_konto_wird_importiert`,
+  `test_camt053_fremdes_konto_im_zweiten_stmt_lehnt_gesamten_import_ab`
+  (zwei Stmt, nur der zweite fremd - trotzdem NULL Transaktionen
+  übrig), `test_camt053_fehlende_iban_lehnt_gesamten_import_ab`.
+
+  **Weiterhin offen (Aufteilung, nicht Ablehnung):** diese Korrektur
+  LEHNT eine gemischte Mehrkonten-Datei vollständig ab - sie TRENNT sie
+  nicht automatisch nach zugelassenen Konten auf. Ein künftiger EBICS-
+  C53-Adapter, der eine kundenweite Sammeldatei mit MEHREREN eigenen,
+  zugelassenen Konten sinnvoll verarbeiten soll (statt sie pauschal
+  abzulehnen, nur weil sie mehr als ein Konto enthält), muss selbst je
+  `Stmt`/`Acct` gruppieren, gegen eine Allowlist zugelassener Konten
+  prüfen und für JEDES zugelassene Konto einen eigenen, isolierten
+  Import-Aufruf mit dessen eigener `erwartete_iban` auslösen - das
+  existiert heute nicht und ist für den aktuellen manuellen
+  Einzelkonto-Dateiupload auch nicht nötig. Diese Session hat KEINE
+  EBICS-Anbindung implementiert (weiterhin nur manueller CAMT/CSV-
+  Dateiupload); CSV-Import und der synthetische Demo-Ablauf bleiben
+  unverändert (die Konto-Validierung betrifft ausschließlich
+  `parse_camt053`).
 - **Mail-/Dokumentversand:** Mahnwesen erzeugt nur eine Outbox
   (Preview/Snapshot), `SEND_ENABLED=false` per Default. Ein realer
   Versandadapter (SMTP/Provider) mit Zustellbestätigung ist nicht

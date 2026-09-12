@@ -43,7 +43,14 @@ from mietinkasso.audit.service import AuditService
 from mietinkasso.auth.service import AuthContext
 from mietinkasso.backoffice.security import LoginRateLimiter, SessionStore, pruefe_passwort
 from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, ist_bekannte_demo_umgebung, option, parse_eur_betrag, seite
-from mietinkasso.bank.importer import CamtMehrteiligeBuchungError, CamtUnvollstaendigError, CsvSpaltenMapping, parse_camt053, parse_csv
+from mietinkasso.bank.importer import (
+    CamtKontoMismatchError,
+    CamtMehrteiligeBuchungError,
+    CamtUnvollstaendigError,
+    CsvSpaltenMapping,
+    parse_camt053,
+    parse_csv,
+)
 from mietinkasso.bank.repository import BankRepository
 from mietinkasso.bank.service import BankImportService
 from mietinkasso.domain.enums import OPTyp, Rolle
@@ -775,9 +782,9 @@ def bank_formular(request: Request, session=Depends(_current_session)) -> HTMLRe
     return _layout(request, session, "Bankdatei-Import", inhalt)
 
 
-def _bank_rohdaten_parsen(*, format_: str, inhalt_bytes: bytes, mapping_felder: dict) -> list:
+def _bank_rohdaten_parsen(*, format_: str, inhalt_bytes: bytes, mapping_felder: dict, bank_konto_iban: str) -> list:
     if format_ == "CAMT":
-        return parse_camt053(inhalt_bytes)
+        return parse_camt053(inhalt_bytes, erwartete_iban=bank_konto_iban)
     mapping = CsvSpaltenMapping(
         betrag=mapping_felder["spalte_betrag"], buchungsdatum=mapping_felder["spalte_datum"],
         referenz=mapping_felder["spalte_referenz"] or None,
@@ -811,8 +818,10 @@ async def bank_vorschau(
         "spalte_eindeutig": spalte_eindeutig, "dezimaltrennzeichen": dezimaltrennzeichen,
     }
     try:
-        rohdaten = _bank_rohdaten_parsen(format_=format, inhalt_bytes=inhalt_bytes, mapping_felder=mapping_felder)
-    except (MietinkassoError, ValueError, CamtUnvollstaendigError, CamtMehrteiligeBuchungError, KeyError) as exc:
+        rohdaten = _bank_rohdaten_parsen(
+            format_=format, inhalt_bytes=inhalt_bytes, mapping_felder=mapping_felder, bank_konto_iban=bank_konto.iban,
+        )
+    except (MietinkassoError, ValueError, CamtUnvollstaendigError, CamtMehrteiligeBuchungError, CamtKontoMismatchError, KeyError) as exc:
         return _fehlerseite(session, "Bankvorschau", f"Datei nicht importierbar: {exc}", "/backoffice/bank")
     if not rohdaten:
         return _fehlerseite(session, "Bankvorschau", "Datei enthält keine Zeilen.", "/backoffice/bank")
@@ -906,7 +915,7 @@ def bank_importieren(
             entity_typ="bank_import", entity_id=bank_konto_id, aktion="importiert", akteur=session.user_id,
             payload={"anzahl": len(transaktionen), "format": format},
         )
-    except (MietinkassoError, ValueError, CamtUnvollstaendigError, CamtMehrteiligeBuchungError) as exc:
+    except (MietinkassoError, ValueError, CamtUnvollstaendigError, CamtMehrteiligeBuchungError, CamtKontoMismatchError) as exc:
         return _fehlerseite(session, "Bankimport", f"Import abgebrochen, NICHTS wurde übernommen: {exc}", "/backoffice/bank")
     inhalt = (
         flash_ok(f"{len(transaktionen)} Bankbewegung(en) importiert (noch nicht zugeordnet).")
