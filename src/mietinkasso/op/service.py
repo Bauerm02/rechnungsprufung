@@ -27,6 +27,25 @@ _POSITIVE_TYPEN = {OPTyp.EROEFFNUNG, OPTyp.SOLL, OPTyp.RUECKLASTSCHRIFT}
 _NEGATIVE_TYPEN = {OPTyp.GUTSCHRIFT, OPTyp.ZAHLUNG}
 
 
+def _pruefe_betrag_positiv(typ: OPTyp, betrag_cent: int) -> None:
+    """SOLL/GUTSCHRIFT/ZAHLUNG/RUECKLASTSCHRIFT leiten ihr Vorzeichen aus
+    `typ` ab (siehe `_effect_cent` oben) - `betrag_cent` muss deshalb
+    IMMER positiv übergeben werden, auch für GUTSCHRIFT/ZAHLUNG (die den
+    Saldo MINDERN, aber als positiver Betrag gebucht werden). Ein
+    negativer Eingabewert würde sonst ein zweites Mal negiert und z. B.
+    eine GUTSCHRIFT versehentlich zu einer Schulderhöhung machen statt
+    zu mindern - das wird hier blockiert statt stillschweigend verbucht.
+    Nur `EROEFFNUNG` (Gesamtsaldo, eine Nettosumme ohne eigenes
+    typ-Vorzeichen - ein Guthaben ist ein legitimer negativer Saldo) und
+    `KORREKTUR` (Vorzeichen wird vom Aufrufer bewusst gesetzt, siehe
+    `storniere_und_korrigiere`) sind ausgenommen."""
+
+    if typ in (OPTyp.EROEFFNUNG, OPTyp.KORREKTUR):
+        return
+    if betrag_cent <= 0:
+        raise ValueError(f"betrag_cent muss für {typ.value} positiv sein (erhalten: {betrag_cent}).")
+
+
 def compute_content_hash(fields: dict) -> str:
     canonical = json.dumps(fields, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -164,6 +183,7 @@ class OPService:
 
         require_gesellschaft_access(ctx, konto.gesellschaft_id)
         require_schreibrecht(ctx)
+        _pruefe_betrag_positiv(typ, betrag_cent)
         self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto, session=session)
         self._pruefe_und_setze_eroeffnungsmodus(konto, "EINZEL_OP", stichtag, session=session)
         content_hash = compute_content_hash(
@@ -267,6 +287,7 @@ class OPService:
 
         require_gesellschaft_access(ctx, konto.gesellschaft_id)
         require_schreibrecht(ctx)
+        _pruefe_betrag_positiv(typ, betrag_cent)
         self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto, session=session)
         if not (grund or "").strip():
             raise ValueError("Eröffnungskorrektur ohne 'grund' ist nicht zulässig.")
@@ -333,6 +354,7 @@ class OPService:
 
         require_gesellschaft_access(ctx, konto.gesellschaft_id)
         require_schreibrecht(ctx)
+        _pruefe_betrag_positiv(typ, betrag_cent)
         self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto, session=session)
         if typ in (OPTyp.SOLL, OPTyp.GUTSCHRIFT):
             self.pruefe_kein_altjournal_in_gesamtsaldo(konto, belegdatum)

@@ -112,7 +112,22 @@ Session-Cookie wird nur über HTTPS übertragen — Caddy muss also
 tatsächlich TLS terminieren (Standardverhalten bei einer öffentlichen
 Domain mit automatischem HTTPS), sonst meldet sich der Browser nie
 erfolgreich an (siehe `env.production.example`, Kommentar bei
-`MIETINKASSO_BACKOFFICE_COOKIE_SECURE`).
+`MIETINKASSO_BACKOFFICE_COOKIE_SECURE`). Mit sicherem Cookie trägt es
+zusätzlich das `__Host-`-Präfix (verlangt genau das: Secure, Path=/,
+keine Domain — hier bereits erfüllt), was der Browser zusätzlich
+gegen ein untergeschobenes Cookie von einer Subdomain absichert.
+
+**Startvalidierung:** Bei `MIETINKASSO_ENVIRONMENT=production` prüft
+der Prozess beim Start selbst (`infrastructure/config.py::pruefe_produktionskonfiguration`,
+aufgerufen in `api/app.py`), dass `SEND_ENABLED=false`, ein
+Passwort-Hash konfiguriert und Cookies sicher sind — fehlt eines davon,
+startet der Prozess gar nicht erst (lauter Fehler statt eines still
+laufenden, unsicher konfigurierten Prozesses).
+
+Der Login begrenzt zusätzlich wiederholte Fehlversuche (kurzzeitige,
+globale Sperre — bewusst nicht IP-basiert, siehe
+`backoffice/security.py::LoginRateLimiter`) und prüft den
+Origin-/Referer-Header gegen Login-CSRF.
 
 ## 6. Health-Check ohne Kundendaten
 

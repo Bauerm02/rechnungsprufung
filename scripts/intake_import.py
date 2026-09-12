@@ -32,11 +32,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from sqlalchemy.orm import Session, sessionmaker  # noqa: E402
+
 from mietinkasso.domain.exceptions import MietinkassoError  # noqa: E402
-from mietinkasso.infrastructure.db.session import build_session_factory  # noqa: E402
+from mietinkasso.infrastructure.db.base import Base  # noqa: E402
+from mietinkasso.infrastructure.db.session import build_engine, build_session_factory  # noqa: E402
 from mietinkasso.intake.apply import wende_an  # noqa: E402
 from mietinkasso.intake.parser import CSV_BUENDEL_DATEINAMEN, IntakeFormatFehlerError, parse_csv_buendel, parse_json_paket  # noqa: E402
 from mietinkasso.intake.planner import IntakePlan, erstelle_plan  # noqa: E402
+from mietinkasso.intake.schema import paket_hash  # noqa: E402
 from mietinkasso.op.repository import OPRepository  # noqa: E402
 from mietinkasso.op.service import OPService  # noqa: E402
 from mietinkasso.stammdaten.repository import StammdatenRepository  # noqa: E402
@@ -60,6 +64,51 @@ def _pruefe_database_url(database_url: str) -> None:
             "Verlangt ist eine ausdrücklich außerhalb des Repos liegende, private Datenbank - "
             "keine Vermischung mit dem synthetischen Demo-Seed."
         )
+
+
+def _sqlite_datei_pfad(database_url: str) -> Path | None:
+    """`None` für Nicht-SQLite (z. B. PostgreSQL) oder `:memory:` - für
+    diese gibt es keine "Datei, die (nicht) existiert"-Unterscheidung."""
+
+    if not database_url.startswith("sqlite:///"):
+        return None
+    pfad_text = database_url.removeprefix("sqlite:///")
+    if pfad_text in ("", ":memory:") or database_url.endswith(":memory:"):
+        return None
+    return Path(pfad_text)
+
+
+def _lesende_session_factory(database_url: str) -> sessionmaker[Session]:
+    """Für `plan` UND für die strukturelle Vorprüfung in `apply` (siehe
+    `main`) - beide dürfen NIE ein neues Dateisystemobjekt anlegen oder
+    das Schema einer bestehenden Ziel-DB verändern.
+
+    - SQLite-Datei existiert bereits: eine ECHTE Read-Only-Verbindung
+      (SQLite-URI `mode=ro`) - ein versehentlicher Schreibversuch schlägt
+      auf DB-Ebene fehl, statt sich nur auf "es wird schon niemand
+      committen" zu verlassen. Fehlt darin das Schema, ist das ein
+      klarer Fehler (die DB muss erst initialisiert werden, z. B. durch
+      einen ersten erfolgreichen `apply`-Lauf) statt einer
+      stillschweigenden Schemaerzeugung.
+    - SQLite-Datei existiert NICHT: strukturell gegen eine synthetische,
+      rein prozessinterne In-Memory-Leerdatenbank planen (identisches
+      Schema, aber nichts auf der Platte) - inhaltlich identisch zu
+      "alles ist NEU", ohne die reale Datei anzulegen.
+    - Nicht-SQLite (z. B. PostgreSQL): nur verbinden, nie Schema
+      erzeugen - eine Serverdatenbank, bei der "Datei existiert nicht"
+      keine sinnvolle Prüfung ist.
+    """
+
+    pfad = _sqlite_datei_pfad(database_url)
+    if pfad is None:
+        return build_session_factory(database_url)
+    if pfad.exists():
+        readonly_url = f"sqlite:///file:{pfad}?mode=ro&uri=true"
+        engine = build_engine(readonly_url)
+        return sessionmaker(bind=engine, future=True, expire_on_commit=False, class_=Session)
+    engine = build_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine, future=True, expire_on_commit=False, class_=Session)
 
 
 def _lade_paket(args: argparse.Namespace):
@@ -134,17 +183,44 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Datei nicht lesbar/ungültig: {exc}", file=sys.stderr)
         return 2
 
+    if args.befehl == "plan":
+        # Rein lesend: NIE Schema erzeugen/ändern, NIE ein neues
+        # Dateisystemobjekt anlegen (siehe _lesende_session_factory).
+        plan = erstelle_plan(paket, session_factory=_lesende_session_factory(args.database_url))
+        _drucke_plan(plan)
+        return 0 if plan.anwendbar else 1
+
+    # apply — Reihenfolge ist bewusst: ZUERST der (reine Rechen-)Hash-
+    # Vergleich, DANN eine rein lesende strukturelle Vorprüfung, und ERST
+    # DANACH wird überhaupt ein Schema an der echten Ziel-DB angelegt.
+    # Ein falscher Hash oder ein nicht anwendbares Paket führt so zu
+    # GAR KEINER Schemaänderung, nicht nur zu keiner Datenschreibung.
+    aktueller_hash = paket_hash(paket)
+    if aktueller_hash != args.bestaetige_hash:
+        print(
+            f"Bestätigter Hash ({args.bestaetige_hash}) stimmt nicht mit dem aktuellen Paketinhalt "
+            f"({aktueller_hash}) überein - bitte erneut planen. Es wurde NICHTS an der Ziel-Datenbank "
+            "verändert (auch kein Schema angelegt).",
+            file=sys.stderr,
+        )
+        return 1
+
+    vorab_plan = erstelle_plan(paket, session_factory=_lesende_session_factory(args.database_url))
+    if not vorab_plan.anwendbar:
+        print(
+            "Paket ist nicht anwendbar (Konflikte/Sperren) - NICHTS wurde eingespielt, "
+            "auch kein Schema an der Ziel-Datenbank angelegt:",
+            file=sys.stderr,
+        )
+        for b in (*vorab_plan.konflikte, *vorab_plan.gesperrt):
+            print(f"  {b.entitaet} {b.id}: {b.grund}", file=sys.stderr)
+        return 1
+
     create_all_tables_fuer(args.database_url)
     session_factory = build_session_factory(args.database_url)
     stammdaten_repo = StammdatenRepository(session_factory)
     op_service = OPService(OPRepository(session_factory), stammdaten_repo)
 
-    if args.befehl == "plan":
-        plan = erstelle_plan(paket, session_factory=session_factory)
-        _drucke_plan(plan)
-        return 0 if plan.anwendbar else 1
-
-    # apply
     try:
         ergebnis = wende_an(
             paket, bestaetigter_hash=args.bestaetige_hash, stammdaten_repo=stammdaten_repo,

@@ -61,6 +61,7 @@ def backoffice_client():
     stammdaten.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso (Test)")
     stammdaten.upsert_objekt(id="107", gesellschaft_id="7DI", bezeichnung="Sieben Dörfer (Test)", ausgeschlossen=True)
     stammdaten.upsert_einheit(id="601-TOP1", objekt_id="601", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_einheit(id="601-TOP2", objekt_id="601", bezeichnung="Top 2 (Keller)", nutzungsstatus="LEERSTAND")
     stammdaten.upsert_einheit(id="107-TOP1", objekt_id="107", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
     stammdaten.upsert_debitor(id="DEB-1", name="Test Mieterin", email="test@example.at")
     stammdaten.upsert_vertrag(
@@ -90,10 +91,20 @@ def backoffice_client():
     get_settings.cache_clear()
 
 
-def _login(client) -> None:
-    antwort = client.post(
-        "/backoffice/login", data={"username": "markus", "password": "test-passwort-123"}, follow_redirects=False,
+def _login_versuch(client, *, username: str = "markus", password: str = "test-passwort-123", origin: str | None = "http://testserver"):
+    # Der Login prüft seit der Härtung (Login-CSRF-Schutz, siehe
+    # backoffice/app.py::_pruefe_login_origin) den Origin/Referer-Header
+    # gegen den eigenen Host - der TestClient sendet ihn nicht automatisch,
+    # ein echter Browser-Formular-POST praktisch immer.
+    headers = {"Origin": origin} if origin is not None else {}
+    return client.post(
+        "/backoffice/login", data={"username": username, "password": password}, follow_redirects=False,
+        headers=headers,
     )
+
+
+def _login(client) -> None:
+    antwort = _login_versuch(client)
     assert antwort.status_code == 303
     assert antwort.headers["location"] == "/backoffice/"
 
@@ -116,13 +127,23 @@ def test_ohne_login_wird_auf_login_umgeleitet(backoffice_client):
 
 def test_login_mit_falschem_passwort_scheitert(backoffice_client):
     client, *_ = backoffice_client
-    antwort = client.post(
-        "/backoffice/login", data={"username": "markus", "password": "falsch"}, follow_redirects=False,
-    )
+    antwort = _login_versuch(client, password="falsch")
     assert antwort.status_code == 303
     assert antwort.headers["location"].startswith("/backoffice/login")
     dashboard = client.get("/backoffice/", follow_redirects=False)
     assert dashboard.status_code == 303  # weiterhin nicht angemeldet
+
+
+def test_login_von_fremdem_origin_wird_abgelehnt(backoffice_client):
+    """Login-CSRF-Schutz: ein Origin-Header, der nicht zum eigenen Host
+    passt, wird abgelehnt - unabhängig davon, ob das Passwort stimmt."""
+
+    client, *_ = backoffice_client
+    antwort = _login_versuch(client, origin="https://angreifer.example")
+    assert antwort.status_code == 403
+
+    antwort_ohne_origin = _login_versuch(client, origin=None)
+    assert antwort_ohne_origin.status_code == 403
 
 
 def test_login_und_dashboard_zeigt_objekte(backoffice_client):
@@ -132,6 +153,23 @@ def test_login_und_dashboard_zeigt_objekte(backoffice_client):
     assert dashboard.status_code == 200
     assert "Am Corso" in dashboard.text
     assert konto_id in dashboard.text
+
+
+def test_dashboard_zeigt_einheiten_ohne_vertrag(backoffice_client):
+    """Codex-Rückprüfung: das Dashboard iterierte bisher nur
+    `list_vertraege_fuer_objekt` - eine Einheit ohne aktiven Vertrag
+    (Leerstand/KZV/Selfstorage/Eigennutzung) war trotz Import unsichtbar.
+    "Leerstand" ist ein erfasster Nutzungsstatus, kein aus dem Fehlen
+    eines Vertrags erratener Zustand - beides muss sichtbar bleiben,
+    ohne einen Dummy-Mieter/Konto dafür anzulegen."""
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+    assert dashboard.status_code == 200
+    assert "Einheiten ohne aktiven Vertrag" in dashboard.text
+    assert "601-TOP2" in dashboard.text
+    assert "LEERSTAND" in dashboard.text
 
 
 def test_hauptnavigation_verlinkt_alle_kontextlosen_arbeitsablaeufe(backoffice_client):
@@ -586,3 +624,30 @@ def _konto_by_id(konto_id: str):
     from mietinkasso.stammdaten.repository import StammdatenRepository
 
     return StammdatenRepository(build_session_factory(get_settings().database_url)).get_konto(konto_id)
+
+
+def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
+    """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
+    unten) - der Login-Ratelimiter ist ein globaler, prozessweiter
+    Zustand (siehe backoffice/app.py::_login_rate_limiter), kein
+    IP-basierter (Codex-Vorgabe: keine Proxy-Header blind glauben, EIN
+    Operator genügt eine globale Sperre). Jede erfolgreiche Anmeldung an
+    anderer Stelle in diesem Modul setzt den Zähler zurück
+    (`erfolgreich_angemeldet`) - deshalb würde ein früherer Testlauf
+    diesen Test nicht stören, aber DIESER Test würde nachfolgende
+    `_login(client)`-Aufrufe sperren, wenn er nicht zuletzt liefe."""
+
+    client, *_ = backoffice_client
+    letzte_antwort = None
+    for _ in range(5):
+        letzte_antwort = _login_versuch(client, password="falsch")
+        assert letzte_antwort.status_code == 303
+    assert "login" in letzte_antwort.headers["location"]
+
+    # Sechster Versuch, diesmal mit dem RICHTIGEN Passwort - bleibt
+    # trotzdem gesperrt, bis die Sperrzeit abgelaufen ist.
+    gesperrt = _login_versuch(client, password="test-passwort-123")
+    assert gesperrt.status_code == 303
+    assert "login" in gesperrt.headers["location"]
+    folge_seite = client.get(gesperrt.headers["location"])
+    assert "Zu viele Fehlversuche" in folge_seite.text

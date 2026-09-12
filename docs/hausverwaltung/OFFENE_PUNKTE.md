@@ -49,6 +49,51 @@ keine stillschweigend übersprungenen Punkte.
   — nur eine NEUE Version anzulegen und freizugeben (bestehendes
   Verhalten von `MahnPolicyRepository`, hier nur sichtbar gemacht).
 
+### Codex-Rückprüfung Commit 1d72611 — behoben
+
+- **`scripts/intake_import.py plan` war NICHT rein lesend:**
+  `create_all_tables_fuer` lief bisher VOR jeder Prüfung und legte bei
+  Bedarf eine neue Datei/ein neues Schema an, auch bei `plan` und bei
+  einem `apply` mit falschem Hash/ungültigem Paket. Behoben:
+  `plan` öffnet eine bestehende SQLite-Datei jetzt über eine ECHTE
+  Read-Only-Verbindung (`mode=ro`) und plant gegen eine noch nicht
+  vorhandene Datei strukturell gegen eine synthetische, rein
+  prozessinterne In-Memory-Leerdatenbank (kein neues
+  Dateisystemobjekt). `apply` prüft ZUERST den Hash (reine Berechnung,
+  keine DB-Verbindung) und führt DANACH dieselbe rein lesende
+  strukturelle Vorprüfung durch - ein Schema an der echten Ziel-DB
+  entsteht erst, wenn beides erfolgreich war. Regressionstests:
+  `tests/mietinkasso/test_intake_cli.py`.
+- **Dashboard zeigte Einheiten ohne Vertrag nicht:** das Dashboard
+  iterierte nur `list_vertraege_fuer_objekt` - eine Einheit mit
+  Nutzungsstatus LEERSTAND/KURZZEITVERMIETUNG/SELFSTORAGE/EIGENNUTZUNG
+  ohne (noch) aktiven Vertrag blieb unsichtbar, obwohl sie importiert
+  war. Behoben durch eine zusätzliche, rein lesende Bestandsliste
+  "Einheiten ohne aktiven Vertrag" je Objekt (kein Dummy-Mieter/-Konto
+  wird dafür angelegt).
+- **Login ohne Fehlversuchsbegrenzung/Origin-Prüfung:** ergänzt um eine
+  GLOBALE (bewusst nicht IP-basierte - siehe
+  `backoffice/security.py::LoginRateLimiter`-Docstring, kein Vertrauen
+  in Proxy-Header) kurzzeitige Sperre nach 5 Fehlversuchen sowie eine
+  Origin-/Referer-Prüfung gegen Login-CSRF
+  (`backoffice/app.py::_pruefe_login_origin`, da vor der Anmeldung noch
+  kein sitzungsgebundenes CSRF-Token existiert). Das Session-Cookie
+  trägt bei `MIETINKASSO_BACKOFFICE_COOKIE_SECURE=true` zusätzlich das
+  `__Host-`-Präfix. Neu: `infrastructure/config.py::pruefe_produktionskonfiguration`
+  lässt den Prozess in `MIETINKASSO_ENVIRONMENT=production` gar nicht
+  erst starten, wenn `SEND_ENABLED`/Passwort-Hash/Cookie-Sicherheit
+  nicht dem erwarteten Produktionsstand entsprechen (aufgerufen in
+  `api/app.py` beim Import).
+- **IMPORT_VERTRAG.md, explizite Betragssemantik:** dokumentiert und
+  TECHNISCH erzwungen, dass `betrag_cent` bei `nachbuchungen[]`/
+  `EINZEL_OP`-Eröffnungen/`eroeffnungskorrekturen[]` immer POSITIV
+  einzugeben ist (Vorzeichen kommt aus `typ`, siehe
+  `op/service.py::_pruefe_betrag_positiv` - greift auch außerhalb des
+  Intakes, z. B. bei der manuellen Backoffice-Nachbuchung), während
+  `GESAMTSALDO` weiterhin ein Guthaben (negativ) sein darf. Außerdem
+  richtiggestellt: `paket_hash` ist ein Hash über den GEPARSTEN,
+  semantischen Inhalt, keine Datei-Prüfsumme über rohe Bytes.
+
 ## Deployment-Paket (HV-20260912-ECHTBETRIEB, Punkt 3) — Vorlage, keine Produktivfreigabe
 
 `docs/hausverwaltung/DEPLOYMENT_HETZNER.md` +

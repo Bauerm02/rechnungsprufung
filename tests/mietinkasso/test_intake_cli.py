@@ -72,7 +72,10 @@ def test_cli_plan_und_apply_end_to_end(tmp_path, capsys):
     assert "Erfolgreich eingespielt" in ausgabe
 
 
-def test_cli_apply_mit_falschem_hash_schreibt_nichts(tmp_path):
+def test_cli_apply_mit_falschem_hash_erzeugt_keine_datei_kein_schema(tmp_path):
+    """Codex-Rückprüfung: ein falscher Hash darf NICHT einmal ein Schema
+    anlegen - vorher wird gar keine Verbindung zur Ziel-DB aufgebaut."""
+
     datei = tmp_path / "paket.json"
     datei.write_text(json.dumps(_beispielpaket()), encoding="utf-8")
     db_pfad = tmp_path / "produktiv.db"
@@ -82,20 +85,98 @@ def test_cli_apply_mit_falschem_hash_schreibt_nichts(tmp_path):
         "--bestaetige-hash", "falscher-hash", "--akteur", "cli-test",
     ])
     assert exit_code == 1
-    assert not db_pfad.exists() or db_pfad.stat().st_size == 0 or _keine_gesellschaft(db_pfad)
+    assert not db_pfad.exists()  # kein neues Dateisystemobjekt, keine Schemaänderung
 
 
-def _keine_gesellschaft(db_pfad: Path) -> bool:
-    import sqlite3
+def test_cli_apply_mit_ungueltigem_paket_erzeugt_keine_datei_kein_schema(tmp_path):
+    """Ein strukturell nicht anwendbares Paket (hier: Objekt 107) darf
+    ebenfalls nicht einmal ein Schema an der Ziel-DB anlegen - die
+    Vorprüfung läuft rein lesend/synthetisch, bevor `create_all_tables_fuer`
+    überhaupt aufgerufen wird."""
 
-    con = sqlite3.connect(db_pfad)
-    try:
-        cur = con.execute("SELECT COUNT(*) FROM gesellschaften")
-        return cur.fetchone()[0] == 0
-    except sqlite3.OperationalError:
-        return True
-    finally:
-        con.close()
+    paket = _beispielpaket()
+    paket["objekte"] = [{"id": "107", "gesellschaft_id": "JLB", "bezeichnung": "Sieben Dörfer"}]
+    datei = tmp_path / "paket.json"
+    datei.write_text(json.dumps(paket), encoding="utf-8")
+    db_pfad = tmp_path / "produktiv.db"
+
+    plan_exit = _MODUL.main(["plan", "--datei", str(datei), "--database-url", f"sqlite:///{db_pfad}"])
+    assert plan_exit == 1
+    assert not db_pfad.exists()
+
+    # Korrekten Hash direkt über die geparste Datei berechnen (identisch
+    # zu dem, was `main()` intern tut), um apply() mit einem PASSENDEN
+    # Hash aufzurufen und so gezielt den "ungültiges Paket trotz
+    # richtigem Hash"-Fall zu prüfen.
+    from mietinkasso.intake.parser import parse_json_paket
+
+    aktueller_hash = _MODUL.paket_hash(parse_json_paket(datei.read_text(encoding="utf-8")))
+
+    apply_exit = _MODUL.main([
+        "apply", "--datei", str(datei), "--database-url", f"sqlite:///{db_pfad}",
+        "--bestaetige-hash", aktueller_hash, "--akteur", "cli-test",
+    ])
+    assert apply_exit == 1
+    assert not db_pfad.exists()  # weiterhin kein Schema angelegt
+
+
+def test_cli_plan_gegen_nicht_vorhandene_db_legt_keine_datei_an(tmp_path, capsys):
+    """`plan` gegen eine noch nicht existierende Ziel-DB plant strukturell
+    gegen eine synthetische In-Memory-Leerdatenbank - alle Zeilen NEU,
+    aber es entsteht KEIN neues Dateisystemobjekt."""
+
+    datei = tmp_path / "paket.json"
+    datei.write_text(json.dumps(_beispielpaket()), encoding="utf-8")
+    db_pfad = tmp_path / "noch-nicht-vorhanden.db"
+    assert not db_pfad.exists()
+
+    exit_code = _MODUL.main(["plan", "--datei", str(datei), "--database-url", f"sqlite:///{db_pfad}"])
+    ausgabe = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Gesamtstatus: ANWENDBAR" in ausgabe
+    assert not db_pfad.exists()
+
+
+def test_cli_plan_gegen_bestehende_db_ist_wirklich_read_only(tmp_path, capsys):
+    """Nach einem erfolgreichen `apply` darf ein erneuter `plan`-Lauf
+    gegen dieselbe (jetzt existierende) Datei weder Inhalt noch Schema
+    verändern - echte Read-Only-Verbindung (SQLite `mode=ro`), nicht nur
+    "es wird schon niemand committen"."""
+
+    datei = tmp_path / "paket.json"
+    datei.write_text(json.dumps(_beispielpaket()), encoding="utf-8")
+    db_pfad = tmp_path / "produktiv.db"
+
+    plan1 = _MODUL.main(["plan", "--datei", str(datei), "--database-url", f"sqlite:///{db_pfad}"])
+    assert plan1 == 0
+    ausgabe = capsys.readouterr().out
+    paket_hash_wert = next(z for z in ausgabe.splitlines() if z.startswith("Paket-Hash:")).split(": ", 1)[1]
+    apply_exit = _MODUL.main([
+        "apply", "--datei", str(datei), "--database-url", f"sqlite:///{db_pfad}",
+        "--bestaetige-hash", paket_hash_wert, "--akteur", "cli-test",
+    ])
+    assert apply_exit == 0
+    capsys.readouterr()
+
+    vor_groesse = db_pfad.stat().st_size
+    vor_mtime = db_pfad.stat().st_mtime_ns
+
+    plan2 = _MODUL.main(["plan", "--datei", str(datei), "--database-url", f"sqlite:///{db_pfad}"])
+    ausgabe2 = capsys.readouterr().out
+    assert plan2 == 0
+    assert "Neu: 0" in ausgabe2  # alles bereits identisch vorhanden -> UNVERAENDERT
+
+    assert db_pfad.stat().st_size == vor_groesse
+    assert db_pfad.stat().st_mtime_ns == vor_mtime  # Datei wurde nicht angefasst
+
+    # Die Read-Only-Verbindung lehnt einen Schreibversuch auch direkt ab.
+    with pytest.raises(Exception):
+        session_factory = _MODUL._lesende_session_factory(f"sqlite:///{db_pfad}")
+        with session_factory() as session:
+            from mietinkasso.infrastructure.db.tables import GesellschaftTable
+
+            session.add(GesellschaftTable(id="SOLLTE-SCHEITERN", name="x"))
+            session.commit()
 
 
 def test_cli_lehnt_repo_internen_datenbankpfad_mit_exitcode_2_ab(tmp_path, capsys):

@@ -379,6 +379,15 @@ def _pruefe_eroeffnung(
     if z.modus == "EINZEL_OP" and z.typ not in {t.value for t in OPTyp}:
         befunde.append(PruefBefund(entitaet, z.import_id, "KONFLIKT", f"Eröffnung '{z.import_id}': ungültiger typ '{z.typ}'."))
         return
+    if z.modus == "EINZEL_OP" and z.betrag_cent <= 0:
+        # EINZEL_OP-Zeilen leiten ihr Vorzeichen aus `typ` ab (siehe
+        # op/service.py::_effect_cent); ein negativer Eingabewert würde
+        # dort ein zweites Mal negiert und z. B. eine GUTSCHRIFT/ZAHLUNG
+        # versehentlich zu einer Schulderhöhung machen statt zu mindern.
+        # NUR die GESAMTSALDO-Eröffnung (Nettosumme, kein typ-Vorzeichen)
+        # darf negativ (ein Guthaben) sein.
+        befunde.append(PruefBefund(entitaet, z.import_id, "KONFLIKT", f"Eröffnung '{z.import_id}': betrag_cent muss bei EINZEL_OP positiv sein ({z.betrag_cent})."))
+        return
 
     if z.modus == "GESAMTSALDO":
         bereits_im_paket = ctx.gesamtsaldo_im_paket.get(z.vertrag_id)
@@ -422,6 +431,15 @@ def _pruefe_nachbuchung(
     if z.typ not in _GUELTIGE_NACHBUCHUNGS_TYPEN:
         befunde.append(PruefBefund(entitaet, z.import_id, "KONFLIKT", f"Nachbuchung '{z.import_id}': ungültiger typ '{z.typ}'."))
         return
+    if z.betrag_cent <= 0:
+        # SOLL/GUTSCHRIFT/ZAHLUNG/RUECKLASTSCHRIFT leiten ihr Vorzeichen
+        # aus `typ` ab (op/service.py::_effect_cent) - `betrag_cent` ist
+        # IMMER positiv einzugeben, auch bei GUTSCHRIFT/ZAHLUNG (die den
+        # Saldo MINDERN, aber als positiver Betrag gebucht werden). Ein
+        # negativer Wert würde sonst ein zweites Mal negiert und z. B.
+        # eine GUTSCHRIFT versehentlich zur Schulderhöhung machen.
+        befunde.append(PruefBefund(entitaet, z.import_id, "KONFLIKT", f"Nachbuchung '{z.import_id}': betrag_cent muss positiv sein ({z.betrag_cent})."))
+        return
 
     if z.typ in (OPTyp.SOLL.value, OPTyp.GUTSCHRIFT.value):
         gesamtsaldo_stichtag = None
@@ -464,6 +482,11 @@ def _pruefe_eroeffnungskorrektur(
         return
     if z.typ not in _GUELTIGE_NACHBUCHUNGS_TYPEN:
         befunde.append(PruefBefund(entitaet, z.import_id, "KONFLIKT", f"Eröffnungskorrektur '{z.import_id}': ungültiger typ '{z.typ}'."))
+        return
+    if z.betrag_cent <= 0:
+        # Dieselbe typ-abgeleitete Vorzeichenlogik wie bei Nachbuchungen
+        # (siehe dort) - betrag_cent ist IMMER positiv einzugeben.
+        befunde.append(PruefBefund(entitaet, z.import_id, "KONFLIKT", f"Eröffnungskorrektur '{z.import_id}': betrag_cent muss positiv sein ({z.betrag_cent})."))
         return
     modus = ctx.gesamtsaldo_im_paket.get(z.vertrag_id) is not None and "GESAMTSALDO" or bestehender_modus(z.vertrag_id)
     if modus != "GESAMTSALDO":

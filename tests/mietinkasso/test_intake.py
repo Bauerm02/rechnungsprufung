@@ -594,3 +594,66 @@ def test_eroeffnungskorrektur_replay_ist_wirkungslos(session_factory, stammdaten
     konto = stammdaten_repo.get_konto_by_vertrag("V-1")
     assert op_service.berechne_saldo(konto.id).saldo_cent == 150000 - 20000
     assert len(op_service.list_alle_positionen(konto.id)) == 2  # Eröffnung + genau EINE Korrektur
+
+
+# ---------------------------------------------------------------------------
+# Codex-Rückprüfung: explizite Betragssemantik - ZAHLUNG/GUTSCHRIFT/SOLL/
+# RUECKLASTSCHRIFT sind IMMER positiv einzugeben (Vorzeichen kommt aus dem
+# typ); nur der GESAMTSALDO (Eröffnung) darf ein Guthaben (negativ) sein.
+# ---------------------------------------------------------------------------
+
+
+def test_negativer_betrag_bei_nachbuchung_gutschrift_ist_konflikt(session_factory):
+    """Ein negativer Betrag würde bei GUTSCHRIFT/ZAHLUNG ein zweites Mal
+    negiert und die Schuld versehentlich ERHÖHEN statt zu mindern -
+    das muss geblockt werden, nicht stillschweigend verbucht."""
+
+    paket = _paket_mit_gesamtsaldo(nachbuchungen=[
+        {"import_id": "N1", "vertrag_id": "V-1", "typ": "GUTSCHRIFT", "betrag_cent": -5000,
+         "belegdatum": "2026-09-01", "buchungsdatum": "2026-09-01"},
+    ])
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    befund = next(b for b in plan.befunde if b.entitaet == "Nachbuchung")
+    assert befund.status == "KONFLIKT"
+    assert "positiv" in befund.grund
+
+
+def test_negativer_betrag_bei_einzel_op_eroeffnung_ist_konflikt(session_factory):
+    paket = _paket(eroeffnungen=[
+        {"import_id": "E1", "vertrag_id": "V-1", "modus": "EINZEL_OP", "typ": "SOLL", "betrag_cent": -1000,
+         "stichtag": "2026-01-01", "quelle_bestaetigt": True},
+    ])
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    befund = next(b for b in plan.befunde if b.entitaet == "Eröffnung")
+    assert befund.status == "KONFLIKT"
+    assert "positiv" in befund.grund
+
+
+def test_negativer_betrag_bei_eroeffnungskorrektur_ist_konflikt(session_factory):
+    paket = _paket_mit_gesamtsaldo(eroeffnungskorrekturen=[
+        {"import_id": "KORR-1", "vertrag_id": "V-1", "typ": "ZAHLUNG", "betrag_cent": -20000,
+         "original_belegdatum": "2026-08-20", "grund": "Test", "quelle_referenz": "Q1"},
+    ])
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    befund = next(b for b in plan.befunde if b.entitaet == "Eröffnungskorrektur")
+    assert befund.status == "KONFLIKT"
+    assert "positiv" in befund.grund
+
+
+def test_negativer_gesamtsaldo_guthaben_bleibt_erlaubt(session_factory, stammdaten_repo, op_service):
+    """Gegenprobe: der GESAMTSALDO selbst (eine Nettosumme, kein
+    typ-Vorzeichen) darf weiterhin negativ sein (ein Guthaben)."""
+
+    paket = _paket(eroeffnungen=[
+        {"import_id": "E1", "vertrag_id": "V-1", "modus": "GESAMTSALDO", "betrag_cent": -15000,
+         "stichtag": "2026-08-31", "quelle_bestaetigt": True},
+    ])
+    plan = _plan(paket, session_factory)
+    assert plan.anwendbar
+    ergebnis = _apply(paket, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    assert ergebnis.anzahl_eroeffnungen == 1
+    konto = stammdaten_repo.get_konto_by_vertrag("V-1")
+    assert op_service.berechne_saldo(konto.id).saldo_cent == -15000

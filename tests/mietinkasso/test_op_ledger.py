@@ -215,6 +215,40 @@ def test_eroeffnungskorrektur_verlangt_grund_und_quelle_referenz(op_service, bas
         )
 
 
+def test_negativer_betrag_wird_bei_typisierten_buchungen_ueberall_geblockt(op_service, basis_vertrag, ctx_factory):
+    """Codex-Rückprüfung: SOLL/GUTSCHRIFT/ZAHLUNG/RUECKLASTSCHRIFT leiten
+    ihr Vorzeichen aus `typ` ab - ein negativer `betrag_cent` würde sonst
+    ein zweites Mal negiert (z. B. eine GUTSCHRIFT erhöht dann die Schuld
+    statt sie zu mindern). Nur `eroeffnen_gesamtsaldo` (Nettosumme, siehe
+    `test_guthaben_eroeffnung_...` oben) darf negativ (Guthaben) sein."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    with pytest.raises(ValueError, match="positiv"):
+        op_service.buchen(
+            ctx=ctx, konto=konto, typ=OPTyp.GUTSCHRIFT, betrag_cent=-5_000,
+            belegdatum=date(2026, 1, 15), buchungsdatum=date(2026, 1, 15), faelligkeit=None,
+            beleg_referenz="sollte scheitern",
+        )
+    with pytest.raises(ValueError, match="positiv"):
+        op_service.eroeffnen_einzel_op(
+            ctx=ctx, konto=konto, stichtag=date(2026, 1, 1), import_id="ERO-NEG", typ=OPTyp.SOLL,
+            betrag_cent=-1_000, belegdatum=date(2026, 1, 1), faelligkeit=None, beleg_referenz="sollte scheitern",
+            akteur="test",
+        )
+    op_service.eroeffnen_gesamtsaldo(
+        ctx=ctx, konto=konto, betrag_cent=150_000, stichtag=date(2026, 8, 31), import_id="ERO-1", akteur="test"
+    )
+    with pytest.raises(ValueError, match="positiv"):
+        op_service.eroeffnungskorrektur_buchen(
+            ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=-20_000,
+            original_belegdatum=date(2026, 8, 20), uebernahmetag=date(2026, 9, 12),
+            grund="Test", quelle_referenz="Q1", import_id="KORR-NEG",
+        )
+    # Nichts davon wurde gebucht.
+    assert len(op_service.list_alle_positionen(konto.id)) == 1  # nur die Gesamtsaldo-Eröffnung
+
+
 def test_eroeffnungskorrektur_replay_ist_wirkungslos_geaenderter_inhalt_ist_konflikt(op_service, basis_vertrag, ctx_factory):
     _, konto = basis_vertrag
     ctx = ctx_factory("7DI")

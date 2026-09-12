@@ -26,7 +26,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 
 from mietinkasso.backoffice.app import router as backoffice_router
-from mietinkasso.infrastructure.config import get_settings
+from mietinkasso.infrastructure.config import get_settings, pruefe_produktionskonfiguration
 from mietinkasso.infrastructure.db.session import build_session_factory
 from mietinkasso.mahnwesen.repository import MahnFallRepository
 from mietinkasso.op.repository import OPRepository
@@ -37,6 +37,9 @@ app = FastAPI(title="Mietinkasso API", version="1")
 app.include_router(backoffice_router)
 
 _settings = get_settings()
+# Sofortiger, lauter Startfehler statt eines still laufenden Prozesses mit
+# unsicherer Konfiguration - siehe infrastructure/config.py.
+pruefe_produktionskonfiguration(_settings)
 _session_factory = build_session_factory(_settings.database_url)
 _stammdaten_repo = StammdatenRepository(_session_factory)
 _op_service = OPService(OPRepository(_session_factory), _stammdaten_repo)

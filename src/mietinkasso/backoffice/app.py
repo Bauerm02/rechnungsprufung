@@ -34,13 +34,14 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from html import escape as h
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Cookie, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from mietinkasso.audit.service import AuditService
 from mietinkasso.auth.service import AuthContext
-from mietinkasso.backoffice.security import SessionStore, pruefe_passwort
+from mietinkasso.backoffice.security import LoginRateLimiter, SessionStore, pruefe_passwort
 from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, option, parse_eur_betrag, seite
 from mietinkasso.bank.importer import CamtMehrteiligeBuchungError, CamtUnvollstaendigError, CsvSpaltenMapping, parse_camt053, parse_csv
 from mietinkasso.bank.repository import BankRepository
@@ -79,8 +80,18 @@ _index_service = IndexService(_index_repo, _stammdaten_repo)
 _audit_service = AuditService(_session_factory)
 
 _sessions = SessionStore(ttl_sekunden=_settings.backoffice_session_ttl_minuten * 60)
+# 5 Fehlversuche innerhalb von 5 Minuten -> 5 Minuten GLOBALE Sperre (siehe
+# LoginRateLimiter-Docstring: kein Vertrauen in Proxy-Header, ein Operator).
+_login_rate_limiter = LoginRateLimiter(max_versuche=5, fenster_sekunden=300, sperre_sekunden=300)
 
-_COOKIE_NAME = "mietinkasso_biz_session"
+# `__Host-`-Präfix nur zulässig/sinnvoll mit Secure-Attribut (siehe unten
+# `secure=_settings.backoffice_cookie_secure`), ohne Domain-Attribut (wird
+# hier nie gesetzt) und mit Path=/ (Default von `Response.set_cookie`) -
+# alle drei Bedingungen sind bereits erfüllt, sobald Cookies sicher sind.
+# Das Präfix lässt den Browser das Cookie zusätzlich ablehnen, falls es
+# jemals versucht würde, es unsicher (HTTP) oder mit einer abweichenden
+# Domain zu setzen.
+_COOKIE_NAME = "__Host-mietinkasso_biz_session" if _settings.backoffice_cookie_secure else "mietinkasso_biz_session"
 
 
 def _require_enabled() -> None:
@@ -96,12 +107,30 @@ def _redirect_to_login() -> HTTPException:
     return HTTPException(status_code=303, headers={"Location": "/backoffice/login"})
 
 
-def _current_session(mietinkasso_biz_session: str | None = Cookie(default=None)):
+def _current_session(session_cookie: str | None = Cookie(default=None, alias=_COOKIE_NAME)):
     _require_enabled()
-    session = _sessions.holen(mietinkasso_biz_session)
+    session = _sessions.holen(session_cookie)
     if session is None:
         raise _redirect_to_login()
     return session
+
+
+def _pruefe_login_origin(request: Request) -> None:
+    """Der Login-POST hat (bewusst) noch KEIN sitzungsgebundenes
+    CSRF-Token - das entsteht erst NACH erfolgreicher Anmeldung
+    (`SessionStore.erstellen`). Die Standardverteidigung gegen
+    Login-CSRF (ein Angreifer verleitet den Browser des Opfers, sich in
+    eine vom Angreifer kontrollierte Sitzung einzuloggen) ist eine
+    Origin-Prüfung: der `Origin`-Header (ersatzweise `Referer`) muss zum
+    eigenen `Host`-Header dieser Anfrage passen. Fehlen beide, wird die
+    Anfrage ABGELEHNT statt stillschweigend durchgelassen - ein echter
+    Browser sendet bei einem Formular-POST praktisch immer mindestens
+    einen der beiden."""
+
+    eigener_host = request.headers.get("host")
+    kandidat = request.headers.get("origin") or request.headers.get("referer")
+    if not eigener_host or not kandidat or urlparse(kandidat).netloc != eigener_host:
+        raise HTTPException(status_code=403, detail="Anfrage von unerwartetem Origin abgelehnt.")
 
 
 def _ctx(session) -> AuthContext:
@@ -162,11 +191,19 @@ def login_formular(request: Request, fehler: str | None = None) -> HTMLResponse:
 
 
 @router.post("/login")
-def login_absenden(username: str = Form(...), password: str = Form(...)) -> RedirectResponse:
+def login_absenden(request: Request, username: str = Form(...), password: str = Form(...)) -> RedirectResponse:
     _require_enabled()
+    _pruefe_login_origin(request)
+    if _login_rate_limiter.gesperrt():
+        return RedirectResponse(
+            url="/backoffice/login?fehler=Zu+viele+Fehlversuche.+Bitte+in+einigen+Minuten+erneut+versuchen.",
+            status_code=303,
+        )
     gueltig = username == _settings.backoffice_user and pruefe_passwort(password, _settings.backoffice_password_hash)
     if not gueltig:
+        _login_rate_limiter.fehlversuch_melden()
         return RedirectResponse(url="/backoffice/login?fehler=Benutzername+oder+Passwort+falsch.", status_code=303)
+    _login_rate_limiter.erfolgreich_angemeldet()
     session_id, _csrf = _sessions.erstellen(username)
     response = RedirectResponse(url="/backoffice/", status_code=303)
     response.set_cookie(
@@ -177,11 +214,11 @@ def login_absenden(username: str = Form(...), password: str = Form(...)) -> Redi
 
 
 @router.post("/logout")
-def logout(csrf_token: str = Form(...), mietinkasso_biz_session: str | None = Cookie(default=None)) -> RedirectResponse:
-    session = _sessions.holen(mietinkasso_biz_session)
+def logout(csrf_token: str = Form(...), session_cookie: str | None = Cookie(default=None, alias=_COOKIE_NAME)) -> RedirectResponse:
+    session = _sessions.holen(session_cookie)
     if session is not None:
         _verify_csrf(session, csrf_token)
-        _sessions.loeschen(mietinkasso_biz_session)
+        _sessions.loeschen(session_cookie)
     response = RedirectResponse(url="/backoffice/login", status_code=303)
     response.delete_cookie(_COOKIE_NAME)
     return response
@@ -253,13 +290,36 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
                     f"<td>{' '.join(status_tags)}</td>"
                     "</tr>"
                 )
+            einheiten_ohne_vertrag = [
+                einheit
+                for einheit in _stammdaten_repo.list_einheiten_fuer_objekt(objekt_id)
+                if einheit.id not in {v.einheit_id for v in vertraege}
+            ]
+            bestand_zeilen = "".join(
+                f"<tr><td>{h(einheit.id)}</td><td>{h(einheit.bezeichnung)}</td><td>{h(einheit.nutzungsstatus)}</td></tr>"
+                for einheit in einheiten_ohne_vertrag
+            )
+            bestand_tabelle = ""
+            if einheiten_ohne_vertrag:
+                bestand_tabelle = f"""
+                <h2>Einheiten ohne aktiven Vertrag — {h(objekt.bezeichnung)} ({h(objekt.id)})</h2>
+                <p class="muted">Nutzungsstatus wird eingespielt/gepflegt, unabhängig davon, ob eine
+                   Mietforderung besteht (z. B. Leerstand, Kurzzeitvermietung, Selfstorage,
+                   Eigennutzung) - "Leerstand" bedeutet hier den erfassten Status, nicht das
+                   Fehlen eines Vertrags per Namens-/Nullsaldo-Vermutung.</p>
+                <table>
+                  <tr><th>Einheit</th><th>Bezeichnung</th><th>Nutzungsstatus</th></tr>
+                  {bestand_zeilen}
+                </table>"""
+
             tabelle = banner + f"""
             <h2>Mietkontenübersicht — {h(objekt.bezeichnung)} ({h(objekt.id)})</h2>
             <table>
               <tr><th>Vertrag</th><th>Einheit</th><th>Nutzungsstatus</th><th>Debitor</th><th>Konto</th>
                   <th>Saldo</th><th>fälliger unstrittiger Rest</th><th>Hinweise</th></tr>
               {''.join(zeilen) if zeilen else '<tr><td colspan=8 class="muted">Keine Verträge.</td></tr>'}
-            </table>"""
+            </table>
+            {bestand_tabelle}"""
 
     return _layout(request, session, "Dashboard", auswahl_form + tabelle)
 

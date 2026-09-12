@@ -21,9 +21,18 @@ von diesem Intake nicht betroffen.
 - **Zwei getrennte Schritte:** `plan` (rein lesend, keine DB-Schreibung)
   und `apply` (schreibt, genau EINE DB-Transaktion für die GESAMTE
   Datei). `apply` verlangt den `paket_hash` aus dem `plan`-Lauf als
-  Bestätigung — ändert sich die Datei zwischen `plan` und `apply` auch
-  nur um ein Byte, ändert sich der Hash, und `apply` verweigert die
-  Ausführung ("bindet sich an identischen Inhalt").
+  Bestätigung. **Wichtig, `paket_hash` ist SEMANTISCH, keine
+  Datei-Prüfsumme:** er wird über das bereits geparste `IntakePaket`
+  (alle Felder aller Zeilen, kanonisch als JSON serialisiert) gebildet,
+  NICHT über die rohen Bytes der Eingabedatei. Eine rein kosmetische
+  Änderung an der Quelldatei, die am geparsten Inhalt nichts ändert
+  (z. B. andere Einrückung/Zeilenumbrüche in der JSON-Datei, eine
+  andere Spaltenreihenfolge im CSV-Bündel, führende/nachgestellte
+  Leerzeichen in einem Feld), ändert den Hash NICHT — `apply` würde in
+  diesem Fall denselben Hash akzeptieren. Ändert sich dagegen IRGENDEIN
+  geparster Feldwert (auch nur einer einzigen Zeile), ändert sich der
+  Hash, und `apply` verweigert die Ausführung ("bindet sich an
+  identischen semantischen Inhalt", nicht an identische Datei-Bytes).
 - **Ein Fehler => gesamter Lauf unverändert:** `apply` öffnet eine
   einzige DB-Session/Transaktion für alle Zeilen aller Entitätstypen.
   Schlägt irgendeine Zeile fehl (unbekannte Referenz, Konflikt,
@@ -79,6 +88,29 @@ IDENTISCH geplant/geprüft.
 
 Alle Beträge sind Integer-Cent. Alle Daten sind `YYYY-MM-DD`. Alle
 Enum-Werte sind exakt wie in `domain/enums.py` (Großschreibung).
+
+**Explizite Betragssemantik (Codex-Rückprüfung, klargestellt):**
+
+- **`betrag_cent` ist IMMER positiv einzugeben** für `nachbuchungen[]`
+  (`SOLL`/`GUTSCHRIFT`/`ZAHLUNG`/`RUECKLASTSCHRIFT`), für
+  `eroeffnungen[]` mit `modus: "EINZEL_OP"` und für
+  `eroeffnungskorrekturen[]` — das Vorzeichen (mindernd bei
+  `GUTSCHRIFT`/`ZAHLUNG`, erhöhend bei `SOLL`/`RUECKLASTSCHRIFT`) wird
+  IMMER aus `typ` abgeleitet (`op/service.py::_effect_cent`), niemals
+  aus dem Vorzeichen des Eingabewerts. Ein negativer Wert wird technisch
+  blockiert (Plan zeigt KONFLIKT) statt ihn ein zweites Mal zu negieren
+  und z. B. eine `GUTSCHRIFT` versehentlich zur Schulderhöhung zu
+  machen.
+- **Ausnahme: `eroeffnungen[]` mit `modus: "GESAMTSALDO"` darf negativ
+  sein** — das ist eine Nettosumme (kein `typ`-Vorzeichen), ein
+  negativer Wert ist ein legitimes Guthaben zum Eröffnungsstichtag.
+- **`komponenten[].betrag_cent` ist BRUTTO** — exakt der Betrag, der bei
+  Sollstellung gebucht wird (siehe `domain/money.py::zerlege_brutto_cent`).
+  `ust_satz_promille` dient AUSSCHLIESSLICH dem Netto/USt-Ausweis am
+  Beleg und verändert NIE den gebuchten Gesamtbetrag. Zulässige Werte:
+  `0` (0 %), `10000` (10 %), `20000` (20 %) — jeder andere Wert wird
+  abgelehnt (`UStSatzUngueltigError`), nicht stillschweigend gerundet
+  oder interpretiert.
 
 ### `gesellschaften[]`
 | Feld | Typ | Pflicht | Hinweis |
@@ -343,7 +375,10 @@ python scripts/intake_import.py apply \
   Zeile ohne bereits bestätigte `GESAMTSALDO`-Eröffnung desselben
   Vertrags, eine `sperren[]`-Zeile mit ungültigem `grund` (kein
   `Sperrgrund`-Enumwert), eine `komponenten[]`-Zeile zu einem
-  ausgeschlossenen Objekt.
+  ausgeschlossenen Objekt, ein nicht-positiver `betrag_cent` bei
+  `nachbuchungen[]`/`eroeffnungskorrekturen[]`/`EINZEL_OP`-Eröffnungen
+  (siehe "Explizite Betragssemantik" oben — nur `GESAMTSALDO` darf
+  negativ/ein Guthaben sein).
 - **Sichtbare Hinweise (blockieren NICHT, weil das bestehende System sie
   bereits sicher behandelt):** fehlende `faelligkeit` (Position bleibt
   sichtbar, wird nie automatisch gemahnt), fehlende Debitor-`email`

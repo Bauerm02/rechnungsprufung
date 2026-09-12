@@ -97,6 +97,47 @@ class SessionStore:
         return bool(token) and hmac.compare_digest(session.csrf_token, token)
 
 
+class LoginRateLimiter:
+    """Kurzzeitige, GLOBALE Sperre nach zu vielen Fehlversuchen - bewusst
+    NICHT pro Client-IP: eine IP-basierte Begrenzung müsste entweder
+    Proxy-Headern wie `X-Forwarded-For` vertrauen (vom Client
+    fälschbar, wenn der vorgeschaltete Reverse-Proxy sie nicht
+    zuverlässig überschreibt) oder eine verlässliche Kenntnis der
+    Proxy-Topologie voraussetzen, die dieses Modul nicht hat. Für den
+    Ein-Operator-Pilotbetrieb ist eine einzige globale Sperre nach
+    wiederholten Fehlversuchen ausreichend und braucht kein Vertrauen in
+    Client-Header. Rein prozessintern (wie `SessionStore`), überlebt
+    keinen Neustart."""
+
+    def __init__(self, *, max_versuche: int, fenster_sekunden: float, sperre_sekunden: float):
+        self._max_versuche = max_versuche
+        self._fenster_sekunden = fenster_sekunden
+        self._sperre_sekunden = sperre_sekunden
+        self._fehlversuche: list[float] = []
+        self._gesperrt_bis: float | None = None
+
+    def gesperrt(self) -> bool:
+        jetzt = time.monotonic()
+        if self._gesperrt_bis is not None:
+            if jetzt < self._gesperrt_bis:
+                return True
+            self._gesperrt_bis = None
+            self._fehlversuche.clear()
+        return False
+
+    def fehlversuch_melden(self) -> None:
+        jetzt = time.monotonic()
+        self._fehlversuche = [t for t in self._fehlversuche if jetzt - t <= self._fenster_sekunden]
+        self._fehlversuche.append(jetzt)
+        if len(self._fehlversuche) >= self._max_versuche:
+            self._gesperrt_bis = jetzt + self._sperre_sekunden
+            self._fehlversuche.clear()
+
+    def erfolgreich_angemeldet(self) -> None:
+        self._fehlversuche.clear()
+        self._gesperrt_bis = None
+
+
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         print("Verwendung: python -m mietinkasso.backoffice.security <passwort>")
