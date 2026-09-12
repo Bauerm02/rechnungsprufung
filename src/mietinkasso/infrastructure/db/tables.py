@@ -173,6 +173,41 @@ class IndexPruefbedarfTable(Base):
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class MieWegVorschauTable(Base):
+    """Versionierte, unveränderliche MieWeG-2026-Berechnungsvorschau
+    (Auftrag 12.09., Paket C) - AUSDRÜCKLICH nur eine Vorschau, nie eine
+    Freigabe/Buchung: löst keine Vorschreibung/Mahnung/keinen Versand
+    aus und schreibt nichts auf `VertragTable`/`VertragsKomponenteTable`/
+    `OPPositionTable` zurück (siehe `mieweg_vorschau/service.py`).
+
+    Bewusst zwei JSON-Textspalten statt eines breiten Spaltensatzes
+    (additiv, kompakt): `eingaben_json` hält ALLE erfassten Eingaben
+    (Rechtsprofil, VPI-Jahresdurchschnitte samt Quelle/Datum,
+    Vertragsspur-Eingaben, referenzierte indexierbare Komponenten,
+    Zustellnachweis-Referenz) unveränderlich fest; `ergebnis_json` die
+    vollständige, nachvollziehbare Jahresschritt-für-Jahresschritt-
+    Herleitung samt offener Nachweise. Die wenigen typisierten Spalten
+    sind nur für Sortierung/Anzeige gedacht, nicht als alleinige
+    Quelle der Wahrheit."""
+
+    __tablename__ = "mieweg_vorschauen"
+    __table_args__ = (UniqueConstraint("vertrag_id", "version", name="uq_mieweg_vorschau_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    rechtsordnung: Mapped[str] = mapped_column(String(48))
+    ist_wohnungsrechner_fall: Mapped[bool] = mapped_column(Boolean)
+    ziel_bewertungsjahr: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    vollstaendig: Mapped[bool] = mapped_column(Boolean, default=False)
+    massgeblicher_hoechstbetrag_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fruehester_termin: Mapped[date | None] = mapped_column(Date, nullable=True)
+    eingaben_json: Mapped[str] = mapped_column(Text)
+    ergebnis_json: Mapped[str] = mapped_column(Text)
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class KontoTable(Base):
     """One Mietkonto per Vertrag. Deliberately its own ID space."""
 

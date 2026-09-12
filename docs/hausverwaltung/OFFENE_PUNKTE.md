@@ -202,6 +202,142 @@ jeweiligen Fixes gegengetestet (der zugehörige Regressionstest schlägt
 ohne den Fix nachweislich fehl), um zu bestätigen, dass die Tests die
 Regression tatsächlich erkennen und nicht nur zufällig grün sind.
 
+## Paket C — MieWeG-2026-Berechnungsvorschau (Nutzerauftrag 12.09., Anschluss an Paket B)
+
+Neues, vollständig additives Modul `src/mietinkasso/mieweg_vorschau/`
+(eigene Tabelle `mieweg_vorschauen`, keine Änderung an
+`VertragTable`/`VertragsKomponenteTable`/`OPPositionTable`/
+`IndexKlauselTable`) - eine ausdrücklich als BERECHNUNGSVORSCHAU
+gekennzeichnete, deterministische Modellierung der MieWeG-2026-
+Wertsicherungsregeln, KEIN Freigabe-/Buchungsmechanismus:
+
+- Löst keine Vorschreibung, keine Sollstellung, keine Mahnung und
+  keinen Mailversand aus.
+- Ruft zur Laufzeit KEIN KI-Modell auf - reine `Decimal`-Arithmetik
+  (`mieweg_vorschau/berechnung.py`).
+- Verwendet AUSDRÜCKLICH NICHT das bestehende
+  `index/service.py::EINFACHER_SCHWELLENVERGLEICH`-Profil (dessen
+  eigene Sperre gegen andere Rechtsprofile bleibt unverändert gültig -
+  siehe "Index-Rechtsprofile" unten) - ein eigenständiges, neues Modell
+  für genau diesen Auftrag.
+
+### Quellenlage (Codex-Hinweis für die fachliche Abnahme)
+
+Die drei vom Nutzer genannten Primärquellen (RIS Bundesgesetzblatt
+NOR40274266/NOR40274269, Parlament-Erläuterungen) waren in dieser
+Sitzung über die Netzwerk-Egress-Policy blockiert (`ris.bka.gv.at`,
+`parlament.gv.at` sowie mehrere Kanzlei-Sekundärquellen nicht
+erreichbar). Die implementierten Regeln stützen sich auf die vom
+Nutzer wörtlich übermittelte Spezifikation, gegengeprüft über
+Web-Suche (Kanzlei-/WKO-Zusammenfassungen zum 5. MILG/MieWeG 2026,
+u. a. zu den Referenzjahr-Übergangsgrenzen 2025/2026 und zur
+Mitteilungsfrist nach § 16 Abs 9 MRG) - **keine direkte Prüfung gegen
+den amtlichen Gesetzestext durch diese Session**. Vor Produktiv-
+Verwendung MUSS Codex (mit Zugriff auf die Primärquellen) die
+implementierten Formeln in `berechnung.py` gegen den tatsächlichen
+Gesetzestext verifizieren, insbesondere:
+
+- Die exakte Formulierung/Randfälle der Referenzjahr-Übergangsgrenzen
+  (2025: max. 1 %, 2026: max. 2 %) und der Jahresübergang zur
+  allgemeinen 3%-Regel ab 2028.
+- Die Reihenfolge Dämpfung-vor-Anteiligkeit und die genaue Definition
+  von "volle Monate nach Abschlussmonat" für Randmonate.
+- Die Altvertrags-Übergangsregel (Bezugsmonat statt Abschlussdatum,
+  fixe erste Modellbewertung April 2026, "Annualaverage als bisherige
+  Basis → Dezember").
+
+### Zwei Rechenspuren - bewusste Vereinfachung der Vertragsspur
+
+Die GESETZLICHE Höchstgrenze wird vollständig nach der in
+`berechnung.py::berechne_gesetzliche_hoechstgrenze` implementierten
+Formel berechnet (VPI-Jahresdurchschnitt-Differenz, allgemeine
+3%-Dämpfung symmetrisch auch bei Deflation, MRG-Vollanwendungs-
+Übergangsdeckel 2025/2026, Erstjahresanteiligkeit, mehrjährige
+Historie ohne Doppelanrechnung, Rundung halber-Cent-ab/mehr-auf).
+
+Die VERTRAGLICH zulässige Änderung wird bewusst NICHT aus den
+VPI-Daten hergeleitet - individuelle Vertragsklauseln variieren zu
+stark, um sie generisch nachzubilden, ohne die konkrete Klausel zu
+erraten (dieselbe Zurückhaltung wie bei der Rechtsordnungs-
+Klassifizierung in `vertragspruefung/service.py`). Stattdessen ist die
+Vertragsspur ein vom Operator manuell geprüfter, mit Pflicht-
+Quellenbeleg belegter Betrag samt optionalem vertraglichen
+frühestmöglichen Termin. Der maßgebliche Höchstbetrag ist das MINIMUM
+beider Spuren; fehlt eine der beiden Spuren (unvollständige VPI-
+Historie ODER noch nicht erfasste Vertragsspur), bleibt der maßgebliche
+Betrag ausdrücklich `None`/Prüfbedarf - es wird NIE nur eine Seite
+verwendet ("fehlende Belege müssen Prüfbedarf ergeben", wörtliche
+Marschroute). Der frühestmögliche Gesamttermin ist das MAXIMUM aus
+gesetzlichem und vertraglichem Termin (eine vertraglich später
+ausgelöste Schwelle wirkt nie vor dem Vertragstermin; eine spätere
+gesetzliche Grenze allein löst nie automatisch eine Erhöhung aus - hier
+strukturell dadurch abgesichert, dass diese Route NIE etwas bucht,
+sondern ausschließlich einen Vorschauwert anzeigt).
+
+**Weiterhin offen:** eine generische "Vertragsklausel-Interpretation"
+aus Freitext oder Strukturdaten ist NICHT gebaut und explizit nicht
+Teil dieses Pakets - die Vertragsspur bleibt manuelle Fachprüfung.
+
+### § 16 Abs 9 MRG / Zustellnachweis - nie eine ausführbare Fälligkeit
+
+Die Berechnung liefert einen gesetzlich zulässigen Bewertungstermin
+(1. April des Ziel-Bewertungsjahres) - das ist AUSDRÜCKLICH NICHT die
+erste tatsächliche Fälligkeit. Nach § 16 Abs 9 MRG muss eine Mitteilung
+NACH Wirksamkeit erfolgen und dem Mieter mindestens 14 Tage vor dem
+Zinstermin zugehen. Da dieses Modul keine Mitteilung versendet und
+keinen Zustellnachweis technisch prüfen kann, wird ein fehlender
+`zustellnachweis_referenz`-Eintrag IMMER als offener Nachweis
+ausgewiesen ("Ergebnis bleibt reine Vorschau, keine ausführbare
+Fälligkeit") - unabhängig davon, ob die restliche Berechnung
+vollständig ist.
+
+### Komponenten - nur explizit vertragsindexierte Beträge
+
+Der Basisbetrag kann optional auf konkrete `VertragsKomponenteTable`-
+Zeilen des Vertrags referenzieren (`basis_komponenten_ids`); der
+Service lehnt jede referenzierte Komponente ab, die nicht
+`indexierbar=True` trägt (z. B. Garage, Betriebskosten-Vorauszahlung -
+diese werden NIE automatisch indexiert, unabhängig vom eingegebenen
+Basisbetrag). Der Basisbetrag selbst bleibt ein manuell eingegebener
+EUR-Wert (kein automatisches Aufsummieren der Komponenten) - die
+Komponentenreferenz dient ausschließlich der Nachvollziehbarkeit
+("welche Beträge wurden hier einbezogen"), nicht der Berechnung selbst.
+
+### Bedienung
+
+`/backoffice/vertrag/{id}/mieweg-vorschau`: pro Vertrag zugängliche,
+versionierte, unveränderliche Vorschauhistorie (Quellen/Datum/Beträge/
+Bezugsmonate/Rechtsprofil/Komponenten/Vertragsschwelle sichtbar je
+Version); fehlende Werte werden konkret benannt (offene Nachweise als
+Klartext-Liste je Version), nie stillschweigend übersprungen.
+CSRF-Schutz, Objekt-107-Ausschluss und echte Gesellschafts-Scope-
+Prüfung wie bei jeder anderen Fachaktion in diesem Modul. VPI-
+Jahresdurchschnittswerte werden über ein einfaches Zeilenformat
+(`JAHR;WERT;QUELLE;DATUM`) statt einer dynamischen JS-Eingabetabelle
+erfasst (bewusst klein gehalten) - eine fehlerhafte Zeile wird als
+Fehler gemeldet, nie still ignoriert.
+
+### Tests
+
+- `tests/mietinkasso/test_mieweg_berechnung.py` (28 Tests): unabhängige
+  Grenzfalltests je Regel - Dämpfung (inkl. Deflation, keine
+  unbegründete Kappung auf 0), Rundung (exakte Decimal-Randtests bei
+  genau halbem Cent), Erstjahresanteiligkeit (Dezember=0/12, Juni=6/12,
+  Dämpfung-vor-Anteiligkeit), Übergangsdeckel 2025/2026 (inkl. "gilt
+  nicht ohne Zinsbeschränkungsflag", "gilt nicht für Deflation", "gilt
+  nicht mehr ab 2027"), mehrjährige Altvertrags-Historie ohne
+  Doppelanrechnung, unabhängige Kumulierung auf der ursprünglichen
+  Basis, fehlende VPI-Werte (kein erfundener Wert), ungültige Eingaben.
+- `tests/mietinkasso/test_mieweg_vorschau_service.py` (18 Tests):
+  Rechtsprofil-Gating (UNGEKLAERT/Gewerbe/WGG/frei/Deutschland kein
+  Wohnungsrechner-Fall, Zinsbeschränkung nur bei Vollanwendung),
+  Kombination der zwei Spuren (Minimum, Maximum-Termin), Quellenbeleg-
+  Pflicht der Vertragsspur, Komponenten-Validierung, Objektausschluss,
+  Altvertrag-Mindestjahr, Versionierung.
+- `tests/mietinkasso/test_backoffice.py` (+3 HTTP-Integrationstests):
+  beide Spuren kombiniert, fehlende VPI-Historie ergibt Prüfbedarf,
+  UNGEKLAERT wird nicht hineingeraten.
+
 ## Echtbetrieb-Intake (HV-20260912-ECHTBETRIEB, 12.09.2026)
 
 - **Quellenmapping bleibt vollständig bei Codex:** `src/mietinkasso/intake/`

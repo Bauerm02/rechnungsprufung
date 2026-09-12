@@ -909,6 +909,113 @@ def test_bankseite_zeigt_keine_automatik_schaltflaeche_ausserhalb_der_demo_umgeb
     assert "Automatische Zuordnung zurückgestellt" in seite_ohne_demo.text
 
 
+def test_mieweg_vorschau_beide_spuren_ergeben_massgeblichen_betrag(backoffice_client):
+    """Paket C: End-to-End über HTTP - Rechtsprofil, gesetzliche VPI-Spur
+    und Vertragsspur erfassen, maßgeblicher Höchstbetrag ist das Minimum
+    beider Spuren, nichts davon bucht/verschickt irgendetwas."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-MIEWEG", objekt_id="601", bezeichnung="Top MieWeG", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-MIEWEG", einheit_id="601-TOP-MIEWEG", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+
+    seite = client.get("/backoffice/vertrag/V-601-MIEWEG/mieweg-vorschau")
+    assert seite.status_code == 200
+    assert "Berechnungsvorschau" in seite.text
+
+    erstellt = client.post(
+        "/backoffice/vertrag/V-601-MIEWEG/mieweg-vorschau/erstellen",
+        data={
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "bezugsjahr": "2024", "bezugsmonat": "6",
+            "ziel_bewertungsjahr": "2025", "basis_betrag": "1.000,00",
+            "vpi_zeilen": "2023;100.0;Statistik Austria VPI 2020;2026-01-15\n2024;102.0;Statistik Austria VPI 2020;2026-01-15",
+            "vertraglicher_betrag": "1.005,00",
+            "vertraglicher_quellenbeleg": "Mietvertrag-2024.pdf, Wertsicherungsklausel",
+            "vertraglicher_termin": "2025-04-01",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert erstellt.status_code == 303
+
+    historie = client.get("/backoffice/vertrag/V-601-MIEWEG/mieweg-vorschau")
+    assert historie.status_code == 200
+    assert "vollständig" in historie.text or "Prüfbedarf" in historie.text
+    assert "1.005,00" in historie.text  # das Minimum (Vertragsspur), nicht die höhere gesetzliche Grenze (1.010,00)
+    assert "1.010,00" in historie.text  # gesetzliche Grenze bleibt sichtbar (2% * 6/12 Anteiligkeit auf 1.000 EUR)
+
+
+def test_mieweg_vorschau_fehlende_vpi_daten_ergeben_pruefbedarf_kein_erfundener_wert(backoffice_client):
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-MIEWEG2", objekt_id="601", bezeichnung="Top MieWeG 2", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-MIEWEG2", einheit_id="601-TOP-MIEWEG2", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+
+    erstellt = client.post(
+        "/backoffice/vertrag/V-601-MIEWEG2/mieweg-vorschau/erstellen",
+        data={
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "bezugsjahr": "2024", "bezugsmonat": "1",
+            "ziel_bewertungsjahr": "2026", "basis_betrag": "1.000,00",
+            "vpi_zeilen": "2023;100.0;Statistik Austria VPI 2020;2026-01-15",  # 2024/2025 fehlen bewusst
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert erstellt.status_code == 303
+
+    historie = client.get("/backoffice/vertrag/V-601-MIEWEG2/mieweg-vorschau")
+    assert "Prüfbedarf" in historie.text
+    assert "VPI-Jahresdurchschnitt fehlt" in historie.text
+
+
+def test_mieweg_vorschau_ungeklaertes_rechtsprofil_wird_nicht_hineingeraten(backoffice_client):
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-MIEWEG3", objekt_id="601", bezeichnung="Top MieWeG 3", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-MIEWEG3", einheit_id="601-TOP-MIEWEG3", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="UNGEKLAERT", gueltig_von=date(2024, 1, 1),
+    )
+
+    erstellt = client.post(
+        "/backoffice/vertrag/V-601-MIEWEG3/mieweg-vorschau/erstellen",
+        data={"rechtsordnung": "UNGEKLAERT", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert erstellt.status_code == 303
+
+    historie = client.get("/backoffice/vertrag/V-601-MIEWEG3/mieweg-vorschau")
+    assert "UNGEKLAERT" in historie.text
+    assert "kein Rateversuch" in historie.text or "keine ausführbare Anpassung" in historie.text
+
+
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
     unten) - der Login-Ratelimiter ist ein globaler, prozessweiter
