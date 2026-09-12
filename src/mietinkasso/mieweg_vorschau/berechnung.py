@@ -21,9 +21,11 @@ Kernregeln (siehe `docs/hausverwaltung/OFFENE_PUNKTE.md`, Abschnitt
   (Jahr-1)) / VPI-Jahresdurchschnitt(Jahr-1) - aus zwei VOLLSTÄNDIGEN
   Jahresdurchschnittswerten, nie aus gerundet veröffentlichten
   Prozentwerten.
-- Allgemeine Dämpfung: über 3 Prozentpunkte (in beide Richtungen, auch
-  bei Deflation) wird nur die Hälfte des übersteigenden Teils
-  angerechnet.
+- Allgemeine Dämpfung: NUR bei einer Erhöhung über 3 Prozentpunkte wird
+  der übersteigende Teil zur Hälfte angerechnet (§1 Abs 2 Z1). KEINE
+  symmetrische Dämpfung bei einer Senkung unter -3 % - eine Senkung
+  wird immer in voller Höhe durchgereicht (siehe `daempfe()`-Docstring
+  für die Korrekturhistorie).
 - MRG-Vollanwendungs-Übergangsdeckel (nur wenn `mrg_zinsbeschraenkung`
   gesetzt ist, nur für eine POSITIVE Veränderung): Referenzjahr 2025
   höchstens 1 %, Referenzjahr 2026 höchstens 2 % - ersetzt für diese
@@ -57,16 +59,26 @@ _UEBERGANGSDECKEL = {2025: Decimal("0.01"), 2026: Decimal("0.02")}
 
 
 def daempfe(rate: Decimal) -> Decimal:
-    """Allgemeine MieWeG-Dämpfung: über 3 Prozentpunkte (in BEIDE
-    Richtungen - auch bei Deflation) wird nur die Hälfte des
-    übersteigenden Teils angerechnet. Bei/unter der Schwelle bleibt die
-    Rate unverändert (kein Rateversuch, keine unbegründete Kappung von
-    Senkungen auf 0)."""
+    """Allgemeine MieWeG-Dämpfung: NUR bei einer ERHÖHUNG über 3
+    Prozentpunkte wird der übersteigende Teil nur zur Hälfte angerechnet.
+
+    KORRIGIERT (Folgeauftrag Markus, unabhängige Prüfung gegen die
+    Primärquelle RIS BGBl. I Nr. 114/2025, §1 Abs 2 Z1 - in dieser
+    Sitzung selbst nicht abrufbar, `ris.bka.gv.at` ist über die
+    Netzwerk-Egress-Policy blockiert, daher hier nicht nachvollzogen,
+    sondern auf ausdrücklichen, mit Fundstelle belegten Hinweis
+    übernommen): §1 Abs 2 Z1 dämpft AUSSCHLIESSLICH eine Veränderung, die
+    3 % ÜBERSTEIGT - das ist im Gesetzestext keine symmetrische Regel für
+    Senkungen. Eine vorherige Fassung dieser Funktion halbierte den
+    übersteigenden Teil AUCH bei einer Senkung unter -3 % ("symmetrisch
+    auch bei Deflation") - dafür gab es keine Rechtsgrundlage; eine
+    Senkung wird jetzt in voller Höhe durchgereicht, ohne jede Dämpfung.
+    Nur der Sonderfall value == genau der Schwelle oder darunter bleibt
+    unverändert (kein Rateversuch, keine unbegründete Kappung einer
+    Senkung auf 0)."""
 
     if rate > _DAEMPFUNGS_SCHWELLE:
         return _DAEMPFUNGS_SCHWELLE + (rate - _DAEMPFUNGS_SCHWELLE) / 2
-    if rate < -_DAEMPFUNGS_SCHWELLE:
-        return -_DAEMPFUNGS_SCHWELLE + (rate + _DAEMPFUNGS_SCHWELLE) / 2
     return rate
 
 

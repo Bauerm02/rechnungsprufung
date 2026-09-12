@@ -15,7 +15,24 @@ Klauselprüfung bleibt Fachaufgabe, wie schon in
 `vertragspruefung/service.py` für die Rechtsordnung selbst). Der
 maßgebliche Höchstbetrag ist das Minimum beider Spuren; fehlt eine der
 beiden Spuren, bleibt das Ergebnis offen (Prüfbedarf) - es wird nie nur
-eine Seite verwendet."""
+eine Seite verwendet.
+
+Alle Cent-Beträge in diesem Modul (`basis_betrag_cent`,
+`vertraglich_zulaessiger_betrag_cent`, `aktuell_verrechneter_betrag_cent`)
+sind BRUTTO - verbindliche Konvention dieses Repositories, siehe
+`domain/money.py::zerlege_brutto_cent`: "`VertragsKomponenteTable.
+betrag_cent`/`VorschreibungPositionTable.betrag_cent` sind BRUTTO - das
+ist der Betrag, der tatsächlich als SOLL gebucht wird". Referenzierte
+Komponenten mit UNTERSCHIEDLICHEN `ust_satz_promille`-Sätzen dürfen zu
+EINER Brutto-Summe addiert werden (Brutto + Brutto = Brutto,
+unabhängig vom jeweiligen Steuersatz), aber diese Summe darf an KEINER
+Stelle so behandelt werden, als wäre sie über einen einzigen,
+einheitlichen (Netto-)Steuersatz herleitbar - eine solche Rückrechnung
+fände hier ohnehin nicht statt (`berechnung.py` multipliziert
+ausschließlich mit VPI-Verhältniszahlen, nie mit einem Steuersatz),
+wird hier aber ausdrücklich als Grenze dokumentiert, da eine künftige
+Erweiterung (z. B. ein Netto-Ausweis je Komponente) das sonst
+stillschweigend falsch mischen könnte."""
 
 from __future__ import annotations
 
@@ -38,6 +55,32 @@ _WOHNUNGSRECHNER_RECHTSORDNUNGEN = {
 }
 _GUELTIGE_RECHTSORDNUNGEN = {e.value for e in Rechtsordnung}
 _ALTVERTRAG_ERSTE_MODELLBEWERTUNG_JAHR = 2026
+
+# Defense-in-depth (Folgeauftrag Markus) - unabhängig vom `indexierbar`-
+# Flag auf `VertragsKomponenteTable` NIEMALS automatisch indexierbar.
+# Deckt sich bewusst mit `index/service.py::_NIE_INDEXIERBARE_ARTEN`
+# (BK_VORAUSZAHLUNG/HEIZ_WW_VORAUSZAHLUNG) und ergänzt die dort
+# genannten Aliasarten (BK_VZ/HK_VZ/BK_PARKPLATZ) - bewusst eine eigene,
+# lokale Liste statt eines Imports aus `index/service.py`, um dieses
+# Modul (Paket C) unabhängig vom bestehenden Index-MVP1-Modul zu halten
+# (siehe AGENTS.md-Modultrennung); Codex sollte beide Listen bei
+# künftigen Änderungen synchron halten.
+_NIE_INDEXIERBARE_ARTEN = frozenset({
+    "BK_VORAUSZAHLUNG",
+    "HEIZ_WW_VORAUSZAHLUNG",
+    "BK_VZ",
+    "HK_VZ",
+    "BK_PARKPLATZ",
+})
+
+
+def _naechster_gueltiger_april(datum: date) -> date:
+    """MieWeG-Anpassungen sind ausschließlich zu einem 1. April wirksam
+    (§ 1 Abs 3) - rundet ein beliebiges Datum auf den nächsten gültigen
+    1. April auf. Ein bereits gültiger 1. April bleibt unverändert."""
+
+    kandidat = date(datum.year, 4, 1)
+    return kandidat if datum <= kandidat else date(datum.year + 1, 4, 1)
 
 
 @dataclass(frozen=True)
@@ -71,6 +114,7 @@ class MieWegVorschauService:
         ctx: AuthContext,
         vertrag: VertragTable,
         rechtsordnung: str,
+        ist_wohnungsnutzung: bool | None,
         mrg_zinsbeschraenkung: bool,
         ist_altvertrag: bool,
         bezugsjahr: int | None,
@@ -83,6 +127,9 @@ class MieWegVorschauService:
         vertraglich_zulaessiger_betrag_cent: int | None,
         vertraglicher_quellenbeleg: str | None,
         vertraglicher_fruehestmoeglicher_termin: date | None,
+        aktuell_verrechneter_betrag_cent: int | None,
+        aktuell_verrechnet_quellenbeleg: str | None,
+        aktuell_verrechnet_stichtag: date | None,
         zustellnachweis_referenz: str | None,
         kommentar: str | None,
         akteur: str,
@@ -108,6 +155,30 @@ class MieWegVorschauService:
         # Küche kann ja sein, Garage nicht automatisch"; BK/HK/Versorger
         # nie automatisch) - jede referenzierte Komponente muss zu DIESEM
         # Vertrag gehören und explizit als indexierbar markiert sein.
+        #
+        # Zusätzlich (Folgeauftrag Markus, Schutz gegen bereits enthaltene
+        # Erhöhungen): "Komponenten statt Gesamtbrutto" - wer Komponenten
+        # referenziert, behauptet damit, die Basis bestehe aus GENAU diesen
+        # Beträgen. Ein davon unabhängiger basis_betrag_cent (zu hoch oder
+        # zu niedrig) würde einen bereits in den Komponenten enthaltenen
+        # Erhöhungsschritt unbemerkt verfälschen - deshalb muss die Summe
+        # exakt übereinstimmen. Ebenso muss jede referenzierte Komponente
+        # zum angegebenen Bezugszeitpunkt (Bezugsjahr/-monat) laut
+        # Stammdaten bereits bestanden haben ("unterschiedliche bestehende
+        # HMZ/Küche/Parkplatz-Stände"): eine erst später vereinbarte
+        # Komponente darf nicht rückwirkend über den gesamten
+        # Kumulierungszeitraum mit hochgerechnet werden.
+        # Leere/doppelte IDs sind IMMER ein fehlerhafter Aufruf, nie eine
+        # legitime Eingabe - eine doppelte ID würde denselben Betrag ein
+        # zweites Mal in `summe_komponenten_cent` einrechnen (eigene Form
+        # einer Doppelzählung).
+        if any(not (kid or "").strip() for kid in basis_komponenten_ids):
+            raise ValueError("basis_komponenten_ids enthält eine leere/blanke ID.")
+        if len(basis_komponenten_ids) != len(set(basis_komponenten_ids)):
+            raise ValueError("basis_komponenten_ids enthält doppelte Einträge.")
+
+        referenzdatum = date(bezugsjahr, bezugsmonat, 1) if bezugsjahr is not None and bezugsmonat is not None else None
+        summe_komponenten_cent = 0
         for komponente_id in basis_komponenten_ids:
             komponente = self._stammdaten_repository.get_komponente(komponente_id)
             if komponente is None or komponente.vertrag_id != vertrag.id:
@@ -118,8 +189,42 @@ class MieWegVorschauService:
                     "vertragsindexierte Komponenten fließen in die Basis ein (BK/HK/Versorger/nicht "
                     "vereinbarte Komponenten werden nie automatisch indexiert)."
                 )
+            if komponente.art in _NIE_INDEXIERBARE_ARTEN:
+                raise ValueError(
+                    f"Komponente {komponente_id} hat die Art '{komponente.art}' - Betriebs-/Heizkosten(-"
+                    "Vorauszahlungen) und vergleichbare Aliasarten werden NIE automatisch indexiert, "
+                    f"unabhängig vom indexierbar-Flag (verteidigt gegen eine fehlerhaft gesetzte "
+                    f"indexierbar=True-Markierung; ausgeschlossene Arten: {sorted(_NIE_INDEXIERBARE_ARTEN)})."
+                )
+            if referenzdatum is not None and komponente.gueltig_von > referenzdatum:
+                raise ValueError(
+                    f"Komponente {komponente_id} ist erst ab {komponente.gueltig_von.isoformat()} gültig und "
+                    f"hat zum angegebenen Bezugszeitpunkt {referenzdatum.isoformat()} noch nicht bestanden - "
+                    "sie darf nicht rückwirkend in die Basis einfließen."
+                )
+            if referenzdatum is not None and komponente.gueltig_bis is not None and komponente.gueltig_bis < referenzdatum:
+                raise ValueError(
+                    f"Komponente {komponente_id} war bereits bis {komponente.gueltig_bis.isoformat()} befristet "
+                    f"und zum angegebenen Bezugszeitpunkt {referenzdatum.isoformat()} nicht mehr gültig."
+                )
+            summe_komponenten_cent += komponente.betrag_cent
 
-        ist_wohnungsrechner_fall = rechtsordnung in _WOHNUNGSRECHNER_RECHTSORDNUNGEN
+        if basis_komponenten_ids and basis_betrag_cent is not None and summe_komponenten_cent != basis_betrag_cent:
+            raise ValueError(
+                f"basis_betrag_cent ({basis_betrag_cent}) entspricht nicht der Summe der referenzierten "
+                f"Komponenten ({summe_komponenten_cent}) - keine von den Komponenten losgelöste Basis, "
+                "sonst könnte ein bereits enthaltener Erhöhungsschritt unbemerkt verfälscht werden."
+            )
+
+        # Folgeauftrag Markus: MieWeG §1 Abs1 gilt AUSDRÜCKLICH nur für
+        # WOHNUNGEN - eine MRG-Vollanwendung/-Teilanwendung allein sagt
+        # das NICHT aus (auch ein Geschäftsraum kann unter MRG_VOLL/
+        # MRG_TEIL fallen). Da es dafür kein bestehendes Stammdatenfeld
+        # gibt, muss die Wohnungsnutzung explizit bestätigt werden;
+        # `None` (nicht geprüft) oder `False` sperrt den Wohnungsrechner
+        # GENAUSO wie ein falsches Rechtsprofil - kein Rateversuch, kein
+        # Sonderweg über eine bloß angenommene MRG-Kategorie.
+        ist_wohnungsrechner_fall = rechtsordnung in _WOHNUNGSRECHNER_RECHTSORDNUNGEN and ist_wohnungsnutzung is True
         offene_nachweise: list[str] = []
         blockiert_grund: str | None = None
         gesetzliches_ergebnis: GesetzlicheHoechstgrenzeErgebnis | None = None
@@ -128,6 +233,13 @@ class MieWegVorschauService:
             blockiert_grund = (
                 "Rechtsprofil UNGEKLAERT - kein Rateversuch, keine ausführbare Anpassung; nur als "
                 "Entwurf mit fehlenden Eingaben gespeichert."
+            )
+        elif rechtsordnung in _WOHNUNGSRECHNER_RECHTSORDNUNGEN and ist_wohnungsnutzung is not True:
+            blockiert_grund = (
+                f"Rechtsordnung {rechtsordnung} allein belegt keine Wohnungsnutzung - MieWeG §1 Abs1 gilt "
+                "ausdrücklich nur für Wohnungen, nicht automatisch für jede MRG-Geschäftsmiete. Ohne "
+                "explizit bestätigte Wohnungsnutzung (ist_wohnungsnutzung=True) kein Wohnungsrechner-Fall, "
+                "keine Berechnung durchgeführt."
             )
         elif not ist_wohnungsrechner_fall:
             blockiert_grund = (
@@ -157,6 +269,34 @@ class MieWegVorschauService:
                     "kein erfundener Wert, Berechnung bricht an dieser Stelle ab."
                 )
 
+            offene_nachweise.extend(self._ueberlappungshinweise(vertrag.id, bezugsjahr))
+
+            # Folgeauftrag Markus: "letzter maßgeblicher Bezugsmonat bei
+            # Altverträgen, nicht blind ursprünglicher Mietbeginn" (§4
+            # Abs2). Diese Klasse kann nicht verlässlich prüfen, OB
+            # bezugsjahr/-monat tatsächlich der zuletzt verwendete
+            # Indexwert sind (dafür gibt es keine verbindliche
+            # Datenquelle in diesem Modul) - aber ein exaktes
+            # Zusammentreffen mit dem URSPRÜNGLICHEN Vertragsbeginn ist
+            # ein konkretes Verdachtsmoment auf eine blind übernommene
+            # Abschlussdatum-statt-Bezugsmonat-Verwechslung und wird
+            # deshalb als offener Nachweis erzwungen (kein Rateversuch:
+            # der Fall kann legitim sein, wenn der Vertrag tatsächlich
+            # noch nie indexiert wurde - deshalb Prüfbedarf, kein
+            # Hartstopp).
+            if (
+                ist_altvertrag
+                and vertrag.gueltig_von is not None
+                and bezugsjahr == vertrag.gueltig_von.year
+                and bezugsmonat == vertrag.gueltig_von.month
+            ):
+                offene_nachweise.append(
+                    f"Altvertrag mit Bezugsjahr/-monat {bezugsjahr}-{bezugsmonat:02d} identisch zum "
+                    f"ursprünglichen Vertragsbeginn ({vertrag.gueltig_von.isoformat()}) - bitte bestätigen, "
+                    "dass dies tatsächlich der zuletzt verwendete Indexwert ist und nicht blind das "
+                    "ursprüngliche Abschlussdatum übernommen wurde (§4 Abs2)."
+                )
+
         # -- Vertragsspur: manuell erfasst, Pflicht-Quellenbeleg (keine
         # beleglose Angabe, wie bei jeder anderen Klassifizierung in
         # diesem Modul).
@@ -179,6 +319,38 @@ class MieWegVorschauService:
                 "keine tatsächliche Fälligkeit ausführbar."
             )
 
+        # -- Aktuell verrechneter Betrag: GETRENNT vom historischen
+        # `basis_betrag_cent` (Folgeauftrag Markus, konkreter
+        # Doppelzählungs-Fund): der historische Basisbetrag und der
+        # HEUTE tatsächlich verrechnete Betrag sind unterschiedliche
+        # Zustände - zwischen dem historischen Bezugszeitpunkt und heute
+        # können bereits (teilweise) Erhöhungen umgesetzt worden sein,
+        # die dieses Modul nicht kennt. `massgeblicher_hoechstbetrag_cent`
+        # ist NIE unmittelbar "der neue Zielbetrag", sondern nur die
+        # gesetzliche/vertragliche OBERGRENZE seit dem historischen
+        # Bezugspunkt - ohne einen dokumentierten, aktuellen
+        # Vergleichswert (mit Datum/Beleg) darf daraus KEINE ausführbare
+        # Erhöhung abgeleitet werden (sonst würde ein bereits verrechneter
+        # Teil der Erhöhung ein zweites Mal aufgeschlagen). Pflicht-
+        # Quellenbeleg wie bei jeder anderen Klassifizierung in diesem
+        # Modul.
+        if aktuell_verrechneter_betrag_cent is not None and not (aktuell_verrechnet_quellenbeleg or "").strip():
+            raise QuellenbelegFehltError(
+                "Ein aktuell verrechneter Betrag ohne Quellenbeleg-Referenz wird abgelehnt - keine "
+                "beleglose Vergleichsbasis."
+            )
+        if aktuell_verrechneter_betrag_cent is None:
+            offene_nachweise.append(
+                "Aktuell verrechneter Betrag (mit Datum/Beleg) noch nicht erfasst - ohne diese Historie "
+                "ist keine ausführbare Erhöhung ausweisbar, nur die gesetzliche/vertragliche Obergrenze "
+                "seit dem historischen Bezugszeitpunkt."
+            )
+        elif aktuell_verrechnet_stichtag is None:
+            offene_nachweise.append(
+                "Kein Stichtag für den aktuell verrechneten Betrag erfasst - der Vergleichswert bleibt "
+                "ohne Datum nicht nachvollziehbar."
+            )
+
         gesetzliche_hoechstgrenze_cent = (
             gesetzliches_ergebnis.hoechstbetrag_cent
             if gesetzliches_ergebnis is not None and gesetzliches_ergebnis.vollstaendig
@@ -194,16 +366,54 @@ class MieWegVorschauService:
             # gesetzlichen April, nie vor dem Vertragstermin": der
             # tatsächlich früheste Termin ist das Maximum aus beiden
             # Spuren, niemals nur einer davon.
+            #
+            # KORRIGIERT (Folgeauftrag Markus): das reine Maximum zweier
+            # Daten kann einen NICHT-April-Termin liefern (z. B. ein
+            # vertraglicher September-Termin), obwohl § 1 Abs 3 MieWeG
+            # ausschließlich den 1. April als Anpassungsstichtag zulässt.
+            # Der kombinierte Termin wird deshalb auf den nächsten
+            # gültigen 1. April aufgerundet; landet dieser dadurch in
+            # einem ANDEREN Jahr als dem hier berechneten
+            # `ziel_bewertungsjahr`, wird das NICHT stillschweigend
+            # übernommen (dafür wären zusätzliche, hier nicht angefragte
+            # VPI-Jahreswerte nötig, siehe `berechne_gesetzliche_
+            # hoechstgrenze`) - stattdessen wird kein Termin ausgegeben,
+            # sondern ein offener Nachweis erzwungen ("berücksichtigen
+            # oder sperren" - hier: sperren, bis eine eigene Berechnung
+            # für das richtige Ziel-Bewertungsjahr vorliegt).
             vertrags_termin = vertraglicher_fruehestmoeglicher_termin or gesetzlicher_termin
-            fruehester_termin_gesamt = max(gesetzlicher_termin, vertrags_termin)
+            kombiniert_roh = max(gesetzlicher_termin, vertrags_termin)
+            kombiniert_april = _naechster_gueltiger_april(kombiniert_roh)
+            if kombiniert_april.year != ziel_bewertungsjahr:
+                offene_nachweise.append(
+                    f"Der vertragliche Termin ({vertrags_termin.isoformat()}) verschiebt die früheste "
+                    f"zulässige Anpassung auf den nächsten gültigen 1. April ({kombiniert_april.isoformat()}) "
+                    f"- ein anderes Jahr als das hier berechnete Ziel-Bewertungsjahr {ziel_bewertungsjahr}. "
+                    "Nur der 1. April ist als Anpassungstermin zulässig; für dieses spätere Jahr ist eine "
+                    "eigene Berechnung mit den dafür erforderlichen VPI-Werten nötig, kein automatischer "
+                    "Sprung auf einen nicht berechneten Zeitraum."
+                )
+            else:
+                fruehester_termin_gesamt = kombiniert_april
         else:
             offene_nachweise.append(
                 "Maßgeblicher Höchstbetrag noch offen - gesetzliche und/oder vertragliche Spur "
                 "unvollständig, keine Vermischung einer einzelnen Seite als Ergebnis."
             )
 
+        # max(0, ...): niemals eine Senkung "vorschlagen", falls der
+        # aktuell verrechnete Betrag den Höchstbetrag bereits erreicht/
+        # übersteigt - das bedeutet lediglich, dass dieser Erhöhungs-
+        # schritt bereits ausgeschöpft ist, nicht dass rückwirkend
+        # gesenkt werden müsste (das wäre eine eigene, hier nicht
+        # beauftragte Fachfrage).
+        ausfuehrbare_erhoehung_cent: int | None = None
+        if massgeblicher_hoechstbetrag_cent is not None and aktuell_verrechneter_betrag_cent is not None:
+            ausfuehrbare_erhoehung_cent = max(0, massgeblicher_hoechstbetrag_cent - aktuell_verrechneter_betrag_cent)
+
         eingaben = {
             "rechtsordnung": rechtsordnung,
+            "ist_wohnungsnutzung": ist_wohnungsnutzung,
             "mrg_zinsbeschraenkung": mrg_zinsbeschraenkung,
             "ist_altvertrag": ist_altvertrag,
             "bezugsjahr": bezugsjahr,
@@ -218,6 +428,11 @@ class MieWegVorschauService:
             "vertraglicher_fruehestmoeglicher_termin": (
                 vertraglicher_fruehestmoeglicher_termin.isoformat() if vertraglicher_fruehestmoeglicher_termin else None
             ),
+            "aktuell_verrechneter_betrag_cent": aktuell_verrechneter_betrag_cent,
+            "aktuell_verrechnet_quellenbeleg": aktuell_verrechnet_quellenbeleg,
+            "aktuell_verrechnet_stichtag": (
+                aktuell_verrechnet_stichtag.isoformat() if aktuell_verrechnet_stichtag else None
+            ),
             "zustellnachweis_referenz": zustellnachweis_referenz,
             "kommentar": kommentar,
         }
@@ -227,6 +442,7 @@ class MieWegVorschauService:
             "gesetzlicher_termin": gesetzlicher_termin.isoformat() if gesetzlicher_termin else None,
             "vertraglich_zulaessiger_betrag_cent": vertraglich_zulaessiger_betrag_cent,
             "massgeblicher_hoechstbetrag_cent": massgeblicher_hoechstbetrag_cent,
+            "ausfuehrbare_erhoehung_cent": ausfuehrbare_erhoehung_cent,
             "fruehester_termin_gesamt": fruehester_termin_gesamt.isoformat() if fruehester_termin_gesamt else None,
             "fehlende_jahre": gesetzliches_ergebnis.fehlende_jahre if gesetzliches_ergebnis is not None else [],
             "jahresschritte": (
@@ -251,6 +467,39 @@ class MieWegVorschauService:
             ergebnis_json=json.dumps(ergebnis, ensure_ascii=False, sort_keys=True),
             erstellt_von=akteur,
         )
+
+    def _ueberlappungshinweise(self, vertrag_id: str, bezugsjahr: int) -> list[str]:
+        """Folgeauftrag Markus (Schutz gegen bereits enthaltene
+        Erhöhungen): eine FRÜHERE Vorschau für DENSELBEN Vertrag, deren
+        Ziel-Bewertungsjahr auf oder nach dem hier verwendeten Bezugsjahr
+        liegt und die bereits eine gesetzliche Höchstgrenze berechnet
+        hatte, deckt den Kumulierungsschritt bis zu ihrem eigenen
+        Ziel-Bewertungsjahr schon ab. Eine Folgevorschau, die WIEDER vom
+        selben (oder einem noch früheren) Bezugsjahr aus rechnet, statt ab
+        dem Ziel-Bewertungsjahr der Vorversion fortzusetzen, würde diesen
+        Schritt ein zweites Mal einrechnen ("identischer Wiederholungslauf"/
+        "nachträgliche Profiländerung"). Das wird NICHT automatisch
+        blockiert (reine Vorschau, keine Fachentscheidung durch Code),
+        aber als offener Nachweis erzwungen - `vollstaendig` wird dadurch
+        automatisch False (siehe Verwendung von `offene_nachweise` in
+        `anlegen()`)."""
+
+        hinweise: list[str] = []
+        for vorherige in self._vorschau_repository.liste_fuer_vertrag(vertrag_id):
+            if vorherige.ziel_bewertungsjahr is None or vorherige.ziel_bewertungsjahr < bezugsjahr:
+                continue
+            vorheriges_ergebnis = json.loads(vorherige.ergebnis_json)
+            if vorheriges_ergebnis.get("gesetzliche_hoechstgrenze_cent") is None:
+                continue
+            hinweise.append(
+                f"Überlappung mit Version {vorherige.version} (Ziel-Bewertungsjahr "
+                f"{vorherige.ziel_bewertungsjahr}): diese Vorversion hat bereits eine gesetzliche "
+                f"Höchstgrenze bis {vorherige.ziel_bewertungsjahr} berechnet, die aktuelle Vorschau "
+                f"rechnet aber erneut ab Bezugsjahr {bezugsjahr} - vor Verwendung prüfen, ob eine "
+                "Erhöhung aus der Vorversion bereits umgesetzt wurde, um keinen Schritt doppelt zu "
+                "zählen."
+            )
+        return hinweise
 
     def liste_fuer_vertrag(self, vertrag_id: str) -> list[MieWegVorschauTable]:
         return self._vorschau_repository.liste_fuer_vertrag(vertrag_id)

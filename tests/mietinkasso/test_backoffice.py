@@ -936,7 +936,7 @@ def test_mieweg_vorschau_beide_spuren_ergeben_massgeblichen_betrag(backoffice_cl
     erstellt = client.post(
         "/backoffice/vertrag/V-601-MIEWEG/mieweg-vorschau/erstellen",
         data={
-            "rechtsordnung": "OESTERREICH_MRG_VOLL", "bezugsjahr": "2024", "bezugsmonat": "6",
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "ist_wohnungsnutzung": "1", "bezugsjahr": "2024", "bezugsmonat": "6",
             "ziel_bewertungsjahr": "2025", "basis_betrag": "1.000,00",
             "vpi_zeilen": "2023;100.0;Statistik Austria VPI 2020;2026-01-15\n2024;102.0;Statistik Austria VPI 2020;2026-01-15",
             "vertraglicher_betrag": "1.005,00",
@@ -974,7 +974,7 @@ def test_mieweg_vorschau_fehlende_vpi_daten_ergeben_pruefbedarf_kein_erfundener_
     erstellt = client.post(
         "/backoffice/vertrag/V-601-MIEWEG2/mieweg-vorschau/erstellen",
         data={
-            "rechtsordnung": "OESTERREICH_MRG_VOLL", "bezugsjahr": "2024", "bezugsmonat": "1",
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "ist_wohnungsnutzung": "1", "bezugsjahr": "2024", "bezugsmonat": "1",
             "ziel_bewertungsjahr": "2026", "basis_betrag": "1.000,00",
             "vpi_zeilen": "2023;100.0;Statistik Austria VPI 2020;2026-01-15",  # 2024/2025 fehlen bewusst
             "csrf_token": csrf,

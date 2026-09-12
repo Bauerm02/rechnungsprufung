@@ -298,10 +298,120 @@ Zeilen des Vertrags referenzieren (`basis_komponenten_ids`); der
 Service lehnt jede referenzierte Komponente ab, die nicht
 `indexierbar=True` trägt (z. B. Garage, Betriebskosten-Vorauszahlung -
 diese werden NIE automatisch indexiert, unabhängig vom eingegebenen
-Basisbetrag). Der Basisbetrag selbst bleibt ein manuell eingegebener
-EUR-Wert (kein automatisches Aufsummieren der Komponenten) - die
-Komponentenreferenz dient ausschließlich der Nachvollziehbarkeit
-("welche Beträge wurden hier einbezogen"), nicht der Berechnung selbst.
+Basisbetrag).
+
+**Korrigiert (Folgeauftrag Markus, Schutzlogik gegen bereits enthaltene
+Erhöhungen, siehe eigener Abschnitt unten):** ursprünglich war der
+Basisbetrag ein von den Komponenten UNABHÄNGIGER, frei eingegebener
+EUR-Wert ("kein automatisches Aufsummieren") - das war eine echte
+Lücke, kein bewusstes Feature: eine referenzierte Komponente behauptet
+"meine Basis besteht aus GENAU diesem Betrag", ein davon losgelöster
+`basis_betrag_cent` hätte einen bereits in der Komponente enthaltenen
+Erhöhungsschritt unbemerkt verfälschen können. Der Service verlangt
+jetzt zwingend `basis_betrag_cent == Summe der referenzierten
+Komponenten-Beträge` (sonst `ValueError`) UND dass jede referenzierte
+Komponente laut `gueltig_von`/`gueltig_bis` zum angegebenen
+Bezugsjahr/-monat bereits bestanden hat (sonst `ValueError`) - eine
+erst später vereinbarte Komponente (z. B. eine 2025 nachträglich
+vereinbarte Küche) darf nicht rückwirkend in eine ab 2024 laufende
+Kumulierung einfließen.
+
+### Folgeauftrag Markus (12.09., Fortsetzung): unabhängige Prüfung der Schutzlogik gegen bereits enthaltene Erhöhungen
+
+Markus hat NACH der ursprünglichen Paket-C-Auslieferung ausdrücklich die
+Schutzlogik gegen Doppelzählung unabhängig geprüft (teils durch direktes
+Lesen der RIS-Primärquelle, `ris.bka.gv.at` ist über die Netzwerk-
+Egress-Policy dieser Sitzung selbst nicht erreichbar) und mehrere
+konkrete, mit Tests reproduzierte Lücken benannt. Alle unten
+beschriebenen Korrekturen sind mit synthetischen Regressionstests
+belegt (`tests/mietinkasso/test_mieweg_berechnung.py`,
+`tests/mietinkasso/test_mieweg_vorschau_service.py`); es wurde an
+diesem Bestand NICHTS freigegeben, keine automatische Vorschreibung/
+kein Versand ergänzt.
+
+1. **`daempfe()` dämpfte fälschlich auch Senkungen (Deflation)
+   symmetrisch.** Nach Markus' Lektüre der Primärquelle (BGBl. I Nr.
+   114/2025, §1 Abs 2 Z1) dämpft das Gesetz AUSSCHLIESSLICH eine
+   Erhöhung über 3 % - für eine symmetrische Halbierung bei einer
+   Senkung unter -3 % gibt es keine Rechtsgrundlage. Korrigiert: eine
+   Senkung wird jetzt immer in voller Höhe durchgereicht. **Nicht in
+   dieser Sitzung selbst gegen die Primärquelle nachvollzogen** (Netz-
+   zugriff blockiert) - Codex sollte §1 Abs 2 Z1 vor Produktivnutzung
+   trotzdem gegenlesen.
+2. **Vertraglicher Termin konnte einen ungültigen (Nicht-April-)Termin
+   oder einen Termin in einem nicht berechneten Jahr liefern.** Das
+   reine `max(gesetzlicher Termin, vertraglicher Termin)` konnte z. B.
+   einen vertraglichen September-Termin unverändert ausgeben, obwohl
+   § 1 Abs 3 nur den 1. April als Anpassungsstichtag zulässt. Korrigiert:
+   der kombinierte Termin wird auf den nächsten gültigen 1. April
+   aufgerundet; landet dieser dadurch in einem ANDEREN Jahr als dem
+   berechneten `ziel_bewertungsjahr` (das würde zusätzliche, hier nicht
+   angefragte VPI-Jahreswerte voraussetzen), wird KEIN Termin
+   ausgegeben, sondern ein offener Nachweis erzwungen - kein
+   automatischer Sprung auf einen nicht berechneten Zeitraum.
+3. **Historischer Basisbetrag wurde mit der heute tatsächlich
+   verrechneten Miete verwechselt - der zentrale Doppelzählungsfund.**
+   `massgeblicher_hoechstbetrag_cent` ist die gesetzliche/vertragliche
+   OBERGRENZE seit dem historischen Bezugszeitpunkt, NICHT automatisch
+   der neue Zielbetrag - zwischen damals und heute können bereits
+   (teilweise) Erhöhungen umgesetzt worden sein, die dieses Modul nicht
+   kennt. Neues, GETRENNTES Pflichtfeld-Trio (analog zur Vertragsspur,
+   mit Pflicht-Quellenbeleg): `aktuell_verrechneter_betrag_cent` +
+   `aktuell_verrechnet_quellenbeleg` + `aktuell_verrechnet_stichtag`.
+   Neues Ergebnisfeld `ausfuehrbare_erhoehung_cent` = `max(0,
+   massgeblicher_hoechstbetrag_cent - aktuell_verrechneter_betrag_cent)`
+   - NIE eine negative "Erhöhung" (Senkung), aber auch NIE ein
+   Aufschlag auf einen bereits teilweise erhöhten Betrag. Ohne
+   dokumentierten aktuellen Vergleichswert bleibt `ausfuehrbare_
+   erhoehung_cent` `None` (Prüfbedarf) - "ohne Historie keine
+   ausführbare Erhöhung", wörtliche Vorgabe.
+4. **Leere/doppelte `basis_komponenten_ids` sowie BK/HK-Aliasarten
+   wurden nicht abgefangen.** Eine doppelte ID hätte denselben Betrag
+   zweimal in die Summenprüfung eingerechnet; eine fälschlich
+   `indexierbar=True` markierte Betriebs-/Heizkosten(-Vorauszahlungs)-
+   Komponente (auch unter den Aliasarten `BK_VZ`/`HK_VZ`/
+   `BK_PARKPLATZ`) wäre sonst durchgerutscht. Beides wird jetzt hart
+   abgelehnt, unabhängig vom `indexierbar`-Flag (Verteidigung in der
+   Tiefe, analog zu `index/service.py::_NIE_INDEXIERBARE_ARTEN` - bewusst
+   eine eigene, lokale Liste in `mieweg_vorschau/service.py`, um die
+   Modultrennung laut `AGENTS.md` nicht aufzuweichen; Codex sollte beide
+   Listen bei künftigen Änderungen synchron halten).
+5. **Netto/Brutto-Klarstellung.** Nach Rückfrage bestätigt: alle
+   Cent-Beträge in diesem Modul sind BRUTTO (verbindliche Konvention
+   dieses Repositories, siehe `domain/money.py::zerlege_brutto_cent`).
+   Komponenten mit unterschiedlichen `ust_satz_promille`-Sätzen dürfen
+   zu einer Brutto-Summe addiert werden, diese Summe darf aber
+   NIRGENDS so behandelt werden, als wäre sie über einen einzigen
+   Netto-Steuersatz herleitbar - im aktuellen Code passiert das nicht
+   (`berechnung.py` rechnet ausschließlich mit VPI-Verhältniszahlen),
+   ist aber als Grenze für künftige Erweiterungen dokumentiert.
+6. **MRG-Vollanwendung/-Teilanwendung wurde ohne Nachweis der
+   Wohnungsnutzung als Wohnungsrechner-Fall behandelt.** MieWeG §1 Abs1
+   gilt ausdrücklich nur für WOHNUNGEN - ein Geschäftsraum unter
+   MRG-Vollanwendung ist kein Wohnungsrechner-Fall, auch wenn die
+   Rechtsordnung `OESTERREICH_MRG_VOLL` lautet. Da es dafür kein
+   bestehendes Stammdatenfeld gibt (`Nutzungsstatus` beschreibt nur den
+   Belegungsstatus, nicht die Nutzungsart), neuer Pflichtparameter
+   `ist_wohnungsnutzung: bool | None` - `None`/`False` sperrt den
+   Wohnungsrechner genauso wie ein falsches Rechtsprofil. **Offener
+   Punkt:** eine strukturierte Wohnung-vs-Geschäftsraum-Kennzeichnung
+   auf `EinheitTable`/`VertragTable` existiert weiterhin nicht; die
+   Bestätigung bleibt manuelle Fachprüfung je Vorschau.
+7. **Altvertrag-Bezugsjahr konnte blind den ursprünglichen
+   Vertragsbeginn statt des zuletzt verwendeten Indexmonats verwenden.**
+   § 4 Abs 2: maßgeblich ist bei Altverträgen der zuletzt TATSÄCHLICH
+   verwendete Indexmonat. Eine verlässliche automatische Prüfung dafür
+   gibt es nicht (dafür fehlt eine belastbare Datenquelle über die
+   bisherige Indexnutzung in diesem Modul) - als Kompromiss erzeugt ein
+   exaktes Zusammentreffen von Bezugsjahr/-monat mit
+   `VertragTable.gueltig_von` einen offenen Nachweis (Verdachtsmoment,
+   kein Hartstopp: ein Altvertrag, der tatsächlich noch nie indexiert
+   wurde, ist ein legitimer Fall). **Offener Punkt:** eine echte
+   Cross-Prüfung gegen `IndexKlauselTable`/`IndexAnpassungTable` (falls
+   für denselben Vertrag bereits ein späterer Index-Anpassungsstichtag
+   dokumentiert ist) ist NICHT gebaut - das würde eine neue Abhängigkeit
+   dieses Moduls auf `index/repository.py` erfordern, die außerhalb
+   dieses eng gefassten Folgeauftrags nicht ergänzt wurde.
 
 ### Bedienung
 
@@ -320,20 +430,26 @@ Fehler gemeldet, nie still ignoriert.
 ### Tests
 
 - `tests/mietinkasso/test_mieweg_berechnung.py` (28 Tests): unabhängige
-  Grenzfalltests je Regel - Dämpfung (inkl. Deflation, keine
-  unbegründete Kappung auf 0), Rundung (exakte Decimal-Randtests bei
-  genau halbem Cent), Erstjahresanteiligkeit (Dezember=0/12, Juni=6/12,
-  Dämpfung-vor-Anteiligkeit), Übergangsdeckel 2025/2026 (inkl. "gilt
-  nicht ohne Zinsbeschränkungsflag", "gilt nicht für Deflation", "gilt
-  nicht mehr ab 2027"), mehrjährige Altvertrags-Historie ohne
-  Doppelanrechnung, unabhängige Kumulierung auf der ursprünglichen
-  Basis, fehlende VPI-Werte (kein erfundener Wert), ungültige Eingaben.
-- `tests/mietinkasso/test_mieweg_vorschau_service.py` (18 Tests):
+  Grenzfalltests je Regel - Dämpfung (NUR bei Erhöhung über 3 %, siehe
+  Korrektur oben; keine unbegründete Kappung von Senkungen auf 0),
+  Rundung (exakte Decimal-Randtests bei genau halbem Cent),
+  Erstjahresanteiligkeit (Dezember=0/12, Juni=6/12, Dämpfung-vor-
+  Anteiligkeit), Übergangsdeckel 2025/2026 (inkl. "gilt nicht ohne
+  Zinsbeschränkungsflag", "gilt nicht für Deflation", "gilt nicht mehr
+  ab 2027"), mehrjährige Altvertrags-Historie ohne Doppelanrechnung,
+  unabhängige Kumulierung auf der ursprünglichen Basis, fehlende
+  VPI-Werte (kein erfundener Wert), ungültige Eingaben.
+- `tests/mietinkasso/test_mieweg_vorschau_service.py` (37 Tests):
   Rechtsprofil-Gating (UNGEKLAERT/Gewerbe/WGG/frei/Deutschland kein
-  Wohnungsrechner-Fall, Zinsbeschränkung nur bei Vollanwendung),
-  Kombination der zwei Spuren (Minimum, Maximum-Termin), Quellenbeleg-
-  Pflicht der Vertragsspur, Komponenten-Validierung, Objektausschluss,
-  Altvertrag-Mindestjahr, Versionierung.
+  Wohnungsrechner-Fall, Zinsbeschränkung nur bei Vollanwendung,
+  MRG_VOLL/MRG_TEIL ohne bestätigte Wohnungsnutzung kein Wohnungsrechner-
+  Fall), Kombination der zwei Spuren (Minimum, gültiger-1.-April-Termin
+  inkl. Ablehnung eines Termins in einem anderen Jahr), Quellenbeleg-
+  Pflicht der Vertrags- UND der Aktuell-verrechnet-Spur, Komponenten-
+  Validierung (Summenabgleich, Gültigkeitszeitraum, leere/doppelte IDs,
+  BK/HK-Aliasarten), Objektausschluss, Altvertrag-Mindestjahr und
+  -Bezugsjahr-Plausibilität, Versionierung, Überlappungswarnung über
+  mehrere Vorschau-Versionen, ausführbare Erhöhung (`max(0, ...)`).
 - `tests/mietinkasso/test_backoffice.py` (+3 HTTP-Integrationstests):
   beide Spuren kombiniert, fehlende VPI-Historie ergibt Prüfbedarf,
   UNGEKLAERT wird nicht hineingeraten.

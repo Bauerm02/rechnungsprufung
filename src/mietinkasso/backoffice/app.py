@@ -1785,6 +1785,14 @@ def _mieweg_vorschau_zeile_html(v) -> str:
         if ergebnis.get("vertraglich_zulaessiger_betrag_cent") is not None
         else "-"
     )
+    aktuell_verrechnet = (
+        eur(ergebnis["aktuell_verrechneter_betrag_cent"])
+        if ergebnis.get("aktuell_verrechneter_betrag_cent") is not None
+        else "-"
+    )
+    ausfuehrbare_erhoehung = (
+        eur(ergebnis["ausfuehrbare_erhoehung_cent"]) if ergebnis.get("ausfuehrbare_erhoehung_cent") is not None else "-"
+    )
     termin = v.fruehester_termin.isoformat() if v.fruehester_termin else "-"
     offene_nachweise = ergebnis.get("offene_nachweise") or []
     blockiert_grund = ergebnis.get("blockiert_grund")
@@ -1797,7 +1805,8 @@ def _mieweg_vorschau_zeile_html(v) -> str:
     return (
         "<tr>"
         f"<td>{v.version}</td><td>{h(v.rechtsordnung)}</td><td>{v.ziel_bewertungsjahr or '-'}</td>"
-        f"<td>{gesetzliche_grenze}</td><td>{vertragsspur}</td><td>{hoechstbetrag}</td><td>{h(termin)}</td>"
+        f"<td>{gesetzliche_grenze}</td><td>{vertragsspur}</td><td>{hoechstbetrag}</td>"
+        f"<td>{aktuell_verrechnet}</td><td>{ausfuehrbare_erhoehung}</td><td>{h(termin)}</td>"
         f"<td>{status_html}</td><td>{nachweise_html}</td>"
         f"<td>{h(v.erstellt_von)}</td><td>{v.erstellt_am.isoformat() if v.erstellt_am else ''}</td>"
         "</tr>"
@@ -1856,6 +1865,9 @@ def mieweg_vorschau_uebersicht(request: Request, vertrag_id: str, session=Depend
           <legend>Rechtsprofil (explizit, keine automatische Einstufung)</legend>
           <label>Rechtsordnung</label>
           <select name="rechtsordnung" required>{rechtsordnung_optionen}</select>
+          <label><input type="checkbox" name="ist_wohnungsnutzung" value="1"> Wohnungsnutzung bestätigt
+            (MieWeG §1 Abs1 gilt nur für Wohnungen - ohne Bestätigung kein Wohnungsrechner-Fall, auch
+            nicht bei MRG-Vollanwendung/-Teilanwendung eines Geschäftsraums)</label><br>
           <label><input type="checkbox" name="mrg_zinsbeschraenkung" value="1"> MRG-Zinsbeschränkung
             (Richtwert-/Kategoriemiete) - nur bei MRG-Vollanwendung, aktiviert den Übergangsdeckel
             2025 (1%)/2026 (2%)</label><br>
@@ -1875,7 +1887,7 @@ def mieweg_vorschau_uebersicht(request: Request, vertrag_id: str, session=Depend
             Bezugsmonat Dezember behandelt</label>
           <label>Ziel-Bewertungsjahr (1. April dieses Jahres)</label>
           <input type="number" name="ziel_bewertungsjahr" min="1990" max="2100">
-          <label>Basisbetrag (EUR, letzter unveränderter Betrag)</label>
+          <label>Basisbetrag (EUR, BRUTTO, letzter unveränderter Betrag)</label>
           <input type="text" name="basis_betrag" placeholder="Betrag EUR">
           <label>Einbezogene, explizit indexierte Komponenten</label>
           {komponenten_html}
@@ -1886,12 +1898,26 @@ def mieweg_vorschau_uebersicht(request: Request, vertrag_id: str, session=Depend
           <legend>Vertragsspur - manuell geprüfter, vertraglich zulässiger Betrag</legend>
           <p class="muted">Wird NICHT aus den VPI-Daten hergeleitet - die individuelle Vertragsklausel
              bleibt Fachprüfung. Ohne Betrag bleibt diese Spur offen (Prüfbedarf).</p>
-          <label>Vertraglich zulässiger Betrag (EUR)</label>
+          <label>Vertraglich zulässiger Betrag (EUR, BRUTTO)</label>
           <input type="text" name="vertraglicher_betrag" placeholder="Betrag EUR">
           <label>Quellenbeleg (Pflicht, sobald ein Betrag erfasst wird)</label>
           <input type="text" name="vertraglicher_quellenbeleg" placeholder="z. B. Mietvertrag-2024.pdf, Wertsicherungsklausel">
           <label>Vertraglich frühestmöglicher Termin</label>
           <input type="date" name="vertraglicher_termin">
+        </fieldset>
+        <fieldset>
+          <legend>Aktuell verrechneter Betrag - GETRENNT vom historischen Basisbetrag</legend>
+          <p class="muted">Der historische Basisbetrag oben ist NICHT automatisch der heute tatsächlich
+             verrechnete Betrag - zwischen dem historischen Bezugszeitpunkt und heute können bereits
+             (teilweise) Erhöhungen umgesetzt worden sein. Ohne diesen Vergleichswert (mit Datum/Beleg)
+             wird KEINE ausführbare Erhöhung ausgewiesen, nur die gesetzliche/vertragliche Obergrenze -
+             sonst würde ein bereits verrechneter Teil ein zweites Mal aufgeschlagen.</p>
+          <label>Aktuell verrechneter Betrag (EUR, BRUTTO - dieselbe Grundlage wie alle Beträge oben)</label>
+          <input type="text" name="aktuell_verrechneter_betrag" placeholder="Betrag EUR">
+          <label>Quellenbeleg (Pflicht, sobald ein Betrag erfasst wird)</label>
+          <input type="text" name="aktuell_verrechnet_quellenbeleg" placeholder="z. B. Vorschreibung 2026-03.pdf">
+          <label>Stichtag des aktuell verrechneten Betrags</label>
+          <input type="date" name="aktuell_verrechnet_stichtag">
         </fieldset>
         <fieldset>
           <legend>Nachweise</legend>
@@ -1909,7 +1935,8 @@ def mieweg_vorschau_uebersicht(request: Request, vertrag_id: str, session=Depend
       <table>
         <tr>
           <th>Version</th><th>Rechtsordnung</th><th>Ziel-Jahr</th><th>Gesetzliche Grenze</th>
-          <th>Vertragsspur</th><th>Maßgeblich</th><th>Frühester Termin</th><th>Status</th>
+          <th>Vertragsspur</th><th>Maßgeblich</th><th>Aktuell verrechnet</th><th>Ausführbare Erhöhung</th>
+          <th>Frühester Termin</th><th>Status</th>
           <th>Offene Nachweise</th><th>Von</th><th>Am</th>
         </tr>
         {historie_html}
@@ -1925,6 +1952,7 @@ def mieweg_vorschau_erstellen(
     request: Request,
     vertrag_id: str,
     rechtsordnung: str = Form(...),
+    ist_wohnungsnutzung: str = Form(""),
     mrg_zinsbeschraenkung: str = Form(""),
     ist_altvertrag: str = Form(""),
     bezugsjahr: str = Form(""),
@@ -1937,6 +1965,9 @@ def mieweg_vorschau_erstellen(
     vertraglicher_betrag: str = Form(""),
     vertraglicher_quellenbeleg: str = Form(""),
     vertraglicher_termin: str = Form(""),
+    aktuell_verrechneter_betrag: str = Form(""),
+    aktuell_verrechnet_quellenbeleg: str = Form(""),
+    aktuell_verrechnet_stichtag: str = Form(""),
     zustellnachweis_referenz: str = Form(""),
     kommentar: str = Form(""),
     csrf_token: str = Form(...),
@@ -1955,8 +1986,15 @@ def mieweg_vorschau_erstellen(
         vertraglicher_fruehestmoeglicher_termin = (
             date.fromisoformat(vertraglicher_termin) if (vertraglicher_termin or "").strip() else None
         )
+        aktuell_verrechneter_betrag_cent = (
+            parse_eur_betrag(aktuell_verrechneter_betrag) if (aktuell_verrechneter_betrag or "").strip() else None
+        )
+        aktuell_verrechnet_stichtag_datum = (
+            date.fromisoformat(aktuell_verrechnet_stichtag) if (aktuell_verrechnet_stichtag or "").strip() else None
+        )
         _mieweg_vorschau_service.vorschau_erstellen(
             ctx=_ctx(session), vertrag=vertrag, rechtsordnung=rechtsordnung,
+            ist_wohnungsnutzung=bool(ist_wohnungsnutzung),
             mrg_zinsbeschraenkung=bool(mrg_zinsbeschraenkung), ist_altvertrag=bool(ist_altvertrag),
             bezugsjahr=int(bezugsjahr) if (bezugsjahr or "").strip() else None,
             bezugsmonat=int(bezugsmonat) if (bezugsmonat or "").strip() else None,
@@ -1967,6 +2005,9 @@ def mieweg_vorschau_erstellen(
             vertraglich_zulaessiger_betrag_cent=vertraglich_zulaessiger_betrag_cent,
             vertraglicher_quellenbeleg=vertraglicher_quellenbeleg or None,
             vertraglicher_fruehestmoeglicher_termin=vertraglicher_fruehestmoeglicher_termin,
+            aktuell_verrechneter_betrag_cent=aktuell_verrechneter_betrag_cent,
+            aktuell_verrechnet_quellenbeleg=aktuell_verrechnet_quellenbeleg or None,
+            aktuell_verrechnet_stichtag=aktuell_verrechnet_stichtag_datum,
             zustellnachweis_referenz=zustellnachweis_referenz or None, kommentar=kommentar or None,
             akteur=session.user_id,
         )

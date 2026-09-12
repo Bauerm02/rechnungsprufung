@@ -17,8 +17,9 @@ from mietinkasso.mieweg_vorschau.berechnung import (
 )
 
 # ---------------------------------------------------------------------------
-# Dämpfung (über 3 Prozentpunkte nur die Hälfte des übersteigenden Teils,
-# symmetrisch auch bei Deflation)
+# Dämpfung (NUR bei Erhöhung über 3 Prozentpunkte die Hälfte des
+# übersteigenden Teils - KEINE symmetrische Dämpfung bei Senkung/Deflation,
+# siehe Korrektur nach unabhängiger RIS-Primärquellenprüfung, §1 Abs2 Z1)
 # ---------------------------------------------------------------------------
 
 
@@ -35,9 +36,15 @@ def test_daempfung_oberhalb_der_schwelle_halbiert_den_uebersteigenden_teil():
     assert daempfe(Decimal("0.04")) == Decimal("0.035")
 
 
-def test_daempfung_bei_deflation_ist_symmetrisch():
-    # -5% -> -3% - (5%-3%)/2 = -4%
-    assert daempfe(Decimal("-0.05")) == Decimal("-0.04")
+def test_daempfung_bei_deflation_ist_nicht_symmetrisch_volle_senkung():
+    """Korrektur: §1 Abs2 Z1 dämpft nur eine Erhöhung über 3% - für eine
+    Senkung unter -3% gibt es dafür keine Rechtsgrundlage. Eine frühere
+    Fassung halbierte hier fälschlich auch den übersteigenden Teil einer
+    Senkung ("symmetrisch auch bei Deflation"); das ist jetzt korrigiert:
+    die volle, ungedämpfte Senkung wird durchgereicht."""
+
+    assert daempfe(Decimal("-0.05")) == Decimal("-0.05")
+    assert daempfe(Decimal("-0.10")) == Decimal("-0.10")
 
 
 def test_daempfung_senkung_wird_nicht_unbegruendet_auf_null_gekappt():
@@ -204,8 +211,11 @@ def test_uebergangsdeckel_gilt_nicht_ohne_mrg_zinsbeschraenkung():
 
 def test_uebergangsdeckel_gilt_nicht_fuer_negative_veraenderung():
     """Der Deckel ist eine reine Erhöhungsgrenze - eine Senkung im Jahr
-    2025 unterliegt weiterhin der allgemeinen (symmetrischen) Dämpfung,
-    nicht dem 1%-Deckel (der keine Untergrenze für Deflation ist)."""
+    2025 unterliegt weiterhin der allgemeinen Dämpfungsregel, nicht dem
+    1%-Deckel (der keine Untergrenze für Deflation ist). Die allgemeine
+    Regel dämpft aber (Korrektur nach unabhängiger RIS-Prüfung, §1 Abs2
+    Z1) NUR Erhöhungen über 3% - eine Senkung bleibt daher in voller
+    Höhe."""
 
     ergebnis = berechne_gesetzliche_hoechstgrenze(
         mrg_zinsbeschraenkung=True,
@@ -217,7 +227,7 @@ def test_uebergangsdeckel_gilt_nicht_fuer_negative_veraenderung():
     )
     schritt_2025 = next(s for s in ergebnis.jahresschritte if s.jahr == 2025)
     assert schritt_2025.rohe_veraenderung == Decimal("-0.06")
-    assert schritt_2025.gedaempfte_veraenderung == Decimal("-0.045")  # -3% - (6%-3%)/2
+    assert schritt_2025.gedaempfte_veraenderung == Decimal("-0.06")  # volle Senkung, keine Dämpfung
     assert schritt_2025.uebergangsdeckel_angewandt is False
 
 
