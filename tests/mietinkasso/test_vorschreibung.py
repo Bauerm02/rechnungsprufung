@@ -4,7 +4,12 @@ from datetime import date
 
 import pytest
 
-from mietinkasso.domain.exceptions import BindungInkonsistentError, NachweisFehltError, ObjektAusgeschlossenError
+from mietinkasso.domain.exceptions import (
+    BindungInkonsistentError,
+    NachweisFehltError,
+    ObjektAusgeschlossenError,
+    RechtsordnungUngeklaertError,
+)
 from mietinkasso.op.repository import OPRepository
 from mietinkasso.op.service import OPService
 from mietinkasso.vorschreibung.repository import VorschreibungRepository
@@ -58,6 +63,23 @@ def test_vorschreibung_sperrt_objekt_107(vorschreibung_service, stammdaten_repo,
 
     with pytest.raises(ObjektAusgeschlossenError):
         vorschreibung_service.entwurf_erstellen(ctx=ctx_admin, vertrag=vertrag, monat="2026-04")
+
+
+def test_sollstellung_sperrt_bei_ungeklaerter_rechtsordnung(vorschreibung_service, stammdaten_repo, basis_vertrag, ctx_factory):
+    """Ergänzung HV-20260912-ECHTBETRIEB: UNGEKLAERT ist eine gültige,
+    anlegbare Rechtsordnung, blockiert aber die tatsächliche Sollstellung
+    explizit (keine Pflichtkategorie raten)."""
+
+    vertrag, konto = basis_vertrag
+    stammdaten_repo.upsert_vertrag(
+        id=vertrag.id, einheit_id=vertrag.einheit_id, debitor_id=vertrag.debitor_id,
+        gesellschaft_id=vertrag.gesellschaft_id, rechtsordnung="UNGEKLAERT", gueltig_von=vertrag.gueltig_von,
+    )
+    vertrag = stammdaten_repo.get_vertrag(vertrag.id)
+    ctx = ctx_factory("7DI")
+    vorschreibung_service.entwurf_erstellen(ctx=ctx, vertrag=vertrag, monat="2026-04")
+    with pytest.raises(RechtsordnungUngeklaertError):
+        vorschreibung_service.sollstellen(ctx=ctx, vertrag=vertrag, konto=konto, monat="2026-04")
 
 
 def test_kueche_und_parkplatz_sind_in_vorschreibung_enthalten(vorschreibung_service, vertrag_mit_komponenten, ctx_factory):

@@ -81,6 +81,7 @@ _NAV_LINKS = [
     ("/backoffice/bank", "Bankimport"),
     ("/backoffice/bank/unzugeordnet", "Offene Zuordnungen"),
     ("/backoffice/bank/vollstaendigkeit", "Bankvollständigkeit"),
+    ("/backoffice/mahnwesen/policy", "Mahnstufen-Konfiguration"),
 ]
 
 

@@ -110,6 +110,23 @@ class StornierungKonfliktError(MietinkassoError):
     ZWEITE aktive Ersatzzeile für dasselbe Original anzulegen."""
 
 
+class IntakeNichtAnwendbarError(MietinkassoError):
+    """`intake/apply.py::wende_an` wurde mit einem Paket aufgerufen, das
+    bei der (unmittelbar vor dem Schreiben erneut durchgeführten)
+    Prüfung Konflikte oder gesperrte Zeilen enthält (unbekannte
+    Referenz, Objekt 107, abweichender Inhalt derselben ID, oder eine
+    Eröffnungszeile ohne `quelle_bestaetigt: true`). Nichts wird
+    geschrieben - "Ein Fehler => gesamter Lauf unverändert"."""
+
+
+class RechtsordnungUngeklaertError(MietinkassoError):
+    """Ein Vertrag trägt (noch) die Rechtsordnung UNGEKLAERT. Blockiert
+    Sollstellung/Index-Anpassung explizit, statt eine der anderen
+    Kategorien zu raten - Mahnung wird über dieselbe Prüfung als
+    BLOCKIERT ausgewiesen (siehe `mahnwesen/service.py::plane_forderung`,
+    das keine Exception wirft, sondern ein PlanungsErgebnis liefert)."""
+
+
 class ObjektAusgeschlossenError(MietinkassoError):
     """Objekt 107 (Sieben Dörfer) is explicitly out of scope for the pilot.
     Enforced centrally (Konto -> Vertrag -> Einheit -> Objekt) on every

@@ -35,7 +35,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
-from mietinkasso.domain.enums import MahnStatus, MahnStufe
+from mietinkasso.domain.enums import MahnStatus, MahnStufe, rechtsordnung_geklaert
 from mietinkasso.domain.exceptions import BindungInkonsistentError, MahnstufeReihenfolgeError
 from mietinkasso.infrastructure.db.tables import KontoTable, MahnFallTable, MahnPolicyTable, VertragTable
 from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
@@ -133,6 +133,13 @@ class MahnwesenService:
             raise PolicyNichtFreigegebenError(
                 f"MahnPolicy Version {policy.version} ist im Status {policy.status}; nur eine FREIGEGEBENE "
                 "Policy darf Mahnfälle planen."
+            )
+
+        if not rechtsordnung_geklaert(vertrag.rechtsordnung):
+            return PlanungsErgebnis(
+                "BLOCKIERT", None, None, forderung.op_position_id,
+                "Rechtsordnung des Vertrags ist UNGEKLAERT; Mahnung gesperrt, bis die rechtliche "
+                "Einordnung feststeht.",
             )
 
         aktive_sperren = self._stammdaten_repository.aktive_sperren(vertrag.id)
@@ -281,6 +288,10 @@ class MahnwesenService:
             return VersandErgebnis("BEREITS_VERARBEITET", f"Status ist bereits {mahnfall.status}; kein Doppelversand.")
 
         self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
+
+        if not rechtsordnung_geklaert(vertrag.rechtsordnung):
+            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
+            return VersandErgebnis("BLOCKIERT", "Rechtsordnung des Vertrags ist UNGEKLAERT.")
 
         aktive_sperren = self._stammdaten_repository.aktive_sperren(vertrag.id)
         if aktive_sperren:

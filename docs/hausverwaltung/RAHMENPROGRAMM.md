@@ -311,3 +311,66 @@ Punkte in `docs/hausverwaltung/OFFENE_PUNKTE.md`.
   `quelle_bestaetigt`-Pflicht auf Eröffnungsebene sowie die bereits
   bestehende Sperren-Tabelle abgedeckt — kein neues, unbelegtes
   Fachkonzept erfunden.
+
+## Ergänzung zu HV-20260912-ECHTBETRIEB (wortgetreu, 12.09.2026)
+
+> Generische Schema-Ergänzungen, ausschließlich synthetische
+> Anforderungen: 1. Rechtsordnung UNGEKLAERT zulassen, daraus explizite
+> Mahn-/Index-/Sollstellungssperre. Keine Pflichtkategorie raten. 2.
+> Intake muss optionale Prüfhinweise/Sperren pro Vertrag dauerhaft
+> speichern und Backoffice anzeigen, etwa RECHTSANWALT/RATENPLAN/MANUELL
+> für ungeklärte Vertrags-/Kontaktfreigabe. 3. Synthetisches Beispiel:
+> Original-Gesamtsaldo zu Monatsende enthält eine nachweislich fehlende
+> Zahlung nicht; tatsächliches Zahlungsdatum liegt VOR dem
+> Eröffnungsstichtag. Eine ausdrücklich belegte Eröffnungskorrektur
+> braucht deshalb eigenes Flag/Grund/Quell-ID und muss
+> Original-Belegdatum bewahren, Buchungsdatum ist Übernahmetag. Nicht
+> Altjournal allgemein freigeben. Originalsaldo plus ergänzende Zahlung
+> nachvollziehbar; idempotent, keine Doppelerfassung. 4. Bitte optionale
+> Vertragskomponenten über denselben atomaren Intake aufnehmen
+> (bestehende Tabelle/Service; keine Indexfreigabe), damit HMZ/Küche/
+> Parkplatz/BK auseinander lesbar bleiben. Schemaänderungen
+> dokumentieren. Keine echten Daten in dieser Nachricht, keine
+> produktiven Funktionstests.
+
+### Umsetzung/Konkretisierungen (diese Ergänzung)
+
+- **Rechtsordnung UNGEKLAERT ist ein neuer Enumwert, kein neues Feld**
+  (`domain/enums.py::Rechtsordnung.UNGEKLAERT`). Die drei Sperren
+  (Mahnung/Index/Sollstellung) laufen über eine EINZIGE gemeinsame
+  Prüffunktion (`domain/enums.py::rechtsordnung_geklaert`), damit sie
+  nicht unabhängig voneinander (und potenziell inkonsistent) je
+  Aufrufer neu formuliert werden. Mahnung liefert `BLOCKIERT` (bestehende
+  Ergebnis-statt-Exception-Konvention von `plane_forderung`/`versenden`);
+  Index/Sollstellung werfen `RechtsordnungUngeklaertError`, da diese
+  Methoden bereits an anderer Stelle Exceptions werfen.
+- **Sperren nutzen die bestehende `SperreTable`, keinen neuen
+  Mechanismus:** `mahnwesen/service.py` wertete `aktive_sperren` schon
+  vor dieser Ergänzung als harte Mahnsperre aus. Der Intake bekommt nur
+  einen neuen, additiven Einspielweg dafür (`sperren[]`) plus
+  Sichtbarkeit im Kontoauszug des Backoffice. Eine Sperre AUFHEBEN
+  bleibt bewusst ein manueller Backoffice-Schritt, nicht Teil des
+  Intakes (sonst könnte ein Re-Import versehentlich eine bewusst
+  gesetzte Sperre stillschweigend entfernen).
+- **Eröffnungskorrektur reicht KEIN neues Altjournal-Tor:** Sie ist eine
+  eigene Methode (`op/service.py::eroeffnungskorrektur_buchen`), nicht
+  eine Lockerung von `pruefe_kein_altjournal_in_gesamtsaldo` — eine
+  gewöhnliche Nachbuchung mit Belegdatum vor/auf dem Gesamtsaldo-
+  Stichtag bleibt weiterhin ein harter Konflikt. Das "eigene Flag"
+  wird bewusst NICHT als neue Bool-Spalte umgesetzt, sondern über den
+  bereits vorhandenen `quelle_system`-Wert `"eroeffnungskorrektur"`
+  (eindeutig unterscheidbar von `"intake_import"`/`"backoffice"`/...);
+  `grund` landet im bereits vorhandenen `aenderungsgrund`-Feld,
+  `quelle_referenz` wird Teil der `beleg_referenz`. Kein Schema-Migrationsbedarf.
+  `belegdatum` bleibt das echte historische Datum, `buchungsdatum` wird
+  vom Aufrufer (`intake/apply.py::wende_an`, neuer optionaler
+  `heute`-Parameter) auf den Übernahmetag gesetzt, nie aus der Datei
+  übernommen.
+- **Vertragskomponenten nutzen `add_komponente` unverändert als reines
+  Insert**, keine neue Upsert-Semantik am bestehenden Service — die
+  Replay-/Konfliktlogik ("gleiche ID = No-Op, geänderte ID = Konflikt")
+  läuft komplett im Intake-Planer/-Apply (Hash-Vergleich vor dem
+  Schreiben), analog zu den übrigen Stammdaten-Entitäten. `indexierbar`
+  bleibt reines Eignungsflag für `index/service.py`; der Intake ruft an
+  keiner Stelle `IndexService` auf — "keine Indexfreigabe" ist damit
+  strukturell erzwungen, nicht nur dokumentiert.

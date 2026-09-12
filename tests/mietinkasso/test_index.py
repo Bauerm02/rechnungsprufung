@@ -10,6 +10,7 @@ from mietinkasso.domain.exceptions import (
     CrossTenantError,
     IndexKlauselFehltError,
     ObjektAusgeschlossenError,
+    RechtsordnungUngeklaertError,
     RechtsprofilNichtImplementiertError,
 )
 from mietinkasso.domain.money import round_index_half_cent_down
@@ -36,6 +37,45 @@ def test_fehlende_klausel_blockiert_erhoehung(index_service, basis_vertrag, ctx_
     with pytest.raises(IndexKlauselFehltError):
         index_service.berechne_vorschlag(
             ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"), quelle_referenz="VPI"
+        )
+
+
+def test_klausel_anlegen_sperrt_bei_ungeklaerter_rechtsordnung(index_service, stammdaten_repo, basis_vertrag, ctx_factory):
+    vertrag, _ = basis_vertrag
+    stammdaten_repo.upsert_vertrag(
+        id=vertrag.id, einheit_id=vertrag.einheit_id, debitor_id=vertrag.debitor_id,
+        gesellschaft_id=vertrag.gesellschaft_id, rechtsordnung="UNGEKLAERT", gueltig_von=vertrag.gueltig_von,
+    )
+    ctx = ctx_factory("7DI")
+    with pytest.raises(RechtsordnungUngeklaertError):
+        index_service.klausel_anlegen(
+            ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+            berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+            basis_reihe="VPI2020", basis_wert=Decimal("100.0"), basis_monat="2024-01",
+        )
+
+
+def test_berechne_vorschlag_sperrt_wenn_rechtsordnung_nachtraeglich_ungeklaert_wird(index_service, stammdaten_repo, basis_vertrag, ctx_factory):
+    """Eine bereits freigegebene Klausel darf keine neue Berechnung mehr
+    auslösen, wenn der Vertrag NACHTRÄGLICH (z. B. wegen eines
+    aufkommenden Rechtsstreits) auf UNGEKLAERT reklassifiziert wird."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    klausel = index_service.klausel_anlegen(
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+        basis_reihe="VPI2020", basis_wert=Decimal("100.0"), basis_monat="2024-01",
+    )
+    index_service.klausel_freigeben(klausel.id, ctx=ctx, freigegeben_von="markus")
+
+    stammdaten_repo.upsert_vertrag(
+        id=vertrag.id, einheit_id=vertrag.einheit_id, debitor_id=vertrag.debitor_id,
+        gesellschaft_id=vertrag.gesellschaft_id, rechtsordnung="UNGEKLAERT", gueltig_von=vertrag.gueltig_von,
+    )
+    with pytest.raises(RechtsordnungUngeklaertError):
+        index_service.berechne_vorschlag(
+            ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"), quelle_referenz="VPI",
         )
 
 

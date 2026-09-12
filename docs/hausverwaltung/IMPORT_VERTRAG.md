@@ -61,11 +61,13 @@ Zwei gleichwertige Eingabeformen:
 
 1. **Eine JSON-Datei** mit den unten stehenden Feldern (empfohlen für
    Codex' Mapping-Skript — ein Objekt, keine Zeilenstreams).
-2. **Ein CSV-Bündel** — bis zu 7 einzelne CSV-Dateien in einem
+2. **Ein CSV-Bündel** — bis zu 10 einzelne CSV-Dateien in einem
    Verzeichnis, mit exakt diesen Dateinamen:
    `gesellschaften.csv`, `objekte.csv`, `einheiten.csv`,
    `debitoren.csv`, `vertraege.csv`, `eroeffnungen.csv`,
-   `nachbuchungen.csv`. Fehlende Dateien = leere Liste für diesen Typ.
+   `nachbuchungen.csv`, `eroeffnungskorrekturen.csv`, `sperren.csv`,
+   `komponenten.csv` (die letzten drei siehe "Ergänzung 12.09.2026"
+   unten). Fehlende Dateien = leere Liste für diesen Typ.
    Spaltennamen entsprechen 1:1 den JSON-Feldnamen unten; Werte sind
    Text (Zahlen/Daten wie im JSON-Beispiel, also `2026-08-31`,
    `150000`, `true`/`false`).
@@ -159,6 +161,110 @@ abweichendem Betrag/Stichtag sind ein Konflikt.
 | `aenderungsgrund` | str\|null | nein | |
 | `leistungsperiode` | str\|null (`YYYY-MM`) | nein | |
 
+## Ergänzung 12.09.2026: vier zusätzliche, optionale Entitätstypen
+
+Nach Beginn des Mappings ausdrücklich als generische, weiterhin rein
+synthetisch getestete Erweiterung nachgetragen — kein neuer Vertrag,
+sondern eine Fortschreibung desselben. Alle vier sind optional (leere/
+fehlende Liste = kein Effekt) und laufen über denselben atomaren
+`plan`/`apply`-Zyklus wie die bestehenden Entitätstypen.
+
+### `rechtsordnung: "UNGEKLAERT"` (kein neues Feld, ein neuer gültiger Wert)
+
+Die `Rechtsordnung`-Enum hat einen neuen Wert `UNGEKLAERT` — bewusst
+STATT eine der bestehenden Kategorien zu erraten, wenn die rechtliche
+Einordnung eines Vertrags beim Import noch nicht feststeht. Ein Vertrag
+mit `rechtsordnung: "UNGEKLAERT"` wird ganz normal angelegt (kein
+Sperrgrund, nur ein Hinweiszähler im Plan), ist aber ab sofort
+technisch gesperrt für:
+
+- **Sollstellung** (`vorschreibung/service.py::sollstellen` wirft
+  `RechtsordnungUngeklaertError`),
+- **Index-Anpassung** (`index/service.py::klausel_anlegen`/
+  `berechne_vorschlag` wirft dieselbe Exception),
+- **Mahnung** (`mahnwesen/service.py::plane_forderung`/`versenden`
+  liefert `BLOCKIERT` — kein Wurf, da diese Methoden generell Ergebnisse
+  statt Exceptions liefern).
+
+Sobald die Rechtsordnung geklärt ist, hebt ein erneuter Intake-Lauf mit
+demselben `vertrag_id` und der korrekten Rechtsordnung die Sperre auf
+(gewöhnlicher Stammdaten-Upsert, kein Sonderpfad nötig).
+
+### `sperren[]` — dauerhafte Prüfhinweise/Sperrgründe je Vertrag
+
+Nutzt die BESTEHENDE `SperreTable`/`StammdatenRepository.aktive_sperren`,
+die `mahnwesen/service.py` bereits als harte Mahnsperre auswertet — kein
+neuer Sperrmechanismus, nur ein neuer Einspielweg dafür.
+
+| Feld | Typ | Pflicht | Hinweis |
+|---|---|---|---|
+| `vertrag_id` | str | ja | muss im Paket oder in der DB existieren |
+| `grund` | str | ja | ein Wert der `Sperrgrund`-Enum, z. B. `RECHTSANWALT`\|`RATENPLAN`\|`MANUELL`\|`INSOLVENZ`\|... |
+| `kommentar` | str\|null | nein | |
+
+Idempotenz: eine bereits AKTIVE Sperre mit identischem `(vertrag_id,
+grund, kommentar)` ist ein wirkungsloser Replay (`UNVERAENDERT`); eine
+inhaltlich andere Sperre (anderer `grund` oder `kommentar`) ist eine
+ZUSÄTZLICHE, eigenständige Sperre (additiver Fakt, kein Ersatz) — kein
+Konflikt, da mehrere gleichzeitig aktive Sperren je Vertrag fachlich
+normal sind. Ein Aufheben einer Sperre ist NICHT Teil dieses Intakes
+(bleibt ein manueller Backoffice-Schritt, `sperre_aufheben`). Im
+Backoffice sichtbar im Kontoauszug jedes betroffenen Vertrags.
+
+### `komponenten[]` — optionale Vertragskomponenten (HMZ/Küche/Parkplatz/BK-VZ)
+
+Nutzt die BESTEHENDE `VertragsKomponenteTable`/
+`StammdatenRepository.add_komponente` (dieselbe, die auch
+`importtemplates/README.md`/die manuelle Zinslisten-Pflege benutzt).
+
+| Feld | Typ | Pflicht | Hinweis |
+|---|---|---|---|
+| `id` | str | ja | eigener ID-Raum |
+| `vertrag_id` | str | ja | |
+| `art` | str | ja | z. B. `HMZ`\|`KUECHE`\|`PARKPLATZ`\|`BK_VORAUSZAHLUNG` |
+| `bezeichnung` | str | ja | |
+| `betrag_cent` | int | ja | |
+| `gueltig_von` | Datum | ja | |
+| `ust_satz_promille` | int | nein (default `10000`) | |
+| `indexierbar` | bool | nein (default `false`) | reines Eignungsflag für `index/service.py` — **löst für sich genommen KEINE Indexklausel/-freigabe aus** |
+| `gueltig_bis` | Datum\|null | nein | |
+
+Idempotenz wie bei den Stammdaten-Entitäten (Hash-Vergleich über die
+`id`): identischer Inhalt = `UNVERAENDERT`, abweichender Inhalt = harter
+Konflikt (gesamter Lauf verweigert) — Komponenten werden nie
+stillschweigend überschrieben.
+
+### `eroeffnungskorrekturen[]` — nachweislich im Gesamtsaldo fehlender Posten
+
+Schmaler Sonderfall für GENAU EINE Situation: der bereits bestätigte
+Eröffnungs-Gesamtsaldo (`quelle_bestaetigt: true`) enthält nachweislich
+einen Posten NICHT, weil dessen tatsächliches Datum vor/auf dem
+Eröffnungsstichtag liegt (Beispiel: eine Zahlung wurde beim
+Stichtags-Export übersehen). Dies ist AUSDRÜCKLICH kein allgemeines
+Altjournal-Tor — eine gewöhnliche `nachbuchungen[]`-Zeile mit Belegdatum
+vor/auf dem Stichtag bleibt weiterhin ein harter Konflikt
+(`pruefe_kein_altjournal_in_gesamtsaldo`).
+
+| Feld | Typ | Pflicht | Hinweis |
+|---|---|---|---|
+| `import_id` | str | ja | Quell-ID für Idempotenz |
+| `vertrag_id` | str | ja | muss bereits (im Paket oder in der DB) eine bestätigte `GESAMTSALDO`-Eröffnung haben, sonst Konflikt |
+| `typ` | str | ja | `SOLL`\|`GUTSCHRIFT`\|`ZAHLUNG`\|`RUECKLASTSCHRIFT` |
+| `betrag_cent` | int | ja | |
+| `original_belegdatum` | Datum | ja | das ECHTE historische Datum — bleibt bewahrt, wird NICHT auf den Übernahmetag verschoben |
+| `grund` | str | ja | Pflichtangabe, kein Platzhalter |
+| `quelle_referenz` | str | ja | Pflichtangabe (z. B. Bankbeleg-/Belegnummer), kein Platzhalter |
+| `beleg_referenz` | str | nein (default `"Eröffnungskorrektur"`) | |
+
+**`buchungsdatum` steht NICHT in der Datei** — es ist immer der
+Übernahmetag (Zeitpunkt des `apply`-Laufs), niemals das historische
+Datum (`op_service.eroeffnungskorrektur_buchen`). `quelle_system` der
+entstehenden Zeile ist fix `"eroeffnungskorrektur"` — das ist das
+geforderte eigene Flag; `grund` landet in `aenderungsgrund`. Original-
+Eröffnungssaldo und Korrektur bleiben beide als getrennte, sichtbare
+Zeilen im Kontoauszug nachvollziehbar (keine In-Place-Änderung der
+Eröffnung). Idempotenz über `import_id` wie bei `nachbuchungen[]`.
+
 ## JSON-Beispiel (rein synthetisch)
 
 ```json
@@ -233,12 +339,18 @@ python scripts/intake_import.py apply \
   `import_id`, abweichender Inhalt), `quelle_bestaetigt` fehlt oder
   `false` bei einer Eröffnungszeile, widersprüchlicher
   Eröffnungsmodus/Doppelbuchung, Nachbuchung mit Belegdatum vor/auf dem
-  Gesamtsaldo-Stichtag desselben Kontos.
+  Gesamtsaldo-Stichtag desselben Kontos, eine `eroeffnungskorrekturen[]`-
+  Zeile ohne bereits bestätigte `GESAMTSALDO`-Eröffnung desselben
+  Vertrags, eine `sperren[]`-Zeile mit ungültigem `grund` (kein
+  `Sperrgrund`-Enumwert), eine `komponenten[]`-Zeile zu einem
+  ausgeschlossenen Objekt.
 - **Sichtbare Hinweise (blockieren NICHT, weil das bestehende System sie
   bereits sicher behandelt):** fehlende `faelligkeit` (Position bleibt
   sichtbar, wird nie automatisch gemahnt), fehlende Debitor-`email`
-  (Vertrag bleibt anlegbar, wird nie automatisch gemahnt). Der Plan
-  zählt beides aus und weist es aus — keine stille Weglassung.
+  (Vertrag bleibt anlegbar, wird nie automatisch gemahnt), Vertrag mit
+  `rechtsordnung: "UNGEKLAERT"` (anlegbar, aber technisch von Mahnung/
+  Index/Sollstellung gesperrt — siehe Ergänzung oben). Der Plan zählt
+  alle drei aus und weist sie aus — keine stille Weglassung.
 
 ## Status
 

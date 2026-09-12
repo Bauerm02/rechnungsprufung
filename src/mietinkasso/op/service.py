@@ -221,6 +221,90 @@ class OPService:
                     f"{konto.eroeffnung_stichtag} und ist darin bereits enthalten."
                 )
 
+    def eroeffnungskorrektur_buchen(
+        self,
+        *,
+        ctx: AuthContext,
+        konto: KontoTable,
+        typ: OPTyp,
+        betrag_cent: int,
+        original_belegdatum: date,
+        uebernahmetag: date,
+        grund: str,
+        quelle_referenz: str,
+        import_id: str,
+        beleg_referenz: str = "Eröffnungskorrektur",
+        session: Session | None = None,
+    ) -> OPPositionTable:
+        """Schmaler Sonderpfad für GENAU EINEN Fall (Auftrag
+        HV-20260912-ECHTBETRIEB, Ergänzung): der bestätigte
+        Eröffnungs-Gesamtsaldo enthält nachweislich einen Posten NICHT
+        (z. B. eine Zahlung, deren tatsächliches Datum vor dem
+        Eröffnungsstichtag liegt), und das muss NACHTRÄGLICH belegt
+        korrigiert werden - OHNE das allgemeine Altjournal-Tor
+        (`pruefe_kein_altjournal_in_gesamtsaldo`) für gewöhnliche
+        Nachbuchungen zu öffnen. Deshalb:
+
+        - nur für ein Konto zulässig, das bereits mit GESAMTSALDO eröffnet
+          wurde (bei EINZEL_OP gibt es kein "im Saldo bereits enthalten" -
+          dort ist eine gewöhnliche `buchen()`-Nachbuchung der richtige Weg);
+        - `original_belegdatum` bleibt das ECHTE, historische Datum (bewahrt,
+          nicht verschoben) und darf/soll auf/vor dem Eröffnungsstichtag
+          liegen - genau das ist der Zweck dieses Pfads;
+        - `buchungsdatum` der entstehenden Zeile ist immer `uebernahmetag`
+          (der Tag DIESER Korrekturbuchung), nie das historische Datum;
+        - `grund` und `quelle_referenz` sind Pflichtangaben (kein
+          Platzhalter) und werden als `aenderungsgrund` bzw. Teil des
+          `beleg_referenz`-Textes gespeichert; `quelle_system` trägt den
+          festen Wert "eroeffnungskorrektur" - das IST das geforderte
+          eigene Flag (eine eigene Bool-Spalte wäre hier nur eine weitere
+          Bezeichnung für dieselbe Unterscheidung);
+        - Idempotenz/Doppelbuchungsschutz laufen exakt wie bei jeder
+          anderen Buchung über `import_id` + Content-Hash
+          (`OPRepository.insert_idempotent`) - ein Replay derselben
+          `import_id` mit identischem Inhalt ist ein No-Op, ein abweichender
+          Inhalt derselben `import_id` ein Konflikt."""
+
+        require_gesellschaft_access(ctx, konto.gesellschaft_id)
+        require_schreibrecht(ctx)
+        self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(konto, session=session)
+        if not (grund or "").strip():
+            raise ValueError("Eröffnungskorrektur ohne 'grund' ist nicht zulässig.")
+        if not (quelle_referenz or "").strip():
+            raise ValueError("Eröffnungskorrektur ohne 'quelle_referenz' ist nicht zulässig.")
+        if konto.eroeffnung_modus != "GESAMTSALDO":
+            raise DoppelteEroeffnungsartError(
+                f"Konto {konto.id}: Eröffnungskorrektur setzt eine bereits mit GESAMTSALDO eröffnete "
+                f"Eröffnung voraus (aktueller Modus: {konto.eroeffnung_modus})."
+            )
+        content_hash = compute_content_hash(
+            {
+                "konto_id": konto.id,
+                "modus": "EROEFFNUNGSKORREKTUR",
+                "typ": typ.value,
+                "betrag_cent": betrag_cent,
+                "original_belegdatum": str(original_belegdatum),
+                "grund": grund,
+                "quelle_referenz": quelle_referenz,
+            }
+        )
+        row = OPPositionTable(
+            konto_id=konto.id,
+            typ=typ.value,
+            betrag_cent=betrag_cent,
+            leistungsperiode=None,
+            belegdatum=original_belegdatum,
+            buchungsdatum=uebernahmetag,
+            faelligkeit=None,
+            faelligkeit_bekannt=False,
+            beleg_referenz=f"{beleg_referenz} (Quelle: {quelle_referenz})",
+            aenderungsgrund=grund,
+            quelle_hash=content_hash,
+            import_id=import_id,
+            quelle_system="eroeffnungskorrektur",
+        )
+        return self._op_repository.insert_idempotent(row, session=session)
+
     # -- Nachbuchung / Vorschreibung / Zahlung ---------------------------
     def buchen(
         self,

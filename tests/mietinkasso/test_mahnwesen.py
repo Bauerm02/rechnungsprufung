@@ -108,6 +108,22 @@ def test_aktive_sperre_blockiert_mahnung(mahn_service, op_service, stammdaten_re
     assert "RATENPLAN" in ergebnis.grund
 
 
+def test_ungeklaerte_rechtsordnung_blockiert_mahnung(mahn_service, op_service, stammdaten_repo, basis_vertrag, ctx_factory, freigegebene_policy):
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    _mit_faelligem_soll(op_service, konto, ctx)
+    stammdaten_repo.upsert_vertrag(
+        id=vertrag.id, einheit_id=vertrag.einheit_id, debitor_id=vertrag.debitor_id,
+        gesellschaft_id=vertrag.gesellschaft_id, rechtsordnung="UNGEKLAERT", gueltig_von=vertrag.gueltig_von,
+    )
+    vertrag = stammdaten_repo.get_vertrag(vertrag.id)
+    forderung = _einzige_forderung(op_service, konto, date(2026, 4, 20))
+
+    ergebnis = _planen(mahn_service, ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung, policy=freigegebene_policy, heute=date(2026, 4, 20))
+    assert ergebnis.status == "BLOCKIERT"
+    assert "UNGEKLAERT" in ergebnis.grund
+
+
 def test_veraltete_bank_blockiert_mahnung(mahn_service, op_service, basis_vertrag, ctx_factory, freigegebene_policy):
     vertrag, konto = basis_vertrag
     ctx = ctx_factory("7DI")
@@ -335,6 +351,27 @@ def test_bankstand_veraltet_bei_versand_stoppt_auch_wenn_bei_planung_frisch(mahn
     ergebnis = _versenden(
         mahn_service, ctx=ctx, mahnfall_id=geplant.mahnfall_id, heute=date(2026, 4, 20), bankstand_alter_tage=5,
         send_enabled=True, versand_fn=lambda snapshot: (_ for _ in ()).throw(AssertionError("darf nicht aufgerufen werden")),
+    )
+    assert ergebnis.status == "BLOCKIERT"
+
+
+def test_rechtsordnung_wird_ungeklaert_nach_planung_stoppt_versand(mahn_service, op_service, stammdaten_repo, basis_vertrag, ctx_factory, freigegebene_policy):
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    _mit_faelligem_soll(op_service, konto, ctx)
+    geplant = _planen(
+        mahn_service, ctx=ctx, vertrag=vertrag, konto=konto,
+        forderung=_einzige_forderung(op_service, konto, date(2026, 4, 20)), policy=freigegebene_policy, heute=date(2026, 4, 20),
+    )
+    assert geplant.status == "GEPLANT"
+
+    stammdaten_repo.upsert_vertrag(
+        id=vertrag.id, einheit_id=vertrag.einheit_id, debitor_id=vertrag.debitor_id,
+        gesellschaft_id=vertrag.gesellschaft_id, rechtsordnung="UNGEKLAERT", gueltig_von=vertrag.gueltig_von,
+    )
+    ergebnis = _versenden(
+        mahn_service, ctx=ctx, mahnfall_id=geplant.mahnfall_id, heute=date(2026, 4, 20), send_enabled=True,
+        versand_fn=lambda snapshot: (_ for _ in ()).throw(AssertionError("darf nicht aufgerufen werden")),
     )
     assert ergebnis.status == "BLOCKIERT"
 

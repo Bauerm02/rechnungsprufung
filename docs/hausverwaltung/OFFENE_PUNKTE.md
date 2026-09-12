@@ -4,6 +4,80 @@ Stand: lokaler synthetischer Backoffice-Pilot, 11.09.2026; keine Produktionsfrei
 Alles hier ist bewusst offen gelassen bzw. bewusst konservativ gebaut —
 keine stillschweigend übersprungenen Punkte.
 
+## Echtbetrieb-Intake (HV-20260912-ECHTBETRIEB, 12.09.2026)
+
+- **Quellenmapping bleibt vollständig bei Codex:** `src/mietinkasso/intake/`
+  + `scripts/intake_import.py` implementieren NUR den generischen
+  Schnittstellenvertrag (`docs/hausverwaltung/IMPORT_VERTRAG.md`) — die
+  Zuordnung der realen Quelldokumente (Deb-/Kred-/Sachkontensalden,
+  Journal, Stammblätter, Zinslisten, Kaution, Verträge) auf dieses
+  Schema ist NICHT Teil dieser Codebasis und ausdrücklich Codex'
+  Aufgabe. Kein Test in diesem Repository prüft echte Quelldateien.
+- **Rechtsordnung UNGEKLAERT ist erlaubt, aber sperrt drei Wege:** ein
+  Vertrag mit `rechtsordnung: "UNGEKLAERT"` ist anlegbar, aber technisch
+  von Sollstellung (`vorschreibung/service.py`), Index-Anpassung
+  (`index/service.py`) und Mahnung (`mahnwesen/service.py`) gesperrt
+  (`domain/enums.py::rechtsordnung_geklaert`). Das Aufheben dieser Sperre
+  passiert automatisch, sobald ein späterer Import/eine spätere manuelle
+  Korrektur eine der anderen `Rechtsordnung`-Kategorien setzt — es gibt
+  keine eigene "Freigabe"-Aktion dafür.
+- **Sperren (`sperren[]`) sind additiv, ein Aufheben ist NICHT Teil des
+  Intakes:** eine über den Intake gesetzte Sperre (RECHTSANWALT/
+  RATENPLAN/MANUELL/...) bleibt aktiv, bis sie MANUELL im Backoffice
+  aufgehoben wird (`StammdatenRepository.sperre_aufheben`) — dafür gibt
+  es aktuell noch keine eigene Backoffice-Bedienoberfläche (nur die
+  Anzeige im Kontoauszug), nur den bestehenden Repository-Aufruf.
+- **Eröffnungskorrektur ist bewusst schmal geschnitten:** der neue Pfad
+  (`op/service.py::eroeffnungskorrektur_buchen`, Intake-Entität
+  `eroeffnungskorrekturen[]`) deckt GENAU den Fall "im bestätigten
+  Gesamtsaldo nachweislich fehlender Posten mit Datum vor/auf dem
+  Stichtag" ab. Er ersetzt/erweitert nicht die Möglichkeit, eine bereits
+  eingespielte EINZEL_OP-Eröffnung nachträglich zu korrigieren (dafür
+  bleibt `storniere_und_korrigiere` der richtige Weg) und öffnet kein
+  allgemeines Altjournal-Tor für Gesamtsaldo-Konten.
+- **Vertragskomponenten-Intake (`komponenten[]`) ersetzt keinen echten
+  Zinslisten-Parser:** wie schon vor dieser Ergänzung dokumentiert
+  (siehe "Zinslisten-Import" unten) bleibt das automatische Einlesen
+  eines realen Zinslisten-Exportformats offen; der Intake nimmt nur
+  bereits einzeln aufbereitete Komponentenzeilen entgegen.
+- **Mahnstufen-Konfiguration im Backoffice** (`/backoffice/mahnwesen/policy`)
+  erlaubt das Anlegen/Freigeben neuer `MahnPolicy`-Versionen mit genau
+  zwei Stufenparametern (Tage nach Fälligkeit / Mindestabstand nach
+  Stufe1); Zinsen/Gebühren sind serverseitig hart auf 0 erzwungen (kein
+  Formularfeld akzeptiert einen anderen Wert). Es gibt keine Möglichkeit,
+  eine bereits FREIGEGEBENE Policy-Version zu deaktivieren/zurückzuziehen
+  — nur eine NEUE Version anzulegen und freizugeben (bestehendes
+  Verhalten von `MahnPolicyRepository`, hier nur sichtbar gemacht).
+
+## Deployment-Paket (HV-20260912-ECHTBETRIEB, Punkt 3) — Vorlage, keine Produktivfreigabe
+
+`docs/hausverwaltung/DEPLOYMENT_HETZNER.md` +
+`docs/hausverwaltung/deploy/` liefern ein Vorlagen-/Beispielpaket
+(Env-Datei-Struktur, systemd-Unit, Caddy-Snippet) für Codex' eigene
+Integration auf dem bestehenden Hetzner-Server — Claude greift nie auf
+den Server zu, deployt nie, und nichts davon wurde gegen den echten
+Server getestet. Konkret offen/einzuhalten:
+
+- **Genau EIN Worker-Prozess ist Pflicht, nicht optional:** der
+  In-Memory-Login-Session-Store verträgt keinen Mehrprozessbetrieb (
+  siehe "Kein Mehrbenutzer-Onlinebetrieb" unten). Ein `--workers`-Wert
+  >1 oder ein zweiter parallel laufender Prozess auf demselben Socket
+  ist ein Betriebsfehler, kein unterstützter Skalierungsweg.
+- **Sichere Cookies verlangen echtes TLS:** `MIETINKASSO_BACKOFFICE_COOKIE_SECURE=true`
+  (Produktionsdefault) setzt voraus, dass Caddy tatsächlich HTTPS
+  terminiert; ohne TLS meldet sich niemand mehr erfolgreich an (kein
+  Fallback, bewusst "der sicherere Fehler").
+- **Eigene Domain/eigener Login, keine Unterroute des CEO-Cockpits:**
+  wie in RAHMENPROGRAMM.md (Ergänzung 12.09.2026) und der
+  Steuerungsnachricht vom selben Tag festgehalten — der bestehende
+  Cockpit-Login (bcrypt + signierte Host-Cookies, kein SSO) wird nicht
+  wiederverwendet, dieses Modul bringt seinen eigenen PBKDF2-Login mit.
+- **Caddy/DNS/TLS-Zertifikate, Firewall-Härtung, Monitoring über
+  `/health` hinaus** sind ausdrücklich NICHT Teil dieses Repos, sondern
+  Codex' eigene Serverintegration.
+- **Kein realer Produktionsstart wurde durchgeführt** — dieses Paket ist
+  ungeprüfte Vorlage, bis Codex es gegen den echten Server verifiziert.
+
 ## Backoffice-Pilot (diese Runde) — technisch gesperrt, nicht nur dokumentiert
 
 - **Kein Mehrbenutzer-Onlinebetrieb:** EIN lokaler Login

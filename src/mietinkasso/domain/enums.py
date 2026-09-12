@@ -97,6 +97,24 @@ class Rechtsordnung(str, enum.Enum):
     OESTERREICH_WGG = "OESTERREICH_WGG"
     OESTERREICH_GEWERBE = "OESTERREICH_GEWERBE"
     DEUTSCHLAND = "DEUTSCHLAND"
+    # Bewusst kein Rateversuch: eine noch nicht geklärte rechtliche
+    # Einordnung wird explizit als UNGEKLAERT erfasst statt eine der
+    # anderen Kategorien zu raten. Ein Vertrag mit dieser Rechtsordnung
+    # bleibt stammdatenseitig anlegbar, ist aber technisch von
+    # Mahnung, Index-Anpassung und Sollstellung gesperrt (siehe
+    # `stammdaten/repository.py`, `mahnwesen/service.py`,
+    # `index/service.py`, `vorschreibung/service.py`).
+    UNGEKLAERT = "UNGEKLAERT"
+
+
+def rechtsordnung_geklaert(rechtsordnung: str) -> bool:
+    """Zentrale Prüfung, die von `vorschreibung/service.py::sollstellen`,
+    `index/service.py::klausel_anlegen`/`berechne_vorschlag` und
+    `mahnwesen/service.py::plane_forderung` gleichermaßen benutzt wird,
+    damit die drei Sperren nicht unabhängig voneinander (und potenziell
+    inkonsistent) je Aufrufer neu formuliert werden."""
+
+    return rechtsordnung != Rechtsordnung.UNGEKLAERT.value
 
 
 class Rolle(str, enum.Enum):

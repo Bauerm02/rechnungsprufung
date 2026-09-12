@@ -32,6 +32,7 @@ Mehrbenutzer-Onlinebetrieb). Jede POST-Route verlangt ein gültiges
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from html import escape as h
 
 from fastapi import APIRouter, Cookie, Depends, File, Form, HTTPException, Request, UploadFile
@@ -169,7 +170,8 @@ def login_absenden(username: str = Form(...), password: str = Form(...)) -> Redi
     session_id, _csrf = _sessions.erstellen(username)
     response = RedirectResponse(url="/backoffice/", status_code=303)
     response.set_cookie(
-        _COOKIE_NAME, session_id, httponly=True, samesite="lax", max_age=_settings.backoffice_session_ttl_minuten * 60,
+        _COOKIE_NAME, session_id, httponly=True, samesite="lax", secure=_settings.backoffice_cookie_secure,
+        max_age=_settings.backoffice_session_ttl_minuten * 60,
     )
     return response
 
@@ -294,6 +296,7 @@ def kontoauszug(request: Request, konto_id: str, session=Depends(_current_sessio
     gesperrt = _objekt_fuer_vertrag_gesperrt(konto.vertrag_id)
     positionen = _op_service.list_alle_positionen(konto_id)
     saldo = _op_service.berechne_saldo(konto_id)
+    aktive_sperren = _stammdaten_repo.aktive_sperren(vertrag.id) if vertrag is not None else []
 
     banner = flash_error("Objekt ist von der Pilotphase ausgeschlossen - nur Ansicht.") if gesperrt else ""
     aktion = "" if gesperrt else f'<p><a href="/backoffice/konto/{h(konto_id)}/buchen">+ Nachbuchung (SOLL/GUTSCHRIFT)</a></p>'
@@ -302,13 +305,30 @@ def kontoauszug(request: Request, konto_id: str, session=Depends(_current_sessio
     <div class="card">
       <h2>Stammdaten (getrennt geführt)</h2>
       <table>
-        <tr><th>Vertrag</th><td>{h(vertrag.id)} — {h(vertrag.rechtsordnung)}, gültig {vertrag.gueltig_von.isoformat()}
-            bis {vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else 'unbefristet'}</td></tr>
+        <tr><th>Vertrag</th><td>{h(vertrag.id)} — {'<span class="warn">UNGEKLAERT</span>' if vertrag.rechtsordnung == 'UNGEKLAERT' else h(vertrag.rechtsordnung)}, gültig {vertrag.gueltig_von.isoformat()}
+            bis {vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else 'unbefristet'}
+            {'<br><span class="warn">Rechtsordnung ungeklärt — Mahnung/Index/Sollstellung gesperrt.</span>' if vertrag.rechtsordnung == 'UNGEKLAERT' else ''}</td></tr>
         <tr><th>Einheit</th><td>{h(einheit.bezeichnung) if einheit else '-'} — Nutzungsstatus:
             <strong>{h(einheit.nutzungsstatus) if einheit else '-'}</strong></td></tr>
         <tr><th>Debitor</th><td>{h(debitor.name) if debitor else '-'} ({h(debitor.email) if debitor and debitor.email else 'keine E-Mail hinterlegt'})</td></tr>
         <tr><th>Eröffnungsmodus</th><td>{h(konto.eroeffnung_modus or '-')}
             {'zum ' + konto.eroeffnung_stichtag.isoformat() if konto.eroeffnung_stichtag else ''}</td></tr>
+      </table>
+    </div>"""
+
+    sperren_zeilen = "".join(
+        f"<tr><td>{h(s.grund)}</td><td>{s.gesetzt_am.isoformat() if s.gesetzt_am else ''}</td>"
+        f"<td>{h(s.kommentar or '')}</td></tr>"
+        for s in aktive_sperren
+    )
+    sperren_karte = ""
+    if aktive_sperren:
+        sperren_karte = f"""
+    <div class="card">
+      <h2 class="error">Aktive Sperre(n) — blockiert Mahnung</h2>
+      <table>
+        <tr><th>Grund</th><th>Gesetzt am</th><th>Kommentar</th></tr>
+        {sperren_zeilen}
       </table>
     </div>"""
 
@@ -335,7 +355,7 @@ def kontoauszug(request: Request, konto_id: str, session=Depends(_current_sessio
           <a href="/backoffice/vertrag/{h(vertrag.id)}/mahnvorschau">Mahnvorschau</a>
         </p>"""
 
-    return _layout(request, session, f"Kontoauszug {konto_id}", banner + stammdaten_karte + op_tabelle + links)
+    return _layout(request, session, f"Kontoauszug {konto_id}", banner + stammdaten_karte + sperren_karte + op_tabelle + links)
 
 
 # -- Nachbuchung ----------------------------------------------------------------
@@ -1174,3 +1194,121 @@ def mahnfall_sendebereitschaft(request: Request, mahnfall_id: int, csrf_token: s
     inhalt = flash_ok(f"Sendebereitschaft (KEIN echter Versand): {ergebnis.status} — {ergebnis.grund}")
     inhalt += f'<p><a href="/backoffice/vertrag/{h(mahnfall.vertrag_id)}/mahnvorschau">&larr; zurück</a></p>'
     return _layout(request, session, "Sendebereitschaft", inhalt)
+
+
+# -- Mahnstufen-Konfiguration (genau 2 Stufen, HV-20260912-ECHTBETRIEB) ------
+
+
+def _policy_zeile_html(policy) -> str:
+    aktion = ""
+    if policy.status == "ENTWURF":
+        aktion = f"""
+        <form method="post" action="/backoffice/mahnwesen/policy/{policy.id}/freigeben" class="inline">
+          {{csrf}}
+          <button type="submit" class="secondary">Freigeben</button>
+        </form>"""
+    return f"""
+    <tr>
+      <td>{policy.version}</td>
+      <td>{policy.stufe1_tage_nach_faelligkeit} Tage</td>
+      <td>{policy.stufe2_mindesttage_nach_stufe1_versand} Tage</td>
+      <td>{policy.zinsen_prozent}%</td>
+      <td>{policy.gebuehr_cent} Cent</td>
+      <td>{h(policy.status)}</td>
+      <td>{policy.freigegeben_am.isoformat() if policy.freigegeben_am else '-'}</td>
+      <td>{aktion}</td>
+    </tr>"""
+
+
+@router.get("/mahnwesen/policy", response_class=HTMLResponse)
+def mahnpolicy_uebersicht(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    aktuelle = _mahn_policy_repo.aktuelle_freigegebene()
+    alle = _mahn_policy_repo.alle()
+
+    aktuelle_html = (
+        f"""<div class="card">
+          <p class="ok">Aktuell freigegeben: Version {aktuelle.version} — Stufe 1 nach {aktuelle.stufe1_tage_nach_faelligkeit}
+          Tagen, Stufe 2 frühestens {aktuelle.stufe2_mindesttage_nach_stufe1_versand} Tage nach tatsächlich
+          versandter Stufe 1 UND erst nach deren vertraglicher Zahlungsfrist (serverseitig als Maximum
+          erzwungen). Zinsen/Gebühren: {aktuelle.zinsen_prozent}% / {aktuelle.gebuehr_cent} Cent.</p>
+        </div>"""
+        if aktuelle is not None
+        else flash_error("Keine freigegebene MahnPolicy vorhanden — es kann derzeit NICHTS automatisch gemahnt werden.")
+    )
+
+    zeilen_html = "".join(_policy_zeile_html(p).replace("{csrf}", csrf_feld(session.csrf_token)) for p in alle)
+
+    inhalt = f"""
+    <div class="card" style="max-width:820px;">
+      <h1>Mahnstufen-Konfiguration</h1>
+      <p class="muted">Genau zwei automatische Mahnstufen (Fachregel 7) — keine dritte Stufe, kein
+         Inkasso/RA, Zinsen/Gebühren in diesem Auftrag fest auf 0 (nicht editierbar). Bestehende Sperren
+         (RA/Ratenplan/Insolvenz/ungeklärter Eingang/unklarer Eröffnungssaldo/manuelle Sperre) sowie die
+         BESTÄTIGTE Bankvollständigkeit gelten unverändert und werden hier NICHT umgangen.
+         <code>SEND_ENABLED=false</code> bleibt Standard — diese Seite ändert daran nichts, sie plant nur
+         Fristen, sie versendet nichts.</p>
+    </div>
+    {aktuelle_html}
+    <div class="card">
+      <h2>Neue Version vorschlagen</h2>
+      <form method="post" action="/backoffice/mahnwesen/policy/anlegen">
+        {csrf_feld(session.csrf_token)}
+        <label>Stufe 1: Tage nach belegter Fälligkeit</label>
+        <input type="number" name="stufe1_tage_nach_faelligkeit" min="1" value="{_settings.mahn_stufe1_tage_nach_faelligkeit}" required>
+        <label>Stufe 2: Mindesttage nach tatsächlich versandter Stufe 1 (zusätzlich wird serverseitig
+               IMMER auch die vertragliche Zahlungsfrist abgewartet — das Maximum beider Werte gilt)</label>
+        <input type="number" name="stufe2_mindesttage_nach_stufe1_versand" min="1" value="{_settings.mahn_stufe2_mindesttage_nach_stufe1}" required>
+        <p class="muted">Zinsen: 0% · Gebühr: 0 Cent (in diesem Auftrag fest, nicht editierbar).</p>
+        <button type="submit">Als Entwurf anlegen</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Versionen</h2>
+      <table>
+        <tr><th>Version</th><th>Stufe 1</th><th>Stufe 2</th><th>Zinsen</th><th>Gebühr</th><th>Status</th><th>Freigegeben am</th><th></th></tr>
+        {zeilen_html or '<tr><td colspan=8 class="muted">Noch keine Policy angelegt.</td></tr>'}
+      </table>
+    </div>"""
+    return _layout(request, session, "Mahnstufen-Konfiguration", inhalt)
+
+
+@router.post("/mahnwesen/policy/anlegen", response_class=HTMLResponse)
+def mahnpolicy_anlegen(
+    request: Request,
+    stufe1_tage_nach_faelligkeit: int = Form(...),
+    stufe2_mindesttage_nach_stufe1_versand: int = Form(...),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+) -> HTMLResponse:
+    _verify_csrf(session, csrf_token)
+    if stufe1_tage_nach_faelligkeit < 1 or stufe2_mindesttage_nach_stufe1_versand < 1:
+        return _fehlerseite(session, "Mahnstufen-Konfiguration", "Beide Werte müssen mindestens 1 Tag betragen.", "/backoffice/mahnwesen/policy")
+    policy = _mahn_policy_repo.anlegen(
+        stufe1_tage_nach_faelligkeit=stufe1_tage_nach_faelligkeit,
+        stufe2_mindesttage_nach_stufe1_versand=stufe2_mindesttage_nach_stufe1_versand,
+        # Fest auf 0 - dieser Auftrag verlangt ausdrücklich "keine Zinsen/Gebühren"; kein Formularfeld,
+        # das versehentlich (oder absichtlich via rohem POST) einen anderen Wert setzen könnte.
+        zinsen_prozent=Decimal("0"),
+        gebuehr_cent=0,
+        status="ENTWURF",
+    )
+    _audit_service.log(
+        entity_typ="mahn_policy", entity_id=str(policy.id), aktion="angelegt", akteur=session.user_id,
+        payload={"version": policy.version, "stufe1_tage": stufe1_tage_nach_faelligkeit, "stufe2_mindesttage": stufe2_mindesttage_nach_stufe1_versand},
+    )
+    inhalt = flash_ok(f"Policy-Version {policy.version} als ENTWURF angelegt — muss noch freigegeben werden, bevor sie wirkt.")
+    inhalt += '<p><a href="/backoffice/mahnwesen/policy">&larr; zurück</a></p>'
+    return _layout(request, session, "Mahnstufen-Konfiguration", inhalt)
+
+
+@router.post("/mahnwesen/policy/{policy_id}/freigeben", response_class=HTMLResponse)
+def mahnpolicy_freigeben(request: Request, policy_id: int, csrf_token: str = Form(...), session=Depends(_current_session)) -> HTMLResponse:
+    _verify_csrf(session, csrf_token)
+    try:
+        policy = _mahn_policy_repo.freigeben(policy_id)
+    except ValueError as exc:
+        return _fehlerseite(session, "Mahnstufen-Konfiguration", str(exc), "/backoffice/mahnwesen/policy")
+    _audit_service.log(entity_typ="mahn_policy", entity_id=str(policy.id), aktion="freigegeben", akteur=session.user_id, payload={"version": policy.version})
+    inhalt = flash_ok(f"Policy-Version {policy.version} freigegeben.")
+    inhalt += '<p><a href="/backoffice/mahnwesen/policy">&larr; zurück</a></p>'
+    return _layout(request, session, "Mahnstufen-Konfiguration", inhalt)

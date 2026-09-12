@@ -1,0 +1,51 @@
+# Vorlage für einen systemd-Unit (HV-20260912-ECHTBETRIEB, Punkt 3).
+# NIEMALS mit echten Pfaden/Werten in Git committen - dies ist nur die
+# Struktur. Die reale Datei lebt außerhalb dieses Repos, z. B. unter
+# /etc/systemd/system/mietinkasso-hausverwaltung.service, und wird von
+# Codex auf dem bestehenden Hetzner-Server angelegt/aktiviert.
+#
+# Bindet an einen Unix-Domain-Socket statt an einen TCP-Port, damit der
+# bereits laufende Caddy-Reverse-Proxy (mountet z. B. /run/jlb-cockpit)
+# ohne neuen öffentlichen Port darauf zugreifen kann - siehe
+# DEPLOYMENT_HETZNER.md.
+#
+# --workers 1 ist PFLICHT: der In-Memory-Login-Session-Store
+# (backoffice/security.py) ist auf genau EINEN Prozess ausgelegt (siehe
+# OFFENE_PUNKTE.md, "Kein Mehrbenutzer-Onlinebetrieb"). Mehrere Worker
+# oder ein zweiter parallel gestarteter Prozess auf demselben Socket
+# würden Logins/CSRF-Tokens inkonsistent machen.
+
+[Unit]
+Description=Hausverwaltung & Mietinkasso (HV-20260912-ECHTBETRIEB)
+After=network.target
+
+[Service]
+Type=simple
+User=mietinkasso-hausverwaltung
+Group=mietinkasso-hausverwaltung
+WorkingDirectory=/opt/mietinkasso-hausverwaltung/app
+
+# Außerhalb von Git - siehe env.production.example für den Inhalt.
+EnvironmentFile=/etc/mietinkasso-hausverwaltung/env
+
+RuntimeDirectory=mietinkasso-hausverwaltung
+RuntimeDirectoryMode=0750
+
+ExecStart=/opt/mietinkasso-hausverwaltung/venv/bin/uvicorn \
+    mietinkasso.api.app:app \
+    --uds /run/mietinkasso-hausverwaltung/uvicorn.sock \
+    --workers 1
+
+# Absturz -> automatischer Neustart (meldet den einzelnen Operator ab,
+# bucht aber nichts doppelt - siehe DEPLOYMENT_HETZNER.md Abschnitt 8).
+Restart=on-failure
+RestartSec=5
+
+# Übliche Härtung - an die tatsächliche Distribution/Umgebung anpassen.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mietinkasso-hausverwaltung /run/mietinkasso-hausverwaltung
+
+[Install]
+WantedBy=multi-user.target

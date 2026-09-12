@@ -146,6 +146,100 @@ def test_saldo_und_enthaltenes_altjournal_nicht_doppelt_gebucht(op_service, basi
         )
 
 
+# ---------------------------------------------------------------------------
+# Eröffnungskorrektur (Auftrag HV-20260912-ECHTBETRIEB, Ergänzung): ein im
+# bestätigten Gesamtsaldo nachweislich fehlender Posten, dessen echtes Datum
+# vor/auf dem Eröffnungsstichtag liegt - ohne das allgemeine Altjournal-Tor
+# zu öffnen.
+# ---------------------------------------------------------------------------
+
+
+def test_eroeffnungskorrektur_bewahrt_original_belegdatum_und_bucht_am_uebernahmetag(op_service, basis_vertrag, ctx_factory):
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    op_service.eroeffnen_gesamtsaldo(
+        ctx=ctx, konto=konto, betrag_cent=150_000, stichtag=date(2026, 8, 31), import_id="ERO-1", akteur="test"
+    )
+    zeile = op_service.eroeffnungskorrektur_buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=20_000,
+        original_belegdatum=date(2026, 8, 20),  # VOR dem Stichtag
+        uebernahmetag=date(2026, 9, 12),
+        grund="Zahlung im Original-Gesamtsaldo nachweislich nicht enthalten (Bankbeleg 2026-08-20)",
+        quelle_referenz="BANKBELEG-2026-08-20-XY",
+        import_id="KORR-1",
+    )
+    assert zeile.belegdatum == date(2026, 8, 20)  # echtes historisches Datum bewahrt
+    assert zeile.buchungsdatum == date(2026, 9, 12)  # Übernahmetag, nicht das historische Datum
+    assert zeile.quelle_system == "eroeffnungskorrektur"
+    assert zeile.aenderungsgrund.startswith("Zahlung im Original-Gesamtsaldo")
+
+    saldo = op_service.berechne_saldo(konto.id)
+    assert saldo.saldo_cent == 150_000 - 20_000  # Original-Eröffnung bleibt unverändert sichtbar, Korrektur ergänzt
+    eroeffnung = [p for p in saldo.positionen if p.typ == "EROEFFNUNG"][0]
+    assert eroeffnung.betrag_cent == 150_000
+
+
+def test_eroeffnungskorrektur_ohne_gesamtsaldo_eroeffnung_wird_blockiert(op_service, basis_vertrag, ctx_factory):
+    """Der Korrekturpfad setzt eine bereits GESAMTSALDO-eröffnete Eröffnung
+    voraus - bei EINZEL_OP (oder noch keiner Eröffnung) gibt es kein "im
+    Saldo bereits enthalten", eine gewöhnliche Nachbuchung ist dort der
+    richtige Weg."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    with pytest.raises(DoppelteEroeffnungsartError):
+        op_service.eroeffnungskorrektur_buchen(
+            ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=20_000,
+            original_belegdatum=date(2026, 8, 20), uebernahmetag=date(2026, 9, 12),
+            grund="Test", quelle_referenz="Q1", import_id="KORR-1",
+        )
+
+
+def test_eroeffnungskorrektur_verlangt_grund_und_quelle_referenz(op_service, basis_vertrag, ctx_factory):
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    op_service.eroeffnen_gesamtsaldo(
+        ctx=ctx, konto=konto, betrag_cent=150_000, stichtag=date(2026, 8, 31), import_id="ERO-1", akteur="test"
+    )
+    with pytest.raises(ValueError, match="grund"):
+        op_service.eroeffnungskorrektur_buchen(
+            ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=20_000,
+            original_belegdatum=date(2026, 8, 20), uebernahmetag=date(2026, 9, 12),
+            grund="", quelle_referenz="Q1", import_id="KORR-1",
+        )
+    with pytest.raises(ValueError, match="quelle_referenz"):
+        op_service.eroeffnungskorrektur_buchen(
+            ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=20_000,
+            original_belegdatum=date(2026, 8, 20), uebernahmetag=date(2026, 9, 12),
+            grund="Grund vorhanden", quelle_referenz="", import_id="KORR-1",
+        )
+
+
+def test_eroeffnungskorrektur_replay_ist_wirkungslos_geaenderter_inhalt_ist_konflikt(op_service, basis_vertrag, ctx_factory):
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    op_service.eroeffnen_gesamtsaldo(
+        ctx=ctx, konto=konto, betrag_cent=150_000, stichtag=date(2026, 8, 31), import_id="ERO-1", akteur="test"
+    )
+    kwargs = dict(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=20_000,
+        original_belegdatum=date(2026, 8, 20), grund="Grund", quelle_referenz="Q1", import_id="KORR-1",
+    )
+    op_service.eroeffnungskorrektur_buchen(uebernahmetag=date(2026, 9, 12), **kwargs)
+    # Replay (auch an einem SPÄTEREN Übernahmetag) mit identischem Inhalt -> No-Op, keine Verdopplung
+    op_service.eroeffnungskorrektur_buchen(uebernahmetag=date(2026, 9, 15), **kwargs)
+    saldo = op_service.berechne_saldo(konto.id)
+    assert saldo.saldo_cent == 150_000 - 20_000
+    assert len(op_service.list_alle_positionen(konto.id)) == 2  # Eröffnung + genau EINE Korrektur
+
+    with pytest.raises(ImportConflictError):
+        op_service.eroeffnungskorrektur_buchen(
+            ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=99_999,  # abweichender Inhalt, gleiche import_id
+            original_belegdatum=date(2026, 8, 20), uebernahmetag=date(2026, 9, 12),
+            grund="Grund", quelle_referenz="Q1", import_id="KORR-1",
+        )
+
+
 def test_eroeffnung_gesamtsaldo_gleicher_fakt_mit_anderer_import_id_ist_replay(op_service, basis_vertrag, ctx_factory):
     """Regression (Codex-Fund #3): zwei Importe mit identischem Konto/
     Stichtag/Betrag aber UNTERSCHIEDLICHEN import_ids (z. B. zwei Dateien

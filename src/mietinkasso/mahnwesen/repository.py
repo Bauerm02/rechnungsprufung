@@ -48,6 +48,11 @@ class MahnPolicyRepository:
             )
             return session.execute(statement).scalar_one_or_none()
 
+    def alle(self) -> list[MahnPolicyTable]:
+        with self._session_factory() as session:
+            statement = select(MahnPolicyTable).order_by(MahnPolicyTable.version.desc())
+            return list(session.execute(statement).scalars().all())
+
 
 class MahnFallRepository:
     def __init__(self, session_factory: sessionmaker[Session]):

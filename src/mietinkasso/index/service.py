@@ -21,8 +21,12 @@ from datetime import date
 from decimal import Decimal
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
-from mietinkasso.domain.enums import IndexAnpassungStatus, IndexKlauselStatus
-from mietinkasso.domain.exceptions import IndexKlauselFehltError, RechtsprofilNichtImplementiertError
+from mietinkasso.domain.enums import IndexAnpassungStatus, IndexKlauselStatus, rechtsordnung_geklaert
+from mietinkasso.domain.exceptions import (
+    IndexKlauselFehltError,
+    RechtsordnungUngeklaertError,
+    RechtsprofilNichtImplementiertError,
+)
 from mietinkasso.domain.money import cents_to_decimal, round_index_half_cent_down, to_cents
 from mietinkasso.index.repository import IndexRepository
 from mietinkasso.infrastructure.db.tables import IndexAnpassungTable, IndexKlauselTable
@@ -80,6 +84,11 @@ class IndexService:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
         self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag_id)
+        if not rechtsordnung_geklaert(vertrag.rechtsordnung):
+            raise RechtsordnungUngeklaertError(
+                f"Vertrag {vertrag_id}: Rechtsordnung ist UNGEKLAERT; eine IndexKlausel darf nicht "
+                "angelegt werden, bis die rechtliche Einordnung feststeht."
+            )
         version = self._repository.naechste_version(vertrag_id)
         klausel = IndexKlauselTable(
             vertrag_id=vertrag_id,
@@ -122,6 +131,11 @@ class IndexService:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
         self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag_id)
+        if not rechtsordnung_geklaert(vertrag.rechtsordnung):
+            raise RechtsordnungUngeklaertError(
+                f"Vertrag {vertrag_id}: Rechtsordnung ist UNGEKLAERT; eine Index-Erhöhung ist gesperrt, "
+                "bis die rechtliche Einordnung feststeht."
+            )
 
         klausel = self._repository.freigegebene_klausel(vertrag_id)
         if klausel is None:

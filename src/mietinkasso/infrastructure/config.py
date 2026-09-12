@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     backoffice_user: str = "markus"
     backoffice_password_hash: str | None = None
     backoffice_session_ttl_minuten: int = 480
+    # Sicher per Default (HV-20260912-ECHTBETRIEB: Produktionsstart hinter
+    # HTTPS-Reverse-Proxy) - das Session-Cookie wird dann nur über TLS
+    # übertragen. Lokale Entwicklung/Tests über reines HTTP (kein TLS)
+    # müssen dies ausdrücklich auf false setzen, sonst sendet der Browser
+    # das Cookie nicht zurück; ein vergessenes "false" in Produktion ist
+    # der sicherere Fehler als ein vergessenes "true".
+    backoffice_cookie_secure: bool = True
 
 
 @lru_cache(maxsize=1)

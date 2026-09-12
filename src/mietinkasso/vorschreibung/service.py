@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from datetime import date
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
-from mietinkasso.domain.enums import OPTyp, VorschreibungStatus
-from mietinkasso.domain.exceptions import BindungInkonsistentError, NachweisFehltError
+from mietinkasso.domain.enums import OPTyp, VorschreibungStatus, rechtsordnung_geklaert
+from mietinkasso.domain.exceptions import BindungInkonsistentError, NachweisFehltError, RechtsordnungUngeklaertError
 from mietinkasso.domain.money import zerlege_brutto_cent
 from mietinkasso.infrastructure.db.tables import KontoTable, VertragTable
 from mietinkasso.op.service import OPService
@@ -146,6 +146,11 @@ class VorschreibungService:
         require_schreibrecht(ctx)
         if konto.vertrag_id != vertrag.id:
             raise BindungInkonsistentError(f"Konto {konto.id} gehört zu Vertrag {konto.vertrag_id}, nicht zu {vertrag.id}.")
+        if not rechtsordnung_geklaert(vertrag.rechtsordnung):
+            raise RechtsordnungUngeklaertError(
+                f"Vertrag {vertrag.id}: Rechtsordnung ist UNGEKLAERT; Sollstellung ist gesperrt, bis die "
+                "rechtliche Einordnung feststeht."
+            )
         heute = heute or date.today()
         vorschreibung = self._repository.get(vertrag.id, monat)
         if vorschreibung is None:

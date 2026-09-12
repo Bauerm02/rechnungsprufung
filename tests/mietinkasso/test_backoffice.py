@@ -37,6 +37,11 @@ def backoffice_client():
 
     os.environ["MIETINKASSO_BACKOFFICE_USER"] = "markus"
     os.environ["MIETINKASSO_BACKOFFICE_PASSWORD_HASH"] = hash_passwort("test-passwort-123")
+    # Produktionsdefault ist secure=true (HTTPS-Reverse-Proxy); der
+    # FastAPI-TestClient spricht aber http://testserver ohne TLS und würde
+    # ein "Secure"-Cookie nie zurücksenden. Nur für diesen Testprozess
+    # ausdrücklich deaktivieren - siehe infrastructure/config.py.
+    os.environ["MIETINKASSO_BACKOFFICE_COOKIE_SECURE"] = "false"
     get_settings.cache_clear()
 
     from mietinkasso.infrastructure.db.session import build_session_factory, create_all_tables
@@ -151,6 +156,7 @@ def test_hauptnavigation_verlinkt_alle_kontextlosen_arbeitsablaeufe(backoffice_c
         "/backoffice/bank",
         "/backoffice/bank/unzugeordnet",
         "/backoffice/bank/vollstaendigkeit",
+        "/backoffice/mahnwesen/policy",
     ]
 
     dashboard = client.get("/backoffice/")
@@ -178,6 +184,32 @@ def test_objekt_107_ist_im_dashboard_nur_lesend(backoffice_client):
     kontoauszug = client.get(f"/backoffice/konto/{konto_gesperrt_id}")
     assert "Objekt ist von der Pilotphase ausgeschlossen" in kontoauszug.text
     assert f"/backoffice/konto/{konto_gesperrt_id}/buchen" not in kontoauszug.text
+
+
+def test_kontoauszug_zeigt_aktive_sperre_aus_intake_an(backoffice_client):
+    """Ergänzung HV-20260912-ECHTBETRIEB: eine über den generischen Intake
+    dauerhaft gespeicherte Sperre (RECHTSANWALT/RATENPLAN/MANUELL/...) muss
+    im Backoffice sichtbar sein, nicht nur in der DB stehen."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    settings = get_settings()
+    stammdaten = StammdatenRepository(build_session_factory(settings.database_url))
+    sperre_id = stammdaten.sperre_setzen(vertrag_id="V-601-1", grund="RECHTSANWALT", kommentar="RA Dr. Muster beauftragt")
+    try:
+        _login(client)
+        kontoauszug = client.get(f"/backoffice/konto/{konto_id}")
+        assert kontoauszug.status_code == 200
+        assert "RECHTSANWALT" in kontoauszug.text
+        assert "RA Dr. Muster beauftragt" in kontoauszug.text
+    finally:
+        # Modul-weit gemeinsam genutztes V-601-1 (siehe Fixture-Docstring) -
+        # spätere Tests (z. B. die Mahnvorschau) dürfen diese Sperre nicht
+        # sehen, sonst ändert sich deren erwarteter BLOCKIERT-Grund.
+        stammdaten.sperre_aufheben(sperre_id)
 
 
 def test_nachbuchung_ohne_csrf_wird_abgelehnt(backoffice_client):
@@ -486,6 +518,59 @@ def test_mahnvorschau_blockiert_ohne_bankbestaetigung_und_sendet_nie_echt(backof
     assert "keine ausreichend aktuelle" in vorschau.text
     assert "sendebereitschaft" not in vorschau.text  # kein Sendebereitschafts-Button für einen BLOCKIERTEN Fall
     assert "Kein Senden-Button löst einen echten Mailversand aus" in vorschau.text
+
+
+def test_mahnpolicy_seite_zeigt_genau_zwei_stufen_und_erzwingt_null_zinsen_gebuehr(backoffice_client):
+    """HV-20260912-ECHTBETRIEB Punkt 2: die Mahnstufen-Konfiguration ist
+    im Backoffice sichtbar/speicherbar - genau zwei Stufen (kein
+    Formularfeld für eine dritte Stufe existiert überhaupt), Zinsen/
+    Gebühr bleiben fest auf 0, auch wenn ein roher POST versucht, andere
+    Werte zu setzen (kein Formularfeld dafür in dieser Version - der
+    Server ignoriert unbekannte Felder und setzt ohnehin hart 0)."""
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+
+    seite = client.get("/backoffice/mahnwesen/policy")
+    assert seite.status_code == 200
+    assert "stufe1_tage_nach_faelligkeit" in seite.text
+    assert "stufe2_mindesttage_nach_stufe1_versand" in seite.text
+    assert "Zinsen: 0% · Gebühr: 0 Cent" in seite.text
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', seite.text).group(1)
+
+    angelegt = client.post(
+        "/backoffice/mahnwesen/policy/anlegen",
+        data={
+            "stufe1_tage_nach_faelligkeit": "7",
+            "stufe2_mindesttage_nach_stufe1_versand": "14",
+            "csrf_token": csrf,
+            # Versuch, Zinsen/Gebühr über ein zusätzliches, in der Form
+            # nicht vorgesehenes Feld zu schmuggeln - wird vom Server
+            # ignoriert (kein entsprechender Parameter in der Route).
+            "zinsen_prozent": "5",
+            "gebuehr_cent": "500",
+        },
+    )
+    assert angelegt.status_code == 200
+    assert "als ENTWURF angelegt" in angelegt.text
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.repository import MahnPolicyRepository
+
+    policies = MahnPolicyRepository(build_session_factory(get_settings().database_url)).alle()
+    neueste = policies[0]
+    assert neueste.status == "ENTWURF"
+    assert neueste.stufe1_tage_nach_faelligkeit == 7
+    assert neueste.stufe2_mindesttage_nach_stufe1_versand == 14
+    assert neueste.zinsen_prozent == 0
+    assert neueste.gebuehr_cent == 0
+
+    uebersicht_nach_anlage = client.get("/backoffice/mahnwesen/policy")
+    csrf2 = re.search(r'name="csrf_token" value="([^"]+)"', uebersicht_nach_anlage.text).group(1)
+    freigegeben = client.post(f"/backoffice/mahnwesen/policy/{neueste.id}/freigeben", data={"csrf_token": csrf2})
+    assert freigegeben.status_code == 200
+    assert "freigegeben" in freigegeben.text
 
 
 def _ctx_admin():

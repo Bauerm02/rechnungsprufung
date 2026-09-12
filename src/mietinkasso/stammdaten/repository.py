@@ -25,14 +25,29 @@ class StammdatenRepository:
         self._session_factory = session_factory
 
     # -- Gesellschaft ---------------------------------------------------
-    def upsert_gesellschaft(self, *, id: str, name: str) -> None:
-        with self._session_factory() as session:
+    def upsert_gesellschaft(self, *, id: str, name: str, session: Session | None = None) -> None:
+        """`session`: siehe `set_eroeffnung_modus` - übergeben, um diese
+        Schreibung Teil einer größeren, vom Aufrufer verwalteten
+        Mehr-Entitäten-Transaktion zu machen (z. B. der generische
+        Echtbetrieb-Intake in `intake/apply.py`, der Gesellschaft, Objekt,
+        Einheit, Debitor, Vertrag und Eröffnung/Nachbuchungen einer
+        gesamten Datei atomar in EINER Session verbucht)."""
+
+        if session is not None:
             row = session.get(GesellschaftTable, id)
             if row is None:
                 session.add(GesellschaftTable(id=id, name=name))
             else:
                 row.name = name
-            session.commit()
+            session.flush()
+            return
+        with self._session_factory() as owned_session:
+            row = owned_session.get(GesellschaftTable, id)
+            if row is None:
+                owned_session.add(GesellschaftTable(id=id, name=name))
+            else:
+                row.name = name
+            owned_session.commit()
 
     def get_gesellschaft(self, id: str) -> GesellschaftTable | None:
         with self._session_factory() as session:
@@ -44,12 +59,21 @@ class StammdatenRepository:
 
     # -- Objekt -----------------------------------------------------------
     def upsert_objekt(
-        self, *, id: str, gesellschaft_id: str, bezeichnung: str, adresse: str | None = None, ausgeschlossen: bool = False
+        self,
+        *,
+        id: str,
+        gesellschaft_id: str,
+        bezeichnung: str,
+        adresse: str | None = None,
+        ausgeschlossen: bool = False,
+        session: Session | None = None,
     ) -> None:
-        with self._session_factory() as session:
-            row = session.get(ObjektTable, id)
+        """`session`: siehe `upsert_gesellschaft`."""
+
+        def _schreiben(active_session: Session) -> None:
+            row = active_session.get(ObjektTable, id)
             if row is None:
-                session.add(
+                active_session.add(
                     ObjektTable(
                         id=id,
                         gesellschaft_id=gesellschaft_id,
@@ -63,7 +87,14 @@ class StammdatenRepository:
                 row.bezeichnung = bezeichnung
                 row.adresse = adresse
                 row.ausgeschlossen = ausgeschlossen
-            session.commit()
+
+        if session is not None:
+            _schreiben(session)
+            session.flush()
+            return
+        with self._session_factory() as owned_session:
+            _schreiben(owned_session)
+            owned_session.commit()
 
     def get_objekt(self, id: str) -> ObjektTable | None:
         with self._session_factory() as session:
@@ -86,11 +117,17 @@ class StammdatenRepository:
         nutzungsstatus: str,
         flaeche_qm: Decimal | None = None,
         miteigentumsanteile: Decimal | None = None,
+        session: Session | None = None,
     ) -> None:
-        with self._session_factory() as session:
-            row = session.get(EinheitTable, id)
+        """`session`: siehe `upsert_gesellschaft`. Funktioniert bewusst
+        auch ohne zugehörigen Vertrag - eine Einheit mit Nutzungsstatus
+        LEERSTAND/SELFSTORAGE/KURZZEITVERMIETUNG ist ohne aktive
+        Mietforderung erfassbar (keine Namens-/Nullsaldo-Heuristik)."""
+
+        def _schreiben(active_session: Session) -> None:
+            row = active_session.get(EinheitTable, id)
             if row is None:
-                session.add(
+                active_session.add(
                     EinheitTable(
                         id=id,
                         objekt_id=objekt_id,
@@ -106,7 +143,14 @@ class StammdatenRepository:
                 row.nutzungsstatus = nutzungsstatus
                 row.flaeche_qm = flaeche_qm
                 row.miteigentumsanteile = miteigentumsanteile
-            session.commit()
+
+        if session is not None:
+            _schreiben(session)
+            session.flush()
+            return
+        with self._session_factory() as owned_session:
+            _schreiben(owned_session)
+            owned_session.commit()
 
     def get_einheit(self, id: str) -> EinheitTable | None:
         with self._session_factory() as session:
@@ -130,16 +174,27 @@ class StammdatenRepository:
             session.commit()
 
     # -- Debitor ------------------------------------------------------------
-    def upsert_debitor(self, *, id: str, name: str, email: str | None = None, adresse: str | None = None) -> None:
-        with self._session_factory() as session:
-            row = session.get(DebitorTable, id)
+    def upsert_debitor(
+        self, *, id: str, name: str, email: str | None = None, adresse: str | None = None, session: Session | None = None
+    ) -> None:
+        """`session`: siehe `upsert_gesellschaft`."""
+
+        def _schreiben(active_session: Session) -> None:
+            row = active_session.get(DebitorTable, id)
             if row is None:
-                session.add(DebitorTable(id=id, name=name, email=email, adresse=adresse))
+                active_session.add(DebitorTable(id=id, name=name, email=email, adresse=adresse))
             else:
                 row.name = name
                 row.email = email
                 row.adresse = adresse
-            session.commit()
+
+        if session is not None:
+            _schreiben(session)
+            session.flush()
+            return
+        with self._session_factory() as owned_session:
+            _schreiben(owned_session)
+            owned_session.commit()
 
     def get_debitor(self, id: str) -> DebitorTable | None:
         with self._session_factory() as session:
@@ -158,11 +213,14 @@ class StammdatenRepository:
         gueltig_bis: date | None = None,
         faelligkeit_tag: int = 5,
         zahlungsfrist_tage: int = 14,
+        session: Session | None = None,
     ) -> None:
-        with self._session_factory() as session:
-            row = session.get(VertragTable, id)
+        """`session`: siehe `upsert_gesellschaft`."""
+
+        def _schreiben(active_session: Session) -> None:
+            row = active_session.get(VertragTable, id)
             if row is None:
-                session.add(
+                active_session.add(
                     VertragTable(
                         id=id,
                         einheit_id=einheit_id,
@@ -184,7 +242,14 @@ class StammdatenRepository:
                 row.gueltig_bis = gueltig_bis
                 row.faelligkeit_tag = faelligkeit_tag
                 row.zahlungsfrist_tage = zahlungsfrist_tage
-            session.commit()
+
+        if session is not None:
+            _schreiben(session)
+            session.flush()
+            return
+        with self._session_factory() as owned_session:
+            _schreiben(owned_session)
+            owned_session.commit()
 
     def get_vertrag(self, id: str) -> VertragTable | None:
         with self._session_factory() as session:
@@ -260,9 +325,23 @@ class StammdatenRepository:
         indexierbar: bool = False,
         gueltig_von: date,
         gueltig_bis: date | None = None,
+        session: Session | None = None,
     ) -> None:
-        with self._session_factory() as session:
-            session.add(
+        """`session`: siehe `upsert_gesellschaft`. Bewusst reines Insert
+        (keine Upsert-Semantik wie bei den Stammdaten-Entitäten oben) - der
+        generische Intake (`intake/apply.py`) prüft VOR dem Aufruf über
+        `intake/planner.py`, ob dieselbe Komponenten-ID bereits identisch
+        existiert (dann kein Aufruf, No-Op) oder mit abweichendem Inhalt
+        (dann KONFLIKT, gesamter Lauf gesperrt) - ein zweiter Aufruf mit
+        derselben ID landet hier also nie, außer bei einem Programmierfehler
+        außerhalb des Intake-Pfads, wo ein `IntegrityError` bewusst laut
+        scheitern soll statt eine bestehende Komponente stillschweigend zu
+        überschreiben (keine Indexfreigabe/-berechnung ist hiervon berührt -
+        `indexierbar` ist nur ein Eignungsflag für `index/service.py`, kein
+        eigenständiger Freigabeschritt)."""
+
+        def _schreiben(active_session: Session) -> None:
+            active_session.add(
                 VertragsKomponenteTable(
                     id=id,
                     vertrag_id=vertrag_id,
@@ -275,7 +354,14 @@ class StammdatenRepository:
                     gueltig_bis=gueltig_bis,
                 )
             )
-            session.commit()
+
+        if session is not None:
+            _schreiben(session)
+            session.flush()
+            return
+        with self._session_factory() as owned_session:
+            _schreiben(owned_session)
+            owned_session.commit()
 
     def get_komponente(self, id: str) -> VertragsKomponenteTable | None:
         with self._session_factory() as session:
@@ -317,12 +403,29 @@ class StammdatenRepository:
             return session.execute(select(KautionTable).where(KautionTable.vertrag_id == vertrag_id)).scalar_one_or_none()
 
     # -- Sperren --------------------------------------------------------------
-    def sperre_setzen(self, *, vertrag_id: str, grund: str, kommentar: str | None = None) -> int:
-        with self._session_factory() as session:
+    def sperre_setzen(
+        self, *, vertrag_id: str, grund: str, kommentar: str | None = None, session: Session | None = None
+    ) -> int:
+        """`session`: siehe `upsert_gesellschaft` - erlaubt dem generischen
+        Intake (`intake/apply.py`), eine Sperre Teil derselben atomaren
+        Mehr-Entitäten-Transaktion zu machen. Bewusst reines Insert (eine
+        Sperre ist ein additiver Fakt, kein Upsert-Ziel) - Wiederholimport-
+        Sicherheit stellt der Aufrufer über `intake/planner.py` her (bereits
+        aktive, inhaltsgleiche Sperre -> kein Aufruf)."""
+
+        def _schreiben(active_session: Session) -> SperreTable:
             row = SperreTable(vertrag_id=vertrag_id, grund=grund, kommentar=kommentar)
-            session.add(row)
-            session.commit()
-            session.refresh(row)
+            active_session.add(row)
+            return row
+
+        if session is not None:
+            row = _schreiben(session)
+            session.flush()
+            return row.id
+        with self._session_factory() as owned_session:
+            row = _schreiben(owned_session)
+            owned_session.commit()
+            owned_session.refresh(row)
             return row.id
 
     def sperre_aufheben(self, sperre_id: int) -> None:
@@ -335,19 +438,28 @@ class StammdatenRepository:
             row.aufgehoben_am = datetime.now(timezone.utc)
             session.commit()
 
-    def aktive_sperren(self, vertrag_id: str) -> list[SperreTable]:
-        with self._session_factory() as session:
+    def aktive_sperren(self, vertrag_id: str, *, session: Session | None = None) -> list[SperreTable]:
+        """`session`: siehe `upsert_gesellschaft`."""
+
+        def _lesen(active_session: Session) -> list[SperreTable]:
             statement = (
                 select(SperreTable)
                 .where(SperreTable.vertrag_id == vertrag_id)
                 .where(SperreTable.aufgehoben_am.is_(None))
             )
-            return list(session.execute(statement).scalars().all())
+            return list(active_session.execute(statement).scalars().all())
+
+        if session is not None:
+            return _lesen(session)
+        with self._session_factory() as owned_session:
+            return _lesen(owned_session)
 
     # -- Konto ------------------------------------------------------------
-    def get_or_create_konto(self, *, vertrag: VertragTable) -> KontoTable:
-        with self._session_factory() as session:
-            existing = session.execute(
+    def get_or_create_konto(self, *, vertrag: VertragTable, session: Session | None = None) -> KontoTable:
+        """`session`: siehe `upsert_gesellschaft`."""
+
+        def _lesen_oder_anlegen(active_session: Session) -> KontoTable:
+            existing = active_session.execute(
                 select(KontoTable).where(KontoTable.vertrag_id == vertrag.id)
             ).scalar_one_or_none()
             if existing is not None:
@@ -358,9 +470,16 @@ class StammdatenRepository:
                 debitor_id=vertrag.debitor_id,
                 gesellschaft_id=vertrag.gesellschaft_id,
             )
-            session.add(konto)
-            session.commit()
-            session.refresh(konto)
+            active_session.add(konto)
+            active_session.flush()
+            return konto
+
+        if session is not None:
+            return _lesen_oder_anlegen(session)
+        with self._session_factory() as owned_session:
+            konto = _lesen_oder_anlegen(owned_session)
+            owned_session.commit()
+            owned_session.refresh(konto)
             return konto
 
     def get_konto(self, konto_id: str) -> KontoTable | None:
