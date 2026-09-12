@@ -128,9 +128,27 @@ class BankImportService:
         zurückgerollt - keine Zeile aus diesem Aufruf bleibt hängen. Ein
         erneuter Lauf nach Korrektur der Quelle ist dank Idempotenz
         (import_id/Fingerprint) immer gefahrlos, weil nichts Teilweises
-        übrig bleibt, auf das man Rücksicht nehmen müsste."""
+        übrig bleibt, auf das man Rücksicht nehmen müsste.
 
-        with self._session_factory() as session:
+        `schreibgesperrte_session` (statt `self._session_factory()`
+        direkt): für Zeilen MIT bankseitig eindeutiger `native_id` ist die
+        Idempotenz bereits durch den echten DB-UNIQUE-Constraint auf
+        `import_id` geschützt (unabhängig vom Locking - eine zweite,
+        echt gleichzeitige Transaktion mit demselben `import_id` schlägt
+        dort so oder so mit einem Constraint-Fehler fehl statt still zu
+        duplizieren). Für Zeilen OHNE `native_id` hängt die Dublettenprüfung
+        dagegen ausschließlich an `find_by_fingerprint` - einem
+        SELECT-dann-Entscheiden OHNE DB-Backstop (`fingerprint_hash` ist
+        nur indiziert, nicht `UNIQUE`) - und unter Datei-SQLite ist
+        `with_for_update` dafür ohnehin ein Kein-Op. Zwei echt
+        gleichzeitige Importe DERSELBEN Datei (identischer Inhalt, keine
+        `native_id`) auf dasselbe Bankkonto könnten sich sonst gegenseitig
+        als "noch nicht vorhanden" sehen und beide dieselbe wirtschaftliche
+        Zahlung als je eigene Zeile einbuchen (dieselbe Fehlerklasse wie
+        Codex' Paket-B-Befund bei `verknuepfe_mit_bestehender_zahlung`,
+        siehe `infrastructure/db/sqlite_write_lock.py`)."""
+
+        with schreibgesperrte_session(self._session_factory) as session:
             ergebnisse: list[BankTransaktionTable] = []
             try:
                 for index, roh in enumerate(rohdaten):

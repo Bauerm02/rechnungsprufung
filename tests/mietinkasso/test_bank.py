@@ -1004,3 +1004,77 @@ def test_verknuepfen_datei_sqlite_gleichzeitige_verknuepfungen_ueberschreiten_za
 
     gesamt_verknuepft = bank_repo.verknuepfter_betrag_fuer_op(zahlung.id)
     assert gesamt_verknuepft == 70_000  # 100 EUR vorher + GENAU EINER der beiden 600-EUR-Versuche, NIE 1.300 EUR
+
+
+def test_importiere_atomar_datei_sqlite_gleichzeitiger_identischer_csv_import_dupliziert_nicht(tmp_path):
+    """Nutzerauftrag (vor Paket C): kurze Prüfung, ob ein zweiter
+    gleichzeitiger identischer CSV-Import allein durch vorhandene
+    Unique Constraints vollständig abgefangen wird. Ergebnis: NUR für
+    Zeilen MIT bankseitig eindeutiger `native_id` (dort schützt der
+    echte DB-UNIQUE-Constraint auf `import_id`, unabhängig vom
+    Locking). Für Zeilen OHNE `native_id` (reiner CSV-Fingerprint-Import,
+    wie hier) hängt die Dublettenprüfung an `find_by_fingerprint` - einem
+    SELECT-dann-Entscheiden OHNE DB-Backstop - und war unter Datei-SQLite
+    NICHT geschützt, bevor `_importiere_atomar` auf
+    `schreibgesperrte_session` umgestellt wurde. Reproduktion mit zwei
+    echten Threads auf eine echte Datei-SQLite-DB (bewusst NICHT
+    `:memory:`)."""
+
+    import threading
+
+    from mietinkasso.auth.service import AuthContext
+    from mietinkasso.domain.enums import Rolle
+    from mietinkasso.infrastructure.db.base import Base
+    from mietinkasso.infrastructure.db.session import build_engine, build_session_factory
+
+    db_pfad = tmp_path / "import-nebenlaeufig.db"
+    engine = build_engine(f"sqlite:///{db_pfad}")
+    Base.metadata.create_all(engine)
+    engine.dispose()
+    session_factory = build_session_factory(f"sqlite:///{db_pfad}")
+
+    bank_repo = BankRepository(session_factory)
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    stammdaten_repo = StammdatenRepository(session_factory)
+    op_service = OPService(OPRepository(session_factory), stammdaten_repo)
+    bank_service = BankImportService(bank_repo, stammdaten_repo, op_service)
+    ctx = AuthContext(user_id="test", rolle=Rolle.BUCHHALTUNG, gesellschaft_ids=frozenset({"7DI"}))
+
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    # KEINE spalte_eindeutig -> hat_native_id=False, ausschließlich
+    # Fingerprint-basierte Dublettenprüfung (der hier relevante Fall).
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+    csv_text = "betrag,datum,referenz\n600.00,2026-04-06,identischer-import\n"
+
+    barrier = threading.Barrier(2)
+    ergebnisse: dict[str, tuple[str, object]] = {}
+
+    def _importieren(schluessel: str):
+        barrier.wait(timeout=5)
+        try:
+            zeilen = bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto, text=csv_text, mapping=mapping)
+            ergebnisse[schluessel] = ("ok", zeilen)
+        except Exception as exc:  # noqa: BLE001 - Ergebnis wird unten geprüft
+            ergebnisse[schluessel] = ("fehler", exc)
+
+    thread_a = threading.Thread(target=_importieren, args=("a",))
+    thread_b = threading.Thread(target=_importieren, args=("b",))
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=15)
+    thread_b.join(timeout=15)
+
+    assert set(ergebnisse) == {"a", "b"}
+    erfolgreiche = [k for k, (status, _) in ergebnisse.items() if status == "ok"]
+    fehlgeschlagene = [k for k, (status, _) in ergebnisse.items() if status == "fehler"]
+    assert len(erfolgreiche) == 1, f"genau EIN gleichzeitiger identischer Import darf durchgehen: {ergebnisse}"
+    assert len(fehlgeschlagene) == 1
+    _, fehler = ergebnisse[fehlgeschlagene[0]]
+    assert isinstance(fehler, MehrfachbuchungsKonfliktError)
+
+    gesamt = bank_repo.list_unzugeordnet("BK-7DI-1")
+    assert len(gesamt) == 1  # NIE zwei Zeilen für dieselbe wirtschaftliche Zahlung

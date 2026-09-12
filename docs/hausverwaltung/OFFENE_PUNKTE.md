@@ -445,7 +445,29 @@ Server getestet. Konkret offen/einzuhalten:
   tatsächlich genutzten Bank(en) noch nicht getestet.
 - **EBICS/Bank-API:** laut Auftrag zunächst CAMT/CSV-Dropfolder; eine
   automatisierte Abholung (EBICS oder Bank-API) ist bewusst nicht
-  gebaut.
+  gebaut - Schlüsselklärung läuft nutzerseitig, noch keine Anbindung.
+  **Verbindliche Leitplanke für den künftigen Adapter (Nutzerauftrag
+  12.09., vor Paket C):** EBICS-C53 kann kundenweite Sammeldateien mit
+  MEHREREN Konten in einer einzigen Antwort liefern (mehrere
+  `Stmt`/`Acct`-Blöcke mit unterschiedlicher IBAN in einer CAMT.053-
+  Datei). Der künftige Adapter MUSS jeden `Stmt`/`Acct`/IBAN-Block
+  GETRENNT verarbeiten und gegen eine EXPLIZITE Konto-Allowlist prüfen
+  - er darf NIEMALS eine gemischte, mehrere Konten enthaltende CAMT-
+  Datei pauschal einem einzelnen, vom Operator ausgewählten Mietkonto
+  zuordnen (sonst würden Umsätze eines fremden/falschen Kontos
+  fälschlich diesem Bankkonto gutgeschrieben). Konkret geprüft:
+  `bank/importer.py::parse_camt053` sucht `Ntry`-Elemente aktuell über
+  `root.iter()` GLOBAL im gesamten Dokument, OHNE jemals festzuhalten,
+  aus welchem `Stmt`/`Acct`/welcher IBAN ein `Ntry` stammt - bei einer
+  mehrere Konten enthaltenden Datei würden alle Umsätze aller Konten
+  ununterscheidbar in eine einzige flache Liste gemischt. Vor einer
+  echten EBICS-C53-Anbindung MUSS der Parser (oder ein vorgeschalteter
+  Adapter) zuerst je `Stmt`/`Acct` gruppieren, dessen IBAN gegen die
+  Allowlist prüfen und nur die zugelassenen Konten überhaupt an den
+  bestehenden Import weiterreichen - diese Aufteilung existiert heute
+  NICHT und ist für reine Einzelkonto-CAMT/CSV-Dateiuploads (aktueller
+  Stand) auch nicht nötig. Diese Session hat KEINE EBICS-Anbindung
+  implementiert (weiterhin nur manueller CAMT/CSV-Dateiupload).
 - **Mail-/Dokumentversand:** Mahnwesen erzeugt nur eine Outbox
   (Preview/Snapshot), `SEND_ENABLED=false` per Default. Ein realer
   Versandadapter (SMTP/Provider) mit Zustellbestätigung ist nicht
@@ -502,8 +524,10 @@ Server getestet. Konkret offen/einzuhalten:
 
   **Behoben** für die drei Bank-Schreibpfade, die exakt dieses "lesen,
   dann entscheiden, dann schreiben"-Muster verwenden -
-  `BankImportService._zuordnen_atomar`, `verarbeite_ruecklastschrift`
-  und `verknuepfe_mit_bestehender_zahlung` — durch
+  `BankImportService._zuordnen_atomar`, `verarbeite_ruecklastschrift`,
+  `verknuepfe_mit_bestehender_zahlung` UND `_importiere_atomar` (Datei-
+  Import je Aufruf, ergänzt beim kurzen Nutzer-Check vor Paket C - siehe
+  unten) — durch
   `infrastructure/db/sqlite_write_lock.py::schreibgesperrte_session`:
   unter Datei-SQLite läuft die jeweilige Transaktion über eine eigene,
   dedizierte Verbindung zur selben Datei, deren ERSTES Statement
@@ -524,18 +548,31 @@ Server getestet. Konkret offen/einzuhalten:
   in `tests/mietinkasso/test_bank.py` (Integrationstest mit echter
   Datei-SQLite-DB, zwei echten Threads, `threading.Barrier`).
 
-  **Weiterhin offen:** `BankImportService._importiere_atomar` (Datei-
-  Import je Aufruf) nutzt dasselbe SELECT-dann-INSERT-Muster für seine
-  Fingerprint-/import_id-Idempotenzprüfung, wurde in dieser Korrektur
-  aber NICHT umgestellt (nicht Teil des von Codex reproduzierten
-  Befunds) — zwei echt gleichzeitige Importe derselben Datei auf
-  dasselbe Bankkonto könnten unter Datei-SQLite theoretisch beide
-  dieselbe "neue" Zeile für sich beanspruchen. Für den Ein-Operator-
-  Pilotbetrieb (sequenzielle manuelle Importe) kein praktisches Risiko,
-  aber ein offener Punkt für einen späteren Mehrbenutzer-/
-  Mehrprozessbetrieb. Ebenso weiterhin offen: unter PostgreSQL bleibt
-  der `SELECT ... FOR UPDATE`-Row-Lock die einzige Absicherung (dort
-  technisch korrekt, aber ungetestet gegen ein echtes Postgres).
+  **Ergänzung (Nutzer-Check vor Paket C):** kurz geprüft, ob
+  `_importiere_atomar` durch vorhandene Unique Constraints bereits
+  ausreichend geschützt ist. Ergebnis differenziert: Zeilen MIT
+  bankseitig eindeutiger `native_id` sind unabhängig vom Locking sicher
+  (echter DB-`UNIQUE`-Constraint `uq_bank_import_id` auf `import_id` -
+  eine zweite, echt gleichzeitige Transaktion mit demselben `import_id`
+  schlägt dort so oder so mit einem Constraint-Fehler fehl statt still
+  zu duplizieren). Zeilen OHNE `native_id` (reiner CSV-Fingerprint-
+  Import) waren dagegen NICHT geschützt: ihre Dublettenprüfung
+  (`find_by_fingerprint`) ist ein reines SELECT-dann-Entscheiden ohne
+  DB-Backstop (`fingerprint_hash` ist nur indiziert, nicht `UNIQUE`) -
+  zwei echt gleichzeitige Importe derselben Datei ohne eindeutige
+  Kennung hätten sich gegenseitig als "noch nicht vorhanden" sehen und
+  beide dieselbe wirtschaftliche Zahlung einbuchen können (reproduziert
+  mit zwei echten Threads). Daher ebenfalls auf `schreibgesperrte_session`
+  umgestellt. Regressionstest:
+  `test_importiere_atomar_datei_sqlite_gleichzeitiger_identischer_csv_import_dupliziert_nicht`
+  in `tests/mietinkasso/test_bank.py`.
+
+  Weiterhin offen: unter PostgreSQL bleibt der `SELECT ... FOR UPDATE`-
+  Row-Lock für `_zuordnen_atomar`/`verarbeite_ruecklastschrift`/
+  `verknuepfe_mit_bestehender_zahlung` die einzige Absicherung (dort
+  technisch korrekt, aber ungetestet gegen ein echtes Postgres); der
+  `import_id`-`UNIQUE`-Constraint für `_importiere_atomar` gilt
+  datenbankunabhängig.
 - **Rücklastschrift-Validierung verschärft:** `verarbeite_ruecklastschrift`
   verlangt jetzt einen tatsächlich negativen Bankeingang (keine
   wiederverwendete positive Zahlungstransaktion — Regressionstest
