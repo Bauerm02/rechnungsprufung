@@ -862,3 +862,145 @@ def test_verknuepfen_zwei_transaktionen_koennen_eine_zahlung_gemeinsam_erklaeren
         bank_service.verknuepfe_mit_bestehender_zahlung(
             ctx=ctx, transaktion=tx_c, op_position=zahlung, konto=konto, betrag_cent=10_000, vorgang_id="TEIL-C-ZU-VIEL",
         )
+
+
+def test_verknuepfen_replay_ueber_fremdes_konto_liefert_nicht_die_fremde_zuordnung(
+    bank_service, bank_repo, op_service, stammdaten_repo, basis_vertrag, ctx_factory,
+):
+    """Codex-Rückprüfung Paket B: der frühere Code prüfte den Replay-
+    Kurzschluss (identische vorgang_id/Transaktion/OP/Betrag) VOR den
+    Bindungs-/Mandantenprüfungen. Ein Aufrufer B mit einem EIGENEN,
+    an sich berechtigten Konto konnte dadurch, wenn er die IDs einer
+    FREMDEN Transaktion/OP von Gesellschaft A plus deren vorgang_id/
+    Betrag kannte oder wiederverwendete, die FREMDE Zuordnung als
+    vermeintlichen "eigenen Replay" zurückbekommen - ohne dass deren
+    tatsächliche Konto-/Mandantenzugehörigkeit je geprüft wurde. Muss
+    stattdessen unabhängig vom Replay-Zustand mit einem Bindungsfehler
+    abgelehnt werden."""
+
+    _, konto_a = basis_vertrag
+    ctx_a = ctx_factory("7DI")
+    zahlung_a = op_service.buchen(
+        ctx=ctx_a, konto=konto_a, typ=OPTyp.ZAHLUNG, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=None, beleg_referenz="Zahlung A",
+    )
+    transaktion_a = _importiere_eine_csv_transaktion(bank_service, bank_repo, ctx_a, betrag_text="600.00", referenz="a")
+    bank_service.verknuepfe_mit_bestehender_zahlung(
+        ctx=ctx_a, transaktion=transaktion_a, op_position=zahlung_a, konto=konto_a, betrag_cent=60_000,
+        vorgang_id="GEMEINSAME-VORGANG-ID",
+    )
+
+    stammdaten_repo.upsert_gesellschaft(id="ANDERE-GESELLSCHAFT", name="Andere GmbH")
+    stammdaten_repo.upsert_objekt(id="999", gesellschaft_id="ANDERE-GESELLSCHAFT", bezeichnung="Fremdes Objekt")
+    stammdaten_repo.upsert_einheit(id="999-TOP1", objekt_id="999", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-FREMD", name="Fremde Mieterin")
+    stammdaten_repo.upsert_vertrag(
+        id="V-FREMD", einheit_id="999-TOP1", debitor_id="DEB-FREMD", gesellschaft_id="ANDERE-GESELLSCHAFT",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto_b = stammdaten_repo.get_or_create_konto(vertrag=stammdaten_repo.get_vertrag("V-FREMD"))
+    ctx_b = ctx_factory("ANDERE-GESELLSCHAFT")
+
+    with pytest.raises(BindungInkonsistentError):
+        bank_service.verknuepfe_mit_bestehender_zahlung(
+            ctx=ctx_b, transaktion=transaktion_a, op_position=zahlung_a, konto=konto_b, betrag_cent=60_000,
+            vorgang_id="GEMEINSAME-VORGANG-ID",
+        )
+    # Die echte Zuordnung von A bleibt unverändert - kein fremder
+    # Zweitzugriff hat sie angerührt.
+    assert bank_repo.zugeordneter_betrag(transaktion_a.id) == 60_000
+
+
+def test_verknuepfen_datei_sqlite_gleichzeitige_verknuepfungen_ueberschreiten_zahlung_nicht(tmp_path):
+    """Codex-Rückprüfung Paket B: unter Datei-SQLite ist `with_for_update`
+    ein Kein-Op (kein echtes Zeilen-Locking) - ohne echte
+    Schreibserialisierung (`schreibgesperrte_session`) könnten zwei ECHT
+    gleichzeitige Verknüpfungsversuche denselben, noch nicht committeten
+    Restbetrag der Zahlung lesen und GEMEINSAM über sie hinausgehen.
+    Reproduktion mit zwei echten Threads auf eine echte Datei-SQLite-DB
+    (bewusst NICHT `:memory:`/StaticPool, wo eine einzige geteilte
+    Verbindung die Frage gar nicht stellt)."""
+
+    import threading
+
+    from mietinkasso.auth.service import AuthContext
+    from mietinkasso.domain.enums import Rolle
+    from mietinkasso.infrastructure.db.base import Base
+    from mietinkasso.infrastructure.db.session import build_engine, build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    db_pfad = tmp_path / "verknuepfen-nebenlaeufig.db"
+    engine = build_engine(f"sqlite:///{db_pfad}")
+    Base.metadata.create_all(engine)
+    engine.dispose()
+    session_factory = build_session_factory(f"sqlite:///{db_pfad}")
+
+    stammdaten_repo = StammdatenRepository(session_factory)
+    op_service = OPService(OPRepository(session_factory), stammdaten_repo)
+    bank_repo = BankRepository(session_factory)
+    bank_service = BankImportService(bank_repo, stammdaten_repo, op_service)
+    ctx = AuthContext(user_id="test", rolle=Rolle.BUCHHALTUNG, gesellschaft_ids=frozenset({"7DI"}))
+
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")
+    stammdaten_repo.upsert_einheit(id="601-TOP3", objekt_id="601", bezeichnung="Top 3", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-1001", name="Max Mustermieter")
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-3", einheit_id="601-TOP3", debitor_id="DEB-1001", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten_repo.get_or_create_konto(vertrag=stammdaten_repo.get_vertrag("V-601-3"))
+
+    zahlung = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=100_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=None, beleg_referenz="Zahlung 1.000,00",
+    )
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    def _importiere(referenz: str):
+        csv_text = f"betrag,datum,referenz\n1000.00,2026-04-06,{referenz}\n"
+        return bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto, text=csv_text, mapping=mapping)[0]
+
+    # Bereits VOR der Nebenläufigkeit ein bestehender 100-EUR-Link -
+    # verbleibender "erklärter" Restbetrag der Zahlung: 900 EUR.
+    tx_vorher = _importiere("vorher")
+    bank_service.verknuepfe_mit_bestehender_zahlung(
+        ctx=ctx, transaktion=tx_vorher, op_position=zahlung, konto=konto, betrag_cent=10_000, vorgang_id="VORHER",
+    )
+
+    tx_a = _importiere("thread-a")
+    tx_b = _importiere("thread-b")
+
+    barrier = threading.Barrier(2)
+    ergebnisse: dict[str, tuple[str, object]] = {}
+
+    def _verknuepfen(schluessel: str, transaktion, vorgang_id: str):
+        barrier.wait(timeout=5)
+        try:
+            zuordnung = bank_service.verknuepfe_mit_bestehender_zahlung(
+                ctx=ctx, transaktion=transaktion, op_position=zahlung, konto=konto, betrag_cent=60_000,
+                vorgang_id=vorgang_id,
+            )
+            ergebnisse[schluessel] = ("ok", zuordnung)
+        except Exception as exc:  # noqa: BLE001 - Ergebnis wird unten geprüft, nicht verschluckt
+            ergebnisse[schluessel] = ("fehler", exc)
+
+    thread_a = threading.Thread(target=_verknuepfen, args=("a", tx_a, "THREAD-A"))
+    thread_b = threading.Thread(target=_verknuepfen, args=("b", tx_b, "THREAD-B"))
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=15)
+    thread_b.join(timeout=15)
+
+    assert set(ergebnisse) == {"a", "b"}  # beide Threads sind tatsächlich fertig geworden, kein Hänger
+    erfolgreiche = [k for k, (status, _) in ergebnisse.items() if status == "ok"]
+    fehlgeschlagene = [k for k, (status, _) in ergebnisse.items() if status == "fehler"]
+    assert len(erfolgreiche) == 1, f"genau EIN gleichzeitiger 600-EUR-Versuch darf erfolgreich sein: {ergebnisse}"
+    assert len(fehlgeschlagene) == 1
+    _, fehler = ergebnisse[fehlgeschlagene[0]]
+    assert isinstance(fehler, ZuordnungUngueltigError)
+
+    gesamt_verknuepft = bank_repo.verknuepfter_betrag_fuer_op(zahlung.id)
+    assert gesamt_verknuepft == 70_000  # 100 EUR vorher + GENAU EINER der beiden 600-EUR-Versuche, NIE 1.300 EUR

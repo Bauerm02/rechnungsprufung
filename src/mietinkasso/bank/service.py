@@ -38,6 +38,7 @@ from mietinkasso.domain.exceptions import (
     MehrfachbuchungsKonfliktError,
     ZuordnungUngueltigError,
 )
+from mietinkasso.infrastructure.db.sqlite_write_lock import schreibgesperrte_session
 from mietinkasso.infrastructure.db.tables import (
     BankKontoTable,
     BankTransaktionTable,
@@ -347,9 +348,15 @@ class BankImportService:
         """OP-Buchung + Zuordnung in EINER DB-Transaktion: schlägt die
         Zuordnungserstellung nach der Buchung fehl (Validierungsfehler ODER
         ein unerwarteter Fehler), wird die Buchung mit zurückgerollt - es
-        bleibt nie eine Zahlung ohne zugehörige Zuordnung im Ledger stehen."""
+        bleibt nie eine Zahlung ohne zugehörige Zuordnung im Ledger stehen.
 
-        with self._session_factory() as session:
+        `schreibgesperrte_session` (statt `self._session_factory()` direkt):
+        unter Datei-SQLite nimmt diese Transaktion ihren Schreib-Lock bereits
+        bei ihrem ersten Statement, nicht erst beim Insert - siehe
+        `infrastructure/db/sqlite_write_lock.py` (Codex-Rückprüfung Paket B,
+        `with_for_update` schützt SQLite nicht)."""
+
+        with schreibgesperrte_session(self._session_factory) as session:
             try:
                 op_row = self._op_service.buchen(
                     ctx=ctx,
@@ -407,9 +414,11 @@ class BankImportService:
 
         Prüfung UND Verknüpfung laufen in EINER gesperrten DB-Transaktion,
         Transaktion/OP/Konto werden per ID frisch aus der DB geladen
-        (`with_for_update`, wo unterstützt) - dieselbe Vorsicht wie bei
-        `verarbeite_ruecklastschrift`, da die Aufrufer-Objekte veraltet
-        sein können:
+        (`with_for_update`, wo unterstützt; unter Datei-SQLite zusätzlich
+        `schreibgesperrte_session` - `with_for_update` ist dort ein Kein-Op,
+        siehe `infrastructure/db/sqlite_write_lock.py`) - dieselbe Vorsicht
+        wie bei `verarbeite_ruecklastschrift`, da die Aufrufer-Objekte
+        veraltet sein können:
 
         - `op_position` muss laut DB eine AKTIVE ZAHLUNG sein und zum
           übergebenen `konto` gehören.
@@ -425,13 +434,24 @@ class BankImportService:
           (`BankRepository.create_zuordnung`).
         - Bestehende Ledger-Zeilen bleiben unverändert (append-only) -
           diese Methode fügt ausschließlich eine neue `ZuordnungTable`-
-          Zeile hinzu, nie eine neue/geänderte `OPPositionTable`-Zeile."""
+          Zeile hinzu, nie eine neue/geänderte `OPPositionTable`-Zeile.
+
+        Codex-Rückprüfung Paket B: der Replay-Kurzschluss für eine
+        WIEDERHOLTE `vorgang_id` darf NIEMALS vor den Bindungs-/Mandanten-/
+        Währungsprüfungen liegen - sonst könnte ein Aufrufer mit einem
+        eigenen, an sich berechtigten Konto über die IDs einer FREMDEN
+        Transaktion/OP plus derselben `vorgang_id`/demselben Betrag die
+        FREMDE Zuordnung als vermeintlichen "eigenen Replay" zurück-
+        bekommen, ohne dass deren tatsächliche Konto-/Mandanten-/
+        Währungszugehörigkeit je geprüft wurde. Nur die NACHFOLGENDEN
+        Restbetrags-/Link-Duplikat-Prüfungen dürfen für einen echten
+        Replay übersprungen werden (siehe unten, direkt vor ihnen)."""
 
         transaktion_id = transaktion.id
         op_position_id = op_position.id
         konto_id = konto.id
 
-        with self._session_factory() as session:
+        with schreibgesperrte_session(self._session_factory) as session:
             try:
                 frisches_konto = session.get(KontoTable, konto_id)
                 if frisches_konto is None:
@@ -446,25 +466,10 @@ class BankImportService:
                 if frische_op is None:
                     raise ValueError(f"Unbekannte OPPosition {op_position_id}")
 
-                # Ein exakter Retry DERSELBEN vorgang_id ist ein sicherer
-                # No-Op - VOR den Restbetrags-Prüfungen unten geprüft, sonst
-                # würde die bereits durch DIESEN Vorgang belegte Menge den
-                # Retry selbst als "überschreitet den Restbetrag" ablehnen.
-                # Ein Konflikt (andere vorgang_id-Zuordnung mit abweichendem
-                # Inhalt) wird weiterhin autoritativ von
-                # `BankRepository.create_zuordnung` unten erkannt.
-                bestehender_vorgang = session.execute(
-                    select(ZuordnungTable).where(ZuordnungTable.vorgang_id == vorgang_id)
-                ).scalar_one_or_none()
-                if (
-                    bestehender_vorgang is not None
-                    and bestehender_vorgang.bank_transaktion_id == transaktion_id
-                    and bestehender_vorgang.op_position_id == op_position_id
-                    and bestehender_vorgang.betrag_cent == betrag_cent
-                ):
-                    session.commit()
-                    return bestehender_vorgang
-
+                # -- Reine Identitäts-/Bindungsprüfungen - gelten AUCH für
+                # einen exakten Replay derselben vorgang_id (siehe Docstring
+                # oben); nur die Restbetrags-/Link-Duplikat-Prüfungen weiter
+                # unten dürfen für einen Replay übersprungen werden.
                 if frische_op.konto_id != frisches_konto.id:
                     raise BindungInkonsistentError(
                         f"OPPosition {op_position_id} gehört zu Konto {frische_op.konto_id}, nicht zu {konto_id}."
@@ -499,6 +504,27 @@ class BankImportService:
                     )
                 if betrag_cent <= 0:
                     raise ZuordnungUngueltigError("Verknüpfungsbetrag muss positiv sein.")
+
+                # Ein exakter Retry DERSELBEN vorgang_id ist JETZT (nach
+                # ALLEN obigen Bindungsprüfungen) ein sicherer No-Op - nur
+                # die nachfolgenden Restbetrags-Prüfungen werden für ihn
+                # übersprungen, sonst würde die bereits durch DIESEN
+                # Vorgang belegte Menge den Retry selbst als "überschreitet
+                # den Restbetrag" ablehnen. Ein Konflikt (andere
+                # vorgang_id-Zuordnung mit abweichendem Inhalt) wird
+                # weiterhin autoritativ von `BankRepository.create_zuordnung`
+                # unten erkannt.
+                bestehender_vorgang = session.execute(
+                    select(ZuordnungTable).where(ZuordnungTable.vorgang_id == vorgang_id)
+                ).scalar_one_or_none()
+                if (
+                    bestehender_vorgang is not None
+                    and bestehender_vorgang.bank_transaktion_id == transaktion_id
+                    and bestehender_vorgang.op_position_id == op_position_id
+                    and bestehender_vorgang.betrag_cent == betrag_cent
+                ):
+                    session.commit()
+                    return bestehender_vorgang
 
                 zugeordnet_transaktion = self._repository.zugeordneter_betrag(transaktion_id, session=session)
                 verbleibend_transaktion = frische_transaktion.betrag_cent - zugeordnet_transaktion
@@ -576,13 +602,18 @@ class BankImportService:
           gebuchter Rückbuchungen) noch die kumulative Rückbuchungsgrenze
           der Ursprungszahlung (abzüglich bereits gegen SIE gebuchter
           Rückbuchungen).
+
+        `schreibgesperrte_session` (statt `self._session_factory()` direkt):
+        unter Datei-SQLite ist `with_for_update` unwirksam (kein echtes
+        Zeilen-Locking) - siehe `infrastructure/db/sqlite_write_lock.py`
+        (Codex-Rückprüfung Paket B).
         """
 
         transaktion_id = transaktion.id
         original_op_position_id = original_op_position.id
         konto_id = konto.id
 
-        with self._session_factory() as session:
+        with schreibgesperrte_session(self._session_factory) as session:
             try:
                 frisches_konto = session.get(KontoTable, konto_id)
                 if frisches_konto is None:

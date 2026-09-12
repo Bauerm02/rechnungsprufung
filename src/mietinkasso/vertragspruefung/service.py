@@ -42,6 +42,7 @@ class VertragspruefungService:
         self._pruefung_repository = pruefung_repository
         self._index_pruefbedarf_repository = index_pruefbedarf_repository
         self._stammdaten_repository = stammdaten_repository
+        self._session_factory = pruefung_repository.session_factory
 
     def pruefung_anlegen(
         self,
@@ -68,34 +69,55 @@ class VertragspruefungService:
                 "keine beleglose Klassifizierung."
             )
 
-        version = self._pruefung_repository.naechste_version(vertrag.id)
-        pruefung = self._pruefung_repository.anlegen(
-            vertrag_id=vertrag.id,
-            version=version,
-            rechtsordnung=rechtsordnung,
-            fachstatus=fachstatus,
-            quellenbeleg_referenz=quellenbeleg_referenz.strip(),
-            kommentar=kommentar,
-            erstellt_von=akteur,
-        )
+        # Prüfungszeile + (bei GEPRUEFT) Rückschreibung der Rechtsordnung auf
+        # den Vertrag laufen in EINER gemeinsamen DB-Transaktion (Codex-
+        # Rückprüfung Paket B: sonst könnte ein Fehler zwischen beiden
+        # Schritten eine "halb gespeicherte Freigabe" hinterlassen - eine
+        # GEPRUEFT-Prüfungszeile, deren Rechtsordnung der Vertrag nie
+        # übernommen hat). Der Audit-Eintrag bleibt bewusst ein separater,
+        # nachgelagerter Schritt der aufrufenden Backoffice-Route - wie bei
+        # JEDER anderen Fachaktion in diesem Modul (Mahnpolicy-Freigabe,
+        # Nachbuchung, ...); das ist die bestehende, durchgängige
+        # Architekturgrenze dieser Codebasis, keine neue Ausnahme.
+        with self._session_factory() as session:
+            try:
+                version = self._pruefung_repository.naechste_version(vertrag.id, session=session)
+                pruefung = self._pruefung_repository.anlegen(
+                    vertrag_id=vertrag.id,
+                    version=version,
+                    rechtsordnung=rechtsordnung,
+                    fachstatus=fachstatus,
+                    quellenbeleg_referenz=quellenbeleg_referenz.strip(),
+                    kommentar=kommentar,
+                    erstellt_von=akteur,
+                    session=session,
+                )
 
-        if fachstatus == VertragPruefungStatus.GEPRUEFT.value:
-            # Freigabe: erst JETZT wirkt sich die geprüfte Rechtsordnung
-            # tatsächlich auf Mahnung/Index/Sollstellung aus (siehe
-            # domain/enums.py::rechtsordnung_geklaert) - ein ENTWURF
-            # (siehe oben, kein Aufruf hier) rührt den Vertrag nicht an.
-            self._stammdaten_repository.upsert_vertrag(
-                id=vertrag.id,
-                einheit_id=vertrag.einheit_id,
-                debitor_id=vertrag.debitor_id,
-                gesellschaft_id=vertrag.gesellschaft_id,
-                rechtsordnung=rechtsordnung,
-                gueltig_von=vertrag.gueltig_von,
-                gueltig_bis=vertrag.gueltig_bis,
-                faelligkeit_tag=vertrag.faelligkeit_tag,
-                zahlungsfrist_tage=vertrag.zahlungsfrist_tage,
-            )
-        return pruefung
+                if fachstatus == VertragPruefungStatus.GEPRUEFT.value:
+                    # Freigabe: erst JETZT wirkt sich die geprüfte
+                    # Rechtsordnung tatsächlich auf Mahnung/Index/
+                    # Sollstellung aus (siehe
+                    # domain/enums.py::rechtsordnung_geklaert) - ein
+                    # ENTWURF (siehe oben, kein Aufruf hier) rührt den
+                    # Vertrag nicht an.
+                    self._stammdaten_repository.upsert_vertrag(
+                        id=vertrag.id,
+                        einheit_id=vertrag.einheit_id,
+                        debitor_id=vertrag.debitor_id,
+                        gesellschaft_id=vertrag.gesellschaft_id,
+                        rechtsordnung=rechtsordnung,
+                        gueltig_von=vertrag.gueltig_von,
+                        gueltig_bis=vertrag.gueltig_bis,
+                        faelligkeit_tag=vertrag.faelligkeit_tag,
+                        zahlungsfrist_tage=vertrag.zahlungsfrist_tage,
+                        session=session,
+                    )
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            session.refresh(pruefung)
+            return pruefung
 
     def liste_pruefungen(self, vertrag_id: str) -> list[VertragPruefungTable]:
         return self._pruefung_repository.liste_fuer_vertrag(vertrag_id)
@@ -118,6 +140,7 @@ class VertragspruefungService:
 
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
+        self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
         if not (begruendung or "").strip():
             raise QuellenbelegFehltError(
                 f"Sperre {sperre_id}: eine Aufhebung ohne Begründung/Beleg wird abgelehnt."
@@ -158,6 +181,7 @@ class VertragspruefungService:
 
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
+        self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
         if rechtsordnung is not None and rechtsordnung not in _GUELTIGE_RECHTSORDNUNGEN:
             raise ValueError(f"Ungültige Rechtsordnung '{rechtsordnung}'.")
         return self._index_pruefbedarf_repository.anlegen(

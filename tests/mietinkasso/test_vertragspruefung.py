@@ -11,7 +11,12 @@ from decimal import Decimal
 
 import pytest
 
-from mietinkasso.domain.exceptions import BindungInkonsistentError, CrossTenantError, QuellenbelegFehltError
+from mietinkasso.domain.exceptions import (
+    BindungInkonsistentError,
+    CrossTenantError,
+    ObjektAusgeschlossenError,
+    QuellenbelegFehltError,
+)
 from mietinkasso.vertragspruefung.repository import IndexPruefbedarfRepository, VertragPruefungRepository
 from mietinkasso.vertragspruefung.service import VertragspruefungService
 
@@ -216,3 +221,97 @@ def test_index_pruefbedarf_liste_zeigt_neueste_zuerst(pruefung_service, basis_ve
     )
     liste = pruefung_service.liste_index_pruefbedarf(vertrag.id)
     assert [e.kommentar for e in liste] == ["Zweite", "Erste"]
+
+
+# ---------------------------------------------------------------------------
+# Objektausschluss (Pilotobjekt 107) - Codex-Rückprüfung Paket B: musste bei
+# `sperre_aufheben`/`index_pruefbedarf_speichern` erst noch ergänzt werden.
+# ---------------------------------------------------------------------------
+
+
+def _ausgeschlossener_vertrag(stammdaten_repo):
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_objekt(id="107", gesellschaft_id="7DI", bezeichnung="Sieben Dörfer", ausgeschlossen=True)
+    stammdaten_repo.upsert_einheit(id="107-TOP1", objekt_id="107", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-107", name="Mieterin 107")
+    stammdaten_repo.upsert_vertrag(
+        id="V-107-1", einheit_id="107-TOP1", debitor_id="DEB-107", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    return stammdaten_repo.get_vertrag("V-107-1")
+
+
+def test_pruefung_anlegen_auf_ausgeschlossenem_objekt_wird_blockiert(pruefung_service, stammdaten_repo, ctx_factory):
+    vertrag = _ausgeschlossener_vertrag(stammdaten_repo)
+    ctx = ctx_factory("7DI")
+    with pytest.raises(ObjektAusgeschlossenError):
+        pruefung_service.pruefung_anlegen(
+            ctx=ctx, vertrag=vertrag, rechtsordnung="OESTERREICH_MRG_VOLL", fachstatus="GEPRUEFT",
+            quellenbeleg_referenz="Beleg.pdf", kommentar=None, akteur="markus",
+        )
+    assert pruefung_service.liste_pruefungen(vertrag.id) == []
+
+
+def test_sperre_aufheben_auf_ausgeschlossenem_objekt_wird_blockiert(pruefung_service, stammdaten_repo, ctx_factory):
+    """Codex-Rückprüfung Paket B: `sperre_aufheben` rief den
+    Objektausschluss (Pilotobjekt 107) bisher NICHT auf - anders als
+    `pruefung_anlegen`, das ihn von Anfang an geprüft hat."""
+
+    vertrag = _ausgeschlossener_vertrag(stammdaten_repo)
+    ctx = ctx_factory("7DI")
+    sperre_id = stammdaten_repo.sperre_setzen(vertrag_id=vertrag.id, grund="MANUELL")
+    with pytest.raises(ObjektAusgeschlossenError):
+        pruefung_service.sperre_aufheben(
+            ctx=ctx, vertrag=vertrag, sperre_id=sperre_id, begruendung="Testbegründung", akteur="markus",
+        )
+    assert len(stammdaten_repo.aktive_sperren(vertrag.id)) == 1  # unverändert aktiv
+
+
+def test_index_pruefbedarf_speichern_auf_ausgeschlossenem_objekt_wird_blockiert(pruefung_service, stammdaten_repo, ctx_factory):
+    """Codex-Rückprüfung Paket B: `index_pruefbedarf_speichern` rief den
+    Objektausschluss (Pilotobjekt 107) bisher NICHT auf."""
+
+    vertrag = _ausgeschlossener_vertrag(stammdaten_repo)
+    ctx = ctx_factory("7DI")
+    with pytest.raises(ObjektAusgeschlossenError):
+        pruefung_service.index_pruefbedarf_speichern(
+            ctx=ctx, vertrag=vertrag, rechtsordnung=None, basis_reihe=None, basis_wert=None, basis_monat=None,
+            kommentar="Notiz", akteur="markus",
+        )
+    assert pruefung_service.liste_index_pruefbedarf(vertrag.id) == []
+
+
+# ---------------------------------------------------------------------------
+# Atomarität der Freigabe (Prüfungszeile + Rechtsordnung-Rückschreibung)
+# ---------------------------------------------------------------------------
+
+
+def test_geprueft_freigabe_ist_atomar_bei_fehler_zwischen_pruefung_und_vertragsschreibung(
+    pruefung_service, stammdaten_repo, basis_vertrag, ctx_factory, monkeypatch,
+):
+    """Codex-Rückprüfung Paket B: Prüfungszeile-Insert und die
+    Rückschreibung der Rechtsordnung auf den Vertrag liefen bisher als
+    ZWEI getrennte Commits - schlägt der zweite Schritt fehl, darf keine
+    GEPRUEFT-Prüfungszeile stehen bleiben, deren Rechtsordnung der
+    Vertrag nie übernommen hat (halb gespeicherte Freigabe)."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    ursprungs_rechtsordnung = vertrag.rechtsordnung
+
+    def _upsert_vertrag_schlaegt_fehl(*args, **kwargs):
+        raise RuntimeError("simulierter Fehler zwischen Prüfung und Vertragsschreibung")
+
+    monkeypatch.setattr(stammdaten_repo, "upsert_vertrag", _upsert_vertrag_schlaegt_fehl)
+
+    with pytest.raises(RuntimeError, match="simulierter Fehler"):
+        pruefung_service.pruefung_anlegen(
+            ctx=ctx, vertrag=vertrag, rechtsordnung="OESTERREICH_MRG_TEIL", fachstatus="GEPRUEFT",
+            quellenbeleg_referenz="Mietvertrag-2024.pdf", kommentar=None, akteur="markus",
+        )
+
+    # Weder die Prüfungszeile noch die Rechtsordnung-Änderung dürfen
+    # übrig geblieben sein - beides oder nichts.
+    assert pruefung_service.liste_pruefungen(vertrag.id) == []
+    unveraendert = stammdaten_repo.get_vertrag(vertrag.id)
+    assert unveraendert.rechtsordnung == ursprungs_rechtsordnung

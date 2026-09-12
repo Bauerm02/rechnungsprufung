@@ -143,6 +143,65 @@ davon (folgen erst nach Rückmeldung des Nutzers).
   bereits in Paket A dokumentierten Modul-Import-Einmaligkeit von
   `api.app`/`backoffice.app` pro Testprozess nicht praktikabel).
 
+### Codex-Rückprüfung Paket B (12.09., vor Produktionsfreigabe) — behoben
+
+Codex hat Paket B mit einer isolierten synthetischen Datei-SQLite-DB
+(keine Echtdaten) unabhängig geprüft und drei konkrete Befunde
+reproduziert; Codex hält Paket B bis zu dieser Korrektur von der
+Produktion zurück:
+
+1. **Cross-Tenant-Leak über den Replay-Kurzschluss in
+   `verknuepfe_mit_bestehender_zahlung`:** der frühere Code prüfte einen
+   exakten Replay derselben `vorgang_id` (identische Transaktion/OP/
+   Betrag) VOR den Bindungs-/Mandanten-/Währungsprüfungen. Ein Aufrufer
+   mit einem EIGENEN, an sich berechtigten Konto konnte dadurch, wenn er
+   die IDs einer FREMDEN Transaktion/OP samt deren `vorgang_id`/Betrag
+   kannte oder wiederverwendete, die FREMDE Zuordnung als vermeintlichen
+   "eigenen Replay" zurückbekommen — ohne dass deren tatsächliche Konto-
+   /Mandantenzugehörigkeit je geprüft wurde. Behoben durch Umordnung:
+   ALLE Identitäts-/Bindungsprüfungen (Konto-Zugehörigkeit der OP,
+   OP-Typ/-Status, Gesellschaft, Währung) laufen jetzt VOR dem
+   Replay-Kurzschluss; nur die nachfolgenden Restbetrags-/Link-Duplikat-
+   Prüfungen dürfen für einen echten Replay noch übersprungen werden.
+   Regressionstest:
+   `test_verknuepfen_replay_ueber_fremdes_konto_liefert_nicht_die_fremde_zuordnung`
+   in `tests/mietinkasso/test_bank.py`.
+2. **SQLite-Schreibserialisierung fehlte tatsächlich** (siehe Korrektur
+   im Abschnitt "Bank-Zuordnung" unter "Integration/Betrieb" oben) —
+   `with_for_update` schützt SQLite nicht, echte Nebenläufigkeit auf
+   `_zuordnen_atomar`, `verarbeite_ruecklastschrift` und
+   `verknuepfe_mit_bestehender_zahlung` konnte denselben Restbetrag
+   mehrfach beanspruchen. Behoben durch
+   `infrastructure/db/sqlite_write_lock.py::schreibgesperrte_session`
+   (`BEGIN IMMEDIATE` ab dem ersten Statement, für Datei-SQLite).
+3. **Objektausschluss (Pilotobjekt 107) fehlte bei zwei der drei neuen
+   Vertragsprüfungspfade:** `sperre_aufheben` und
+   `index_pruefbedarf_speichern` riefen
+   `StammdatenRepository.pruefe_vertrag_nicht_ausgeschlossen` bisher
+   NICHT auf (anders als `pruefung_anlegen`, das ihn von Anfang an
+   geprüft hat) — beide ergänzt. Zusätzlich: die Freigabe
+   (`pruefung_anlegen` mit `fachstatus=GEPRUEFT`) schrieb die
+   Prüfungszeile und die Rechtsordnung-Rückschreibung auf den Vertrag
+   bisher als ZWEI getrennte Commits — ein Fehler zwischen beiden hätte
+   eine "halb gespeicherte Freigabe" hinterlassen können (eine
+   GEPRUEFT-Prüfungszeile, deren Rechtsordnung der Vertrag nie
+   übernommen hat). Beide Schritte laufen jetzt in EINER gemeinsamen
+   DB-Transaktion mit gemeinsamem Rollback. Der Audit-Eintrag bleibt
+   bewusst ein separater, nachgelagerter Schritt der aufrufenden
+   Backoffice-Route — wie bei jeder anderen Fachaktion in diesem Modul
+   (Mahnpolicy-Freigabe, Nachbuchung, ...); eine vollständig
+   transaktionale Audit-Kette wäre eine größere, hier nicht angefragte
+   Architekturänderung. Regressionstests in
+   `tests/mietinkasso/test_vertragspruefung.py`:
+   `test_sperre_aufheben_auf_ausgeschlossenem_objekt_wird_blockiert`,
+   `test_index_pruefbedarf_speichern_auf_ausgeschlossenem_objekt_wird_blockiert`,
+   `test_geprueft_freigabe_ist_atomar_bei_fehler_zwischen_pruefung_und_vertragsschreibung`.
+
+Alle drei Fixes wurden gegen absichtlich deaktivierte Fassungen des
+jeweiligen Fixes gegengetestet (der zugehörige Regressionstest schlägt
+ohne den Fix nachweislich fehl), um zu bestätigen, dass die Tests die
+Regression tatsächlich erkennen und nicht nur zufällig grün sind.
+
 ## Echtbetrieb-Intake (HV-20260912-ECHTBETRIEB, 12.09.2026)
 
 - **Quellenmapping bleibt vollständig bei Codex:** `src/mietinkasso/intake/`
@@ -425,20 +484,58 @@ Server getestet. Konkret offen/einzuhalten:
   zufällig identischem Betrag sind über eine vom Aufrufer vergebene,
   eindeutige `vorgang_id` von bloßen Retries unterscheidbar
   (`test_vorgang_id_unterscheidet_retry_von_unabhaengiger_teilzuordnung`).
-  Offen bleibt: der Restbetrags-Check in `_create_zuordnung` ist ein
-  SELECT-dann-INSERT innerhalb einer Transaktion, kein `SELECT ... FOR
-  UPDATE`/echtes Serializable-Locking. Unter SQLite (Dev/Tests) sind
-  Schreibtransaktionen ohnehin serialisiert, ein Doppelbuchungsfenster
-  ist damit nicht beobachtbar; unter einer produktiven Mehrbenutzer-DB
-  (z. B. PostgreSQL) mit Standard-Isolationsstufe (READ COMMITTED)
-  könnten zwei ECHT GLEICHZEITIGE Zuordnungsversuche mit
-  UNTERSCHIEDLICHER `vorgang_id` auf denselben Restbetrag derselben
-  Transaktion theoretisch beide den (noch nicht committeten) alten
-  Restbetrag sehen und ihn gemeinsam überschreiten. Ein Row-Lock auf der
-  Banktransaktion (`SELECT ... FOR UPDATE`) beim Zuordnungscheck ist der
-  nächste Schritt, falls Mehrbenutzerbetrieb mit hoher Nebenläufigkeit
-  auf demselben Bankkonto produktiv relevant wird — technisch noch NICHT
-  gebaut.
+  **Korrektur (Codex-Rückprüfung Paket B, 12.09.):** eine frühere Version
+  dieses Punkts behauptete hier fälschlich, SQLite-Schreibtransaktionen
+  seien für ein SELECT-dann-INSERT wie den Restbetrags-Check "ohnehin
+  serialisiert" und ein Doppelbuchungsfenster damit unter SQLite gar
+  nicht beobachtbar. Das ist FALSCH: `session.get(..., with_for_update=True)`
+  ist unter SQLite ein reines Kein-Op (der Dialekt kompiliert `FOR
+  UPDATE` weg), und eine gewöhnliche SQLite-Transaktion nimmt ihren
+  Schreib-Lock (DEFERRED) erst bei ihrem ERSTEN Schreibbefehl, nicht bei
+  ihrem ersten Lesebefehl — zwei echte, gleichzeitige Datei-SQLite-
+  Verbindungen konnten dieselbe, noch nicht committete Zwischensumme
+  lesen, bevor eine von beiden schreibt (von Codex mit zwei echten
+  Threads auf `verknuepfe_mit_bestehender_zahlung` reproduziert:
+  zusammen mit einem bereits bestehenden 100-EUR-Link hätten zwei
+  gleichzeitige 600-EUR-Verknüpfungsversuche auf eine 1.000-EUR-Zahlung
+  BEIDE durchgehen und sie auf 1.300 EUR überzeichnen können).
+
+  **Behoben** für die drei Bank-Schreibpfade, die exakt dieses "lesen,
+  dann entscheiden, dann schreiben"-Muster verwenden -
+  `BankImportService._zuordnen_atomar`, `verarbeite_ruecklastschrift`
+  und `verknuepfe_mit_bestehender_zahlung` — durch
+  `infrastructure/db/sqlite_write_lock.py::schreibgesperrte_session`:
+  unter Datei-SQLite läuft die jeweilige Transaktion über eine eigene,
+  dedizierte Verbindung zur selben Datei, deren ERSTES Statement
+  `BEGIN IMMEDIATE` ausführt (nimmt den Schreib-Lock sofort statt erst
+  beim Schreibbefehl) — eine zweite gleichzeitige kritische Sektion
+  blockiert (bis zum sqlite3-Busy-Timeout), statt denselben veralteten
+  Zwischenstand zu lesen. PostgreSQL bleibt davon unberührt (dort
+  gelten weiterhin die bestehenden `with_for_update=True`-Zeilensperren
+  unverändert als korrekt); für `:memory:`-Datenbanken (Unit-Tests) ist
+  die Umschaltung wirkungslos, aber auch nicht nötig (dort teilt ein
+  `StaticPool` ohnehin eine einzige Verbindung). Regressionstests:
+  `tests/mietinkasso/test_sqlite_write_lock.py` (deterministischer
+  Primitiv-Test über zwei per `threading.Event` kontrolliert
+  synchronisierte Threads — ein reiner Zwei-Thread-Business-Logik-Test
+  kann eine echte Interleaving-Race nicht zuverlässig/wiederholbar
+  erzwingen) sowie
+  `test_verknuepfen_datei_sqlite_gleichzeitige_verknuepfungen_ueberschreiten_zahlung_nicht`
+  in `tests/mietinkasso/test_bank.py` (Integrationstest mit echter
+  Datei-SQLite-DB, zwei echten Threads, `threading.Barrier`).
+
+  **Weiterhin offen:** `BankImportService._importiere_atomar` (Datei-
+  Import je Aufruf) nutzt dasselbe SELECT-dann-INSERT-Muster für seine
+  Fingerprint-/import_id-Idempotenzprüfung, wurde in dieser Korrektur
+  aber NICHT umgestellt (nicht Teil des von Codex reproduzierten
+  Befunds) — zwei echt gleichzeitige Importe derselben Datei auf
+  dasselbe Bankkonto könnten unter Datei-SQLite theoretisch beide
+  dieselbe "neue" Zeile für sich beanspruchen. Für den Ein-Operator-
+  Pilotbetrieb (sequenzielle manuelle Importe) kein praktisches Risiko,
+  aber ein offener Punkt für einen späteren Mehrbenutzer-/
+  Mehrprozessbetrieb. Ebenso weiterhin offen: unter PostgreSQL bleibt
+  der `SELECT ... FOR UPDATE`-Row-Lock die einzige Absicherung (dort
+  technisch korrekt, aber ungetestet gegen ein echtes Postgres).
 - **Rücklastschrift-Validierung verschärft:** `verarbeite_ruecklastschrift`
   verlangt jetzt einen tatsächlich negativen Bankeingang (keine
   wiederverwendete positive Zahlungstransaktion — Regressionstest
