@@ -94,6 +94,30 @@ keine stillschweigend übersprungenen Punkte.
   richtiggestellt: `paket_hash` ist ein Hash über den GEPARSTEN,
   semantischen Inhalt, keine Datei-Prüfsumme über rohe Bytes.
 
+### Codex-Rückprüfung Commit bb08f92 — behoben
+
+- **Paketinterne ID-Dubletten wurden nicht erkannt:** `pruefe_paket`
+  verglich die Primär-/Quell-IDs jeder Zeile nur GEGEN die DB
+  (`session.get(...)`), nie GEGENEINANDER innerhalb desselben Pakets.
+  Zwei verschiedene Zeilen mit derselben `id` (z. B. zwei
+  `KomponenteZeile` mit `id="K1"`, aber unterschiedlichem Betrag)
+  konnten dadurch BEIDE als "NEU" durchgehen - `apply()` hätte die
+  erste beim Schreiben je nach Reihenfolge/Flush-Zeitpunkt still
+  verdrängt, ohne dass der Plan das angezeigt hätte. Behoben durch eine
+  paketinterne Dublettenprüfung (`planner.py::_mehrfache_werte`) VOR
+  jeder DB-Prüfung, für Gesellschaft/Objekt/Einheit/Debitor/Vertrag/
+  Komponente (jeweils eigener ID-Raum) sowie für `import_id` GEMEINSAM
+  über Eröffnungen/Nachbuchungen/Eröffnungskorrekturen hinweg (diese
+  drei schreiben alle in denselben DB-weiten Unique-Index
+  `uq_op_import_id`). Eine erkannte Dublette markiert JEDE betroffene
+  Zeile als KONFLIKT und blockiert damit den gesamten Lauf (bestehende
+  "Ein Fehler ⇒ gesamter Lauf unverändert"-Garantie). Sperren behalten
+  ihre bewusst andere, bereits dokumentierte Dedupe-Logik (`sperre_ist_bereits_aktiv`
+  über `(vertrag_id, grund, kommentar)`) - eine Sperre ist ein additiver
+  Fakt, mehrere unterschiedliche Sperren desselben Vertrags sind
+  fachlich normal und bleiben kein Konflikt. Regressionstests in
+  `tests/mietinkasso/test_intake.py`.
+
 ## Deployment-Paket (HV-20260912-ECHTBETRIEB, Punkt 3) — Vorlage, keine Produktivfreigabe
 
 `docs/hausverwaltung/DEPLOYMENT_HETZNER.md` +

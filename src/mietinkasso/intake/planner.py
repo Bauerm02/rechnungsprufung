@@ -92,6 +92,24 @@ class IntakePlan:
         return not self.konflikte and not self.gesperrt
 
 
+def _mehrfache_werte(werte: list[str]) -> set[str]:
+    """Liefert die Werte, die 2+ Mal in `werte` vorkommen - Grundlage für
+    die paketinterne Dublettenprüfung (siehe `pruefe_paket`): zwei
+    verschiedene Zeilen mit derselben Primär-/Quell-ID im SELBEN Paket
+    dürfen NIE beide als NEU durchgehen, sonst würde eine die andere
+    beim Schreiben still überschreiben/verdrängen, je nach Reihenfolge
+    und Flush-Zeitpunkt - nicht deterministisch und nicht erkennbar am
+    Plan."""
+
+    gesehen: set[str] = set()
+    mehrfach: set[str] = set()
+    for wert in werte:
+        if wert in gesehen:
+            mehrfach.add(wert)
+        gesehen.add(wert)
+    return mehrfach
+
+
 def _felder_hash(felder: dict) -> str:
     kanonisch = json.dumps(felder, sort_keys=True, default=str, ensure_ascii=False)
     return hashlib.sha256(kanonisch.encode("utf-8")).hexdigest()
@@ -178,7 +196,12 @@ def pruefe_paket(
     hinweise: list[str] = []
     ctx = _Kontext()
 
+    gesellschaft_mehrfach = _mehrfache_werte([z.id for z in paket.gesellschaften])
     for z in paket.gesellschaften:
+        ctx.gesellschaft_ids.add(z.id)
+        if z.id in gesellschaft_mehrfach:
+            befunde.append(PruefBefund("Gesellschaft", z.id, "KONFLIKT", f"Gesellschaft-ID '{z.id}' ist mehrfach im selben Paket vertreten - eindeutige IDs sind Pflicht."))
+            continue
         felder = _gesellschaft_felder(z.name)
         bestehend = session.get(GesellschaftTable, z.id)
         if bestehend is None:
@@ -187,10 +210,14 @@ def pruefe_paket(
             befunde.append(PruefBefund("Gesellschaft", z.id, "UNVERAENDERT"))
         else:
             befunde.append(PruefBefund("Gesellschaft", z.id, "KONFLIKT", f"Gesellschaft '{z.id}' existiert bereits mit abweichendem Inhalt."))
-        ctx.gesellschaft_ids.add(z.id)
 
+    objekt_mehrfach = _mehrfache_werte([z.id for z in paket.objekte])
     for z in paket.objekte:
         gesperrt_grund = None
+        if z.id in objekt_mehrfach:
+            befunde.append(PruefBefund("Objekt", z.id, "KONFLIKT", f"Objekt-ID '{z.id}' ist mehrfach im selben Paket vertreten - eindeutige IDs sind Pflicht."))
+            ctx.objekt_ausgeschlossen[z.id] = z.id in ausgeschlossene_objekte or z.ausgeschlossen
+            continue
         if z.id in ausgeschlossene_objekte or z.ausgeschlossen:
             gesperrt_grund = f"Objekt '{z.id}' ist ausgeschlossen (Pilot-Fachregel 1) und darf nicht eingespielt werden."
         if z.gesellschaft_id not in ctx.gesellschaft_ids and session.get(GesellschaftTable, z.gesellschaft_id) is None:
@@ -216,7 +243,12 @@ def pruefe_paket(
         bestehend = session.get(ObjektTable, objekt_id)
         return bestehend is not None and bestehend.ausgeschlossen
 
+    einheit_mehrfach = _mehrfache_werte([z.id for z in paket.einheiten])
     for z in paket.einheiten:
+        ctx.einheit_objekt[z.id] = z.objekt_id
+        if z.id in einheit_mehrfach:
+            befunde.append(PruefBefund("Einheit", z.id, "KONFLIKT", f"Einheit-ID '{z.id}' ist mehrfach im selben Paket vertreten - eindeutige IDs sind Pflicht."))
+            continue
         objekt_bekannt = z.objekt_id in ctx.objekt_ausgeschlossen or session.get(ObjektTable, z.objekt_id) is not None
         if z.nutzungsstatus not in _GUELTIGE_NUTZUNGSSTATUS:
             befunde.append(PruefBefund("Einheit", z.id, "KONFLIKT", f"Einheit '{z.id}': ungültiger Nutzungsstatus '{z.nutzungsstatus}'."))
@@ -233,10 +265,16 @@ def pruefe_paket(
                 befunde.append(PruefBefund("Einheit", z.id, "UNVERAENDERT"))
             else:
                 befunde.append(PruefBefund("Einheit", z.id, "KONFLIKT", f"Einheit '{z.id}' existiert bereits mit abweichendem Inhalt."))
-        ctx.einheit_objekt[z.id] = z.objekt_id
 
     fehlende_email_anzahl = 0
+    debitor_mehrfach = _mehrfache_werte([z.id for z in paket.debitoren])
     for z in paket.debitoren:
+        ctx.debitor_ids.add(z.id)
+        if not (z.email or "").strip():
+            fehlende_email_anzahl += 1
+        if z.id in debitor_mehrfach:
+            befunde.append(PruefBefund("Debitor", z.id, "KONFLIKT", f"Debitor-ID '{z.id}' ist mehrfach im selben Paket vertreten - eindeutige IDs sind Pflicht."))
+            continue
         felder = _debitor_felder(z.name, z.email, z.adresse)
         bestehend = session.get(DebitorTable, z.id)
         if bestehend is None:
@@ -245,9 +283,6 @@ def pruefe_paket(
             befunde.append(PruefBefund("Debitor", z.id, "UNVERAENDERT"))
         else:
             befunde.append(PruefBefund("Debitor", z.id, "KONFLIKT", f"Debitor '{z.id}' existiert bereits mit abweichendem Inhalt."))
-        if not (z.email or "").strip():
-            fehlende_email_anzahl += 1
-        ctx.debitor_ids.add(z.id)
 
     def _einheit_objekt_id(einheit_id: str) -> str | None:
         if einheit_id in ctx.einheit_objekt:
@@ -257,9 +292,15 @@ def pruefe_paket(
 
     fehlende_faelligkeit_anzahl = 0
     ungeklaerte_rechtsordnung_anzahl = 0
+    vertrag_mehrfach = _mehrfache_werte([z.id for z in paket.vertraege])
     for z in paket.vertraege:
+        ctx.vertrag_gesellschaft[z.id] = z.gesellschaft_id
+        ctx.vertrag_einheit[z.id] = z.einheit_id
         if not rechtsordnung_geklaert(z.rechtsordnung):
             ungeklaerte_rechtsordnung_anzahl += 1
+        if z.id in vertrag_mehrfach:
+            befunde.append(PruefBefund("Vertrag", z.id, "KONFLIKT", f"Vertrag-ID '{z.id}' ist mehrfach im selben Paket vertreten - eindeutige IDs sind Pflicht."))
+            continue
         einheit_bekannt = z.einheit_id in ctx.einheit_objekt or session.get(EinheitTable, z.einheit_id) is not None
         debitor_bekannt = z.debitor_id in ctx.debitor_ids or session.get(DebitorTable, z.debitor_id) is not None
         gesellschaft_bekannt = z.gesellschaft_id in ctx.gesellschaft_ids or session.get(GesellschaftTable, z.gesellschaft_id) is not None
@@ -289,8 +330,6 @@ def pruefe_paket(
                     befunde.append(PruefBefund("Vertrag", z.id, "UNVERAENDERT"))
                 else:
                     befunde.append(PruefBefund("Vertrag", z.id, "KONFLIKT", f"Vertrag '{z.id}' existiert bereits mit abweichendem Inhalt."))
-        ctx.vertrag_gesellschaft[z.id] = z.gesellschaft_id
-        ctx.vertrag_einheit[z.id] = z.einheit_id
 
     def _vertrag_bekannt(vertrag_id: str) -> bool:
         return vertrag_id in ctx.vertrag_einheit or session.get(VertragTable, vertrag_id) is not None
@@ -310,19 +349,37 @@ def pruefe_paket(
         konto = session.execute(select(KontoTable).where(KontoTable.vertrag_id == vertrag_id)).scalar_one_or_none()
         return konto.eroeffnung_modus if konto is not None else None
 
+    # Eröffnungen/Nachbuchungen/Eröffnungskorrekturen teilen sich EINEN
+    # ID-Raum (alle schreiben letztlich in `OPPositionTable.import_id`,
+    # ein einziger DB-weiter Unique-Index `uq_op_import_id`) - eine
+    # Dublette MUSS deshalb über alle drei Listen hinweg geprüft werden,
+    # nicht nur innerhalb einer einzelnen Liste.
+    op_import_id_mehrfach = _mehrfache_werte([
+        z.import_id for z in (*paket.eroeffnungen, *paket.nachbuchungen, *paket.eroeffnungskorrekturen)
+    ])
+
     for z in paket.eroeffnungen:
+        if z.import_id in op_import_id_mehrfach:
+            befunde.append(PruefBefund("Eröffnung", z.import_id, "KONFLIKT", f"import_id '{z.import_id}' ist mehrfach im selben Paket vertreten (Eröffnungen/Nachbuchungen/Eröffnungskorrekturen teilen sich einen ID-Raum) - eindeutige IDs sind Pflicht."))
+            continue
         _pruefe_eroeffnung(z, ctx=ctx, session=session, befunde=befunde, vertrag_bekannt=_vertrag_bekannt(z.vertrag_id),
                             konto_id=_konto_id(z.vertrag_id), bestehende_eroeffnung=_bestehende_eroeffnung, bestehender_modus=_bestehender_eroeffnungsmodus)
         if not z.faelligkeit and z.modus == "EINZEL_OP":
             fehlende_faelligkeit_anzahl += 1
 
     for z in paket.nachbuchungen:
+        if z.import_id in op_import_id_mehrfach:
+            befunde.append(PruefBefund("Nachbuchung", z.import_id, "KONFLIKT", f"import_id '{z.import_id}' ist mehrfach im selben Paket vertreten (Eröffnungen/Nachbuchungen/Eröffnungskorrekturen teilen sich einen ID-Raum) - eindeutige IDs sind Pflicht."))
+            continue
         _pruefe_nachbuchung(z, ctx=ctx, session=session, befunde=befunde, vertrag_bekannt=_vertrag_bekannt(z.vertrag_id),
                              konto_id=_konto_id(z.vertrag_id), bestehender_modus=_bestehender_eroeffnungsmodus)
         if not z.faelligkeit:
             fehlende_faelligkeit_anzahl += 1
 
     for z in paket.eroeffnungskorrekturen:
+        if z.import_id in op_import_id_mehrfach:
+            befunde.append(PruefBefund("Eröffnungskorrektur", z.import_id, "KONFLIKT", f"import_id '{z.import_id}' ist mehrfach im selben Paket vertreten (Eröffnungen/Nachbuchungen/Eröffnungskorrekturen teilen sich einen ID-Raum) - eindeutige IDs sind Pflicht."))
+            continue
         _pruefe_eroeffnungskorrektur(
             z, ctx=ctx, session=session, befunde=befunde, vertrag_bekannt=_vertrag_bekannt(z.vertrag_id),
             bestehender_modus=_bestehender_eroeffnungsmodus,
@@ -337,7 +394,11 @@ def pruefe_paket(
         bestehender_vertrag = session.get(VertragTable, vertrag_id)
         return bestehender_vertrag.einheit_id if bestehender_vertrag is not None else None
 
+    komponente_mehrfach = _mehrfache_werte([z.id for z in paket.komponenten])
     for z in paket.komponenten:
+        if z.id in komponente_mehrfach:
+            befunde.append(PruefBefund("Komponente", z.id, "KONFLIKT", f"Komponente-ID '{z.id}' ist mehrfach im selben Paket vertreten - eindeutige IDs sind Pflicht."))
+            continue
         einheit_id = _einheit_id_fuer_vertrag(z.vertrag_id)
         objekt_id = _einheit_objekt_id(einheit_id) if einheit_id is not None else None
         _pruefe_komponente(

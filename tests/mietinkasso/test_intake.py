@@ -523,6 +523,154 @@ def test_komponente_replay_ist_wirkungslos_geaenderter_inhalt_ist_konflikt(sessi
 
 
 # ---------------------------------------------------------------------------
+# Codex-Rückprüfung bb08f92: paketinterne Dubletten derselben Primär-/
+# Quell-ID müssen hart als KONFLIKT abgelehnt werden - `pruefe_paket` prüfte
+# Komponenten-IDs (und die anderen Stammdaten-IDs) bisher nur gegen die DB,
+# nicht gegeneinander im selben Paket. Zwei verschiedene KomponenteZeile mit
+# gleicher id konnten dadurch beide als NEU durchgehen; `add_komponente`
+# hätte die erste beim Schreiben still verdrängt (Reihenfolge-/
+# Flush-abhängig, nicht am Plan erkennbar).
+# ---------------------------------------------------------------------------
+
+
+def test_doppelte_komponenten_id_im_paket_ist_konflikt_und_blockiert_alles(session_factory, stammdaten_repo, op_service):
+    """Synthetischer Test aus der Rückprüfung: K1 zweimal mit 1200 und
+    300 Cent muss Plan UND Apply blockieren, DB bleibt VOLLSTÄNDIG
+    unverändert (auch keine der ansonsten unproblematischen Stammdaten)."""
+
+    paket = _paket(komponenten=[
+        {"id": "K1", "vertrag_id": "V-1", "art": "HMZ", "bezeichnung": "Hauptmietzins",
+         "betrag_cent": 1200, "gueltig_von": "2020-01-01"},
+        {"id": "K1", "vertrag_id": "V-1", "art": "PARKPLATZ", "bezeichnung": "Stellplatz",
+         "betrag_cent": 300, "gueltig_von": "2020-01-01"},
+    ])
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    komponenten_befunde = [b for b in plan.befunde if b.entitaet == "Komponente"]
+    assert len(komponenten_befunde) == 2
+    assert all(b.status == "KONFLIKT" for b in komponenten_befunde)
+    assert all("mehrfach" in (b.grund or "") for b in komponenten_befunde)
+
+    with pytest.raises(IntakeNichtAnwendbarError):
+        _apply(paket, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+
+    # DB vollständig unverändert - auch nicht die für sich genommen
+    # unproblematischen Stammdaten (Gesellschaft/Objekt/Einheit/Debitor/Vertrag).
+    assert stammdaten_repo.get_komponente("K1") is None
+    assert stammdaten_repo.get_gesellschaft("JLB") is None
+    assert stammdaten_repo.get_vertrag("V-1") is None
+
+
+def test_zwei_verschiedene_komponenten_ids_gleicher_art_und_vertrag_bleiben_beide_erhalten(session_factory, stammdaten_repo, op_service):
+    """Gegenprobe: zwei ECHT verschiedene IDs (auch mit gleichem
+    art/Vertrag - z. B. zwei HMZ-Perioden) sind kein Konflikt und müssen
+    beide angelegt werden."""
+
+    paket = _paket(komponenten=[
+        {"id": "K1", "vertrag_id": "V-1", "art": "HMZ", "bezeichnung": "Hauptmietzins (alt)",
+         "betrag_cent": 1200, "gueltig_von": "2020-01-01", "gueltig_bis": "2025-12-31"},
+        {"id": "K2", "vertrag_id": "V-1", "art": "HMZ", "bezeichnung": "Hauptmietzins (neu)",
+         "betrag_cent": 1300, "gueltig_von": "2026-01-01"},
+    ])
+    plan = _plan(paket, session_factory)
+    assert plan.anwendbar
+    komponenten_befunde = [b for b in plan.befunde if b.entitaet == "Komponente"]
+    assert {b.status for b in komponenten_befunde} == {"NEU"}
+    _apply(paket, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+
+    assert stammdaten_repo.get_komponente("K1").betrag_cent == 1200
+    assert stammdaten_repo.get_komponente("K2").betrag_cent == 1300
+
+
+def test_doppelte_gesellschafts_id_im_paket_ist_konflikt(session_factory):
+    paket = _paket(gesellschaften=[
+        {"id": "JLB", "name": "JLB Projects GmbH"},
+        {"id": "JLB", "name": "Andere Bezeichnung GmbH"},
+    ])
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    befunde = [b for b in plan.befunde if b.entitaet == "Gesellschaft"]
+    assert len(befunde) == 2
+    assert all(b.status == "KONFLIKT" for b in befunde)
+
+
+def test_doppelte_objekt_id_im_paket_ist_konflikt(session_factory):
+    paket = _paket(objekte=[
+        {"id": "601", "gesellschaft_id": "JLB", "bezeichnung": "Am Corso"},
+        {"id": "601", "gesellschaft_id": "JLB", "bezeichnung": "Anderer Name"},
+    ])
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    befunde = [b for b in plan.befunde if b.entitaet == "Objekt"]
+    assert len(befunde) == 2
+    assert all(b.status == "KONFLIKT" for b in befunde)
+
+
+def test_doppelte_einheit_id_im_paket_ist_konflikt(session_factory):
+    paket = _paket(einheiten=[
+        {"id": "601-T1", "objekt_id": "601", "bezeichnung": "Top 1", "nutzungsstatus": "DAUERVERMIETUNG"},
+        {"id": "601-T1", "objekt_id": "601", "bezeichnung": "Top 1 (anders)", "nutzungsstatus": "LEERSTAND"},
+    ])
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    befunde = [b for b in plan.befunde if b.entitaet == "Einheit"]
+    assert len(befunde) == 2
+    assert all(b.status == "KONFLIKT" for b in befunde)
+
+
+def test_doppelte_debitor_id_im_paket_ist_konflikt(session_factory):
+    paket = _paket(debitoren=[
+        {"id": "DEB-1", "name": "Erika Musterfrau", "email": "erika@example.at"},
+        {"id": "DEB-1", "name": "Anderer Name", "email": "anders@example.at"},
+    ])
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    befunde = [b for b in plan.befunde if b.entitaet == "Debitor"]
+    assert len(befunde) == 2
+    assert all(b.status == "KONFLIKT" for b in befunde)
+
+
+def test_doppelte_vertrag_id_im_paket_ist_konflikt(session_factory):
+    paket = _paket(vertraege=[
+        {"id": "V-1", "einheit_id": "601-T1", "debitor_id": "DEB-1", "gesellschaft_id": "JLB",
+         "rechtsordnung": "OESTERREICH_MRG_VOLL", "gueltig_von": "2020-01-01"},
+        {"id": "V-1", "einheit_id": "601-T1", "debitor_id": "DEB-1", "gesellschaft_id": "JLB",
+         "rechtsordnung": "OESTERREICH_MRG_FREI", "gueltig_von": "2021-01-01"},
+    ])
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    befunde = [b for b in plan.befunde if b.entitaet == "Vertrag"]
+    assert len(befunde) == 2
+    assert all(b.status == "KONFLIKT" for b in befunde)
+
+
+def test_gleiche_import_id_ueber_eroeffnung_und_nachbuchung_hinweg_ist_konflikt(session_factory):
+    """Eröffnungen/Nachbuchungen/Eröffnungskorrekturen teilen sich EINEN
+    ID-Raum (`OPPositionTable.import_id`, ein DB-weiter Unique-Index) -
+    eine Dublette über die Listen hinweg muss genauso erkannt werden wie
+    innerhalb einer einzelnen Liste."""
+
+    paket = _paket(
+        eroeffnungen=[
+            {"import_id": "X1", "vertrag_id": "V-1", "modus": "GESAMTSALDO", "betrag_cent": 150000,
+             "stichtag": "2026-08-31", "quelle_bestaetigt": True},
+        ],
+        nachbuchungen=[
+            {"import_id": "X1", "vertrag_id": "V-1", "typ": "SOLL", "betrag_cent": 1000,
+             "belegdatum": "2026-09-01", "buchungsdatum": "2026-09-01"},
+        ],
+    )
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    eroeffnung_befund = next(b for b in plan.befunde if b.entitaet == "Eröffnung")
+    nachbuchung_befund = next(b for b in plan.befunde if b.entitaet == "Nachbuchung")
+    assert eroeffnung_befund.status == "KONFLIKT"
+    assert nachbuchung_befund.status == "KONFLIKT"
+    assert "mehrfach" in eroeffnung_befund.grund
+    assert "mehrfach" in nachbuchung_befund.grund
+
+
+# ---------------------------------------------------------------------------
 # Ergänzung HV-20260912-ECHTBETRIEB: Eröffnungskorrektur (nachweislich im
 # bestätigten Gesamtsaldo fehlender Posten, echtes Datum vor dem Stichtag).
 # ---------------------------------------------------------------------------
