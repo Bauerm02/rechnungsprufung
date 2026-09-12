@@ -41,7 +41,7 @@ verbindliche Quelle, nicht diese Kurzfassung.
   versionierte, überprüfbare Regelprofile, die erst nach fachlicher
   Freigabe wirksam werden.
 
-### Synthetic-only
+### Synthetic-only (für Claude weiterhin uneingeschränkt gültig)
 
 - Es werden ausschließlich synthetische Testdaten verwendet
   (`scripts/seed_synthetic_data.py`, `src/mietinkasso/importtemplates/`).
@@ -49,8 +49,53 @@ verbindliche Quelle, nicht diese Kurzfassung.
   Originaldokumente aus den lokalen Dropbox-/Windows-Pfaden werden in
   dieses Repository kopiert oder eingelesen. Falls solche Pfade in einer
   Sitzung erwähnt werden: Zugriff prüfen, niemals Inhalte übernehmen.
-- Keine echten Mietermails, keine Produktivbuchungen, keine Bankaktionen,
-  kein Deployment.
+- Keine echten Mietermails, keine Produktivbuchungen, keine Bankaktionen
+  durch Claude. Claude greift nie auf einen Server zu und deployt nie.
+
+### Auftrag HV-20260912-ECHTBETRIEB — differenzierte Freigabe (löst die
+### bisherige pauschale Synthetic-only/Kein-Deployment-Grenze für Codex ab)
+
+Markus hat am 12.09.2026 ausdrücklich erlaubt, echte
+Hausverwaltungs-Stammdaten/Salden zu übernehmen, zwei Mahnstufen
+einzustellen und den geschützten Onlinebetrieb auf seinem bestehenden
+Hetzner-Server (über die JLB-Webseite) einzurichten. Automatische
+Bankabholung/-zuordnung bleiben ausdrücklich zurückgestellt bis zur
+EBS/EBICS-Lösung. Vollständiger Wortlaut:
+`docs/hausverwaltung/RAHMENPROGRAMM.md` (Abschnitt HV-20260912-ECHTBETRIEB).
+
+Diese Freigabe ist **differenziert nach Owner**, nicht pauschal:
+
+- **Codex** darf ab diesem Auftrag echte Daten mappen (privates
+  Datenmapping außerhalb dieses Repos), unabhängig abnehmen und den
+  kontrollierten Serverbetrieb auf der bestehenden Hetzner-Infrastruktur
+  übernehmen. Für Codex ist die alte Synthetic-only/Kein-Deployment-Grenze
+  durch diesen Auftrag abgelöst.
+- **Claude bleibt bei synthetischen Testdaten** (siehe Abschnitt oben,
+  unverändert gültig) und greift weiterhin nie auf einen Server zu,
+  deployt nie und importiert nie echte Personen-, Bank-, Dokument- oder
+  Secret-Daten in Git oder Cloud-Code. Claude baut die generische,
+  wiederverwendbare Infrastruktur (Intake-Engine, Mahnstufen-Konfiguration,
+  Deployment-Paket als Dateien/Anleitung) — Codex befüllt sie mit echten
+  Daten und führt den Betrieb.
+- Weiterhin gilt: keine tatsächliche Mietermail aus diesem
+  Entwicklungsauftrag (`SEND_ENABLED=false` bleibt Standard), keine
+  automatische Bankabholung/-zuordnung, kein Rechnungsmodul-Zugriff
+  (`src/invoice_automation/` bleibt unangetastet), keine zusätzlichen
+  kostenpflichtigen Dienste.
+
+Konkrete Ergänzungen unter diesem Auftrag (Details in RAHMENPROGRAMM.md
+und `docs/hausverwaltung/IMPORT_VERTRAG.md`):
+
+1. Generischer, atomarer, idempotenter Intake für Gesellschaften/Objekte/
+   Einheiten/Debitoren/Verträge sowie bestätigte Eröffnungssalden und
+   separat datierte Nachbuchungen — Dry-run (Plan mit Quelle/Hash) und
+   Apply (bindet sich an identischen Plan-Hash) getrennt, private DB
+   außerhalb des Repos, keine Vermischung mit dem Demo-Seed.
+2. Genau zwei konfigurierbare Mahnstufen, backoffice-sichtbar, ohne
+   Zinsen/Gebühren, `SEND_ENABLED=false` unverändert Standard.
+3. Minimales Deployment-Paket (Doku/Vorlagen) für Markus als EINEN
+   Operator über HTTPS mit persistenten Daten, ohne Demo-Seed — Codex
+   führt die tatsächliche Integration auf dem Server durch.
 
 ### Send-off / Übergabeprotokoll
 

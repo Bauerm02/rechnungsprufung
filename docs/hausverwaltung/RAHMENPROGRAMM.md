@@ -224,3 +224,90 @@ angehängt, mit Datum/Kontext, statt den Originaltext zu verändern.
 Die vollständige, laufend aktualisierte Statusübersicht steht in
 `docs/hausverwaltung/REVIEW_ZUSAMMENFASSUNG.md`; offene technische
 Punkte in `docs/hausverwaltung/OFFENE_PUNKTE.md`.
+
+## Auftrag HV-20260912-ECHTBETRIEB (wortgetreu, 12.09.2026)
+
+> Neuer ausdrücklicher Nutzerauftrag HV-20260912-ECHTBETRIEB: Markus
+> erlaubt jetzt, die echten Hausverwaltungs-Stammdaten und Salden in das
+> Programm zu übernehmen, zwei Mahnstufen einzustellen und den
+> geschützten Onlinebetrieb auf seinem bestehenden Hetzner-Server über
+> die JLB-Webseite einzurichten. Automatische Bankabholung und
+> automatische Zahlungszuordnung ausdrücklich zurückgestellt bis zu
+> seiner EBS/EBICS-Lösung. Du implementierst weiter im bestehenden
+> Branch claude/bold-volta-7xovjq mit Sonnet 5, High, Fast AUS; Codex
+> macht privates Datenmapping, unabhängige Abnahme und kontrollierten
+> Serverbetrieb. Die alte Synthetic-only/kein-Deployment-Grenze ist für
+> Codex durch diesen neuen Nutzerauftrag abgelöst. Bei dir bleiben
+> Testdaten synthetisch; keine echten Personen, Bankdaten, Dokumente
+> oder Secrets in Git oder Cloud-Code. Aktualisiere AGENTS.md/CLAUDE.md
+> dateigleich mit der differenzierten neuen Freigabe und
+> RAHMENPROGRAMM/OFFENE_PUNKTE.
+>
+> Implementiere die notwendigen Ergänzungen, ohne das Rechnungsmodul
+> anzufassen:
+>
+> 1. Generischer atomarer, idempotenter Intake für Gesellschaften/
+>    Objekte/Einheiten/Debitoren/Verträge sowie bestätigte
+>    Eröffnungssalden zum Stichtag und separat datierte Nachbuchungen.
+>    Vorhandene Services und IDs nutzen. JSON/CSV-Dry-run erzeugt
+>    lesbaren Plan mit Quelle/Hash; Apply bindet sich an identischen
+>    Inhalt und schreibt in eine ausdrücklich angegebene private DB
+>    außerhalb Repo. Ein Fehler => gesamter Lauf unverändert.
+>    Wiederholung keine Duplikate; geänderte gleiche Quell-ID Konflikt;
+>    Eröffnungssaldo und enthaltenes Journal niemals doppelt; keine
+>    Produktionsdaten aus Demo seed. Codex erzeugt echte Eingabe. Früh
+>    Schema/Beispiel und CLI-Befehle nennen, damit Mapping parallel
+>    möglich ist. Fehlende Fälligkeit, Kontakt-/Vertragsfreigabe oder
+>    ungeprüfte Anfangssalden als sichtbare Sperrgründe, nicht erfundene
+>    Werte. Stammdaten/Nutzungsstatus auch ohne aktive Mietforderung
+>    erfassbar (Leerstand, KZV, Selfstorage). Objekt107 ausgeschlossen.
+>    Keine historische Sollstellung durch Datenimport starten.
+> 2. Genau zwei konfigurierbare Mahnstufen im Backoffice sichtbar
+>    speichern: Stufe1 7 Tage nach belegter Fälligkeit, Stufe2
+>    frühestens14 Tage nach tatsächlich versandter Stufe1 und erst nach
+>    deren Zahlungsfrist, keine Zinsen/Gebühren. Bestehende Sperren
+>    bleiben, RA/Ratenplan/unklare Salden/fehlende
+>    Bankvollständigkeit/unklare Zahlungseingänge. Keine tatsächliche
+>    Mietermail aus diesem Entwicklungsauftrag; SEND_ENABLED=false,
+>    Vorlagen/Planung konfigurierbar und überprüfbar. Fehlende
+>    automatische Bankversorgung klar anzeigen, manuellen geprüften
+>    Bankstand zulassen, keine Bankvollständigkeit erfinden.
+> 3. Produktionsstart zunächst für Markus als EINEN Operator über HTTPS
+>    mit persistenten Daten, ohne Demo-Seed. Sichere Auth/Sitzung/CSRF
+>    für Reverse Proxy, sichere Cookies, keine offenen API-Hintertüren.
+>    Minimales Deployment-Paket für bestehendes Hetzner mit env
+>    außerhalb Git, Health ohne Kundendaten, Backup/Restore-Anleitung
+>    und Einzelinstanz/DB-Transaktionsschutz. Bestehende Auth/DB nutzen
+>    wo passend; keine zusätzlichen kostenpflichtigen Dienste. Codex
+>    prüft vorhandene Serverinfrastruktur und übernimmt Integration, du
+>    greifst nicht auf Server zu und deployest nicht.
+>
+> Akzeptanz: Einspielung technisch möglich ohne Rohdaten in Git;
+> Kontosalden centgenau rücklesbar, Dublettentest/Rollback synthetisch;
+> keine Mahnung bei gesperrten Konten; zwei Stufen ohne Stufe3;
+> Produktionsstart enthält null Demo-Daten; unautorisierter
+> Onlinezugriff blockiert. Tests angemessen, im bestehenden Branch
+> committen/pushen. Codex editiert deine Implementierungsdateien nicht.
+> Erledigt-Nachweise erhalten. Liefere früh Importvertrag und dann
+> Umsetzung bis fertig.
+
+### Umsetzung/Konkretisierungen (diese Sitzung)
+
+- **Importvertrag zuerst geliefert:** `docs/hausverwaltung/IMPORT_VERTRAG.md`
+  (Schema, Beispiel, CLI-Befehle), damit Codex das reale Mapping
+  parallel zur Implementierung beginnen kann.
+- **Sperrgründe vs. sichtbare Hinweise:** "ungeprüfte Anfangssalden"
+  wird als hartes Pflichtfeld (`quelle_bestaetigt`) je Eröffnungszeile
+  umgesetzt — fehlt/false, blockiert die GESAMTE Einspielung (Konflikt
+  mit "Ein Fehler => gesamter Lauf unverändert" wäre sonst nicht
+  auflösbar). "Fehlende Fälligkeit" und "fehlender Debitor-Kontakt"
+  werden NICHT hart geblockt, weil das bestehende System sie bereits
+  sicher als "nicht automatisch mahnfähig" behandelt (siehe
+  `mahnwesen/service.py::plane_forderung`) — der Intake-Plan weist sie
+  stattdessen als sichtbare Zähler/Hinweise aus, damit nichts erfunden,
+  aber auch nichts unnötig blockiert wird, was das System ohnehin schon
+  konservativ behandelt. "Vertragsfreigabe" hat keine eigene
+  Datenbankspalte in diesem Schema; sie wird über dieselbe
+  `quelle_bestaetigt`-Pflicht auf Eröffnungsebene sowie die bereits
+  bestehende Sperren-Tabelle abgedeckt — kein neues, unbelegtes
+  Fachkonzept erfunden.
