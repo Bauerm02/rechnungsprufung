@@ -1279,6 +1279,91 @@ def test_indexautomatik_rechtsprofil_freigabe_ohne_csrf_wird_abgelehnt(backoffic
     assert antwort.status_code == 403
 
 
+def test_indexautomatik_soll_umsetzung_liste_vorschau_und_flag_gesperrt(backoffice_client):
+    """Auftrag HV-20260913-VERSAND-SOLL: Backoffice-Ansicht für den
+    letzten fehlenden Schritt der Indexautomatik-Pipeline. Diese Test-
+    Umgebung hat KEIN MIETINKASSO_INDEXAUTOMATIK_SOLL_UMSETZUNG_ENABLED
+    gesetzt (Default false, wie in Produktion bis zur echten Freigabe) -
+    "Jetzt umsetzen" muss deshalb wirkungslos bleiben, exakt wie der
+    tägliche Worker mit demselben Flag."""
+
+    from mietinkasso.index.repository import IndexRepository
+    from mietinkasso.indexautomatik.rechtsprofil import RechtsprofilService
+    from mietinkasso.indexautomatik.repository import ErhoehungsschreibenRepository, RechtsprofilRepository
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.infrastructure.db.tables import ErhoehungsschreibenTable
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    session_factory = build_session_factory(get_settings().database_url)
+    stammdaten = StammdatenRepository(session_factory)
+    stammdaten.upsert_einheit(id="601-TOP-SOLLUMS", objekt_id="601", bezeichnung="Top Soll-Umsetzung", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-SOLLUMS", einheit_id="601-TOP-SOLLUMS", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    stammdaten.add_komponente(
+        id="K-601-SOLLUMS-HMZ", vertrag_id="V-601-SOLLUMS", art="HMZ", bezeichnung="Hauptmietzins",
+        betrag_cent=100_000, indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    rechtsprofil_repo = RechtsprofilRepository(session_factory)
+    rechtsprofil_service = RechtsprofilService(rechtsprofil_repo, stammdaten, IndexRepository(session_factory))
+    entwurf = rechtsprofil_service.entwurf_anlegen(
+        ctx=_ctx_admin(), vertrag_id="V-601-SOLLUMS", rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
+        mrg_zinsbeschraenkung=False, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False,
+        mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
+        bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False,
+        basis_komponenten_ids=["K-601-SOLLUMS-HMZ"], vertraglich_zulaessiger_betrag_cent=200_000,
+        vertraglicher_quellenbeleg="Punkt 5", vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1),
+        vertrag_beleg_referenz="Vertrag", klausel_referenz=None, erstellt_von="markus",
+    )
+    profil = rechtsprofil_service.freigeben(entwurf.id, ctx=_ctx_admin(), freigegeben_von="markus")
+
+    outbox_repo = ErhoehungsschreibenRepository(session_factory)
+    schreiben = outbox_repo.anlegen(
+        ErhoehungsschreibenTable(
+            vertrag_id="V-601-SOLLUMS", ziel_bewertungsjahr=2026, rechtsprofil_id=profil.id,
+            rechtsprofil_version=profil.version, status="SOLL_UMSETZUNG_OFFEN", massgeblicher_termin=date(2026, 4, 1),
+            erhoehung_cent=1000, schreiben_text="Test", idempotenzschluessel="V-601-SOLLUMS:mieweg:2026",
+            zugangsform="EINSCHREIBEN", zugang_bestaetigt_am=date(2026, 4, 1), zugang_beleg="RSb-1",
+            zahlungspflicht_ab=date(2026, 4, 15), empfaenger_snapshot={"debitor_id": "DEB-1"},
+            komponenten_verteilung={
+                "komponente_id": "K-601-SOLLUMS-HMZ", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 101_000,
+            },
+        )
+    )
+
+    liste = client.get("/backoffice/indexautomatik/soll-umsetzung")
+    assert liste.status_code == 200
+    assert "V-601-SOLLUMS" in liste.text
+    assert "SOLL_UMSETZUNG_OFFEN" in liste.text
+    assert "deaktiviert" in liste.text  # Hinweis auf das gesperrte Flag
+
+    detail = client.get(f"/backoffice/indexautomatik/soll-umsetzung/{schreiben.id}")
+    assert detail.status_code == 200
+    assert "K-601-SOLLUMS-HMZ" in detail.text
+    assert "1.010,00" in detail.text or "1010,00" in detail.text  # neuer Betrag
+    assert "Jetzt umsetzen" in detail.text
+
+    ohne_csrf = client.post(f"/backoffice/indexautomatik/soll-umsetzung/{schreiben.id}/umsetzen", data={"csrf_token": "falsch"})
+    assert ohne_csrf.status_code == 403
+
+    umgesetzt_versuch = client.post(
+        f"/backoffice/indexautomatik/soll-umsetzung/{schreiben.id}/umsetzen", data={"csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert umgesetzt_versuch.status_code == 200
+    assert "BEREITS_VERARBEITET" in umgesetzt_versuch.text
+
+    # Flag deaktiviert -> KEINE Wirkung, weder Status noch Komponente.
+    assert outbox_repo.get(schreiben.id).status == "SOLL_UMSETZUNG_OFFEN"
+    assert stammdaten.get_komponente("K-601-SOLLUMS-HMZ").betrag_cent == 100_000
+
+
 def test_variable_abrechnung_erfassen_und_liste(backoffice_client):
     client, *_ = backoffice_client
     _login(client)

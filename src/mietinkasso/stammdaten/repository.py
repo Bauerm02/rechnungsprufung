@@ -405,9 +405,17 @@ class StammdatenRepository:
             _schreiben(owned_session)
             owned_session.commit()
 
-    def get_komponente(self, id: str) -> VertragsKomponenteTable | None:
-        with self._session_factory() as session:
+    def get_komponente(self, id: str, *, session: Session | None = None) -> VertragsKomponenteTable | None:
+        """`session`: siehe `objekt_fuer_vertrag` - Pflicht, wenn die
+        gesuchte Komponente innerhalb einer noch NICHT committeten
+        äußeren Transaktion erst neu eingefügt wurde (z. B.
+        `indexautomatik/umsetzung_service.py::umsetzen`); eine separat
+        geöffnete Session sähe eine solche Zeile noch nicht."""
+
+        if session is not None:
             return session.get(VertragsKomponenteTable, id)
+        with self._session_factory() as owned_session:
+            return owned_session.get(VertragsKomponenteTable, id)
 
     def list_aktive_komponenten(self, vertrag_id: str, stichtag: date) -> list[VertragsKomponenteTable]:
         with self._session_factory() as session:

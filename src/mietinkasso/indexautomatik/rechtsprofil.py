@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from datetime import date
 
+from sqlalchemy.orm import Session
+
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import Rechtsordnung
 from mietinkasso.domain.exceptions import QuellenbelegFehltError
@@ -84,6 +86,8 @@ class RechtsprofilService:
         vertrag_beleg_referenz: str,
         klausel_referenz: str | None,
         erstellt_von: str,
+        frist_tage_zugang_bis_wirksamkeit: int | None = None,
+        frist_quellenbeleg: str | None = None,
     ) -> RechtsprofilTable:
         vertrag = self._vertrag_oder_fehler(vertrag_id)
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
@@ -120,6 +124,14 @@ class RechtsprofilService:
             )
         if mietzinsobergrenze_cent is not None and mietzinsobergrenze_cent < 0:
             raise ValueError(f"mietzinsobergrenze_cent ({mietzinsobergrenze_cent}) ist negativ.")
+        if frist_tage_zugang_bis_wirksamkeit is not None and not (frist_quellenbeleg or "").strip():
+            raise QuellenbelegFehltError(
+                "Ein konfiguriertes Fristenprofil (frist_tage_zugang_bis_wirksamkeit) ohne "
+                "frist_quellenbeleg wird abgelehnt - keine unbelegte Frist wird an einen Mieter "
+                "kommuniziert."
+            )
+        if frist_tage_zugang_bis_wirksamkeit is not None and frist_tage_zugang_bis_wirksamkeit < 0:
+            raise ValueError(f"frist_tage_zugang_bis_wirksamkeit ({frist_tage_zugang_bis_wirksamkeit}) ist negativ.")
         if vertraglich_zulaessiger_betrag_cent is not None and vertragsklausel_id is not None:
             raise ValueError(
                 "vertraglich_zulaessiger_betrag_cent (statischer Zielbetrag) und vertragsklausel_id "
@@ -156,6 +168,8 @@ class RechtsprofilService:
             vertragsklausel_id=vertragsklausel_id,
             vertrag_beleg_referenz=vertrag_beleg_referenz,
             klausel_referenz=klausel_referenz,
+            frist_tage_zugang_bis_wirksamkeit=frist_tage_zugang_bis_wirksamkeit,
+            frist_quellenbeleg=frist_quellenbeleg,
             status="ENTWURF",
             erstellt_von=erstellt_von,
         )
@@ -219,10 +233,21 @@ class RechtsprofilService:
                     f"befristet - zum Bezugszeitpunkt {referenzdatum.isoformat()} nicht mehr gültig."
                 )
 
-    def _quelle_snapshot(self, profil: RechtsprofilTable, vertrag: VertragTable) -> dict:
+    def _quelle_snapshot(
+        self, profil: RechtsprofilTable, vertrag: VertragTable, *, session: Session | None = None
+    ) -> dict:
+        """`session`: siehe `stammdaten/repository.py::get_komponente` -
+        Pflicht für einen Aufrufer, der eine referenzierte Komponente
+        INNERHALB derselben, noch nicht committeten Transaktion neu
+        angelegt hat (`indexautomatik/umsetzung_service.py::umsetzen`) -
+        ohne das würde eine separat geöffnete Session die neue Zeile
+        noch nicht sehen und einen abweichenden, für spätere (nach dem
+        Commit ganz normal berechnete) Prüfungen falschen Hash
+        erzeugen."""
+
         komponenten_snapshot = []
         for komponente_id in sorted(profil.basis_komponenten_ids):
-            komponente = self._stammdaten_repository.get_komponente(komponente_id)
+            komponente = self._stammdaten_repository.get_komponente(komponente_id, session=session)
             komponenten_snapshot.append(
                 {
                     "id": komponente_id,
@@ -287,6 +312,8 @@ class RechtsprofilService:
                 "vertragsklausel_id": profil.vertragsklausel_id,
                 "vertrag_beleg_referenz": profil.vertrag_beleg_referenz,
                 "klausel_referenz": profil.klausel_referenz,
+                "frist_tage_zugang_bis_wirksamkeit": profil.frist_tage_zugang_bis_wirksamkeit,
+                "frist_quellenbeleg": profil.frist_quellenbeleg,
             },
             "komponenten": komponenten_snapshot,
             "vertragsklausel": klausel_snapshot,

@@ -664,6 +664,20 @@ class RechtsprofilTable(Base):
     vertragsklausel_id: Mapped[int | None] = mapped_column(ForeignKey("index_klauseln.id"), nullable=True)
     vertrag_beleg_referenz: Mapped[str] = mapped_column(String(256))
     klausel_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Auftrag HV-20260913-VERSAND-SOLL, Punkt 2: EXPLIZIT konfigurierbares
+    # Fristenprofil zwischen bestätigtem Zugang und Wirksamkeit -
+    # ausschließlich additive Infrastruktur, KEINE Fachentscheidung durch
+    # Claude. Ist `frist_tage_zugang_bis_wirksamkeit` gesetzt, verwendet
+    # `outbox_service.zugang_bestaetigen` DIESE Frist (mit Pflicht-
+    # `frist_quellenbeleg`) statt der bisherigen pauschalen 14-Tage-
+    # Annahme (§ 16 Abs 9 MRG) - z. B. für eine belegte Gewerbe-/
+    # Jännerklausel mit abweichender vertraglicher Frist. Ist NICHTS
+    # gesetzt, bleibt das bisherige Verhalten (nur MRG_VOLL, 14 Tage)
+    # unverändert bestehen - keine Verhaltensänderung für bestehende
+    # Fälle. Die tatsächlichen Werte je Vertragstyp liefert Codex anhand
+    # geprüfter Vertragsprofile, nicht diese Codebasis.
+    frist_tage_zugang_bis_wirksamkeit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    frist_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
     quelle_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="ENTWURF")
     freigegeben_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -758,6 +772,56 @@ class ErhoehungsschreibenTable(Base):
     fehlergrund: Mapped[str | None] = mapped_column(Text, nullable=True)
     blockiert_gruende: Mapped[list] = mapped_column(JSON, default=list)
     empfaenger_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    # `server_default` (statt nur `default=dict`) ist Pflicht, damit die
+    # additive Spaltenmigration (`infrastructure/db/migrations.py::
+    # ensure_additive_columns`) diese NOT-NULL-Spalte per
+    # `ALTER TABLE ... ADD COLUMN` auf einer bereits befüllten
+    # `erhoehungsschreiben`-Tabelle nachziehen kann, ohne bestehende
+    # Zeilen zu verletzen - ein reiner Python-seitiger `default` gilt
+    # nur für neue, über den ORM eingefügte Zeilen.
+    komponenten_verteilung: Mapped[dict] = mapped_column(JSON, default=dict, server_default=text("'{}'"))
+    """Centgenaue Zuordnung der Erhöhung auf GENAU EINE Vertragskomponente
+    (`mehrkomponenten_blockiert` in outbox_service.py garantiert das für
+    jedes nicht blockierte Schreiben) - Form
+    {"komponente_id": str, "alter_betrag_cent": int, "neuer_betrag_cent": int}.
+    Leer ({}) bei blockierten/älteren Schreiben ohne eindeutige Komponente;
+    `umsetzung_service.py` verweigert die Soll-Umsetzung dann statt zu
+    schätzen."""
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    aktualisiert_am: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class IndexSollUmsetzungTable(Base):
+    """Ausführungsnachweis für die atomare Übernahme eines zugegangenen,
+    wirksamen Erhöhungsschreibens in Vertragskomponenten und
+    Rechtsprofil-Basis (Auftrag HV-20260913-VERSAND-SOLL). Genau eine Zeile
+    je `ErhoehungsschreibenTable` (UNIQUE) - das ist der Beleg, dass
+    `umsetzung_service.umsetzen()` für dieses Schreiben bereits (genau)
+    einmal gelaufen ist, unabhängig vom aktuellen Status der referenzierten
+    Zeilen. `blockiert_gruende` bleibt auch bei Status "UMGESETZT" leer;
+    bei "BLOCKIERT" trägt die Zeile den Blockiergrund, damit ein erneuter
+    Anlauf (nach Behebung der Ursache) nachvollziehbar ist, ohne den
+    vorherigen Blockierversuch zu überschreiben - jeder Anlauf erzeugt
+    daher KEINE neue Zeile, sondern aktualisiert diese eine Zeile je
+    Erhöhungsschreiben (kein Unique-Konflikt bei Wiederholung)."""
+
+    __tablename__ = "index_soll_umsetzungen"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    erhoehungsschreiben_id: Mapped[int] = mapped_column(
+        ForeignKey("erhoehungsschreiben.id"), unique=True, index=True
+    )
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="OFFEN")
+    blockiert_gruende: Mapped[list] = mapped_column(JSON, default=list)
+    quelle_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    neue_komponente_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    beendete_komponente_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    neues_rechtsprofil_id: Mapped[int | None] = mapped_column(ForeignKey("rechtsprofile.id"), nullable=True)
+    wirksam_ab: Mapped[date | None] = mapped_column(Date, nullable=True)
+    akteur: Mapped[str | None] = mapped_column(String(128), nullable=True)
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     aktualisiert_am: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

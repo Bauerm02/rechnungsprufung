@@ -7,6 +7,7 @@ from sqlalchemy.pool import StaticPool
 from mietinkasso.infrastructure.config import Settings
 from mietinkasso.infrastructure.db.base import Base
 from mietinkasso.infrastructure.db import tables as _tables  # noqa: F401
+from mietinkasso.infrastructure.db.migrations import ensure_additive_columns
 
 
 def build_engine(database_url: str):
@@ -23,5 +24,11 @@ def build_session_factory(database_url: str) -> sessionmaker[Session]:
 
 
 def create_all_tables(settings: Settings) -> None:
+    """Legt fehlende TABELLEN an (`create_all`) und zieht anschließend
+    fehlende SPALTEN bereits existierender, ggf. schon befüllter
+    Tabellen additiv nach (`ensure_additive_columns`) - siehe
+    `migrations.py`. Beides idempotent, kein destruktiver Schritt."""
+
     engine = build_engine(settings.database_url)
     Base.metadata.create_all(engine)
+    ensure_additive_columns(engine)

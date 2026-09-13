@@ -99,6 +99,15 @@ class Settings(BaseSettings):
     # einen erfundenen Endpunkt).
     indexautomatik_transport_endpoint_url: str | None = None
     indexautomatik_transport_api_key: str | None = None
+    # Auftrag HV-20260913-VERSAND-SOLL: eigenes, GETRENNTES Flag für die
+    # tatsächliche Soll-Umsetzung (Vertragskomponenten-/Rechtsprofil-
+    # änderung) - bewusst UNABHÄNGIG von `indexautomatik_send_enabled`
+    # (Mailversand), weil die Umsetzung selbst KEINEN Mailversand macht,
+    # aber trotzdem eine erstmals scharf zu schaltende, echte
+    # Buchhaltungs-/Vertragsänderung ist (gleiche "erst explizit
+    # freigeben"-Vorsicht wie bei jedem anderen neuen Automatikschritt
+    # in diesem Repository). Default false.
+    indexautomatik_soll_umsetzung_enabled: bool = False
 
 
 class ProduktionskonfigurationUngueltigError(RuntimeError):

@@ -84,6 +84,7 @@ _NAV_LINKS = [
     ("/backoffice/mahnwesen/policy", "Mahnstufen-Konfiguration"),
     ("/backoffice/indexautomatik/laeufe", "Indexautomatik-Monatsläufe"),
     ("/backoffice/indexautomatik/outbox", "Indexautomatik-Outbox"),
+    ("/backoffice/indexautomatik/soll-umsetzung", "Indexautomatik-Soll-Umsetzung"),
     ("/backoffice/indexautomatik/vpi", "VPI-Werte"),
     ("/backoffice/indexautomatik/vertragsende", "Vertragsende-Erinnerungen"),
     ("/backoffice/variable-abrechnung", "Variable Monatsabrechnung"),

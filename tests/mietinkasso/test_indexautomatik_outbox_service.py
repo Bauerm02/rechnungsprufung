@@ -315,6 +315,93 @@ def test_zugangsfrist_fuer_nicht_unterstuetzte_rechtsordnung_wird_gesperrt(admin
         )
 
 
+def test_zugangsfrist_konfiguriertes_fristenprofil_hebt_sperre_gezielt_auf(
+    admin_ctx, basis_vertrag, outbox_service, outbox_repo, rechtsprofil_service, rechtsprofil_repo, stammdaten_repo
+):
+    """Auftrag HV-20260913-VERSAND-SOLL, Punkt 2: ein belegtes, geprüftes
+    Fristenprofil (frist_tage_zugang_bis_wirksamkeit/frist_quellenbeleg)
+    hebt die pauschale Sperre GEZIELT für dieses Rechtsprofil auf - auch
+    für eine sonst nicht unterstützte Rechtsordnung (Gewerbe-/
+    Jännerklausel) - ohne das bisherige Verhalten für unveränderte
+    Fälle (siehe `test_zugangsfrist_fuer_nicht_unterstuetzte_
+    rechtsordnung_wird_gesperrt`) zu berühren."""
+
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.add_komponente(
+        id="K-1", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=100_000,
+        indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    entwurf = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_GEWERBE", ist_wohnungsnutzung=False,
+        mrg_zinsbeschraenkung=False, ist_altvertrag=False, ist_hauptmiete=None, foerderbindung=False,
+        mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
+        bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=["K-1"],
+        vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
+        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz=None,
+        erstellt_von="markus", frist_tage_zugang_bis_wirksamkeit=30,
+        frist_quellenbeleg="Vertrag Punkt 9, belegte Gewerbeklausel",
+    )
+    profil = rechtsprofil_service.freigeben(entwurf.id, ctx=admin_ctx, freigegeben_von="markus")
+    debitor = stammdaten_repo.get_debitor(vertrag.debitor_id)
+    stammdaten_repo.upsert_debitor(id=debitor.id, name=debitor.name, email=debitor.email, adresse="Corsogasse 1/3, 1010 Wien")
+    vertrag = stammdaten_repo.get_vertrag(vertrag.id)
+    debitor = stammdaten_repo.get_debitor(vertrag.debitor_id)
+    schreiben = outbox_repo.anlegen(
+        ErhoehungsschreibenTable(
+            vertrag_id=vertrag.id, ziel_bewertungsjahr=2026, rechtsprofil_id=profil.id, rechtsprofil_version=profil.version,
+            status="BEREIT", massgeblicher_termin=date(2026, 3, 1), erhoehung_cent=1000,
+            schreiben_text="Testschreiben", idempotenzschluessel=f"{vertrag.id}:2026",
+            empfaenger_snapshot={
+                "debitor_id": vertrag.debitor_id, "name": debitor.name, "adresse": debitor.adresse, "email": debitor.email,
+                "vertrag_gueltig_bis": vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else None,
+                "vertrag_rechtsordnung": vertrag.rechtsordnung,
+                "komponenten_snapshot": [],
+            },
+        )
+    )
+
+    outbox_service.versenden(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 3, 1), send_enabled=True,
+        mailops_allowlist_bestaetigt=True, transport=FakeTransportadapter(),
+    )
+    aktualisiert = outbox_service.zugang_bestaetigen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 3, 5), zugang_datum=date(2026, 3, 1),
+        zugangsform="EINSCHREIBEN_RUECKSCHEIN", zugang_beleg="Rückschein",
+    )
+    assert aktualisiert.status == "ZUGANG_BESTAETIGT"
+    # 30 Tage nach 1.3. = 31.3., faelligkeit_tag=5 -> naechster Zinstermin 5.4.
+    assert aktualisiert.zahlungspflicht_ab == date(2026, 4, 5)
+
+
+def test_zugangsfrist_konfiguriert_ohne_quellenbeleg_wird_gesperrt(
+    admin_ctx, basis_vertrag, outbox_service, outbox_repo, rechtsprofil_service, rechtsprofil_repo, stammdaten_repo
+):
+    """Eine konfigurierte Frist OHNE Beleg wird NIE stillschweigend
+    angewendet - lieber intern sperren als eine unbelegte Frist an den
+    Mieter zu kommunizieren."""
+
+    vertrag, _konto = basis_vertrag
+    schreiben = _bereites_schreiben(admin_ctx, outbox_repo, rechtsprofil_service, stammdaten_repo, vertrag)
+    profil = rechtsprofil_repo.get(schreiben.rechtsprofil_id)
+    with stammdaten_repo._session_factory() as session:
+        from mietinkasso.infrastructure.db.tables import RechtsprofilTable
+
+        row = session.get(RechtsprofilTable, profil.id)
+        row.frist_tage_zugang_bis_wirksamkeit = 30
+        row.frist_quellenbeleg = None
+        session.commit()
+
+    outbox_service.versenden(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 3, 1), send_enabled=True,
+        mailops_allowlist_bestaetigt=True, transport=FakeTransportadapter(),
+    )
+    with pytest.raises(ValueError):
+        outbox_service.zugang_bestaetigen(
+            ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 3, 5), zugang_datum=date(2026, 3, 1),
+            zugangsform="EINSCHREIBEN_RUECKSCHEIN", zugang_beleg="Rückschein",
+        )
+
+
 def test_mrg_teil_wird_bereits_vor_versand_gesperrt(
     admin_ctx, basis_vertrag, outbox_service, outbox_repo, rechtsprofil_service, rechtsprofil_repo, stammdaten_repo
 ):
@@ -398,3 +485,56 @@ def test_mehrkomponenten_werden_vor_versand_blockiert(admin_ctx, basis_vertrag, 
     )
     assert schreiben.status == "BLOCKIERT"
     assert any("Mehr" in g for g in schreiben.blockiert_gruende)
+    assert schreiben.komponenten_verteilung == {}
+
+
+def test_erstellen_aus_mieweg_befuellt_komponenten_verteilung_bei_genau_einer_komponente(
+    admin_ctx, basis_vertrag, outbox_service, rechtsprofil_service, stammdaten_repo
+):
+    """Auftrag HV-20260913-VERSAND-SOLL, Punkt 1: `komponenten_verteilung`
+    ist die centgenaue Grundlage für die spätere Soll-Umsetzung
+    (`umsetzung_service.py`) - befüllt GENAU DANN, wenn (wie bei jedem
+    nicht blockierten Schreiben) exakt eine Komponente referenziert
+    ist."""
+
+    from mietinkasso.mieweg_vorschau.repository import MieWegVorschauRepository
+    from mietinkasso.mieweg_vorschau.service import MieWegVorschauService, VpiWert
+
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.add_komponente(id="K-1", vertrag_id=vertrag.id, art="HMZ", bezeichnung="HMZ", betrag_cent=100_000, indexierbar=True, gueltig_von=date(2024, 1, 1))
+
+    profil = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
+        mrg_zinsbeschraenkung=False, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False,
+        mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
+        bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=["K-1"],
+        vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
+        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz=None,
+        erstellt_von="markus",
+    )
+    profil = rechtsprofil_service.freigeben(profil.id, ctx=admin_ctx, freigegeben_von="markus")
+
+    mieweg_service = MieWegVorschauService(MieWegVorschauRepository(stammdaten_repo._session_factory), stammdaten_repo)
+    vorschau = mieweg_service.vorschau_erstellen(
+        ctx=admin_ctx, vertrag=vertrag, rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
+        mrg_zinsbeschraenkung=False, ist_altvertrag=False, bezugsjahr=2024, bezugsmonat=1,
+        letzte_basis_war_jahresdurchschnitt=False, ziel_bewertungsjahr=2026, basis_betrag_cent=100_000,
+        basis_komponenten_ids=["K-1"], vpi_jahresdurchschnitte={
+            2023: VpiWert(wert="100", quelle="test", datum="2024-01-01"),
+            2024: VpiWert(wert="102", quelle="test", datum="2025-01-01"),
+            2025: VpiWert(wert="104", quelle="test", datum="2026-01-01"),
+        },
+        vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
+        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), aktuell_verrechneter_betrag_cent=100_000,
+        aktuell_verrechnet_quellenbeleg="Test", aktuell_verrechnet_stichtag=date(2026, 9, 1),
+        zustellnachweis_referenz=None, kommentar=None, akteur="test",
+    )
+    komponente = stammdaten_repo.get_komponente("K-1")
+    schreiben = outbox_service.erstellen_aus_mieweg(
+        ctx=admin_ctx, vertrag=vertrag, profil=profil, vorschau=vorschau, ziel_bewertungsjahr=2026,
+        massgeblicher_termin=date(2026, 4, 1), erhoehung_cent=1000, aktuell_verrechnet_cent=100_000,
+        referenzierte_komponenten=[komponente], unveraenderte_komponenten=[], akteur="test",
+    )
+    assert schreiben.komponenten_verteilung == {
+        "komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 101_000,
+    }

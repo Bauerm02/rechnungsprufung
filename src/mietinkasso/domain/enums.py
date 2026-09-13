@@ -181,6 +181,22 @@ class ErhoehungsschreibenStatus(str, enum.Enum):
     GESENDET = "GESENDET"
     ZUGANG_BESTAETIGT = "ZUGANG_BESTAETIGT"
     SOLL_UMSETZUNG_OFFEN = "SOLL_UMSETZUNG_OFFEN"
+    # Auftrag HV-20260913-VERSAND-SOLL: der bisher fehlende letzte
+    # Schritt (SOLL_UMSETZUNG_OFFEN -> tatsächliche Änderung von
+    # VertragsKomponenteTable/Indexbasis). SOLL_UMSETZUNG_IN_PRUEFUNG ist
+    # ein rein interner, transienter Claim-Zustand (analog IN_VERSAND) -
+    # er wird NIE dauerhaft sichtbar, weil `umsetzung_service.umsetzen`
+    # den Claim UND alle Änderungen in EINER Transaktion committet: ein
+    # Absturz dazwischen rollt die gesamte Transaktion (inkl. Claim)
+    # zurück, die Zeile bleibt bei SOLL_UMSETZUNG_OFFEN stehen (kein
+    # separater Recovery-Job wie bei IN_VERSAND nötig, weil hier - anders
+    # als beim Mailversand - kein externer Aufruf die Transaktion
+    # überdauern kann). SOLL_UMSETZUNG_BLOCKIERT ist wie BLOCKIERT
+    # retryable (z. B. nach einer nachträglich belegten differenziellen
+    # Korrektur), SOLL_UMGESETZT ist terminal.
+    SOLL_UMSETZUNG_IN_PRUEFUNG = "SOLL_UMSETZUNG_IN_PRUEFUNG"
+    SOLL_UMSETZUNG_BLOCKIERT = "SOLL_UMSETZUNG_BLOCKIERT"
+    SOLL_UMGESETZT = "SOLL_UMGESETZT"
     UNKLAR = "UNKLAR"
 
 

@@ -2540,6 +2540,125 @@ def indexautomatik_outbox_zugang_bestaetigen(
     return RedirectResponse(url="/backoffice/indexautomatik/outbox", status_code=303)
 
 
+#: Auftrag HV-20260913-VERSAND-SOLL: nur diese drei Status gehören
+#: überhaupt in diese Ansicht - alle vorherigen Zustände (ENTWURF bis
+#: ZUGANG_BESTAETIGT) laufen weiterhin ausschließlich über die
+#: bestehende Outbox-Seite oben.
+_SOLL_UMSETZUNG_STATUS = ("SOLL_UMSETZUNG_OFFEN", "SOLL_UMSETZUNG_BLOCKIERT", "SOLL_UMGESETZT")
+
+
+def _soll_umsetzung_zeile_html(o) -> str:
+    aktion = ""
+    if o.status in ("SOLL_UMSETZUNG_OFFEN", "SOLL_UMSETZUNG_BLOCKIERT"):
+        aktion = f'<a href="/backoffice/indexautomatik/soll-umsetzung/{o.id}">Prüfen/Umsetzen</a>'
+    gruende = "<br>".join(h(g) for g in (o.blockiert_gruende or [])) or "-"
+    return (
+        "<tr>"
+        f"<td>{h(o.vertrag_id)}</td><td>{eur(o.erhoehung_cent)}</td>"
+        f"<td>{o.zahlungspflicht_ab.isoformat() if o.zahlungspflicht_ab else '-'}</td>"
+        f"<td>{h(o.status)}</td><td>{gruende}</td><td>{aktion}</td></tr>"
+    )
+
+
+@router.get("/indexautomatik/soll-umsetzung", response_class=HTMLResponse)
+def indexautomatik_soll_umsetzung(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    """Verständliche Übersicht für den bisher letzten fehlenden Schritt
+    der Indexautomatik-Pipeline (SOLL_UMSETZUNG_OFFEN -> tatsächliche
+    Komponenten-/Rechtsprofiländerung, siehe umsetzung_service.py). GET
+    ist rein lesend - keine Statusänderung, kein Claim."""
+
+    alle = [o for o in _indexautomatik.outbox_repository.liste_alle() if o.status in _SOLL_UMSETZUNG_STATUS]
+    zeilen = "".join(_soll_umsetzung_zeile_html(o) for o in alle) or (
+        '<tr><td colspan=6 class="muted">Kein Fall mit fälliger/bereits umgesetzter Soll-Umsetzung.</td></tr>'
+    )
+    hinweis = (
+        ""
+        if _settings.indexautomatik_soll_umsetzung_enabled
+        else '<p class="muted">Soll-Umsetzung ist konfigurationsseitig deaktiviert '
+        "(indexautomatik_soll_umsetzung_enabled=false) - \"Jetzt umsetzen\" bleibt bis dahin wirkungslos.</p>"
+    )
+    inhalt = f"""
+    <div class="card">
+      <h1>Indexautomatik-Soll-Umsetzung</h1>
+      <p class="muted">Ein zugegangenes, wirksam gewordenes Erhöhungsschreiben wird hier tatsächlich in
+         Vertragskomponenten und Rechtsprofil-Basis übernommen - erst NACH bestätigtem Zugang und
+         erreichter Zahlungspflicht, nie vorher.</p>
+      {hinweis}
+      <table>
+        <tr><th>Vertrag</th><th>Erhöhung</th><th>Wirksam ab</th><th>Status</th><th>Gründe</th><th>Aktion</th></tr>
+        {zeilen}
+      </table>
+    </div>
+    """
+    return _layout(request, session, "Indexautomatik-Soll-Umsetzung", inhalt)
+
+
+@router.get("/indexautomatik/soll-umsetzung/{erhoehungsschreiben_id}", response_class=HTMLResponse)
+def indexautomatik_soll_umsetzung_detail(
+    request: Request, erhoehungsschreiben_id: int, session=Depends(_current_session)
+) -> HTMLResponse:
+    """Vorschau Soll alt/neu ab Datum bzw. konkreter Blockiergrund - rein
+    lesend (`umsetzung_service.vorschau`), keine Statusänderung."""
+
+    try:
+        vorschau = _indexautomatik.soll_umsetzung_service.vorschau(
+            ctx=_ctx(session), erhoehungsschreiben_id=erhoehungsschreiben_id, heute=heute_wien(),
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Indexautomatik-Soll-Umsetzung", str(exc), "/backoffice/indexautomatik/soll-umsetzung")
+
+    if vorschau["blockiert"]:
+        stand_html = (
+            "<p><strong>Blockiert - Gründe:</strong></p><ul>"
+            + "".join(f"<li>{h(g)}</li>" for g in vorschau["gruende"])
+            + "</ul>"
+        )
+    else:
+        stand_html = f"""
+        <table>
+          <tr><th>Komponente</th><th>Alter Betrag</th><th>Neuer Betrag</th><th>Wirksam ab</th></tr>
+          <tr><td>{h(vorschau['komponente_id'])}</td><td>{eur(vorschau['alter_betrag_cent'])}</td>
+              <td>{eur(vorschau['neuer_betrag_cent'])}</td><td>{h(vorschau['wirksam_ab'])}</td></tr>
+        </table>
+        """
+    aktion_html = ""
+    if vorschau["status"] in ("SOLL_UMSETZUNG_OFFEN", "SOLL_UMSETZUNG_BLOCKIERT"):
+        aktion_html = f"""
+        <form method="post" action="/backoffice/indexautomatik/soll-umsetzung/{erhoehungsschreiben_id}/umsetzen">
+          {csrf_feld(session.csrf_token)}
+          <button type="submit">Jetzt umsetzen</button>
+        </form>
+        """
+    inhalt = f"""
+    <div class="card">
+      <h1>Soll-Umsetzung Vertrag {h(vorschau['vertrag_id'])}</h1>
+      <p class="muted">Status: {h(vorschau['status'])} — Zahlungspflicht ab: {h(vorschau['zahlungspflicht_ab'] or '-')}</p>
+      {stand_html}
+      {aktion_html}
+      <p><a href="/backoffice/indexautomatik/soll-umsetzung">&larr; zurück</a></p>
+    </div>
+    """
+    return _layout(request, session, "Indexautomatik-Soll-Umsetzung", inhalt)
+
+
+@router.post("/indexautomatik/soll-umsetzung/{erhoehungsschreiben_id}/umsetzen")
+def indexautomatik_soll_umsetzung_umsetzen(
+    request: Request, erhoehungsschreiben_id: int, csrf_token: str = Form(...), session=Depends(_current_session)
+):
+    _verify_csrf(session, csrf_token)
+    try:
+        ergebnis = _indexautomatik.soll_umsetzung_service.umsetzen(
+            ctx=_ctx(session), erhoehungsschreiben_id=erhoehungsschreiben_id, heute=heute_wien(),
+            akteur=session.user_id, soll_umsetzung_enabled=_settings.indexautomatik_soll_umsetzung_enabled,
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Indexautomatik-Soll-Umsetzung", str(exc), "/backoffice/indexautomatik/soll-umsetzung")
+    inhalt = flash_ok(f"Soll-Umsetzung: {ergebnis.status}" + (f" — {', '.join(ergebnis.gruende)}" if ergebnis.gruende else "")) + (
+        '<p><a href="/backoffice/indexautomatik/soll-umsetzung">&larr; zurück</a></p>'
+    )
+    return _layout(request, session, "Indexautomatik-Soll-Umsetzung", inhalt)
+
+
 @router.get("/indexautomatik/vpi", response_class=HTMLResponse)
 def indexautomatik_vpi(request: Request, session=Depends(_current_session)) -> HTMLResponse:
     werte = _indexautomatik.vpi_repository.jahreswert_liste()

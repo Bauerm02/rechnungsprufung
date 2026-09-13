@@ -22,6 +22,7 @@ from mietinkasso.indexautomatik.repository import (
     VpiRepository,
 )
 from mietinkasso.indexautomatik.service import IndexautomatikService
+from mietinkasso.indexautomatik.umsetzung_service import IndexSollUmsetzungService
 from mietinkasso.indexautomatik.vertragsende_service import VertragsendeErinnerungService
 from mietinkasso.infrastructure.config import Settings
 from mietinkasso.mieweg_vorschau.repository import MieWegVorschauRepository
@@ -43,6 +44,7 @@ class IndexautomatikBundle:
     index_automatik_service: IndexautomatikService
     vertragsende_repository: VertragsendeErinnerungRepository
     vertragsende_service: VertragsendeErinnerungService
+    soll_umsetzung_service: IndexSollUmsetzungService
 
 
 def bauen(session_factory: sessionmaker[Session], settings: Settings) -> IndexautomatikBundle:
@@ -78,6 +80,13 @@ def bauen(session_factory: sessionmaker[Session], settings: Settings) -> Indexau
         vertragsende_repository, stammdaten_repository, owner_email=settings.owner_email
     )
 
+    soll_umsetzung_service = IndexSollUmsetzungService(
+        session_factory=session_factory,
+        stammdaten_repository=stammdaten_repository,
+        rechtsprofil_service=rechtsprofil_service,
+        erhoehungsschreiben_repository=outbox_repository,
+    )
+
     return IndexautomatikBundle(
         stammdaten_repository=stammdaten_repository,
         rechtsprofil_repository=rechtsprofil_repository,
@@ -91,4 +100,5 @@ def bauen(session_factory: sessionmaker[Session], settings: Settings) -> Indexau
         index_automatik_service=index_automatik_service,
         vertragsende_repository=vertragsende_repository,
         vertragsende_service=vertragsende_service,
+        soll_umsetzung_service=soll_umsetzung_service,
     )

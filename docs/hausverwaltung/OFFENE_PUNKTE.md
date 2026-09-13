@@ -1138,21 +1138,17 @@ ist und WAS ES BEWUSST NICHT TUT.
 
 ### Was ausdrücklich NICHT geliefert ist (bewusste, offen benannte Lücken)
 
-- **Kein automatisches Nachziehen von Sollstellung/Vorschreibung.**
-  Ein Fall, der `SOLL_UMSETZUNG_OFFEN` erreicht (Zahlungspflicht laut
-  bestätigtem Zugang eingetreten), löst KEINE automatische Änderung
-  von `VertragsKomponenteTable.betrag_cent` oder eine neue
-  Vorschreibung aus - das bleibt ein manueller Folgeschritt (entspricht
-  der bestehenden "keine Produktivbuchungen durch Claude"-Grenze). Der
-  Auftrag nennt diesen Zustand wörtlich "ausgeführt"
-  (`ErhoehungsschreibenStatus.AUSGEFUEHRT` in einer früheren Fassung);
-  ein unabhängiger Review hat zu Recht angemerkt, dass dieser Name
-  missverständlich ist ("es wurde tatsächlich etwas ausgeführt"), und
-  eine ehrliche Umbenennung ausdrücklich verlangt statt einer bloßen
-  Doku-Anmerkung. Der Status heißt daher jetzt `SOLL_UMSETZUNG_OFFEN`
-  (Enum, Code, Tests, Backoffice-Anzeige, diese Doku) - das weicht vom
-  wörtlichen Auftragstext ab, drückt die tatsächliche Bedeutung aber
-  ehrlicher aus.
+- **Automatisches Nachziehen von Sollstellung/Vorschreibung existiert
+  inzwischen** (Auftrag HV-20260913-VERSAND-SOLL, siehe eigener
+  Abschnitt weiter unten) - `SOLL_UMSETZUNG_OFFEN` ist damit kein
+  dauerhafter Endzustand mehr, sondern wird von
+  `indexautomatik/umsetzung_service.py::umsetzen()` (Backoffice-Button
+  oder täglicher Worker, beide hinter
+  `MIETINKASSO_INDEXAUTOMATIK_SOLL_UMSETZUNG_ENABLED`, Default AUS) in
+  eine tatsächliche Komponenten-/Rechtsprofiländerung überführt. Der
+  Status heißt weiterhin `SOLL_UMSETZUNG_OFFEN` (statt des im
+  ursprünglichen Auftragstext genannten "ausgeführt") - siehe
+  Begründung im Abschnitt zum Auftrag HV-20260913-VERSAND-SOLL.
 - **Geschäftsraum-/Klausel-Pfad erzeugt aktuell KEIN automatisches
   Erhöhungsschreiben.** Der Rechenweg über `index/service.py` läuft
   real und ist an die fachliche Anpassung gebunden (identische Basis+
@@ -1193,7 +1189,14 @@ ist und WAS ES BEWUSST NICHT TUT.
   Realer Versand bleibt an ZWEI unabhängige Flags
   (`MIETINKASSO_INDEXAUTOMATIK_SEND_ENABLED` UND
   `MIETINKASSO_INDEXAUTOMATIK_MAILOPS_ALLOWLIST_BESTAETIGT`) und einen
-  konfigurierten Endpunkt gebunden, alle Default aus/leer.
+  konfigurierten Endpunkt gebunden, alle Default aus/leer. Codex hat
+  inzwischen (eb3b126, 81 Tests) den echten MailOps-Serverdienst
+  produktiv ergänzt (Unix-Domain-Socket, drei Kanäle weiterhin
+  deaktiviert) - die Anbindung DIESES Moduls an genau diesen Dienst
+  (`httpx.HTTPTransport(uds=...)`, `POST /v1/send`, `GET /v1/status`,
+  `GET /v1/health`) ist als eigener, separater Folge-Commit geplant
+  (siehe Abschnitt zum Auftrag HV-20260913-VERSAND-SOLL), NICHT Teil
+  dieses Commits.
 - **Backoffice-UI deckt keinen CSV-Datei-Upload für den OGD-Import ab**
   - die Bedienoberfläche bietet nur den manuellen Jahreswert-Override
     (mit Beleg); der native Datei-Import läuft ausschließlich über
@@ -1209,8 +1212,15 @@ ist und WAS ES BEWUSST NICHT TUT.
   `zahlungspflicht_ab` auf dem Erhöhungsschreiben selbst.
 - **Keine Migrationsspalten-Löschung/-Umbenennung.** Wie im gesamten
   Repository (kein Migrationswerkzeug, siehe Paket A) sind alle neuen
-  Tabellen additiv; `create_all_tables()` legt nur fehlende Tabellen an,
-  ändert nie bestehende Spalten.
+  Tabellen additiv; `create_all_tables()` legt fehlende Tabellen an
+  UND zieht seit HV-20260913-VERSAND-SOLL (`infrastructure/db/
+  migrations.py::ensure_additive_columns`, Codex-Rückmeldung: bereits
+  befüllte `rechtsprofile`/`erhoehungsschreiben` bekommen sonst keine
+  neuen Spalten) auch fehlende SPALTEN bestehender, bereits befüllter
+  Tabellen additiv per `ALTER TABLE ... ADD COLUMN` nach - niemals eine
+  bestehende Spalte ändert/löscht/umbenennt, niemals eine
+  Fremdschlüsselspalte (dafür bricht die Funktion sichtbar ab statt
+  eine unsichere inline-REFERENCES-Klausel zu raten).
 - **Rundungs-/Berechnungsdetails synthetisch, nicht amtlich
   gegengeprüft**: §1 Abs2 Z1/§1 Abs4 MieWeG und §16 Abs9 MRG wurden in
   einer früheren Sitzung nicht selbst gegen `ris.bka.gv.at` verifiziert
@@ -1218,6 +1228,136 @@ ist und WAS ES BEWUSST NICHT TUT.
   Hinweise übernommen (siehe Paket-C-Abschnitt oben). Die MRG-Teil-
   Formulierung im Erhöhungsschreiben zitiert § 16 Abs 9 deshalb bewusst
   qualifiziert statt zuversichtlich.
+
+## Paket Soll-Umsetzung (Auftrag 13.09.2026, HV-20260913-VERSAND-SOLL)
+
+### Was funktioniert (mit Tests belegt)
+
+- **Atomare, versionierte Soll-Umsetzung** (`indexautomatik/
+  umsetzung_service.py::IndexSollUmsetzungService.umsetzen`): der
+  bisher fehlende letzte Schritt der Indexautomatik-Pipeline
+  (`SOLL_UMSETZUNG_OFFEN` -> tatsächliche Änderung von
+  `VertragsKomponenteTable`/Rechtsprofil-Basis). Claim (CAS
+  `SOLL_UMSETZUNG_OFFEN`/`SOLL_UMSETZUNG_BLOCKIERT` ->
+  `SOLL_UMSETZUNG_IN_PRUEFUNG`), vollständige Re-Validierung gegen den
+  AKTUELLEN Stand (Vertragsstatus, Komponenten-Stale-Snapshot,
+  Rechtsprofil-Stale-Snapshot über denselben `quelle_hash`-Mechanismus
+  wie die Freigabe, bereits gebuchte Folgeperiode), Komponenten-
+  Historisierung (alte Zeile per `gueltig_bis` geschlossen, NIE
+  in-place geändert), neue Rechtsprofil-Version (alte wird
+  `INVALIDIERT`, genau wie bei einer manuellen Freigabe) und
+  Ausführungsnachweis (`IndexSollUmsetzungTable`, genau eine Zeile je
+  Erhöhungsschreiben) laufen in EINER einzigen DB-Transaktion - ein
+  Absturz/Parallelstart ergibt nachweislich genau eine Änderung (10
+  dedizierte Tests: Erfolg, Replay, paralleler Claim, zwei Stale-
+  Snapshot-Varianten, falscher Mandant, unveränderte BK-Komponente
+  bleibt unangetastet, Zugang/Zeitpunkt, bereits gebuchte Folgeperiode,
+  Transaktionsabbruch mitten in der Umsetzung).
+- **`komponenten_verteilung`** auf `ErhoehungsschreibenTable`: die
+  centgenaue Alt-/Neu-Zuordnung auf GENAU EINE Komponente, befüllt von
+  `outbox_service.erstellen_aus_mieweg`/`erstellen_aus_index_anpassung`
+  immer dann, wenn (wie bei jedem nicht blockierten Schreiben) exakt
+  eine Komponente referenziert ist - leer bei Mehrkomponenten-Fällen,
+  die `umsetzen()` dann konsequent verweigert statt zu schätzen.
+- **Konfigurierbares Fristenprofil** (`RechtsprofilTable.
+  frist_tage_zugang_bis_wirksamkeit`/`frist_quellenbeleg`, über
+  `RechtsprofilService.entwurf_anlegen` setzbar): hebt die pauschale
+  Sperre für nicht unterstützte Rechtsordnungen (Gewerbe-/
+  Jännerklausel u. Ä.) GEZIELT für ein einzelnes, belegtes Rechtsprofil
+  auf (sowohl in `versenden()` als auch in `zugang_bestaetigen()`),
+  OHNE das bisherige pauschale 14-Tage-MRG-Voll-Verhalten für
+  unveränderte Fälle zu berühren. Fließt jetzt auch in den
+  `quelle_hash` ein (Drift-Erkennung wie jedes andere Profilfeld).
+- **Additive Spaltenmigration für bereits produktiv befüllte
+  Datenbanken** (`infrastructure/db/migrations.py::
+  ensure_additive_columns`, in `create_all_tables()` verdrahtet) - vier
+  dedizierte Tests gegen eine handgebaute Altschema-Fixture (volle
+  Spaltenliste von `rechtsprofile`/`erhoehungsschreiben` VOR diesem
+  Auftrag, mit befüllten Zeilen): Spalten werden nachgezogen, bestehende
+  Zeilenwerte bleiben unverändert, Idempotenz bei wiederholtem Lauf.
+- **Backoffice-Ansicht** unter `/backoffice/indexautomatik/soll-
+  umsetzung` (Liste + Detail/Vorschau + POST `/umsetzen`,
+  authentifiziert/CSRF-geschützt/gesellschaftsscope-geprüft, GET rein
+  lesend) - zeigt Stand, konkreten Blockiergrund bzw. Vorschau Soll
+  alt/neu ab Datum. `MIETINKASSO_INDEXAUTOMATIK_SOLL_UMSETZUNG_ENABLED`
+  (Default AUS) sperrt sowohl den Backoffice-Button als auch den
+  täglichen Worker uniform (Flag wird in `umsetzen()` selbst geprüft,
+  nicht nur im Aufrufer) - ein Integrationstest belegt, dass der Button
+  bei deaktiviertem Flag wirkungslos bleibt.
+- **Täglicher Worker erweitert**
+  (`scripts/indexautomatik_taegliche_pflege.py`): greift bei aktivem
+  Flag automatisch NUR frische `SOLL_UMSETZUNG_OFFEN`-Fälle auf (exakt
+  wie `versenden()` nur `BEREIT`, nicht `BLOCKIERT`, automatisch
+  aufgreift) - ein bereits `SOLL_UMSETZUNG_BLOCKIERT`er Fall braucht
+  eine behobene Ursache und wird dann bewusst manuell über die
+  Backoffice-Ansicht erneut angestoßen, keine zweite Worker-/
+  Schedulerinstanz.
+
+### Was ausdrücklich NICHT geliefert ist (bewusste, offen benannte Lücken)
+
+- **`MIETINKASSO_INDEXAUTOMATIK_SOLL_UMSETZUNG_ENABLED` bleibt Default
+  AUS** - wie jede andere neue Automatikschaltung in diesem Repository
+  erst nach expliziter Betriebsfreigabe zu aktivieren.
+- **Transport/MailOps-Anbindung ist bewusst NICHT Teil dieses Commits**
+  (Auftrag: "Liefere zunächst den Soll-Pfad ... danach Transport") -
+  Mailversand für Index-Erhöhungsschreiben läuft unverändert über den
+  bestehenden generischen `HttpTransportadapter`
+  (`indexautomatik_transport_endpoint_url`/`_api_key`), NICHT über den
+  von Codex inzwischen produktiv ergänzten MailOps-Unix-Domain-Socket-
+  Dienst (eb3b126). Die konkrete Schnittstelle ist bereits bekannt
+  (`POST /v1/send` mit `referenz`/`art`/`empfaenger_*`/`betreff`/
+  `text`/`freigabe_referenz`, `GET /v1/status`/`GET /v1/health`,
+  Antwortstatus `ANGENOMMEN|GESENDET|UNKLAR|IN_BEARBEITUNG|
+  DEAKTIVIERT|NICHT_GEFUNDEN|FEHLER` - `FEHLER` terminal, nie erneut
+  senden; NUR `GESENDET` mit tatsächlichem `versendet_am` aus einem
+  echten SentItems-Beleg zählt als Versandnachweis/löst Mahnstufe 2
+  aus; `ANGENOMMEN` NIE als Empfängerzugang werten; `UNKLAR` löst eine
+  Statusabfrage, aber NIE einen neuen Send-POST aus; idempotente
+  POST-Wiederholung mit geändertem Payload liefert 409; Owner-
+  Erinnerungen serverseitig fix `mb@jlb-immo.at`, kein Mieterfallback;
+  Sender serverseitig fix `hausverwaltung@jlb-immo.at`; UDS-Pfad
+  `/run/jlb-hv-mail/mailops-hv.sock`, Tokenfile
+  `/run/secrets/hv-mail-token`) und als eigener, separater Folge-Commit
+  geplant - KEIN eigener direkter SMTP-/Graph-Sender im Mietmodul,
+  Provider-Abstraktion mit synthetischem Fake zuerst, echte Anbindung
+  erst nach dieser Schnittstellenfestlegung.
+- **Fachliche Fristenprofil-Werte je Vertragstyp fehlen weiterhin.**
+  Die generische, konfigurierbare Infrastruktur (siehe oben) trifft
+  KEINE eigene Rechtsentscheidung - welche konkreten Verträge welche
+  `frist_tage_zugang_bis_wirksamkeit`/welchen `frist_quellenbeleg`
+  bekommen, bleibt Codex' fachlicher Prüfung vorbehalten.
+- **Drei von Codex am 13.09. gemeldete, noch NICHT umgesetzte
+  Regel-Verfeinerungen** (bewusst in einem separaten Folge-Commit,
+  NICHT in diesem):
+  1. `IndexKlauselTable` braucht belegte Kalender-/Intervall-/
+     Rundungsfelder statt nur eines einmaligen
+     `fruehestmoeglicher_termin` (der sonst ab Februar pauschal alles
+     erlaubt) - u. a. für den Fall "nur Jänner UND strikt >3 %-
+     Schwelle, Grenzwerte auf eine Dezimalstelle" versus "Jänner ohne
+     Schwelle" versus "maximal einmal jährlich ohne fixen Monat".
+  2. MRG-Zinsbeschränkung/Förderbindung dürfen bei unbekannter Lage
+     NICHT stillschweigend `False` werden - ein `ENTWURF` darf
+     unbekannt bleiben, eine Freigabe muss echte Tri-State-Angaben
+     (bekannt-ja/bekannt-nein/unbekannt) statt eines gerateten Booleans
+     verlangen.
+  3. Ein `bezugsjahr`/`bezugsmonat` der Rechtsprofil-Quelle kann
+     Jahrzehnte vor einer erst kürzlich importierten aktuellen
+     Komponentenfassung liegen - die real bestehende aktuelle
+     Sollkomponente ist erst ab ihrem Übernahmestichtag im System.
+     `umsetzen()`/`_validiere_vollstaendigkeit_fuer_freigabe` dürfen
+     `bezugsmonat` NIE mit dem Komponentenbeginn gleichsetzen oder
+     zurückdatieren; vor einer Umsetzung muss die referenzierte
+     AKTUELLE Fassung nachweislich aktiv sein, eine historische letzte
+     Basis braucht einen SEPARATEN Beleg.
+- **Backoffice-Ansicht ist bewusst minimal** (Liste + Detail/Vorschau +
+  ein Aktions-Button) - keine Massenumsetzung, kein Filter/keine
+  Suche, keine Sortierung nach Dringlichkeit.
+- **Kein automatischer Differenzkorrektur-Mechanismus** für bereits
+  `SOLLGESTELLT`/`ZUGESTELLT`/`EXPORTIERT`e Perioden, die den
+  Wirksamkeitszeitraum überlappen - `umsetzen()` BLOCKIERT diesen Fall
+  sichtbar mit Nennung der betroffenen Vorschreibung(en) statt eine
+  Korrekturbuchung zu erfinden; die tatsächliche Korrektur bleibt ein
+  dokumentierter, manueller Folgeschritt.
 
 ## Paket Dashboard/Variable Monatsabrechnung (Auftrag 13.09.2026, HV-20260913-DASHBOARD)
 

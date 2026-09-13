@@ -262,6 +262,15 @@ class ErhoehungsschreibenOutboxService:
                 **self._empfaenger_snapshot(vertrag),
                 "komponenten_snapshot": self._komponenten_snapshot(referenzierte_komponenten + unveraenderte_komponenten),
             },
+            komponenten_verteilung=(
+                {}
+                if mehrkomponenten_blockiert
+                else {
+                    "komponente_id": referenzierte_komponenten[0].id,
+                    "alter_betrag_cent": referenzierte_komponenten[0].betrag_cent,
+                    "neuer_betrag_cent": referenzierte_komponenten[0].betrag_cent + erhoehung_cent,
+                }
+            ),
         )
         return self._entwurf_speichern(row, mehrkomponenten_blockiert=mehrkomponenten_blockiert, bestehende_id=bestehende_id)
 
@@ -336,6 +345,15 @@ class ErhoehungsschreibenOutboxService:
                 **self._empfaenger_snapshot(vertrag),
                 "komponenten_snapshot": self._komponenten_snapshot(referenzierte_komponenten + unveraenderte_komponenten),
             },
+            komponenten_verteilung=(
+                {}
+                if mehrkomponenten_blockiert
+                else {
+                    "komponente_id": referenzierte_komponenten[0].id,
+                    "alter_betrag_cent": referenzierte_komponenten[0].betrag_cent,
+                    "neuer_betrag_cent": referenzierte_komponenten[0].betrag_cent + erhoehung_cent,
+                }
+            ),
         )
         return self._entwurf_speichern(row, mehrkomponenten_blockiert=mehrkomponenten_blockiert)
 
@@ -409,13 +427,22 @@ class ErhoehungsschreibenOutboxService:
         # unterstützte Rechtsordnung, wodurch ein MRG_TEIL-Fall bereits
         # unwiderruflich VERSENDET werden konnte, bevor die fehlende
         # Fristenunterstützung überhaupt auffiel. Der Versand selbst wird
-        # jetzt schon für eine nicht unterstützte Rechtsordnung gesperrt.
-        if aktuelles_profil.rechtsordnung not in _ZUGANGSFRIST_UNTERSTUETZTE_RECHTSORDNUNGEN:
+        # jetzt schon für eine nicht unterstützte Rechtsordnung gesperrt -
+        # AUSSER ein explizit belegtes, geprüftes Fristenprofil
+        # (Auftrag HV-20260913-VERSAND-SOLL, Punkt 2) hebt die Sperre für
+        # GENAU DIESES Rechtsprofil gezielt auf (`zugang_bestaetigen`
+        # verweigert dieselbe Frist trotzdem ohne `frist_quellenbeleg`).
+        hat_konfiguriertes_fristenprofil = (
+            aktuelles_profil.frist_tage_zugang_bis_wirksamkeit is not None
+            and (aktuelles_profil.frist_quellenbeleg or "").strip()
+        )
+        if aktuelles_profil.rechtsordnung not in _ZUGANGSFRIST_UNTERSTUETZTE_RECHTSORDNUNGEN and not hat_konfiguriertes_fristenprofil:
             grund = (
                 f"Rechtsordnung {aktuelles_profil.rechtsordnung} hat keine unterstützte automatische "
                 "Zugangsfrist-/Zahlungspflicht-Regel (§ 16 Abs 9 MRG gilt nicht pauschal für "
-                "Teilanwendung) - Versand wird VOR dem Versand gesperrt, kein Mieterschreiben mit "
-                "ungeklärter Fristenlage geht automatisch heraus. Bitte manuell klären."
+                "Teilanwendung) und kein belegtes Fristenprofil - Versand wird VOR dem Versand gesperrt, "
+                "kein Mieterschreiben mit ungeklärter Fristenlage geht automatisch heraus. Bitte manuell "
+                "klären oder ein geprüftes Fristenprofil erfassen."
             )
             self._repository.set_status(schreiben.id, "BLOCKIERT", blockiert_gruende=[grund])
             return VersandErgebnis("BLOCKIERT", grund)
@@ -535,15 +562,24 @@ class ErhoehungsschreibenOutboxService:
             )
 
         profil = self._rechtsprofil_repository.get(schreiben.rechtsprofil_id)
-        if profil is None or profil.rechtsordnung not in _ZUGANGSFRIST_UNTERSTUETZTE_RECHTSORDNUNGEN:
+        frist_tage = profil.frist_tage_zugang_bis_wirksamkeit if profil is not None else None
+        if frist_tage is not None and not (profil.frist_quellenbeleg or "").strip():
+            raise ValueError(
+                "Rechtsprofil hat eine konfigurierte Zugangsfrist ohne Quellenbeleg "
+                "(frist_quellenbeleg) - ungeklärte Beleglage wird intern gesperrt, nicht mit einer "
+                "unbelegten Frist an den Mieter kommuniziert. Bitte manuell klären."
+            )
+        if frist_tage is None and (profil is None or profil.rechtsordnung not in _ZUGANGSFRIST_UNTERSTUETZTE_RECHTSORDNUNGEN):
             raise ValueError(
                 f"Automatische Zustellungs-/Zahlungspflichtfristen (§ 16 Abs 9 MRG, 14 Tage) sind für die "
                 f"Rechtsordnung {profil.rechtsordnung if profil else 'unbekannt'} hier nicht unterstützt - "
                 "ungeklärte Fristenlage wird intern gesperrt, nicht mit einem geratenen Termin an den "
-                "Mieter kommuniziert. Bitte manuell klären."
+                "Mieter kommuniziert. Bitte manuell klären. Ein geprüftes, belegtes Fristenprofil "
+                "(frist_tage_zugang_bis_wirksamkeit/frist_quellenbeleg) kann diese Sperre gezielt "
+                "für diesen Vertrag/dieses Rechtsprofil aufheben."
             )
 
-        fruehester = zugang_datum + timedelta(days=14)
+        fruehester = zugang_datum + timedelta(days=frist_tage if frist_tage is not None else 14)
         zahlungspflicht_ab = naechster_zinstermin_ab(fruehester, faelligkeit_tag=vertrag.faelligkeit_tag)
         return self._repository.set_status(
             schreiben.id,

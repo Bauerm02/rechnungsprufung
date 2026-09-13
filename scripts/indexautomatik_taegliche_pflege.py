@@ -126,6 +126,27 @@ def main(argv: list[str] | None = None) -> int:
 
         ausgefuehrt = bundle.outbox_service.taegliche_pflege(heute=heute)
 
+        # Auftrag HV-20260913-VERSAND-SOLL: die tatsächliche Soll-Umsetzung
+        # (Vertragskomponenten-/Rechtsprofiländerung) ist ein eigener,
+        # separat geschalteter Schritt - analog zu `versenden()` oben wird
+        # NUR der jeweils frische Auto-Status (SOLL_UMSETZUNG_OFFEN)
+        # automatisch aufgegriffen; ein bereits BLOCKIERTer Fall braucht
+        # (wie ein BLOCKIERTes Erhöhungsschreiben) erst eine behobene
+        # Ursache und wird dann bewusst manuell/über die Backoffice-Ansicht
+        # erneut angestoßen, nicht täglich stillschweigend automatisch
+        # wiederholt.
+        umgesetzt, umsetzung_blockiert = 0, 0
+        for schreiben in bundle.outbox_repository.liste_nach_status("SOLL_UMSETZUNG_OFFEN"):
+            ergebnis_umsetzung = bundle.soll_umsetzung_service.umsetzen(
+                ctx=_ADMIN_CTX, erhoehungsschreiben_id=schreiben.id, heute=heute,
+                akteur="indexautomatik-taegliche-pflege",
+                soll_umsetzung_enabled=settings.indexautomatik_soll_umsetzung_enabled,
+            )
+            if ergebnis_umsetzung.status == "UMGESETZT":
+                umgesetzt += 1
+            else:
+                umsetzung_blockiert += 1
+
         # Unabhängiger Review (b31-Folgereview): "Keine No-op/Fake-
         # Versandfunktion produktiv: echten Adapter verdrahten, ohne
         # Adapter hart blockieren" - `versand_fn=lambda auftrag: None`
@@ -147,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
             "erhoehungsschreiben_versendet": versendet,
             "erhoehungsschreiben_uebersprungen_oder_blockiert": uebersprungen,
             "erhoehungsschreiben_ausgefuehrt": len(ausgefuehrt),
+            "erhoehungsschreiben_soll_umgesetzt": umgesetzt,
+            "erhoehungsschreiben_soll_umsetzung_uebersprungen_oder_blockiert": umsetzung_blockiert,
             "vertragsende_verwaiste_als_unklar_markiert": len(verwaiste_erinnerungen),
             "vertragsende_neu_geplant": len(vertragsende_geplant),
             "vertragsende_benachrichtigt": len(vertragsende_benachrichtigt),
