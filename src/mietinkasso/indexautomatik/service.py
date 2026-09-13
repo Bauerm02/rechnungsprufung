@@ -262,6 +262,7 @@ class IndexautomatikService:
             zustellnachweis_referenz=None,
             kommentar=f"Automatischer Indexautomatik-Lauf, Periode {periode}.",
             akteur=akteur,
+            historische_basis_belege=profil.historische_basis_belege,
         )
         ergebnis = json.loads(vorschau.ergebnis_json)
         if ergebnis["blockiert_grund"] is not None:
