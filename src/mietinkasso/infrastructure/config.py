@@ -73,6 +73,15 @@ class Settings(BaseSettings):
     # globale Aktivierung von Mahnungen)". Beide Default false.
     indexautomatik_send_enabled: bool = False
     vertragsende_erinnerung_send_enabled: bool = False
+    # Betriebspräzisierung 13.09.2026: die bestehende JLB-MailOps-Strecke
+    # verlangt eine ECHTE manuelle CLICK_RELEASED-Freigabe und führt
+    # Hausverwaltung noch NICHT in ihrer Mailbox-Allowlist - diese
+    # Freigabe darf nie simuliert werden. Realer Versand setzt deshalb
+    # ZUSÄTZLICH zu `indexautomatik_send_enabled` diese von Codex nach
+    # echter Prüfung zu setzende Bestätigung voraus; beide bleiben in
+    # dieser Sitzung false.
+    indexautomatik_mailops_allowlist_bestaetigt: bool = False
+    indexautomatik_jlb_signatur: str = "JLB Projects GmbH - Hausverwaltung"
 
 
 class ProduktionskonfigurationUngueltigError(RuntimeError):

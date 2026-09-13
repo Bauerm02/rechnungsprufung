@@ -576,6 +576,16 @@ class VpiMonatswertTable(Base):
     finalitaet: Mapped[str] = mapped_column(String(16))
     quelle_datei: Mapped[str] = mapped_column(String(256))
     quelle_zeile: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Betriebspräzisierung 13.09.: "Kalenderdatum allein garantiert
+    # keine tatsächliche Veröffentlichung" - `quelle_hash` (SHA256 des
+    # importierten Datei-INHALTS) belegt, WELCHE konkrete Dateiversion
+    # importiert wurde; `abgerufen_am` ist ein vom Aufrufer explizit
+    # anzugebender Zeitpunkt (WANN die Datei tatsächlich von Statistik
+    # Austria abgerufen wurde) - wird NIE aus der Systemuhr zum
+    # Importzeitpunkt geraten, weil eine Datei auch lange nach dem
+    # eigentlichen Abruf importiert werden kann.
+    quelle_hash: Mapped[str] = mapped_column(String(64))
+    abgerufen_am: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     importiert_von: Mapped[str] = mapped_column(String(128))
     importiert_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

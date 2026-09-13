@@ -74,6 +74,10 @@ class HttpTransportadapter:
             "betreff": auftrag.betreff,
             "text": auftrag.text,
         }
+        # Fehlermeldungen bleiben ABSICHTLICH kategorisch statt die rohe
+        # Provider-Antwort/Exception zu zitieren: eine echte Fehlerantwort
+        # kann Tokens/interne Details enthalten, und `fehlergrund` landet
+        # sichtbar im Backoffice (`ErhoehungsschreibenTable.fehlergrund`).
         try:
             response = self._http_post(
                 self._endpoint_url,
@@ -83,7 +87,8 @@ class HttpTransportadapter:
             )
         except Exception as exc:  # Timeout/ConnectError/... - jede Transportstörung ist ungewiss.
             raise TransportFehlerUngewissError(
-                f"Transportfehler beim Versand von {auftrag.referenz!r}: {exc}"
+                f"Transportfehler beim Versand von {auftrag.referenz!r} ({type(exc).__name__}) - "
+                "möglicherweise dennoch angenommen, kein automatischer Retry."
             ) from exc
 
         if response.status_code != 200:
@@ -95,12 +100,13 @@ class HttpTransportadapter:
             data = response.json()
         except Exception as exc:
             raise TransportFehlerUngewissError(
-                f"Antwort für {auftrag.referenz!r} ist kein gültiges JSON: {exc}"
+                f"Antwort für {auftrag.referenz!r} ist kein gültiges JSON ({type(exc).__name__})."
             ) from exc
-        if data.get("status") != "ANGENOMMEN" or not data.get("externe_referenz"):
+        if not isinstance(data, dict) or data.get("status") != "ANGENOMMEN" or not data.get("externe_referenz"):
             raise TransportFehlerUngewissError(
-                f"Unerwartete Antwortstruktur für {auftrag.referenz!r}: {data!r} - der vereinbarte "
-                "Vertrag verlangt status='ANGENOMMEN' und eine externe_referenz."
+                f"Unerwartete Antwortstruktur für {auftrag.referenz!r} - der vereinbarte Vertrag verlangt "
+                "status='ANGENOMMEN' und eine externe_referenz (Antwortinhalt wird bewusst nicht "
+                "protokolliert, könnte sensible Provider-Details enthalten)."
             )
         return VersandBestaetigung(externe_referenz=str(data["externe_referenz"]), status="ANGENOMMEN")
 

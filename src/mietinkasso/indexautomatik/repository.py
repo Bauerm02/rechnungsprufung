@@ -17,6 +17,7 @@ from mietinkasso.infrastructure.db.tables import (
     RechtsprofilTable,
     VertragsendeErinnerungTable,
     VpiJahreswertTable,
+    VpiMonatswertTable,
 )
 
 
@@ -24,14 +25,18 @@ class VpiRepository:
     def __init__(self, session_factory: sessionmaker[Session]):
         self._session_factory = session_factory
 
-    def erfassen(
-        self, *, jahr: int, wert: Decimal, quelle: str, quelle_datum: date, erfasst_von: str
+    # -- Jahresdurchschnitt-Override (manuell, mit Beleg) --------------------
+    def jahreswert_erfassen(
+        self, *, reihe: str, jahr: int, wert: Decimal, quelle: str, quelle_datum: date, erfasst_von: str
     ) -> VpiJahreswertTable:
         with self._session_factory() as session:
-            row = session.get(VpiJahreswertTable, jahr)
+            statement = select(VpiJahreswertTable).where(
+                VpiJahreswertTable.reihe == reihe, VpiJahreswertTable.jahr == jahr
+            )
+            row = session.execute(statement).scalars().first()
             if row is None:
                 row = VpiJahreswertTable(
-                    jahr=jahr, wert=wert, quelle=quelle, quelle_datum=quelle_datum, erfasst_von=erfasst_von
+                    reihe=reihe, jahr=jahr, wert=wert, quelle=quelle, quelle_datum=quelle_datum, erfasst_von=erfasst_von
                 )
                 session.add(row)
             else:
@@ -43,18 +48,95 @@ class VpiRepository:
             session.refresh(row)
             return row
 
-    def get(self, jahr: int) -> VpiJahreswertTable | None:
+    def jahreswert_liste(self, reihe: str | None = None) -> list[VpiJahreswertTable]:
         with self._session_factory() as session:
-            return session.get(VpiJahreswertTable, jahr)
+            statement = select(VpiJahreswertTable).order_by(VpiJahreswertTable.reihe, VpiJahreswertTable.jahr)
+            if reihe is not None:
+                statement = statement.where(VpiJahreswertTable.reihe == reihe)
+            return list(session.execute(statement).scalars().all())
 
-    def alle_als_dict(self) -> dict[int, Decimal]:
+    # -- Monatswerte (amtlicher Import) ---------------------------------------
+    def monatswert_erfassen(
+        self,
+        *,
+        reihe: str,
+        jahr: int,
+        monat: int,
+        wert: Decimal,
+        finalitaet: str,
+        quelle_datei: str,
+        quelle_zeile: int | None,
+        quelle_hash: str,
+        abgerufen_am: datetime,
+        importiert_von: str,
+    ) -> VpiMonatswertTable:
         with self._session_factory() as session:
-            rows = session.execute(select(VpiJahreswertTable)).scalars().all()
-            return {row.jahr: row.wert for row in rows}
+            statement = select(VpiMonatswertTable).where(
+                VpiMonatswertTable.reihe == reihe, VpiMonatswertTable.jahr == jahr, VpiMonatswertTable.monat == monat
+            )
+            row = session.execute(statement).scalars().first()
+            if row is None:
+                row = VpiMonatswertTable(
+                    reihe=reihe,
+                    jahr=jahr,
+                    monat=monat,
+                    wert=wert,
+                    finalitaet=finalitaet,
+                    quelle_datei=quelle_datei,
+                    quelle_zeile=quelle_zeile,
+                    quelle_hash=quelle_hash,
+                    abgerufen_am=abgerufen_am,
+                    importiert_von=importiert_von,
+                )
+                session.add(row)
+            else:
+                row.wert = wert
+                row.finalitaet = finalitaet
+                row.quelle_datei = quelle_datei
+                row.quelle_zeile = quelle_zeile
+                row.quelle_hash = quelle_hash
+                row.abgerufen_am = abgerufen_am
+                row.importiert_von = importiert_von
+            session.commit()
+            session.refresh(row)
+            return row
 
-    def liste(self) -> list[VpiJahreswertTable]:
+    def monatswerte_liste(self, reihe: str, jahr: int) -> list[VpiMonatswertTable]:
         with self._session_factory() as session:
-            return list(session.execute(select(VpiJahreswertTable).order_by(VpiJahreswertTable.jahr)).scalars().all())
+            statement = (
+                select(VpiMonatswertTable)
+                .where(VpiMonatswertTable.reihe == reihe, VpiMonatswertTable.jahr == jahr)
+                .order_by(VpiMonatswertTable.monat)
+            )
+            return list(session.execute(statement).scalars().all())
+
+    def jahresdurchschnitt(self, reihe: str, jahr: int) -> Decimal | None:
+        """Liefert den Jahresdurchschnitt für (Reihe, Jahr) - bevorzugt
+        einen manuell erfassten `VpiJahreswertTable`-Override; sonst nur,
+        wenn ALLE 12 Monate vorliegen UND ausnahmslos ENDGUELTIG sind
+        (kein teilweise erfundener/vorläufiger Durchschnitt)."""
+
+        with self._session_factory() as session:
+            override_statement = select(VpiJahreswertTable).where(
+                VpiJahreswertTable.reihe == reihe, VpiJahreswertTable.jahr == jahr
+            )
+            override = session.execute(override_statement).scalars().first()
+            if override is not None:
+                return override.wert
+            monate = self.monatswerte_liste(reihe, jahr)
+            if len(monate) != 12:
+                return None
+            if any(m.finalitaet != "ENDGUELTIG" for m in monate):
+                return None
+            return sum((m.wert for m in monate), Decimal("0")) / 12
+
+    def jahresdurchschnitte_fuer(self, reihe: str, jahre: set[int]) -> dict[int, Decimal]:
+        ergebnis: dict[int, Decimal] = {}
+        for jahr in jahre:
+            wert = self.jahresdurchschnitt(reihe, jahr)
+            if wert is not None:
+                ergebnis[jahr] = wert
+        return ergebnis
 
 
 class RechtsprofilRepository:
