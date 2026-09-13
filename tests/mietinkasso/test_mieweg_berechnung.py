@@ -552,3 +552,13 @@ def test_mindestbefristung_kein_zusaetzlicher_juni_stichtag():
     )
     assert ergebnis.anwendbar is True
     assert ergebnis.mindestdauer_jahre == 3
+
+
+@pytest.mark.parametrize("unverified", [None, "false", 0])
+def test_mindestbefristung_unbekannter_unternehmerstatus_keine_dreijahresannahme(unverified):
+    with pytest.raises(ValueError, match="Unternehmereigenschaft"):
+        pruefe_mindestbefristung_wohnung(
+            rechtsordnung="OESTERREICH_MRG_TEIL", ist_wohnungsnutzung=True,
+            abschluss_oder_erneuerungsdatum=date(2026, 1, 1),
+            ist_unternehmerischer_vermieter=unverified,
+        )

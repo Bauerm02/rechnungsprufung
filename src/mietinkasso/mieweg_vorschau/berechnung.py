@@ -327,7 +327,7 @@ def pruefe_mindestbefristung_wohnung(
     if ist_wohnungsnutzung is not True:
         gruende.append(
             "Wohnungsnutzung ist nicht bestätigt (ungeprüft oder Geschäftsraum) - §49k Abs 4 MRG betrifft "
-            "ausschließlich Wohnungs-Hauptmiete, keine automatische Annahme."
+            "Wohnungs-Haupt- und Untermiete, keine automatische Annahme."
         )
         return MindestbefristungErgebnis(anwendbar=False, mindestdauer_jahre=None, gruende=gruende)
     if abschluss_oder_erneuerungsdatum <= _STICHTAG_MINDESTBEFRISTUNG_NEU:
@@ -337,6 +337,8 @@ def pruefe_mindestbefristung_wohnung(
             "alten Recht unterworfen, keine rückwirkende Verlängerung."
         )
         return MindestbefristungErgebnis(anwendbar=False, mindestdauer_jahre=None, gruende=gruende)
+    if type(ist_unternehmerischer_vermieter) is not bool:
+        raise ValueError("Unternehmereigenschaft des Vermieters muss ausdrücklich geprüft sein (True oder False).")
     return MindestbefristungErgebnis(
         anwendbar=True, mindestdauer_jahre=5 if ist_unternehmerischer_vermieter else 3, gruende=[]
     )
