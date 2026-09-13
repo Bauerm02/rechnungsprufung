@@ -2271,12 +2271,16 @@ def rechtsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_
           <label>Haupt-/Untermiete</label>
           <select name="ist_hauptmiete"><option value="">ungeklärt</option><option value="1">Hauptmiete (geprüft)</option>
             <option value="0">Untermiete (geprüft)</option></select>
-          <label><input type="checkbox" name="mrg_zinsbeschraenkung" value="1"> MRG-Zinsbeschränkung</label><br>
+          <label>MRG-Zinsbeschränkung</label>
+          <select name="mrg_zinsbeschraenkung"><option value="">ungeklärt</option>
+            <option value="1">Ja (geprüft)</option><option value="0">Nein (geprüft)</option></select><br>
           <label><input type="checkbox" name="ist_altvertrag" value="1"> Altvertrag</label>
         </fieldset>
         <fieldset>
           <legend>Förderbindung/Mietzinsobergrenze (BRUTTO, wirkt unabhängig von foerderbindung als Kappung)</legend>
-          <label><input type="checkbox" name="foerderbindung" value="1"> Förderbindung</label><br>
+          <label>Förderbindung</label>
+          <select name="foerderbindung"><option value="">ungeklärt</option>
+            <option value="1">Ja (geprüft)</option><option value="0">Nein (geprüft)</option></select><br>
           <label>Mietzinsobergrenze (EUR, BRUTTO)</label>
           <input type="text" name="mietzinsobergrenze">
           <label>Quellenbeleg</label>
@@ -2363,8 +2367,15 @@ def rechtsprofil_erstellen(
             ctx=_ctx(session), vertrag_id=vertrag_id, rechtsordnung=rechtsordnung,
             ist_wohnungsnutzung=bool(ist_wohnungsnutzung),
             ist_hauptmiete=(None if ist_hauptmiete == "" else bool(int(ist_hauptmiete))),
-            mrg_zinsbeschraenkung=bool(mrg_zinsbeschraenkung), ist_altvertrag=bool(ist_altvertrag),
-            foerderbindung=bool(foerderbindung),
+            # Tri-State wie `ist_hauptmiete`: "" = ungeklärt (Wert bleibt
+            # False, `_geprueft` bleibt False - eine Freigabe verlangt
+            # `_geprueft=True`, siehe rechtsprofil.py); "0"/"1" = geprüfte
+            # Angabe.
+            mrg_zinsbeschraenkung=bool(int(mrg_zinsbeschraenkung)) if mrg_zinsbeschraenkung != "" else False,
+            mrg_zinsbeschraenkung_geprueft=mrg_zinsbeschraenkung != "",
+            ist_altvertrag=bool(ist_altvertrag),
+            foerderbindung=bool(int(foerderbindung)) if foerderbindung != "" else False,
+            foerderbindung_geprueft=foerderbindung != "",
             mietzinsobergrenze_cent=parse_eur_betrag(mietzinsobergrenze) if mietzinsobergrenze.strip() else None,
             mietzinsobergrenze_quellenbeleg=mietzinsobergrenze_quellenbeleg or None,
             mietzinsobergrenze_gueltig_bis=(

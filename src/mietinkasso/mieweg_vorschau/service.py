@@ -217,7 +217,7 @@ class MieWegVorschauService:
                     f"unabhängig vom indexierbar-Flag (verteidigt gegen eine fehlerhaft gesetzte "
                     f"indexierbar=True-Markierung; ausgeschlossene Arten: {sorted(_NIE_INDEXIERBARE_ARTEN)})."
                 )
-            if referenzdatum is not None and komponente.gueltig_von > referenzdatum:
+            if referenzdatum is not None and self._ursprungs_gueltig_von(komponente) > referenzdatum:
                 raise ValueError(
                     f"Komponente {komponente_id} ist erst ab {komponente.gueltig_von.isoformat()} gültig und "
                     f"hat zum angegebenen Bezugszeitpunkt {referenzdatum.isoformat()} noch nicht bestanden - "
@@ -534,6 +534,35 @@ class MieWegVorschauService:
             ergebnis_json=json.dumps(ergebnis, ensure_ascii=False, sort_keys=True),
             erstellt_von=akteur,
         )
+
+    def _ursprungs_gueltig_von(self, komponente) -> date:
+        """Verfolgt die explizite Historisierungs-Kette
+        (`VertragsKomponenteTable.historisiert_von_id`, gesetzt AUSSCHLIESSLICH
+        von `indexautomatik/umsetzung_service.py::umsetzen`) bis zur
+        URSPRÜNGLICHEN Zeile zurück und liefert deren `gueltig_von`.
+
+        Grund: eine Index-Umsetzung schließt die alte Komponentenzeile
+        (`gueltig_bis`) und legt eine NEUE mit neuer ID/neuem `gueltig_von`
+        (dem Anspruchsmonat) an - dieselbe, ununterbrochen fortbestehende
+        vertragliche Verpflichtung, nur eine neue DB-Zeile (append-only
+        Historisierung). Eine reine `komponente.gueltig_von`-Prüfung würde
+        deshalb nach JEDER Umsetzung fälschlich behaupten, die Komponente
+        habe zu einem davor liegenden, aber vollkommen legitimen
+        Bezugszeitpunkt (z. B. dem bewusst fortgeschriebenen
+        MieWeG-`bezugsjahr`/`bezugsmonat` aus der Vorperiode, siehe dortiger
+        Docstring zum "Leerschritt") noch nicht bestanden. `historisiert_von_id`
+        ist eine explizite, ausschließlich von unserem eigenen Code gesetzte
+        Fremdschlüsselreferenz - KEINE ID-String-/Namens-Heuristik (AGENTS.md)."""
+
+        aktuelle = komponente
+        besucht = {aktuelle.id}
+        while aktuelle.historisiert_von_id is not None:
+            vorgaenger = self._stammdaten_repository.get_komponente(aktuelle.historisiert_von_id)
+            if vorgaenger is None or vorgaenger.id in besucht:
+                break
+            besucht.add(vorgaenger.id)
+            aktuelle = vorgaenger
+        return aktuelle.gueltig_von
 
     def _ueberlappungshinweise(self, vertrag_id: str, bezugsjahr: int) -> list[str]:
         """Folgeauftrag Markus (Schutz gegen bereits enthaltene

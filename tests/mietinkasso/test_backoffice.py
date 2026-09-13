@@ -1217,6 +1217,7 @@ def test_indexautomatik_rechtsprofil_erstellen_und_freigeben(backoffice_client):
         "/backoffice/vertrag/V-601-IDXAUTO/rechtsprofil/erstellen",
         data={
             "rechtsordnung": "OESTERREICH_MRG_VOLL", "ist_wohnungsnutzung": "1", "ist_hauptmiete": "1",
+            "mrg_zinsbeschraenkung": "0", "foerderbindung": "0",
             "bezugsjahr": "2024", "bezugsmonat": "1", "vpi_reihe": "VPI20C18",
             "basis_komponenten_ids": ["K-601-IDXAUTO-HMZ"],
             "vertraglicher_betrag": "2.000,00", "vertraglicher_quellenbeleg": "Mietvertrag Punkt 5",
@@ -1314,7 +1315,8 @@ def test_indexautomatik_soll_umsetzung_liste_vorschau_und_flag_gesperrt(backoffi
     rechtsprofil_service = RechtsprofilService(rechtsprofil_repo, stammdaten, IndexRepository(session_factory))
     entwurf = rechtsprofil_service.entwurf_anlegen(
         ctx=_ctx_admin(), vertrag_id="V-601-SOLLUMS", rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
-        mrg_zinsbeschraenkung=False, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False,
+        mrg_zinsbeschraenkung=False, mrg_zinsbeschraenkung_geprueft=True, ist_altvertrag=False, ist_hauptmiete=True,
+        foerderbindung=False, foerderbindung_geprueft=True,
         mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
         bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False,
         basis_komponenten_ids=["K-601-SOLLUMS-HMZ"], vertraglich_zulaessiger_betrag_cent=200_000,

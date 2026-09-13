@@ -106,6 +106,20 @@ class VertragsKomponenteTable(Base):
     indexierbar: Mapped[bool] = mapped_column(Boolean, default=False)
     gueltig_von: Mapped[date] = mapped_column(Date)
     gueltig_bis: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Additiv, nullable (ensure_additive_columns-sicher): explizite
+    # Historisierungs-Kette statt einer ID-String-Heuristik. Wird NUR von
+    # `indexautomatik/umsetzung_service.py::umsetzen` gesetzt, wenn eine
+    # Umsetzung die ALTE Zeile schließt und eine NEUE für dieselbe,
+    # ununterbrochen fortbestehende vertragliche Verpflichtung anlegt (append-
+    # only Historisierung, siehe dortiger Docstring). Erlaubt
+    # `mieweg_vorschau/service.py`, für die "existierte die Komponente zum
+    # Bezugszeitpunkt bereits"-Prüfung bis zur URSPRÜNGLICHEN Zeile
+    # zurückzuverfolgen, statt eine bloß technisch neu vergebene ID mit einer
+    # fachlich neuen/nie zuvor existierten Komponente zu verwechseln (AGENTS.md:
+    # keine Namens-/ID-Heuristik - dies ist eine explizite, von unserem
+    # eigenen Code gesetzte Fremdschlüsselbeziehung, keine geratene Ableitung
+    # aus fachlichen Daten).
+    historisiert_von_id: Mapped[str | None] = mapped_column(String(48), nullable=True)
 
 
 class KautionTable(Base):
@@ -622,6 +636,23 @@ class RechtsprofilTable(Base):
     rechtsordnung: Mapped[str] = mapped_column(String(48))
     ist_wohnungsnutzung: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     mrg_zinsbeschraenkung: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Codex-Rückprüfung (499c36f): `mrg_zinsbeschraenkung`/`foerderbindung`
+    # sind PRODUKTIV BEREITS BESTEHENDE NOT-NULL-Spalten - die additive
+    # Migration (`infrastructure/db/migrations.py::
+    # ensure_additive_columns`) ändert NIE Constraints bestehender
+    # Spalten, ein reines `nullable=True` hier würde deshalb nur auf
+    # einer frischen Test-/CI-DB funktionieren, nie auf der echten
+    # Produktions-DB. Der dreiwertige Zustand "unbekannt" wird deshalb
+    # NICHT über `None` auf der bestehenden Spalte abgebildet, sondern
+    # über dieses separate, additive, unverändert NOT-NULL/Default-False
+    # Flag: `False` = noch nicht geprüft ("unbekannt", sperrt die
+    # Freigabe - siehe `rechtsprofil.py::
+    # _validiere_vollstaendigkeit_fuer_freigabe`), `True` = eine geprüfte
+    # Angabe liegt vor (der Wert von `mrg_zinsbeschraenkung` selbst kann
+    # dann `True` ODER `False` sein - beides ist eine geklärte Aussage).
+    # Ein `ENTWURF` darf mit `False` (ungeklärt) bleiben; eine Freigabe
+    # verlangt `True`. Kein Automatik-Freigabe-Bypass durch den Default.
+    mrg_zinsbeschraenkung_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
     ist_altvertrag: Mapped[bool] = mapped_column(Boolean, default=False)
     # DREIWERTIG, kein Boolean-Ersatz für "ungeklärt": `None` = noch
     # nicht geprüft (sperrt die Automatik, keine Rechtsannahme);
@@ -633,6 +664,9 @@ class RechtsprofilTable(Base):
     # unterscheiden"); `True` = geprüfte Hauptmiete.
     ist_hauptmiete: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     foerderbindung: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Siehe `mrg_zinsbeschraenkung_geprueft` oben - identisches additiv-
+    # sicheres Tri-State-Muster für Förderbindung.
+    foerderbindung_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
     # BRUTTO (verbindliche Konvention dieses Repositories, siehe
     # domain/money.py::zerlege_brutto_cent) - wirkt als zusätzliche
     # harte Kappung von `massgeblicher_hoechstbetrag_cent` im

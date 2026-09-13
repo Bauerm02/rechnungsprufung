@@ -47,7 +47,7 @@ def _freigegebenes_profil(admin_ctx, rechtsprofil_service, stammdaten_repo, vert
     )
     profil = rechtsprofil_service.entwurf_anlegen(
         ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
-        mrg_zinsbeschraenkung=False, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False,
+        mrg_zinsbeschraenkung=False, mrg_zinsbeschraenkung_geprueft=True, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False, foerderbindung_geprueft=True,
         mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
         bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=[komponente_id],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
@@ -333,7 +333,7 @@ def test_zugangsfrist_konfiguriertes_fristenprofil_hebt_sperre_gezielt_auf(
     )
     entwurf = rechtsprofil_service.entwurf_anlegen(
         ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_GEWERBE", ist_wohnungsnutzung=False,
-        mrg_zinsbeschraenkung=False, ist_altvertrag=False, ist_hauptmiete=None, foerderbindung=False,
+        mrg_zinsbeschraenkung=False, mrg_zinsbeschraenkung_geprueft=True, ist_altvertrag=False, ist_hauptmiete=None, foerderbindung=False, foerderbindung_geprueft=True,
         mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
         bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=["K-1"],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
@@ -453,7 +453,7 @@ def test_mehrkomponenten_werden_vor_versand_blockiert(admin_ctx, basis_vertrag, 
 
     profil = rechtsprofil_service.entwurf_anlegen(
         ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
-        mrg_zinsbeschraenkung=False, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False,
+        mrg_zinsbeschraenkung=False, mrg_zinsbeschraenkung_geprueft=True, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False, foerderbindung_geprueft=True,
         mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
         bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=["K-1", "K-2"],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
@@ -525,7 +525,7 @@ def test_erstellen_aus_mieweg_befuellt_komponenten_verteilung_bei_genau_einer_ko
 
     profil = rechtsprofil_service.entwurf_anlegen(
         ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
-        mrg_zinsbeschraenkung=False, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False,
+        mrg_zinsbeschraenkung=False, mrg_zinsbeschraenkung_geprueft=True, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False, foerderbindung_geprueft=True,
         mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
         bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=["K-1"],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",

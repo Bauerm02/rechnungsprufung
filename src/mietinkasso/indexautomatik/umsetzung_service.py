@@ -439,6 +439,13 @@ class IndexSollUmsetzungService:
                 # stillschweigend zu "unbefristet" werden - es wird
                 # unverändert auf die neue Komponente übertragen.
                 gueltig_bis=urspruengliches_gueltig_bis,
+                # Explizite Historisierungs-Kette (KEINE ID-String-Heuristik):
+                # `mieweg_vorschau/service.py`s Existenzprüfung verfolgt diese
+                # Referenz bis zur ursprünglichen Zeile zurück - die neue Zeile
+                # ist rechtlich dieselbe, ununterbrochen fortbestehende
+                # Verpflichtung wie `alte_komponente`, nur eine neue DB-Zeile
+                # (append-only Historisierung), keine neu vereinbarte Komponente.
+                historisiert_von_id=alte_komponente.id,
                 session=session,
             )
 
@@ -448,23 +455,32 @@ class IndexSollUmsetzungService:
             # jetzt auf die NEUE Komponente. Beim MieWeG-Pfad werden
             # bezugsjahr/-monat/letzte_basis_war_jahresdurchschnitt
             # gemeinsam auf die neue Jahresbasis fortgeschrieben (Codex-
-            # Rückprüfung 499c36f: "bezugsmonat/letzte_basis_war_
-            # jahresdurchschnitt müssen konsistent fortgeführt werden,
-            # keine wiederholte Erstjahres-Aliquotierung") -
-            # `letzte_basis_war_jahresdurchschnitt=True` UND
-            # `bezugsmonat=12` signalisieren dem nächsten Zyklus, dass die
-            # neue Basis ein VOLLES Jahr abbildet (siehe
-            # `mieweg_vorschau/berechnung.py::berechne_gesetzliche_
-            # hoechstgrenze`: der `anteil`-Faktor < 1 gilt AUSSCHLIESSLICH
-            # für das allererste, u. U. unterjährige Bezugsjahr - würde
-            # `bezugsmonat` auf dem ursprünglichen, u. U. unterjährigen
-            # Wert stehen bleiben, würde diese Aliquotierung beim
-            # nächsten automatischen Zyklus fälschlich ERNEUT angewandt).
+            # Rückprüfung 499c36f/fb34ecb).
+            #
+            # `berechne_gesetzliche_hoechstgrenze` (mieweg_vorschau/
+            # berechnung.py) behandelt die ERSTE Loop-Iteration
+            # (jahr=erster_bezug_jahr) IMMER als u. U. unterjährig
+            # (`anteil=(12-erster_bezug_monat)/12`), jede FOLGENDE
+            # Iteration voll (`anteil=1`). Mit `erster_bezug_monat=12`
+            # (effektiver_monat bei `letzte_basis_war_jahresdurchschnitt`)
+            # wird die ERSTE Iteration bewusst zu `anteil=0` - ein
+            # gezielter "Leerschritt", der GENAU DAS bereits verarbeitete
+            # Jahr (das schon Teil der vorherigen Erhöhung war) neutral
+            # überspringt, damit die ECHTE neue Vergleichsperiode erst in
+            # der ZWEITEN (voll gewichteten) Iteration ankommt. Deshalb
+            # ist die neue `bezugsjahr` NICHT das verarbeitete
+            # `ziel_bewertungsjahr` selbst, sondern EIN JAHR DAVOR - sonst
+            # hätte ein direkt folgender Jahreszyklus (ziel_bewertungsjahr
+            # der Vorperiode + 1) nur die eine (geleerte) Iteration und
+            # ergäbe fälschlich GAR KEINE Erhöhung (unabhängige Rückprüfung
+            # fb34ecb: "ergibt für das Folgejahr im ersten Schritt 0").
             # Der Geschäftsraum-/Klausel-Pfad hat kein `ziel_bewertungsjahr`
             # und damit kein analoges Gate - alle drei Felder bleiben dort
             # unverändert.
             ist_mieweg_pfad = frisches_schreiben.ziel_bewertungsjahr is not None
-            neues_bezugsjahr = frisches_schreiben.ziel_bewertungsjahr if ist_mieweg_pfad else profil.bezugsjahr
+            neues_bezugsjahr = (
+                frisches_schreiben.ziel_bewertungsjahr - 1 if ist_mieweg_pfad else profil.bezugsjahr
+            )
             neuer_bezugsmonat = 12 if ist_mieweg_pfad else profil.bezugsmonat
             neue_letzte_basis_war_jahresdurchschnitt = (
                 True if ist_mieweg_pfad else profil.letzte_basis_war_jahresdurchschnitt
@@ -484,9 +500,11 @@ class IndexSollUmsetzungService:
                 rechtsordnung=profil.rechtsordnung,
                 ist_wohnungsnutzung=profil.ist_wohnungsnutzung,
                 mrg_zinsbeschraenkung=profil.mrg_zinsbeschraenkung,
+                mrg_zinsbeschraenkung_geprueft=profil.mrg_zinsbeschraenkung_geprueft,
                 ist_altvertrag=profil.ist_altvertrag,
                 ist_hauptmiete=profil.ist_hauptmiete,
                 foerderbindung=profil.foerderbindung,
+                foerderbindung_geprueft=profil.foerderbindung_geprueft,
                 mietzinsobergrenze_cent=profil.mietzinsobergrenze_cent,
                 mietzinsobergrenze_quellenbeleg=profil.mietzinsobergrenze_quellenbeleg,
                 mietzinsobergrenze_gueltig_bis=profil.mietzinsobergrenze_gueltig_bis,

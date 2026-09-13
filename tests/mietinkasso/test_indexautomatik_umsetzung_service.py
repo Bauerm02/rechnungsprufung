@@ -18,14 +18,25 @@ from datetime import date, datetime, timezone
 import pytest
 from sqlalchemy import select, update as sa_update
 
+from decimal import Decimal
+
 from mietinkasso.domain.exceptions import CrossTenantError
 from mietinkasso.index.repository import IndexRepository
+from mietinkasso.index.service import IndexService
 from mietinkasso.indexautomatik.outbox_service import ErhoehungsschreibenOutboxService
 from mietinkasso.indexautomatik.rechtsprofil import RechtsprofilService
-from mietinkasso.indexautomatik.repository import ErhoehungsschreibenRepository, RechtsprofilRepository
+from mietinkasso.indexautomatik.repository import (
+    ErhoehungsschreibenRepository,
+    IndexautomatikLaufRepository,
+    RechtsprofilRepository,
+    VpiRepository,
+)
+from mietinkasso.indexautomatik.service import IndexautomatikService
 from mietinkasso.indexautomatik.transport import FakeTransportadapter
 from mietinkasso.indexautomatik.umsetzung_service import IndexSollUmsetzungService
 from mietinkasso.infrastructure.db.tables import ErhoehungsschreibenTable, IndexSollUmsetzungTable, RechtsprofilTable
+from mietinkasso.mieweg_vorschau.repository import MieWegVorschauRepository
+from mietinkasso.mieweg_vorschau.service import MieWegVorschauService
 from mietinkasso.vorschreibung.repository import VorschreibungRepository
 from mietinkasso.vorschreibung.service import VorschreibungService
 
@@ -72,6 +83,39 @@ def vorschreibung_service(session_factory, stammdaten_repo, op_service) -> Vorsc
     return VorschreibungService(VorschreibungRepository(session_factory), stammdaten_repo, op_service)
 
 
+@pytest.fixture
+def vpi_repo(session_factory) -> VpiRepository:
+    return VpiRepository(session_factory)
+
+
+@pytest.fixture
+def indexautomatik_service(
+    session_factory, stammdaten_repo, rechtsprofil_service, outbox_repo, vpi_repo, index_repo, outbox_service,
+) -> IndexautomatikService:
+    lauf_repo = IndexautomatikLaufRepository(session_factory)
+    mieweg_service = MieWegVorschauService(MieWegVorschauRepository(session_factory), stammdaten_repo)
+    index_service = IndexService(index_repo, stammdaten_repo)
+    return IndexautomatikService(
+        stammdaten_repository=stammdaten_repo,
+        rechtsprofil_service=rechtsprofil_service,
+        lauf_repository=lauf_repo,
+        outbox_repository=outbox_repo,
+        vpi_repository=vpi_repo,
+        mieweg_service=mieweg_service,
+        index_repository=index_repo,
+        index_service=index_service,
+        outbox_service=outbox_service,
+    )
+
+
+def _seed_vpi(vpi_repo, *, jahre_werte: dict[int, str], reihe="VPI20C18"):
+    for jahr, wert in jahre_werte.items():
+        vpi_repo.jahreswert_erfassen(
+            reihe=reihe, jahr=jahr, wert=Decimal(wert), quelle="Statistik Austria (synthetisch)",
+            quelle_datum=date(jahr + 1, 2, 17), erfasst_von="markus",
+        )
+
+
 def _profil_und_komponente(
     admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag, *,
     komponente_id="K-1", komponente_gueltig_bis=None, bezugsjahr=2024, bezugsmonat=1,
@@ -83,7 +127,7 @@ def _profil_und_komponente(
     )
     entwurf = rechtsprofil_service.entwurf_anlegen(
         ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
-        mrg_zinsbeschraenkung=False, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False,
+        mrg_zinsbeschraenkung=False, mrg_zinsbeschraenkung_geprueft=True, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False, foerderbindung_geprueft=True,
         mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
         bezugsjahr=bezugsjahr, bezugsmonat=bezugsmonat, letzte_basis_war_jahresdurchschnitt=letzte_basis_war_jahresdurchschnitt,
         basis_komponenten_ids=[komponente_id],
@@ -587,61 +631,132 @@ def test_umsetzen_end_to_end_ueber_echten_versand_und_zugang_und_vorschreibung(
     assert vorschreibungs_ergebnis.summe_cent == 101_000  # NICHT mehr der alte Betrag (100_000)
 
 
-def test_umsetzen_zwei_aufeinanderfolgende_jahreszyklen_ohne_wiederholte_aliquotierung(
-    admin_ctx, basis_vertrag, umsetzung_service, outbox_repo, rechtsprofil_repo, rechtsprofil_service, stammdaten_repo,
-    vorschreibung_service,
+def test_umsetzen_zwei_echte_aufeinanderfolgende_monatslaeufe_ohne_wiederholte_aliquotierung(
+    admin_ctx, basis_vertrag, umsetzung_service, outbox_repo, outbox_service, rechtsprofil_repo, rechtsprofil_service,
+    stammdaten_repo, vorschreibung_service, vpi_repo, indexautomatik_service,
 ):
-    """Codex-Rückprüfung (499c36f): nach einer echten Umsetzung muss
-    bezugsjahr/-monat/letzte_basis_war_jahresdurchschnitt so
-    fortgeschrieben werden, dass ein ZWEITER, unmittelbar folgender
-    Zyklus NICHT erneut die (nur für das allererste Bezugsjahr gültige)
-    unterjährige Aliquotierung anwendet (`mieweg_vorschau/berechnung.py`:
-    `anteil < 1` nur für `ist_erstes_jahr`)."""
+    """Unabhängige Rückprüfung (fb34ecb): der vorherige Test erzeugte
+    `schreiben_2` künstlich mit einem erfundenen `erhoehung_cent` - KEIN
+    echter zweiter Monatslauf. Dieser Test läuft beide Zyklen
+    VOLLSTÄNDIG über die echten Produktionspfade
+    (`IndexautomatikService.monatslauf_fuer_vertrag` mit amtlichen
+    synthetischen Jahres-VPI-Werten, `outbox_service.versenden`/
+    `zugang_bestaetigen`/`taegliche_pflege`, `umsetzung_service.
+    umsetzen`) und weist eine ECHTE, POSITIVE volle Jahresänderung im
+    zweiten Zyklus nach - durch unabhängige Neuberechnung über
+    `berechne_gesetzliche_hoechstgrenze` exakt verifiziert (kein bloßes
+    ">0"). April 2026 verwendet dabei den Jahresdurchschnitt 2025
+    (keine erfundene Dezember-2026-Basis)."""
+
+    from mietinkasso.mieweg_vorschau.berechnung import berechne_gesetzliche_hoechstgrenze
 
     vertrag, _konto = basis_vertrag
+    debitor = stammdaten_repo.get_debitor(vertrag.debitor_id)
+    stammdaten_repo.upsert_debitor(id=debitor.id, name=debitor.name, email=debitor.email, adresse="Corsogasse 1/3, 1010 Wien")
+
     # Ursprüngliches Profil: unterjähriger erster Bezug (Bezugsmonat 7 -
-    # ein NEUER Vertrag/Komponente, noch KEIN Jahresdurchschnitt).
+    # ein NEUER Vertrag/eine neue Komponente, noch KEIN Jahresdurchschnitt).
+    # Der (großzügige) vertragliche Höchstbetrag aus `_profil_und_komponente`
+    # (200.000 Cent) bindet bei den hier gewählten kleinen VPI-Schritten
+    # nicht - der Test prüft die GESETZLICHE Spur gegen
+    # `berechne_gesetzliche_hoechstgrenze`.
     profil = _profil_und_komponente(
         admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag,
         bezugsjahr=2024, bezugsmonat=7, letzte_basis_war_jahresdurchschnitt=False,
     )
 
-    schreiben_1 = _soll_umsetzung_offenes_schreiben(
-        outbox_repo, vertrag, profil, alter_betrag_cent=100_000, erhoehung_cent=1_000,
-        zahlungspflicht_ab=date(2026, 4, 15), zugang_bestaetigt_am=date(2026, 4, 1),
+    # Amtliche (synthetische) Jahresdurchschnitte - jeweils unter der
+    # 3%-Dämpfungsschwelle, damit die Rechnung klar nachvollziehbar bleibt.
+    _seed_vpi(vpi_repo, jahre_werte={2023: "100", 2024: "102", 2025: "104", 2026: "106"})
+
+    # --- Zyklus 1: echter Monatslauf für April 2026 ---------------------
+    lauf_1 = indexautomatik_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 4, 5), akteur="test")
+    assert lauf_1.status == "ERHOEHUNG_ERZEUGT"
+    schreiben_1 = outbox_repo.get(lauf_1.erhoehungsschreiben_id)
+    assert schreiben_1.status == "BEREIT"
+    assert schreiben_1.erhoehung_cent > 0
+
+    versand_1 = outbox_service.versenden(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben_1.id, heute=date(2026, 4, 5), send_enabled=True,
+        mailops_allowlist_bestaetigt=True, transport=FakeTransportadapter(),
     )
+    assert versand_1.status == "GESENDET"
+    zugang_1 = outbox_service.zugang_bestaetigen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben_1.id, heute=date(2026, 4, 6), zugang_datum=date(2026, 4, 5),
+        zugangsform="EINSCHREIBEN_RUECKSCHEIN", zugang_beleg="Rückschein Post AG Nr. 1",
+    )
+    assert zugang_1.status == "ZUGANG_BESTAETIGT"
+    zahlungspflicht_ab_1 = zugang_1.zahlungspflicht_ab
+
+    faellige_1 = outbox_service.taegliche_pflege(heute=zahlungspflicht_ab_1)
+    assert len(faellige_1) == 1
+
     ergebnis_1 = umsetzung_service.umsetzen(
-        ctx=admin_ctx, erhoehungsschreiben_id=schreiben_1.id, heute=date(2026, 4, 20), akteur="markus",
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben_1.id, heute=zahlungspflicht_ab_1, akteur="markus",
         soll_umsetzung_enabled=True,
     )
     assert ergebnis_1.status == "UMGESETZT"
 
     neues_profil_1 = rechtsprofil_repo.get(ergebnis_1.neues_rechtsprofil_id)
-    assert neues_profil_1.bezugsjahr == 2026
+    # Bewusst EIN JAHR VOR dem verarbeiteten Bewertungsjahr (siehe
+    # umsetzung_service.py-Kommentar zum "Leerschritt") - NICHT das
+    # Bewertungsjahr selbst und NICHT Dezember 2026 als erfundene Basis.
+    assert neues_profil_1.bezugsjahr == 2025
     assert neues_profil_1.bezugsmonat == 12
     assert neues_profil_1.letzte_basis_war_jahresdurchschnitt is True
+    assert neues_profil_1.basis_komponenten_ids == [ergebnis_1.neue_komponente_id]
 
-    # ZWEITER Zyklus, unmittelbar im Folgejahr: eine neue Erhöhung auf
-    # Basis der NEUEN Komponente/des NEUEN Profils.
-    schreiben_2 = _soll_umsetzung_offenes_schreiben(
-        outbox_repo, vertrag, neues_profil_1, komponente_id=ergebnis_1.neue_komponente_id,
-        alter_betrag_cent=101_000, erhoehung_cent=2_000, ziel_bewertungsjahr=2027,
-        zahlungspflicht_ab=date(2027, 4, 15), zugang_bestaetigt_am=date(2027, 4, 1),
-        versendet_am=datetime(2027, 3, 15, 9, 0, tzinfo=timezone.utc), externe_versandreferenz="MAILOPS-TEST-2",
+    neue_komponente_1 = stammdaten_repo.get_komponente(ergebnis_1.neue_komponente_id)
+    assert neue_komponente_1.betrag_cent == 100_000 + schreiben_1.erhoehung_cent
+
+    # --- Zyklus 2: echter, UNMITTELBAR folgender Monatslauf für April 2027 ---
+    lauf_2 = indexautomatik_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2027, 4, 5), akteur="test")
+    assert lauf_2.status == "ERHOEHUNG_ERZEUGT", lauf_2.blockiert_gruende
+    schreiben_2 = outbox_repo.get(lauf_2.erhoehungsschreiben_id)
+    assert schreiben_2.komponenten_verteilung["komponente_id"] == ergebnis_1.neue_komponente_id
+
+    # Unabhängige Neuberechnung derselben Periode über den ECHTEN Rechner
+    # (kein zweites, eigenes Rechenmodell) - beweist eine ECHTE, POSITIVE
+    # volle Jahresänderung (2026 gegenüber 2025), NICHT bloß "> 0".
+    erwartetes_ergebnis = berechne_gesetzliche_hoechstgrenze(
+        mrg_zinsbeschraenkung=False, erster_bezug_jahr=neues_profil_1.bezugsjahr, erster_bezug_monat=12,
+        ziel_bewertungsjahr=2027, vpi_jahresdurchschnitte={2024: Decimal("102"), 2025: Decimal("104"), 2026: Decimal("106")},
+        basis_betrag_cent=neue_komponente_1.betrag_cent,
     )
+    assert erwartetes_ergebnis.vollstaendig
+    # Der EINZIGE mit vollem Gewicht (anteil=1) zählende Schritt ist 2026
+    # gegenüber 2025 - 2025 gegenüber 2024 ist der bewusste Leerschritt
+    # (anteil=0), keine doppelte Zählung des bereits verarbeiteten Jahres.
+    volle_schritte = [s for s in erwartetes_ergebnis.jahresschritte if s.anteil == 1]
+    assert [s.jahr for s in volle_schritte] == [2026]
+    erwartete_erhoehung_cent = erwartetes_ergebnis.hoechstbetrag_cent - neue_komponente_1.betrag_cent
+    assert erwartete_erhoehung_cent > 0
+    assert schreiben_2.erhoehung_cent == erwartete_erhoehung_cent
+
+    versand_2 = outbox_service.versenden(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben_2.id, heute=date(2027, 4, 5), send_enabled=True,
+        mailops_allowlist_bestaetigt=True, transport=FakeTransportadapter(),
+    )
+    assert versand_2.status == "GESENDET"
+    zugang_2 = outbox_service.zugang_bestaetigen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben_2.id, heute=date(2027, 4, 6), zugang_datum=date(2027, 4, 5),
+        zugangsform="EINSCHREIBEN_RUECKSCHEIN", zugang_beleg="Rückschein Post AG Nr. 2",
+    )
+    assert zugang_2.status == "ZUGANG_BESTAETIGT"
+    zahlungspflicht_ab_2 = zugang_2.zahlungspflicht_ab
+
+    faellige_2 = outbox_service.taegliche_pflege(heute=zahlungspflicht_ab_2)
+    assert len(faellige_2) == 1
+
     ergebnis_2 = umsetzung_service.umsetzen(
-        ctx=admin_ctx, erhoehungsschreiben_id=schreiben_2.id, heute=date(2027, 4, 20), akteur="markus",
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben_2.id, heute=zahlungspflicht_ab_2, akteur="markus",
         soll_umsetzung_enabled=True,
     )
     assert ergebnis_2.status == "UMGESETZT"
 
-    neues_profil_2 = rechtsprofil_repo.get(ergebnis_2.neues_rechtsprofil_id)
-    assert neues_profil_2.bezugsjahr == 2027
-    assert neues_profil_2.bezugsmonat == 12
-    assert neues_profil_2.letzte_basis_war_jahresdurchschnitt is True
-
     neue_komponente_2 = stammdaten_repo.get_komponente(ergebnis_2.neue_komponente_id)
-    assert neue_komponente_2.betrag_cent == 103_000
+    assert neue_komponente_2.betrag_cent == neue_komponente_1.betrag_cent + erwartete_erhoehung_cent
 
-    vorschreibungs_ergebnis = vorschreibung_service.entwurf_erstellen(ctx=admin_ctx, vertrag=vertrag, monat="2027-04")
-    assert vorschreibungs_ergebnis.summe_cent == 103_000
+    anspruchsmonat_2 = f"{zahlungspflicht_ab_2.year:04d}-{zahlungspflicht_ab_2.month:02d}"
+    vorschreibungs_ergebnis = vorschreibung_service.entwurf_erstellen(ctx=admin_ctx, vertrag=vertrag, monat=anspruchsmonat_2)
+    assert vorschreibungs_ergebnis.summe_cent == neue_komponente_2.betrag_cent

@@ -72,6 +72,8 @@ class RechtsprofilService:
         ist_hauptmiete: bool | None,
         foerderbindung: bool,
         mietzinsobergrenze_cent: int | None,
+        mrg_zinsbeschraenkung_geprueft: bool = False,
+        foerderbindung_geprueft: bool = False,
         mietzinsobergrenze_quellenbeleg: str | None,
         mietzinsobergrenze_gueltig_bis: date | None,
         bezugsjahr: int | None,
@@ -151,9 +153,11 @@ class RechtsprofilService:
             rechtsordnung=rechtsordnung,
             ist_wohnungsnutzung=ist_wohnungsnutzung,
             mrg_zinsbeschraenkung=mrg_zinsbeschraenkung,
+            mrg_zinsbeschraenkung_geprueft=mrg_zinsbeschraenkung_geprueft,
             ist_altvertrag=ist_altvertrag,
             ist_hauptmiete=ist_hauptmiete,
             foerderbindung=foerderbindung,
+            foerderbindung_geprueft=foerderbindung_geprueft,
             mietzinsobergrenze_cent=mietzinsobergrenze_cent,
             mietzinsobergrenze_quellenbeleg=mietzinsobergrenze_quellenbeleg,
             mietzinsobergrenze_gueltig_bis=mietzinsobergrenze_gueltig_bis,
@@ -200,6 +204,21 @@ class RechtsprofilService:
                 "MRG-Zinsbeschränkung ist bestätigt, aber keine Mietzinsobergrenze erfasst - eine "
                 "bestätigte gesetzliche Zinsbeschränkung wird nie fiktiv als unbegrenzt behandelt. "
                 "Bitte Mietzinsobergrenze/Quellenbeleg vor Freigabe erfassen."
+            )
+        # Auftrag HV-20260913-VERSAND-SOLL, Punkt "Tri-State": `unbekannt`
+        # (Default `False` auf dem additiven `*_geprueft`-Flag) darf eine
+        # Freigabe NIE stillschweigend passieren lassen - eine Freigabe
+        # verlangt eine EXPLIZIT geklärte Angabe (ja ODER nein), kein
+        # gerateter Boolean. Ein `ENTWURF` bleibt davon unberührt.
+        if not profil.mrg_zinsbeschraenkung_geprueft:
+            raise ValueError(
+                "MRG-Zinsbeschränkung ist nicht geprüft (unbekannt) - eine Freigabe verlangt eine "
+                "geklärte Angabe (ja oder nein), keine automatische Annahme."
+            )
+        if not profil.foerderbindung_geprueft:
+            raise ValueError(
+                "Förderbindung ist nicht geprüft (unbekannt) - eine Freigabe verlangt eine geklärte "
+                "Angabe (ja oder nein), keine automatische Annahme."
             )
         if not profil.basis_komponenten_ids:
             raise ValueError("Mindestens eine referenzierte Basis-Komponente ist für eine Freigabe Pflicht.")
@@ -289,9 +308,11 @@ class RechtsprofilService:
                 "rechtsordnung": profil.rechtsordnung,
                 "ist_wohnungsnutzung": profil.ist_wohnungsnutzung,
                 "mrg_zinsbeschraenkung": profil.mrg_zinsbeschraenkung,
+                "mrg_zinsbeschraenkung_geprueft": profil.mrg_zinsbeschraenkung_geprueft,
                 "ist_altvertrag": profil.ist_altvertrag,
                 "ist_hauptmiete": profil.ist_hauptmiete,
                 "foerderbindung": profil.foerderbindung,
+                "foerderbindung_geprueft": profil.foerderbindung_geprueft,
                 "mietzinsobergrenze_cent": profil.mietzinsobergrenze_cent,
                 "mietzinsobergrenze_quellenbeleg": profil.mietzinsobergrenze_quellenbeleg,
                 "mietzinsobergrenze_gueltig_bis": (

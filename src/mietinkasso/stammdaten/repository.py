@@ -367,6 +367,7 @@ class StammdatenRepository:
         indexierbar: bool = False,
         gueltig_von: date,
         gueltig_bis: date | None = None,
+        historisiert_von_id: str | None = None,
         session: Session | None = None,
     ) -> None:
         """`session`: siehe `upsert_gesellschaft`. Bewusst reines Insert
@@ -394,6 +395,7 @@ class StammdatenRepository:
                     indexierbar=indexierbar,
                     gueltig_von=gueltig_von,
                     gueltig_bis=gueltig_bis,
+                    historisiert_von_id=historisiert_von_id,
                 )
             )
 

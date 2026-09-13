@@ -82,7 +82,8 @@ def _mit_komponente(stammdaten_repo, vertrag, *, id="K-1", betrag_cent=100_000):
 def _freigegebenes_wohnungsprofil(admin_ctx, rechtsprofil_service, vertrag, **overrides) -> object:
     basis = dict(
         ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
-        mrg_zinsbeschraenkung=False, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False,
+        mrg_zinsbeschraenkung=False, mrg_zinsbeschraenkung_geprueft=True, ist_altvertrag=False, ist_hauptmiete=True,
+        foerderbindung=False, foerderbindung_geprueft=True,
         mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
         bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=["K-1"],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Mietvertrag Punkt 5",
