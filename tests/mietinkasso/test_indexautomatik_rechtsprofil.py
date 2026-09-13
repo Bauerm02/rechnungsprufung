@@ -5,8 +5,10 @@ from datetime import date
 import pytest
 
 from mietinkasso.domain.exceptions import QuellenbelegFehltError
+from mietinkasso.index.repository import IndexRepository
 from mietinkasso.indexautomatik.rechtsprofil import RechtsprofilService
 from mietinkasso.indexautomatik.repository import RechtsprofilRepository
+from mietinkasso.infrastructure.db.tables import IndexKlauselTable
 
 
 @pytest.fixture
@@ -15,8 +17,13 @@ def rechtsprofil_repo(session_factory) -> RechtsprofilRepository:
 
 
 @pytest.fixture
-def rechtsprofil_service(rechtsprofil_repo, stammdaten_repo) -> RechtsprofilService:
-    return RechtsprofilService(rechtsprofil_repo, stammdaten_repo)
+def index_repo(session_factory) -> IndexRepository:
+    return IndexRepository(session_factory)
+
+
+@pytest.fixture
+def rechtsprofil_service(rechtsprofil_repo, stammdaten_repo, index_repo) -> RechtsprofilService:
+    return RechtsprofilService(rechtsprofil_repo, stammdaten_repo, index_repo)
 
 
 def _standard_kwargs(**overrides) -> dict:
@@ -130,6 +137,94 @@ def test_geaenderte_komponente_entwertet_freigabe(admin_ctx, basis_vertrag, rech
 
     assert rechtsprofil_service.ist_noch_gueltig(freigegeben) is False
     assert rechtsprofil_service.aktives_gueltiges_profil(vertrag.id) is None
+
+
+def test_statischer_betrag_und_vertragsklausel_schliessen_sich_aus(
+    admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo, index_repo
+):
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    klausel = index_repo.anlegen(
+        IndexKlauselTable(
+            vertrag_id=vertrag.id,
+            version=1,
+            rechtsordnung=vertrag.rechtsordnung,
+            berechnungsprofil="EINFACHER_SCHWELLENVERGLEICH",
+            abschlussdatum=date(2024, 1, 1),
+            basis_reihe="VPI20C18",
+            basis_wert=100,
+            basis_monat="2024-01",
+        )
+    )
+    with pytest.raises(ValueError):
+        rechtsprofil_service.entwurf_anlegen(
+            ctx=admin_ctx,
+            vertrag_id=vertrag.id,
+            **_standard_kwargs(vertragsklausel_id=klausel.id),
+        )
+
+
+def test_freigabe_ohne_komponenten_wird_abgelehnt(admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo):
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    profil = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx, vertrag_id=vertrag.id, **_standard_kwargs(basis_komponenten_ids=[])
+    )
+    with pytest.raises(ValueError):
+        rechtsprofil_service.freigeben(profil.id, ctx=admin_ctx, freigegeben_von="markus")
+
+
+def test_geaenderte_vertragsklausel_entwertet_freigabe(
+    admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo, index_repo
+):
+    from mietinkasso.infrastructure.db.tables import IndexKlauselTable
+
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    klausel = index_repo.anlegen(
+        IndexKlauselTable(
+            vertrag_id=vertrag.id,
+            version=1,
+            rechtsordnung=vertrag.rechtsordnung,
+            berechnungsprofil="EINFACHER_SCHWELLENVERGLEICH",
+            abschlussdatum=date(2024, 1, 1),
+            basis_reihe="VPI20C18",
+            basis_wert=100,
+            basis_monat="2024-01",
+        )
+    )
+    profil = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx,
+        vertrag_id=vertrag.id,
+        **_standard_kwargs(vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None, vertragsklausel_id=klausel.id),
+    )
+    freigegeben = rechtsprofil_service.freigeben(profil.id, ctx=admin_ctx, freigegeben_von="markus")
+    assert rechtsprofil_service.ist_noch_gueltig(freigegeben) is True
+
+    with stammdaten_repo._session_factory() as session:
+        row = session.get(IndexKlauselTable, klausel.id)
+        row.schwelle_prozent = 5
+        session.commit()
+
+    assert rechtsprofil_service.ist_noch_gueltig(freigegeben) is False
+
+
+def test_abgelaufene_mietzinsobergrenze_entwertet_freigabe(admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo):
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    profil = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx,
+        vertrag_id=vertrag.id,
+        **_standard_kwargs(
+            foerderbindung=True,
+            mietzinsobergrenze_cent=90_000,
+            mietzinsobergrenze_quellenbeleg="Förderzusicherung Punkt 3",
+            mietzinsobergrenze_gueltig_bis=date(2025, 12, 31),
+        ),
+    )
+    freigegeben = rechtsprofil_service.freigeben(profil.id, ctx=admin_ctx, freigegeben_von="markus")
+    assert rechtsprofil_service.ist_noch_gueltig(freigegeben, heute=date(2025, 6, 1)) is True
+    assert rechtsprofil_service.ist_noch_gueltig(freigegeben, heute=date(2026, 1, 1)) is False
 
 
 def test_geaendertes_vertragsende_entwertet_freigabe(admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo):

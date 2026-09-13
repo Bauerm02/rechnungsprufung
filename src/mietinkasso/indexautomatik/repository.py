@@ -187,9 +187,23 @@ class ErhoehungsschreibenRepository:
             )
             return session.execute(statement).scalars().first()
 
+    def get_by_index_anpassung(self, index_anpassung_id: int) -> ErhoehungsschreibenTable | None:
+        with self._session_factory() as session:
+            statement = select(ErhoehungsschreibenTable).where(
+                ErhoehungsschreibenTable.index_anpassung_id == index_anpassung_id
+            )
+            return session.execute(statement).scalars().first()
+
     def anlegen(self, row: ErhoehungsschreibenTable) -> ErhoehungsschreibenTable:
-        """Idempotent über den (vertrag_id, ziel_bewertungsjahr)-Unique-
-        Constraint - analog zu `IndexautomatikLaufRepository.anlegen`."""
+        """Idempotent - für den MieWeG-Pfad (`ziel_bewertungsjahr`
+        gesetzt) über den partiellen (vertrag_id, ziel_bewertungsjahr)-
+        Unique-Index; für den Geschäftsraum-/Klausel-Pfad
+        (`index_anpassung_id` gesetzt, `ziel_bewertungsjahr` NULL) ist
+        die Idempotenz bereits vorgelagert über
+        `IndexautomatikLaufRepository` (höchstens ein Versuch pro
+        Kalendermonat) sichergestellt - ein `IntegrityError` sollte für
+        diesen Pfad nicht auftreten, wird hier aber trotzdem defensiv
+        über `index_anpassung_id` aufgelöst statt weiterzuwerfen."""
 
         with self._session_factory() as session:
             session.add(row)
@@ -197,7 +211,12 @@ class ErhoehungsschreibenRepository:
                 session.commit()
             except IntegrityError:
                 session.rollback()
-                bestehend = self.get_by_ziel(row.vertrag_id, row.ziel_bewertungsjahr)
+                if row.ziel_bewertungsjahr is not None:
+                    bestehend = self.get_by_ziel(row.vertrag_id, row.ziel_bewertungsjahr)
+                elif row.index_anpassung_id is not None:
+                    bestehend = self.get_by_index_anpassung(row.index_anpassung_id)
+                else:
+                    bestehend = None
                 if bestehend is None:
                     raise
                 return bestehend
@@ -205,20 +224,38 @@ class ErhoehungsschreibenRepository:
             return row
 
     def claim_fuer_versand(self, id: int, *, jetzt: datetime | None = None) -> bool:
-        """Atomarer Compare-and-Swap BEREIT->GESENDET-Vormerkung (analog
+        """Atomarer Compare-and-Swap BEREIT->IN_VERSAND (analog
         `MahnFallRepository.claim_fuer_versand`): nur der Worker, dessen
         UPDATE tatsächlich eine Zeile trifft, darf den Transportadapter
-        aufrufen."""
+        aufrufen. Unabhängiger Review (0d65e2b): die vorherige Fassung
+        setzte NUR `versand_beansprucht_am`, ließ `status` aber auf
+        BEREIT stehen - das WHERE-Kriterium eines zweiten, praktisch
+        gleichzeitigen Aufrufs traf dadurch weiterhin zu und beide
+        Worker erhielten `True` (Doppelversand). Der Status wechselt
+        jetzt selbst TEIL des atomaren UPDATE-Prädikats zu IN_VERSAND,
+        exakt wie beim bestehenden Mahnwesen-Muster."""
 
         with self._session_factory() as session:
             result = session.execute(
                 update(ErhoehungsschreibenTable)
                 .where(ErhoehungsschreibenTable.id == id)
                 .where(ErhoehungsschreibenTable.status == "BEREIT")
-                .values(versand_beansprucht_am=jetzt or datetime.now(timezone.utc))
+                .values(status="IN_VERSAND", versand_beansprucht_am=jetzt or datetime.now(timezone.utc))
             )
             session.commit()
             return result.rowcount > 0
+
+    def verwaiste_in_versand(self, *, aelter_als: datetime) -> list[ErhoehungsschreibenTable]:
+        """Recovery für einen Absturz zwischen `claim_fuer_versand` und
+        dem Auflösen des Ergebnisses (analog
+        `mahnwesen/service.py::markiere_verwaiste_als_unsicher`)."""
+
+        with self._session_factory() as session:
+            statement = select(ErhoehungsschreibenTable).where(
+                ErhoehungsschreibenTable.status == "IN_VERSAND",
+                ErhoehungsschreibenTable.versand_beansprucht_am < aelter_als,
+            )
+            return list(session.execute(statement).scalars().all())
 
     def set_status(self, id: int, status: str, **felder) -> ErhoehungsschreibenTable:
         with self._session_factory() as session:
@@ -282,20 +319,36 @@ class VertragsendeErinnerungRepository:
             session.refresh(row)
             return row
 
-    def invalidiere_veraltete(self, vertrag_id: str, aktuelles_end_datum: date) -> list[VertragsendeErinnerungTable]:
+    def invalidiere_veraltete(
+        self, vertrag_id: str, aktuelles_end_datum: date | None
+    ) -> list[VertragsendeErinnerungTable]:
         """Fachregel: ändert sich `VertragTable.gueltig_bis` (Verlängerung/
-        Verkürzung), werden alle noch offenen/benachrichtigten Erinnerungen
-        für ein ANDERES Enddatum desselben Vertrags ungültig - eine neue
-        Zeile für das neue Enddatum wird separat (idempotent über den
-        Unique-Constraint) angelegt."""
+        Verkürzung ODER Wechsel auf unbefristet), werden alle noch nicht
+        ungültigen Erinnerungen für ein ANDERES Enddatum desselben
+        Vertrags ungültig - eine neue Zeile für ein neues, weiterhin
+        befristetes Enddatum wird separat (idempotent über den
+        Unique-Constraint) angelegt.
+
+        Unabhängiger Review (0d65e2b): zwei bisherige Lücken behoben -
+        (1) `aktuelles_end_datum=None` (Vertrag wurde unbefristet)
+        invalidiert jetzt ALLE noch nicht ungültigen Erinnerungen
+        dieses Vertrags, unabhängig vom jeweiligen `end_datum` (ein
+        SQL-`!=`-Vergleich gegen NULL wäre sonst nie wahr gewesen und
+        hätte stattdessen fälschlich GAR NICHTS invalidiert). (2) auch
+        eine bereits `ENTSCHIEDEN`e, aber laut Fachregel NIE automatisch
+        versendete Zeile (der Mieterentwurf bleibt bis zur manuellen
+        Freigabe durch einen Menschen ungesendet) wird bei einer
+        Enddatum-Änderung mit invalidiert, nicht nur OFFEN/
+        BENACHRICHTIGT."""
 
         with self._session_factory() as session:
             statement = (
                 select(VertragsendeErinnerungTable)
                 .where(VertragsendeErinnerungTable.vertrag_id == vertrag_id)
-                .where(VertragsendeErinnerungTable.end_datum != aktuelles_end_datum)
-                .where(VertragsendeErinnerungTable.status.in_(["OFFEN", "BENACHRICHTIGT"]))
+                .where(VertragsendeErinnerungTable.status.in_(["OFFEN", "BENACHRICHTIGT", "ENTSCHIEDEN"]))
             )
+            if aktuelles_end_datum is not None:
+                statement = statement.where(VertragsendeErinnerungTable.end_datum != aktuelles_end_datum)
             betroffene = list(session.execute(statement).scalars().all())
             for row in betroffene:
                 row.status = "UNGUELTIG"

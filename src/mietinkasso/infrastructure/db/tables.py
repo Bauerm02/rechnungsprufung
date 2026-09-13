@@ -526,22 +526,58 @@ class UserTable(Base):
 
 
 class VpiJahreswertTable(Base):
-    """Manuell im Backoffice gepflegter VPI-Jahresdurchschnittswert
-    (Auftrag 13.09., Indexautomatik) - KEIN automatischer Statistik-
-    Austria-Abruf (Claude greift nie auf externe Server zu). Fehlt ein
-    für eine Berechnung benötigtes Jahr, bricht
-    `mieweg_vorschau/berechnung.py::berechne_gesetzliche_hoechstgrenze`
-    an dieser Stelle ab (kein erfundener Wert) - siehe
-    `indexautomatik/service.py`."""
+    """Manuell im Backoffice erfasster, mit einem konkreten
+    Publikations-Beleg belegter VPI-JAHRESDURCHSCHNITT-Override
+    (Auftrag 13.09., Indexautomatik) - z. B. wenn Statistik Austria
+    bereits einen offiziellen Jahresdurchschnitt veröffentlicht hat,
+    bevor/ohne dass alle 12 Monatswerte einzeln importiert wurden.
+    `VpiRepository.jahresdurchschnitt` bevorzugt diesen Override, sonst
+    wird aus `VpiMonatswertTable` abgeleitet (siehe dort). KEIN
+    automatischer Statistik-Austria-Abruf (Claude greift nie auf
+    externe Server zu) - fehlt ein benötigtes Jahr auf beiden Wegen,
+    bricht `mieweg_vorschau/berechnung.py::berechne_gesetzliche_
+    hoechstgrenze` an dieser Stelle ab (kein erfundener Wert)."""
 
     __tablename__ = "vpi_jahreswerte"
+    __table_args__ = (UniqueConstraint("reihe", "jahr", name="uq_vpi_jahreswert"),)
 
-    jahr: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    reihe: Mapped[str] = mapped_column(String(32))
+    jahr: Mapped[int] = mapped_column(Integer)
     wert: Mapped[Decimal] = mapped_column(Numeric(12, 4))
     quelle: Mapped[str] = mapped_column(String(256))
     quelle_datum: Mapped[date] = mapped_column(Date)
     erfasst_von: Mapped[str] = mapped_column(String(128))
     erfasst_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class VpiMonatswertTable(Base):
+    """Amtlicher VPI-Monatswert je (Reihe, Jahr, Monat) - Zielformat für
+    einen künftigen Statistik-Austria-OGD-Import (Auftrag 13.09.,
+    Betriebspräzisierung). `finalitaet` unterscheidet einen bereits
+    ENDGUELTIGen von einem noch VORLAEUFIGen Veröffentlichungsstand;
+    `VpiRepository.jahresdurchschnitt` verlangt für einen abgeleiteten
+    Jahresdurchschnitt ALLE 12 Monate ENDGUELTIG - ein einzelner
+    vorläufiger oder fehlender Monat blockiert den gesamten Jahreswert
+    (kein teilweise erfundener Durchschnitt). Das exakte Spaltenlayout
+    der realen OGD-CSV-Dateien (data.statistik.gv.at) wurde in dieser
+    Sitzung NICHT gegen eine echte Datei verifiziert (kein
+    Server-/Internetzugriff) - siehe `indexautomatik/vpi_import.py` und
+    OFFENE_PUNKTE.md."""
+
+    __tablename__ = "vpi_monatswerte"
+    __table_args__ = (UniqueConstraint("reihe", "jahr", "monat", name="uq_vpi_monatswert"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    reihe: Mapped[str] = mapped_column(String(32))
+    jahr: Mapped[int] = mapped_column(Integer)
+    monat: Mapped[int] = mapped_column(Integer)
+    wert: Mapped[Decimal] = mapped_column(Numeric(12, 4))
+    finalitaet: Mapped[str] = mapped_column(String(16))
+    quelle_datei: Mapped[str] = mapped_column(String(256))
+    quelle_zeile: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    importiert_von: Mapped[str] = mapped_column(String(128))
+    importiert_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class RechtsprofilTable(Base):
@@ -576,9 +612,24 @@ class RechtsprofilTable(Base):
     bezugsmonat: Mapped[int | None] = mapped_column(Integer, nullable=True)
     letzte_basis_war_jahresdurchschnitt: Mapped[bool] = mapped_column(Boolean, default=False)
     basis_komponenten_ids: Mapped[list] = mapped_column(JSON, default=list)
+    # VPI-Reihe für die GESETZLICHE (MieWeG-)Spur dieses Vertrags (z. B.
+    # "VPI20C18") - siehe `indexautomatik/vpi_import.py`/`VpiMonatswertTable`.
+    vpi_reihe: Mapped[str] = mapped_column(String(32), default="VPI20C18")
+    # Vertragliche Spur: ENTWEDER ein manuell erfasster, statischer
+    # Zielbetrag (für Verträge mit einer tatsächlich fixen Obergrenze)
+    # ODER eine Referenz auf eine versionierte, bereits freigegebene
+    # `IndexKlauselTable`-Klausel, aus der die vertragliche Spur JEDEN
+    # Zyklus NEU aus amtlichen Werten berechnet wird (Fachlicher
+    # Abnahmepunkt Codex: "ein fixer manuell eingetragener
+    # vertraglich_zulaessiger_betrag_cent ist keine dauerhafte
+    # Vertragsformel"). `RechtsprofilService.freigeben` verlangt GENAU
+    # eine der beiden Varianten. `vertragsklausel_id` ist AUCH der
+    # alleinige Antrieb für einen Geschäftsraum-/Nicht-Wohnungsrechner-
+    # Fall (kein MieWeG, siehe `indexautomatik/service.py`).
     vertraglich_zulaessiger_betrag_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
     vertraglicher_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
     vertraglicher_fruehestmoeglicher_termin: Mapped[date | None] = mapped_column(Date, nullable=True)
+    vertragsklausel_id: Mapped[int | None] = mapped_column(ForeignKey("index_klauseln.id"), nullable=True)
     vertrag_beleg_referenz: Mapped[str] = mapped_column(String(256))
     klausel_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
     quelle_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -611,25 +662,53 @@ class IndexautomatikLaufTable(Base):
 
 
 class ErhoehungsschreibenTable(Base):
-    """Persistente Outbox für MieWeG-Erhöhungsschreiben (Auftrag
-    13.09.) - Unique je (Vertrag, Ziel-Bewertungsjahr): pro Vertrag und
-    gesetzlichem April-Zyklus höchstens EIN Fall, unabhängig davon, wie
-    oft der Monatslauf bis dahin durchläuft. `versendet_am` (Transport
-    hat angenommen) und `zugang_bestaetigt_am` (fachlich bestätigter
-    Empfang) sind bewusst getrennte Felder - ein technisch
-    angenommener Versand ist NIE automatisch ein bestätigter Zugang
-    (siehe `indexautomatik/outbox_service.py`)."""
+    """Persistente Outbox für Erhöhungsschreiben (Auftrag 13.09.) - trägt
+    ZWEI unabhängige Berechnungspfade:
+
+    - MieWeG-Wohnungsrechner-Pfad (`mieweg_vorschau_id` gesetzt,
+      `ziel_bewertungsjahr` gesetzt): pro Vertrag und gesetzlichem
+      April-Zyklus höchstens EIN Fall - das ist für DIESEN Pfad
+      fachlich korrekt, weil § 1 Abs 4 MieWeG selbst nur einen
+      jährlichen 1.-April-Termin kennt. Der partielle Unique-Index
+      unten gilt daher NUR, wenn `ziel_bewertungsjahr` gesetzt ist.
+    - Geschäftsraum-/generischer-Klausel-Pfad (`index_anpassung_id`
+      gesetzt, `ziel_bewertungsjahr` NULL): reine Vertragsklausel über
+      `index/service.py`/`IndexKlauselTable`, OHNE April-Bindung und
+      OHNE künstliche Einmal-pro-Jahr-Grenze (Fachlicher Abnahmepunkt
+      Codex: "Geschäftsraum-Indexierungen dürfen ... nicht durch
+      Unique(Vertrag,Bewertungsjahr) dauerhaft auf einmal pro Jahr
+      begrenzt werden, falls ihre geprüfte Klausel mehr zulässt") - die
+      Idempotenz für DIESEN Pfad kommt stattdessen aus dem
+      (vertrag_id, periode)-Unique-Constraint auf
+      `IndexautomatikLaufTable` (höchstens ein Berechnungsversuch pro
+      Kalendermonat) plus der natürlichen 1:1-Bindung an eine konkrete
+      `IndexAnpassungTable`-Zeile.
+
+    `versendet_am` (Transport hat angenommen) und `zugang_bestaetigt_am`
+    (fachlich bestätigter Empfang) sind bewusst getrennte Felder - ein
+    technisch angenommener Versand ist NIE automatisch ein bestätigter
+    Zugang (siehe `indexautomatik/outbox_service.py`)."""
 
     __tablename__ = "erhoehungsschreiben"
-    __table_args__ = (UniqueConstraint("vertrag_id", "ziel_bewertungsjahr", name="uq_erhoehungsschreiben_ziel"),)
+    __table_args__ = (
+        Index(
+            "uq_erhoehungsschreiben_ziel_mieweg",
+            "vertrag_id",
+            "ziel_bewertungsjahr",
+            unique=True,
+            sqlite_where=text("ziel_bewertungsjahr IS NOT NULL"),
+            postgresql_where=text("ziel_bewertungsjahr IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
-    ziel_bewertungsjahr: Mapped[int] = mapped_column(Integer)
+    ziel_bewertungsjahr: Mapped[int | None] = mapped_column(Integer, nullable=True)
     rechtsprofil_id: Mapped[int] = mapped_column(ForeignKey("rechtsprofile.id"))
     rechtsprofil_version: Mapped[int] = mapped_column(Integer)
-    mieweg_vorschau_id: Mapped[int] = mapped_column(ForeignKey("mieweg_vorschauen.id"))
+    mieweg_vorschau_id: Mapped[int | None] = mapped_column(ForeignKey("mieweg_vorschauen.id"), nullable=True)
     mieweg_vorschau_final_id: Mapped[int | None] = mapped_column(ForeignKey("mieweg_vorschauen.id"), nullable=True)
+    index_anpassung_id: Mapped[int | None] = mapped_column(ForeignKey("index_anpassungen.id"), nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="ENTWURF")
     massgeblicher_termin: Mapped[date] = mapped_column(Date)
     erhoehung_cent: Mapped[int] = mapped_column(Integer)
