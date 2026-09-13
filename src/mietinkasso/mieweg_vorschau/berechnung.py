@@ -40,9 +40,40 @@ Kernregeln (siehe `docs/hausverwaltung/OFFENE_PUNKTE.md`, Abschnitt
   EIGENEN Basis weiter (Multiplikator auf den ursprünglichen
   `basis_betrag_cent`) - sie wird NICHT jährlich auf einen tatsächlich
   niedrigeren, tatsächlich verrechneten Betrag zurückgesetzt.
-- Rundung je gesetzlicher Entgeltanpassung: ein halber Cent oder
-  weniger wird abgerundet, mehr als ein halber Cent aufgerundet
+- Rundung: GENAU EINMAL je Funktionsaufruf, auf den EINEN tatsächlich
+  wirksam werdenden (kumulierten) Betrag - ein halber Cent oder weniger
+  wird abgerundet, mehr als ein halber Cent aufgerundet
   (`ROUND_HALF_DOWN` auf Cent-Ebene, ausschließlich mit `Decimal`).
+  KLARSTELLUNG (Codex-Rückprüfung, unabhängige Prüfung Auftrag Markus
+  13.09.: "derzeit Doku sagt je Anpassung, Implementation rundet
+  anscheinend nur Endprodukt"): diese Funktion berechnet und rundet
+  GENAU EINE tatsächliche Anpassung - auch wenn ihre interne Schleife
+  mehrere übersprungene Kalenderjahre (Nachholung/Altvertrag ohne
+  zwischenzeitliche Vorschreibung) durchläuft, gibt es dafür KEINE
+  mehreren, separat gerundeten Zwischenbeträge, weil in diesen
+  übersprungenen Jahren nie tatsächlich vorgeschrieben wurde - es gibt
+  nichts, was dort real auf den Cent zu runden wäre (siehe Tests
+  `test_altvertrag_mehrjaehrige_historie_kumuliert_je_jahr_getrennt`,
+  `test_kumulierung_bleibt_unabhaengig_von_zwischenzeitlich_
+  niedrigerer_miete`: NUR die Dämpfung/der Deckel wird dort "je Jahr
+  getrennt" verwendet, NICHT die Rundung). GEFAHR bei Fremdverwendung:
+  eine RÜCKWIRKENDE REKONSTRUKTION, die vorgibt, eine Kette TATSÄCHLICH
+  Jahr für Jahr umgesetzter (und damit real gerundeter) Anpassungen
+  nachzubilden, darf diese Funktion NICHT mit einer mehrjährigen Spanne
+  in einem einzigen Aufruf verwenden - das ergibt ein anderes Ergebnis
+  als die Kette echter Einzeljahres-Rundungen (Beispiel: Basis 100,00 €,
+  Jahr 1 +0,125%, Jahr 2 +0,5% - Einzelrundung je Jahr ergibt 100,62 €
+  [Jahr1: 100,125€ exakter Halb-Cent-Fall -> ab auf 100,12€; Jahr2:
+  100,12€×1,005=100,6206€ -> 100,62€], diese Funktion in einem Aufruf
+  ergibt 100,63 € [1,00125×1,005=1,00625625 -> 100,625625€ -> 100,63€] -
+  1 Cent Differenz bei nur zwei Jahren und homöopathischen Sätzen, bei
+  längeren Ketten ggf. mehr). Für eine solche Rekonstruktion muss diese
+  Funktion (oder ein äquivalenter Einzeljahresschritt) JE JAHR EINZELN
+  aufgerufen werden, mit dem gerundeten Cent-Ergebnis von Jahr N als
+  `basis_betrag_cent` für Jahr N+1 - das ist eine bewusste Design-
+  entscheidung dieser Funktion, keine unentdeckte Ungenauigkeit, und
+  wird hier nicht geändert (Nachholung/Altvertrag-Verhalten ist
+  bestehend getestet und produktiv genutzt).
 - Fehlt ein benötigter VPI-Jahresdurchschnittswert, wird NICHTS
   erfunden: die Berechnung bricht an dieser Stelle ab und meldet das
   fehlende Jahr."""
@@ -54,8 +85,29 @@ from datetime import date
 from decimal import ROUND_HALF_DOWN, Decimal
 from typing import Mapping
 
+from mietinkasso.domain.enums import Rechtsordnung
+
 _DAEMPFUNGS_SCHWELLE = Decimal("0.03")
 _UEBERGANGSDECKEL = {2025: Decimal("0.01"), 2026: Decimal("0.02")}
+
+#: §49k Abs 4 MRG (5. MILG/MieWeG-Reform 2025): die neue Mindestbefristung
+#: gilt nur für einen Abschluss/eine vertragliche oder gesetzliche
+#: Erneuerung NACH diesem Datum (exklusiv) - am oder vor dem Stichtag
+#: bleibt eine bereits VEREINBARTE Befristung dem ALTEN Recht
+#: unterworfen. Kein weiterer, insbesondere kein zusätzlicher
+#: Juni-Stichtag existiert in der Primärquelle.
+_STICHTAG_MINDESTBEFRISTUNG_NEU = date(2025, 12, 31)
+
+#: Rechtsordnungen, für die MRG-WOHNUNGSREGELN (hier: §49k-Mindest-
+#: befristung) überhaupt in Frage kommen - dieselbe Abgrenzung wie
+#: `mieweg_vorschau/service.py::_WOHNUNGSRECHNER_RECHTSORDNUNGEN`/
+#: `indexautomatik/service.py::_WOHNUNGSRECHNER_RECHTSORDNUNGEN` (hier
+#: bewusst nicht importiert, um keine Modulabhängigkeit in die andere
+#: Richtung zu erzeugen - dieselben zwei Enum-Werte, siehe dort).
+_MRG_WOHNUNGSFAEHIGE_RECHTSORDNUNGEN = {
+    Rechtsordnung.OESTERREICH_MRG_VOLL.value,
+    Rechtsordnung.OESTERREICH_MRG_TEIL.value,
+}
 
 
 def daempfe(rate: Decimal) -> Decimal:
@@ -83,12 +135,17 @@ def daempfe(rate: Decimal) -> Decimal:
 
 
 def runde_halbcent(cent_wert: Decimal) -> Decimal:
-    """Rundung je gesetzlicher Entgeltanpassung: ein halber Cent oder
-    weniger wird abgerundet, mehr als ein halber Cent aufgerundet.
-    `cent_wert` ist bereits in CENT ausgedrückt (kann noch
+    """Rundung EINER tatsächlich wirksam werdenden Entgeltanpassung: ein
+    halber Cent oder weniger wird abgerundet, mehr als ein halber Cent
+    aufgerundet. `cent_wert` ist bereits in CENT ausgedrückt (kann noch
     Sub-Cent-Nachkommastellen tragen); das Ergebnis ist eine ganze
     Cent-Zahl. `ROUND_HALF_DOWN` rundet exakte Hälften Richtung Null,
-    was für positive Cent-Beträge exakt "halber Cent -> ab" bedeutet."""
+    was für positive Cent-Beträge exakt "halber Cent -> ab" bedeutet.
+    Für eine Kette MEHRERER, TATSÄCHLICH separat umgesetzter
+    Jahresanpassungen (z. B. eine Rekonstruktion) muss diese Funktion je
+    Jahr EINZELN aufgerufen werden (siehe Modul-Docstring, Abschnitt
+    "Rundung") - ein einziger Aufruf über mehrere Jahre rundet nur EINEN
+    Gesamtbetrag, nicht mehrere Zwischenbeträge."""
 
     return cent_wert.quantize(Decimal("1"), rounding=ROUND_HALF_DOWN)
 
@@ -214,4 +271,72 @@ def berechne_gesetzliche_hoechstgrenze(
         fehlende_jahre=[],
         hoechstbetrag_cent=hoechstbetrag_cent,
         kumulierter_multiplikator=kumulierter_multiplikator,
+    )
+
+
+@dataclass(frozen=True)
+class MindestbefristungErgebnis:
+    anwendbar: bool
+    mindestdauer_jahre: int | None
+    gruende: list[str] = field(default_factory=list)
+
+
+def pruefe_mindestbefristung_wohnung(
+    *,
+    rechtsordnung: str,
+    ist_wohnungsnutzung: bool | None,
+    abschluss_oder_erneuerungsdatum: date,
+    ist_unternehmerischer_vermieter: bool,
+) -> MindestbefristungErgebnis:
+    """§49k Abs 4 MRG (5. MILG/MieWeG-Reform 2025, RIS BGBl. I Nr.
+    114/2025): neue Mindestbefristung für WOHNUNGS-Mietverträge im
+    MRG-Voll-/Teilanwendungsbereich - 5 Jahre bei unternehmerischer
+    Vermietung, sonst 3 Jahre (unverändert gegenüber altem Recht).
+
+    Reine, seiteneffektfreie Prüf-/Klassifikationsfunktion (Auftrag
+    Markus, unabhängige Rückprüfung 13.09.: "Fünfjahres-/Gewerbe-
+    Abgrenzung als reine Helper-Prüfung ... ohne echte Vertragsdaten
+    anzufassen") - liest/schreibt KEINE Vertragsdaten, ändert NIE eine
+    bestehende `VertragTable.gueltig_bis`. `ist_unternehmerischer_
+    vermieter` ist bewusst ein Eingabeparameter: OB ein konkreter
+    Vermieter im Einzelfall "unternehmerisch" iSd §49k Abs 4 MRG
+    vermietet, ist eine vertragsindividuelle Tatsachen-/Rechtsfrage, die
+    diese Funktion NICHT selbst herleitet (siehe AGENTS.md: "Claude baut
+    keine eigenen Rechtsregeln").
+
+    Bestätigte Fachregel (Auftrag Markus): NIEMALS für Geschäftsräume -
+    `anwendbar=False`, sobald `rechtsordnung` außerhalb MRG-Voll/-Teil
+    liegt ODER `ist_wohnungsnutzung` nicht `True` ist (Geschäftsraum kann
+    unbefristet sein). `ist_wohnungsnutzung=None` (ungeprüft) blockiert
+    ebenso wie `False` - kein Rateversuch zur Nutzungsart.
+
+    Zeitliche Anwendbarkeit: NUR bei Abschluss ODER vertraglicher/
+    gesetzlicher ERNEUERUNG NACH dem 31.12.2025 (exklusiv) - eine an
+    diesem Stichtag oder davor bereits VEREINBARTE Befristung bleibt dem
+    ALTEN Recht unterworfen. KEINE rückwirkende Verlängerung bereits
+    bestehender Wohnungsmietverträge, KEIN zusätzlicher (insbesondere
+    kein Juni-)Stichtag - die Primärquelle kennt nur den 31.12.2025."""
+
+    gruende: list[str] = []
+    if rechtsordnung not in _MRG_WOHNUNGSFAEHIGE_RECHTSORDNUNGEN:
+        gruende.append(
+            f"§49k Abs 4 MRG gilt nur im MRG-Voll-/Teilanwendungsbereich, nicht für Rechtsordnung "
+            f"'{rechtsordnung}' - Geschäftsräume/Gewerbe können unbefristet sein."
+        )
+        return MindestbefristungErgebnis(anwendbar=False, mindestdauer_jahre=None, gruende=gruende)
+    if ist_wohnungsnutzung is not True:
+        gruende.append(
+            "Wohnungsnutzung ist nicht bestätigt (ungeprüft oder Geschäftsraum) - §49k Abs 4 MRG betrifft "
+            "ausschließlich Wohnungs-Hauptmiete, keine automatische Annahme."
+        )
+        return MindestbefristungErgebnis(anwendbar=False, mindestdauer_jahre=None, gruende=gruende)
+    if abschluss_oder_erneuerungsdatum <= _STICHTAG_MINDESTBEFRISTUNG_NEU:
+        gruende.append(
+            f"Abschluss/Erneuerung am {abschluss_oder_erneuerungsdatum.isoformat()} liegt nicht NACH dem "
+            f"{_STICHTAG_MINDESTBEFRISTUNG_NEU.isoformat()} - eine bereits vereinbarte Befristung bleibt dem "
+            "alten Recht unterworfen, keine rückwirkende Verlängerung."
+        )
+        return MindestbefristungErgebnis(anwendbar=False, mindestdauer_jahre=None, gruende=gruende)
+    return MindestbefristungErgebnis(
+        anwendbar=True, mindestdauer_jahre=5 if ist_unternehmerischer_vermieter else 3, gruende=[]
     )

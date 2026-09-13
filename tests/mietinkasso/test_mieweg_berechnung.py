@@ -13,6 +13,7 @@ import pytest
 from mietinkasso.mieweg_vorschau.berechnung import (
     berechne_gesetzliche_hoechstgrenze,
     daempfe,
+    pruefe_mindestbefristung_wohnung,
     runde_halbcent,
 )
 
@@ -325,6 +326,65 @@ def test_kumulierung_bleibt_unabhaengig_von_zwischenzeitlich_niedrigerer_miete()
 
 
 # ---------------------------------------------------------------------------
+# Rundung GENAU EINMAL je Aufruf (auf den kumulierten Gesamtbetrag), NICHT
+# je durchlaufenem Kalenderjahr - unabhängige Prüfung (Auftrag Markus
+# 13.09.: "derzeit Doku sagt je Anpassung, Implementation rundet
+# anscheinend nur Endprodukt"). Dokumentiert UND sperrt das bestehende,
+# bewusste Verhalten gegen eine unbemerkte Verhaltensänderung; siehe
+# Modul-Docstring für die Einordnung (Nachholung korrekt, Fremdverwendung
+# für eine Jahr-für-Jahr-Rekonstruktion tatsächlich umgesetzter Beträge
+# NICHT korrekt).
+# ---------------------------------------------------------------------------
+
+
+def test_rundung_erfolgt_einmalig_am_gesamtbetrag_nicht_je_jahr():
+    """Basis 100,00 EUR, Jahr 1 +0,125%, Jahr 2 +0,5% (beide unter der
+    Dämpfungsschwelle). Der EINZELNE Aufruf dieser Funktion rundet NUR
+    das kumulierte Endergebnis (100,625625 EUR -> 100,63 EUR) - eine
+    Kette aus zwei SEPARAT gerundeten Einzeljahren (100,125 EUR -> exakter
+    Halb-Cent-Fall -> ab auf 100,12 EUR; dann 100,12 EUR*1,005=100,6206
+    EUR -> 100,62 EUR) ergäbe einen ANDEREN Betrag (100,62 statt 100,63
+    EUR). Ein Leerschritt (`erster_bezug_monat=12` -> anteil=0, wie in
+    `indexautomatik/umsetzung_service.py` für den MieWeG-Pfad verwendet)
+    hebt die Erstjahresanteiligkeit für diesen Test gezielt auf, damit
+    beide zu prüfenden Jahre voll (anteil=1) gewichtet werden."""
+
+    ergebnis = berechne_gesetzliche_hoechstgrenze(
+        mrg_zinsbeschraenkung=False,
+        erster_bezug_jahr=2023,
+        erster_bezug_monat=12,  # Leerschritt: erste Iteration (2023) zählt 0/12
+        ziel_bewertungsjahr=2026,
+        vpi_jahresdurchschnitte={
+            2022: Decimal("100000"),
+            2023: Decimal("100000"),  # Leerschritt-Iteration: 0% (durch anteil=0 ohnehin wirkungslos)
+            2024: Decimal("100125"),  # +0,125% ggü. 2023
+            2025: Decimal("100625.625"),  # +0,5% ggü. 2024
+        },
+        basis_betrag_cent=10_000,  # 100,00 EUR
+    )
+    assert ergebnis.vollstaendig
+    assert ergebnis.kumulierter_multiplikator == Decimal("1.00625625")
+    # EINMALIGE Rundung des Gesamtbetrags: 100,625625 EUR -> 100,63 EUR.
+    assert ergebnis.hoechstbetrag_cent == 10_063
+
+    # Gegenprobe: eine Kette aus zwei SEPARAT je Jahr gerundeten Beträgen
+    # (wie sie eine Rekonstruktion tatsächlich umgesetzter, real
+    # vorgeschriebener Jahresbeträge bräuchte) ergibt einen ANDEREN
+    # Cent-Betrag - genau der in der Modul-Docstring dokumentierte
+    # Unterschied. Diese Funktion bildet diese Kette NICHT nach; die
+    # Berechnung erfolgt hier direkt mit denselben Bausteinen
+    # (`daempfe`/`runde_halbcent`), um den Unterschied nachvollziehbar zu
+    # machen.
+    jahr1_gedaempft = daempfe(Decimal("100125") / Decimal("100000") - 1)
+    jahr1_cent = runde_halbcent(Decimal(10_000) * (Decimal("1") + jahr1_gedaempft))
+    assert jahr1_cent == Decimal("10012")  # exakter Halb-Cent-Fall -> ab
+    jahr2_gedaempft = daempfe(Decimal("100625.625") / Decimal("100125") - 1)
+    jahr2_cent = runde_halbcent(jahr1_cent * (Decimal("1") + jahr2_gedaempft))
+    assert jahr2_cent == Decimal("10062")  # ein Cent WENIGER als ergebnis.hoechstbetrag_cent
+    assert int(jahr2_cent) != ergebnis.hoechstbetrag_cent
+
+
+# ---------------------------------------------------------------------------
 # Fehlende Eingaben: kein erfundener Wert
 # ---------------------------------------------------------------------------
 
@@ -387,3 +447,108 @@ def test_negativer_basisbetrag_wird_abgelehnt():
             ziel_bewertungsjahr=2024, vpi_jahresdurchschnitte={2022: Decimal("100"), 2023: Decimal("102")},
             basis_betrag_cent=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# §49k Abs 4 MRG - Mindestbefristung Wohnung (5 vs. 3 Jahre), NIEMALS für
+# Geschäftsräume, nur für Abschluss/Erneuerung NACH dem 31.12.2025, keine
+# rückwirkende Verlängerung bestehender Verträge, kein Juni-Stichtag.
+# ---------------------------------------------------------------------------
+
+
+def test_mindestbefristung_fuenf_jahre_bei_unternehmerischer_vermietung():
+    ergebnis = pruefe_mindestbefristung_wohnung(
+        rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
+        abschluss_oder_erneuerungsdatum=date(2026, 1, 15), ist_unternehmerischer_vermieter=True,
+    )
+    assert ergebnis.anwendbar is True
+    assert ergebnis.mindestdauer_jahre == 5
+    assert ergebnis.gruende == []
+
+
+def test_mindestbefristung_drei_jahre_bei_nichtunternehmerischer_vermietung():
+    ergebnis = pruefe_mindestbefristung_wohnung(
+        rechtsordnung="OESTERREICH_MRG_TEIL", ist_wohnungsnutzung=True,
+        abschluss_oder_erneuerungsdatum=date(2026, 3, 1), ist_unternehmerischer_vermieter=False,
+    )
+    assert ergebnis.anwendbar is True
+    assert ergebnis.mindestdauer_jahre == 3
+
+
+def test_mindestbefristung_gilt_niemals_fuer_geschaeftsraum():
+    """Bestätigte Fachregel: neue Wohnungsregeln gelten NUR für Wohnungen
+    im MRG-Voll-/Teilanwendungsbereich, niemals pauschal für
+    Geschäftsräume - Gewerbe kann unbefristet sein. Selbst bei einem
+    Abschluss weit nach dem Stichtag und unternehmerischer Vermietung
+    bleibt ein Geschäftsraum (`ist_wohnungsnutzung=False`) außen vor."""
+
+    ergebnis = pruefe_mindestbefristung_wohnung(
+        rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=False,
+        abschluss_oder_erneuerungsdatum=date(2026, 6, 1), ist_unternehmerischer_vermieter=True,
+    )
+    assert ergebnis.anwendbar is False
+    assert ergebnis.mindestdauer_jahre is None
+    assert any("Wohnungsnutzung" in g for g in ergebnis.gruende)
+
+
+def test_mindestbefristung_bei_reiner_gewerbe_rechtsordnung_nicht_anwendbar():
+    ergebnis = pruefe_mindestbefristung_wohnung(
+        rechtsordnung="OESTERREICH_GEWERBE", ist_wohnungsnutzung=True,
+        abschluss_oder_erneuerungsdatum=date(2026, 6, 1), ist_unternehmerischer_vermieter=True,
+    )
+    assert ergebnis.anwendbar is False
+    assert ergebnis.mindestdauer_jahre is None
+
+
+def test_mindestbefristung_ungeprüfte_wohnungsnutzung_blockiert():
+    """`None` (ungeprüft) darf NICHT wie eine bestätigte Wohnung
+    behandelt werden - kein Rateversuch zur Nutzungsart."""
+
+    ergebnis = pruefe_mindestbefristung_wohnung(
+        rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=None,
+        abschluss_oder_erneuerungsdatum=date(2026, 6, 1), ist_unternehmerischer_vermieter=True,
+    )
+    assert ergebnis.anwendbar is False
+
+
+def test_mindestbefristung_keine_rueckwirkende_verlaengerung_bestehender_vertraege():
+    """Ein VOR dem Stichtag bereits vereinbarter Vertrag bleibt dem alten
+    Recht unterworfen, selbst wenn heute (Prüfzeitpunkt) längst nach
+    2025 liegt - maßgeblich ist das Abschluss-/Erneuerungsdatum selbst,
+    keine rückwirkende Verlängerung aller bestehenden Wohnungen."""
+
+    ergebnis = pruefe_mindestbefristung_wohnung(
+        rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
+        abschluss_oder_erneuerungsdatum=date(2024, 5, 1), ist_unternehmerischer_vermieter=True,
+    )
+    assert ergebnis.anwendbar is False
+    assert any("31.12.2025" in g or "2024-05-01" in g for g in ergebnis.gruende)
+
+
+def test_mindestbefristung_stichtag_exklusiv():
+    """Am Stichtag selbst (31.12.2025) noch NICHT anwendbar - erst am
+    Folgetag."""
+
+    am_stichtag = pruefe_mindestbefristung_wohnung(
+        rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
+        abschluss_oder_erneuerungsdatum=date(2025, 12, 31), ist_unternehmerischer_vermieter=True,
+    )
+    assert am_stichtag.anwendbar is False
+
+    tag_danach = pruefe_mindestbefristung_wohnung(
+        rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
+        abschluss_oder_erneuerungsdatum=date(2026, 1, 1), ist_unternehmerischer_vermieter=True,
+    )
+    assert tag_danach.anwendbar is True
+
+
+def test_mindestbefristung_kein_zusaetzlicher_juni_stichtag():
+    """Kein besonderer Juni-Stichtag existiert - ein Datum im Juni 2026
+    wird genauso wie jedes andere Datum nach dem 31.12.2025 behandelt."""
+
+    ergebnis = pruefe_mindestbefristung_wohnung(
+        rechtsordnung="OESTERREICH_MRG_TEIL", ist_wohnungsnutzung=True,
+        abschluss_oder_erneuerungsdatum=date(2026, 6, 30), ist_unternehmerischer_vermieter=False,
+    )
+    assert ergebnis.anwendbar is True
+    assert ergebnis.mindestdauer_jahre == 3
