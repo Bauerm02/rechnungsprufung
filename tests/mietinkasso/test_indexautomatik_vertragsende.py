@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 
 from mietinkasso.indexautomatik.repository import VertragsendeErinnerungRepository
 from mietinkasso.indexautomatik.vertragsende_service import VertragsendeErinnerungService
+from mietinkasso.indexautomatik.mailops_client import MailOpsErgebnis
+
+
+def _test_receipt():
+    return MailOpsErgebnis("GESENDET", "SYNTHETIC-REF", "SYNTHETIC-SENT",
+        datetime(2026, 9, 30, 10, tzinfo=timezone.utc))
 
 
 @pytest.fixture
@@ -102,7 +108,7 @@ def test_owner_ist_einziger_empfaenger_kein_mieter_fallback(admin_ctx, basis_ver
 
     empfaenger = []
     benachrichtigt = service_mit_owner.benachrichtige_faellige(
-        heute=date(2026, 9, 30), send_enabled=True, versand_fn=lambda auftrag: empfaenger.append(auftrag["empfaenger"])
+        heute=date(2026, 9, 30), send_enabled=True, versand_fn=lambda auftrag: (empfaenger.append(auftrag["empfaenger"]), _test_receipt())[1]
     )
     assert len(benachrichtigt) == 1
     assert empfaenger == ["markus@jlb-projects.at"]
@@ -173,8 +179,8 @@ def test_faellige_wird_nicht_zweimal_benachrichtigt(admin_ctx, basis_vertrag, se
     vertrag = _befristeter_vertrag(stammdaten_repo, vertrag, date(2026, 12, 31))
     service_mit_owner.plane_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 1, 1))
 
-    erster_lauf = service_mit_owner.benachrichtige_faellige(heute=date(2026, 9, 30), send_enabled=True, versand_fn=lambda a: None)
-    zweiter_lauf = service_mit_owner.benachrichtige_faellige(heute=date(2026, 10, 15), send_enabled=True, versand_fn=lambda a: None)
+    erster_lauf = service_mit_owner.benachrichtige_faellige(heute=date(2026, 9, 30), send_enabled=True, versand_fn=lambda a: _test_receipt())
+    zweiter_lauf = service_mit_owner.benachrichtige_faellige(heute=date(2026, 10, 15), send_enabled=True, versand_fn=lambda a: _test_receipt())
     assert len(erster_lauf) == 1
     assert zweiter_lauf == []
 
@@ -185,7 +191,7 @@ def test_verspaeteter_lauf_holt_faellige_erinnerung_einmal_nach(admin_ctx, basis
     service_mit_owner.plane_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 1, 1))
 
     # Der Job lief erst deutlich NACH dem faelligen Datum (30.09.) wieder.
-    nachgeholt = service_mit_owner.benachrichtige_faellige(heute=date(2026, 11, 1), send_enabled=True, versand_fn=lambda a: None)
+    nachgeholt = service_mit_owner.benachrichtige_faellige(heute=date(2026, 11, 1), send_enabled=True, versand_fn=lambda a: _test_receipt())
     assert len(nachgeholt) == 1
 
 

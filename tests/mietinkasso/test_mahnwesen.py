@@ -8,6 +8,12 @@ import pytest
 from mietinkasso.domain.enums import MahnStatus, OPTyp, Rolle, Sperrgrund
 from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
 from mietinkasso.mahnwesen.service import MahnwesenService, PolicyNichtFreigegebenError, VersandUngewissError
+from mietinkasso.indexautomatik.mailops_client import MailOpsErgebnis
+
+
+def _test_receipt(heute):
+    return MailOpsErgebnis("GESENDET", "SYNTHETIC-REF", "SYNTHETIC-SENT",
+        datetime.combine(heute, datetime.min.time(), tzinfo=timezone.utc))
 
 
 @pytest.fixture
@@ -79,7 +85,7 @@ def _stufe1_bis_gesendet(mahn_service, op_service, vertrag, konto, ctx, policy, 
     assert geplant.status == "GEPLANT"
     versendet = _versenden(
         mahn_service, ctx=ctx, mahnfall_id=geplant.mahnfall_id, heute=heute_faellig_plus_7,
-        send_enabled=True, versand_fn=lambda snapshot: None,
+        send_enabled=True, versand_fn=lambda snapshot: _test_receipt(heute_faellig_plus_7),
     )
     assert versendet.status == "GESENDET"
     return geplant, forderung
@@ -473,6 +479,7 @@ def test_zwei_worker_versenden_nicht_doppelt(mahn_service, op_service, basis_ver
 
     def zaehlender_versand(snapshot):
         versand_zaehler["count"] += 1
+        return _test_receipt(date(2026, 4, 20))
 
     ergebnis_a = _versenden(mahn_service, ctx=ctx, mahnfall_id=geplant.mahnfall_id, heute=date(2026, 4, 20), send_enabled=True, versand_fn=zaehlender_versand)
     ergebnis_b = _versenden(mahn_service, ctx=ctx, mahnfall_id=geplant.mahnfall_id, heute=date(2026, 4, 20), send_enabled=True, versand_fn=zaehlender_versand)
@@ -491,7 +498,7 @@ def test_nach_stufe2_kein_stufe3_nur_interner_fall(mahn_service, op_service, bas
         mahn_service, ctx=ctx, vertrag=vertrag, konto=konto,
         forderung=_einzige_forderung(op_service, konto, date(2026, 4, 27)), policy=freigegebene_policy, heute=date(2026, 4, 27),
     )
-    _versenden(mahn_service, ctx=ctx, mahnfall_id=stufe2.mahnfall_id, heute=date(2026, 4, 27), send_enabled=True, versand_fn=lambda snapshot: None)
+    _versenden(mahn_service, ctx=ctx, mahnfall_id=stufe2.mahnfall_id, heute=date(2026, 4, 27), send_enabled=True, versand_fn=lambda snapshot: _test_receipt(date(2026, 4, 27)))
 
     kein_stufe3 = _planen(
         mahn_service, ctx=ctx, vertrag=vertrag, konto=konto,
@@ -515,7 +522,7 @@ def test_neue_forderung_bekommt_eigenen_zyklus_nach_stufe2_der_alten(mahn_servic
         forderung=op_service.offene_forderungen(konto.id, heute=date(2026, 4, 27))[0],
         policy=freigegebene_policy, heute=date(2026, 4, 27),
     )
-    _versenden(mahn_service, ctx=ctx, mahnfall_id=stufe2.mahnfall_id, heute=date(2026, 4, 27), send_enabled=True, versand_fn=lambda snapshot: None)
+    _versenden(mahn_service, ctx=ctx, mahnfall_id=stufe2.mahnfall_id, heute=date(2026, 4, 27), send_enabled=True, versand_fn=lambda snapshot: _test_receipt(date(2026, 4, 27)))
 
     # Neue, eigenständige Forderung: Miete Mai, eigene Fälligkeit
     op_service.buchen(

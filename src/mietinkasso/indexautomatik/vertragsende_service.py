@@ -19,6 +19,7 @@ from mietinkasso.indexautomatik.repository import VertragsendeErinnerungReposito
 from mietinkasso.indexautomatik.zeit import kalendermonate_subtrahieren
 from mietinkasso.infrastructure.db.tables import VertragsendeErinnerungTable, VertragTable
 from mietinkasso.stammdaten.repository import StammdatenRepository
+from mietinkasso.indexautomatik.mailnachweis import nachweis_daten, versand_belegen
 
 _VORLAUF_MONATE = 3
 _GUELTIGE_ENTSCHEIDUNGEN = {e.value for e in VertragsendeEntscheidung}
@@ -114,6 +115,10 @@ class VertragsendeErinnerungService:
             vertrag = self._stammdaten_repository.get_vertrag(erinnerung.vertrag_id)
             if vertrag is None or vertrag.gueltig_bis != erinnerung.end_datum:
                 continue  # veraltet - sollte bereits UNGUELTIG sein, defensiv trotzdem übersprungen
+            try:
+                self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
+            except ObjektAusgeschlossenError:
+                continue
             if not self._repository.claim_fuer_versand(erinnerung.id):
                 continue  # bereits von einem anderen Worker geclaimt
             objekt = self._stammdaten_repository.objekt_fuer_vertrag(vertrag.id)
@@ -128,14 +133,22 @@ class VertragsendeErinnerungService:
                 "'nicht verlängern prüfen'/'Rückfrage'."
             )
             try:
-                versand_fn({
+                beleg = versand_fn({
                     "empfaenger": self._owner_email, "text": text, "vertrag_id": vertrag.id,
                     "idempotenzschluessel": idempotenzschluessel,
                 })
             except TransportFehlerUngewissError as exc:
                 self._repository.set_status(erinnerung.id, "UNKLAR", fehlergrund=str(exc))
                 continue
-            self._repository.set_status(erinnerung.id, "BENACHRICHTIGT", benachrichtigt_am=datetime.now(timezone.utc))
+            except ValueError:
+                self._repository.set_status(erinnerung.id, "UNKLAR", fehlergrund="Mailauftrag oder Mailkonfiguration unvollständig; Status prüfen.")
+                continue
+            if nachweis_daten(beleg) is None:
+                self._repository.set_status(erinnerung.id, "UNKLAR", fehlergrund="Noch kein tatsächlicher Versandnachweis; nur Statusabfrage, kein erneuter Versand.")
+                continue
+            versand_belegen(self._repository._session_factory, VertragsendeErinnerungTable, erinnerung.id,
+                ergebnis=beleg, erlaubt={"IN_VERSAND", "UNKLAR"}, neuer_status="BENACHRICHTIGT",
+                zeitfeld="benachrichtigt_am", referenz=idempotenzschluessel)
             benachrichtigt.append(erinnerung)
         return benachrichtigt
 

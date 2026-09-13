@@ -41,6 +41,14 @@ from mietinkasso.infrastructure.db.tables import KontoTable, MahnFallTable, Mahn
 from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
 from mietinkasso.op.service import OffeneForderung, OPService, compute_content_hash
 from mietinkasso.stammdaten.repository import StammdatenRepository
+from mietinkasso.indexautomatik.mailnachweis import nachweis_daten, versand_belegen
+from mietinkasso.domain.exceptions import TransportFehlerUngewissError
+from mietinkasso.indexautomatik.zeit import heute_wien
+
+
+def _versandtag_wien(value):
+    # SQLite drops timezone information. Persisted sending times are UTC.
+    return heute_wien(value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value)
 
 
 class VersandUngewissError(Exception):
@@ -194,11 +202,11 @@ class MahnwesenService:
             letzte_stufe1 = self._repository.letzter_mahnfall_je_stufe_fuer_forderung(
                 forderung.op_position_id, MahnStufe.STUFE_1.value
             )
-            if letzte_stufe1 is None or letzte_stufe1.status != MahnStatus.GESENDET.value:
+            if letzte_stufe1 is None or letzte_stufe1.status != MahnStatus.GESENDET.value or letzte_stufe1.gesendet_am is None:
                 raise MahnstufeReihenfolgeError(
                     f"Forderung {forderung.op_position_id}: Stufe 2 verlangt eine erfolgreich gesendete Stufe 1."
                 )
-            tage_seit_versand = (heute - letzte_stufe1.gesendet_am.date()).days
+            tage_seit_versand = (heute - _versandtag_wien(letzte_stufe1.gesendet_am)).days
             mindest_tage = max(policy.stufe2_mindesttage_nach_stufe1_versand, vertrag.zahlungsfrist_tage)
             if tage_seit_versand < mindest_tage:
                 return PlanungsErgebnis(
@@ -264,7 +272,7 @@ class MahnwesenService:
         bank_bestaetigt_bis: date | None,
         ungeklaerte_eingaenge_vorhanden: bool,
         send_enabled: bool,
-        versand_fn: Callable[[dict], None],
+        versand_fn: Callable[[dict], object],
     ) -> VersandErgebnis:
         """`bank_bestaetigt_bis`/`ungeklaerte_eingaenge_vorhanden` MÜSSEN
         unmittelbar vor diesem Aufruf frisch ermittelt werden - ein bei der
@@ -360,6 +368,22 @@ class MahnwesenService:
                 "(Zahlung, Korrektur oder Storno).",
             )
 
+        # Re-evaluate timing after a possibly delayed approval/dispatch.
+        if not passende_forderung.faelligkeit_bekannt or passende_forderung.faelligkeit is None:
+            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
+            return VersandErgebnis("BLOCKIERT", "Fälligkeit ist inzwischen ungeklärt.")
+        if mahnfall.stufe == 1:
+            fruehestens = passende_forderung.faelligkeit + timedelta(days=aktuelle_policy.stufe1_tage_nach_faelligkeit)
+        else:
+            first = self._repository.letzter_mahnfall_je_stufe_fuer_forderung(mahnfall.forderung_op_position_id, 1)
+            if first is None or first.status != "GESENDET" or first.gesendet_am is None:
+                self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
+                return VersandErgebnis("BLOCKIERT", "Zweite Mahnung benötigt die tatsächlich gesendete erste Mahnung.")
+            fruehestens = _versandtag_wien(first.gesendet_am) + timedelta(days=max(
+                aktuelle_policy.stufe2_mindesttage_nach_stufe1_versand, vertrag.zahlungsfrist_tage))
+        if heute < fruehestens:
+            return VersandErgebnis("BLOCKIERT", "Mahnfrist ist noch nicht abgelaufen.")
+
         if not send_enabled:
             return VersandErgebnis("BEREITS_VERARBEITET", "SEND_ENABLED=false: nur Preview/Outbox, kein realer Versand.")
 
@@ -367,14 +391,20 @@ class MahnwesenService:
             return VersandErgebnis("BEREITS_VERARBEITET", "Ein anderer Worker verarbeitet diesen Fall bereits.")
 
         try:
-            versand_fn(mahnfall.snapshot)
-        except VersandUngewissError:
+            beleg = versand_fn(mahnfall.snapshot)
+        except (VersandUngewissError, TransportFehlerUngewissError):
             self._repository.set_status(mahnfall_id, MahnStatus.UNSICHER.value)
             return VersandErgebnis("UNSICHER", "Provider-Timeout nach möglicher Annahme; kein automatischer Retry.")
-
-        gesendet_am = datetime.combine(heute, datetime.min.time(), tzinfo=timezone.utc)
-        self._repository.set_status(mahnfall_id, MahnStatus.GESENDET.value, gesendet_am=gesendet_am)
-        return VersandErgebnis("GESENDET", "Erfolgreich versendet.")
+        except ValueError:
+            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
+            return VersandErgebnis("BLOCKIERT", "Mailauftrag oder private Mailkonfiguration unvollständig.")
+        if nachweis_daten(beleg) is None:
+            self._repository.set_status(mahnfall_id, MahnStatus.UNSICHER.value)
+            return VersandErgebnis("UNSICHER", "Noch kein tatsächlicher Versandnachweis; Status wird abgefragt, nicht erneut gesendet.")
+        versand_belegen(self._repository._session_factory, MahnFallTable, mahnfall_id,
+            ergebnis=beleg, erlaubt={"IN_VERSAND", "UNSICHER"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
+            referenz="mahnung:" + mahnfall.outbox_key)
+        return VersandErgebnis("GESENDET", "Tatsächlicher Versand im Maildienst nachgewiesen.")
 
     def markiere_verwaiste_als_unsicher(self, *, jetzt: datetime | None = None, max_alter: timedelta = timedelta(minutes=15)) -> list[MahnFallTable]:
         """Recovery für einen Absturz zwischen `claim_fuer_versand` und dem
@@ -389,11 +419,18 @@ class MahnwesenService:
             self._repository.set_status(fall.id, MahnStatus.UNSICHER.value)
         return verwaiste
 
-    def manuell_abklaeren(self, *, mahnfall_id: int, neuer_status: MahnStatus) -> MahnFallTable:
+    def manuell_abklaeren(self, *, mahnfall_id: int, neuer_status: MahnStatus, versandnachweis=None) -> MahnFallTable:
         """Löst einen UNSICHER-Fall gezielt manuell auf (z. B. nach Rückfrage
         beim Provider), statt ihn blind erneut zu versenden."""
 
-        zusatz = {}
         if neuer_status is MahnStatus.GESENDET:
-            zusatz["gesendet_am"] = datetime.now(timezone.utc)
-        return self._repository.set_status(mahnfall_id, neuer_status.value, **zusatz)
+            row = self._repository.get(mahnfall_id)
+            if row is None:
+                raise ValueError("Mahnfall fehlt.")
+            versand_belegen(self._repository._session_factory, MahnFallTable, row.id,
+                ergebnis=versandnachweis, erlaubt={"UNSICHER"}, neuer_status="GESENDET",
+                zeitfeld="gesendet_am", referenz="mahnung:" + row.outbox_key)
+            return self._repository.get(row.id)
+        if neuer_status is MahnStatus.GEPLANT:
+            raise ValueError("Unklarer Versand wird nicht zurück auf GEPLANT gesetzt; zuerst Providerstatus klären.")
+        return self._repository.set_status(mahnfall_id, neuer_status.value)

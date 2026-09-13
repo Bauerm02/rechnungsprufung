@@ -14,7 +14,7 @@ zu verschieben."""
 from __future__ import annotations
 
 import importlib.util
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -43,7 +43,8 @@ class _AufzeichnenderTransport:
 
     def senden(self, auftrag: VersandAuftrag) -> VersandBestaetigung:
         self.aufrufe.append(auftrag)
-        return VersandBestaetigung(externe_referenz="TEST-1", status="ANGENOMMEN")
+        return VersandBestaetigung(externe_referenz="TEST-1", status="GESENDET",
+            provider_referenz="SYNTHETIC-SENT", versendet_am=datetime(2026, 9, 30, 10, tzinfo=timezone.utc))
 
 
 def test_owner_versand_fn_ruft_transport_mit_stabilem_schluessel_auf(script_modul):

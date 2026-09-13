@@ -30,6 +30,7 @@ from mietinkasso.auth.service import AuthContext  # noqa: E402
 from mietinkasso.domain.enums import Rolle  # noqa: E402
 from mietinkasso.domain.exceptions import ObjektAusgeschlossenError  # noqa: E402
 from mietinkasso.indexautomatik.bootstrap import bauen  # noqa: E402
+from mietinkasso.indexautomatik.mailversand_service import HVMailversandService  # noqa: E402
 from mietinkasso.indexautomatik.transport import HttpTransportadapter, Transportadapter, VersandAuftrag  # noqa: E402
 from mietinkasso.indexautomatik.zeit import heute_wien  # noqa: E402
 from mietinkasso.infrastructure.config import Settings  # noqa: E402
@@ -64,8 +65,8 @@ def _owner_versand_fn(transport: Transportadapter):
     unverändert als `referenz` an den Transport weitergereicht, damit ein
     Retry beim Provider erkennbar bleibt."""
 
-    def _senden(auftrag: dict) -> None:
-        transport.senden(
+    def _senden(auftrag: dict):
+        return transport.senden(
             VersandAuftrag(
                 referenz=auftrag["idempotenzschluessel"],
                 empfaenger_name="",
@@ -100,23 +101,18 @@ def main(argv: list[str] | None = None) -> int:
 
     heute = heute_wien(datetime.now(ZoneInfo("Europe/Vienna")))
     fachschluessel = heute.isoformat()
-    transport = _transport_fuer(settings)
+    mail = HVMailversandService(session_factory, bundle, settings)
 
     def _arbeit() -> dict:
         verwaiste = bundle.outbox_service.markiere_verwaiste_als_unklar()
         verwaiste_erinnerungen = bundle.vertragsende_service.markiere_verwaiste_als_unklar()
+        mail.mahn_service.markiere_verwaiste_als_unsicher()
+        nachgewiesen = mail.status_abgleichen(ctx=_ADMIN_CTX)
 
         versendet, uebersprungen = 0, 0
-        if transport is not None:
+        if mail.client is not None:
             for schreiben in bundle.outbox_repository.liste_nach_status("BEREIT"):
-                ergebnis = bundle.outbox_service.versenden(
-                    ctx=_ADMIN_CTX,
-                    erhoehungsschreiben_id=schreiben.id,
-                    heute=heute,
-                    send_enabled=settings.indexautomatik_send_enabled,
-                    mailops_allowlist_bestaetigt=settings.indexautomatik_mailops_allowlist_bestaetigt,
-                    transport=transport,
-                )
+                ergebnis = mail.index_senden(ctx=_ADMIN_CTX, row_id=schreiben.id, heute=heute)
                 if ergebnis.status == "GESENDET":
                     versendet += 1
                 else:
@@ -155,15 +151,21 @@ def main(argv: list[str] | None = None) -> int:
         # wurde. `send_enabled` wird jetzt hart auf False gezwungen,
         # sobald kein Transport konfiguriert ist - unabhängig vom
         # gesetzten Konfigurationsflag.
-        vertragsende_send_enabled = settings.vertragsende_erinnerung_send_enabled and transport is not None
+        vertragsende_send_enabled = (settings.vertragsende_erinnerung_send_enabled
+            and settings.hv_mail_allowlist_bestaetigt and mail.client is not None)
         vertragsende_geplant = bundle.vertragsende_service.plane_alle(ctx=_ADMIN_CTX, heute=heute)
         vertragsende_benachrichtigt = bundle.vertragsende_service.benachrichtige_faellige(
             heute=heute,
             send_enabled=vertragsende_send_enabled,
-            versand_fn=_owner_versand_fn(transport) if transport is not None else _kein_transport_versand_fn,
+            versand_fn=mail.owner_senden,
         )
+        mahnlauf = mail.mahnlauf(ctx=_ADMIN_CTX, heute=heute)
 
         return {
+            "mailversand_nachtraeglich_nachgewiesen": nachgewiesen,
+            "mahnlauf_geplant": mahnlauf["geplant"],
+            "mahnlauf_gesendet": mahnlauf["gesendet"],
+            "mahnlauf_blockiert": mahnlauf["blockiert"],
             "verwaiste_als_unklar_markiert": len(verwaiste),
             "erhoehungsschreiben_versendet": versendet,
             "erhoehungsschreiben_uebersprungen_oder_blockiert": uebersprungen,
@@ -180,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Tägliche Pflege für {fachschluessel} lief bereits (oder läuft gerade) - kein Doppellauf.")
         return 0
 
-    if transport is None:
+    if mail.client is None:
         print("Hinweis: kein Transport-Endpunkt konfiguriert - Versand strukturell blockiert (nur Vorschau/Outbox).")
     for schluessel, wert in ergebnis.items():
         print(f"  {schluessel}: {wert}")

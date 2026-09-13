@@ -16,6 +16,7 @@ separat, ausdrücklich und mit Formangabe im Backoffice bestätigt
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Protocol
 
 from mietinkasso.domain.exceptions import TransportFehlerUngewissError
@@ -29,12 +30,15 @@ class VersandAuftrag:
     empfaenger_email: str | None
     betreff: str
     text: str
+    freigabe_referenz: str = ""
 
 
 @dataclass(frozen=True)
 class VersandBestaetigung:
     externe_referenz: str
-    status: str  # ausschließlich "ANGENOMMEN" - kein Zugangsnachweis
+    status: str  # ANGENOMMEN is not evidence of sending or receipt.
+    provider_referenz: str | None = None
+    versendet_am: datetime | None = None
 
 
 class Transportadapter(Protocol):
@@ -127,4 +131,6 @@ class FakeTransportadapter:
         self.aufrufe.append(auftrag)
         if self._verhalten == "TIMEOUT":
             raise TransportFehlerUngewissError(f"Fake-Timeout für {auftrag.referenz!r} (Test).")
-        return VersandBestaetigung(externe_referenz=f"FAKE-{len(self.aufrufe)}", status="ANGENOMMEN")
+        # Explicit synthetic sending receipt, never used by production wiring.
+        return VersandBestaetigung(externe_referenz=f"FAKE-{len(self.aufrufe)}", status="GESENDET",
+            provider_referenz="SYNTHETIC-SENT", versendet_am=datetime(2026, 1, 1, 9, tzinfo=timezone.utc))

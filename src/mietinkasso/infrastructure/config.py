@@ -99,6 +99,10 @@ class Settings(BaseSettings):
     # einen erfundenen Endpunkt).
     indexautomatik_transport_endpoint_url: str | None = None
     indexautomatik_transport_api_key: str | None = None
+    # Private existing JLB MailOps process, credentials stay on the server.
+    hv_mail_socket_path: str | None = None
+    hv_mail_token_file: str | None = None
+    hv_mail_allowlist_bestaetigt: bool = False
     # Auftrag HV-20260913-VERSAND-SOLL: eigenes, GETRENNTES Flag für die
     # tatsächliche Soll-Umsetzung (Vertragskomponenten-/Rechtsprofil-
     # änderung) - bewusst UNABHÄNGIG von `indexautomatik_send_enabled`
@@ -126,10 +130,10 @@ def pruefe_produktionskonfiguration(settings: Settings) -> None:
     if settings.environment != "production":
         return
     fehler = []
-    if settings.send_enabled:
+    if settings.send_enabled and not (settings.hv_mail_allowlist_bestaetigt and
+            settings.hv_mail_socket_path and settings.hv_mail_token_file):
         fehler.append(
-            "MIETINKASSO_SEND_ENABLED muss in production 'false' bleiben, bis ein Mensch echten Versand "
-            "ausdrücklich freigibt."
+            "MIETINKASSO_SEND_ENABLED verlangt den ausdrücklich freigegebenen privaten Hausverwaltungs-Mailweg."
         )
     if not settings.backoffice_password_hash:
         fehler.append(
