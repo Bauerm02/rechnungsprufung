@@ -39,10 +39,12 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Cookie, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
+from sqlalchemy import select
 
 from mietinkasso.audit.service import AuditService
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access
 from mietinkasso.backoffice.security import LoginRateLimiter, SessionStore, pruefe_passwort
+from mietinkasso.backoffice.indexklausel_form import klausel_formular, klausel_form_werte
 from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, ist_bekannte_demo_umgebung, option, parse_eur_betrag, seite
 from mietinkasso.bank.importer import (
     CamtKontoMismatchError,
@@ -61,6 +63,7 @@ from mietinkasso.index.repository import IndexRepository
 from mietinkasso.index.service import UNTERSTUETZTE_BERECHNUNGSPROFILE, IndexService
 from mietinkasso.infrastructure.config import get_settings
 from mietinkasso.infrastructure.db.session import build_session_factory
+from mietinkasso.infrastructure.db.tables import IndexKlauselTable
 from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
 from mietinkasso.mahnwesen.service import MahnwesenService
 from mietinkasso.op.eroeffnung_import import importiere_eroeffnung_csv_atomar, parse_eroeffnung_csv
@@ -2275,6 +2278,71 @@ def _rechtsprofil_zeile_html(p) -> str:
     )
 
 
+def _historische_belege_aus_form(ids, betraege, daten, quellen, erlaubte_ids):
+    if not (len(ids) == len(betraege) == len(daten) == len(quellen)):
+        raise ValueError("Unvollständige Belegfelder; bitte das Formular neu laden.")
+    belege = {}
+    for kid, betrag, datum, quelle in zip(ids, betraege, daten, quellen):
+        if not any((betrag.strip(), datum.strip(), quelle.strip())):
+            continue
+        if kid not in erlaubte_ids or kid in belege:
+            raise ValueError("Der Basisbeleg muss zu einer ausgewählten Mietkomponente gehören.")
+        if not all((betrag.strip(), datum.strip(), quelle.strip())):
+            raise ValueError("Jeder Basisbeleg braucht Betrag, Belegdatum und Quelle.")
+        cent = parse_eur_betrag(betrag)
+        if cent <= 0:
+            raise ValueError("Der belegte Basisbetrag muss positiv sein.")
+        belege[kid] = {"betrag_cent": cent, "datum": date.fromisoformat(datum).isoformat(),
+                       "quellenbeleg": quelle.strip()}
+    return belege
+
+
+@router.get("/vertrag/{vertrag_id}/indexklauseln", response_class=HTMLResponse)
+def indexklauseln_uebersicht(request: Request, vertrag_id: str, session=Depends(_current_session)):
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Indexklauseln", "Vertrag nicht verfügbar.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    komponenten = _stammdaten_repo.list_aktive_komponenten(vertrag_id, heute_wien())
+    with _session_factory() as db:
+        klauseln = list(db.execute(select(IndexKlauselTable).where(IndexKlauselTable.vertrag_id == vertrag_id)
+                                  .order_by(IndexKlauselTable.version.desc())).scalars())
+    return _layout(request, session, "Vertragliche Indexklauseln",
+                   klausel_formular(vertrag, komponenten, klauseln, session.csrf_token))
+
+
+@router.post("/vertrag/{vertrag_id}/indexklausel/erstellen")
+async def indexklausel_erstellen(request: Request, vertrag_id: str, session=Depends(_current_session)):
+    form = await request.form()
+    _verify_csrf(session, str(form.get("csrf_token", "")))
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Indexklauseln", "Vertrag nicht verfügbar.")
+    try:
+        werte = klausel_form_werte(form, vertrag, _stammdaten_repo.list_aktive_komponenten(vertrag_id, heute_wien()))
+        klausel = _indexautomatik.index_service.klausel_anlegen(ctx=_ctx(session), **werte)
+        _audit_service.log(entity_typ="index_klausel", entity_id=str(klausel.id), aktion="ENTWURF_ERFASST",
+                           akteur=session.user_id, payload={"vertrag_id": vertrag_id, "version": klausel.version})
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Indexklauseln", str(exc), f"/backoffice/vertrag/{vertrag_id}/indexklauseln")
+    return RedirectResponse(f"/backoffice/vertrag/{vertrag_id}/indexklauseln", status_code=303)
+
+
+@router.post("/indexklausel/{klausel_id}/freigeben")
+def indexklausel_freigeben(request: Request, klausel_id: int, csrf_token: str = Form(...), session=Depends(_current_session)):
+    _verify_csrf(session, csrf_token)
+    klausel = _indexautomatik.index_repository.get_klausel(klausel_id)
+    if klausel is None or klausel.status != "ENTWURF" or _objekt_fuer_vertrag_gesperrt(klausel.vertrag_id):
+        return _fehlerseite(session, "Indexklauseln", "Kein bestätigbarer Vertragsentwurf vorhanden.")
+    try:
+        _indexautomatik.index_service.klausel_freigeben(klausel_id, ctx=_ctx(session), freigegeben_von=session.user_id)
+        _audit_service.log(entity_typ="index_klausel", entity_id=str(klausel_id), aktion="KLAUSEL_BESTAETIGT",
+                           akteur=session.user_id, payload={"vertrag_id": klausel.vertrag_id, "version": klausel.version})
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Indexklauseln", str(exc))
+    return RedirectResponse(f"/backoffice/vertrag/{klausel.vertrag_id}/rechtsprofil", status_code=303)
+
+
 @router.get("/vertrag/{vertrag_id}/rechtsprofil", response_class=HTMLResponse)
 def rechtsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_current_session)) -> HTMLResponse:
     vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
@@ -2292,6 +2360,14 @@ def rechtsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_
         f"{h(k.bezeichnung)} ({eur(k.betrag_cent)}, {h(k.art)})</label><br>"
         for k in komponenten if k.indexierbar
     ) or '<p class="muted">Keine als indexierbar markierte Komponente vorhanden.</p>'
+    belege_html = "".join(
+        f'<fieldset><legend>{h(k.bezeichnung)} – bisheriger Basisbetrag</legend>'
+        f'<input type="hidden" name="beleg_komponente_id" value="{h(k.id)}">'
+        '<label>Belegter Betrag (EUR, brutto)</label><input name="beleg_betrag" type="text">'
+        '<label>Datum des Vertrags oder Betragsbelegs</label><input name="beleg_datum" type="date">'
+        '<label>Datei und Fundstelle</label><input name="beleg_quelle" type="text"></fieldset>'
+        for k in komponenten if k.indexierbar
+    )
     klauseln = _indexautomatik.index_repository.freigegebene_klausel(vertrag_id)
     klausel_hinweis = (
         f'<p class="muted">Freigegebene IndexKlausel: #{klauseln.id} (Basis {klauseln.basis_reihe}={klauseln.basis_wert}, '
@@ -2312,6 +2388,7 @@ def rechtsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_
     </div>
     <div class="card">
       <h2>Neues Rechtsprofil (Entwurf)</h2>
+      <p><a href="/backoffice/vertrag/{h(vertrag_id)}/indexklauseln">Vertragliche Indexklausel erfassen oder prüfen</a></p>
       {klausel_hinweis}
       <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/rechtsprofil/erstellen">
         {csrf_feld(session.csrf_token)}
@@ -2353,6 +2430,12 @@ def rechtsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_
              gehört als eigene IndexKlausel unten erfasst.</p>
           <label>Referenzierte Basis-Komponenten</label>
           {komponenten_html}
+          <details><summary>Basisbelege für bereits vor dem Import vereinbarte Mieten</summary>
+            <p class="muted">Nur ausfüllen, wenn der Vertrag den unveränderten Basisbetrag belegt.
+               Das Belegdatum bleibt das echte Unterschrifts- oder Ausstellungsdatum;
+               der vereinbarte VPI-Bezugsmonat steht getrennt oben. Der Betrag wird vor Freigabe abgeglichen.</p>
+            {belege_html}
+          </details>
         </fieldset>
         <fieldset>
           <legend>Vertragliche Spur - GENAU EINE der beiden Varianten</legend>
@@ -2362,9 +2445,11 @@ def rechtsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_
           <input type="text" name="vertraglicher_quellenbeleg">
           <label>Vertraglich frühestmöglicher Termin</label>
           <input type="date" name="vertraglicher_termin">
-          <p class="muted">ODER: ID einer freigegebenen IndexKlausel (dynamisch berechnete Spur, siehe oben)</p>
-          <label>Vertragsklausel-ID</label>
-          <input type="number" name="vertragsklausel_id">
+          <p class="muted">ODER: bestätigte Vertragsklausel für die wiederkehrende Berechnung</p>
+          <label>Vertragsklausel</label>
+          <select name="vertragsklausel_id"><option value="">keine ausgewählt</option>
+            {option(str(klauseln.id), f'Version {klauseln.version}: {klauseln.basis_reihe}, Basis {klauseln.basis_monat}') if klauseln else ''}
+          </select>
         </fieldset>
         <fieldset>
           <legend>Belege</legend>
@@ -2372,6 +2457,11 @@ def rechtsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_
           <input type="text" name="vertrag_beleg_referenz" required>
           <label>Klauselreferenz</label>
           <input type="text" name="klausel_referenz">
+          <label>Vertragliche Frist vom Zugang bis zur Wirksamkeit (Tage)</label>
+          <input type="number" name="frist_tage_zugang_bis_wirksamkeit" min="0">
+          <label>Beleg der Zugangsfrist</label>
+          <input type="text" name="frist_quellenbeleg" placeholder="Vertrag, Seite und Absatz">
+          <p class="muted">Leer bedeutet ungeklärt. Gesetzliche Mindestfristen werden zusätzlich geprüft.</p>
         </fieldset>
         <button type="submit">Rechtsprofil als Entwurf speichern</button>
       </form>
@@ -2410,6 +2500,12 @@ def rechtsprofil_erstellen(
     vertraglicher_quellenbeleg: str = Form(""),
     vertraglicher_termin: str = Form(""),
     vertragsklausel_id: str = Form(""),
+    beleg_komponente_id: list[str] = Form([]),
+    beleg_betrag: list[str] = Form([]),
+    beleg_datum: list[str] = Form([]),
+    beleg_quelle: list[str] = Form([]),
+    frist_tage_zugang_bis_wirksamkeit: str = Form(""),
+    frist_quellenbeleg: str = Form(""),
     vertrag_beleg_referenz: str = Form(...),
     klausel_referenz: str = Form(""),
     csrf_token: str = Form(...),
@@ -2439,6 +2535,13 @@ def rechtsprofil_erstellen(
             bezugsmonat=int(bezugsmonat) if bezugsmonat.strip() else None,
             letzte_basis_war_jahresdurchschnitt=bool(letzte_basis_war_jahresdurchschnitt),
             basis_komponenten_ids=basis_komponenten_ids, vpi_reihe=vpi_reihe,
+            historische_basis_belege=_historische_belege_aus_form(
+                beleg_komponente_id, beleg_betrag, beleg_datum, beleg_quelle, set(basis_komponenten_ids)
+            ),
+            frist_tage_zugang_bis_wirksamkeit=(
+                int(frist_tage_zugang_bis_wirksamkeit) if frist_tage_zugang_bis_wirksamkeit.strip() else None
+            ),
+            frist_quellenbeleg=frist_quellenbeleg.strip() or None,
             vertraglich_zulaessiger_betrag_cent=parse_eur_betrag(vertraglicher_betrag) if vertraglicher_betrag.strip() else None,
             vertraglicher_quellenbeleg=vertraglicher_quellenbeleg or None,
             vertraglicher_fruehestmoeglicher_termin=(

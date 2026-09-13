@@ -644,7 +644,11 @@ class ErhoehungsschreibenOutboxService:
                 "für diesen Vertrag/dieses Rechtsprofil aufheben."
             )
 
-        fruehester = zugang_datum + timedelta(days=frist_tage if frist_tage is not None else 14)
+        # Eine vertragliche Angabe darf die zwingende Mindestfrist im
+        # Vollanwendungsbereich nicht verkürzen. Längere Fristen bleiben wirksam.
+        gesetzliches_minimum = 14 if profil.rechtsordnung in _ZUGANGSFRIST_UNTERSTUETZTE_RECHTSORDNUNGEN else 0
+        wirksame_frist = max(gesetzliches_minimum, frist_tage or 0)
+        fruehester = zugang_datum + timedelta(days=wirksame_frist)
         zahlungspflicht_ab = naechster_zinstermin_ab(fruehester, faelligkeit_tag=vertrag.faelligkeit_tag)
         return self._repository.set_status(
             schreiben.id,

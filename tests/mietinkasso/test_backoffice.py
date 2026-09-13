@@ -1244,6 +1244,83 @@ def test_indexautomatik_rechtsprofil_erstellen_und_freigeben(backoffice_client):
     assert "FREIGEGEBEN" in historie_danach.text
 
 
+def test_portal_historischer_beleg_bindet_betrag_ohne_rueckdatierung(backoffice_client):
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.indexautomatik.repository import RechtsprofilRepository
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    sf = build_session_factory(get_settings().database_url)
+    sd = StammdatenRepository(sf)
+    sd.upsert_einheit(id="601-BELEGT", objekt_id="601", bezeichnung="Belegt", nutzungsstatus="DAUERVERMIETUNG")
+    sd.upsert_vertrag(id="V-BELEGT", einheit_id="601-BELEGT", debitor_id="DEB-1", gesellschaft_id="7DI",
+                     rechtsordnung="OESTERREICH_MRG_TEIL", gueltig_von=date(2026, 4, 1))
+    sd.add_komponente(id="K-BELEGT", vertrag_id="V-BELEGT", art="HMZ", bezeichnung="Miete",
+                      betrag_cent=100_000, indexierbar=True, gueltig_von=date(2026, 9, 1))
+    form = {
+        "csrf_token": csrf, "rechtsordnung": "OESTERREICH_MRG_TEIL", "ist_wohnungsnutzung": "0",
+        "ist_hauptmiete": "0", "mrg_zinsbeschraenkung": "0", "foerderbindung": "0",
+        "bezugsjahr": "2026", "bezugsmonat": "2", "basis_komponenten_ids": ["K-BELEGT"],
+        "vertraglicher_betrag": "1.100,00", "vertraglicher_quellenbeleg": "synthetischer Vertrag",
+        "vertraglicher_termin": "2027-01-01", "vertrag_beleg_referenz": "synthetisch",
+        "beleg_komponente_id": ["K-BELEGT"], "beleg_betrag": ["0,01"],
+        "beleg_datum": ["2026-03-02"], "beleg_quelle": ["synthetischer Vertrag, Punkt 3"],
+        "frist_tage_zugang_bis_wirksamkeit": "14", "frist_quellenbeleg": "synthetischer Vertrag, Punkt 4",
+    }
+    repo = RechtsprofilRepository(sf)
+    for betrag, erlaubt in [("0,01", False), ("1.000,00", True)]:
+        form["beleg_betrag"] = [betrag]
+        assert client.post("/backoffice/vertrag/V-BELEGT/rechtsprofil/erstellen", data=form,
+                           follow_redirects=False).status_code == 303
+        profil = repo.liste_fuer_vertrag("V-BELEGT")[0]
+        response = client.post(f"/backoffice/indexautomatik/rechtsprofil/{profil.id}/freigeben",
+                               data={"csrf_token": csrf}, follow_redirects=False)
+        assert (response.status_code == 303) == erlaubt
+        assert profil.historische_basis_belege["K-BELEGT"]["datum"] == "2026-03-02"
+        assert profil.frist_tage_zugang_bis_wirksamkeit == 14
+        assert sd.get_komponente("K-BELEGT").gueltig_von == date(2026, 9, 1)
+
+
+def test_portal_klausel_entwurf_mit_beleg_und_csrf(backoffice_client):
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    from mietinkasso.infrastructure.db.tables import IndexKlauselTable
+    from sqlalchemy import select
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    sf = build_session_factory(get_settings().database_url)
+    sd = StammdatenRepository(sf)
+    sd.upsert_einheit(id="601-KLAUSEL", objekt_id="601", bezeichnung="Regel", nutzungsstatus="DAUERVERMIETUNG")
+    sd.upsert_vertrag(id="V-KLAUSEL", einheit_id="601-KLAUSEL", debitor_id="DEB-1", gesellschaft_id="7DI",
+                     rechtsordnung="OESTERREICH_MRG_TEIL", gueltig_von=date(2026, 4, 1))
+    sd.add_komponente(id="K-KLAUSEL", vertrag_id="V-KLAUSEL", art="HMZ", bezeichnung="Miete",
+                      betrag_cent=100_000, indexierbar=True, gueltig_von=date(2026, 4, 1))
+    assert client.get("/backoffice/vertrag/V-KLAUSEL/indexklauseln").status_code == 200
+    form = {"csrf_token": "wrong", "abschlussdatum": "2026-03-02", "basis_reihe": "VPI20C18",
+            "basis_monat": "2026-02", "basis_wert": "130,0", "komponenten": ["K-KLAUSEL"],
+            "klausel_text": "Synthetischer Vertrag, Punkt 3: jährlich im Jänner.", "schwelle_prozent": "0",
+            "schwelle_inklusive": "1", "anpassungsmonat": "1", "mindestintervall_monate": "12",
+            "terminmodus": "FIXER_MONAT"}
+    url = "/backoffice/vertrag/V-KLAUSEL/indexklausel/erstellen"
+    assert client.post(url, data=form, follow_redirects=False).status_code == 403
+    form["csrf_token"] = csrf
+    form["komponenten"] = ["K-601-1-HMZ"]
+    assert client.post(url, data=form, follow_redirects=False).status_code == 400
+    form["komponenten"] = ["K-KLAUSEL"]
+    assert client.post(url, data=form, follow_redirects=False).status_code == 303
+    with sf() as db:
+        row = db.execute(select(IndexKlauselTable).where(IndexKlauselTable.vertrag_id == "V-KLAUSEL")).scalar_one()
+        assert row.status == "ENTWURF" and row.basis_monat == "2026-02"
+        assert row.indexierbare_komponenten == ["K-KLAUSEL"]
+    assert sd.get_komponente("K-KLAUSEL").betrag_cent == 100_000
+
+
 def test_indexautomatik_vpi_werte_erfassen_und_anzeigen(backoffice_client):
     client, *_ = backoffice_client
     _login(client)

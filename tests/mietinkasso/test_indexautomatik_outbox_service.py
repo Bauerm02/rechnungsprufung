@@ -40,7 +40,7 @@ def outbox_service(outbox_repo, stammdaten_repo, rechtsprofil_repo, rechtsprofil
     )
 
 
-def _freigegebenes_profil(admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag, komponente_id="K-1"):
+def _freigegebenes_profil(admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag, komponente_id="K-1", frist_tage=None):
     stammdaten_repo.add_komponente(
         id=komponente_id, vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=100_000,
         indexierbar=True, gueltig_von=date(2024, 1, 1),
@@ -52,15 +52,16 @@ def _freigegebenes_profil(admin_ctx, rechtsprofil_service, stammdaten_repo, vert
         bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=[komponente_id],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
         vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz=None,
-        erstellt_von="markus",
+        erstellt_von="markus", frist_tage_zugang_bis_wirksamkeit=frist_tage,
+        frist_quellenbeleg="Synthetischer Vertrag Punkt 9" if frist_tage is not None else None,
     )
     return rechtsprofil_service.freigeben(profil.id, ctx=admin_ctx, freigegeben_von="markus")
 
 
 def _bereites_schreiben(
-    admin_ctx, outbox_repo, rechtsprofil_service, stammdaten_repo, vertrag, *, massgeblicher_termin=date(2026, 4, 1)
+    admin_ctx, outbox_repo, rechtsprofil_service, stammdaten_repo, vertrag, *, massgeblicher_termin=date(2026, 4, 1), frist_tage=None
 ) -> ErhoehungsschreibenTable:
-    profil = _freigegebenes_profil(admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag)
+    profil = _freigegebenes_profil(admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag, frist_tage=frist_tage)
     debitor = stammdaten_repo.get_debitor(vertrag.debitor_id)
     stammdaten_repo.upsert_debitor(id=debitor.id, name=debitor.name, email=debitor.email, adresse="Corsogasse 1/3, 1010 Wien")
     vertrag = stammdaten_repo.get_vertrag(vertrag.id)
@@ -287,6 +288,23 @@ def test_ausreichender_zugang_berechnet_zahlungspflicht_und_ausfuehrung(admin_ct
     nach_faelligkeit = outbox_service.taegliche_pflege(heute=date(2026, 5, 5))
     assert len(nach_faelligkeit) == 1
     assert outbox_repo.get(schreiben.id).status == "SOLL_UMSETZUNG_OFFEN"
+
+
+@pytest.mark.parametrize("vertragliche_tage,erwartet", [(0, date(2026, 5, 5)), (40, date(2026, 6, 5))])
+def test_mrg_mindestfrist_wird_nicht_durch_vertragsfrist_verkuerzt(
+    admin_ctx, basis_vertrag, outbox_service, outbox_repo, rechtsprofil_service, stammdaten_repo,
+    vertragliche_tage, erwartet,
+):
+    vertrag, _ = basis_vertrag
+    schreiben = _bereites_schreiben(admin_ctx, outbox_repo, rechtsprofil_service, stammdaten_repo,
+                                   vertrag, frist_tage=vertragliche_tage)
+    outbox_service.versenden(ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 4, 1),
+                            send_enabled=True, mailops_allowlist_bestaetigt=True, transport=FakeTransportadapter())
+    result = outbox_service.zugang_bestaetigen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 4, 5),
+        zugang_datum=date(2026, 4, 1), zugangsform="EINSCHREIBEN_RUECKSCHEIN", zugang_beleg="synthetisch",
+    )
+    assert result.zahlungspflicht_ab == erwartet
 
 
 def test_zugangsfrist_fuer_nicht_unterstuetzte_rechtsordnung_wird_gesperrt(admin_ctx, basis_vertrag, outbox_service, outbox_repo, rechtsprofil_service, rechtsprofil_repo, stammdaten_repo):
