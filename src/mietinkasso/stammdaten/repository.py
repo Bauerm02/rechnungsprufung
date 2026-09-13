@@ -13,6 +13,7 @@ from mietinkasso.infrastructure.db.tables import (
     GesellschaftTable,
     KautionTable,
     KontoTable,
+    MietvertragsprofilTable,
     ObjektTable,
     SperreTable,
     VertragTable,
@@ -199,6 +200,10 @@ class StammdatenRepository:
     def get_debitor(self, id: str) -> DebitorTable | None:
         with self._session_factory() as session:
             return session.get(DebitorTable, id)
+
+    def list_alle_debitoren(self) -> list[DebitorTable]:
+        with self._session_factory() as session:
+            return list(session.execute(select(DebitorTable).order_by(DebitorTable.id)).scalars().all())
 
     # -- Vertrag ------------------------------------------------------------
     def upsert_vertrag(
@@ -500,13 +505,20 @@ class StammdatenRepository:
             return list(session.execute(statement).scalars().all())
 
     # -- Kaution (strictly separate from OP) ---------------------------------
-    def set_kaution(self, *, id: str, vertrag_id: str, betrag_cent: int, stichtag: date, referenz: str | None = None) -> None:
-        with self._session_factory() as session:
-            existing = session.execute(
+    def set_kaution(
+        self, *, id: str, vertrag_id: str, betrag_cent: int, stichtag: date, referenz: str | None = None,
+        session: Session | None = None,
+    ) -> None:
+        """`session`: siehe `upsert_gesellschaft` - erlaubt dem generischen
+        Intake (`intake/apply.py`), eine Kaution Teil derselben atomaren
+        Mehr-Entitäten-Transaktion zu machen."""
+
+        def _schreiben(active_session: Session) -> None:
+            existing = active_session.execute(
                 select(KautionTable).where(KautionTable.vertrag_id == vertrag_id)
             ).scalar_one_or_none()
             if existing is None:
-                session.add(
+                active_session.add(
                     KautionTable(
                         id=id, vertrag_id=vertrag_id, betrag_cent=betrag_cent, stichtag=stichtag, referenz=referenz
                     )
@@ -515,11 +527,126 @@ class StammdatenRepository:
                 existing.betrag_cent = betrag_cent
                 existing.stichtag = stichtag
                 existing.referenz = referenz
-            session.commit()
 
-    def get_kaution(self, vertrag_id: str) -> KautionTable | None:
-        with self._session_factory() as session:
+        if session is not None:
+            _schreiben(session)
+            session.flush()
+            return
+        with self._session_factory() as owned_session:
+            _schreiben(owned_session)
+            owned_session.commit()
+
+    def get_kaution(self, vertrag_id: str, *, session: Session | None = None) -> KautionTable | None:
+        if session is not None:
             return session.execute(select(KautionTable).where(KautionTable.vertrag_id == vertrag_id)).scalar_one_or_none()
+        with self._session_factory() as owned_session:
+            return owned_session.execute(select(KautionTable).where(KautionTable.vertrag_id == vertrag_id)).scalar_one_or_none()
+
+    # -- Mietvertragsprofil (Auftrag HV-20260913-VERTRAGSANLAGE) ---------------
+    def add_mietvertragsprofil(
+        self,
+        *,
+        vertrag_id: str,
+        nutzungsart: str,
+        quelle_typ: str,
+        erstellt_von: str,
+        urspruenglicher_mietbeginn: date | None = None,
+        verwaltungsuebernahme_am: date | None = None,
+        verwaltung_bezeichnung: str | None = None,
+        vertragliche_kaution_cent: int | None = None,
+        vertragliche_kaution_quellenbeleg: str | None = None,
+        mahngebuehr_cent: int | None = None,
+        mahngebuehr_quellenbeleg: str | None = None,
+        index_reihe: str | None = None,
+        index_urspruenglicher_basismonat: str | None = None,
+        index_urspruenglicher_basiswert: Decimal | None = None,
+        index_schwelle_prozent: Decimal | None = None,
+        index_schwelle_inklusive: bool | None = None,
+        index_anpassungsmonat: int | None = None,
+        index_mindestintervall_monate: int | None = None,
+        index_klauseltext_auszug: str | None = None,
+        index_klauseltext_seite: int | None = None,
+        quelle_referenz: str | None = None,
+        session: Session | None = None,
+    ) -> MietvertragsprofilTable:
+        """Reines Insert einer NEUEN Version (append-only, siehe
+        `MietvertragsprofilTable`-Docstring) - NIE ein In-Place-Update einer
+        bestehenden Zeile. Die Versionsnummer wird hier aus der zuletzt
+        gespeicherten Version fortgeschrieben (analog `add_komponente`s
+        Historisierungs-Pattern); der Aufrufer (`intake/apply.py`) entscheidet
+        über `intake/planner.py`, OB eine neue Version nötig ist (Status
+        NEU/AKTUALISIERUNG) - ein Aufruf hier landet nur bei tatsächlich
+        abweichendem Inhalt oder einer ersten Anlage."""
+
+        def _schreiben(active_session: Session) -> MietvertragsprofilTable:
+            bisherige_version = active_session.execute(
+                select(MietvertragsprofilTable.version)
+                .where(MietvertragsprofilTable.vertrag_id == vertrag_id)
+                .order_by(MietvertragsprofilTable.version.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            row = MietvertragsprofilTable(
+                vertrag_id=vertrag_id,
+                version=(bisherige_version or 0) + 1,
+                nutzungsart=nutzungsart,
+                urspruenglicher_mietbeginn=urspruenglicher_mietbeginn,
+                verwaltungsuebernahme_am=verwaltungsuebernahme_am,
+                verwaltung_bezeichnung=verwaltung_bezeichnung,
+                vertragliche_kaution_cent=vertragliche_kaution_cent,
+                vertragliche_kaution_quellenbeleg=vertragliche_kaution_quellenbeleg,
+                mahngebuehr_cent=mahngebuehr_cent,
+                mahngebuehr_quellenbeleg=mahngebuehr_quellenbeleg,
+                index_reihe=index_reihe,
+                index_urspruenglicher_basismonat=index_urspruenglicher_basismonat,
+                index_urspruenglicher_basiswert=index_urspruenglicher_basiswert,
+                index_schwelle_prozent=index_schwelle_prozent,
+                index_schwelle_inklusive=index_schwelle_inklusive,
+                index_anpassungsmonat=index_anpassungsmonat,
+                index_mindestintervall_monate=index_mindestintervall_monate,
+                index_klauseltext_auszug=index_klauseltext_auszug,
+                index_klauseltext_seite=index_klauseltext_seite,
+                quelle_typ=quelle_typ,
+                quelle_referenz=quelle_referenz,
+                erstellt_von=erstellt_von,
+            )
+            active_session.add(row)
+            return row
+
+        if session is not None:
+            row = _schreiben(session)
+            session.flush()
+            return row
+        with self._session_factory() as owned_session:
+            row = _schreiben(owned_session)
+            owned_session.commit()
+            owned_session.refresh(row)
+            return row
+
+    def neuestes_mietvertragsprofil(self, vertrag_id: str, *, session: Session | None = None) -> MietvertragsprofilTable | None:
+        def _lesen(active_session: Session) -> MietvertragsprofilTable | None:
+            return active_session.execute(
+                select(MietvertragsprofilTable)
+                .where(MietvertragsprofilTable.vertrag_id == vertrag_id)
+                .order_by(MietvertragsprofilTable.version.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+
+        if session is not None:
+            return _lesen(session)
+        with self._session_factory() as owned_session:
+            return _lesen(owned_session)
+
+    def liste_mietvertragsprofil_versionen(self, vertrag_id: str) -> list[MietvertragsprofilTable]:
+        """Für die Anzeige 'Quellen und Historie' im Backoffice-Detail -
+        älteste zuerst."""
+        with self._session_factory() as session:
+            return list(
+                session.execute(
+                    select(MietvertragsprofilTable)
+                    .where(MietvertragsprofilTable.vertrag_id == vertrag_id)
+                    .order_by(MietvertragsprofilTable.version.asc())
+                ).scalars().all()
+            )
 
     # -- Sperren --------------------------------------------------------------
     def sperre_setzen(

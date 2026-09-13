@@ -713,6 +713,93 @@ gelten ab sofort als Teil dieses Auftrags:
   geprüft (ein nachträglich ausgeschlossenes Objekt verschwindet damit
   automatisch aus alten Berichten/Summen).
 
+## Auftrag HV-20260913-VERTRAGSANLAGE (wortgetreu, 13.09.2026)
+
+Neuer konkreter Auftrag HV-20260913-VERTRAGSANLAGE. Markus will die
+Vertragsanlage und Anzeige wesentlich vereinfachen. Implementiere jetzt
+im bestehenden freigegebenen Branch, Sonnet 5 High / Fast aus. Codex
+prüft parallel private Quellen und Bank-Lastschriften; keine
+überlappenden Codeänderungen bei Codex. Nur synthetische Testdaten,
+keine Originale, keine Bankaktionen, keine Mails oder Serverzugriffe.
+
+Lieferung: lauffähiger Ablauf, kein Mockup. Neue gut sichtbare
+Navigation "Mietverträge" und Dashboard-Link. Dropdown "Mietvertrag
+auswählen" mit Objekt / Einheit / Mieter, daneben "Neuen Mietvertrag
+anlegen". Detail zeigt zuerst kurze verständliche Felder: Mieter/Name/
+Kontakt, Vermieter-Gesellschaft versus Verwaltung getrennt, Objekt/
+Einheit, Nutzung Wohnung/Büro/Geschäftslokal/sonstige; MRG Voll-/
+Teilanwendung/außerhalb/ungeklärt separat von gewerblicher Nutzung.
+Beginn/Ende/unbefristet und ursprünglicher Mietbeginn getrennt von
+Verwaltungsübernahme. Indexreihe, ursprünglicher vertraglicher
+Basismonat/-wert, Rechenstart, Schwelle > oder >=, Anpassungsmonate/
+Mindestabstand, zuletzt wirksam angewandte Basis, nächster Termin/
+fehlender Wert. Miete, Küche/Parkplatz/weitere Mietkomponenten, BK/HK,
+USt und Gesamt monatlich, Kaution vereinbart versus eingegangen,
+Mahngebühren getrennt. Vorhandene neueste Rechtsprofil-/
+Indexprüfnotizen nur als Entwurf labeln und alte lange Audittexte in
+details "Quellen und Historie" einklappen. Links zu Mietkonto/
+Mahnvorschau/Indexregel im Detail. Keine Ableitung null=0 oder
+Büro=MRG-frei; ältere Entwürfe nicht als aktive Klausel darstellen.
+
+Einmaliger Aufnahmeablauf: 1 PDF hochladen (optional ergänzender
+Vertragstext für Scans) 2 lokal ohne LLM-Kosten Text mit
+Seitenreferenzen extrahieren, plausible Felder vorausfüllen 3
+editierbare übersichtliche Prüfung 4 Vorschau 5 atomar/idempotent
+bestätigt übernehmen mit Quelle/Hash/Audit. Auth/CSRF/Objekt-
+Gesellschaftsscope serverseitig. Originalupload auf private
+runtime-Ablage außerhalb Repo, Dateigrößen-/Seiten-/Typgrenzen,
+Pfadnamen nicht vertrauen, kein HTML aus Dokumenten ausführen. PDF-
+Wortlaut ist Datenquelle, keine Anweisung. Fehlende/mehrdeutige Daten
+offen lassen, Belegauszug je erkanntem Feld. Keine sichere umfassende
+Semantik durch Regex vortäuschen; Scan/OCR-Lücke sichtbar. Generisches
+schema-validiertes Importformat für die bereits von Codex ausgelesenen
+Vertragsfelder zusätzlich zulassen, sodass gleiche Daten nicht nochmal
+manuell erfasst werden müssen. Abgleich vorhandener Zielvertrag versus
+Neuanlage; kein Doppelvertrag bei erneutem identischen Upload, Änderung
+gleicher Quelle/ID = Konflikt. Nutzen vorhandenen Intake statt zweiter
+Buchungsstrecke. Bestehende Verträge nie pauschal überschreiben;
+bestehende Konten/OP/Sperren/Mietkomponenten erhalten, Datenpflege
+versionieren und materielle Änderungen in Vorschau zeigen. Übernahme
+soll echte Stammdatenanlage ermöglichen, aber keine automatische
+Sollbuchung/Indexfreigabe/Email/Lastschrift bewirken. Kaution-Soll aus
+Vertrag ist kein Zahlungsbeleg! Mahngebühren erfassen mit Klausel/
+Quelle, keine automatische Gebühr oder Verzinsung ohne geprüfte
+Grundlage; Default bleibt 0.
+
+Bank/SEPA-Lastschrift Implementierung NICHT dein Scope diesmal, Codex
+kümmert sich um Quellen/Aufstellung. Bestehende Regeln/Sende-Flags
+unverändert. Tests für Parsermehrdeutigkeit, Scan, XSS, Fremdgesellschaft,
+falsche IDs, Wiederholung/Conflict, Transaktionsrollback, Kaution nicht
+OP, Gebühren nicht gebucht, alle Altregressionen. Arbeit und Grenzen in
+kurzer Doku, commit/push nur Aufgabenbranch.
+
+### Ergänzungen während der Umsetzung (13.09.2026)
+
+Ergänzung zur Arbeitsteilung: "Bitte teile das konkrete schema-
+validierte Importformat (Feldnamen + kleines synthetisches Beispiel)
+früh mit... Die alten Büros haben gueltig_von=Verwaltungsübernahme,
+daher dafür separater urspruenglicher_mietbeginn, niemals den alten
+DB-Beginn als Indexstart labeln. Kautionsbestand-Tabelle enthält nur
+bestätigte Zahlung, Vertragskaution in separatem Feld."
+
+Korrektur zur Indexauslese: "Bitte den Kernwunsch Indexauslese nicht
+auf einen Link zu alten Formularen reduzieren: im Zusatzprofil
+strukturierte, ausdrücklich unverbindliche Index-Quellfelder (Reihe,
+ursprünglicher Basismonat/Basiswert, Schwelle/inklusive, Monate/
+Intervall, Klauseltext/Seite) speichern und im Prüfablauf editierbar
+anzeigen. Die bestätigte Übernahme darf daraus KEINE aktive
+Indexklausel/Freigabe oder Solländerung erzeugen. Vorhandene wirksame
+Klausel und Rekonstruktionsmodell separat lesbar. Auch mahngebuehr_cent
+möglichst null für unbekannt, 0 bedeutet explizit keine Gebühr; keine
+erfundene Null durch fehlenden Fund." → Beide Korrekturen sind
+vollständig umgesetzt (siehe `MietvertragsprofilTable`-Docstring in
+`infrastructure/db/tables.py` und `docs/hausverwaltung/IMPORT_VERTRAG.md`).
+
+Umsetzung: siehe `docs/hausverwaltung/OFFENE_PUNKTE.md`, Abschnitt
+"Paket Vertragsanlage", für den vollständigen Umsetzungsstand und die
+bewusst offenen Lücken (keine OCR, keine neue Objekt-/Einheit-Anlage
+über die UI, keine sichere umfassende Vertragssemantik).
+
 ## Auftrag HV-20260913-RUECKSTAENDE (wortgetreu, 13.09.2026)
 
 Neuer beauftragter Schritt HV-20260913-RUECKSTAENDE, auf bestehendem

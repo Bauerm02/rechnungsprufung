@@ -43,6 +43,8 @@ class IntakeErgebnis:
     anzahl_eroeffnungskorrekturen: int
     anzahl_sperren: int
     anzahl_komponenten: int
+    anzahl_kautionen: int
+    anzahl_mietvertragsprofile: int
 
 
 def wende_an(
@@ -162,6 +164,44 @@ def wende_an(
                         session=session,
                     )
 
+            # Kaution: STRIKTE Idempotenz (siehe planner.py::_pruefe_kaution)
+            # - `plan.anwendbar` ist hier bereits geprüft, jede verbliebene
+            # Kaution-Zeile ist also NEU oder UNVERAENDERT; UNVERAENDERT wird
+            # bewusst übersprungen (kein wirkungsloses Update).
+            kaution_status = {b.id: b.status for b in plan.befunde if b.entitaet == "Kaution"}
+            for z in paket.kautionen:
+                if kaution_status.get(z.vertrag_id) == "NEU":
+                    stammdaten_repo.set_kaution(
+                        id=f"KAU-{z.vertrag_id}", vertrag_id=z.vertrag_id, betrag_cent=z.betrag_cent,
+                        stichtag=z.stichtag, referenz=z.referenz, session=session,
+                    )
+
+            # Mietvertragsprofil: append-only (siehe planner.py::_pruefe_mietvertragsprofil)
+            # - NEU legt die erste Version an, AKTUALISIERUNG eine weitere;
+            # UNVERAENDERT wird übersprungen (kein wirkungsloser No-Op-Insert).
+            mietvertragsprofil_status = {b.id: b.status for b in plan.befunde if b.entitaet == "Mietvertragsprofil"}
+            for z in paket.mietvertragsprofile:
+                if mietvertragsprofil_status.get(z.vertrag_id) in ("NEU", "AKTUALISIERUNG"):
+                    stammdaten_repo.add_mietvertragsprofil(
+                        vertrag_id=z.vertrag_id, nutzungsart=z.nutzungsart,
+                        urspruenglicher_mietbeginn=z.urspruenglicher_mietbeginn,
+                        verwaltungsuebernahme_am=z.verwaltungsuebernahme_am,
+                        verwaltung_bezeichnung=z.verwaltung_bezeichnung,
+                        vertragliche_kaution_cent=z.vertragliche_kaution_cent,
+                        vertragliche_kaution_quellenbeleg=z.vertragliche_kaution_quellenbeleg,
+                        mahngebuehr_cent=z.mahngebuehr_cent, mahngebuehr_quellenbeleg=z.mahngebuehr_quellenbeleg,
+                        index_reihe=z.index_reihe, index_urspruenglicher_basismonat=z.index_urspruenglicher_basismonat,
+                        index_urspruenglicher_basiswert=z.index_urspruenglicher_basiswert,
+                        index_schwelle_prozent=z.index_schwelle_prozent,
+                        index_schwelle_inklusive=z.index_schwelle_inklusive,
+                        index_anpassungsmonat=z.index_anpassungsmonat,
+                        index_mindestintervall_monate=z.index_mindestintervall_monate,
+                        index_klauseltext_auszug=z.index_klauseltext_auszug,
+                        index_klauseltext_seite=z.index_klauseltext_seite,
+                        quelle_typ=z.quelle_typ, quelle_referenz=z.quelle_referenz,
+                        erstellt_von=akteur, session=session,
+                    )
+
             session.commit()
         except Exception as exc:
             session.rollback()
@@ -185,4 +225,6 @@ def wende_an(
         anzahl_eroeffnungskorrekturen=len(paket.eroeffnungskorrekturen),
         anzahl_sperren=len(paket.sperren),
         anzahl_komponenten=len(paket.komponenten),
+        anzahl_kautionen=len(paket.kautionen),
+        anzahl_mietvertragsprofile=len(paket.mietvertragsprofile),
     )

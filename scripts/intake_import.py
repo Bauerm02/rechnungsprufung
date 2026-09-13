@@ -237,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Eröffnungen: {ergebnis.anzahl_eroeffnungen}  Nachbuchungen: {ergebnis.anzahl_nachbuchungen}  "
           f"Eröffnungskorrekturen: {ergebnis.anzahl_eroeffnungskorrekturen}")
     print(f"  Sperren: {ergebnis.anzahl_sperren}  Komponenten: {ergebnis.anzahl_komponenten}")
+    print(f"  Kautionen: {ergebnis.anzahl_kautionen}  Mietvertragsprofile: {ergebnis.anzahl_mietvertragsprofile}")
     return 0
 
 

@@ -805,3 +805,210 @@ def test_negativer_gesamtsaldo_guthaben_bleibt_erlaubt(session_factory, stammdat
     assert ergebnis.anzahl_eroeffnungen == 1
     konto = stammdaten_repo.get_konto_by_vertrag("V-1")
     assert op_service.berechne_saldo(konto.id).saldo_cent == -15000
+
+
+# ---------------------------------------------------------------------------
+# Kaution / Mietvertragsprofil (Auftrag HV-20260913-VERTRAGSANLAGE)
+# ---------------------------------------------------------------------------
+
+
+def test_kaution_wird_angelegt_und_ist_getrennt_von_vertraglicher_kaution(session_factory, stammdaten_repo, op_service):
+    paket = _paket(kautionen=[{"vertrag_id": "V-1", "betrag_cent": 150000, "stichtag": "2020-01-01", "referenz": "Überweisung"}])
+    plan = _plan(paket, session_factory)
+    befund = next(b for b in plan.befunde if b.entitaet == "Kaution")
+    assert befund.status == "NEU"
+    ergebnis = _apply(paket, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    assert ergebnis.anzahl_kautionen == 1
+    kaution = stammdaten_repo.get_kaution("V-1")
+    assert kaution.betrag_cent == 150000
+    assert kaution.referenz == "Überweisung"
+    # Kaution legt kein Konto/keine OP-Position an - strukturell getrennt vom OP-Saldo.
+    assert stammdaten_repo.get_konto_by_vertrag("V-1") is None
+
+
+def test_kaution_wiederholimport_identisch_ist_wirkungslos(session_factory, stammdaten_repo, op_service):
+    paket = _paket(kautionen=[{"vertrag_id": "V-1", "betrag_cent": 150000, "stichtag": "2020-01-01"}])
+    plan1 = _plan(paket, session_factory)
+    _apply(paket, plan1, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    plan2 = _plan(paket, session_factory)
+    befund = next(b for b in plan2.befunde if b.entitaet == "Kaution")
+    assert befund.status == "UNVERAENDERT"
+    _apply(paket, plan2, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    assert stammdaten_repo.get_kaution("V-1").betrag_cent == 150000
+
+
+def test_kaution_abweichender_betrag_ist_konflikt_kein_stilles_update(session_factory, stammdaten_repo, op_service):
+    paket1 = _paket(kautionen=[{"vertrag_id": "V-1", "betrag_cent": 150000, "stichtag": "2020-01-01"}])
+    plan1 = _plan(paket1, session_factory)
+    _apply(paket1, plan1, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+
+    paket2 = _paket(kautionen=[{"vertrag_id": "V-1", "betrag_cent": 999999, "stichtag": "2020-01-01"}])
+    plan2 = _plan(paket2, session_factory)
+    befund = next(b for b in plan2.befunde if b.entitaet == "Kaution")
+    assert befund.status == "KONFLIKT"
+    assert not plan2.anwendbar
+    with pytest.raises(IntakeNichtAnwendbarError):
+        _apply(paket2, plan2, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    # Bestehende Kaution bleibt unangetastet.
+    assert stammdaten_repo.get_kaution("V-1").betrag_cent == 150000
+
+
+def test_kaution_negativer_betrag_ist_konflikt(session_factory):
+    paket = _paket(kautionen=[{"vertrag_id": "V-1", "betrag_cent": -100, "stichtag": "2020-01-01"}])
+    plan = _plan(paket, session_factory)
+    befund = next(b for b in plan.befunde if b.entitaet == "Kaution")
+    assert befund.status == "KONFLIKT"
+
+
+def test_mietvertragsprofil_wird_versioniert_angelegt(session_factory, stammdaten_repo, op_service):
+    paket = _paket(mietvertragsprofile=[{
+        "vertrag_id": "V-1", "nutzungsart": "WOHNUNG",
+        "urspruenglicher_mietbeginn": "2015-06-01", "verwaltungsuebernahme_am": "2020-01-01",
+        "quelle_typ": "MANUELL",
+    }])
+    plan = _plan(paket, session_factory)
+    befund = next(b for b in plan.befunde if b.entitaet == "Mietvertragsprofil")
+    assert befund.status == "NEU"
+    ergebnis = _apply(paket, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    assert ergebnis.anzahl_mietvertragsprofile == 1
+    profil = stammdaten_repo.neuestes_mietvertragsprofil("V-1")
+    assert profil.version == 1
+    assert profil.nutzungsart == "WOHNUNG"
+    assert profil.mahngebuehr_cent is None  # kein erfundener Default
+
+
+def test_mietvertragsprofil_abweichender_inhalt_ist_aktualisierung_kein_konflikt(session_factory, stammdaten_repo, op_service):
+    paket1 = _paket(mietvertragsprofile=[{"vertrag_id": "V-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL"}])
+    plan1 = _plan(paket1, session_factory)
+    _apply(paket1, plan1, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+
+    paket2 = _paket(mietvertragsprofile=[{
+        "vertrag_id": "V-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL",
+        "mahngebuehr_cent": 0,  # jetzt ausdrücklich belegt: keine Gebühr
+    }])
+    plan2 = _plan(paket2, session_factory)
+    befund = next(b for b in plan2.befunde if b.entitaet == "Mietvertragsprofil")
+    assert befund.status == "AKTUALISIERUNG"
+    assert plan2.anwendbar  # AKTUALISIERUNG blockiert NICHT
+    ergebnis = _apply(paket2, plan2, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    assert ergebnis.anzahl_mietvertragsprofile == 1
+    versionen = stammdaten_repo.liste_mietvertragsprofil_versionen("V-1")
+    assert [v.version for v in versionen] == [1, 2]
+    assert versionen[0].mahngebuehr_cent is None
+    assert versionen[1].mahngebuehr_cent == 0
+
+
+def test_mietvertragsprofil_identischer_wiederholimport_erzeugt_keine_neue_version(session_factory, stammdaten_repo, op_service):
+    paket = _paket(mietvertragsprofile=[{"vertrag_id": "V-1", "nutzungsart": "BUERO", "quelle_typ": "MANUELL"}])
+    plan1 = _plan(paket, session_factory)
+    _apply(paket, plan1, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    plan2 = _plan(paket, session_factory)
+    befund = next(b for b in plan2.befunde if b.entitaet == "Mietvertragsprofil")
+    assert befund.status == "UNVERAENDERT"
+    _apply(paket, plan2, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    assert len(stammdaten_repo.liste_mietvertragsprofil_versionen("V-1")) == 1
+
+
+def test_mietvertragsprofil_buero_wird_nicht_als_mrg_frei_abgeleitet(session_factory, stammdaten_repo, op_service):
+    """Nutzungsart ist unabhängig von Rechtsordnung - BUERO darf niemals
+    implizit eine Rechtsordnungs-Ableitung/-Änderung auslösen."""
+
+    paket = _paket(mietvertragsprofile=[{"vertrag_id": "V-1", "nutzungsart": "BUERO", "quelle_typ": "MANUELL"}])
+    plan = _plan(paket, session_factory)
+    _apply(paket, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    with session_factory() as session:
+        from mietinkasso.infrastructure.db.tables import VertragTable
+        vertrag = session.get(VertragTable, "V-1")
+        assert vertrag.rechtsordnung == "OESTERREICH_MRG_VOLL"  # unverändert vom Vertrags-Intake
+
+
+def test_mietvertragsprofil_ungueltige_nutzungsart_ist_konflikt(session_factory):
+    paket = _paket(mietvertragsprofile=[{"vertrag_id": "V-1", "nutzungsart": "GARTENHAUS", "quelle_typ": "MANUELL"}])
+    plan = _plan(paket, session_factory)
+    befund = next(b for b in plan.befunde if b.entitaet == "Mietvertragsprofil")
+    assert befund.status == "KONFLIKT"
+
+
+def test_mietvertragsprofil_unbekannter_vertrag_ist_konflikt(session_factory):
+    paket = _paket(mietvertragsprofile=[{"vertrag_id": "V-UNBEKANNT", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL"}])
+    plan = _plan(paket, session_factory)
+    befund = next(b for b in plan.befunde if b.entitaet == "Mietvertragsprofil")
+    assert befund.status == "KONFLIKT"
+    assert not plan.anwendbar
+
+
+def test_kaution_unbekannter_vertrag_ist_konflikt(session_factory):
+    paket = _paket(kautionen=[{"vertrag_id": "V-UNBEKANNT", "betrag_cent": 1000, "stichtag": "2020-01-01"}])
+    plan = _plan(paket, session_factory)
+    befund = next(b for b in plan.befunde if b.entitaet == "Kaution")
+    assert befund.status == "KONFLIKT"
+
+
+def test_doppelte_kaution_im_selben_paket_ist_konflikt(session_factory):
+    paket = _paket(kautionen=[
+        {"vertrag_id": "V-1", "betrag_cent": 1000, "stichtag": "2020-01-01"},
+        {"vertrag_id": "V-1", "betrag_cent": 2000, "stichtag": "2020-01-01"},
+    ])
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    assert all(b.status == "KONFLIKT" for b in plan.befunde if b.entitaet == "Kaution")
+
+
+def test_doppeltes_mietvertragsprofil_im_selben_paket_ist_konflikt(session_factory):
+    paket = _paket(mietvertragsprofile=[
+        {"vertrag_id": "V-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL"},
+        {"vertrag_id": "V-1", "nutzungsart": "BUERO", "quelle_typ": "MANUELL"},
+    ])
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    assert all(b.status == "KONFLIKT" for b in plan.befunde if b.entitaet == "Mietvertragsprofil")
+
+
+def test_mahngebuehr_none_bleibt_none_bei_fehlendem_feld_kein_erfundener_default(session_factory, stammdaten_repo, op_service):
+    paket = _paket(mietvertragsprofile=[{"vertrag_id": "V-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL"}])
+    plan = _plan(paket, session_factory)
+    _apply(paket, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    profil = stammdaten_repo.neuestes_mietvertragsprofil("V-1")
+    assert profil.mahngebuehr_cent is None
+
+
+def test_mietvertragsprofil_index_quellfelder_sind_reine_staging_daten_ohne_klausel(session_factory, stammdaten_repo, op_service):
+    """Die Index-Quellfelder dürfen NIEMALS automatisch eine aktive
+    `IndexKlauselTable`-Zeile/Freigabe/Sollstellung erzeugen (Auftrag
+    Markus, Präzisierung 13.09.)."""
+
+    paket = _paket(mietvertragsprofile=[{
+        "vertrag_id": "V-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL",
+        "index_reihe": "VPI 2020", "index_urspruenglicher_basismonat": "2015-06",
+        "index_urspruenglicher_basiswert": "106.7", "index_schwelle_prozent": "5.0",
+        "index_schwelle_inklusive": True, "index_anpassungsmonat": 4,
+        "index_mindestintervall_monate": 12, "index_klauseltext_auszug": "Der Mietzins erhöht sich...",
+        "index_klauseltext_seite": 3,
+    }])
+    plan = _plan(paket, session_factory)
+    _apply(paket, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    profil = stammdaten_repo.neuestes_mietvertragsprofil("V-1")
+    assert profil.index_reihe == "VPI 2020"
+    assert profil.index_schwelle_inklusive is True
+    with session_factory() as session:
+        from mietinkasso.infrastructure.db.tables import IndexKlauselTable
+        anzahl_klauseln = session.query(IndexKlauselTable).filter_by(vertrag_id="V-1").count()
+        assert anzahl_klauseln == 0  # keine automatisch erzeugte Klausel/Freigabe
+
+
+def test_kautionen_und_mietvertragsprofile_teilen_sich_kein_atomares_rollback_mit_fehler(session_factory, stammdaten_repo, op_service):
+    """Ein Fehler in einer anderen Entität desselben Pakets darf keine
+    bereits geplante Kaution/Mietvertragsprofil-Zeile isoliert schreiben -
+    das gesamte Paket bleibt atomar (siehe `test_atomarer_rollback_bei_einer_kaputten_zeile`)."""
+
+    paket = _paket(
+        kautionen=[{"vertrag_id": "V-1", "betrag_cent": 150000, "stichtag": "2020-01-01"}],
+        mietvertragsprofile=[{"vertrag_id": "V-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL"}],
+        sperren=[{"vertrag_id": "V-UNBEKANNT", "grund": "MANUELL"}],  # referenziert unbekannten Vertrag -> KONFLIKT
+    )
+    plan = _plan(paket, session_factory)
+    assert not plan.anwendbar
+    with pytest.raises(IntakeNichtAnwendbarError):
+        _apply(paket, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    assert stammdaten_repo.get_kaution("V-1") is None
+    assert stammdaten_repo.neuestes_mietvertragsprofil("V-1") is None

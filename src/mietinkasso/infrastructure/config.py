@@ -113,6 +113,16 @@ class Settings(BaseSettings):
     # in diesem Repository). Default false.
     indexautomatik_soll_umsetzung_enabled: bool = False
 
+    # Vertragsanlage-Aufnahme (Auftrag HV-20260913-VERTRAGSANLAGE): der
+    # hochgeladene Original-PDF-Vertrag wird NIE ins Repository/DB-BLOB
+    # geschrieben, sondern in dieses private Verzeichnis AUSSERHALB des
+    # Repos gelegt - ohne konfiguriertes Verzeichnis bleibt der Upload
+    # blockiert (kein Fallback auf einen Pfad INNERHALB des Repos, kein
+    # /tmp-Verzeichnis, das mit anderen Prozessen geteilt sein könnte).
+    vertragsanlage_upload_verzeichnis: str | None = None
+    vertragsanlage_max_upload_bytes: int = 15 * 1024 * 1024
+    vertragsanlage_max_seiten: int = 60
+
 
 class ProduktionskonfigurationUngueltigError(RuntimeError):
     """Wird beim Prozessstart geworfen, wenn `environment == "production"`

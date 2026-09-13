@@ -107,6 +107,31 @@ class Rechtsordnung(str, enum.Enum):
     UNGEKLAERT = "UNGEKLAERT"
 
 
+class Nutzungsart(str, enum.Enum):
+    """Anzeige-/Verwaltungsklassifikation der tatsächlichen Nutzung einer
+    Mieteinheit (Auftrag HV-20260913-VERTRAGSANLAGE) - AUSDRÜCKLICH
+    UNABHÄNGIG von `Rechtsordnung`/`RechtsprofilTable.ist_wohnungsnutzung`:
+    ein Büro kann MRG-Vollanwendung sein, eine Wohnung kann Geschäftsraum-
+    artig vermietet sein. Niemals aus der Rechtsordnung ableiten (kein
+    "Büro = MRG-frei"-Rateversuch, siehe `mieweg_vorschau/service.py`)."""
+
+    WOHNUNG = "WOHNUNG"
+    BUERO = "BUERO"
+    GESCHAEFTSLOKAL = "GESCHAEFTSLOKAL"
+    SONSTIGE = "SONSTIGE"
+    UNGEKLAERT = "UNGEKLAERT"
+
+
+class MietvertragsprofilQuelle(str, enum.Enum):
+    """Herkunft einer `MietvertragsprofilTable`-Version - nie
+    stillschweigend geraten, siehe `intake/pdf_extraktion.py`/
+    `intake/schema.py::MietvertragsprofilZeile`."""
+
+    PDF_EXTRAKTION = "PDF_EXTRAKTION"
+    MANUELL = "MANUELL"
+    IMPORT_SCHEMA = "IMPORT_SCHEMA"
+
+
 def rechtsordnung_geklaert(rechtsordnung: str) -> bool:
     """Zentrale Prüfung, die von `vorschreibung/service.py::sollstellen`,
     `index/service.py::klausel_anlegen`/`berechne_vorschlag` und

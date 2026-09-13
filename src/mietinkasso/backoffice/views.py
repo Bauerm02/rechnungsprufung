@@ -77,6 +77,7 @@ def parse_eur_betrag(text: str | None) -> int:
 #: sein, sonst gibt es keinen sichtbaren Weg dorthin.
 _NAV_LINKS = [
     ("/backoffice/", "Dashboard"),
+    ("/backoffice/vertraege", "Mietverträge"),
     ("/backoffice/eroeffnung", "Eröffnungsimport"),
     ("/backoffice/bank", "Bankimport"),
     ("/backoffice/bank/unzugeordnet", "Offene Zuordnungen"),

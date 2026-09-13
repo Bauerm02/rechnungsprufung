@@ -132,6 +132,94 @@ class KautionTable(Base):
     referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
 
+class MietvertragsprofilTable(Base):
+    """Zusätzliche, VERSIONIERTE Verwaltungs-/Anzeigefelder je Vertrag
+    (Auftrag HV-20260913-VERTRAGSANLAGE) - bewusst GETRENNT von
+    `RechtsprofilTable` (das ist die Freigabe-pflichtige Rechtsgrundlage
+    der Indexautomatik) und von `VertragTable.gueltig_von` (das bleibt
+    unverändert die für Sollstellung/OP maßgebliche technische
+    Vertragslaufzeit).
+
+    `urspruenglicher_mietbeginn`/`verwaltungsuebernahme_am` sind ein
+    Auftrag Markus (13.09., Rückprüfung): bei Altobjekten ist
+    `VertragTable.gueltig_von` häufig das Datum der VERWALTUNGS-
+    ÜBERNAHME, nicht der tatsächliche Mietbeginn - das darf niemals als
+    Indexstart/Rechenstart verwendet oder damit verwechselt werden,
+    deshalb ein separates, rein dokumentarisches Feldpaar hier.
+
+    Append-only wie überall in diesem Repository: eine inhaltliche
+    Änderung legt eine NEUE Version an (siehe `intake/planner.py`),
+    NIE ein In-Place-Update - abweichend von der sonst strikten
+    Stammdaten-Konfliktregel ist das hier ABSICHTLICH KEIN Konflikt,
+    weil laufende Datenpflege/Korrektur dieser rein beschreibenden
+    Felder normal ist (siehe `docs/hausverwaltung/IMPORT_VERTRAG.md`,
+    Abschnitt `mietvertragsprofile[]`)."""
+
+    __tablename__ = "mietvertragsprofile"
+    __table_args__ = (UniqueConstraint("vertrag_id", "version", name="uq_mietvertragsprofil_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    # WOHNUNG|BUERO|GESCHAEFTSLOKAL|SONSTIGE|UNGEKLAERT - NIEMALS aus
+    # `rechtsordnung`/`ist_wohnungsnutzung` abgeleitet (kein "Büro =
+    # MRG-frei"-Rateversuch, siehe mieweg_vorschau/service.py).
+    nutzungsart: Mapped[str] = mapped_column(String(24), default="UNGEKLAERT", server_default=text("'UNGEKLAERT'"))
+    urspruenglicher_mietbeginn: Mapped[date | None] = mapped_column(Date, nullable=True)
+    verwaltungsuebernahme_am: Mapped[date | None] = mapped_column(Date, nullable=True)
+    verwaltung_bezeichnung: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Der VEREINBARTE Betrag laut Vertrag - strukturell GETRENNT von
+    # `KautionTable.betrag_cent` (der TATSÄCHLICH eingegangene, bestätigte
+    # Betrag). Ein vereinbarter Betrag ist NIEMALS ein Zahlungsbeleg
+    # (Auftrag Markus: "Kaution-Soll aus Vertrag ist kein Zahlungsbeleg!").
+    vertragliche_kaution_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    vertragliche_kaution_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Nur mit Klausel/Quelle erfassbar, NIE automatisch berechnet oder
+    # verzinst. NULLABLE, KEIN Default 0 (Auftrag Markus, Präzisierung:
+    # "mahngebuehr_cent möglichst null für unbekannt, 0 bedeutet explizit
+    # keine Gebühr; keine erfundene Null durch fehlenden Fund") - `None`
+    # = nicht erfasst/unbekannt, `0` = eine ausdrücklich belegte
+    # vertragliche Aussage "keine Mahngebühr". Diese Unterscheidung geht
+    # verloren, sobald ein fehlender PDF-Fund stillschweigend als 0
+    # eingetragen würde - deshalb kein Default hier.
+    mahngebuehr_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mahngebuehr_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Strukturierte, AUSDRÜCKLICH UNVERBINDLICHE Index-QUELLFELDER (Auftrag
+    # Markus, Präzisierung 13.09.: "im Zusatzprofil strukturierte,
+    # ausdrücklich unverbindliche Index-Quellfelder speichern ... Die
+    # bestätigte Übernahme darf daraus KEINE aktive Indexklausel/Freigabe
+    # oder Solländerung erzeugen"). Reine STAGING-Ablage dessen, was im
+    # Vertragstext zur Wertsicherung gefunden wurde - erzeugt NIEMALS
+    # automatisch eine `IndexKlauselTable`-Zeile, keine Freigabe, keine
+    # Sollstellung. Die tatsächlich WIRKSAME Klausel bleibt ausschließlich
+    # über den bestehenden, eigenen Weg (`index/service.py::
+    # klausel_anlegen` + `klausel_freigeben`, Backoffice-Formular
+    # `/vertrag/{id}/indexklauseln`) erzeugt - diese Felder hier sind ein
+    # Gedächtnisstütze/Vorbefüll-Vorschlag für GENAU dieses bestehende
+    # Formular, keine eigene Berechnungsgrundlage. Immer zusammen mit dem
+    # tatsächlich freigegebenen Regelprofil (falls vorhanden) UND einem
+    # eventuellen Rekonstruktionsmodell getrennt lesbar anzuzeigen, nie
+    # vermischt (Auftrag Markus: "Vorhandene wirksame Klausel und
+    # Rekonstruktionsmodell separat lesbar").
+    index_reihe: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    index_urspruenglicher_basismonat: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    index_urspruenglicher_basiswert: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
+    index_schwelle_prozent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
+    # Tri-State: `None` = im Vertragstext nicht eindeutig festgestellt
+    # (weder "ab" noch "über" belegt) - NIE geraten.
+    index_schwelle_inklusive: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    index_anpassungsmonat: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    index_mindestintervall_monate: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    index_klauseltext_auszug: Mapped[str | None] = mapped_column(Text, nullable=True)
+    index_klauseltext_seite: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # PDF_EXTRAKTION|MANUELL|IMPORT_SCHEMA - wie diese Version entstand,
+    # NIE stillschweigend geraten.
+    quelle_typ: Mapped[str] = mapped_column(String(24))
+    quelle_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class SperreTable(Base):
     __tablename__ = "sperren"
 

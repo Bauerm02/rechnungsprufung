@@ -15,12 +15,22 @@ from datetime import date
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from mietinkasso.domain.enums import Nutzungsstatus, OPTyp, Rechtsordnung, Sperrgrund, rechtsordnung_geklaert
+from mietinkasso.domain.enums import (
+    MietvertragsprofilQuelle,
+    Nutzungsart,
+    Nutzungsstatus,
+    OPTyp,
+    Rechtsordnung,
+    Sperrgrund,
+    rechtsordnung_geklaert,
+)
 from mietinkasso.infrastructure.db.tables import (
     DebitorTable,
     EinheitTable,
     GesellschaftTable,
+    KautionTable,
     KontoTable,
+    MietvertragsprofilTable,
     ObjektTable,
     OPPositionTable,
     SperreTable,
@@ -31,11 +41,16 @@ from mietinkasso.intake.schema import (
     EroeffnungskorrekturZeile,
     EroeffnungZeile,
     IntakePaket,
+    KautionZeile,
     KomponenteZeile,
+    MietvertragsprofilZeile,
     NachbuchungZeile,
     SperreZeile,
     paket_hash,
 )
+
+_GUELTIGE_NUTZUNGSARTEN = {e.value for e in Nutzungsart}
+_GUELTIGE_MIETVERTRAGSPROFIL_QUELLEN = {e.value for e in MietvertragsprofilQuelle}
 
 _GUELTIGE_NUTZUNGSSTATUS = {e.value for e in Nutzungsstatus}
 _GUELTIGE_RECHTSORDNUNGEN = {e.value for e in Rechtsordnung}
@@ -55,8 +70,15 @@ class PruefBefund:
       widerspricht einer anderen Zeile desselben Pakets.
     - "GESPERRT": Objekt 107/ausgeschlossen, oder ein Anfangssaldo ohne
       `quelle_bestaetigt`.
-    Nur "NEU"/"UNVERAENDERT" sind unproblematisch; ein Paket mit
-    irgendeinem KONFLIKT/GESPERRT ist NICHT anwendbar (siehe
+    - "AKTUALISIERUNG": NUR für `Mietvertragsprofil` (Auftrag
+      HV-20260913-VERTRAGSANLAGE) - existiert bereits, aber mit
+      abweichendem Inhalt gegenüber der zuletzt gespeicherten Version.
+      Anders als "KONFLIKT" blockiert das NICHT den Lauf: laufende
+      Datenpflege an rein deskriptiven Verwaltungsfeldern ist gewollt
+      (siehe `MietvertragsprofilTable`-Docstring) und erzeugt beim Apply
+      eine neue, sichtbare Version statt den gesamten Lauf abzulehnen.
+    "NEU"/"UNVERAENDERT"/"AKTUALISIERUNG" sind unproblematisch; ein Paket
+    mit irgendeinem KONFLIKT/GESPERRT ist NICHT anwendbar (siehe
     `IntakePlan.anwendbar`)."""
 
     entitaet: str
@@ -86,6 +108,10 @@ class IntakePlan:
     @property
     def gesperrt(self) -> list[PruefBefund]:
         return [b for b in self.befunde if b.status == "GESPERRT"]
+
+    @property
+    def aktualisierungen(self) -> list[PruefBefund]:
+        return [b for b in self.befunde if b.status == "AKTUALISIERUNG"]
 
     @property
     def anwendbar(self) -> bool:
@@ -146,6 +172,79 @@ def _komponente_felder(
         "ust_satz_promille": ust_satz_promille, "indexierbar": indexierbar,
         "gueltig_von": str(gueltig_von), "gueltig_bis": str(gueltig_bis) if gueltig_bis else None,
     }
+
+
+def _kaution_felder(betrag_cent: int, stichtag: date, referenz: str | None) -> dict:
+    return {"betrag_cent": betrag_cent, "stichtag": str(stichtag), "referenz": referenz}
+
+
+def _mietvertragsprofil_felder(
+    *, nutzungsart: str, urspruenglicher_mietbeginn: date | None, verwaltungsuebernahme_am: date | None,
+    verwaltung_bezeichnung: str | None, vertragliche_kaution_cent: int | None,
+    vertragliche_kaution_quellenbeleg: str | None, mahngebuehr_cent: int | None,
+    mahngebuehr_quellenbeleg: str | None, index_reihe: str | None,
+    index_urspruenglicher_basismonat: str | None, index_urspruenglicher_basiswert,
+    index_schwelle_prozent, index_schwelle_inklusive: bool | None, index_anpassungsmonat: int | None,
+    index_mindestintervall_monate: int | None, index_klauseltext_auszug: str | None,
+    index_klauseltext_seite: int | None, quelle_typ: str, quelle_referenz: str | None,
+) -> dict:
+    """Feldabbild für den Versionsvergleich (siehe `_pruefe_mietvertragsprofil`)
+    - bewusst OHNE `erstellt_von`/`erstellt_am`/`version`: eine neue Version mit
+    identischem fachlichem Inhalt aber anderem Erfasser/Zeitstempel ist immer
+    noch UNVERAENDERT, kein Grund für eine neue Version."""
+    return {
+        "nutzungsart": nutzungsart,
+        "urspruenglicher_mietbeginn": str(urspruenglicher_mietbeginn) if urspruenglicher_mietbeginn else None,
+        "verwaltungsuebernahme_am": str(verwaltungsuebernahme_am) if verwaltungsuebernahme_am else None,
+        "verwaltung_bezeichnung": verwaltung_bezeichnung,
+        "vertragliche_kaution_cent": vertragliche_kaution_cent,
+        "vertragliche_kaution_quellenbeleg": vertragliche_kaution_quellenbeleg,
+        "mahngebuehr_cent": mahngebuehr_cent,
+        "mahngebuehr_quellenbeleg": mahngebuehr_quellenbeleg,
+        "index_reihe": index_reihe,
+        "index_urspruenglicher_basismonat": index_urspruenglicher_basismonat,
+        "index_urspruenglicher_basiswert": str(index_urspruenglicher_basiswert) if index_urspruenglicher_basiswert is not None else None,
+        "index_schwelle_prozent": str(index_schwelle_prozent) if index_schwelle_prozent is not None else None,
+        "index_schwelle_inklusive": index_schwelle_inklusive,
+        "index_anpassungsmonat": index_anpassungsmonat,
+        "index_mindestintervall_monate": index_mindestintervall_monate,
+        "index_klauseltext_auszug": index_klauseltext_auszug,
+        "index_klauseltext_seite": index_klauseltext_seite,
+        "quelle_typ": quelle_typ,
+        "quelle_referenz": quelle_referenz,
+    }
+
+
+def _mietvertragsprofil_felder_aus_zeile(z: MietvertragsprofilZeile) -> dict:
+    return _mietvertragsprofil_felder(
+        nutzungsart=z.nutzungsart, urspruenglicher_mietbeginn=z.urspruenglicher_mietbeginn,
+        verwaltungsuebernahme_am=z.verwaltungsuebernahme_am, verwaltung_bezeichnung=z.verwaltung_bezeichnung,
+        vertragliche_kaution_cent=z.vertragliche_kaution_cent,
+        vertragliche_kaution_quellenbeleg=z.vertragliche_kaution_quellenbeleg,
+        mahngebuehr_cent=z.mahngebuehr_cent, mahngebuehr_quellenbeleg=z.mahngebuehr_quellenbeleg,
+        index_reihe=z.index_reihe, index_urspruenglicher_basismonat=z.index_urspruenglicher_basismonat,
+        index_urspruenglicher_basiswert=z.index_urspruenglicher_basiswert,
+        index_schwelle_prozent=z.index_schwelle_prozent, index_schwelle_inklusive=z.index_schwelle_inklusive,
+        index_anpassungsmonat=z.index_anpassungsmonat, index_mindestintervall_monate=z.index_mindestintervall_monate,
+        index_klauseltext_auszug=z.index_klauseltext_auszug, index_klauseltext_seite=z.index_klauseltext_seite,
+        quelle_typ=z.quelle_typ, quelle_referenz=z.quelle_referenz,
+    )
+
+
+def _mietvertragsprofil_felder_aus_tabelle(t: MietvertragsprofilTable) -> dict:
+    return _mietvertragsprofil_felder(
+        nutzungsart=t.nutzungsart, urspruenglicher_mietbeginn=t.urspruenglicher_mietbeginn,
+        verwaltungsuebernahme_am=t.verwaltungsuebernahme_am, verwaltung_bezeichnung=t.verwaltung_bezeichnung,
+        vertragliche_kaution_cent=t.vertragliche_kaution_cent,
+        vertragliche_kaution_quellenbeleg=t.vertragliche_kaution_quellenbeleg,
+        mahngebuehr_cent=t.mahngebuehr_cent, mahngebuehr_quellenbeleg=t.mahngebuehr_quellenbeleg,
+        index_reihe=t.index_reihe, index_urspruenglicher_basismonat=t.index_urspruenglicher_basismonat,
+        index_urspruenglicher_basiswert=t.index_urspruenglicher_basiswert,
+        index_schwelle_prozent=t.index_schwelle_prozent, index_schwelle_inklusive=t.index_schwelle_inklusive,
+        index_anpassungsmonat=t.index_anpassungsmonat, index_mindestintervall_monate=t.index_mindestintervall_monate,
+        index_klauseltext_auszug=t.index_klauseltext_auszug, index_klauseltext_seite=t.index_klauseltext_seite,
+        quelle_typ=t.quelle_typ, quelle_referenz=t.quelle_referenz,
+    )
 
 
 def _vertrag_felder(
@@ -406,6 +505,20 @@ def pruefe_paket(
             objekt_ausgeschlossen=objekt_id is not None and _objekt_ausgeschlossen(objekt_id),
         )
 
+    kaution_mehrfach = _mehrfache_werte([z.vertrag_id for z in paket.kautionen])
+    for z in paket.kautionen:
+        if z.vertrag_id in kaution_mehrfach:
+            befunde.append(PruefBefund("Kaution", z.vertrag_id, "KONFLIKT", f"Kaution für Vertrag '{z.vertrag_id}' ist mehrfach im selben Paket vertreten - eindeutige Zeile je Vertrag ist Pflicht."))
+            continue
+        _pruefe_kaution(z, session=session, befunde=befunde, vertrag_bekannt=_vertrag_bekannt(z.vertrag_id))
+
+    mietvertragsprofil_mehrfach = _mehrfache_werte([z.vertrag_id for z in paket.mietvertragsprofile])
+    for z in paket.mietvertragsprofile:
+        if z.vertrag_id in mietvertragsprofil_mehrfach:
+            befunde.append(PruefBefund("Mietvertragsprofil", z.vertrag_id, "KONFLIKT", f"Mietvertragsprofil für Vertrag '{z.vertrag_id}' ist mehrfach im selben Paket vertreten - eindeutige Zeile je Vertrag ist Pflicht."))
+            continue
+        _pruefe_mietvertragsprofil(z, session=session, befunde=befunde, vertrag_bekannt=_vertrag_bekannt(z.vertrag_id))
+
     if fehlende_email_anzahl:
         hinweise.append(f"{fehlende_email_anzahl} Debitor(en) ohne E-Mail — bleiben anlegbar, sind aber nie automatisch mahnfähig.")
     if fehlende_faelligkeit_anzahl:
@@ -637,6 +750,71 @@ def _pruefe_komponente(
         befunde.append(PruefBefund(entitaet, z.id, "UNVERAENDERT"))
     else:
         befunde.append(PruefBefund(entitaet, z.id, "KONFLIKT", f"Komponente '{z.id}' existiert bereits mit abweichendem Inhalt."))
+
+
+def _pruefe_kaution(
+    z: KautionZeile, *, session: Session, befunde: list[PruefBefund], vertrag_bekannt: bool,
+) -> None:
+    """STRIKTE Idempotenz wie die übrigen Stammdaten (siehe `KautionZeile`-
+    Docstring): eine Kaution ist ein bestätigter Zahlungsfakt, keine laufend
+    fortzuschreibende Angabe wie `MietvertragsprofilZeile` - abweichender
+    Inhalt ist immer ein KONFLIKT, nie eine stille Aktualisierung."""
+
+    entitaet = "Kaution"
+    if not vertrag_bekannt:
+        befunde.append(PruefBefund(entitaet, z.vertrag_id, "KONFLIKT", f"Kaution referenziert unbekannten Vertrag '{z.vertrag_id}'."))
+        return
+    if z.betrag_cent <= 0:
+        befunde.append(PruefBefund(entitaet, z.vertrag_id, "KONFLIKT", f"Kaution für Vertrag '{z.vertrag_id}': betrag_cent muss positiv sein ({z.betrag_cent})."))
+        return
+    felder = _kaution_felder(z.betrag_cent, z.stichtag, z.referenz)
+    bestehend = session.execute(select(KautionTable).where(KautionTable.vertrag_id == z.vertrag_id)).scalar_one_or_none()
+    if bestehend is None:
+        befunde.append(PruefBefund(entitaet, z.vertrag_id, "NEU"))
+    elif _felder_hash(_kaution_felder(bestehend.betrag_cent, bestehend.stichtag, bestehend.referenz)) == _felder_hash(felder):
+        befunde.append(PruefBefund(entitaet, z.vertrag_id, "UNVERAENDERT"))
+    else:
+        befunde.append(PruefBefund(entitaet, z.vertrag_id, "KONFLIKT", f"Kaution für Vertrag '{z.vertrag_id}' existiert bereits mit abweichendem Inhalt."))
+
+
+def _neuestes_mietvertragsprofil(session: Session, vertrag_id: str) -> MietvertragsprofilTable | None:
+    return session.execute(
+        select(MietvertragsprofilTable)
+        .where(MietvertragsprofilTable.vertrag_id == vertrag_id)
+        .order_by(MietvertragsprofilTable.version.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _pruefe_mietvertragsprofil(
+    z: MietvertragsprofilZeile, *, session: Session, befunde: list[PruefBefund], vertrag_bekannt: bool,
+) -> None:
+    """Anders als alle übrigen Stammdaten-Zeilen: ein abweichender Inhalt
+    ist HIER kein KONFLIKT, sondern eine neue Version ("AKTUALISIERUNG") -
+    siehe `MietvertragsprofilTable`-Docstring und `PruefBefund`-Docstring."""
+
+    entitaet = "Mietvertragsprofil"
+    if not vertrag_bekannt:
+        befunde.append(PruefBefund(entitaet, z.vertrag_id, "KONFLIKT", f"Mietvertragsprofil referenziert unbekannten Vertrag '{z.vertrag_id}'."))
+        return
+    if z.nutzungsart not in _GUELTIGE_NUTZUNGSARTEN:
+        befunde.append(PruefBefund(entitaet, z.vertrag_id, "KONFLIKT", f"Mietvertragsprofil '{z.vertrag_id}': ungültige Nutzungsart '{z.nutzungsart}'."))
+        return
+    if z.quelle_typ not in _GUELTIGE_MIETVERTRAGSPROFIL_QUELLEN:
+        befunde.append(PruefBefund(entitaet, z.vertrag_id, "KONFLIKT", f"Mietvertragsprofil '{z.vertrag_id}': ungültiger quelle_typ '{z.quelle_typ}'."))
+        return
+    bestehend = _neuestes_mietvertragsprofil(session, z.vertrag_id)
+    neue_felder = _mietvertragsprofil_felder_aus_zeile(z)
+    if bestehend is None:
+        befunde.append(PruefBefund(entitaet, z.vertrag_id, "NEU"))
+    elif _felder_hash(_mietvertragsprofil_felder_aus_tabelle(bestehend)) == _felder_hash(neue_felder):
+        befunde.append(PruefBefund(entitaet, z.vertrag_id, "UNVERAENDERT"))
+    else:
+        befunde.append(PruefBefund(
+            entitaet, z.vertrag_id, "AKTUALISIERUNG",
+            f"Mietvertragsprofil '{z.vertrag_id}' erhält eine neue Version (Inhalt weicht von der zuletzt "
+            "gespeicherten Version ab) - bestehende Konten/OP/Sperren/Komponenten bleiben unangetastet.",
+        ))
 
 
 def erstelle_plan(

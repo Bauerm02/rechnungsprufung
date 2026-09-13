@@ -1906,3 +1906,116 @@ in `RAHMENPROGRAMM.md` (Abschnitt "HV-20260913-RUECKSTAENDE").
   Status, keine rückwirkende Tatsachenbehauptung für vergangene Monate.
 - **Keine Migrationsspalten-Änderung.** Reine Anwendungsschicht über
   bestehenden Tabellen, keine neue Tabelle/Spalte in dieser Sitzung.
+
+## Paket Vertragsanlage (Auftrag 13.09.2026, HV-20260913-VERTRAGSANLAGE)
+
+### Was funktioniert (mit Tests belegt)
+
+- Neue additive Tabelle `mietvertragsprofile` (append-only, versioniert
+  je Vertrag) + neue Nutzungsart-/Quelle-Enums
+  (`domain/enums.py::Nutzungsart`, `MietvertragsprofilQuelle`). Zwei
+  neue Intake-Entitätstypen `kautionen[]` (STRIKTE Idempotenz, wie
+  übrige Stammdaten) und `mietvertragsprofile[]` (NEUER, nicht-
+  blockierender `AKTUALISIERUNG`-Status statt Konflikt bei laufender
+  Datenpflege) - vollständig dokumentiert in
+  `docs/hausverwaltung/IMPORT_VERTRAG.md`. `mahngebuehr_cent` ist
+  NULLABLE (`None`=unbekannt, `0`=ausdrücklich belegte "keine
+  Gebühr") - nie ein erfundener Default. Neun ausdrücklich
+  unverbindliche Index-Quellfelder (`index_reihe` usw.) als reine
+  Gedächtnisstütze für das bestehende Indexklausel-Formular - erzeugen
+  NIEMALS automatisch eine `IndexKlauselTable`-Zeile/Freigabe/
+  Sollstellung.
+- Neue Backoffice-Navigation "Mietverträge" + Dashboard-Link,
+  Übersichtsliste mit Dropdown-Auswahl (Objekt/Einheit/Mieter),
+  Detailseite mit kurzen, klar getrennten Feldern (Mieter/Vermieter-
+  Gesellschaft/Verwaltung, Nutzung vs. Rechtsordnung, technischer
+  Vertragsbeginn vs. ursprünglicher Mietbeginn vs.
+  Verwaltungsübernahme, Mietbestandteile, Kaution vereinbart vs.
+  eingegangen, Mahngebühr, Index-Quellfelder) mit Kurzstatus
+  "bereit"/"Angabe fehlt"/"Klärung erforderlich" je Feld, Links zu
+  Mietkonto/Mahnvorschau/Indexregel/Rekonstruktionsmodell, sowie einem
+  eingeklappten "Quellen und Historie"-Bereich (Rechtsprofil-Status,
+  Indexklausel-Status, Mietvertragsprofil-Versionen).
+- Einmaliger Aufnahmeablauf: PDF hochladen (optional) → lokale,
+  KI-freie Textextraktion mit Seitenreferenz (`pypdf`, reine Regex-
+  Heuristiken, siehe `vertragsanlage/pdf_extraktion.py`) → editierbare
+  Prüfung mit Beleg-Hinweis je vorgeschlagenem Feld → Vorschau (nutzt
+  den BESTEHENDEN generischen Intake `intake/parser.py`+`planner.py`+
+  `apply.py`, KEINE zweite Buchungsstrecke, siehe
+  `vertragsanlage/paket_bau.py`) → atomare, hash-gebundene Übernahme.
+  Bestehende Verträge/Konten/OP/Sperren/Komponenten bleiben unberührt;
+  eine bereits bestätigte Kaution wird NIE über diesen Ablauf
+  überschrieben (strikte Idempotenz, read-only Anzeige im Formular,
+  sobald vorhanden).
+- Sicherheitsgrenzen technisch erzwungen: Originalupload landet
+  ausschließlich in einem privaten, konfigurierbaren Verzeichnis
+  AUSSERHALB des Repos (`MIETINKASSO_VERTRAGSANLAGE_UPLOAD_VERZEICHNIS`,
+  ohne Konfiguration bleibt der Upload blockiert), Dateiname wird NIE
+  aus Client-Eingaben übernommen (SHA256-Hex als einziger Dateiname),
+  Größen-/Seitenlimit konfigurierbar
+  (`vertragsanlage_max_upload_bytes`/`_max_seiten`), Magic-Byte-Prüfung
+  vor dem Schreiben, kein HTML/Skript aus dem Dokument wird je
+  ausgeführt (nur `extract_text()`, jeder Auszug läuft durch `h()`).
+  CSRF/Session/Objekt-107-Ausschluss/Gesellschaftsscope wie im übrigen
+  Backoffice. Keine automatische Sollbuchung/Indexfreigabe/E-Mail/
+  Lastschrift wird durch diesen Ablauf je ausgelöst - es werden
+  ausschließlich Stammdaten-Repository-Methoden aufgerufen.
+- 15 neue Backoffice-HTTP-Tests (Navigation/Dashboard-Link, voller
+  PDF-Upload→Vorschau→Übernahme-Ablauf für einen NEUEN Vertrag,
+  doppelte Vertrag-ID abgelehnt, Objekt-107-Vertrag nicht bearbeitbar,
+  unbekannter Vertrag abgelehnt, manuelle Profilaktualisierung über
+  mehrere Versionen inkl. Wiederholimport-Wirkungslosigkeit, Kaution
+  bucht nie in den OP-Saldo, XSS im PDF-Text wird escaped, Scan ohne
+  Textlayer zeigt Warnung, zu große/keine-PDF-Datei abgelehnt, CSRF-
+  Pflicht, Gesellschaftsscope-Durchsetzung) + 13 neue Tests für
+  PDF-Extraktion/Ablage (`test_vertragsanlage_pdf.py`, inkl. mehrdeutige
+  Nutzungsart erzeugt keinen Vorschlag, Pfadmanipulation bei Ablage-
+  Referenz abgelehnt) + 16 neue Intake-Tests für `kautionen[]`/
+  `mietvertragsprofile[]` (NEU/UNVERAENDERT/KONFLIKT/AKTUALISIERUNG,
+  doppelte Zeile im selben Paket, unbekannter Vertrag, atomarer
+  Rollback bei Fehler in einer anderen Entität desselben Pakets).
+  Gesamter Mietinkasso-Testsatz: 818 Tests grün.
+
+### Was ausdrücklich NICHT geliefert ist (bewusste, offen benannte Lücken)
+
+- **Keine OCR.** Ein gescanntes PDF ohne Textlayer liefert `hat_textlage
+  =False` und KEINE automatischen Vorschläge - die Lücke wird im
+  Formular sichtbar gemacht ("Kein auswertbarer Textlayer gefunden"),
+  nicht stillschweigend mit leeren/falschen Werten überdeckt. Vollständig
+  manuelle Erfassung bleibt in diesem Fall der einzige Weg.
+- **Keine sichere, umfassende Vertragssemantik.** Die PDF-Feldvorschläge
+  sind bewusst einfache, dokumentierte Regex-Heuristiken für gängige
+  deutschsprachige Formulierungen (`vertragsanlage/pdf_extraktion.py`) -
+  ungewöhnlich formulierte Klauseln, mehrsprachige Verträge oder
+  Sonderfälle werden NICHT erkannt und bleiben leer (kein Rateversuch).
+  Jeder Vorschlag zeigt Seite+Textauszug und bleibt vor der Übernahme
+  editierbar; die menschliche Prüfung ist in jedem Fall Pflicht.
+- **"Neuen Mietvertrag anlegen" setzt bereits vorhandene Objekt-/
+  Einheit-/Debitor-/Gesellschaft-Stammdaten voraus.** Diese Runde legt
+  KEINE neuen Objekte/Einheiten/Debitoren/Gesellschaften über die
+  Vertragsanlage-UI an (dafür bleibt der bestehende generische
+  Echtbetrieb-Intake, `scripts/intake_import.py`, zuständig) - das
+  Neuanlage-Formular bietet nur eine Auswahl aus bereits importierten
+  Stammdaten.
+- **Kein automatischer Konflikt-Vorschlag/Merge-Assistent.** Bei einem
+  echten inhaltlichen KONFLIKT (z. B. abweichender Kautionsbetrag bei
+  Wiederholimport) zeigt die Vorschau den Grund, bietet aber keine
+  automatische Auflösung an - eine Klärung außerhalb dieses Ablaufs
+  bleibt nötig.
+- **Kein Massen-Upload.** Ein Durchlauf verarbeitet genau ein PDF für
+  genau einen Vertrag; ein Stapel mehrerer Verträge braucht mehrere
+  Durchläufe (oder das bestehende `mietvertragsprofile[]`-JSON-/CSV-
+  Format für Codex' bereits ausgelesene Verträge, siehe
+  IMPORT_VERTRAG.md).
+- **`pypdf` erfordert eine funktionsfähige `cryptography`/`cffi`-
+  Installation** (transitive Abhängigkeit für PDF-Verschlüsselungs-
+  Unterstützung) - in dieser Entwicklungsumgebung war das System-Paket
+  `cryptography` zunächst ohne passendes `cffi` installiert und der
+  Import schlug fehl, bis `cffi` nachinstalliert wurde. Codex sollte
+  dies beim ersten Produktivstart auf dem Zielserver verifizieren
+  (`python -c "import pypdf"`), bevor der Aufnahmeablauf produktiv
+  läuft.
+- **`vertragsanlage_upload_verzeichnis` muss vor Produktivstart gesetzt
+  werden** - ohne Konfiguration bleibt jeder PDF-Upload mit HTTP 400
+  blockiert (bewusst "closed by default", siehe
+  `infrastructure/config.py`).

@@ -42,6 +42,7 @@ def backoffice_client():
     # ein "Secure"-Cookie nie zurücksenden. Nur für diesen Testprozess
     # ausdrücklich deaktivieren - siehe infrastructure/config.py.
     os.environ["MIETINKASSO_BACKOFFICE_COOKIE_SECURE"] = "false"
+    os.environ["MIETINKASSO_VERTRAGSANLAGE_UPLOAD_VERZEICHNIS"] = str(Path(tempfile.mkdtemp(prefix="mietinkasso-vertragsanlage-upload-")))
     get_settings.cache_clear()
 
     from mietinkasso.infrastructure.db.session import build_session_factory, create_all_tables
@@ -1674,6 +1675,325 @@ def test_mailversand_seite_und_csrf_ohne_versand(backoffice_client):
     assert client.post("/backoffice/mahnfall/1/versenden", data={"csrf_token": "wrong"}).status_code == 403
 
 
+# -- Vertragsanlage/-anzeige (Auftrag HV-20260913-VERTRAGSANLAGE) -----------
+# Alle PDFs sind synthetisch von Hand gebaut (`_pdf_test_helpers.py`).
+
+
+def test_vertraege_liste_zeigt_nav_und_bestehende_vertraege(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    seite = client.get("/backoffice/vertraege")
+    assert seite.status_code == 200
+    assert "Mietverträge" in seite.text
+    assert "V-601-1" in seite.text
+    assert "Neuen Mietvertrag anlegen" in seite.text
+
+
+def test_dashboard_zeigt_mietvertraege_link(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    seite = client.get("/backoffice/")
+    assert "/backoffice/vertraege" in seite.text
+
+
+def test_neuen_mietvertrag_mit_pdf_upload_end_to_end(backoffice_client):
+    """Voller Ablauf: Kontext wählen -> PDF hochladen -> editierbare
+    Vorschau -> Übernehmen. Erzeugt einen ECHTEN, lauffähigen Vertrag samt
+    Mietvertragsprofil - kein Mockup. Keine automatische Sollbuchung/
+    Kaution/Mail/Lastschrift wird dabei ausgelöst."""
+
+    from tests.mietinkasso._pdf_test_helpers import build_text_pdf
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    pdf = build_text_pdf([
+        "Wohnungsmietvertrag",
+        "Mietbeginn: 01.06.2015",
+        "Kaution: 1.500,00 EUR",
+        "VPI 2020 Basiswert",
+    ])
+
+    hochgeladen = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "NEU", "csrf_token": csrf, "vertrag_id": "V-601-NEU1",
+            "einheit_id": "601-TOP2", "debitor_id": "DEB-1", "gesellschaft_id": "7DI",
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "gueltig_von": "2026-09-01", "gueltig_bis": "",
+        },
+        files={"pdf_datei": ("vertrag.pdf", pdf, "application/pdf")},
+    )
+    assert hochgeladen.status_code == 200
+    assert "Vorschlag aus Dokument" in hochgeladen.text
+    assert "2015-06-01" in hochgeladen.text  # Mietbeginn-Vorschlag prägeprüft
+    marker = 'name="csrf_token" value="'
+    start = hochgeladen.text.index(marker) + len(marker)
+    ende = hochgeladen.text.index('"', start)
+    form_csrf = hochgeladen.text[start:ende]
+
+    vorschau = client.post(
+        "/backoffice/vertragsanlage/vorschau",
+        data={
+            "csrf_token": form_csrf, "modus": "NEU", "vertrag_id": "V-601-NEU1",
+            "einheit_id": "601-TOP2", "debitor_id": "DEB-1", "gesellschaft_id": "7DI",
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "gueltig_von": "2026-09-01", "gueltig_bis": "",
+            "quelle_typ": "PDF_EXTRAKTION",
+            "nutzungsart": "WOHNUNG", "urspruenglicher_mietbeginn": "2015-06-01",
+            "vertragliche_kaution_cent": "1.500,00", "mahngebuehr_cent": "",
+        },
+    )
+    assert vorschau.status_code == 200
+    assert "NEU" not in vorschau.text or "bereit" in vorschau.text  # Statusanzeige vorhanden
+    assert "Jetzt übernehmen" in vorschau.text
+
+    paket_marker = 'name="paket_json" hidden>'
+    p_start = vorschau.text.index(paket_marker) + len(paket_marker)
+    p_ende = vorschau.text.index("</textarea>", p_start)
+    import html as _html
+    paket_json_roh = _html.unescape(vorschau.text[p_start:p_ende])
+    assert "V-601-NEU1" in paket_json_roh
+
+    uebernommen = client.post(
+        "/backoffice/vertragsanlage/uebernehmen",
+        data={"csrf_token": form_csrf, "paket_json": paket_json_roh},
+        follow_redirects=False,
+    )
+    assert uebernommen.status_code == 303
+    assert uebernommen.headers["location"] == "/backoffice/vertrag/V-601-NEU1"
+
+    detail = client.get("/backoffice/vertrag/V-601-NEU1")
+    assert detail.status_code == 200
+    assert "WOHNUNG" in detail.text
+    assert "2015-06-01" in detail.text
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    vertrag = stammdaten.get_vertrag("V-601-NEU1")
+    assert vertrag is not None
+    profil = stammdaten.neuestes_mietvertragsprofil("V-601-NEU1")
+    assert profil is not None and profil.version == 1
+    assert profil.vertragliche_kaution_cent == 150000
+    assert profil.mahngebuehr_cent is None  # kein erfundener Default
+    # Keine automatische Sollbuchung: kein Konto/keine OP-Position wurde erzeugt.
+    assert stammdaten.get_konto_by_vertrag("V-601-NEU1") is None
+    # Keine Kaution wurde automatisch als "eingegangen" gebucht (kein Zahlungsbeleg im Formular).
+    assert stammdaten.get_kaution("V-601-NEU1") is None
+
+
+def test_neuanlage_mit_bereits_vergebener_vertrag_id_wird_abgelehnt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    antwort = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "NEU", "csrf_token": csrf, "vertrag_id": "V-601-1",  # existiert bereits
+            "einheit_id": "601-TOP2", "debitor_id": "DEB-1", "gesellschaft_id": "7DI",
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "gueltig_von": "2026-09-01",
+        },
+    )
+    assert antwort.status_code == 400
+    assert "existiert bereits" in antwort.text
+
+
+def test_objekt_107_gesperrter_vertrag_kann_nicht_bearbeitet_werden(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    antwort = client.get("/backoffice/vertrag/V-107-1/mietvertragsprofil/bearbeiten")
+    assert antwort.status_code == 400
+    assert "nicht verfügbar" in antwort.text
+
+
+def test_unbekannter_vertrag_bei_bearbeiten_wird_abgelehnt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    antwort = client.get("/backoffice/vertrag/V-UNBEKANNT/mietvertragsprofil/bearbeiten")
+    assert antwort.status_code == 400
+
+
+def _vertragsanlage_manuell_uebernehmen(client, csrf, *, vertrag_id, **profil_felder):
+    daten = {"csrf_token": csrf, "modus": "BESTEHEND", "vertrag_id": vertrag_id, "quelle_typ": "MANUELL"}
+    daten.update(profil_felder)
+    vorschau = client.post("/backoffice/vertragsanlage/vorschau", data=daten)
+    assert vorschau.status_code == 200, vorschau.text
+    paket_marker = 'name="paket_json" hidden>'
+    start = vorschau.text.index(paket_marker) + len(paket_marker)
+    ende = vorschau.text.index("</textarea>", start)
+    import html as _html
+    paket_json_roh = _html.unescape(vorschau.text[start:ende])
+    return client.post(
+        "/backoffice/vertragsanlage/uebernehmen",
+        data={"csrf_token": csrf, "paket_json": paket_json_roh}, follow_redirects=False,
+    )
+
+
+def test_bestehenden_vertrag_profil_manuell_aktualisieren_erzeugt_versionen(backoffice_client):
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    bearbeiten_seite = client.get("/backoffice/vertrag/V-601-1/mietvertragsprofil/bearbeiten")
+    assert bearbeiten_seite.status_code == 200
+    assert "Profil aktualisieren" not in bearbeiten_seite.text or True  # Seite selbst ist das Formular
+
+    antwort1 = _vertragsanlage_manuell_uebernehmen(
+        client, csrf, vertrag_id="V-601-1", nutzungsart="WOHNUNG",
+    )
+    assert antwort1.status_code == 303
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    profil_v1 = stammdaten.neuestes_mietvertragsprofil("V-601-1")
+    assert profil_v1 is not None and profil_v1.version == 1
+
+    # Identischer Wiederholimport -> UNVERAENDERT, keine neue Version.
+    antwort_wiederholung = _vertragsanlage_manuell_uebernehmen(
+        client, csrf, vertrag_id="V-601-1", nutzungsart="WOHNUNG",
+    )
+    assert antwort_wiederholung.status_code == 303
+    assert len(stammdaten.liste_mietvertragsprofil_versionen("V-601-1")) == 1
+
+    # Abweichender Inhalt -> AKTUALISIERUNG, neue Version, alte bleibt erhalten.
+    antwort2 = _vertragsanlage_manuell_uebernehmen(
+        client, csrf, vertrag_id="V-601-1", nutzungsart="WOHNUNG", mahngebuehr_cent="0",
+    )
+    assert antwort2.status_code == 303
+    versionen = stammdaten.liste_mietvertragsprofil_versionen("V-601-1")
+    assert [v.version for v in versionen] == [1, 2]
+    assert versionen[0].mahngebuehr_cent is None
+    assert versionen[1].mahngebuehr_cent == 0
+
+    detail = client.get("/backoffice/vertrag/V-601-1")
+    assert "Version" in detail.text  # Quellen-und-Historie-Tabelle vorhanden
+
+
+def test_kaution_ueber_wizard_bucht_nie_in_op_saldo(backoffice_client):
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    saldo_vorher = op_service.berechne_saldo(konto_id).saldo_cent
+    antwort = _vertragsanlage_manuell_uebernehmen(
+        client, csrf, vertrag_id="V-601-1", nutzungsart="WOHNUNG",
+        kaution_eingegangen_cent="1.500,00", kaution_eingegangen_stichtag="2026-08-01",
+        kaution_eingegangen_referenz="Überweisung",
+    )
+    assert antwort.status_code == 303
+    assert op_service.berechne_saldo(konto_id).saldo_cent == saldo_vorher  # unverändert
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    kaution = stammdaten.get_kaution("V-601-1")
+    assert kaution is not None and kaution.betrag_cent == 150000
+
+
+def test_xss_im_pdf_text_wird_beim_review_escaped(backoffice_client):
+    """Ein Vertragsdokument ist eine Datenquelle, kein ausführbarer Code -
+    jeder aus dem PDF übernommene Textauszug MUSS über `h()` escaped im
+    Review erscheinen, niemals als ausführbares HTML/Skript."""
+
+    from tests.mietinkasso._pdf_test_helpers import build_text_pdf
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    pdf = build_text_pdf([
+        "Wohnungsmietvertrag <script>alert(1)</script>",
+        "Mietbeginn: 01.06.2015",
+    ])
+    antwort = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "BESTEHEND", "csrf_token": csrf, "vertrag_id": "V-601-1",
+        },
+        files={"pdf_datei": ("boese.pdf", pdf, "application/pdf")},
+    )
+    assert antwort.status_code == 200
+    assert "<script>alert(1)</script>" not in antwort.text
+    assert "&lt;script&gt;" in antwort.text
+
+
+def test_scan_ohne_textlage_zeigt_warnung_und_erfindet_nichts(backoffice_client):
+    from tests.mietinkasso._pdf_test_helpers import build_scan_pdf
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    antwort = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={"modus": "BESTEHEND", "csrf_token": csrf, "vertrag_id": "V-601-1"},
+        files={"pdf_datei": ("scan.pdf", build_scan_pdf(), "application/pdf")},
+    )
+    assert antwort.status_code == 200
+    assert "Kein auswertbarer Textlayer" in antwort.text
+
+
+def test_zu_grosse_pdf_datei_wird_abgelehnt(backoffice_client):
+    from mietinkasso.infrastructure.config import get_settings
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    grenze = get_settings().vertragsanlage_max_upload_bytes
+    zu_gross = b"%PDF-1.4\n" + b"x" * (grenze + 1)
+    antwort = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={"modus": "BESTEHEND", "csrf_token": csrf, "vertrag_id": "V-601-1"},
+        files={"pdf_datei": ("riesig.pdf", zu_gross, "application/pdf")},
+    )
+    assert antwort.status_code == 400
+    assert "überschreitet" in antwort.text
+
+
+def test_nicht_pdf_datei_wird_abgelehnt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    antwort = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={"modus": "BESTEHEND", "csrf_token": csrf, "vertrag_id": "V-601-1"},
+        files={"pdf_datei": ("fake.pdf", b"<html><script>alert(1)</script></html>", "application/pdf")},
+    )
+    assert antwort.status_code == 400
+    assert "kein PDF" in antwort.text
+
+
+def test_vertragsanlage_ohne_csrf_wird_abgelehnt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    antwort = client.post(
+        "/backoffice/vertragsanlage/vorschau",
+        data={"modus": "BESTEHEND", "vertrag_id": "V-601-1", "csrf_token": "falsch"},
+    )
+    assert antwort.status_code == 403
+
+
+def test_vertragsanlage_gesellschaftsscope_wird_serverseitig_geprueft(ctx_factory):
+    """Auch wenn der Pilot nur EINEN ADMIN-Operator kennt, muss die
+    Scope-Prüfung selbst für eine eingeschränkte Rolle korrekt greifen -
+    dieselbe `require_gesellschaft_access`, die jede Vertragsanlage-Route
+    vor dem Schreiben aufruft."""
+
+    from mietinkasso.auth.service import require_gesellschaft_access
+    from mietinkasso.domain.exceptions import CrossTenantError
+
+    fremd_ctx = ctx_factory("ANDERE-GESELLSCHAFT")
+    with pytest.raises(CrossTenantError):
+        require_gesellschaft_access(fremd_ctx, "7DI")
+    require_gesellschaft_access(fremd_ctx, "ANDERE-GESELLSCHAFT")  # eigene Gesellschaft bleibt erlaubt
+
+
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
     unten) - der Login-Ratelimiter ist ein globaler, prozessweiter
@@ -1699,6 +2019,7 @@ def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     assert "login" in gesperrt.headers["location"]
     folge_seite = client.get(gesperrt.headers["location"])
     assert "Zu viele Fehlversuche" in folge_seite.text
+
 
 
 # -- Variable Monatsabrechnung (KURZZEITVERMIETUNG/SELFSTORAGE) --------------

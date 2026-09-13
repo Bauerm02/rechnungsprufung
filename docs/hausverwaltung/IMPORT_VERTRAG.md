@@ -70,13 +70,14 @@ Zwei gleichwertige Eingabeformen:
 
 1. **Eine JSON-Datei** mit den unten stehenden Feldern (empfohlen für
    Codex' Mapping-Skript — ein Objekt, keine Zeilenstreams).
-2. **Ein CSV-Bündel** — bis zu 10 einzelne CSV-Dateien in einem
+2. **Ein CSV-Bündel** — bis zu 12 einzelne CSV-Dateien in einem
    Verzeichnis, mit exakt diesen Dateinamen:
    `gesellschaften.csv`, `objekte.csv`, `einheiten.csv`,
    `debitoren.csv`, `vertraege.csv`, `eroeffnungen.csv`,
    `nachbuchungen.csv`, `eroeffnungskorrekturen.csv`, `sperren.csv`,
-   `komponenten.csv` (die letzten drei siehe "Ergänzung 12.09.2026"
-   unten). Fehlende Dateien = leere Liste für diesen Typ.
+   `komponenten.csv` (siehe "Ergänzung 12.09.2026" unten),
+   `kautionen.csv`, `mietvertragsprofile.csv` (siehe "Ergänzung
+   13.09.2026" unten). Fehlende Dateien = leere Liste für diesen Typ.
    Spaltennamen entsprechen 1:1 den JSON-Feldnamen unten; Werte sind
    Text (Zahlen/Daten wie im JSON-Beispiel, also `2026-08-31`,
    `150000`, `true`/`false`).
@@ -297,6 +298,84 @@ Eröffnungssaldo und Korrektur bleiben beide als getrennte, sichtbare
 Zeilen im Kontoauszug nachvollziehbar (keine In-Place-Änderung der
 Eröffnung). Idempotenz über `import_id` wie bei `nachbuchungen[]`.
 
+## Ergänzung 13.09.2026: zwei weitere, optionale Entitätstypen (Auftrag
+## HV-20260913-VERTRAGSANLAGE — Vertragsanlage/-anzeige)
+
+Zusätzlich zu den oben dokumentierten Entitäten erlaubt dieses Format ab
+jetzt auch die bereits von Codex ausgelesenen Vertragsfelder, damit
+dieselben Daten nicht ein zweites Mal manuell erfasst werden müssen.
+
+### `kautionen[]` — bestätigter, tatsächlich eingegangener Kautionsbetrag
+
+Nutzt die BESTEHENDE `KautionTable`/`StammdatenRepository.set_kaution`
+(ID-Konvention `KAU-{vertrag_id}`, 1:1 je Vertrag). AUSDRÜCKLICH der
+TATSÄCHLICH eingegangene Betrag — niemals der vertraglich vereinbarte
+(siehe `mietvertragsprofile[].vertragliche_kaution_cent` unten). Ein
+vereinbarter Betrag ist KEIN Zahlungsbeleg.
+
+| Feld | Typ | Pflicht | Hinweis |
+|---|---|---|---|
+| `vertrag_id` | str | ja | |
+| `betrag_cent` | int | ja | muss positiv sein |
+| `stichtag` | Datum | ja | |
+| `referenz` | str\|null | nein | |
+
+STRIKTE Idempotenz wie bei den übrigen Stammdaten-Entitäten (nicht wie
+`mietvertragsprofile[]` unten): identischer Inhalt = `UNVERAENDERT`,
+abweichender Inhalt = harter Konflikt (gesamter Lauf verweigert) — eine
+Kaution ist ein bestätigter Zahlungsfakt, keine laufend fortzuschreibende
+Angabe.
+
+### `mietvertragsprofile[]` — zusätzliche, VERSIONIERTE Verwaltungs-/Anzeigefelder
+
+Nutzt die NEUE `MietvertragsprofilTable`/
+`StammdatenRepository.add_mietvertragsprofil` — bewusst GETRENNT von
+`RechtsprofilTable` (Freigabe-pflichtige Rechtsgrundlage der
+Indexautomatik) und von `VertragTable.gueltig_von` (bleibt unverändert
+die für Sollstellung/OP maßgebliche technische Vertragslaufzeit).
+
+| Feld | Typ | Pflicht | Hinweis |
+|---|---|---|---|
+| `vertrag_id` | str | ja | |
+| `nutzungsart` | str | nein (default `UNGEKLAERT`) | `WOHNUNG`\|`BUERO`\|`GESCHAEFTSLOKAL`\|`SONSTIGE`\|`UNGEKLAERT` — NIEMALS aus `rechtsordnung` abgeleitet (kein "Büro = MRG-frei") |
+| `urspruenglicher_mietbeginn` | Datum\|null | nein | tatsächlicher historischer Mietbeginn — bei Altobjekten oft ABWEICHEND von `VertragTable.gueltig_von` (das ist dort häufig die Verwaltungsübernahme) |
+| `verwaltungsuebernahme_am` | Datum\|null | nein | |
+| `verwaltung_bezeichnung` | str\|null | nein | |
+| `vertragliche_kaution_cent` | int\|null | nein | der VEREINBARTE Betrag — KEIN Zahlungsbeleg, strukturell getrennt von `kautionen[].betrag_cent` |
+| `vertragliche_kaution_quellenbeleg` | str\|null | nein | |
+| `mahngebuehr_cent` | int\|null | nein | `null` = unbekannt/kein Fund, `0` = ausdrücklich belegte "keine Gebühr" — NIE ein erfundener Default bei fehlendem Fund |
+| `mahngebuehr_quellenbeleg` | str\|null | nein | |
+| `index_reihe` | str\|null | nein | AUSDRÜCKLICH UNVERBINDLICHES Staging-Feld, siehe unten |
+| `index_urspruenglicher_basismonat` | str (`JJJJ-MM`)\|null | nein | " |
+| `index_urspruenglicher_basiswert` | Decimal\|null | nein | " |
+| `index_schwelle_prozent` | Decimal\|null | nein | " |
+| `index_schwelle_inklusive` | bool\|null | nein | Tri-State — `null` = im Vertragstext nicht eindeutig festgestellt, NIE geraten |
+| `index_anpassungsmonat` | int\|null | nein | " |
+| `index_mindestintervall_monate` | int\|null | nein | " |
+| `index_klauseltext_auszug` | str\|null | nein | " |
+| `index_klauseltext_seite` | int\|null | nein | " |
+| `quelle_typ` | str | nein (default `IMPORT_SCHEMA`) | `PDF_EXTRAKTION`\|`MANUELL`\|`IMPORT_SCHEMA` |
+| `quelle_referenz` | str\|null | nein | |
+
+**Index-Quellfelder sind reine Gedächtnisstütze/Vorbefüll-Vorschläge**
+für das bestehende, eigenständige Formular
+`/vertrag/{id}/indexklauseln` (`index/service.py::klausel_anlegen` +
+`klausel_freigeben`) — ihre Übernahme erzeugt NIEMALS automatisch eine
+`IndexKlauselTable`-Zeile, keine Freigabe, keine Sollstellung. Eine
+tatsächlich wirksame Klausel und ein eventuelles Rekonstruktionsmodell
+bleiben im Backoffice immer getrennt lesbar, nie vermischt mit diesen
+Staging-Feldern.
+
+**Append-only, KEIN In-Place-Update:** eine inhaltliche Änderung legt
+eine NEUE Version an (`version` fortlaufend je `vertrag_id`), nie eine
+Überschreibung. Abweichend von der sonst strikten Stammdaten-
+Konfliktregel ist ein inhaltlich abweichender Import HIER KEIN Konflikt
+(Status `AKTUALISIERUNG` statt `KONFLIKT`) — laufende Datenpflege dieser
+rein beschreibenden Felder ist gewollt und blockiert den Lauf nicht.
+Identischer Inhalt gegenüber der zuletzt gespeicherten Version bleibt
+`UNVERAENDERT` (kein wirkungsloser Zusatz-Insert). Bestehende Konten/
+OP/Sperren/Vertragskomponenten bleiben davon vollständig unberührt.
+
 ## JSON-Beispiel (rein synthetisch)
 
 ```json
@@ -327,6 +406,18 @@ Eröffnung). Idempotenz über `import_id` wie bei `nachbuchungen[]`.
     {"import_id": "NACH-V-601-TOP1-202609", "vertrag_id": "V-601-TOP1", "typ": "SOLL",
      "betrag_cent": 76000, "belegdatum": "2026-09-01", "buchungsdatum": "2026-09-01",
      "faelligkeit": "2026-09-05", "beleg_referenz": "Miete September 2026"}
+  ],
+  "kautionen": [
+    {"vertrag_id": "V-601-TOP1", "betrag_cent": 152000, "stichtag": "2020-01-15", "referenz": "Überweisung Kaution"}
+  ],
+  "mietvertragsprofile": [
+    {"vertrag_id": "V-601-TOP1", "nutzungsart": "WOHNUNG",
+     "urspruenglicher_mietbeginn": "2015-06-01", "verwaltungsuebernahme_am": "2020-01-01",
+     "vertragliche_kaution_cent": 152000, "mahngebuehr_cent": null,
+     "index_reihe": "VPI 2020", "index_urspruenglicher_basismonat": "2015-06",
+     "index_urspruenglicher_basiswert": "106.7", "index_schwelle_prozent": "5.0",
+     "index_schwelle_inklusive": true, "quelle_typ": "PDF_EXTRAKTION",
+     "quelle_referenz": "vertrag_601_top1.pdf#3"}
   ]
 }
 ```

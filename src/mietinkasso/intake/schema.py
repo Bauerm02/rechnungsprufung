@@ -142,6 +142,62 @@ class KomponenteZeile:
 
 
 @dataclass(frozen=True)
+class KautionZeile:
+    """Bestätigter Kautionsbestand (Auftrag HV-20260913-VERTRAGSANLAGE) -
+    nutzt die bestehende `KautionTable`/`StammdatenRepository.set_kaution`
+    (ID-Konvention `KAU-{vertrag_id}`, wie im Seed-Skript). STRIKTE
+    Idempotenz wie die übrigen Stammdaten (abweichender Inhalt =
+    Konflikt, gesamter Lauf verweigert) - eine Kaution ist ein
+    bestätigter Fakt, keine laufend fortzuschreibende Angabe wie
+    `MietvertragsprofilZeile`. AUSDRÜCKLICH der TATSÄCHLICH eingegangene
+    Betrag - NICHT der vertraglich vereinbarte (siehe dort)."""
+
+    vertrag_id: str
+    betrag_cent: int
+    stichtag: date
+    referenz: str | None = None
+
+
+@dataclass(frozen=True)
+class MietvertragsprofilZeile:
+    """Zusätzliche, VERSIONIERTE Verwaltungs-/Anzeigefelder je Vertrag
+    (Auftrag HV-20260913-VERTRAGSANLAGE) - siehe `MietvertragsprofilTable`-
+    Docstring in `infrastructure/db/tables.py` für die vollständige
+    Begründung (insbesondere `urspruenglicher_mietbeginn` vs.
+    `VertragZeile.gueltig_von`, `vertragliche_kaution_cent` vs.
+    `KautionZeile.betrag_cent`). Abweichend von der strikten Stammdaten-
+    Konfliktregel erzeugt ein abweichender Inhalt hier KEINEN Konflikt,
+    sondern eine neue, sichtbare Version (siehe `planner.py`)."""
+
+    vertrag_id: str
+    nutzungsart: str = "UNGEKLAERT"
+    urspruenglicher_mietbeginn: date | None = None
+    verwaltungsuebernahme_am: date | None = None
+    verwaltung_bezeichnung: str | None = None
+    vertragliche_kaution_cent: int | None = None
+    vertragliche_kaution_quellenbeleg: str | None = None
+    # None = unbekannt/kein Fund; 0 = ausdrücklich belegte "keine Gebühr".
+    # NIEMALS aus einem fehlenden Treffer eine 0 erfinden (siehe Tabellen-Docstring).
+    mahngebuehr_cent: int | None = None
+    mahngebuehr_quellenbeleg: str | None = None
+    # Ausdrücklich unverbindliche Index-QUELLFELDER (Gedächtnisstütze/Vorausfüllung
+    # für `index/service.py::klausel_anlegen`) - erzeugen NIE automatisch eine
+    # `IndexKlauselTable`-Zeile/Freigabe/Sollstellung. Immer getrennt von einer
+    # tatsächlich wirksamen Klausel oder einem Rekonstruktionsmodell anzuzeigen.
+    index_reihe: str | None = None
+    index_urspruenglicher_basismonat: str | None = None
+    index_urspruenglicher_basiswert: Decimal | None = None
+    index_schwelle_prozent: Decimal | None = None
+    index_schwelle_inklusive: bool | None = None
+    index_anpassungsmonat: int | None = None
+    index_mindestintervall_monate: int | None = None
+    index_klauseltext_auszug: str | None = None
+    index_klauseltext_seite: int | None = None
+    quelle_typ: str = "IMPORT_SCHEMA"
+    quelle_referenz: str | None = None
+
+
+@dataclass(frozen=True)
 class IntakePaket:
     """Vollständig geparstes, aber noch NICHT fachlich geprüftes Paket -
     egal ob aus einer JSON-Datei oder einem CSV-Bündel geparst, identisch
@@ -158,6 +214,8 @@ class IntakePaket:
     eroeffnungskorrekturen: tuple[EroeffnungskorrekturZeile, ...] = field(default_factory=tuple)
     sperren: tuple[SperreZeile, ...] = field(default_factory=tuple)
     komponenten: tuple[KomponenteZeile, ...] = field(default_factory=tuple)
+    kautionen: tuple[KautionZeile, ...] = field(default_factory=tuple)
+    mietvertragsprofile: tuple[MietvertragsprofilZeile, ...] = field(default_factory=tuple)
 
 
 def paket_hash(paket: IntakePaket) -> str:

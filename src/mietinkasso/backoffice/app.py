@@ -45,6 +45,17 @@ from mietinkasso.audit.service import AuditService
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.backoffice.security import LoginRateLimiter, SessionStore, pruefe_passwort
 from mietinkasso.backoffice.indexklausel_form import klausel_formular, klausel_form_werte
+from mietinkasso.backoffice.vertragsanlage_form import (
+    bestehende_werte as _vertragsanlage_bestehende_werte,
+    detail_ansicht as _vertragsanlage_detail_ansicht,
+    neu_kontext_formular as _vertragsanlage_neu_kontext_formular,
+    neu_kontext_werte as _vertragsanlage_neu_kontext_werte,
+    pdf_upload_mini_formular as _vertragsanlage_pdf_upload_mini_formular,
+    profil_werte_aus_form as _vertragsanlage_profil_werte_aus_form,
+    review_formular as _vertragsanlage_review_formular,
+    vertraege_liste_formular as _vertragsanlage_liste_formular,
+    vorschau_ansicht as _vertragsanlage_vorschau_ansicht,
+)
 from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, ist_bekannte_demo_umgebung, option, parse_eur_betrag, seite
 from mietinkasso.bank.importer import (
     CamtKontoMismatchError,
@@ -64,6 +75,13 @@ from mietinkasso.index.service import UNTERSTUETZTE_BERECHNUNGSPROFILE, IndexSer
 from mietinkasso.infrastructure.config import get_settings
 from mietinkasso.infrastructure.db.session import build_session_factory
 from mietinkasso.infrastructure.db.tables import IndexKlauselTable, VpiMonatswertTable
+from mietinkasso.intake.apply import wende_an as _intake_wende_an
+from mietinkasso.intake.parser import IntakeFormatFehlerError, parse_json_paket as _intake_parse_json_paket
+from mietinkasso.intake.planner import erstelle_plan as _intake_erstelle_plan
+from mietinkasso.vertragsanlage.ablage import UploadAbgelehntError as _VertragsanlageUploadAbgelehntError, speichern as _vertragsanlage_speichern
+from mietinkasso.vertragsanlage.paket_bau import baue_paket_json as _vertragsanlage_baue_paket_json
+from mietinkasso.vertragsanlage.pdf_extraktion import PdfNichtLesbarError as _VertragsanlagePdfNichtLesbarError, extrahiere as _vertragsanlage_extrahiere
+from mietinkasso.vertragsanlage.vorschlaege import vorschlaege_aus_extraktion as _vertragsanlage_vorschlaege_aus_extraktion
 from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
 from mietinkasso.mahnwesen.service import MahnwesenService
 from mietinkasso.op.eroeffnung_import import importiere_eroeffnung_csv_atomar, parse_eroeffnung_csv
@@ -505,9 +523,13 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
       </div>
     </div>"""
 
+    mietvertraege_karte = (
+        '<div class="card"><a href="/backoffice/vertraege"><button type="button">Mietverträge öffnen</button></a> '
+        '<span class="muted">Vertragsanlage/-anzeige, Mietvertragsprofile, Aufnahme aus PDF.</span></div>'
+    )
     return _layout(
         request, session, "Rückstandsübersicht",
-        auswahl_form + kpi_html + mietkonten_tabelle + positionen_tabelle + mahnfaelle_tabelle + bestand_tabelle,
+        mietvertraege_karte + auswahl_form + kpi_html + mietkonten_tabelle + positionen_tabelle + mahnfaelle_tabelle + bestand_tabelle,
     )
 
 
@@ -3552,3 +3574,322 @@ def komponenten_freigabe_erstellen(
     except (MietinkassoError, ValueError, InvalidOperation) as exc:
         return _fehlerseite(session, "Netto-Mietanteil-Freigabe", str(exc), f"/backoffice/vertrag/{vertrag_id}/komponenten-freigabe")
     return RedirectResponse(url=f"/backoffice/vertrag/{vertrag_id}/komponenten-freigabe", status_code=303)
+
+
+# -- Vertragsanlage/-anzeige (Auftrag HV-20260913-VERTRAGSANLAGE) -----------
+#
+# Nutzt bewusst die BESTEHENDE generische Intake-Schreibstrecke
+# (`intake/parser.py::parse_json_paket` + `intake/planner.py::erstelle_plan`
+# + `intake/apply.py::wende_an`) statt einer zweiten Buchungsstrecke - siehe
+# `vertragsanlage/paket_bau.py`. Diese Routen lesen/schreiben NIE ein
+# Original-PDF in die Datenbank; der Upload landet ausschließlich über
+# `vertragsanlage/ablage.py` in einem privaten Verzeichnis AUSSERHALB des
+# Repos (siehe `infrastructure/config.py::vertragsanlage_upload_verzeichnis`).
+
+
+def _hat_gesellschaft_zugriff(ctx: AuthContext, gesellschaft_id: str) -> bool:
+    try:
+        require_gesellschaft_access(ctx, gesellschaft_id)
+        return True
+    except MietinkassoError:
+        return False
+
+
+@router.get("/vertraege", response_class=HTMLResponse)
+def vertragsanlage_liste(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    ctx = _ctx(session)
+    zeilen = []
+    for vertrag in _stammdaten_repo.list_alle_vertraege():
+        if not _hat_gesellschaft_zugriff(ctx, vertrag.gesellschaft_id):
+            continue
+        einheit = _stammdaten_repo.get_einheit(vertrag.einheit_id)
+        objekt = _stammdaten_repo.get_objekt(einheit.objekt_id) if einheit else None
+        debitor = _stammdaten_repo.get_debitor(vertrag.debitor_id)
+        if einheit is None or objekt is None or debitor is None:
+            continue
+        zeilen.append({"vertrag": vertrag, "objekt": objekt, "einheit": einheit, "debitor": debitor})
+    return _layout(request, session, "Mietverträge", _vertragsanlage_liste_formular(zeilen, session.csrf_token))
+
+
+@router.get("/vertrag/weiterleiten")
+def vertragsanlage_weiterleiten(vertrag_id: str, session=Depends(_current_session)) -> RedirectResponse:
+    return RedirectResponse(f"/backoffice/vertrag/{vertrag_id}", status_code=303)
+
+
+@router.get("/vertraege/neu", response_class=HTMLResponse)
+def vertragsanlage_neu_formular(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    ctx = _ctx(session)
+    einheiten_mit_objekt = []
+    for objekt in sorted(_stammdaten_repo.list_objekte(), key=lambda o: o.id):
+        if objekt.ausgeschlossen or not _hat_gesellschaft_zugriff(ctx, objekt.gesellschaft_id):
+            continue
+        for einheit in _stammdaten_repo.list_einheiten_fuer_objekt(objekt.id):
+            einheiten_mit_objekt.append((objekt, einheit))
+    debitoren = _stammdaten_repo.list_alle_debitoren()
+    gesellschaften = [g for g in _stammdaten_repo.list_gesellschaften() if _hat_gesellschaft_zugriff(ctx, g.id)]
+    inhalt = _vertragsanlage_neu_kontext_formular(
+        einheiten_mit_objekt=einheiten_mit_objekt, debitoren=debitoren, gesellschaften=gesellschaften,
+        csrf=session.csrf_token,
+    )
+    return _layout(request, session, "Neuen Mietvertrag anlegen", inhalt)
+
+
+@router.get("/vertrag/{vertrag_id}/mietvertragsprofil/bearbeiten", response_class=HTMLResponse)
+def vertragsanlage_bearbeiten_formular(request: Request, vertrag_id: str, session=Depends(_current_session)) -> HTMLResponse:
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Mietvertragsprofil", "Vertrag nicht verfügbar.", "/backoffice/vertraege")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    profil = _stammdaten_repo.neuestes_mietvertragsprofil(vertrag_id)
+    kaution = _stammdaten_repo.get_kaution(vertrag_id)
+    werte = _vertragsanlage_bestehende_werte(profil, kaution)
+    upload_mini = _vertragsanlage_pdf_upload_mini_formular(vertrag_id, session.csrf_token)
+    review = _vertragsanlage_review_formular(
+        ist_neu=False, kontext_hidden={"modus": "BESTEHEND", "vertrag_id": vertrag_id, "quelle_typ": "MANUELL"},
+        werte=werte, vorschlaege={}, warnungen=(), csrf=session.csrf_token,
+        aktion_url="/backoffice/vertragsanlage/vorschau", zurueck_href=f"/backoffice/vertrag/{vertrag_id}",
+        kaution_bereits_vorhanden=kaution is not None,
+    )
+    return _layout(request, session, "Mietvertragsprofil bearbeiten", upload_mini + review)
+
+
+@router.get("/vertrag/{vertrag_id}", response_class=HTMLResponse)
+def vertragsanlage_detail(request: Request, vertrag_id: str, session=Depends(_current_session)) -> HTMLResponse:
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Mietvertrag", f"Unbekannter Vertrag {vertrag_id}.", "/backoffice/vertraege")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    einheit = _stammdaten_repo.get_einheit(vertrag.einheit_id)
+    objekt = _stammdaten_repo.get_objekt(einheit.objekt_id) if einheit else None
+    debitor = _stammdaten_repo.get_debitor(vertrag.debitor_id)
+    gesellschaft = _stammdaten_repo.get_gesellschaft(vertrag.gesellschaft_id)
+    if einheit is None or objekt is None or debitor is None or gesellschaft is None:
+        return _fehlerseite(session, "Mietvertrag", "Stammdaten unvollständig.", "/backoffice/vertraege")
+
+    profil = _stammdaten_repo.neuestes_mietvertragsprofil(vertrag_id)
+    kaution = _stammdaten_repo.get_kaution(vertrag_id)
+    konto = _stammdaten_repo.get_konto_by_vertrag(vertrag_id)
+    komponenten = _stammdaten_repo.list_aktive_komponenten(vertrag_id, heute_wien())
+    versionen = _stammdaten_repo.liste_mietvertragsprofil_versionen(vertrag_id)
+
+    rechtsprofil_hinweis = None
+    historie = _indexautomatik.rechtsprofil_service.liste_fuer_vertrag(vertrag_id)
+    if historie:
+        neuestes = historie[-1]
+        status_label = " (ENTWURF, noch nicht freigegeben)" if neuestes.status == "ENTWURF" else " (freigegeben)"
+        rechtsprofil_hinweis = f"Version {neuestes.version}, Rechtsordnung {neuestes.rechtsordnung}{status_label}"
+
+    index_klausel_hinweis = None
+    freigegebene_klausel = _indexautomatik.index_repository.freigegebene_klausel(vertrag_id)
+    if freigegebene_klausel is not None:
+        index_klausel_hinweis = (
+            f"Freigegeben: {freigegebene_klausel.basis_reihe} Basis {freigegebene_klausel.basis_wert} "
+            f"(Bezugsmonat {freigegebene_klausel.basis_monat})"
+        )
+
+    inhalt = _vertragsanlage_detail_ansicht(
+        vertrag=vertrag, objekt=objekt, einheit=einheit, debitor=debitor, gesellschaft=gesellschaft,
+        profil=profil, kaution=kaution, konto_id=konto.id if konto else None, komponenten=komponenten,
+        rechtsprofil_hinweis=rechtsprofil_hinweis, index_klausel_hinweis=index_klausel_hinweis,
+        versionen=versionen, csrf=session.csrf_token,
+    )
+    return _layout(request, session, f"Mietvertrag {vertrag_id}", inhalt)
+
+
+@router.post("/vertragsanlage/pdf-hochladen", response_class=HTMLResponse)
+async def vertragsanlage_pdf_hochladen(
+    request: Request,
+    modus: str = Form(...),
+    csrf_token: str = Form(...),
+    vertrag_id: str = Form(""),
+    einheit_id: str = Form(""),
+    debitor_id: str = Form(""),
+    gesellschaft_id: str = Form(""),
+    rechtsordnung: str = Form(""),
+    gueltig_von: str = Form(""),
+    gueltig_bis: str = Form(""),
+    pdf_datei: UploadFile | None = File(None),
+    session=Depends(_current_session),
+) -> HTMLResponse:
+    _verify_csrf(session, csrf_token)
+    ist_neu = modus == "NEU"
+
+    if ist_neu:
+        try:
+            kontext = _vertragsanlage_neu_kontext_werte({
+                "vertrag_id": vertrag_id, "einheit_id": einheit_id, "debitor_id": debitor_id,
+                "gesellschaft_id": gesellschaft_id, "rechtsordnung": rechtsordnung,
+                "gueltig_von": gueltig_von, "gueltig_bis": gueltig_bis,
+            })
+        except ValueError as exc:
+            return _fehlerseite(session, "Neuer Mietvertrag", str(exc), "/backoffice/vertraege/neu")
+        vertrag_id = kontext["vertrag_id"]
+        einheit = _stammdaten_repo.get_einheit(kontext["einheit_id"])
+        if einheit is None:
+            return _fehlerseite(session, "Neuer Mietvertrag", "Unbekannte Einheit.", "/backoffice/vertraege/neu")
+        objekt = _stammdaten_repo.get_objekt(einheit.objekt_id)
+        if objekt is None or objekt.ausgeschlossen:
+            return _fehlerseite(session, "Neuer Mietvertrag", "Objekt ist gesperrt/unbekannt - keine Anlage möglich.", "/backoffice/vertraege/neu")
+        if _stammdaten_repo.get_vertrag(vertrag_id) is not None:
+            return _fehlerseite(session, "Neuer Mietvertrag", f"Vertrag-ID '{vertrag_id}' existiert bereits.", "/backoffice/vertraege/neu")
+        require_gesellschaft_access(_ctx(session), kontext["gesellschaft_id"])
+        basis_werte: dict = {}
+        kaution_bereits_vorhanden = False
+    else:
+        vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+        if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+            return _fehlerseite(session, "Mietvertragsprofil", "Vertrag nicht verfügbar.", "/backoffice/vertraege")
+        require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+        profil = _stammdaten_repo.neuestes_mietvertragsprofil(vertrag_id)
+        kaution = _stammdaten_repo.get_kaution(vertrag_id)
+        basis_werte = _vertragsanlage_bestehende_werte(profil, kaution)
+        kaution_bereits_vorhanden = kaution is not None
+        kontext = None
+
+    vorschlaege: dict = {}
+    warnungen: tuple = ()
+    quelle_typ = "MANUELL"
+    quelle_referenz: str | None = None
+    if pdf_datei is not None and pdf_datei.filename:
+        rohbytes = await pdf_datei.read()
+        try:
+            dokument = _vertragsanlage_speichern(
+                rohbytes, konfiguriertes_verzeichnis=_settings.vertragsanlage_upload_verzeichnis,
+                max_bytes=_settings.vertragsanlage_max_upload_bytes,
+            )
+            ergebnis = _vertragsanlage_extrahiere(rohbytes, max_seiten=_settings.vertragsanlage_max_seiten)
+        except (_VertragsanlageUploadAbgelehntError, _VertragsanlagePdfNichtLesbarError) as exc:
+            return _fehlerseite(
+                session, "PDF-Aufnahme", str(exc),
+                "/backoffice/vertraege/neu" if ist_neu else f"/backoffice/vertrag/{vertrag_id}/mietvertragsprofil/bearbeiten",
+            )
+        vorschlaege = _vertragsanlage_vorschlaege_aus_extraktion(ergebnis)
+        warnungen = ergebnis.warnungen
+        quelle_typ = "PDF_EXTRAKTION"
+        quelle_referenz = f"pdf-sha256:{dokument.ablage_id}"
+
+    werte = dict(basis_werte)
+    for feld, vorschlag in vorschlaege.items():
+        if not werte.get(feld):
+            werte[feld] = vorschlag.formularwert
+
+    kontext_hidden = {"modus": modus, "vertrag_id": vertrag_id, "quelle_typ": quelle_typ}
+    if quelle_referenz:
+        kontext_hidden["quelle_referenz"] = quelle_referenz
+    if ist_neu:
+        kontext_hidden.update({
+            "einheit_id": kontext["einheit_id"], "debitor_id": kontext["debitor_id"],
+            "gesellschaft_id": kontext["gesellschaft_id"], "rechtsordnung": kontext["rechtsordnung"],
+            "gueltig_von": kontext["gueltig_von"], "gueltig_bis": kontext["gueltig_bis"] or "",
+        })
+
+    inhalt = _vertragsanlage_review_formular(
+        ist_neu=ist_neu, kontext_hidden=kontext_hidden, werte=werte, vorschlaege=vorschlaege,
+        warnungen=warnungen, csrf=session.csrf_token, aktion_url="/backoffice/vertragsanlage/vorschau",
+        zurueck_href="/backoffice/vertraege/neu" if ist_neu else f"/backoffice/vertrag/{vertrag_id}",
+        kaution_bereits_vorhanden=kaution_bereits_vorhanden,
+    )
+    return _layout(request, session, "Mietvertragsprofil prüfen", inhalt)
+
+
+@router.post("/vertragsanlage/vorschau", response_class=HTMLResponse)
+async def vertragsanlage_vorschau(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    form = await request.form()
+    _verify_csrf(session, str(form.get("csrf_token", "")))
+    modus = str(form.get("modus", ""))
+    ist_neu = modus == "NEU"
+    vertrag_id = str(form.get("vertrag_id", "")).strip()
+    if not vertrag_id:
+        return _fehlerseite(session, "Vertragsanlage", "Fehlende Vertrag-ID.", "/backoffice/vertraege")
+
+    if ist_neu:
+        neuer_vertrag = {
+            "einheit_id": str(form.get("einheit_id", "")), "debitor_id": str(form.get("debitor_id", "")),
+            "gesellschaft_id": str(form.get("gesellschaft_id", "")), "rechtsordnung": str(form.get("rechtsordnung", "")),
+            "gueltig_von": str(form.get("gueltig_von", "")), "gueltig_bis": str(form.get("gueltig_bis", "")) or None,
+        }
+        require_gesellschaft_access(_ctx(session), neuer_vertrag["gesellschaft_id"])
+        zurueck_href = "/backoffice/vertraege/neu"
+    else:
+        vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+        if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+            return _fehlerseite(session, "Vertragsanlage", "Vertrag nicht verfügbar.", "/backoffice/vertraege")
+        require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+        neuer_vertrag = None
+        zurueck_href = f"/backoffice/vertrag/{vertrag_id}/mietvertragsprofil/bearbeiten"
+
+    try:
+        profil_werte = _vertragsanlage_profil_werte_aus_form(form)
+    except ValueError as exc:
+        return _fehlerseite(session, "Vertragsanlage", str(exc), zurueck_href)
+
+    kaution_bereits_vorhanden = (not ist_neu) and _stammdaten_repo.get_kaution(vertrag_id) is not None
+    kaution_werte = None if kaution_bereits_vorhanden else profil_werte
+
+    quelle_typ = str(form.get("quelle_typ", "MANUELL")) or "MANUELL"
+    quelle_referenz = str(form.get("quelle_referenz", "")) or None
+
+    paket_json = _vertragsanlage_baue_paket_json(
+        quelle=f"backoffice-vertragsanlage:{session.user_id}", vertrag_id=vertrag_id, neuer_vertrag=neuer_vertrag,
+        profil_werte=profil_werte, kaution_werte=kaution_werte, quelle_typ=quelle_typ, quelle_referenz=quelle_referenz,
+    )
+    try:
+        paket = _intake_parse_json_paket(paket_json)
+    except IntakeFormatFehlerError as exc:
+        return _fehlerseite(session, "Vertragsanlage", str(exc), zurueck_href)
+    plan = _intake_erstelle_plan(paket, session_factory=_session_factory)
+
+    inhalt = _vertragsanlage_vorschau_ansicht(
+        ist_neu=ist_neu, befunde=list(plan.befunde), anwendbar=plan.anwendbar, hinweise=plan.hinweise,
+        paket_json=paket_json, csrf=session.csrf_token, aktion_url="/backoffice/vertragsanlage/uebernehmen",
+        zurueck_href=zurueck_href,
+    )
+    return _layout(request, session, "Vorschau Vertragsanlage", inhalt)
+
+
+@router.post("/vertragsanlage/uebernehmen", response_class=HTMLResponse)
+async def vertragsanlage_uebernehmen(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    form = await request.form()
+    _verify_csrf(session, str(form.get("csrf_token", "")))
+    paket_json = str(form.get("paket_json", ""))
+    try:
+        paket = _intake_parse_json_paket(paket_json)
+    except IntakeFormatFehlerError as exc:
+        return _fehlerseite(session, "Vertragsanlage", f"Ungültiges Paket: {exc}", "/backoffice/vertraege")
+
+    if paket.vertraege:
+        require_gesellschaft_access(_ctx(session), paket.vertraege[0].gesellschaft_id)
+        vertrag_id = paket.vertraege[0].id
+    else:
+        vertrag_id = (
+            paket.mietvertragsprofile[0].vertrag_id if paket.mietvertragsprofile
+            else (paket.kautionen[0].vertrag_id if paket.kautionen else "")
+        )
+        bestehender_vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+        if bestehender_vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+            return _fehlerseite(session, "Vertragsanlage", "Vertrag nicht (mehr) verfügbar.", "/backoffice/vertraege")
+        require_gesellschaft_access(_ctx(session), bestehender_vertrag.gesellschaft_id)
+
+    plan = _intake_erstelle_plan(paket, session_factory=_session_factory)
+    if not plan.anwendbar:
+        return _fehlerseite(
+            session, "Vertragsanlage",
+            "Der Stand hat sich seit der Vorschau geändert oder enthält ungeklärte Punkte; nichts wurde übernommen.",
+            "/backoffice/vertraege",
+        )
+    try:
+        ergebnis = _intake_wende_an(
+            paket, bestaetigter_hash=plan.paket_hash, stammdaten_repo=_stammdaten_repo, op_service=_op_service,
+            session_factory=_session_factory, akteur=session.user_id,
+        )
+        _audit_service.log(
+            entity_typ="vertragsanlage", entity_id=vertrag_id, aktion="UEBERNOMMEN", akteur=session.user_id,
+            payload={
+                "anzahl_vertraege": ergebnis.anzahl_vertraege,
+                "anzahl_mietvertragsprofile": ergebnis.anzahl_mietvertragsprofile,
+                "anzahl_kautionen": ergebnis.anzahl_kautionen,
+            },
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Vertragsanlage", f"Übernahme abgebrochen, NICHTS wurde gespeichert: {exc}", "/backoffice/vertraege")
+    return RedirectResponse(f"/backoffice/vertrag/{vertrag_id}", status_code=303)

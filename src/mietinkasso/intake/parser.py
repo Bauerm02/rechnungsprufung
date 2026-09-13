@@ -21,7 +21,9 @@ from mietinkasso.intake.schema import (
     EroeffnungZeile,
     GesellschaftZeile,
     IntakePaket,
+    KautionZeile,
     KomponenteZeile,
+    MietvertragsprofilZeile,
     NachbuchungZeile,
     ObjektZeile,
     SperreZeile,
@@ -40,6 +42,8 @@ CSV_BUENDEL_DATEINAMEN = (
     "eroeffnungskorrekturen",
     "sperren",
     "komponenten",
+    "kautionen",
+    "mietvertragsprofile",
 )
 
 
@@ -83,6 +87,15 @@ def _pflicht_bool(zeile: dict, feld: str, kontext: str) -> bool:
 def _optional_bool(zeile: dict, feld: str, *, default: bool) -> bool:
     if feld not in zeile or zeile.get(feld) in (None, ""):
         return default
+    return _pflicht_bool(zeile, feld, feld)
+
+
+def _optional_bool_oder_none(zeile: dict, feld: str) -> bool | None:
+    """Tri-state: None = nicht bestimmt/unbekannt, sonst echter Wahrheitswert.
+    Für Felder wie `index_schwelle_inklusive`, bei denen ein fehlender Fund
+    NICHT mit einem konkreten True/False verwechselt werden darf."""
+    if feld not in zeile or zeile.get(feld) in (None, ""):
+        return None
     return _pflicht_bool(zeile, feld, feld)
 
 
@@ -248,6 +261,49 @@ def _komponente_aus_dict(zeile: dict) -> KomponenteZeile:
     )
 
 
+def _kaution_aus_dict(zeile: dict) -> KautionZeile:
+    kontext = f"Kaution für Vertrag '{zeile.get('vertrag_id')}'"
+    return KautionZeile(
+        vertrag_id=_pflicht_str(zeile, "vertrag_id", "Kaution"),
+        betrag_cent=_pflicht_int(zeile, "betrag_cent", kontext),
+        stichtag=_pflicht_datum(zeile, "stichtag", kontext),
+        referenz=_optional_str(zeile, "referenz"),
+    )
+
+
+def _mietvertragsprofil_aus_dict(zeile: dict) -> MietvertragsprofilZeile:
+    kontext = f"Mietvertragsprofil für Vertrag '{zeile.get('vertrag_id')}'"
+    return MietvertragsprofilZeile(
+        vertrag_id=_pflicht_str(zeile, "vertrag_id", "Mietvertragsprofil"),
+        nutzungsart=(_optional_str(zeile, "nutzungsart") or "UNGEKLAERT").upper(),
+        urspruenglicher_mietbeginn=_optional_datum(zeile, "urspruenglicher_mietbeginn"),
+        verwaltungsuebernahme_am=_optional_datum(zeile, "verwaltungsuebernahme_am"),
+        verwaltung_bezeichnung=_optional_str(zeile, "verwaltung_bezeichnung"),
+        vertragliche_kaution_cent=_optional_int_oder_none(zeile, "vertragliche_kaution_cent", kontext),
+        vertragliche_kaution_quellenbeleg=_optional_str(zeile, "vertragliche_kaution_quellenbeleg"),
+        # None = unbekannt/kein Fund; 0 = ausdrücklich belegte "keine Gebühr".
+        mahngebuehr_cent=_optional_int_oder_none(zeile, "mahngebuehr_cent", kontext),
+        mahngebuehr_quellenbeleg=_optional_str(zeile, "mahngebuehr_quellenbeleg"),
+        index_reihe=_optional_str(zeile, "index_reihe"),
+        index_urspruenglicher_basismonat=_optional_str(zeile, "index_urspruenglicher_basismonat"),
+        index_urspruenglicher_basiswert=_optional_decimal(zeile, "index_urspruenglicher_basiswert", kontext),
+        index_schwelle_prozent=_optional_decimal(zeile, "index_schwelle_prozent", kontext),
+        index_schwelle_inklusive=_optional_bool_oder_none(zeile, "index_schwelle_inklusive"),
+        index_anpassungsmonat=_optional_int_oder_none(zeile, "index_anpassungsmonat", kontext),
+        index_mindestintervall_monate=_optional_int_oder_none(zeile, "index_mindestintervall_monate", kontext),
+        index_klauseltext_auszug=_optional_str(zeile, "index_klauseltext_auszug"),
+        index_klauseltext_seite=_optional_int_oder_none(zeile, "index_klauseltext_seite", kontext),
+        quelle_typ=(_optional_str(zeile, "quelle_typ") or "IMPORT_SCHEMA").upper(),
+        quelle_referenz=_optional_str(zeile, "quelle_referenz"),
+    )
+
+
+def _optional_int_oder_none(zeile: dict, feld: str, kontext: str) -> int | None:
+    if feld not in zeile or zeile.get(feld) in (None, ""):
+        return None
+    return _pflicht_int(zeile, feld, kontext)
+
+
 def parse_json_paket(text: str) -> IntakePaket:
     try:
         rohdaten = json.loads(text)
@@ -270,6 +326,10 @@ def parse_json_paket(text: str) -> IntakePaket:
         ),
         sperren=tuple(_sperre_aus_dict(z) for z in rohdaten.get("sperren", [])),
         komponenten=tuple(_komponente_aus_dict(z) for z in rohdaten.get("komponenten", [])),
+        kautionen=tuple(_kaution_aus_dict(z) for z in rohdaten.get("kautionen", [])),
+        mietvertragsprofile=tuple(
+            _mietvertragsprofil_aus_dict(z) for z in rohdaten.get("mietvertragsprofile", [])
+        ),
     )
 
 
@@ -304,4 +364,6 @@ def parse_csv_buendel(*, quelle: str, dateien: dict[str, str]) -> IntakePaket:
         ),
         sperren=tuple(_sperre_aus_dict(z) for z in _zeilen("sperren")),
         komponenten=tuple(_komponente_aus_dict(z) for z in _zeilen("komponenten")),
+        kautionen=tuple(_kaution_aus_dict(z) for z in _zeilen("kautionen")),
+        mietvertragsprofile=tuple(_mietvertragsprofil_aus_dict(z) for z in _zeilen("mietvertragsprofile")),
     )

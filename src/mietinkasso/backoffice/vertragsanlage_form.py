@@ -1,0 +1,524 @@
+"""Formulare für die vereinfachte Vertragsanlage/-anzeige (Auftrag
+HV-20260913-VERTRAGSANLAGE). Reine Renderer/Validatoren wie
+`indexklausel_form.py` - kein FastAPI-Import, keine Datenbankschreibung
+hier. Nutzt den BESTEHENDEN generischen Intake (`intake/`) als einzige
+Schreibstrecke; dieses Modul baut nur die editierbare Formularoberfläche
+und übersetzt Formularwerte in `IntakePaket`-Rohdaten."""
+
+from __future__ import annotations
+
+from datetime import date
+from decimal import Decimal, InvalidOperation
+from html import escape as h
+
+from mietinkasso.backoffice.views import csrf_feld, eur, option, parse_eur_betrag
+from mietinkasso.domain.money import cents_to_decimal
+
+NUTZUNGSARTEN = ["UNGEKLAERT", "WOHNUNG", "BUERO", "GESCHAEFTSLOKAL", "SONSTIGE"]
+RECHTSORDNUNGEN = [
+    "UNGEKLAERT", "OESTERREICH_MRG_VOLL", "OESTERREICH_MRG_TEIL", "OESTERREICH_MRG_FREI",
+    "OESTERREICH_WGG", "OESTERREICH_GEWERBE", "DEUTSCHLAND",
+]
+
+
+def feld_status(wert, *, unklar_werte: tuple = ()) -> str:
+    """Kurzstatus für die Übersicht - NIE mehr als diese drei Zustände,
+    kein kilometerlanges Roh-JSON im Hauptbild (Auftrag Markus)."""
+
+    if wert in unklar_werte:
+        return "Klärung erforderlich"
+    if wert is None or wert == "":
+        return "Angabe fehlt"
+    return "bereit"
+
+
+def _status_badge(status: str) -> str:
+    klasse = {"bereit": "badge-muted", "Angabe fehlt": "badge-warn", "Klärung erforderlich": "badge-error"}[status]
+    farbe = {"bereit": "ok", "Angabe fehlt": "warn", "Klärung erforderlich": "error"}[status]
+    return f'<span class="badge {klasse}"><span class="{farbe}">{h(status)}</span></span>'
+
+
+def _beleg_hinweis(vorschlaege: dict, feld: str) -> str:
+    v = vorschlaege.get(feld)
+    if v is None:
+        return ""
+    return (
+        f'<p class="muted">Vorschlag aus Dokument, Seite {v.seite}: '
+        f'&bdquo;&hellip;{h(v.auszug)}&hellip;&ldquo; — bitte prüfen.</p>'
+    )
+
+
+def einheit_label(objekt, einheit) -> str:
+    return f"{objekt.bezeichnung} ({objekt.id}) / {einheit.bezeichnung} ({einheit.id})"
+
+
+# ---------------------------------------------------------------------------
+# Liste + Auswahl
+# ---------------------------------------------------------------------------
+
+
+def vertraege_liste_formular(zeilen: list[dict], csrf: str) -> str:
+    """`zeilen`: Liste von {vertrag, objekt, einheit, debitor}."""
+
+    optionen = "".join(
+        option(z["vertrag"].id, f"{einheit_label(z['objekt'], z['einheit'])} — {z['debitor'].name}")
+        for z in zeilen
+    )
+    tabellenzeilen = "".join(
+        f"<tr><td>{h(z['vertrag'].id)}</td><td>{h(z['objekt'].bezeichnung)}</td>"
+        f"<td>{h(z['einheit'].bezeichnung)}</td><td>{h(z['debitor'].name)}</td>"
+        f"<td><a href='/backoffice/vertrag/{h(z['vertrag'].id)}'>Öffnen</a></td></tr>"
+        for z in zeilen
+    ) or "<tr><td colspan=5>Noch keine Verträge vorhanden.</td></tr>"
+    return f"""
+    <div class="card">
+      <h1>Mietverträge</h1>
+      <form method="get" action="/backoffice/vertrag/weiterleiten" style="max-width:520px;">
+        <label>Mietvertrag auswählen (Objekt / Einheit — Mieter)</label>
+        <select name="vertrag_id" required>{optionen}</select>
+        <button type="submit">Öffnen</button>
+      </form>
+      <p><a href="/backoffice/vertraege/neu"><button type="button" class="secondary">Neuen Mietvertrag anlegen</button></a></p>
+    </div>
+    <div class="card"><h2>Übersicht</h2>
+      <table><tr><th>Vertrag</th><th>Objekt</th><th>Einheit</th><th>Mieter</th><th></th></tr>
+      {tabellenzeilen}</table>
+    </div>"""
+
+
+# ---------------------------------------------------------------------------
+# Neuanlage - Kontext (Objekt/Einheit/Debitor/Gesellschaft + Vertragsdaten)
+# ---------------------------------------------------------------------------
+
+
+def neu_kontext_formular(*, einheiten_mit_objekt: list[tuple], debitoren: list, gesellschaften: list, csrf: str, fehler: str | None = None) -> str:
+    einheit_optionen = "".join(
+        f'<option value="{h(einheit.id)}">{h(einheit_label(objekt, einheit))}</option>'
+        for objekt, einheit in einheiten_mit_objekt
+    )
+    debitor_optionen = "".join(option(d.id, f"{d.name} ({d.id})") for d in debitoren)
+    gesellschaft_optionen = "".join(option(g.id, f"{g.name} ({g.id})") for g in gesellschaften)
+    rechtsordnung_optionen = "".join(option(r, r) for r in RECHTSORDNUNGEN)
+    fehlerblock = f'<div class="flash-error">{h(fehler)}</div>' if fehler else ""
+    return f"""
+    <div class="card">
+      <h1>Neuen Mietvertrag anlegen</h1>
+      <p class="muted">Objekt/Einheit, Gesellschaft und Mieter müssen bereits als Stammdaten vorhanden sein
+         (Einspielung über den Echtbetrieb-Intake). Dieser Ablauf legt den Mietvertrag selbst sowie das
+         Mietvertragsprofil an - optional vorausgefüllt aus einem hochgeladenen PDF.</p>
+      {fehlerblock}
+      <form method="post" action="/backoffice/vertragsanlage/pdf-hochladen" enctype="multipart/form-data">
+        {csrf_feld(csrf)}
+        <input type="hidden" name="modus" value="NEU">
+        <fieldset><legend>Vertrag</legend>
+          <label>Vertrag-ID (frei wählbar, eindeutig)</label>
+          <input name="vertrag_id" required placeholder="z. B. V-601-TOP4">
+          <label>Einheit</label><select name="einheit_id" required>{einheit_optionen}</select>
+          <label>Mieter (Debitor)</label><select name="debitor_id" required>{debitor_optionen}</select>
+          <label>Vermieter-Gesellschaft</label><select name="gesellschaft_id" required>{gesellschaft_optionen}</select>
+          <label>Rechtsordnung</label><select name="rechtsordnung" required>{rechtsordnung_optionen}</select>
+          <label>Vertragsbeginn (technisch, Sollstellung/OP)</label><input type="date" name="gueltig_von" required>
+          <label>Vertragsende (leer lassen = unbefristet)</label><input type="date" name="gueltig_bis">
+        </fieldset>
+        <fieldset><legend>Optionale einmalige PDF-Aufnahme</legend>
+          <p class="muted">Lokale Texterkennung ohne KI-/Cloud-Aufruf - liefert nur Vorschläge mit Seitenbeleg,
+             nichts wird ungeprüft übernommen. Ohne Datei geht es direkt zur manuellen Eingabe weiter.</p>
+          <label>Vertrags-PDF (optional)</label><input type="file" name="pdf_datei" accept="application/pdf">
+        </fieldset>
+        <button type="submit">Weiter zur Prüfung</button>
+      </form>
+    </div>"""
+
+
+def neu_kontext_werte(form) -> dict:
+    vertrag_id = str(form.get("vertrag_id", "")).strip()
+    if not vertrag_id:
+        raise ValueError("Vertrag-ID darf nicht leer sein.")
+    einheit_id = str(form.get("einheit_id", "")).strip()
+    debitor_id = str(form.get("debitor_id", "")).strip()
+    gesellschaft_id = str(form.get("gesellschaft_id", "")).strip()
+    rechtsordnung = str(form.get("rechtsordnung", "")).strip()
+    if rechtsordnung not in RECHTSORDNUNGEN:
+        raise ValueError("Ungültige Rechtsordnung.")
+    if not (einheit_id and debitor_id and gesellschaft_id):
+        raise ValueError("Einheit, Mieter und Gesellschaft sind Pflichtfelder.")
+    gueltig_von_raw = str(form.get("gueltig_von", "")).strip()
+    if not gueltig_von_raw:
+        raise ValueError("Vertragsbeginn ist ein Pflichtfeld.")
+    date.fromisoformat(gueltig_von_raw)  # Formatprüfung
+    gueltig_bis_raw = str(form.get("gueltig_bis", "")).strip()
+    if gueltig_bis_raw:
+        date.fromisoformat(gueltig_bis_raw)  # Formatprüfung
+    return dict(
+        vertrag_id=vertrag_id, einheit_id=einheit_id, debitor_id=debitor_id, gesellschaft_id=gesellschaft_id,
+        rechtsordnung=rechtsordnung, gueltig_von=gueltig_von_raw, gueltig_bis=gueltig_bis_raw or None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Editierbares Review (Mietvertragsprofil + optionale Kaution)
+# ---------------------------------------------------------------------------
+
+
+def _dezimal_feld(name: str, label: str, werte: dict, vorschlaege: dict, *, hinweis: str = "") -> str:
+    wert = werte.get(name, "") or ""
+    beleg = _beleg_hinweis(vorschlaege, name)
+    hinweistext = f'<p class="muted">{h(hinweis)}</p>' if hinweis else ""
+    return f'<label>{h(label)}</label><input name="{name}" value="{h(str(wert))}">{beleg}{hinweistext}'
+
+
+def _kaution_eingang_feld(werte: dict, kaution_bereits_vorhanden: bool) -> str:
+    if kaution_bereits_vorhanden:
+        return (
+            f'<p><strong>Bereits erfasst: {h(str(werte.get("kaution_eingegangen_cent") or ""))} '
+            f'am {h(str(werte.get("kaution_eingegangen_stichtag") or ""))}.</strong> '
+            "Eine bestätigte Kaution wird über diesen Ablauf NICHT geändert (strikte Idempotenz) - "
+            "Korrekturen bitte gesondert klären.</p>"
+        )
+    return (
+        '<label>Tatsächlich eingegangener Betrag (nur bei belegtem Zahlungseingang ausfüllen)</label>'
+        f'<input name="kaution_eingegangen_cent" value="{h(str(werte.get("kaution_eingegangen_cent") or ""))}">'
+        '<label>Stichtag des Zahlungseingangs</label>'
+        f'<input type="date" name="kaution_eingegangen_stichtag" value="{h(str(werte.get("kaution_eingegangen_stichtag") or ""))}">'
+        '<label>Referenz (Überweisungsbeleg o. Ä.)</label>'
+        f'<input name="kaution_eingegangen_referenz" value="{h(str(werte.get("kaution_eingegangen_referenz") or ""))}">'
+    )
+
+
+def pdf_upload_mini_formular(vertrag_id: str, csrf: str) -> str:
+    return f"""
+    <div class="card">
+      <h2>Optional: aus PDF vorausfüllen</h2>
+      <p class="muted">Lokale Texterkennung ohne KI-/Cloud-Aufruf - überschreibt NIE bereits gespeicherte
+         Angaben, füllt nur leere Felder unten vor.</p>
+      <form method="post" action="/backoffice/vertragsanlage/pdf-hochladen" enctype="multipart/form-data">
+        {csrf_feld(csrf)}
+        <input type="hidden" name="modus" value="BESTEHEND">
+        <input type="hidden" name="vertrag_id" value="{h(vertrag_id)}">
+        <input type="file" name="pdf_datei" accept="application/pdf" required>
+        <button type="submit">Hochladen und Vorschläge einblenden</button>
+      </form>
+    </div>"""
+
+
+def review_formular(
+    *, ist_neu: bool, kontext_hidden: dict, werte: dict, vorschlaege: dict, warnungen: tuple[str, ...],
+    csrf: str, aktion_url: str, zurueck_href: str, kaution_bereits_vorhanden: bool = False,
+) -> str:
+    hidden_felder = "".join(f'<input type="hidden" name="{h(k)}" value="{h(str(v))}">' for k, v in kontext_hidden.items())
+    warnblock = "".join(f'<p class="warn">{h(w)}</p>' for w in warnungen)
+    nutzungsart_optionen = "".join(
+        option(n, n, selected=(werte.get("nutzungsart") or "UNGEKLAERT") == n) for n in NUTZUNGSARTEN
+    )
+    inklusive_wert = werte.get("index_schwelle_inklusive")
+    inklusive_optionen = "".join([
+        option("", "nicht festgestellt", selected=inklusive_wert in (None, "")),
+        option("1", "ab Erreichen der Schwelle (inklusive)", selected=inklusive_wert == "1"),
+        option("0", "erst über der Schwelle", selected=inklusive_wert == "0"),
+    ])
+    return f"""
+    <div class="card">
+      <h1>{'Neuen Mietvertrag prüfen' if ist_neu else 'Mietvertragsprofil aktualisieren'}</h1>
+      <p class="muted">Lokal ausgelesene bzw. bereits gespeicherte Werte - jedes Feld bleibt editierbar.
+         Fehlende/unklare Angaben bewusst offen lassen, nichts wird erfunden.</p>
+      {warnblock}
+      <form method="post" action="{h(aktion_url)}">
+        {csrf_feld(csrf)}
+        {hidden_felder}
+        <fieldset><legend>Nutzung und Rechtsgrundlage</legend>
+          <label>Nutzungsart (unabhängig von der Rechtsordnung)</label>
+          <select name="nutzungsart">{nutzungsart_optionen}</select>
+          {_beleg_hinweis(vorschlaege, "nutzungsart")}
+        </fieldset>
+        <fieldset><legend>Mietbeginn und Verwaltung</legend>
+          <label>Ursprünglicher tatsächlicher Mietbeginn (falls abweichend vom Vertragsbeginn)</label>
+          <input type="date" name="urspruenglicher_mietbeginn" value="{h(str(werte.get('urspruenglicher_mietbeginn') or ''))}">
+          {_beleg_hinweis(vorschlaege, "urspruenglicher_mietbeginn")}
+          <label>Verwaltungsübernahme durch JLB/7DI am</label>
+          <input type="date" name="verwaltungsuebernahme_am" value="{h(str(werte.get('verwaltungsuebernahme_am') or ''))}">
+          <label>Verwaltung (Bezeichnung, falls abweichend)</label>
+          <input name="verwaltung_bezeichnung" value="{h(str(werte.get('verwaltung_bezeichnung') or ''))}">
+        </fieldset>
+        <fieldset><legend>Kaution</legend>
+          <label>Vereinbarter Betrag laut Vertrag (KEIN Zahlungsbeleg)</label>
+          <input name="vertragliche_kaution_cent" value="{h(str(werte.get('vertragliche_kaution_cent') or ''))}" placeholder="z. B. 1.500,00">
+          {_beleg_hinweis(vorschlaege, "vertragliche_kaution_cent")}
+          <label>Fundstelle im Vertrag</label>
+          <input name="vertragliche_kaution_quellenbeleg" value="{h(str(werte.get('vertragliche_kaution_quellenbeleg') or ''))}">
+          <p class="muted">Tatsächlich eingegangene Kaution getrennt unten erfassen - niemals automatisch gleichgesetzt.</p>
+          {_kaution_eingang_feld(werte, kaution_bereits_vorhanden)}
+        </fieldset>
+        <fieldset><legend>Mahngebühren</legend>
+          <p class="muted">Leer = unbekannt/kein Fund. Nur bei ausdrücklich belegter Klausel "0" für
+             "keine Gebühr vereinbart" eintragen - niemals automatisch verrechnet oder verzinst.</p>
+          <label>Mahngebühr laut Vertrag</label>
+          <input name="mahngebuehr_cent" value="{h(str(werte.get('mahngebuehr_cent') or ''))}">
+          {_beleg_hinweis(vorschlaege, "mahngebuehr_cent")}
+          <label>Fundstelle/Klausel</label>
+          <input name="mahngebuehr_quellenbeleg" value="{h(str(werte.get('mahngebuehr_quellenbeleg') or ''))}">
+        </fieldset>
+        <fieldset><legend>Index-Quellfelder (ausdrücklich unverbindlich)</legend>
+          <p class="muted">Reine Gedächtnisstütze für die spätere Anlage der tatsächlichen Indexklausel unter
+             "Indexregel" - erzeugt hier KEINE aktive Klausel, keine Freigabe, keine Sollstellung.</p>
+          <label>Indexreihe laut Vertrag</label>
+          <input name="index_reihe" value="{h(str(werte.get('index_reihe') or ''))}">
+          {_beleg_hinweis(vorschlaege, "index_reihe")}
+          <label>Ursprünglicher vertraglicher Basismonat (JJJJ-MM)</label>
+          <input type="month" name="index_urspruenglicher_basismonat" value="{h(str(werte.get('index_urspruenglicher_basismonat') or ''))}">
+          {_dezimal_feld("index_urspruenglicher_basiswert", "Ursprünglicher vertraglicher Basiswert", werte, vorschlaege)}
+          {_dezimal_feld("index_schwelle_prozent", "Schwelle in Prozent", werte, vorschlaege)}
+          <label>Schwelle bezogen auf</label><select name="index_schwelle_inklusive">{inklusive_optionen}</select>
+          <label>Anpassungsmonat (1-12, falls fix vereinbart)</label>
+          <input name="index_anpassungsmonat" value="{h(str(werte.get('index_anpassungsmonat') or ''))}">
+          <label>Mindestabstand zwischen Anpassungen (Monate)</label>
+          <input name="index_mindestintervall_monate" value="{h(str(werte.get('index_mindestintervall_monate') or ''))}">
+          <label>Klauseltext (Auszug)</label>
+          <textarea name="index_klauseltext_auszug" rows="3">{h(str(werte.get('index_klauseltext_auszug') or ''))}</textarea>
+          <label>Seite im Dokument</label>
+          <input name="index_klauseltext_seite" value="{h(str(werte.get('index_klauseltext_seite') or ''))}">
+        </fieldset>
+        <button type="submit">Vorschau anzeigen</button>
+      </form>
+      <p><a href="{h(zurueck_href)}">&larr; zurück</a></p>
+    </div>"""
+
+
+_STATUS_ANZEIGE = {
+    "NEU": ("bereit (neu)", "badge-muted"),
+    "UNVERAENDERT": ("bereit (unverändert)", "badge-muted"),
+    "AKTUALISIERUNG": ("bereit (neue Version)", "badge-warn"),
+    "KONFLIKT": ("Klärung erforderlich", "badge-error"),
+    "GESPERRT": ("gesperrt", "badge-error"),
+}
+
+
+def vorschau_ansicht(*, ist_neu: bool, befunde: list, anwendbar: bool, hinweise: tuple[str, ...], paket_json: str, csrf: str, aktion_url: str, zurueck_href: str) -> str:
+    zeilen = []
+    for b in befunde:
+        text, klasse = _STATUS_ANZEIGE.get(b.status, (b.status, "badge-muted"))
+        grund = f'<br><span class="muted">{h(b.grund)}</span>' if b.grund else ""
+        zeilen.append(f"<tr><td>{h(b.entitaet)}</td><td>{h(b.id)}</td><td><span class='badge {klasse}'>{h(text)}</span>{grund}</td></tr>")
+    hinweisblock = "".join(f'<p class="muted">{h(x)}</p>' for x in hinweise)
+    if anwendbar:
+        bestaetigen = f"""
+        <form method="post" action="{h(aktion_url)}">
+          {csrf_feld(csrf)}
+          <textarea name="paket_json" hidden>{h(paket_json)}</textarea>
+          <button type="submit">Jetzt übernehmen (Stammdaten, keine Sollstellung/Mail/Lastschrift)</button>
+        </form>"""
+    else:
+        bestaetigen = '<div class="flash-error">Es gibt ungeklärte Punkte (siehe oben) - es wird NICHTS übernommen, solange diese bestehen.</div>'
+    return f"""
+    <div class="card">
+      <h1>Vorschau — {'Neuer Mietvertrag' if ist_neu else 'Mietvertragsprofil-Aktualisierung'}</h1>
+      {hinweisblock}
+      <table><tr><th>Bereich</th><th>ID</th><th>Status</th></tr>{''.join(zeilen)}</table>
+      {bestaetigen}
+      <p><a href="{h(zurueck_href)}">&larr; zurück zur Bearbeitung</a></p>
+    </div>"""
+
+
+def _eur_ohne_symbol(cent: int) -> str:
+    """Wie `views.eur()`, aber OHNE " €"-Suffix - für die Formular-
+    Vorbefüllung, damit ein unverändert abgeschicktes Feld wieder
+    `parse_eur_betrag()`-kompatibel ist (das lehnt ein Suffix als
+    mehrdeutig ab)."""
+
+    return f"{cents_to_decimal(cent):,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
+
+
+def bestehende_werte(profil, kaution) -> dict:
+    """Übersetzt eine bereits gespeicherte `MietvertragsprofilTable`-Zeile
+    (+ optionale `KautionTable`-Zeile) zurück in die vom Formular
+    erwarteten String-Werte - Basis für die Bearbeiten-Ansicht eines
+    BESTEHENDEN Vertrags (kein PDF-Upload nötig)."""
+
+    werte: dict = {}
+    if profil is not None:
+        werte.update(dict(
+            nutzungsart=profil.nutzungsart,
+            urspruenglicher_mietbeginn=profil.urspruenglicher_mietbeginn.isoformat() if profil.urspruenglicher_mietbeginn else None,
+            verwaltungsuebernahme_am=profil.verwaltungsuebernahme_am.isoformat() if profil.verwaltungsuebernahme_am else None,
+            verwaltung_bezeichnung=profil.verwaltung_bezeichnung,
+            vertragliche_kaution_cent=_eur_ohne_symbol(profil.vertragliche_kaution_cent) if profil.vertragliche_kaution_cent is not None else None,
+            vertragliche_kaution_quellenbeleg=profil.vertragliche_kaution_quellenbeleg,
+            mahngebuehr_cent=_eur_ohne_symbol(profil.mahngebuehr_cent) if profil.mahngebuehr_cent is not None else None,
+            mahngebuehr_quellenbeleg=profil.mahngebuehr_quellenbeleg,
+            index_reihe=profil.index_reihe,
+            index_urspruenglicher_basismonat=profil.index_urspruenglicher_basismonat,
+            index_urspruenglicher_basiswert=profil.index_urspruenglicher_basiswert,
+            index_schwelle_prozent=profil.index_schwelle_prozent,
+            index_schwelle_inklusive=("1" if profil.index_schwelle_inklusive is True else "0" if profil.index_schwelle_inklusive is False else ""),
+            index_anpassungsmonat=profil.index_anpassungsmonat,
+            index_mindestintervall_monate=profil.index_mindestintervall_monate,
+            index_klauseltext_auszug=profil.index_klauseltext_auszug,
+            index_klauseltext_seite=profil.index_klauseltext_seite,
+        ))
+    if kaution is not None:
+        werte.update(dict(
+            kaution_eingegangen_cent=eur(kaution.betrag_cent),
+            kaution_eingegangen_stichtag=kaution.stichtag.isoformat(),
+            kaution_eingegangen_referenz=kaution.referenz,
+        ))
+    return werte
+
+
+def profil_werte_aus_form(form) -> dict:
+    def text(name: str) -> str | None:
+        wert = str(form.get(name, "")).strip()
+        return wert or None
+
+    def eur_cent(name: str) -> int | None:
+        wert = text(name)
+        if wert is None:
+            return None
+        return parse_eur_betrag(wert)
+
+    def ganzzahl(name: str) -> int | None:
+        wert = text(name)
+        if wert is None:
+            return None
+        try:
+            return int(wert)
+        except ValueError:
+            raise ValueError(f"'{name}' muss eine Ganzzahl sein.") from None
+
+    def dezimal(name: str) -> Decimal | None:
+        wert = text(name)
+        if wert is None:
+            return None
+        try:
+            return Decimal(wert.replace(",", "."))
+        except InvalidOperation:
+            raise ValueError(f"'{name}' ist keine gültige Dezimalzahl.") from None
+
+    nutzungsart = text("nutzungsart") or "UNGEKLAERT"
+    if nutzungsart not in NUTZUNGSARTEN:
+        raise ValueError("Ungültige Nutzungsart.")
+
+    inklusive_raw = text("index_schwelle_inklusive")
+    index_schwelle_inklusive = {"1": True, "0": False}.get(inklusive_raw)
+
+    basismonat = text("index_urspruenglicher_basismonat")
+    if basismonat is not None:
+        date.fromisoformat(basismonat + "-01")  # Formatprüfung, wirft bei ungültigem Wert
+
+    return dict(
+        nutzungsart=nutzungsart,
+        urspruenglicher_mietbeginn=text("urspruenglicher_mietbeginn"),
+        verwaltungsuebernahme_am=text("verwaltungsuebernahme_am"),
+        verwaltung_bezeichnung=text("verwaltung_bezeichnung"),
+        vertragliche_kaution_cent=eur_cent("vertragliche_kaution_cent"),
+        vertragliche_kaution_quellenbeleg=text("vertragliche_kaution_quellenbeleg"),
+        mahngebuehr_cent=eur_cent("mahngebuehr_cent"),
+        mahngebuehr_quellenbeleg=text("mahngebuehr_quellenbeleg"),
+        index_reihe=text("index_reihe"),
+        index_urspruenglicher_basismonat=basismonat,
+        index_urspruenglicher_basiswert=dezimal("index_urspruenglicher_basiswert"),
+        index_schwelle_prozent=dezimal("index_schwelle_prozent"),
+        index_schwelle_inklusive=index_schwelle_inklusive,
+        index_anpassungsmonat=ganzzahl("index_anpassungsmonat"),
+        index_mindestintervall_monate=ganzzahl("index_mindestintervall_monate"),
+        index_klauseltext_auszug=text("index_klauseltext_auszug"),
+        index_klauseltext_seite=ganzzahl("index_klauseltext_seite"),
+        kaution_eingegangen_cent=eur_cent("kaution_eingegangen_cent"),
+        kaution_eingegangen_stichtag=text("kaution_eingegangen_stichtag"),
+        kaution_eingegangen_referenz=text("kaution_eingegangen_referenz"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Detailansicht
+# ---------------------------------------------------------------------------
+
+
+def detail_ansicht(
+    *, vertrag, objekt, einheit, debitor, gesellschaft, profil, kaution, konto_id, komponenten,
+    rechtsprofil_hinweis: str | None, index_klausel_hinweis: str | None, versionen: list, csrf: str,
+) -> str:
+    nutzungsart = profil.nutzungsart if profil else "UNGEKLAERT"
+    nutzungsart_status = feld_status(nutzungsart, unklar_werte=("UNGEKLAERT",))
+    rechtsordnung_status = feld_status(vertrag.rechtsordnung, unklar_werte=("UNGEKLAERT",))
+    mahngebuehr_status = "bereit" if (profil and profil.mahngebuehr_cent is not None) else "Angabe fehlt"
+    kaution_vereinbart_status = "bereit" if (profil and profil.vertragliche_kaution_cent is not None) else "Angabe fehlt"
+    kaution_eingegangen_status = "bereit" if kaution is not None else "Angabe fehlt"
+
+    komponenten_zeilen = "".join(
+        f"<tr><td>{h(k.art)}</td><td>{h(k.bezeichnung)}</td><td>{eur(k.betrag_cent)}</td>"
+        f"<td>{k.ust_satz_promille / 100:.1f} %</td></tr>"
+        for k in komponenten
+    ) or "<tr><td colspan=4>Keine aktiven Mietkomponenten.</td></tr>"
+    summe_cent = sum(k.betrag_cent for k in komponenten)
+
+    versionen_zeilen = "".join(
+        f"<tr><td>{v.version}</td><td>{h(v.quelle_typ)}</td><td>{h(v.quelle_referenz or '')}</td>"
+        f"<td>{h(v.erstellt_von)}</td><td>{v.erstellt_am.strftime('%Y-%m-%d %H:%M') if v.erstellt_am else ''}</td></tr>"
+        for v in versionen
+    ) or "<tr><td colspan=5>Noch keine Version gespeichert.</td></tr>"
+
+    konto_link = f'<a href="/backoffice/konto/{h(konto_id)}">Mietkonto</a> · ' if konto_id else '<span class="muted">Mietkonto (noch keine Eröffnung)</span> · '
+    return f"""
+    <div class="card">
+      <h1>Mietvertrag {h(vertrag.id)}</h1>
+      <p>{konto_link}
+         <a href="/backoffice/vertrag/{h(vertrag.id)}/mahnvorschau">Mahnvorschau</a> ·
+         <a href="/backoffice/vertrag/{h(vertrag.id)}/indexklauseln">Indexregel</a> ·
+         <a href="/backoffice/vertrag/{h(vertrag.id)}/mieweg-vorschau">Rekonstruktionsmodell (Mietzinsobergrenze)</a></p>
+      <a href="/backoffice/vertrag/{h(vertrag.id)}/mietvertragsprofil/bearbeiten"><button type="button">Profil aktualisieren</button></a>
+    </div>
+    <div class="card"><h2>Mieter und Objekt</h2>
+      <table>
+        <tr><th>Mieter</th><td>{h(debitor.name)}{' — ' + h(debitor.email) if debitor.email else ''}</td></tr>
+        <tr><th>Vermieter-Gesellschaft</th><td>{h(gesellschaft.name)}</td></tr>
+        <tr><th>Verwaltung</th><td>{h(profil.verwaltung_bezeichnung) if profil and profil.verwaltung_bezeichnung else '—'}
+            {_status_badge('bereit' if (profil and profil.verwaltung_bezeichnung) else 'Angabe fehlt')}</td></tr>
+        <tr><th>Objekt / Einheit</th><td>{h(objekt.bezeichnung)} / {h(einheit.bezeichnung)}</td></tr>
+        <tr><th>Nutzung</th><td>{h(nutzungsart)} {_status_badge(nutzungsart_status)}</td></tr>
+        <tr><th>Rechtsordnung (MRG)</th><td>{h(vertrag.rechtsordnung)} {_status_badge(rechtsordnung_status)}</td></tr>
+      </table>
+    </div>
+    <div class="card"><h2>Laufzeit</h2>
+      <table>
+        <tr><th>Vertragsbeginn (technisch)</th><td>{vertrag.gueltig_von.isoformat()}</td></tr>
+        <tr><th>Vertragsende</th><td>{vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else 'unbefristet'}</td></tr>
+        <tr><th>Ursprünglicher tatsächlicher Mietbeginn</th>
+            <td>{profil.urspruenglicher_mietbeginn.isoformat() if profil and profil.urspruenglicher_mietbeginn else '—'}
+            {_status_badge('bereit' if (profil and profil.urspruenglicher_mietbeginn) else 'Angabe fehlt')}</td></tr>
+        <tr><th>Verwaltungsübernahme</th>
+            <td>{profil.verwaltungsuebernahme_am.isoformat() if profil and profil.verwaltungsuebernahme_am else '—'}
+            {_status_badge('bereit' if (profil and profil.verwaltungsuebernahme_am) else 'Angabe fehlt')}</td></tr>
+      </table>
+    </div>
+    <div class="card"><h2>Mietbestandteile (aktiv)</h2>
+      <table><tr><th>Art</th><th>Bezeichnung</th><th>Betrag</th><th>USt</th></tr>{komponenten_zeilen}</table>
+      <p><strong>Summe netto: {eur(summe_cent)}</strong> (USt je Komponente separat, siehe Vorschreibung für Bruttosumme)</p>
+    </div>
+    <div class="card"><h2>Kaution und Mahngebühren</h2>
+      <table>
+        <tr><th>Kaution vereinbart (laut Vertrag)</th>
+            <td>{eur(profil.vertragliche_kaution_cent) if profil and profil.vertragliche_kaution_cent is not None else '—'}
+            {_status_badge(kaution_vereinbart_status)}</td></tr>
+        <tr><th>Kaution eingegangen (bestätigt)</th>
+            <td>{eur(kaution.betrag_cent) if kaution else '—'} {_status_badge(kaution_eingegangen_status)}</td></tr>
+        <tr><th>Mahngebühr laut Vertrag</th>
+            <td>{eur(profil.mahngebuehr_cent) if profil and profil.mahngebuehr_cent is not None else '—'}
+            {_status_badge(mahngebuehr_status)}
+            {' <span class="muted">(0 = ausdrücklich keine Gebühr vereinbart)</span>' if profil and profil.mahngebuehr_cent == 0 else ''}</td></tr>
+      </table>
+    </div>
+    <div class="card"><h2>Index-Quellfelder (unverbindlich)</h2>
+      <p class="muted">Reine Gedächtnisstütze - erzeugt keine aktive Klausel. Die tatsächlich wirksame Indexklausel
+         steht getrennt unter "Indexregel" oben.</p>
+      <table>
+        <tr><th>Reihe</th><td>{h(profil.index_reihe) if profil and profil.index_reihe else '—'}</td></tr>
+        <tr><th>Basismonat</th><td>{h(profil.index_urspruenglicher_basismonat) if profil and profil.index_urspruenglicher_basismonat else '—'}</td></tr>
+        <tr><th>Basiswert</th><td>{profil.index_urspruenglicher_basiswert if profil and profil.index_urspruenglicher_basiswert is not None else '—'}</td></tr>
+        <tr><th>Schwelle</th><td>{f"{profil.index_schwelle_prozent} % ({'ab' if profil.index_schwelle_inklusive else 'über'})" if profil and profil.index_schwelle_prozent is not None else '—'}</td></tr>
+      </table>
+    </div>
+    <details class="card"><summary>Quellen und Historie</summary>
+      <h3>Freigegebenes Rechtsprofil</h3><p>{h(rechtsprofil_hinweis) if rechtsprofil_hinweis else 'Kein Rechtsprofil freigegeben.'}</p>
+      <h3>Indexklausel</h3><p>{h(index_klausel_hinweis) if index_klausel_hinweis else 'Keine Indexklausel erfasst.'}</p>
+      <h3>Mietvertragsprofil-Versionen</h3>
+      <table><tr><th>Version</th><th>Quelle</th><th>Referenz</th><th>Erfasst von</th><th>Am</th></tr>{versionen_zeilen}</table>
+    </details>"""
