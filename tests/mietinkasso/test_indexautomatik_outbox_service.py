@@ -443,7 +443,13 @@ def test_verwaiste_in_versand_werden_markiert(admin_ctx, basis_vertrag, outbox_s
     assert outbox_repo.get(schreiben.id).status == "UNKLAR"
 
 
-def test_mehrkomponenten_werden_vor_versand_blockiert(admin_ctx, basis_vertrag, outbox_service, rechtsprofil_service, stammdaten_repo):
+def test_mehrkomponenten_werden_centgenau_verteilt(admin_ctx, basis_vertrag, outbox_service, rechtsprofil_service, stammdaten_repo):
+    """Codex-Rückprüfung (499c36f/8f499c9): "Mehrkomponenten bleibt komplett
+    gesperrt, obwohl HMZ+Küche beauftragt - explizite centgenaue Verteilung
+    implementieren". Zwei referenzierte Komponenten (HMZ 100.000 Cent,
+    Küche 10.000 Cent) mit Gesamterhöhung 1000 Cent werden proportional zum
+    jeweiligen Anteil verteilt (größte-Rest-Verfahren): HMZ 909/110.000-tel,
+    Küche 91/110.000-tel - Summe exakt 1000 Cent, kein Rundungsverlust."""
     from mietinkasso.mieweg_vorschau.repository import MieWegVorschauRepository
     from mietinkasso.mieweg_vorschau.service import MieWegVorschauService, VpiWert
 
@@ -483,29 +489,33 @@ def test_mehrkomponenten_werden_vor_versand_blockiert(admin_ctx, basis_vertrag, 
         massgeblicher_termin=date(2026, 4, 1), erhoehung_cent=1000, aktuell_verrechnet_cent=110_000,
         referenzierte_komponenten=komponenten, unveraenderte_komponenten=[], akteur="test",
     )
+    # Ohne belegte Postadresse bleibt das Schreiben BLOCKIERT - Mehrkomponenten
+    # selbst ist aber kein Blockiergrund mehr.
     assert schreiben.status == "BLOCKIERT"
-    assert any("Mehr" in g for g in schreiben.blockiert_gruende)
-    assert schreiben.komponenten_verteilung == {}
+    assert not any("Mehr" in g for g in schreiben.blockiert_gruende)
+    eintraege = {e["komponente_id"]: e for e in schreiben.komponenten_verteilung["eintraege"]}
+    assert eintraege["K-1"] == {"komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 100_909}
+    assert eintraege["K-2"] == {"komponente_id": "K-2", "alter_betrag_cent": 10_000, "neuer_betrag_cent": 10_091}
+    summe_delta = sum(e["neuer_betrag_cent"] - e["alter_betrag_cent"] for e in eintraege.values())
+    assert summe_delta == 1000
+    assert "HMZ" in schreiben.schreiben_text and "Küche" in schreiben.schreiben_text
 
-    # Codex-Rückprüfung (499c36f): nach behobener Quelle (hier: nur noch
-    # EINE statt zwei referenzierte Komponenten) muss ein Retry über
-    # `bestehende_id` die VERALTETE (leere) `komponenten_verteilung`
-    # durch die frisch berechnete ersetzen - nicht stillschweigend leer
-    # lassen.
+    # Nach behobener Quelle (hier: Postadresse ergänzt) muss ein Retry über
+    # `bestehende_id` die Verteilung neu berechnen und BEREIT setzen.
     debitor = stammdaten_repo.get_debitor(vertrag.debitor_id)
     stammdaten_repo.upsert_debitor(id=debitor.id, name=debitor.name, email=debitor.email, adresse="Corsogasse 1/3, 1010 Wien")
-    komponente = stammdaten_repo.get_komponente("K-1")
+    komponenten_aktuell = [stammdaten_repo.get_komponente("K-1"), stammdaten_repo.get_komponente("K-2")]
     erneuert = outbox_service.erstellen_aus_mieweg(
         ctx=admin_ctx, vertrag=vertrag, profil=profil, vorschau=vorschau, ziel_bewertungsjahr=2026,
-        massgeblicher_termin=date(2026, 4, 1), erhoehung_cent=1000, aktuell_verrechnet_cent=100_000,
-        referenzierte_komponenten=[komponente], unveraenderte_komponenten=[], akteur="test",
+        massgeblicher_termin=date(2026, 4, 1), erhoehung_cent=1000, aktuell_verrechnet_cent=110_000,
+        referenzierte_komponenten=komponenten_aktuell, unveraenderte_komponenten=[], akteur="test",
         bestehende_id=schreiben.id,
     )
     assert erneuert.id == schreiben.id
     assert erneuert.status == "BEREIT"
-    assert erneuert.komponenten_verteilung == {
-        "komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 101_000,
-    }
+    eintraege_erneuert = {e["komponente_id"]: e for e in erneuert.komponenten_verteilung["eintraege"]}
+    assert eintraege_erneuert["K-1"]["neuer_betrag_cent"] == 100_909
+    assert eintraege_erneuert["K-2"]["neuer_betrag_cent"] == 10_091
 
 
 def test_erstellen_aus_mieweg_befuellt_komponenten_verteilung_bei_genau_einer_komponente(
@@ -556,5 +566,5 @@ def test_erstellen_aus_mieweg_befuellt_komponenten_verteilung_bei_genau_einer_ko
         referenzierte_komponenten=[komponente], unveraenderte_komponenten=[], akteur="test",
     )
     assert schreiben.komponenten_verteilung == {
-        "komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 101_000,
+        "eintraege": [{"komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 101_000}]
     }

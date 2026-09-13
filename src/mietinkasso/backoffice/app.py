@@ -2641,11 +2641,15 @@ def indexautomatik_soll_umsetzung_detail(
             + "</ul>"
         )
     else:
+        zeilen_soll = "".join(
+            f"<tr><td>{h(eintrag['komponente_id'])}</td><td>{eur(eintrag['alter_betrag_cent'])}</td>"
+            f"<td>{eur(eintrag['neuer_betrag_cent'])}</td><td>{h(vorschau['wirksam_ab'])}</td></tr>"
+            for eintrag in vorschau["eintraege"]
+        )
         stand_html = f"""
         <table>
           <tr><th>Komponente</th><th>Alter Betrag</th><th>Neuer Betrag</th><th>Wirksam ab</th></tr>
-          <tr><td>{h(vorschau['komponente_id'])}</td><td>{eur(vorschau['alter_betrag_cent'])}</td>
-              <td>{eur(vorschau['neuer_betrag_cent'])}</td><td>{h(vorschau['wirksam_ab'])}</td></tr>
+          {zeilen_soll}
         </table>
         """
     aktion_html = ""

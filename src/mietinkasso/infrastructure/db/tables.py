@@ -853,6 +853,16 @@ class IndexSollUmsetzungTable(Base):
     quelle_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     neue_komponente_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     beendete_komponente_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Additiv (ensure_additive_columns-sicher, keine FK): Mehrkomponenten-
+    # Umsetzung (HV-20260913-VERSAND-SOLL, Mehrkomponentenverteilung) kann
+    # MEHR als eine Komponente historisieren - `neue_komponente_id`/
+    # `beendete_komponente_id` bleiben für den (weiterhin häufigsten)
+    # Ein-Komponenten-Fall unverändert bequem gefüllt, tragen bei mehreren
+    # betroffenen Komponenten aber `None`. Diese beiden Listenfelder sind
+    # IMMER vollständig (auch im Ein-Komponenten-Fall) und damit die
+    # verbindliche, generische Quelle für den Ausführungsnachweis.
+    neue_komponenten_ids: Mapped[list] = mapped_column(JSON, default=list)
+    beendete_komponenten_ids: Mapped[list] = mapped_column(JSON, default=list)
     neues_rechtsprofil_id: Mapped[int | None] = mapped_column(ForeignKey("rechtsprofile.id"), nullable=True)
     wirksam_ab: Mapped[date | None] = mapped_column(Date, nullable=True)
     akteur: Mapped[str | None] = mapped_column(String(128), nullable=True)
