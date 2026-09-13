@@ -143,3 +143,60 @@ class JobLaufStatus(str, enum.Enum):
     LAEUFT = "LAEUFT"
     ERFOLGREICH = "ERFOLGREICH"
     FEHLGESCHLAGEN = "FEHLGESCHLAGEN"
+
+
+class RechtsprofilStatus(str, enum.Enum):
+    ENTWURF = "ENTWURF"
+    FREIGEGEBEN = "FREIGEGEBEN"
+    INVALIDIERT = "INVALIDIERT"
+
+
+class IndexautomatikLaufStatus(str, enum.Enum):
+    BLOCKIERT = "BLOCKIERT"
+    TERMIN_NICHT_ERREICHT = "TERMIN_NICHT_ERREICHT"
+    KEIN_ERHOEHUNGSBEDARF = "KEIN_ERHOEHUNGSBEDARF"
+    ERHOEHUNG_ERZEUGT = "ERHOEHUNG_ERZEUGT"
+    BEREITS_ERFASST = "BEREITS_ERFASST"
+
+
+class ErhoehungsschreibenStatus(str, enum.Enum):
+    """Wortlaut exakt wie beauftragt: "Entwurf/blockiert/bereit/
+    gesendet/Zugang bestätigt/ausgeführt/unklar"."""
+
+    ENTWURF = "ENTWURF"
+    BLOCKIERT = "BLOCKIERT"
+    BEREIT = "BEREIT"
+    GESENDET = "GESENDET"
+    ZUGANG_BESTAETIGT = "ZUGANG_BESTAETIGT"
+    AUSGEFUEHRT = "AUSGEFUEHRT"
+    UNKLAR = "UNKLAR"
+
+
+#: Formal für eine MRG-Zugangsfrist geeignete Zustellwege - eine bloß
+#: technisch angenommene E-Mail (SMTP/HTTP-accepted) gilt NICHT
+#: automatisch als Zugang (Fachlicher Nachtrag 13.09.: "nicht jedes
+#: E-Mail verbieten", aber "keine automatische Gleichsetzung von SMTP/
+#: HTTP-accepted mit Zugang"). `EMAIL_UNBESTAETIGT` bleibt daher
+#: bewusst AUSSERHALB dieser Menge; eine formal ausreichende Bestätigung
+#: (z. B. Lesebestätigung, Übergabeprotokoll, Rückschein) gehört hier
+#: hinein.
+ZUGANGSFORMEN_AUSREICHEND = frozenset({
+    "EINSCHREIBEN_RUECKSCHEIN",
+    "UEBERGABE_BESTAETIGT",
+    "EMAIL_MIT_LESEBESTAETIGUNG",
+    "SONSTIGER_FORMELLER_NACHWEIS",
+})
+ZUGANGSFORMEN_ALLE = ZUGANGSFORMEN_AUSREICHEND | {"EMAIL_UNBESTAETIGT"}
+
+
+class VertragsendeErinnerungStatus(str, enum.Enum):
+    OFFEN = "OFFEN"
+    BENACHRICHTIGT = "BENACHRICHTIGT"
+    ENTSCHIEDEN = "ENTSCHIEDEN"
+    UNGUELTIG = "UNGUELTIG"
+
+
+class VertragsendeEntscheidung(str, enum.Enum):
+    VERLAENGERN_PRUEFEN = "VERLAENGERN_PRUEFEN"
+    NICHT_VERLAENGERN_PRUEFEN = "NICHT_VERLAENGERN_PRUEFEN"
+    RUECKFRAGE = "RUECKFRAGE"

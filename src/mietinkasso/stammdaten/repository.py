@@ -255,6 +255,17 @@ class StammdatenRepository:
         with self._session_factory() as session:
             return session.get(VertragTable, id)
 
+    def list_alle_vertraege(self) -> list[VertragTable]:
+        """Für Batch-/Automatikläufe über ALLE Verträge (Indexautomatik,
+        Vertragsende-Erinnerung) - anders als `list_vertraege_fuer_objekt`
+        ohne Objektfilter. Schließt Objekt 107 NICHT selbst aus (das bleibt
+        `pruefe_vertrag_nicht_ausgeschlossen`, das der jeweilige Aufrufer
+        pro Vertrag aufruft), damit ein ausgeschlossener Vertrag sichtbar
+        mit Grund übersprungen wird statt lautlos zu fehlen."""
+
+        with self._session_factory() as session:
+            return list(session.execute(select(VertragTable).order_by(VertragTable.id)).scalars().all())
+
     def list_vertraege_fuer_objekt(self, objekt_id: str) -> list[VertragTable]:
         with self._session_factory() as session:
             statement = (

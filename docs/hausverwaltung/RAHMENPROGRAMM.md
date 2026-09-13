@@ -374,3 +374,189 @@ Punkte in `docs/hausverwaltung/OFFENE_PUNKTE.md`.
   bleibt reines Eignungsflag für `index/service.py`; der Intake ruft an
   keiner Stelle `IndexService` auf — "keine Indexfreigabe" ist damit
   strukturell erzwungen, nicht nur dokumentiert.
+
+## Auftrag HV-20260913-INDEXAUTOMATIK (wortgetreu, 13.09.2026)
+
+> Neuer verbindlicher Nutzerauftrag HV-20260913-INDEXAUTOMATIK. Bitte
+> auf dem bestehenden freigegebenen Branch claude/bold-volta-7xovjq ab
+> ae3abb4 implementieren, testen, committen und normal pushen. Sonnet
+> reicht; Fast bleibt aus. Du implementierst, Codex prüft unabhängig und
+> übernimmt reale Stammdaten/Betrieb. Nur synthetische Daten in
+> Code/Tests, keine Serverzugriffe oder echten Mails/Buchungen,
+> Rechnungsmodul und EBICS-Baum nicht ändern. Keine parallelen
+> Code-Writer.
+>
+> Ziel: dauerhafter deterministischer Betrieb ohne KI: jeden Monat
+> vertragliche Indexierung prüfen, rechtlich ausführbare Erhöhung mit
+> korrektem Schreiben automatisch zur Zustellung bringen; zusätzlich
+> drei Kalendermonate vor vertraglichem Mietende ausschließlich den
+> intern konfigurierten Eigentümer/Markus erinnern. Mieter bei
+> Vertragsende ERST nach seiner ausdrücklichen gespeicherten
+> Entscheidung kontaktieren. Nicht automatisch kündigen, verlängern
+> oder Leerstand buchen. Klare UI im bestehenden geschützten
+> Backoffice, keine zweite Datenquelle.
+>
+> Bitte vollständigen zusammenhängenden Workflow im vorhandenen
+> Mietmodul bauen (persistente Tabellen/Migration, Service, CLI/
+> systemd-Vorlagen, Backoffice, Tests/Doku):
+>
+> 1. Monatsprüfung je aktivem Vertrag und Monatsperiode idempotent,
+>    prozess-/DB-sicher, bei Wiederholung oder Absturz keine
+>    Doppelbuchung/Double-Send. Bestehende Quellen/Komponenten, aktuell
+>    verrechneter Betrag und letzte tatsächlich verwendete Indexbasis,
+>    nicht nur historischer theoretischer Verlauf; rückdatierte
+>    Veröffentlichungen und bereits angewandte Erhöhungen beachten.
+>    Monatslauf prüft; Ausführung nur zum vertraglich und gesetzlich
+>    erlaubten Termin. Kalenderzeit Europe/Vienna, Monatsende/
+>    Schaltjahr sauber.
+> 2. Wiederverwendung der abgenommenen mieweg_vorschau/index-Rechner,
+>    KEIN paralleler ungeschützter Rohrechner. Für jeden Fall
+>    versioniertes freigegebenes Profil mit Vertragsbeleg/Klausel/
+>    Rechtsordnung, Wohnung versus Geschäft explizit, Haupt-/
+>    Untermiete, Förderbindung/Mietzinsobergrenze und Bezug/
+>    Letzterhöhung. Ungeklärte Daten blockieren nur den Fall, erzeugen
+>    konkrete interne Prüfliste. Nutzer will MRG-Vollanwendung
+>    ausdrücklich mit abgedeckt: MieWeG für Wohnungen im Voll-/
+>    Teilbereich, Deckel/April-Termin/Altvertragsübergang prüfen; MRG
+>    §16 Abs9 Höchstzins und schriftliches Erhöhungsbegehren nach
+>    Wirksamwerden, rechtzeitiger ZUGANG mindestens 14 Tage vor
+>    maßgeblichem Zinstermin. Keine pauschale Rechtsklassifikation
+>    MRG_VOLL=>Wohnung. Eigentümer-Rechtsprofilfreigabe einmal
+>    versioniert, danach keine unnötige monatliche Einzelgenehmigung
+>    unveränderter Standardfälle. Änderungen an Quelle/Basis/Vertrag/
+>    Profil entwerten alte Freigabe. Gesetzesdetails prüft Codex
+>    separat und liefert Präzisierungen; keine eigene Rechtsannahme bei
+>    Lücke.
+> 3. Nur indexfähige Komponenten, Küche/Stellplatz gemäß eigener
+>    Vertragsgrundlage; BK/HK/Wasser/Strom etc niemals pauschal
+>    indexieren. Netto/USt/Brutto transparent. Gesetzliche Obergrenze
+>    ist harte Bedingung (inklusive deren Beleg/Gültigkeit); fehlend=>
+>    blockiert statt fiktiv unbegrenzt. Bei MRG muss ein bloß
+>    versendetes SMTP-E-Mail nicht als rechtzeitiger Zugang gelten.
+>    Formal geeigneten Zustellweg samt Beleg modellieren; bei fehlendem
+>    Zugang oder Formnachweis keine erhöhte Sollbuchung und keine
+>    rückwirkende Mahnung. Fristversäumnis=>nächsten rechtlich
+>    zulässigen Zinstermin bestimmen, nicht starr Versanddatum+14
+>    buchen.
+> 4. Qualifiziertes deutsches Erhöhungsschreiben: Gesellschaft aus
+>    Vertrag, Adresse/Top/Mieter, Klausel, Reihe/Basis-/Vergleichsmonat/
+>    -werte, Rechenweg, alter/neuer HMZ sowie Küche/Parkplatz einzeln
+>    und USt/Gesamtsumme, Wirksamkeits-/Zahlungstermin, unveränderte BK
+>    transparent, Belege/Version, JLB-Signatur aus Konfiguration.
+>    Rechts-/Zustellform explizit; HTML allein oder Provider-Acceptance
+>    nicht als qualifizierte Schriftform/Zugang ausgeben. Persistente
+>    Outbox mit Zuständen Entwurf/blockiert/bereit/gesendet/Zugang
+>    bestätigt/ausgeführt/unklar; vor Dispatch Quelle/Empfänger/
+>    Vertragsstatus erneut prüfen. Stabile Idempotenz an Transport,
+>    unklarer Timeout wird NICHT blind wiederholt. Ein
+>    Transportadapter/konfigurierbarer interner Dienst genügt, mit
+>    echten implementierten Request-/Responsechecks und isolierten
+>    Fakes für Tests; keine erfundene Liveintegration. Versand-/Index-
+>    und Owner-Erinnerungsflags getrennt (keine globale Aktivierung von
+>    Mahnungen). Produktionsdaten nicht ändern.
+> 5. Vertragsende: Trigger end_date minus 3 Kalendermonate (kein 90
+>    Tage), fällige verpasste Hinweise einmal nachholen, zukünftige
+>    Frist beachten. Unbefristet/kein belastbarer Endtermin=>kein
+>    erfundener Leerstand. Stabile Aufgabe je Vertrag+Enddatum, nach
+>    Verlängerung alte Aufgabe/Outbox ungültig, neuer Termin neu
+>    planbar. Interner Hinweis mit Objekt/Top/Mieter/Ende und
+>    Entscheidung im authentifizierten Portal 'verlängern prüfen'/
+>    'nicht verlängern prüfen'/'Rückfrage'. Keine Entscheidung über
+>    GET-Link, CSRF/Auth/Audit. Empfänger hart Owner-only; kein
+>    tenant_email Fallback/CC. Entscheidung erzeugt höchstens
+>    freizugebenden Mieterentwurf, niemals automatisches rechtlich
+>    bindendes Kündigungsschreiben oder einen neuen Vertrag.
+> 6. Produktivplan: monatlich Indexkontrolle (z.B. 1. um 06:00 Wien),
+>    täglich fällige Zustellungen/3-Monats-Erinnerungen nachziehen
+>    (keine KI-Automation). Ein Writer, Lock/Idempotenz, sichtbarer
+>    letzter Lauf/Fehler/konkrete Blocker. Default Versand aus; Codex
+>    kann nach Abnahme definierte Features separat aktivieren, ohne
+>    bestehende Mahnsperren aufzuheben. Migration muss die bestehende
+>    reale DB verlustfrei erweitern.
+>
+> Abnahmetests: Januarvertrag außerhalb Januar; genau 3% versus >3%;
+> Wohnung Voll/Teil, Geschäft unter MRG, unbekanntes Profil; April/
+> 14-Tage-Zugang/fehlender Zugang/Fristversäumnis; Deckel/
+> Fördergrenze; letzte Basis+bereits angewandte Erhöhung; fehlende
+> amtliche VPI-Publikation; Doppel-/Parallelstart/Crash/unklarer
+> Versand; abgelaufener Vertrag und geänderter Empfänger; leap-day/
+> 31.05 minus 3 Monate; Reminder nur Owner, Änderung des Enddatums,
+> unbefristet, tenant action nur nach Entscheidung; CSRF/
+> Objektzugriff. Bitte Kern integrieren statt nur TODOs oder isolierte
+> Bibliothek. Vor Umsetzung kurz Scope/Ausgangscommit prüfen; danach
+> arbeiten bis Übergabecommit mit Testnachweis und ehrlichen Resten.
+
+### Fachlicher Nachtrag (13.09.2026, während der Umsetzung)
+
+> Fachlicher Nachtrag, Codex hat die amtlichen RIS-PDFs am 13.09.2026
+> tatsächlich heruntergeladen/gelesen (NOR40274266 §1, NOR40274269 §4,
+> NOR40273694 §16). Wichtig für Implementierung: §1 Abs2 Z1 positiver
+> Anteil über 3% halbiert; erste volle Monate nach Bezug und
+> Halbcent-ABRUNDUNG; Abs3 Bezugsjahre 2025=1%, 2026=2% nur bei
+> Wohnungs-Mietzinsbeschränkung. §4 Abs2 Altvertrag: tatsächlich
+> zuletzt angewandter Indexbezugsmonat, nicht automatisch Miet-/
+> Verwaltungsbeginn. Abs4 Vertragsdeckel+gesetzlicher Deckel,
+> April-Modelltermin. §16 Abs9 bleibt unberührt: Höchstzins+nach
+> Wirksamwerden ergehendes Schreiben und 14 Tage Zugang.
+> Modell-Wirksamkeit (April) und erste Zahlungspflicht nach
+> fristgerechtem Zugang sind GETRENNTE Termine; verspätete Zustellung
+> nicht automatisch um ganzes Jahr schieben. Präzisierung: "qualifiziert
+> richtig" heißt fachlich korrektes Schreiben, NICHT pauschal
+> QES-Pflicht! Nicht jedes E-Mail verbieten; konkreten dokumentierten
+> Zustellweg/Formregel als Profil prüfen. Keine automatische
+> Gleichsetzung von SMTP/HTTP-accepted mit Zugang. JLB-Versand nutzt
+> gestaltete HTML-Signatur mit eingebettetem Original-Logo, bestehende
+> Mailstrecke; generischer Transport mit strengem dokumentiertem
+> Request/Response-Vertrag, keine Fake-Live-Behauptung. Codex prüft
+> gerade vorhandene Betriebsanbindung. Bitte jetzt fokussiert
+> implementieren; keine weiteren breiten Architektursuchen oder
+> zusätzlichen Agenten. Bestehende Baugruppen wiederverwenden. Erst
+> vollständiger Kern inkl. UI/CLI/Tests und Übergabecommit; keine
+> fremden Module anfassen. Ist dies in sinnvollen Teilcommits möglich,
+> bitte Zwischenergebnisse committen/pushen, damit Codex die
+> unabhängige Prüfung parallel beginnen kann, ohne deine Dateien zu
+> ändern.
+
+### Umsetzung/Konkretisierungen (diese Sitzung)
+
+- **Terminmodell §16 Abs9, aus dem Nachtrag abgeleitet:** die
+  MieWeG-April-Wirksamkeit (`fruehester_termin_gesamt` aus
+  `mieweg_vorschau/service.py`) und die tatsächliche
+  Zahlungspflicht-Fälligkeit sind zwei GETRENNTE Daten. Ein
+  Erhöhungsschreiben ergeht ERST NACH diesem April-Termin (nie davor);
+  die Zahlungspflicht beginnt erst am nächsten monatlichen Zinstermin
+  (`VertragTable.faelligkeit_tag`), der mindestens 14 Tage nach
+  tatsächlich bestätigtem Zugang liegt. Eine verspätete Zustellung
+  verschiebt daher nur den nächsten monatlichen Zinstermin, NIE den
+  ganzen April-Zyklus um ein Jahr - siehe `indexautomatik/outbox_service.py`.
+- **Zwei-Phasen-Nutzung von `mieweg_vorschau_service.vorschau_erstellen`:**
+  Phase 1 (Planung, vor Versand) ruft ihn ohne
+  `zustellnachweis_referenz` auf und verwendet ausschließlich
+  `rechnerische_differenz_cent` (nicht `ausfuehrbare_erhoehung_cent`,
+  das dort bewusst einen bereits vorhandenen Zustellnachweis
+  voraussetzt - hier aber zirkulär wäre, da der Nachweis erst NACH
+  dem Versand entsteht) für die Entscheidung, ob ein Schreiben
+  überhaupt erzeugt wird. Phase 2 (nach bestätigtem Zugang) ruft ihn
+  ERNEUT mit dem jetzt vorliegenden Zustellnachweis auf und erzeugt
+  damit den finalen, tatsächlich `vollstaendig`en Prüfsatz mit
+  gesetztem `ausfuehrbare_erhoehung_cent` als Abschlussbeleg. Die
+  bereits abgenommene Paket-C-Datei `mieweg_vorschau/service.py`
+  selbst wird dafür NICHT verändert.
+- **VPI-Jahresdurchschnittswerte** sind eine neue, rein manuell im
+  Backoffice gepflegte Tabelle (`VpiJahreswertTable`) - kein
+  automatischer Statistik-Austria-Abruf (kein Serverzugriff durch
+  Claude). Eine fehlende Publikation für ein benötigtes Jahr blockiert
+  den betroffenen Fall sichtbar, erfindet aber nie einen Wert.
+- **Transportadapter:** `indexautomatik/transport.py` definiert einen
+  generischen HTTP-Vertrag (Request/Response-Felder, Timeout->
+  `TransportFehlerUngewissError`, kein Blind-Retry) plus
+  `FakeTransportadapter` für Tests. Die tatsächliche JLB-Mailstrecke
+  (HTML-Signatur, Original-Logo) verdrahtet Codex serverseitig; dieses
+  Modul erfindet keine Live-Integration.
+- **Keine automatische Sollstellung/Vorschreibungsänderung:** dieser
+  Auftrag deckt Prüfung, Schreiben-Generierung und Zustellung/
+  Zugangs-Tracking ab, NICHT das automatische Nachziehen von
+  `VertragsKomponenteTable.betrag_cent`/einer neuen Vorschreibung -
+  das bleibt ein bewusst offener, in `OFFENE_PUNKTE.md` benannter
+  manueller Folgeschritt (entspricht der bestehenden
+  "keine Produktivbuchungen durch Claude"-Grenze).

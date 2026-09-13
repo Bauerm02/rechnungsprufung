@@ -135,6 +135,19 @@ class RechtsordnungUngeklaertError(MietinkassoError):
     das keine Exception wirft, sondern ein PlanungsErgebnis liefert)."""
 
 
+class RechtsprofilNichtFreigegebenError(MietinkassoError):
+    """Ein Rechtsprofil im Status ENTWURF/INVALIDIERT darf keinen
+    Indexautomatik-Lauf/kein Erhöhungsschreiben antreiben - nur eine
+    aktuell FREIGEGEBENE, unveränderte Version."""
+
+
+class TransportFehlerUngewissError(MietinkassoError):
+    """Der Versand-Transport hat einen Timeout/eine unerwartete Antwort
+    geliefert, NACHDEM die Nachricht möglicherweise bereits angenommen
+    wurde. Niemals blind erneut senden; der Fall bleibt UNKLAR bis zur
+    manuellen Klärung (analog zu `mahnwesen/service.py::VersandUngewissError`)."""
+
+
 class ObjektAusgeschlossenError(MietinkassoError):
     """Objekt 107 (Sieben Dörfer) is explicitly out of scope for the pilot.
     Enforced centrally (Konto -> Vertrag -> Einheit -> Objekt) on every

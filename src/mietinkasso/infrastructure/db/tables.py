@@ -525,6 +525,160 @@ class UserTable(Base):
     gesellschaft_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
 
+class VpiJahreswertTable(Base):
+    """Manuell im Backoffice gepflegter VPI-Jahresdurchschnittswert
+    (Auftrag 13.09., Indexautomatik) - KEIN automatischer Statistik-
+    Austria-Abruf (Claude greift nie auf externe Server zu). Fehlt ein
+    für eine Berechnung benötigtes Jahr, bricht
+    `mieweg_vorschau/berechnung.py::berechne_gesetzliche_hoechstgrenze`
+    an dieser Stelle ab (kein erfundener Wert) - siehe
+    `indexautomatik/service.py`."""
+
+    __tablename__ = "vpi_jahreswerte"
+
+    jahr: Mapped[int] = mapped_column(Integer, primary_key=True)
+    wert: Mapped[Decimal] = mapped_column(Numeric(12, 4))
+    quelle: Mapped[str] = mapped_column(String(256))
+    quelle_datum: Mapped[date] = mapped_column(Date)
+    erfasst_von: Mapped[str] = mapped_column(String(128))
+    erfasst_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RechtsprofilTable(Base):
+    """Versioniertes, vom Eigentümer einmalig freigegebenes
+    Rechtsprofil je Vertrag (Auftrag 13.09., Indexautomatik) - liefert
+    der monatlichen Indexautomatik alle Eingaben für
+    `mieweg_vorschau_service.vorschau_erstellen`, OHNE dass jeden Monat
+    erneut manuell bestätigt werden muss. `quelle_hash` bindet die
+    Freigabe an den Stand von Vertrag/referenzierten Komponenten zum
+    Freigabezeitpunkt; ändert sich dieser Stand, gilt die Freigabe als
+    invalidiert (siehe `indexautomatik/rechtsprofil_service.py::ist_noch_gueltig`
+    - "Änderungen an Quelle/Basis/Vertrag/Profil entwerten alte
+    Freigabe"). `ist_hauptmiete=False`/`None` blockiert die Automatik
+    bewusst (keine Rechtsannahme zur Untermiete-Anwendbarkeit)."""
+
+    __tablename__ = "rechtsprofile"
+    __table_args__ = (UniqueConstraint("vertrag_id", "version", name="uq_rechtsprofil_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    rechtsordnung: Mapped[str] = mapped_column(String(48))
+    ist_wohnungsnutzung: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    mrg_zinsbeschraenkung: Mapped[bool] = mapped_column(Boolean, default=False)
+    ist_altvertrag: Mapped[bool] = mapped_column(Boolean, default=False)
+    ist_hauptmiete: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    foerderbindung: Mapped[bool] = mapped_column(Boolean, default=False)
+    mietzinsobergrenze_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mietzinsobergrenze_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    mietzinsobergrenze_gueltig_bis: Mapped[date | None] = mapped_column(Date, nullable=True)
+    bezugsjahr: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bezugsmonat: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    letzte_basis_war_jahresdurchschnitt: Mapped[bool] = mapped_column(Boolean, default=False)
+    basis_komponenten_ids: Mapped[list] = mapped_column(JSON, default=list)
+    vertraglich_zulaessiger_betrag_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    vertraglicher_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    vertraglicher_fruehestmoeglicher_termin: Mapped[date | None] = mapped_column(Date, nullable=True)
+    vertrag_beleg_referenz: Mapped[str] = mapped_column(String(256))
+    klausel_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    quelle_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="ENTWURF")
+    freigegeben_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    freigegeben_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class IndexautomatikLaufTable(Base):
+    """Ein Eintrag je (Vertrag, Kalendermonat "YYYY-MM") - der
+    Unique-Constraint ist die Idempotenzgrenze gegen einen doppelten
+    Monatslauf (Wiederholung/Absturz/Parallelstart), analog zu
+    `MahnFallTable.outbox_key`/`JobLockTable`."""
+
+    __tablename__ = "indexautomatik_laeufe"
+    __table_args__ = (UniqueConstraint("vertrag_id", "periode", name="uq_indexautomatik_lauf_periode"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    periode: Mapped[str] = mapped_column(String(7))
+    rechtsprofil_id: Mapped[int | None] = mapped_column(ForeignKey("rechtsprofile.id"), nullable=True)
+    rechtsprofil_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mieweg_vorschau_id: Mapped[int | None] = mapped_column(ForeignKey("mieweg_vorschauen.id"), nullable=True)
+    erhoehungsschreiben_id: Mapped[int | None] = mapped_column(ForeignKey("erhoehungsschreiben.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(32))
+    blockiert_gruende: Mapped[list] = mapped_column(JSON, default=list)
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ErhoehungsschreibenTable(Base):
+    """Persistente Outbox für MieWeG-Erhöhungsschreiben (Auftrag
+    13.09.) - Unique je (Vertrag, Ziel-Bewertungsjahr): pro Vertrag und
+    gesetzlichem April-Zyklus höchstens EIN Fall, unabhängig davon, wie
+    oft der Monatslauf bis dahin durchläuft. `versendet_am` (Transport
+    hat angenommen) und `zugang_bestaetigt_am` (fachlich bestätigter
+    Empfang) sind bewusst getrennte Felder - ein technisch
+    angenommener Versand ist NIE automatisch ein bestätigter Zugang
+    (siehe `indexautomatik/outbox_service.py`)."""
+
+    __tablename__ = "erhoehungsschreiben"
+    __table_args__ = (UniqueConstraint("vertrag_id", "ziel_bewertungsjahr", name="uq_erhoehungsschreiben_ziel"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    ziel_bewertungsjahr: Mapped[int] = mapped_column(Integer)
+    rechtsprofil_id: Mapped[int] = mapped_column(ForeignKey("rechtsprofile.id"))
+    rechtsprofil_version: Mapped[int] = mapped_column(Integer)
+    mieweg_vorschau_id: Mapped[int] = mapped_column(ForeignKey("mieweg_vorschauen.id"))
+    mieweg_vorschau_final_id: Mapped[int | None] = mapped_column(ForeignKey("mieweg_vorschauen.id"), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="ENTWURF")
+    massgeblicher_termin: Mapped[date] = mapped_column(Date)
+    erhoehung_cent: Mapped[int] = mapped_column(Integer)
+    schreiben_text: Mapped[str] = mapped_column(Text)
+    schreiben_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    idempotenzschluessel: Mapped[str] = mapped_column(String(128))
+    versandkanal: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    versendet_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    versand_beansprucht_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    externe_versandreferenz: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    zugangsform: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    zugang_bestaetigt_am: Mapped[date | None] = mapped_column(Date, nullable=True)
+    zugang_beleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    zahlungspflicht_ab: Mapped[date | None] = mapped_column(Date, nullable=True)
+    fehlergrund: Mapped[str | None] = mapped_column(Text, nullable=True)
+    blockiert_gruende: Mapped[list] = mapped_column(JSON, default=list)
+    empfaenger_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    aktualisiert_am: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class VertragsendeErinnerungTable(Base):
+    """Eine stabile Aufgabe je (Vertrag, tatsächlichem Enddatum) -
+    ändert sich `VertragTable.gueltig_bis` (Verlängerung/Verkürzung),
+    bleibt die alte Zeile stehen (Audit), wird aber von
+    `indexautomatik/vertragsende_service.py` als `UNGUELTIG` markiert
+    und eine neue Zeile für das neue Enddatum geplant. Empfänger ist
+    IMMER `Settings.owner_email` - nie `DebitorTable.email` (kein
+    Mieter-Fallback/CC bei dieser internen Erinnerung)."""
+
+    __tablename__ = "vertragsende_erinnerungen"
+    __table_args__ = (UniqueConstraint("vertrag_id", "end_datum", name="uq_vertragsende_erinnerung"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    end_datum: Mapped[date] = mapped_column(Date)
+    faellig_am: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(24), default="OFFEN")
+    benachrichtigt_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    entscheidung: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    entschieden_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    entschieden_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    mieterentwurf_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mieterentwurf_erstellt_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class JobLockTable(Base):
     """Mutual-exclusion row: a unique (job_name, fachschluessel) prevents a
     second worker (or a restarted first worker) from repeating a job that

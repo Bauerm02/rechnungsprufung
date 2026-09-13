@@ -61,6 +61,19 @@ class Settings(BaseSettings):
     # der sicherere Fehler als ein vergessenes "true".
     backoffice_cookie_secure: bool = True
 
+    # Indexautomatik (Auftrag 13.09.2026, HV-20260913-INDEXAUTOMATIK):
+    # interner Empfänger für Vertragsende-Erinnerungen - IMMER Owner,
+    # NIE ein Mieter-Fallback/CC (siehe VertragsendeErinnerungTable-
+    # Docstring). Ohne konfigurierte Adresse bleibt die
+    # Vertragsende-Erinnerung geblockt statt an niemanden/eine geratene
+    # Adresse zu gehen.
+    owner_email: str | None = None
+    # Bewusst GETRENNT vom bestehenden `send_enabled` (Mahnwesen) -
+    # "Versand-/Index- und Owner-Erinnerungsflags getrennt (keine
+    # globale Aktivierung von Mahnungen)". Beide Default false.
+    indexautomatik_send_enabled: bool = False
+    vertragsende_erinnerung_send_enabled: bool = False
+
 
 class ProduktionskonfigurationUngueltigError(RuntimeError):
     """Wird beim Prozessstart geworfen, wenn `environment == "production"`
