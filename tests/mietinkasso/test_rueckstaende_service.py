@@ -304,6 +304,41 @@ def test_kontostand_ohne_entsprechende_einzelposition_zeigt_abweichung(
     assert not any(p.vertrag_id == "V-601-1" for p in uebersicht.offene_positionen)
 
 
+def test_reines_guthaben_ohne_offene_position_zeigt_keine_abweichung(
+    admin_ctx, stammdaten_repo, op_service, mahn_fall_repo
+):
+    """Unabhängiger Review: `abweichung = saldo_cent - positionen_rest_
+    gesamt` markierte ein normales Guthaben fälschlich als Warn-
+    Abweichung, obwohl keine Unstimmigkeit vorliegt - nur der POSITIVE
+    Kontostand-Anteil zählt (`max(saldo_cent, 0) - positionen_rest_
+    gesamt`). Konto -30,00 EUR (Guthaben), 0,00 EUR offene Positionen:
+    Abweichung muss 0 sein, das Guthaben bleibt separat sichtbar."""
+
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")
+    stammdaten_repo.upsert_einheit(id="601-TOP1", objekt_id="601", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-1", name="Mieter Eins")
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-1", einheit_id="601-TOP1", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    vertrag = stammdaten_repo.get_vertrag("V-601-1")
+    konto = stammdaten_repo.get_or_create_konto(vertrag=vertrag)
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.GUTSCHRIFT, betrag_cent=3_000, belegdatum=date(2026, 8, 1),
+        buchungsdatum=date(2026, 8, 1), faelligkeit=None, beleg_referenz="Gutschrift ohne offene Forderung",
+    )
+    uebersicht = berechne_rueckstandsuebersicht(
+        ctx=admin_ctx, objekt_id="601", stammdaten_repository=stammdaten_repo, op_service=op_service,
+        mahn_fall_repository=mahn_fall_repo, heute=_HEUTE,
+    )
+    zeile = uebersicht.mietkonten[0]
+    assert zeile.saldo_cent == -3_000
+    assert zeile.positionen_rest_gesamt_cent == 0
+    assert zeile.abweichung_saldo_zu_positionen_cent == 0  # NICHT -3000
+    assert uebersicht.kennzahlen.summe_guthaben_cent == 3_000  # Guthaben bleibt separat sichtbar
+
+
 def test_kontosaldo_und_einzelposition_koennen_bewusst_abweichen(
     admin_ctx, bestand, stammdaten_repo, op_service, mahn_fall_repo
 ):

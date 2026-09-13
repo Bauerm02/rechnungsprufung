@@ -31,12 +31,14 @@ Fachliche Leitplanken (siehe auch AGENTS.md):
   Ergebnisse desselben `OPService` - JEDE Mietkonto-Zeile trägt darum
   BEIDE Zahlen getrennt (`faelliger_unstrittiger_rest_cent` und
   `positionen_faelliger_rest_cent`) sowie eine explizite
-  `abweichung_saldo_zu_positionen_cent` (Kontostand minus Summe aller
-  offenen Einzelpositionen) - nie stillschweigend gleichgesetzt oder
-  glattgerechnet. Ein Beispiel, das eine echte Abweichung erzeugt: eine
-  positive KORREKTUR-Buchung erhöht den Kontostand, erzeugt aber KEINE
-  eigene offene Einzelposition (KORREKTUR ist keine Forderungsart in
-  `OPService.offene_forderungen`).
+  `abweichung_saldo_zu_positionen_cent` (NUR der positive Kontostand-
+  Anteil minus Summe aller offenen Einzelpositionen - ein Guthaben hat
+  keine korrespondierende offene Forderung und ist keine Unstimmigkeit,
+  darf hier also nie eine Abweichung anzeigen) - nie stillschweigend
+  gleichgesetzt oder glattgerechnet. Ein Beispiel, das eine echte
+  Abweichung erzeugt: eine positive KORREKTUR-Buchung erhöht den
+  Kontostand, erzeugt aber KEINE eigene offene Einzelposition
+  (KORREKTUR ist keine Forderungsart in `OPService.offene_forderungen`).
 - Einheiten ohne (aktives) Mietkonto - Leerstand, Kurzzeitvermietung,
   Selfstorage, Eigennutzung - sind Bestand, kein erfundener
   Nullsaldo/Rückstand; sie erscheinen in einer eigenen Liste, NIE als
@@ -94,7 +96,7 @@ class MietkontoZeile:
     faelliger_unstrittiger_rest_cent: int | None  # bestehende Kontosaldo-Rechnung (OPSaldo)
     positionen_faelliger_rest_cent: int | None  # Summe der Einzelpositionen mit bekannter, verstrichener Fälligkeit
     positionen_rest_gesamt_cent: int | None  # Summe ALLER offenen Einzelpositionen dieses Kontos
-    abweichung_saldo_zu_positionen_cent: int | None  # saldo_cent - positionen_rest_gesamt_cent
+    abweichung_saldo_zu_positionen_cent: int | None  # max(saldo_cent, 0) - positionen_rest_gesamt_cent
     historisch: bool
     sperrgruende: tuple[str, ...]
     mahnfaelle_anzahl: int  # Anzahl vorhandener Mahnfälle - Details siehe RueckstandsUebersicht.mahnfaelle
@@ -308,14 +310,18 @@ def berechne_rueckstandsuebersicht(
                             objekt_id=objekt.id, objekt_bezeichnung=objekt.bezeichnung, vertrag_id=vertrag.id,
                             debitor_name=debitor.name if debitor else "-", konto_id=konto.id,
                             op_position_id=forderung.op_position_id,
-                            beleg_referenz=op_position.beleg_referenz if op_position else "",
+                            beleg_referenz=(op_position.beleg_referenz or "") if op_position else "",
                             art=forderung.art, betrag_cent=forderung.betrag_cent, rest_cent=forderung.rest_cent,
                             belegdatum=forderung.belegdatum, leistungsperiode=forderung.leistungsperiode,
                             faelligkeit=forderung.faelligkeit, faelligkeit_bekannt=forderung.faelligkeit_bekannt,
                             faelligkeitsklasse=klasse,
                         )
                     )
-                abweichung = saldo_cent - positionen_rest_gesamt
+                # NUR ein positiver Kontostand hat eine korrespondierende
+                # offene Forderung, gegen die er abgeglichen werden kann -
+                # ein Guthaben (saldo_cent < 0) ist keine Unstimmigkeit und
+                # darf hier NIE eine Warn-Abweichung erzeugen.
+                abweichung = max(saldo_cent, 0) - positionen_rest_gesamt
 
             mietkonten.append(
                 MietkontoZeile(

@@ -236,6 +236,37 @@ def test_dashboard_einzelposition_zeigt_op_nr_und_belegreferenz(backoffice_clien
     assert synthetische_referenz in dashboard.text
 
 
+def test_dashboard_ohne_belegreferenz_liefert_200_statt_500(backoffice_client):
+    """Codex-Rückprüfung zu 708b0f0: `beleg_referenz` ist laut Schema
+    nullable - eine offene SOLL-Position mit `beleg_referenz=None` darf
+    das gesamte Dashboard nicht mit einem 500 zum Absturz bringen. Die
+    OP-ID muss trotzdem sichtbar sein."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-OHNEREF", objekt_id="601", bezeichnung="Top ohne Beleg", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-OHNEREF", einheit_id="601-TOP-OHNEREF", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-OHNEREF"))
+    position = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=4_500,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
+        beleg_referenz=None,
+    )
+    dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+    assert dashboard.status_code == 200
+    assert f"#{position.id}" in dashboard.text
+
+
 def test_dashboard_zeigt_pilot_banner_in_development_umgebung(backoffice_client):
     """Diese Fixture importiert `api.app` mit `MIETINKASSO_ENVIRONMENT`
     unausgesprochen auf dem Default "development" - der Banner muss
