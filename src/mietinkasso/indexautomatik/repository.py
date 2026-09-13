@@ -4,6 +4,7 @@ Konvention aus `mieweg_vorschau/`, `mahnwesen/`)."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
@@ -19,6 +20,13 @@ from mietinkasso.infrastructure.db.tables import (
     VpiJahreswertTable,
     VpiMonatswertTable,
 )
+
+
+@dataclass(frozen=True)
+class VpiMonatswertMitPeriode:
+    wert: Decimal
+    jahr: int
+    monat: int
 
 
 class VpiRepository:
@@ -154,6 +162,18 @@ class VpiRepository:
             )
             return list(session.execute(statement).scalars().all())
 
+    def get_monatswert(self, reihe: str, jahr: int, monat: int) -> VpiMonatswertTable | None:
+        """Exakte Einzelzeile (Reihe, Jahr, Monat) - z. B. für eine
+        vertragliche Wartefrist, die sich auf die amtliche
+        VERÖFFENTLICHUNG (`abgerufen_am`) statt auf die VPI-Periode
+        selbst bezieht (`indexautomatik/service.py::_monatslauf_klausel`)."""
+
+        with self._session_factory() as session:
+            statement = select(VpiMonatswertTable).where(
+                VpiMonatswertTable.reihe == reihe, VpiMonatswertTable.jahr == jahr, VpiMonatswertTable.monat == monat
+            )
+            return session.execute(statement).scalars().first()
+
     def jahresdurchschnitt(self, reihe: str, jahr: int) -> Decimal | None:
         """Liefert den Jahresdurchschnitt für (Reihe, Jahr) - bevorzugt
         einen manuell erfassten `VpiJahreswertTable`-Override; sonst nur,
@@ -195,6 +215,30 @@ class VpiRepository:
             )
             row = session.execute(statement).scalars().first()
             return row.wert if row else None
+
+    def neuester_endgueltiger_monatswert_mit_periode(self, reihe: str, bis: date) -> VpiMonatswertMitPeriode | None:
+        """Wie `neuester_endgueltiger_monatswert`, liefert aber ZUSÄTZLICH
+        den tatsächlichen VPI-Quellmonat (Jahr/Monat) des gefundenen
+        Werts - für Aufrufer, die diesen Bezug nachvollziehbar
+        weiterreichen müssen (Codex-Rückprüfung: `IndexAnpassungTable.
+        vpi_jahr`/`vpi_monat`, `umsetzung_service.py`s Klausel-
+        Basisfortschreibung braucht den echten VPI-Quellmonat, NICHT den
+        Anspruchsmonat der neuen Miete)."""
+
+        with self._session_factory() as session:
+            statement = (
+                select(VpiMonatswertTable)
+                .where(VpiMonatswertTable.reihe == reihe)
+                .where(VpiMonatswertTable.finalitaet == "ENDGUELTIG")
+                .where(
+                    (VpiMonatswertTable.jahr < bis.year)
+                    | ((VpiMonatswertTable.jahr == bis.year) & (VpiMonatswertTable.monat <= bis.month))
+                )
+                .order_by(VpiMonatswertTable.jahr.desc(), VpiMonatswertTable.monat.desc())
+                .limit(1)
+            )
+            row = session.execute(statement).scalars().first()
+            return VpiMonatswertMitPeriode(wert=row.wert, jahr=row.jahr, monat=row.monat) if row else None
 
     def jahresdurchschnitte_fuer(self, reihe: str, jahre: set[int]) -> dict[int, Decimal]:
         ergebnis: dict[int, Decimal] = {}

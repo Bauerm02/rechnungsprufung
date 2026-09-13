@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from datetime import date
+from decimal import ROUND_HALF_UP, Decimal
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import Rechtsordnung
@@ -48,6 +49,29 @@ _BEHANDELBARE_FEHLER = (
     RechtsordnungUngeklaertError,
     RechtsprofilNichtImplementiertError,
 )
+
+
+def _monate_addieren(basis: date, monate: int) -> date:
+    """Addiert KALENDERMONATE auf den 1. eines Monats - NIE über eine
+    Tage-Umrechnung (Auftrag Markus: "keine pauschale Umrechnung zwei
+    Monate=60 Tage"). Ergebnis ist immer der 1. des Zielmonats."""
+
+    gesamter_monatsindex = basis.year * 12 + (basis.month - 1) + monate
+    jahr, monat_index = divmod(gesamter_monatsindex, 12)
+    return date(jahr, monat_index + 1, 1)
+
+
+def _naechster_gueltiger_kalendermonat(ab: date, ziel_monat: int) -> date:
+    """Nächster Termin des `ziel_monat` (1-12) auf oder NACH `ab` - der
+    ERSTE möglich zulässige Termin einer jährlich wiederkehrenden
+    Kalenderklausel ist NICHT "ab + 12 Monate" (Auftrag Markus: "Jährlich
+    am 01.01. bedeutet bei Beginn 01.04.2026 den ersten möglichen Termin
+    01.01.2027; nicht automatisch zwölf Monate Wartezeit ab Mietbeginn
+    erfinden"), sondern schlicht die nächste tatsächliche Kalendermonats-
+    Wiederkehr - hier also der 1.1.2027, nicht der 1.4.2027."""
+
+    kandidat = date(ab.year, ziel_monat, 1)
+    return kandidat if kandidat >= ab else date(ab.year + 1, ziel_monat, 1)
 
 
 class IndexautomatikService:
@@ -312,11 +336,103 @@ class IndexautomatikService:
         klausel = self._index_repository.get_klausel(profil.vertragsklausel_id)
         if klausel is None or klausel.status != "FREIGEGEBEN":
             return _abschliessen("BLOCKIERT", ["Referenzierte Vertragsklausel ist nicht (mehr) freigegeben."])
-        aktueller_vpi = self._vpi_repository.neuester_endgueltiger_monatswert(klausel.basis_reihe, heute)
-        if aktueller_vpi is None:
+
+        # Belegtes Kalender-/Intervallregelprofil (Auftrag Markus) - OHNE
+        # beide Felder bleibt der Pfad gesperrt, KEIN Termin wird aus dem
+        # heutigen Datum erfunden.
+        if klausel.anpassungsmonat is None or klausel.mindestintervall_monate is None:
             return _abschliessen(
-                "BLOCKIERT", [f"Kein amtlicher, endgültiger VPI-Monatswert für Reihe {klausel.basis_reihe} verfügbar."]
+                "BLOCKIERT",
+                [
+                    "Kein belegtes Kalender-/Intervallregelprofil (Anpassungsmonat/Mindestintervall) für "
+                    "diese Vertragsklausel konfiguriert - kein automatischer Wirksamkeitstermin ohne "
+                    "geprüfte Vertragsregel, kein erfundenes Datum."
+                ],
             )
+        if heute.month != klausel.anpassungsmonat:
+            return _abschliessen("TERMIN_NICHT_ERREICHT")
+
+        # Erster möglicher Termin (ab Vertragsbeginn) und Mindestabstand
+        # ZWISCHEN bereits erfolgten Anpassungen sind ZWEI GETRENNTE
+        # Prüfungen (Auftrag Markus: "nicht automatisch zwölf Monate
+        # Wartezeit ab Mietbeginn erfinden" - der erste Termin ist schlicht
+        # die nächste tatsächliche Kalendermonats-Wiederkehr, NICHT
+        # Vertragsbeginn + Mindestintervall).
+        heute_monatserster = date(heute.year, heute.month, 1)
+        if klausel.letzte_anpassung_monat is None:
+            erster_moeglicher_termin = _naechster_gueltiger_kalendermonat(vertrag.gueltig_von, klausel.anpassungsmonat)
+            if heute_monatserster < erster_moeglicher_termin:
+                return _abschliessen("TERMIN_NICHT_ERREICHT")
+        else:
+            letztes_jahr, letzter_monat = (int(teil) for teil in klausel.letzte_anpassung_monat.split("-"))
+            naechst_zulaessig = _monate_addieren(date(letztes_jahr, letzter_monat, 1), klausel.mindestintervall_monate)
+            if heute_monatserster < naechst_zulaessig:
+                return _abschliessen(
+                    "TERMIN_NICHT_ERREICHT",
+                    [
+                        f"Mindestintervall ({klausel.mindestintervall_monate} Monate) seit der letzten "
+                        f"Anpassung ({klausel.letzte_anpassung_monat}) erst ab {naechst_zulaessig.isoformat()} "
+                        "wieder erfüllt."
+                    ],
+                )
+
+        # Optionale vertragliche Wartefrist NACH dem maßgeblichen
+        # Indexereignis (Auftrag Markus) - NIE über eine Tage-Umrechnung,
+        # NUR mit einem eindeutigen, tatsächlich vorhandenen Datumsbezug
+        # (VPI-Periode selbst ODER deren Veröffentlichung/Abruf). Fehlt der
+        # Ereignis-/Datumsbeleg, wird gesperrt statt geraten.
+        hat_wartefrist = klausel.wartefrist_monate_nach_indexereignis is not None
+        if hat_wartefrist:
+            vpi_periode = self._vpi_repository.neuester_endgueltiger_monatswert_mit_periode(klausel.basis_reihe, heute)
+            if vpi_periode is None:
+                return _abschliessen(
+                    "BLOCKIERT", [f"Kein amtlicher, endgültiger VPI-Monatswert für Reihe {klausel.basis_reihe} verfügbar."]
+                )
+            if klausel.wartefrist_bezug == "VPI_PERIODE":
+                indexereignis_datum = date(vpi_periode.jahr, vpi_periode.monat, 1)
+            elif klausel.wartefrist_bezug == "VEROEFFENTLICHUNG":
+                monatswert_zeile = self._vpi_repository.get_monatswert(klausel.basis_reihe, vpi_periode.jahr, vpi_periode.monat)
+                if monatswert_zeile is None or monatswert_zeile.abgerufen_am is None:
+                    return _abschliessen(
+                        "BLOCKIERT",
+                        [
+                            f"Wartefrist bezieht sich auf die Veröffentlichung, aber kein Abrufdatum für "
+                            f"VPI {klausel.basis_reihe} {vpi_periode.jahr}-{vpi_periode.monat:02d} belegt - "
+                            "kein erfundener Veröffentlichungstermin."
+                        ],
+                    )
+                indexereignis_datum = monatswert_zeile.abgerufen_am.date()
+            else:
+                return _abschliessen(
+                    "BLOCKIERT",
+                    [f"Wartefrist-Bezug '{klausel.wartefrist_bezug}' ist nicht eindeutig VPI_PERIODE/VEROEFFENTLICHUNG."],
+                )
+            wartefrist_erfuellt_ab = _monate_addieren(indexereignis_datum, klausel.wartefrist_monate_nach_indexereignis)
+            if heute < wartefrist_erfuellt_ab:
+                return _abschliessen(
+                    "TERMIN_NICHT_ERREICHT",
+                    [
+                        f"Vertragliche Wartefrist ({klausel.wartefrist_monate_nach_indexereignis} Monate nach "
+                        f"{indexereignis_datum.isoformat()}) erst ab {wartefrist_erfuellt_ab.isoformat()} erfüllt."
+                    ],
+                )
+            aktueller_vpi = vpi_periode.wert
+            vpi_jahr, vpi_monat = vpi_periode.jahr, vpi_periode.monat
+        else:
+            vpi_periode = self._vpi_repository.neuester_endgueltiger_monatswert_mit_periode(klausel.basis_reihe, heute)
+            if vpi_periode is None:
+                return _abschliessen(
+                    "BLOCKIERT", [f"Kein amtlicher, endgültiger VPI-Monatswert für Reihe {klausel.basis_reihe} verfügbar."]
+                )
+            aktueller_vpi = vpi_periode.wert
+            vpi_jahr, vpi_monat = vpi_periode.jahr, vpi_periode.monat
+
+        # Bekannte vertragliche Rundung des amtlichen Indexwerts VOR dem
+        # Schwellenvergleich (Auftrag Markus) - explizit zu konfigurieren,
+        # sonst bleibt der volle, ungerundete amtliche Wert maßgeblich.
+        if klausel.indexwert_rundung_dezimalstellen is not None:
+            quant = Decimal(1).scaleb(-klausel.indexwert_rundung_dezimalstellen)
+            aktueller_vpi = aktueller_vpi.quantize(quant, rounding=ROUND_HALF_UP)
 
         # Idempotenz an die FACHLICHE Anpassung (identischer Vergleich:
         # gleiche Klausel-Basis, gleicher aktueller VPI-Wert) binden,
@@ -347,28 +463,43 @@ class IndexautomatikService:
             stichtag=heute,
             neuer_wert=aktueller_vpi,
             quelle_referenz=(
-                f"Automatischer Indexautomatik-Lauf, Periode {periode}, VPI {klausel.basis_reihe}={aktueller_vpi}"
+                f"Automatischer Indexautomatik-Lauf, Periode {periode}, VPI {klausel.basis_reihe}={aktueller_vpi} "
+                f"(Quellmonat {vpi_jahr}-{vpi_monat:02d})"
             ),
+            neuer_wert_jahr=vpi_jahr,
+            neuer_wert_monat=vpi_monat,
         )
         if vorschlag.erhoehung_cent <= 0:
             return _abschliessen("KEIN_ERHOEHUNGSBEDARF")
 
-        # Kein unabhängig verifizierter automatischer Wirksamkeitstermin
-        # für diesen Pfad (Geschäftsraum/generische Klausel) - "kein
-        # heutiges Datum als frei erfundenen Erhöhungstermin" (Modellreview
-        # 13.09.). Der rechnerische Vorschlag liegt geprüft vor
-        # (IndexAnpassungTable, bereits abgenommener Rechner), aber KEIN
-        # automatisches Erhöhungsschreiben/keine Outbox-Zeile wird daraus
-        # erzeugt - siehe OFFENE_PUNKTE.md.
-        return _abschliessen(
-            "BLOCKIERT",
-            [
-                f"Rechnerischer Vorschlag liegt vor (IndexAnpassung {vorschlag.id}, Erhöhung "
-                f"{vorschlag.erhoehung_cent} Cent) - ein automatischer Wirksamkeitstermin für den "
-                "Geschäftsraum-/Klausel-Pfad wird noch nicht unterstützt. Bitte Termin manuell prüfen "
-                "und bestätigen (kein erfundenes Datum)."
-            ],
+        aktive_komponenten = {k.id: k for k in self._stammdaten_repository.list_aktive_komponenten(vertrag.id, heute)}
+        fehlend = [kid for kid in profil.basis_komponenten_ids if kid not in aktive_komponenten]
+        if fehlend:
+            return _abschliessen(
+                "BLOCKIERT",
+                [f"Referenzierte Komponente(n) {fehlend} zum heutigen Stichtag {heute.isoformat()} nicht mehr aktiv/gültig."],
+            )
+        referenzierte = [aktive_komponenten[kid] for kid in profil.basis_komponenten_ids]
+        referenzierte_ids = set(profil.basis_komponenten_ids)
+        unveraendert = self._unveraenderte_komponenten(vertrag.id, heute, referenzierte_ids)
+
+        # Belegter fixer Anpassungsmonat = tatsächlicher Wirksamkeitstermin
+        # (des Kalenderjahres, in dem der heutige Lauf stattfindet) - KEIN
+        # aus dem heutigen Tagesdatum erfundener Termin, sondern die
+        # geprüfte Vertragsregel selbst.
+        massgeblicher_termin = date(heute.year, klausel.anpassungsmonat, 1)
+        schreiben = self._outbox_service.erstellen_aus_index_anpassung(
+            ctx=ctx,
+            vertrag=vertrag,
+            profil=profil,
+            index_anpassung_id=vorschlag.id,
+            massgeblicher_termin=massgeblicher_termin,
+            erhoehung_cent=vorschlag.erhoehung_cent,
+            referenzierte_komponenten=referenzierte,
+            unveraenderte_komponenten=unveraendert,
+            akteur=akteur,
         )
+        return _abschliessen("ERHOEHUNG_ERZEUGT", erhoehungsschreiben_id=schreiben.id)
 
     def monatslauf_alle(self, *, ctx: AuthContext, heute: date, akteur: str) -> list[IndexautomatikLaufTable]:
         """Unabhängiger Review (b31-Folgereview, synthetisch mit "1

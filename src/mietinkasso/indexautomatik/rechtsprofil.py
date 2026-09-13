@@ -255,7 +255,7 @@ class RechtsprofilService:
             if self._stammdaten_repository.ursprungs_gueltig_von(
                 komponente
             ) > referenzdatum and not belegte_historische_basis_gueltig(
-                (profil.historische_basis_belege or {}).get(komponente_id), referenzdatum
+                (profil.historische_basis_belege or {}).get(komponente_id), erwarteter_betrag_cent=komponente.betrag_cent
             ):
                 raise ValueError(
                     f"Komponente {komponente_id} ist erst ab {komponente.gueltig_von.isoformat()} gültig - "
@@ -324,6 +324,11 @@ class RechtsprofilService:
                         str(klausel.vertragliche_grenze_prozent) if klausel.vertragliche_grenze_prozent is not None else None
                     ),
                     "indexierbare_komponenten": sorted(klausel.indexierbare_komponenten or []),
+                    "anpassungsmonat": klausel.anpassungsmonat,
+                    "mindestintervall_monate": klausel.mindestintervall_monate,
+                    "indexwert_rundung_dezimalstellen": klausel.indexwert_rundung_dezimalstellen,
+                    "wartefrist_monate_nach_indexereignis": klausel.wartefrist_monate_nach_indexereignis,
+                    "wartefrist_bezug": klausel.wartefrist_bezug,
                 }
         return {
             "vertrag_rechtsordnung": vertrag.rechtsordnung,

@@ -586,19 +586,38 @@ class IndexSollUmsetzungService:
                         # Anpassung verwendeten Wert - der Kern der
                         # Korrektur, verhindert die wiederholte Indexierung.
                         basis_wert=anpassung.neuer_wert,
-                        # `basis_monat` fließt in KEINE Berechnung ein (rein
-                        # dokumentarisch, siehe IndexKlauselTable/
-                        # vertragsspur.py) - dokumentiert hier bewusst den
-                        # Anspruchsmonat DIESER Fortschreibung, statt den
-                        # genauen (hier nicht sicher rekonstruierbaren)
-                        # VPI-Quellmonat zu erfinden.
-                        basis_monat=anspruchsmonat_str,
+                        # Codex-Rückprüfung (zu c01ceb2): `basis_monat` muss
+                        # der TATSÄCHLICHE VPI-Quellmonat von `neuer_wert`
+                        # sein, NICHT der Anspruchsmonat der neuen Miete
+                        # (zwei unterschiedliche Monate, z. B. bei einer
+                        # vertraglichen Wartefrist). `IndexAnpassungTable.
+                        # vpi_jahr`/`vpi_monat` tragen diesen Bezug seit
+                        # `IndexService.berechne_vorschlag` nachvollziehbar
+                        # mit; eine ältere, davor erzeugte Anpassung ohne
+                        # diese Angabe (`None`) fällt auf den Anspruchsmonat
+                        # zurück (degradiert, aber niemals ein erfundener
+                        # früherer Monat).
+                        basis_monat=(
+                            f"{anpassung.vpi_jahr:04d}-{anpassung.vpi_monat:02d}"
+                            if anpassung.vpi_jahr is not None and anpassung.vpi_monat is not None
+                            else anspruchsmonat_str
+                        ),
                         letzte_anpassung_monat=anspruchsmonat_str,
                         schwelle_prozent=alte_klausel.schwelle_prozent,
                         schwelle_inklusive=alte_klausel.schwelle_inklusive,
                         daempfung_prozent=alte_klausel.daempfung_prozent,
                         vertragliche_grenze_prozent=alte_klausel.vertragliche_grenze_prozent,
                         indexierbare_komponenten=list(alte_klausel.indexierbare_komponenten or []),
+                        # Belegtes Kalender-/Intervall-/Rundungs-/
+                        # Wartefrist-Regelprofil bleibt bei der mechanischen
+                        # Fortschreibung UNVERÄNDERT erhalten (Auftrag
+                        # Markus) - reine Bestandskorrektur der Basis, keine
+                        # neue Fachentscheidung zur Vertragsregel selbst.
+                        anpassungsmonat=alte_klausel.anpassungsmonat,
+                        mindestintervall_monate=alte_klausel.mindestintervall_monate,
+                        indexwert_rundung_dezimalstellen=alte_klausel.indexwert_rundung_dezimalstellen,
+                        wartefrist_monate_nach_indexereignis=alte_klausel.wartefrist_monate_nach_indexereignis,
+                        wartefrist_bezug=alte_klausel.wartefrist_bezug,
                         status="FREIGEGEBEN",
                         freigegeben_am=datetime.now(timezone.utc),
                         freigegeben_von=akteur,
