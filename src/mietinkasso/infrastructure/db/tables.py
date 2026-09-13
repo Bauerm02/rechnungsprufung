@@ -418,28 +418,66 @@ class IndexKlauselTable(Base):
     daempfung_prozent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
     vertragliche_grenze_prozent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
     indexierbare_komponenten: Mapped[list] = mapped_column(JSON, default=list)
-    # Additiv, nullable: belegtes Kalender-/Intervallregelprofil (Auftrag
-    # Markus, Geschäftsraum-/Klausel-Pfad) - OHNE beide Felder bleibt der
-    # automatische Wirksamkeitstermin in `indexautomatik/service.py::
-    # _monatslauf_klausel` gesperrt (kein erfundenes Datum). Beide
-    # zusammen ersetzen den früheren einmaligen
-    # `vertraglicher_fruehestmoeglicher_termin` (der ab seinem Eintritt
-    # pauschal ALLES erlaubte) durch eine wiederkehrende, tatsächlich
-    # geprüfte Vertragsregel.
+    # Additiv, nullable: explizites Terminmodell (Codex-Rückprüfung zu
+    # 5535ae2 - "anpassungsmonat ist zwingend und damit reine
+    # Schwellenklauseln ohne festen Monat sowie maximal-einmal-jährlich
+    # ohne fixen Monat nicht darstellbar"). GENAU EINER von drei Modi,
+    # `None` bleibt gesperrt (kein erfundener Termin ohne belegtes
+    # Modell) - siehe `indexautomatik/service.py::_monatslauf_klausel`
+    # für die vollständige Fachlogik je Modus:
+    #   "FIXER_MONAT"  - Anpassung nur in `anpassungsmonat` (1-12),
+    #                    Mindestabstand zur letzten Anpassung über
+    #                    `mindestintervall_monate` (beide Felder Pflicht).
+    #   "INTERVALL"    - kein fixer Kalendermonat, nur ein
+    #                    Mindestabstand (`mindestintervall_monate`) seit
+    #                    Vertragsbeginn/letzter Anpassung - z. B.
+    #                    "maximal einmal jährlich" OHNE Monatsbindung.
+    #   "BEI_SCHWELLE" - reine Schwellenklausel ohne Kalenderbindung,
+    #                    jeden Monat prüfbar; optionaler
+    #                    `mindestintervall_monate` verhindert nur ein
+    #                    sofortiges erneutes Auslösen im Folgemonat.
+    terminmodus: Mapped[str | None] = mapped_column(String(16), nullable=True)
     anpassungsmonat: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mindestintervall_monate: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Optional: bekannte vertragliche Rundung des amtlichen Indexwerts auf
     # N Nachkommastellen VOR dem Schwellenvergleich (z. B. "eine
     # Dezimalstelle") - explizit zu erfassen, sonst bleibt der volle,
     # ungerundete amtliche Wert maßgeblich (unverändertes Verhalten).
+    # Betrifft NUR den amtlichen Indexwert selbst - eine gesonderte
+    # Rundung des daraus berechneten Schwellenkorridors (der
+    # Veränderungsprozentzahl) ist ein ANDERES, separat zu erfassendes
+    # Feld (`schwellenkorridor_rundung_dezimalstellen`); die eine
+    # Rundung ist NICHT automatisch die andere (Codex-Rückprüfung zu
+    # 5535ae2: "Indexwertrundung ist nicht automatisch Rundung des
+    # Schwellenkorridors").
     indexwert_rundung_dezimalstellen: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Optional: bekannte vertragliche Rundung der SCHWELLENKORRIDOR-
+    # GRENZWERTE (Ober-/Untergrenze in INDEXPUNKTEN, `basis_wert*
+    # (1±schwelle/100)`) auf N Nachkommastellen VOR dem Vergleich mit dem
+    # tatsächlichen amtlichen Indexwert - NICHT eine Rundung der daraus
+    # berechneten Veränderungsprozentzahl (Präzisierung Markus: Basis 300,
+    # Schwelle 3% strikt -> oberer Grenzwert 309,0; ein amtlicher Wert
+    # 309,1 überschreitet ihn direkt, obwohl die gerundete Veränderung
+    # selbst fälschlich noch 3,0% ergäbe und NICHT auslösen würde). Der
+    # für eine ausgelöste Erhöhung tatsächlich verwendete Betrag bleibt
+    # IMMER aus dem vollen, unverkürzten Indexquotienten berechnet - diese
+    # Rundung wirkt NUR auf die Trigger-Entscheidung (siehe
+    # `IndexService.schwellenkorridor_grenzwerte`/
+    # `ueberschreitet_schwelle_grenzwerte`). `None` bedeutet: keine
+    # Korridor-Grenzwertrundung, der Schwellenvergleich läuft wie bisher
+    # über die (ggf. gedämpfte/vertraglich gedeckelte) Prozentzahl.
+    schwellenkorridor_rundung_dezimalstellen: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Optional: zusätzliche vertragliche Wartefrist in KALENDERMONATEN
     # nach dem maßgeblichen Indexereignis - NIE über eine Tage-Umrechnung
-    # (2 Monate != 60 Tage). `wartefrist_bezug` legt EINDEUTIG fest, ob
-    # sich die Frist auf die VPI-Periode selbst ("VPI_PERIODE") oder auf
-    # deren amtliche Veröffentlichung/Abruf ("VEROEFFENTLICHUNG") bezieht
-    # - beide zusammen oder keines, nie nur eines (sonst gesperrt, kein
-    # Rateversuch bei fehlendem Ereignis-/Datumsbeleg).
+    # (2 Monate != 60 Tage), aber TAGGENAU addiert (15.11. + 2 Monate =
+    # 15.01., nicht auf den 1. gekürzt - Codex-Rückprüfung zu 5535ae2).
+    # `wartefrist_bezug` legt EINDEUTIG fest, ob sich die Frist auf die
+    # VPI-Periode selbst ("VPI_PERIODE") oder auf deren belegte amtliche
+    # Veröffentlichung ("VEROEFFENTLICHUNG", siehe
+    # `VpiMonatswertTable.veroeffentlicht_am` - NICHT `abgerufen_am`,
+    # das ist nur der eigene Abrufzeitpunkt) bezieht - beide zusammen
+    # oder keines, nie nur eines (sonst gesperrt, kein Rateversuch bei
+    # fehlendem Ereignis-/Datumsbeleg).
     wartefrist_monate_nach_indexereignis: Mapped[int | None] = mapped_column(Integer, nullable=True)
     wartefrist_bezug: Mapped[str | None] = mapped_column(String(24), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="ENTWURF")
@@ -642,6 +680,19 @@ class VpiMonatswertTable(Base):
     # eigentlichen Abruf importiert werden kann.
     quelle_hash: Mapped[str] = mapped_column(String(64))
     abgerufen_am: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Additiv, nullable: das amtliche VERÖFFENTLICHUNGSDATUM dieses
+    # Monatswerts (Codex-Rückprüfung zu 5535ae2: "VPI.abgerufen_am ist
+    # NUR Abruf, niemals amtlicher Veröffentlichungstag!"). `abgerufen_am`
+    # bleibt WANN WIR importiert haben - `veroeffentlicht_am` ist WANN
+    # Statistik Austria den Wert tatsächlich publiziert hat, mit eigener
+    # belegter Quelle (`veroeffentlichung_quelle`, z. B. URL/Referenz der
+    # Pressemitteilung). Eine vertragliche Wartefrist mit
+    # `wartefrist_bezug="VEROEFFENTLICHUNG"` darf NUR dieses Feld
+    # verwenden, nie `abgerufen_am` - fehlt es, bleibt die Wartefrist
+    # gesperrt statt geraten (siehe `indexautomatik/service.py::
+    # _monatslauf_klausel`).
+    veroeffentlicht_am: Mapped[date | None] = mapped_column(Date, nullable=True)
+    veroeffentlichung_quelle: Mapped[str | None] = mapped_column(String(256), nullable=True)
     importiert_von: Mapped[str] = mapped_column(String(128))
     importiert_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

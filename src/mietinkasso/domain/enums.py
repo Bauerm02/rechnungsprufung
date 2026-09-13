@@ -155,6 +155,14 @@ class IndexautomatikLaufStatus(str, enum.Enum):
     BLOCKIERT = "BLOCKIERT"
     TERMIN_NICHT_ERREICHT = "TERMIN_NICHT_ERREICHT"
     KEIN_ERHOEHUNGSBEDARF = "KEIN_ERHOEHUNGSBEDARF"
+    # Codex-Rückprüfung zu 5535ae2: eine NEGATIVE Anpassung (Index
+    # tatsächlich gesunken) ist fachlich etwas anderes als "keine
+    # Erhöhung nötig" (Anpassung == 0, unterhalb der Schwelle) - eine
+    # Senkung darf nicht stillschweigend unter demselben Status
+    # verschwinden. Automatische Senkungen sind NICHT implementiert
+    # (kein automatisches Schreiben); dieser Status macht den internen
+    # Prüfbedarf sichtbar, statt ihn zu verstecken.
+    SENKUNG_PRUEFBEDARF = "SENKUNG_PRUEFBEDARF"
     ERHOEHUNG_ERZEUGT = "ERHOEHUNG_ERZEUGT"
     BEREITS_ERFASST = "BEREITS_ERFASST"
 

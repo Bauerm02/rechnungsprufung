@@ -14,6 +14,7 @@ gesamten Monatslauf."""
 
 from __future__ import annotations
 
+import calendar
 import json
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
@@ -31,9 +32,14 @@ from mietinkasso.index.repository import IndexRepository
 from mietinkasso.index.service import IndexService
 from mietinkasso.indexautomatik.outbox_service import ErhoehungsschreibenOutboxService
 from mietinkasso.indexautomatik.rechtsprofil import RechtsprofilService
-from mietinkasso.indexautomatik.repository import ErhoehungsschreibenRepository, IndexautomatikLaufRepository, VpiRepository
+from mietinkasso.indexautomatik.repository import (
+    ErhoehungsschreibenRepository,
+    IndexautomatikLaufRepository,
+    VpiMonatswertMitPeriode,
+    VpiRepository,
+)
 from mietinkasso.indexautomatik.vertragsspur import berechne_vertragliche_spur_cent
-from mietinkasso.infrastructure.db.tables import IndexautomatikLaufTable, RechtsprofilTable, VertragTable
+from mietinkasso.infrastructure.db.tables import IndexautomatikLaufTable, IndexKlauselTable, RechtsprofilTable, VertragTable
 from mietinkasso.mieweg_vorschau.service import MieWegVorschauService, VpiWert
 from mietinkasso.stammdaten.repository import StammdatenRepository
 
@@ -59,6 +65,26 @@ def _monate_addieren(basis: date, monate: int) -> date:
     gesamter_monatsindex = basis.year * 12 + (basis.month - 1) + monate
     jahr, monat_index = divmod(gesamter_monatsindex, 12)
     return date(jahr, monat_index + 1, 1)
+
+
+def _kalendermonate_addieren_exakt(basis: date, monate: int) -> date:
+    """Addiert KALENDERMONATE unter Erhalt des TAGES (15.11. + 2 Monate =
+    15.01., NICHT auf den 1. gekürzt - Codex-Rückprüfung zu 5535ae2:
+    "Kalenderfrist muss konkreten Tag erhalten ... derzeit _monate_
+    addieren kürzt auf 1. und erlaubt vor Fristende"). Für eine
+    vertragliche Wartefrist NACH einem konkreten Ereignisdatum (VPI-
+    Periode oder deren belegte Veröffentlichung) ist NUR diese taggenaue
+    Rechnung korrekt - `_monate_addieren` (Monatserster) bleibt für die
+    davon GETRENNTE Frage "in welchem Kalendermonat darf/muss die
+    NÄCHSTE Anpassung wirksam werden" (Anpassungsmonat/Mindestintervall)
+    weiterhin richtig. Bei einem Tag, den der Zielmonat nicht hat (z. B.
+    31.01. + 1 Monat), wird auf den letzten Tag des Zielmonats geklemmt."""
+
+    gesamter_monatsindex = basis.year * 12 + (basis.month - 1) + monate
+    jahr, monat_index = divmod(gesamter_monatsindex, 12)
+    zielmonat = monat_index + 1
+    letzter_tag_zielmonat = calendar.monthrange(jahr, zielmonat)[1]
+    return date(jahr, zielmonat, min(basis.day, letzter_tag_zielmonat))
 
 
 def _naechster_gueltiger_kalendermonat(ab: date, ziel_monat: int) -> date:
@@ -323,6 +349,53 @@ class IndexautomatikService:
         )
         return _abschliessen("ERHOEHUNG_ERZEUGT", mieweg_vorschau_id=vorschau.id, erhoehungsschreiben_id=schreiben.id)
 
+    def _erstes_ueberschreitungsereignis(self, klausel: IndexKlauselTable, heute: date) -> VpiMonatswertMitPeriode | None:
+        """Das MASSGEBLICHE Überschreitungsereignis für eine vertragliche
+        Wartefrist ist der ERSTE (chronologisch früheste) ENDGUELTIGe
+        VPI-Monat NACH `klausel.basis_monat`, dessen Wert die
+        klauselseitige Schwelle tatsächlich überschreitet - NICHT "der
+        jeweils neueste verfügbare VPI-Wert" (Codex-Rückprüfung zu
+        5535ae2: "Wartefrist läuft vom maßgeblichen Überschreitungs-
+        ereignis, nicht immer neuesten VPI, sonst verschiebt sie sich
+        endlos"). Eine reine Vorwärtssuche ab einem FESTEN Startpunkt
+        (`basis_monat`) liefert über beliebig viele spätere Läufe hinweg
+        IMMER dasselbe erste Ergebnis - die Wartefrist "wandert" dadurch
+        nie mit neu hinzukommenden VPI-Daten mit. `None`, wenn (noch)
+        keine Periode die Schwelle überschreitet - dann bleibt der Fall
+        gesperrt, statt das Ereignis zu schätzen."""
+
+        basis_jahr, basis_monat_num = (int(teil) for teil in klausel.basis_monat.split("-"))
+        kandidaten = self._vpi_repository.endgueltige_monatswerte_zwischen(
+            klausel.basis_reihe, nach_jahr=basis_jahr, nach_monat=basis_monat_num, bis=heute
+        )
+        if klausel.schwellenkorridor_rundung_dezimalstellen is not None:
+            obergrenze, untergrenze = IndexService.schwellenkorridor_grenzwerte(
+                basis_wert=klausel.basis_wert, schwelle_prozent=klausel.schwelle_prozent,
+                rundung_dezimalstellen=klausel.schwellenkorridor_rundung_dezimalstellen,
+            )
+        for kandidat in kandidaten:
+            wert = kandidat.wert
+            if klausel.indexwert_rundung_dezimalstellen is not None:
+                quant = Decimal(1).scaleb(-klausel.indexwert_rundung_dezimalstellen)
+                wert = wert.quantize(quant, rounding=ROUND_HALF_UP)
+            if klausel.schwellenkorridor_rundung_dezimalstellen is not None:
+                ueberschritten = IndexService.ueberschreitet_schwelle_grenzwerte(
+                    wert, obergrenze=obergrenze, untergrenze=untergrenze, schwelle_inklusive=klausel.schwelle_inklusive
+                )
+            else:
+                effektive_veraenderung = IndexService.effektive_veraenderung_prozent(
+                    alter_wert=klausel.basis_wert,
+                    neuer_wert=wert,
+                    daempfung_prozent=klausel.daempfung_prozent,
+                    vertragliche_grenze_prozent=klausel.vertragliche_grenze_prozent,
+                )
+                ueberschritten = IndexService.ueberschreitet_schwelle(
+                    effektive_veraenderung, schwelle_prozent=klausel.schwelle_prozent, schwelle_inklusive=klausel.schwelle_inklusive
+                )
+            if ueberschritten:
+                return kandidat
+        return None
+
     def _monatslauf_klausel(
         self, ctx: AuthContext, vertrag: VertragTable, profil: RechtsprofilTable, heute: date, periode: str,
         akteur: str, claim_id: int,
@@ -337,77 +410,171 @@ class IndexautomatikService:
         if klausel is None or klausel.status != "FREIGEGEBEN":
             return _abschliessen("BLOCKIERT", ["Referenzierte Vertragsklausel ist nicht (mehr) freigegeben."])
 
-        # Belegtes Kalender-/Intervallregelprofil (Auftrag Markus) - OHNE
-        # beide Felder bleibt der Pfad gesperrt, KEIN Termin wird aus dem
-        # heutigen Datum erfunden.
-        if klausel.anpassungsmonat is None or klausel.mindestintervall_monate is None:
+        # `klausel.letzte_anpassung_monat` wird NUR bei einer TATSÄCHLICHEN
+        # Umsetzung fortgeschrieben (umsetzung_service.py, nach Zugang/
+        # Zahlungspflicht) - bis dahin kann bereits ein noch unumgesetzter
+        # VORSCHLAG (IndexAnpassung) für GENAU DIESE Klauselversion
+        # existieren. Ohne diesen zusätzlich zu berücksichtigen, würde ein
+        # Folgemonat mit einem erneut veränderten VPI-Wert einen ZWEITEN,
+        # abweichenden Vorschlag erzeugen, obwohl der erste noch gar nicht
+        # umgesetzt ist - der spätere der beiden Zeitpunkte gilt.
+        letzte_anpassung = self._index_repository.letzte_anpassung(vertrag.id)
+        effektiver_letzter_anpassung_monat = klausel.letzte_anpassung_monat
+        if (
+            letzte_anpassung is not None
+            and letzte_anpassung.index_klausel_id == klausel.id
+            and letzte_anpassung.status != "VERWORFEN"
+        ):
+            kandidat_monat = f"{letzte_anpassung.stichtag.year:04d}-{letzte_anpassung.stichtag.month:02d}"
+            if effektiver_letzter_anpassung_monat is None or kandidat_monat > effektiver_letzter_anpassung_monat:
+                effektiver_letzter_anpassung_monat = kandidat_monat
+
+        # Explizites Terminmodell (Codex-Rückprüfung zu 5535ae2 - "anpassungs-
+        # monat ist zwingend und damit reine Schwellenklauseln ohne festen
+        # Monat sowie maximal-einmal-jährlich ohne fixen Monat nicht
+        # darstellbar"). GENAU EINER von drei Modi, kein erfundener Termin
+        # ohne belegtes Modell (siehe `IndexKlauselTable.terminmodus`-
+        # Docstring für die vollständige Beschreibung je Modus).
+        heute_monatserster = date(heute.year, heute.month, 1)
+        if klausel.terminmodus is None:
             return _abschliessen(
                 "BLOCKIERT",
                 [
-                    "Kein belegtes Kalender-/Intervallregelprofil (Anpassungsmonat/Mindestintervall) für "
-                    "diese Vertragsklausel konfiguriert - kein automatischer Wirksamkeitstermin ohne "
-                    "geprüfte Vertragsregel, kein erfundenes Datum."
+                    "Kein belegtes Terminmodell (FIXER_MONAT/BEI_SCHWELLE/INTERVALL) für diese "
+                    "Vertragsklausel konfiguriert - kein automatischer Wirksamkeitstermin ohne geprüfte "
+                    "Vertragsregel, kein erfundenes Datum."
                 ],
             )
-        if heute.month != klausel.anpassungsmonat:
-            return _abschliessen("TERMIN_NICHT_ERREICHT")
-
-        # Erster möglicher Termin (ab Vertragsbeginn) und Mindestabstand
-        # ZWISCHEN bereits erfolgten Anpassungen sind ZWEI GETRENNTE
-        # Prüfungen (Auftrag Markus: "nicht automatisch zwölf Monate
-        # Wartezeit ab Mietbeginn erfinden" - der erste Termin ist schlicht
-        # die nächste tatsächliche Kalendermonats-Wiederkehr, NICHT
-        # Vertragsbeginn + Mindestintervall).
-        heute_monatserster = date(heute.year, heute.month, 1)
-        if klausel.letzte_anpassung_monat is None:
-            erster_moeglicher_termin = _naechster_gueltiger_kalendermonat(vertrag.gueltig_von, klausel.anpassungsmonat)
-            if heute_monatserster < erster_moeglicher_termin:
-                return _abschliessen("TERMIN_NICHT_ERREICHT")
-        else:
-            letztes_jahr, letzter_monat = (int(teil) for teil in klausel.letzte_anpassung_monat.split("-"))
-            naechst_zulaessig = _monate_addieren(date(letztes_jahr, letzter_monat, 1), klausel.mindestintervall_monate)
-            if heute_monatserster < naechst_zulaessig:
+        if klausel.terminmodus == "FIXER_MONAT":
+            if klausel.anpassungsmonat is None or klausel.mindestintervall_monate is None:
                 return _abschliessen(
-                    "TERMIN_NICHT_ERREICHT",
-                    [
-                        f"Mindestintervall ({klausel.mindestintervall_monate} Monate) seit der letzten "
-                        f"Anpassung ({klausel.letzte_anpassung_monat}) erst ab {naechst_zulaessig.isoformat()} "
-                        "wieder erfüllt."
-                    ],
+                    "BLOCKIERT",
+                    ["Terminmodell FIXER_MONAT verlangt sowohl anpassungsmonat als auch mindestintervall_monate."],
                 )
+            if heute.month != klausel.anpassungsmonat:
+                return _abschliessen("TERMIN_NICHT_ERREICHT")
+            # Erster möglicher Termin (ab Vertragsbeginn) und Mindestabstand
+            # ZWISCHEN bereits erfolgten Anpassungen sind ZWEI GETRENNTE
+            # Prüfungen (Auftrag Markus: "nicht automatisch zwölf Monate
+            # Wartezeit ab Mietbeginn erfinden" - der erste Termin ist
+            # schlicht die nächste tatsächliche Kalendermonats-Wiederkehr,
+            # NICHT Vertragsbeginn + Mindestintervall).
+            if effektiver_letzter_anpassung_monat is None:
+                erster_moeglicher_termin = _naechster_gueltiger_kalendermonat(vertrag.gueltig_von, klausel.anpassungsmonat)
+                if heute_monatserster < erster_moeglicher_termin:
+                    return _abschliessen("TERMIN_NICHT_ERREICHT")
+            else:
+                letztes_jahr, letzter_monat = (int(teil) for teil in effektiver_letzter_anpassung_monat.split("-"))
+                naechst_zulaessig = _monate_addieren(date(letztes_jahr, letzter_monat, 1), klausel.mindestintervall_monate)
+                if heute_monatserster < naechst_zulaessig:
+                    return _abschliessen(
+                        "TERMIN_NICHT_ERREICHT",
+                        [
+                            f"Mindestintervall ({klausel.mindestintervall_monate} Monate) seit der letzten "
+                            f"Anpassung ({effektiver_letzter_anpassung_monat}) erst ab {naechst_zulaessig.isoformat()} "
+                            "wieder erfüllt."
+                        ],
+                    )
+            massgeblicher_termin = date(heute.year, klausel.anpassungsmonat, 1)
+        elif klausel.terminmodus == "INTERVALL":
+            if klausel.mindestintervall_monate is None:
+                return _abschliessen("BLOCKIERT", ["Terminmodell INTERVALL verlangt mindestintervall_monate."])
+            if klausel.anpassungsmonat is not None:
+                return _abschliessen(
+                    "BLOCKIERT", ["Terminmodell INTERVALL darf keinen fixen anpassungsmonat haben."]
+                )
+            # Kein Kalenderanker: der erste mögliche Termin ist Vertrags-
+            # beginn + Mindestintervall, jeder weitere die letzte Anpassung
+            # + Mindestintervall - beides taggenau auf Kalendermonate, nie
+            # eine Tage-Umrechnung (Auftrag Markus).
+            if effektiver_letzter_anpassung_monat is None:
+                erster_moeglicher_termin = _monate_addieren(vertrag.gueltig_von, klausel.mindestintervall_monate)
+                if heute_monatserster < erster_moeglicher_termin:
+                    return _abschliessen("TERMIN_NICHT_ERREICHT")
+            else:
+                letztes_jahr, letzter_monat = (int(teil) for teil in effektiver_letzter_anpassung_monat.split("-"))
+                naechst_zulaessig = _monate_addieren(date(letztes_jahr, letzter_monat, 1), klausel.mindestintervall_monate)
+                if heute_monatserster < naechst_zulaessig:
+                    return _abschliessen(
+                        "TERMIN_NICHT_ERREICHT",
+                        [
+                            f"Mindestintervall ({klausel.mindestintervall_monate} Monate) seit der letzten "
+                            f"Anpassung ({effektiver_letzter_anpassung_monat}) erst ab {naechst_zulaessig.isoformat()} "
+                            "wieder erfüllt."
+                        ],
+                    )
+            massgeblicher_termin = heute_monatserster
+        elif klausel.terminmodus == "BEI_SCHWELLE":
+            if klausel.anpassungsmonat is not None:
+                return _abschliessen(
+                    "BLOCKIERT", ["Terminmodell BEI_SCHWELLE darf keinen fixen anpassungsmonat haben."]
+                )
+            # Kein Kalenderanker - jeden Monat prüfbar. Ein optionaler
+            # Mindestabstand verhindert nur ein sofortiges erneutes
+            # Auslösen im unmittelbaren Folgemonat.
+            if klausel.mindestintervall_monate is not None and effektiver_letzter_anpassung_monat is not None:
+                letztes_jahr, letzter_monat = (int(teil) for teil in effektiver_letzter_anpassung_monat.split("-"))
+                naechst_zulaessig = _monate_addieren(date(letztes_jahr, letzter_monat, 1), klausel.mindestintervall_monate)
+                if heute_monatserster < naechst_zulaessig:
+                    return _abschliessen(
+                        "TERMIN_NICHT_ERREICHT",
+                        [
+                            f"Mindestintervall ({klausel.mindestintervall_monate} Monate) seit der letzten "
+                            f"Anpassung ({effektiver_letzter_anpassung_monat}) erst ab {naechst_zulaessig.isoformat()} "
+                            "wieder erfüllt."
+                        ],
+                    )
+            massgeblicher_termin = heute_monatserster
+        else:
+            return _abschliessen("BLOCKIERT", [f"Unbekanntes Terminmodell '{klausel.terminmodus}'."])
 
         # Optionale vertragliche Wartefrist NACH dem maßgeblichen
         # Indexereignis (Auftrag Markus) - NIE über eine Tage-Umrechnung,
-        # NUR mit einem eindeutigen, tatsächlich vorhandenen Datumsbezug
-        # (VPI-Periode selbst ODER deren Veröffentlichung/Abruf). Fehlt der
-        # Ereignis-/Datumsbeleg, wird gesperrt statt geraten.
+        # aber TAGGENAU addiert, NUR mit einem eindeutigen, tatsächlich
+        # BELEGTEN Datumsbezug (VPI-Periode selbst ODER deren belegte
+        # amtliche Veröffentlichung - NIEMALS der bloße eigene Abrufzeit-
+        # punkt `abgerufen_am`, Codex-Rückprüfung zu 5535ae2). Fehlt der
+        # Ereignis-/Datumsbeleg, wird gesperrt statt geraten. Der Anker
+        # ist das ERSTE (chronologisch früheste) Überschreitungsereignis
+        # seit `basis_monat`, NIE "der jeweils neueste VPI-Wert" - sonst
+        # verschiebt sich die Frist mit jedem neu veröffentlichten Monat
+        # endlos weiter.
         hat_wartefrist = klausel.wartefrist_monate_nach_indexereignis is not None
         if hat_wartefrist:
-            vpi_periode = self._vpi_repository.neuester_endgueltiger_monatswert_mit_periode(klausel.basis_reihe, heute)
-            if vpi_periode is None:
+            ueberschreitung = self._erstes_ueberschreitungsereignis(klausel, heute)
+            if ueberschreitung is None:
                 return _abschliessen(
-                    "BLOCKIERT", [f"Kein amtlicher, endgültiger VPI-Monatswert für Reihe {klausel.basis_reihe} verfügbar."]
+                    "TERMIN_NICHT_ERREICHT",
+                    [
+                        f"Noch keine belegte Schwellenüberschreitung (Reihe {klausel.basis_reihe}) seit Basis "
+                        f"{klausel.basis_monat} festgestellt - kein geschätztes Indexereignis."
+                    ],
                 )
             if klausel.wartefrist_bezug == "VPI_PERIODE":
-                indexereignis_datum = date(vpi_periode.jahr, vpi_periode.monat, 1)
+                indexereignis_datum = date(ueberschreitung.jahr, ueberschreitung.monat, 1)
             elif klausel.wartefrist_bezug == "VEROEFFENTLICHUNG":
-                monatswert_zeile = self._vpi_repository.get_monatswert(klausel.basis_reihe, vpi_periode.jahr, vpi_periode.monat)
-                if monatswert_zeile is None or monatswert_zeile.abgerufen_am is None:
+                monatswert_zeile = self._vpi_repository.get_monatswert(
+                    klausel.basis_reihe, ueberschreitung.jahr, ueberschreitung.monat
+                )
+                if monatswert_zeile is None or monatswert_zeile.veroeffentlicht_am is None:
                     return _abschliessen(
                         "BLOCKIERT",
                         [
-                            f"Wartefrist bezieht sich auf die Veröffentlichung, aber kein Abrufdatum für "
-                            f"VPI {klausel.basis_reihe} {vpi_periode.jahr}-{vpi_periode.monat:02d} belegt - "
-                            "kein erfundener Veröffentlichungstermin."
+                            f"Wartefrist bezieht sich auf die amtliche Veröffentlichung, aber kein belegtes "
+                            f"Veröffentlichungsdatum für VPI {klausel.basis_reihe} "
+                            f"{ueberschreitung.jahr}-{ueberschreitung.monat:02d} vorhanden (der eigene "
+                            "Abrufzeitpunkt zählt dafür NICHT) - kein erfundener Veröffentlichungstermin."
                         ],
                     )
-                indexereignis_datum = monatswert_zeile.abgerufen_am.date()
+                indexereignis_datum = monatswert_zeile.veroeffentlicht_am
             else:
                 return _abschliessen(
                     "BLOCKIERT",
                     [f"Wartefrist-Bezug '{klausel.wartefrist_bezug}' ist nicht eindeutig VPI_PERIODE/VEROEFFENTLICHUNG."],
                 )
-            wartefrist_erfuellt_ab = _monate_addieren(indexereignis_datum, klausel.wartefrist_monate_nach_indexereignis)
+            wartefrist_erfuellt_ab = _kalendermonate_addieren_exakt(
+                indexereignis_datum, klausel.wartefrist_monate_nach_indexereignis
+            )
             if heute < wartefrist_erfuellt_ab:
                 return _abschliessen(
                     "TERMIN_NICHT_ERREICHT",
@@ -416,8 +583,8 @@ class IndexautomatikService:
                         f"{indexereignis_datum.isoformat()}) erst ab {wartefrist_erfuellt_ab.isoformat()} erfüllt."
                     ],
                 )
-            aktueller_vpi = vpi_periode.wert
-            vpi_jahr, vpi_monat = vpi_periode.jahr, vpi_periode.monat
+            aktueller_vpi = ueberschreitung.wert
+            vpi_jahr, vpi_monat = ueberschreitung.jahr, ueberschreitung.monat
         else:
             vpi_periode = self._vpi_repository.neuester_endgueltiger_monatswert_mit_periode(klausel.basis_reihe, heute)
             if vpi_periode is None:
@@ -430,6 +597,10 @@ class IndexautomatikService:
         # Bekannte vertragliche Rundung des amtlichen Indexwerts VOR dem
         # Schwellenvergleich (Auftrag Markus) - explizit zu konfigurieren,
         # sonst bleibt der volle, ungerundete amtliche Wert maßgeblich.
+        # Betrifft NUR den Indexwert selbst, NICHT automatisch den daraus
+        # berechneten Schwellenkorridor (`IndexKlauselTable.
+        # schwellenkorridor_rundung_dezimalstellen` ist ein separates
+        # Feld, siehe `IndexService.berechne_vorschlag`).
         if klausel.indexwert_rundung_dezimalstellen is not None:
             quant = Decimal(1).scaleb(-klausel.indexwert_rundung_dezimalstellen)
             aktueller_vpi = aktueller_vpi.quantize(quant, rounding=ROUND_HALF_UP)
@@ -439,8 +610,9 @@ class IndexautomatikService:
         # nicht allein an eine neue technische index_anpassung_id -
         # solange sich weder Basis noch amtlicher Wert geändert haben,
         # erzeugt ein Folgemonat KEINEN zweiten, inhaltlich identischen
-        # Vorschlag (unabhängiger Review, fd8c2b2-Folgereview).
-        letzte_anpassung = self._index_repository.letzte_anpassung(vertrag.id)
+        # Vorschlag (unabhängiger Review, fd8c2b2-Folgereview). `letzte_
+        # anpassung` wurde bereits weiter oben für die Terminmodell-
+        # Prüfung geladen.
         if (
             letzte_anpassung is not None
             and letzte_anpassung.index_klausel_id == klausel.id
@@ -469,7 +641,22 @@ class IndexautomatikService:
             neuer_wert_jahr=vpi_jahr,
             neuer_wert_monat=vpi_monat,
         )
-        if vorschlag.erhoehung_cent <= 0:
+        if vorschlag.erhoehung_cent < 0:
+            # Codex-Rückprüfung zu 5535ae2: eine tatsächliche SENKUNG darf
+            # nicht unter "keine Erhöhung nötig" verschwinden - automatische
+            # Senkungen sind NICHT implementiert (kein automatisches
+            # Schreiben), aber der Fall bleibt sichtbar als interner
+            # Prüfbedarf, statt stillschweigend wie ein Nulldurchgang
+            # behandelt zu werden.
+            return _abschliessen(
+                "SENKUNG_PRUEFBEDARF",
+                [
+                    f"Berechnete Veränderung ist eine SENKUNG ({vorschlag.veraenderung_prozent}%, "
+                    f"{vorschlag.erhoehung_cent} Cent) - automatische Senkungen sind nicht implementiert, "
+                    "interner Prüfbedarf statt automatisches Erhöhungsschreiben."
+                ],
+            )
+        if vorschlag.erhoehung_cent == 0:
             return _abschliessen("KEIN_ERHOEHUNGSBEDARF")
 
         aktive_komponenten = {k.id: k for k in self._stammdaten_repository.list_aktive_komponenten(vertrag.id, heute)}
@@ -483,11 +670,11 @@ class IndexautomatikService:
         referenzierte_ids = set(profil.basis_komponenten_ids)
         unveraendert = self._unveraenderte_komponenten(vertrag.id, heute, referenzierte_ids)
 
-        # Belegter fixer Anpassungsmonat = tatsächlicher Wirksamkeitstermin
-        # (des Kalenderjahres, in dem der heutige Lauf stattfindet) - KEIN
-        # aus dem heutigen Tagesdatum erfundener Termin, sondern die
-        # geprüfte Vertragsregel selbst.
-        massgeblicher_termin = date(heute.year, klausel.anpassungsmonat, 1)
+        # `massgeblicher_termin` wurde bereits weiter oben je Terminmodell
+        # bestimmt (FIXER_MONAT: der belegte Anpassungsmonat dieses Jahres;
+        # INTERVALL/BEI_SCHWELLE: der Monatserste des tatsächlichen,
+        # kalenderregelkonformen Laufs) - kein erneut aus dem heutigen
+        # Tagesdatum erfundener Termin.
         schreiben = self._outbox_service.erstellen_aus_index_anpassung(
             ctx=ctx,
             vertrag=vertrag,

@@ -287,6 +287,24 @@ class IndexSollUmsetzungService:
                     "vorzunehmen."
                 )
 
+        # Codex-Rückprüfung zu 5535ae2 (Punkt 4): ein Rollforward OHNE
+        # belegten VPI-Quellmonat auf der IndexAnpassung darf NICHT
+        # stillschweigend auf den Anspruchsmonat zurückfallen (das wäre
+        # ein FALSCHER VPI-Monat) - eine solche Umsetzung wird blockiert,
+        # statt die Klausel-Basisfortschreibung mit einem erfundenen Bezug
+        # fortzuschreiben.
+        if schreiben.index_anpassung_id is not None:
+            anpassung_fuer_pruefung = session.get(IndexAnpassungTable, schreiben.index_anpassung_id)
+            if anpassung_fuer_pruefung is not None and (
+                anpassung_fuer_pruefung.vpi_jahr is None or anpassung_fuer_pruefung.vpi_monat is None
+            ):
+                gruende.append(
+                    f"IndexAnpassung {anpassung_fuer_pruefung.id} hat keinen belegten VPI-Quellmonat "
+                    "(vpi_jahr/vpi_monat) - eine Klausel-Basisfortschreibung würde sonst fälschlich den "
+                    "Anspruchsmonat der neuen Miete als VPI-Quellmonat eintragen. Keine automatische "
+                    "Umsetzung ohne diesen Bezug."
+                )
+
         if gruende or alte_komponenten is None or profil is None:
             return gruende, None
 
@@ -586,22 +604,18 @@ class IndexSollUmsetzungService:
                         # Anpassung verwendeten Wert - der Kern der
                         # Korrektur, verhindert die wiederholte Indexierung.
                         basis_wert=anpassung.neuer_wert,
-                        # Codex-Rückprüfung (zu c01ceb2): `basis_monat` muss
-                        # der TATSÄCHLICHE VPI-Quellmonat von `neuer_wert`
-                        # sein, NICHT der Anspruchsmonat der neuen Miete
-                        # (zwei unterschiedliche Monate, z. B. bei einer
-                        # vertraglichen Wartefrist). `IndexAnpassungTable.
-                        # vpi_jahr`/`vpi_monat` tragen diesen Bezug seit
-                        # `IndexService.berechne_vorschlag` nachvollziehbar
-                        # mit; eine ältere, davor erzeugte Anpassung ohne
-                        # diese Angabe (`None`) fällt auf den Anspruchsmonat
-                        # zurück (degradiert, aber niemals ein erfundener
-                        # früherer Monat).
-                        basis_monat=(
-                            f"{anpassung.vpi_jahr:04d}-{anpassung.vpi_monat:02d}"
-                            if anpassung.vpi_jahr is not None and anpassung.vpi_monat is not None
-                            else anspruchsmonat_str
-                        ),
+                        # Codex-Rückprüfung (zu c01ceb2, verschärft zu
+                        # 5535ae2): `basis_monat` muss der TATSÄCHLICHE
+                        # VPI-Quellmonat von `neuer_wert` sein, NICHT der
+                        # Anspruchsmonat der neuen Miete (zwei
+                        # unterschiedliche Monate, z. B. bei einer
+                        # vertraglichen Wartefrist). `_pruefen` blockiert
+                        # eine Umsetzung bereits VORHER, wenn
+                        # `IndexAnpassungTable.vpi_jahr`/`vpi_monat` fehlen -
+                        # an dieser Stelle sind beide deshalb IMMER gesetzt,
+                        # kein Rückfall auf den Anspruchsmonat mehr (der
+                        # wäre ein FALSCHER VPI-Monat).
+                        basis_monat=f"{anpassung.vpi_jahr:04d}-{anpassung.vpi_monat:02d}",
                         letzte_anpassung_monat=anspruchsmonat_str,
                         schwelle_prozent=alte_klausel.schwelle_prozent,
                         schwelle_inklusive=alte_klausel.schwelle_inklusive,
@@ -613,9 +627,11 @@ class IndexSollUmsetzungService:
                         # Fortschreibung UNVERÄNDERT erhalten (Auftrag
                         # Markus) - reine Bestandskorrektur der Basis, keine
                         # neue Fachentscheidung zur Vertragsregel selbst.
+                        terminmodus=alte_klausel.terminmodus,
                         anpassungsmonat=alte_klausel.anpassungsmonat,
                         mindestintervall_monate=alte_klausel.mindestintervall_monate,
                         indexwert_rundung_dezimalstellen=alte_klausel.indexwert_rundung_dezimalstellen,
+                        schwellenkorridor_rundung_dezimalstellen=alte_klausel.schwellenkorridor_rundung_dezimalstellen,
                         wartefrist_monate_nach_indexereignis=alte_klausel.wartefrist_monate_nach_indexereignis,
                         wartefrist_bezug=alte_klausel.wartefrist_bezug,
                         status="FREIGEGEBEN",

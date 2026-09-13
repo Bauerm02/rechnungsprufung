@@ -316,3 +316,153 @@ def test_nicht_implementiertes_rechtsprofil_wird_gesperrt(index_service, stammda
         index_service.berechne_vorschlag(
             ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("110.0"), quelle_referenz="VPI"
         )
+
+
+def test_terminmodus_fixer_monat_ohne_mindestintervall_wird_abgelehnt(index_service, basis_vertrag, ctx_factory):
+    """Codex-Rückprüfung zu 5535ae2 (Punkt 1): FIXER_MONAT verlangt BEIDE
+    Felder (anpassungsmonat UND mindestintervall_monate)."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    with pytest.raises(ValueError, match="FIXER_MONAT"):
+        index_service.klausel_anlegen(
+            ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+            berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+            basis_reihe="VPI2020", basis_wert=Decimal("100"), basis_monat="2024-01",
+            terminmodus="FIXER_MONAT", anpassungsmonat=1,
+        )
+
+
+def test_terminmodus_intervall_mit_fixem_anpassungsmonat_wird_abgelehnt(index_service, basis_vertrag, ctx_factory):
+    """INTERVALL ist per Definition OHNE Kalenderbindung - ein fixer
+    anpassungsmonat wäre widersprüchlich (dafür gibt es FIXER_MONAT)."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    with pytest.raises(ValueError, match="INTERVALL"):
+        index_service.klausel_anlegen(
+            ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+            berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+            basis_reihe="VPI2020", basis_wert=Decimal("100"), basis_monat="2024-01",
+            terminmodus="INTERVALL", anpassungsmonat=1, mindestintervall_monate=12,
+        )
+
+
+def test_anpassungsmonat_ohne_terminmodus_wird_abgelehnt(index_service, basis_vertrag, ctx_factory):
+    """Ohne ein gesetztes Terminmodell ist anpassungsmonat/
+    mindestintervall_monate wirkungslos - kein stiller Teilzustand."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    with pytest.raises(ValueError, match="terminmodus"):
+        index_service.klausel_anlegen(
+            ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+            berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+            basis_reihe="VPI2020", basis_wert=Decimal("100"), basis_monat="2024-01",
+            anpassungsmonat=1,
+        )
+
+
+def test_letzte_anpassung_monat_kann_bei_anlage_belegt_werden(index_service, basis_vertrag, ctx_factory):
+    """Auftrag Markus (Portal-Anforderung): eine belegte bestehende
+    Anpassungsperiode (z. B. Migration eines Altvertrags mit bereits
+    erfolgten Anpassungen) muss bei Neuanlage explizit gesetzt werden
+    können - ohne diese Angabe bleibt es bei `None` (keine Annahme bei
+    fehlender/unbekannter Vorbasis)."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    klausel = index_service.klausel_anlegen(
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2020, 1, 1),
+        basis_reihe="VPI2020", basis_wert=Decimal("100"), basis_monat="2020-01",
+        letzte_anpassung_monat="2025-01", terminmodus="FIXER_MONAT", anpassungsmonat=1, mindestintervall_monate=12,
+    )
+    assert klausel.letzte_anpassung_monat == "2025-01"
+
+    ohne_angabe = index_service.klausel_anlegen(
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2020, 1, 1),
+        basis_reihe="VPI2020", basis_wert=Decimal("100"), basis_monat="2020-01",
+    )
+    assert ohne_angabe.letzte_anpassung_monat is None
+
+
+def test_letzte_anpassung_monat_ungueltiges_format_wird_abgelehnt(index_service, basis_vertrag, ctx_factory):
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    with pytest.raises(ValueError, match="letzte_anpassung_monat"):
+        index_service.klausel_anlegen(
+            ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+            berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2020, 1, 1),
+            basis_reihe="VPI2020", basis_wert=Decimal("100"), basis_monat="2020-01",
+            letzte_anpassung_monat="2025-13",
+        )
+
+
+def test_schwellenkorridor_rundung_vergleicht_gerundete_grenzwerte_nicht_prozentzahl(
+    index_service, stammdaten_repo, basis_vertrag, ctx_factory
+):
+    """Präzisierung Markus (vor Commit, Codex-Rückprüfung zu 5535ae2):
+    `schwellenkorridor_rundung_dezimalstellen` rundet die GRENZWERTE des
+    Schwellenkorridors (Ober-/Untergrenze in Indexpunkten), NICHT die
+    daraus berechnete Veränderungsprozentzahl. Basis 307, Schwelle 3%
+    inklusiv -> ungerundeter oberer Grenzwert 316,21, auf eine
+    Dezimalstelle gerundet 316,2. Ein amtlicher Wert von genau 316,2
+    ERREICHT diesen gerundeten Grenzwert und löst aus, obwohl die
+    tatsächliche (unveränderte) Veränderung nur rund 2,9967% beträgt -
+    UNTER der 3%-Schwelle, ein reiner Prozentvergleich würde NICHT
+    auslösen."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id="K-HMZ", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=100_000,
+        indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    klausel = index_service.klausel_anlegen(
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+        basis_reihe="VPI2020", basis_wert=Decimal("307"), basis_monat="2024-01",
+        schwelle_prozent=Decimal("3"), schwelle_inklusive=True, schwellenkorridor_rundung_dezimalstellen=1,
+    )
+    index_service.klausel_freigeben(klausel.id, ctx=ctx, freigegeben_von="markus")
+
+    vorschlag = index_service.berechne_vorschlag(
+        ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("316.2"), quelle_referenz="VPI"
+    )
+    assert vorschlag.erhoehung_cent > 0
+    # "Berechnungsbetrag weiterhin aus unverkürztem Indexquotienten"
+    # (Präzisierung Markus) - der volle, unveränderte Prozentwert bleibt
+    # für den tatsächlichen Erhöhungsbetrag maßgeblich.
+    erwartete_rohe_veraenderung = (Decimal("316.2") - Decimal("307")) / Decimal("307") * 100
+    assert vorschlag.veraenderung_prozent == erwartete_rohe_veraenderung
+
+
+def test_ohne_schwellenkorridor_rundung_bleibt_reiner_prozentvergleich_massgeblich(
+    index_service, stammdaten_repo, basis_vertrag, ctx_factory
+):
+    """Gegenprobe zum vorigen Test: OHNE konfigurierte Korridor-
+    Grenzwertrundung bleibt der reine, ungerundete Prozentvergleich
+    maßgeblich - derselbe Wert (316,2 bei Basis 307/Schwelle 3%
+    inklusiv, tatsächliche Veränderung rund 2,9967%) löst dann NICHT
+    aus."""
+
+    vertrag, _ = basis_vertrag
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.add_komponente(
+        id="K-HMZ", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=100_000,
+        indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    klausel = index_service.klausel_anlegen(
+        ctx=ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL",
+        berechnungsprofil=EINFACHER_SCHWELLENVERGLEICH, abschlussdatum=date(2024, 1, 1),
+        basis_reihe="VPI2020", basis_wert=Decimal("307"), basis_monat="2024-01",
+        schwelle_prozent=Decimal("3"), schwelle_inklusive=True,
+    )
+    index_service.klausel_freigeben(klausel.id, ctx=ctx, freigegeben_von="markus")
+
+    vorschlag = index_service.berechne_vorschlag(
+        ctx=ctx, vertrag_id=vertrag.id, stichtag=date(2026, 4, 1), neuer_wert=Decimal("316.2"), quelle_referenz="VPI"
+    )
+    assert vorschlag.erhoehung_cent == 0
