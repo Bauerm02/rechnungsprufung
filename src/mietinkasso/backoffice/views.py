@@ -86,6 +86,8 @@ _NAV_LINKS = [
     ("/backoffice/indexautomatik/outbox", "Indexautomatik-Outbox"),
     ("/backoffice/indexautomatik/vpi", "VPI-Werte"),
     ("/backoffice/indexautomatik/vertragsende", "Vertragsende-Erinnerungen"),
+    ("/backoffice/variable-abrechnung", "Variable Monatsabrechnung"),
+    ("/backoffice/dashboard/monatsuebersicht", "Monatsübersicht (Nettomieterlös)"),
 ]
 
 

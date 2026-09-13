@@ -63,6 +63,8 @@ def backoffice_client():
     stammdaten.upsert_einheit(id="601-TOP1", objekt_id="601", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
     stammdaten.upsert_einheit(id="601-TOP2", objekt_id="601", bezeichnung="Top 2 (Keller)", nutzungsstatus="LEERSTAND")
     stammdaten.upsert_einheit(id="107-TOP1", objekt_id="107", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_einheit(id="601-KURZ1", objekt_id="601", bezeichnung="Kurzzeit 1", nutzungsstatus="KURZZEITVERMIETUNG")
+    stammdaten.upsert_einheit(id="107-KURZ1", objekt_id="107", bezeichnung="Kurzzeit gesperrt", nutzungsstatus="KURZZEITVERMIETUNG")
     stammdaten.upsert_debitor(id="DEB-1", name="Test Mieterin", email="test@example.at")
     stammdaten.upsert_vertrag(
         id="V-601-1", einheit_id="601-TOP1", debitor_id="DEB-1", gesellschaft_id="7DI",
@@ -1166,6 +1168,191 @@ def test_indexautomatik_rechtsprofil_freigabe_ohne_csrf_wird_abgelehnt(backoffic
     assert antwort.status_code == 403
 
 
+def test_variable_abrechnung_erfassen_und_liste(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    antwort = client.post(
+        "/backoffice/variable-abrechnung/erfassen",
+        data={
+            "einheit_id": "601-KURZ1", "art": "KURZZEITVERMIETUNG", "leistungsmonat": "2026-08",
+            "belegdatum": "2026-09-05", "quelle_referenz": "Betreiberreport August", "status": "BESTAETIGT",
+            "unser_netto_anteil": "300,00", "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert antwort.status_code == 303
+
+    liste = client.get("/backoffice/variable-abrechnung")
+    assert liste.status_code == 200
+    assert "601-KURZ1" in liste.text
+    assert "300,00" in liste.text
+
+
+def test_variable_abrechnung_ohne_csrf_wird_abgelehnt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    antwort = client.post(
+        "/backoffice/variable-abrechnung/erfassen",
+        data={
+            "einheit_id": "601-KURZ1", "art": "KURZZEITVERMIETUNG", "leistungsmonat": "2099-01",
+            "belegdatum": "2099-02-01", "quelle_referenz": "x", "status": "ENTWURF", "csrf_token": "falsch",
+        },
+    )
+    assert antwort.status_code == 403
+
+
+def test_variable_abrechnung_bestaetigt_ohne_netto_wird_abgelehnt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    antwort = client.post(
+        "/backoffice/variable-abrechnung/erfassen",
+        data={
+            "einheit_id": "601-KURZ1", "art": "KURZZEITVERMIETUNG", "leistungsmonat": "2099-02",
+            "belegdatum": "2099-03-01", "quelle_referenz": "Report ohne Netto", "status": "BESTAETIGT",
+            "csrf_token": csrf,
+        },
+    )
+    assert antwort.status_code == 400
+
+
+def test_variable_abrechnung_gesperrtes_objekt_wird_blockiert(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    antwort = client.post(
+        "/backoffice/variable-abrechnung/erfassen",
+        data={
+            "einheit_id": "107-KURZ1", "art": "KURZZEITVERMIETUNG", "leistungsmonat": "2026-08",
+            "belegdatum": "2026-09-05", "quelle_referenz": "Report gesperrtes Objekt", "status": "ENTWURF",
+            "csrf_token": csrf,
+        },
+    )
+    assert antwort.status_code == 400
+
+
+def test_variable_abrechnung_korrektur_ohne_aenderungsgrund_wird_abgelehnt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    client.post(
+        "/backoffice/variable-abrechnung/erfassen",
+        data={
+            "einheit_id": "601-KURZ1", "art": "KURZZEITVERMIETUNG", "leistungsmonat": "2099-03",
+            "belegdatum": "2099-04-01", "quelle_referenz": "Report v1", "status": "ENTWURF", "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    liste = client.get("/backoffice/variable-abrechnung?monat=2099-03")
+    match = re.search(r"/backoffice/variable-abrechnung/(\d+)/korrigieren", liste.text)
+    assert match is not None
+    zeilen_id = match.group(1)
+
+    # Ein wirklich LEERES aenderungsgrund-Feld wird bereits vom
+    # Formular-Parser als fehlend abgelehnt (422) - ein rein
+    # whitespace-Wert kommt dagegen tatsächlich im Service an und prüft
+    # so die eigentliche Fachvalidierung (`.strip()`-Prüfung in
+    # `VariableAbrechnungService.korrigieren`).
+    antwort = client.post(
+        f"/backoffice/variable-abrechnung/{zeilen_id}/korrigieren",
+        data={
+            "belegdatum": "2099-04-02", "quelle_referenz": "Report v2", "status": "ENTWURF",
+            "aenderungsgrund": "   ", "csrf_token": csrf,
+        },
+    )
+    assert antwort.status_code == 400
+
+
+def test_variable_abrechnung_import_vorschau_und_uebernehmen(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    csv_inhalt = (
+        "einheit_id,art,leistungsmonat,belegdatum,quelle_referenz,status,berichteter_betrag,"
+        "berichteter_betragsart,unser_netto_anteil,tatsaechlicher_zahlungseingang,vermietete_einheiten,"
+        "vermietete_flaeche_qm,aenderungsgrund,import_id\n"
+        "601-KURZ1,KURZZEITVERMIETUNG,2099-04,2099-05-01,CSV Report,BESTAETIGT,500.00,BRUTTO,400.00,,,,,\n"
+    )
+    vorschau = client.post(
+        "/backoffice/variable-abrechnung/import/vorschau",
+        files={"datei": ("report.csv", csv_inhalt, "text/csv")},
+        data={"csrf_token": csrf},
+    )
+    assert vorschau.status_code == 200
+    assert "NEU" in vorschau.text
+    hash_match = re.search(r'name="plan_hash" value="([a-f0-9]+)"', vorschau.text)
+    assert hash_match is not None
+
+    uebernehmen = client.post(
+        "/backoffice/variable-abrechnung/import/uebernehmen",
+        data={"datei_inhalt": csv_inhalt, "plan_hash": hash_match.group(1), "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert uebernehmen.status_code == 200
+    assert "1 neu" in uebernehmen.text
+
+
+def test_variable_abrechnung_import_veralteter_hash_wird_abgelehnt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    csv_inhalt = (
+        "einheit_id,art,leistungsmonat,belegdatum,quelle_referenz,status\n"
+        "601-KURZ1,KURZZEITVERMIETUNG,2099-05,2099-06-01,CSV Report,ENTWURF\n"
+    )
+    antwort = client.post(
+        "/backoffice/variable-abrechnung/import/uebernehmen",
+        data={"datei_inhalt": csv_inhalt, "plan_hash": "veralteter-hash", "csrf_token": csrf},
+    )
+    assert antwort.status_code == 400
+
+
+def test_dashboard_monatsuebersicht_seite_erreichbar(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    antwort = client.get("/backoffice/dashboard/monatsuebersicht?monat=2026-08")
+    assert antwort.status_code == 200
+    assert "Nettomieterlös" in antwort.text
+    assert "Datenlücke" in antwort.text
+
+
+def test_dashboard_relabeling_kontostand_und_faelligkeit(backoffice_client):
+    client, konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    objekt_seite = client.get("/backoffice/?objekt_id=601")
+    assert "Kontostand (offen/Guthaben)" in objekt_seite.text
+    assert "Davon mit bekannter Fälligkeit" in objekt_seite.text
+
+    konto_seite = client.get(f"/backoffice/konto/{konto_id}")
+    assert "Kontostand (offen/Guthaben)" in konto_seite.text
+    assert "Davon mit bekannter Fälligkeit" in konto_seite.text
+    assert "Rechenweg" in konto_seite.text
+
+
+def test_bestehende_op_unveraendert_nach_variable_abrechnung(backoffice_client):
+    """Item 1: die variable Monatsabrechnung ist reine Zusatzerfassung -
+    sie darf den bestehenden OP-Kontostand nicht verändern."""
+
+    client, konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    saldo_vorher = op_service.berechne_saldo(konto_id).saldo_cent
+
+    client.post(
+        "/backoffice/variable-abrechnung/erfassen",
+        data={
+            "einheit_id": "601-KURZ1", "art": "KURZZEITVERMIETUNG", "leistungsmonat": "2099-06",
+            "belegdatum": "2099-07-01", "quelle_referenz": "Report ohne OP-Wirkung", "status": "BESTAETIGT",
+            "unser_netto_anteil": "123,45", "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    saldo_nachher = op_service.berechne_saldo(konto_id).saldo_cent
+    assert saldo_nachher == saldo_vorher
+
+
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
     unten) - der Login-Ratelimiter ist ein globaler, prozessweiter
@@ -1191,3 +1378,8 @@ def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     assert "login" in gesperrt.headers["location"]
     folge_seite = client.get(gesperrt.headers["location"])
     assert "Zu viele Fehlversuche" in folge_seite.text
+
+
+# -- Variable Monatsabrechnung (KURZZEITVERMIETUNG/SELFSTORAGE) --------------
+# Auftrag 13.09., HV-20260913-DASHBOARD.
+

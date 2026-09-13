@@ -792,6 +792,81 @@ class VertragsendeErinnerungTable(Base):
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class VariableAbrechnungTable(Base):
+    """Monatliche variable Nutzungsentgelt-Meldung für KURZZEITVERMIETUNG/
+    SELFSTORAGE-Einheiten (Auftrag 13.09., HV-20260913-DASHBOARD) - diese
+    Einheiten haben KEINE feste Dauervermietungs-Vorschreibung, sondern
+    einen berichtsbasierten, monatlich schwankenden Anteil.
+
+    Versioniert und UNVERÄNDERLICH wie `MieWegVorschauTable`/
+    `RechtsprofilTable`: eine Korrektur legt IMMER eine neue Zeile mit
+    `version + 1` an, nie ein In-Place-Update. Ein partieller Unique-
+    Index erzwingt genau eine `ist_aktuell=True`-Zeile je
+    (einheit_id, art, leistungsmonat) - "keine Summierung desselben
+    Reports aus Import und manueller Erfassung".
+
+    Quellenbedingte Präzisierung (13.09.): ein Monatsbericht liegt oft
+    zuerst nur als roher Buchungsumsatz vor, ohne bestätigten
+    Eigentümer-Nettoanteil. `berichteter_betrag_cent`/
+    `berichteter_betragsart` (BRUTTO/NETTO/UNGEKLAERT) halten GENAU das
+    fest, WIE es gemeldet wurde - es gibt HIER keine automatische
+    Netto-Umrechnung über einen angenommenen USt-Satz. Erst wenn
+    `unser_netto_anteil_cent` tatsächlich geprüft/bestätigt ist
+    (`status=BESTAETIGT`), fließt der Fall in eine Erlössumme ein; eine
+    `status=ENTWURF`-Zeile bleibt sichtbar, aber unbestätigt.
+
+    `betriebskosten_hinweis_cent`/`reinigungskosten_hinweis_cent`/
+    `verwaltungskosten_hinweis_cent` sind REIN ERLÄUTERND - diese Kosten
+    können bereits im ausgewiesenen `unser_netto_anteil_cent` enthalten
+    sein und werden von keinem Code-Pfad nochmals abgezogen.
+    `tatsaechlicher_zahlungseingang_cent` (die tatsächliche Überweisung
+    an den Eigentümer) kann Kostenersatz enthalten und ist NICHT
+    gleichzusetzen mit dem Nettomieterlös - beide Felder bleiben
+    strikt getrennt und werden nie miteinander verrechnet. Weder dieses
+    Feld noch `unser_netto_anteil_cent` ersetzt eine OP-/Bankbuchung;
+    `OPPositionTable` bleibt von diesem Modul vollständig unberührt."""
+
+    __tablename__ = "variable_abrechnungen"
+    __table_args__ = (
+        UniqueConstraint("import_id", name="uq_variable_abrechnung_import_id"),
+        # Genau eine AKTUELLE Version je (Einheit, Art, Leistungsmonat) -
+        # analog zu `uq_op_eroeffnung_pro_konto` oben.
+        Index(
+            "uq_variable_abrechnung_aktuell",
+            "einheit_id", "art", "leistungsmonat",
+            unique=True,
+            sqlite_where=text("ist_aktuell = 1"),
+            postgresql_where=text("ist_aktuell IS TRUE"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    einheit_id: Mapped[str] = mapped_column(ForeignKey("einheiten.id"), index=True)
+    gesellschaft_id: Mapped[str] = mapped_column(ForeignKey("gesellschaften.id"), index=True)
+    art: Mapped[str] = mapped_column(String(32))
+    leistungsmonat: Mapped[str] = mapped_column(String(7))
+    version: Mapped[int] = mapped_column(Integer)
+    ist_aktuell: Mapped[bool] = mapped_column(Boolean, default=True)
+    status: Mapped[str] = mapped_column(String(16), default="ENTWURF")
+    belegdatum: Mapped[date] = mapped_column(Date)
+    quelle_referenz: Mapped[str] = mapped_column(String(256))
+    quelle_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    berichteter_betrag_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    berichteter_betragsart: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    unser_netto_anteil_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    betriebskosten_hinweis_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reinigungskosten_hinweis_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    verwaltungskosten_hinweis_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tatsaechlicher_zahlungseingang_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    vermietete_einheiten: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    vermietete_flaeche_qm: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    aenderungsgrund: Mapped[str | None] = mapped_column(Text, nullable=True)
+    quelle_system: Mapped[str] = mapped_column(String(32), default="MANUELL")
+    import_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class JobLockTable(Base):
     """Mutual-exclusion row: a unique (job_name, fachschluessel) prevents a
     second worker (or a restarted first worker) from repeating a job that

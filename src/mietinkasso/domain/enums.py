@@ -214,3 +214,35 @@ class VertragsendeEntscheidung(str, enum.Enum):
     VERLAENGERN_PRUEFEN = "VERLAENGERN_PRUEFEN"
     NICHT_VERLAENGERN_PRUEFEN = "NICHT_VERLAENGERN_PRUEFEN"
     RUECKFRAGE = "RUECKFRAGE"
+
+
+class VariableAbrechnungArt(str, enum.Enum):
+    """Auftrag 13.09., HV-20260913-DASHBOARD - nur diese zwei
+    Nutzungsarten haben eine variable, berichtsbasierte
+    Monatsabrechnung statt einer festen Dauervermietungs-Vorschreibung."""
+
+    KURZZEITVERMIETUNG = "KURZZEITVERMIETUNG"
+    SELFSTORAGE = "SELFSTORAGE"
+
+
+class VariableAbrechnungStatus(str, enum.Enum):
+    """Quellenbedingte Präzisierung (13.09.): Monatsberichte enthalten
+    häufig zunächst nur einen Buchungsumsatz OHNE bestätigten
+    Eigentümer-Nettoanteil. `ENTWURF` bleibt sichtbar, fließt aber NIE
+    in eine Erlössumme ein - nur `BESTAETIGT` (mit belegtem, geprüftem
+    `unser_netto_anteil_cent`) zählt."""
+
+    ENTWURF = "ENTWURF"
+    BESTAETIGT = "BESTAETIGT"
+
+
+class VariableAbrechnungBetragsart(str, enum.Enum):
+    """Betragsart des ROH gemeldeten Ursprungsbetrags
+    (`berichteter_betrag_cent`) - getrennt von `unser_netto_anteil_cent`.
+    Es gibt HIER keine automatische Netto-Umrechnung über einen
+    angenommenen USt-Satz ("keine pauschale USt-Umrechnung, keine
+    Division durch erfundene USt")."""
+
+    BRUTTO = "BRUTTO"
+    NETTO = "NETTO"
+    UNGEKLAERT = "UNGEKLAERT"

@@ -76,6 +76,15 @@ from mietinkasso.vertragspruefung.repository import IndexPruefbedarfRepository, 
 from mietinkasso.vertragspruefung.service import VertragspruefungService
 from mietinkasso.vorschreibung.repository import VorschreibungRepository
 from mietinkasso.vorschreibung.service import VorschreibungService, faelligkeitsdatum
+from mietinkasso.variableabrechnung.bootstrap import bauen as _variableabrechnung_bauen
+from mietinkasso.variableabrechnung.csv_import import (
+    VariableAbrechnungImportNichtAnwendbarError,
+    erstelle_plan as _variable_abrechnung_erstelle_plan,
+    parse_csv as _variable_abrechnung_parse_csv,
+    plan_hash as _variable_abrechnung_plan_hash,
+    wende_an as _variable_abrechnung_wende_an,
+)
+from mietinkasso.variableabrechnung.dashboard import berechne_monatsuebersicht
 
 router = APIRouter(prefix="/backoffice", tags=["backoffice"])
 
@@ -109,6 +118,7 @@ _mieweg_vorschau_repo = MieWegVorschauRepository(_session_factory)
 _mieweg_vorschau_service = MieWegVorschauService(_mieweg_vorschau_repo, _stammdaten_repo)
 _audit_service = AuditService(_session_factory)
 _indexautomatik = _indexautomatik_bauen(_session_factory, _settings)
+_variableabrechnung = _variableabrechnung_bauen(_session_factory, _stammdaten_repo)
 
 _sessions = SessionStore(ttl_sekunden=_settings.backoffice_session_ttl_minuten * 60)
 # 5 Fehlversuche innerhalb von 5 Minuten -> 5 Minuten GLOBALE Sperre (siehe
@@ -316,6 +326,10 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
                     status_tags.append('<span class="warn">historisch</span>')
                 if einheit and einheit.nutzungsstatus == "LEERSTAND":
                     status_tags.append('<span class="warn">Leerstand</span>')
+                aktive_sperren_zeile = _stammdaten_repo.aktive_sperren(vertrag.id)
+                if aktive_sperren_zeile:
+                    gruende_kurz = ", ".join(h(s.grund) for s in aktive_sperren_zeile)
+                    status_tags.append(f'<span class="error">Mahnsperre ({gruende_kurz})</span>')
                 konto_link = f'<a href="/backoffice/konto/{h(konto.id)}">{h(konto.id)}</a>' if konto else "-"
                 zeilen.append(
                     f"<tr class='{'gesperrt-row' if gesperrt else ''}'>"
@@ -352,9 +366,15 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
 
             tabelle = banner + f"""
             <h2>Mietkontenübersicht — {h(objekt.bezeichnung)} ({h(objekt.id)})</h2>
+            <p class="muted">"Kontostand" = Eröffnung + Vorschreibungen − Zahlungen/Gutschriften (positiv:
+               offener Betrag; negativ: Guthaben). "Davon mit bekannter Fälligkeit" ist NUR die Teilmenge mit
+               bereits verstrichenem, bekanntem Fälligkeitsdatum - eine UNBEKANNTE Fälligkeit ist deshalb
+               NICHT automatisch strittig, sie ist schlicht (noch) nicht in dieser Spalte enthalten. Eine
+               bekannte Fälligkeit ist umgekehrt KEINE Mahnfreigabe - eine aktive Mahnsperre (Spalte
+               "Hinweise") blockiert unabhängig davon.</p>
             <table>
               <tr><th>Vertrag</th><th>Einheit</th><th>Nutzungsstatus</th><th>Debitor</th><th>Konto</th>
-                  <th>Saldo</th><th>fälliger unstrittiger Rest</th><th>Hinweise</th></tr>
+                  <th>Kontostand (offen/Guthaben)</th><th>Davon mit bekannter Fälligkeit</th><th>Hinweise</th></tr>
               {''.join(zeilen) if zeilen else '<tr><td colspan=8 class="muted">Keine Verträge.</td></tr>'}
             </table>
             {bestand_tabelle}"""
@@ -381,6 +401,28 @@ def _op_zeile_html(position) -> str:
         f"<td>{aktion_html}</td>"
         "</tr>"
     )
+
+
+def _rechenweg_html(positionen) -> str:
+    """Reine Darstellung des bestehenden `OPService.berechne_saldo`-
+    Ergebnisses als Formel - ändert/berechnet NICHTS selbst, sondern
+    gruppiert dieselben `positionen` (aus `OPSaldo.positionen`, also
+    identisch mit dem tatsächlich verwendeten Rechenweg) nur nach Typ
+    für die Anzeige (Auftrag 13.09., HV-20260913-DASHBOARD: "Rechenweg
+    Eröffnung + Vorschreibungen - Zahlungen/Gutschriften zeigen")."""
+
+    summen = {"EROEFFNUNG": 0, "SOLL": 0, "RUECKLASTSCHRIFT": 0, "GUTSCHRIFT": 0, "ZAHLUNG": 0, "KORREKTUR": 0}
+    for p in positionen:
+        if p.typ in summen:
+            summen[p.typ] += p.betrag_cent
+    vorschreibungen = summen["SOLL"] + summen["RUECKLASTSCHRIFT"]
+    formel = (
+        f"Eröffnung {eur(summen['EROEFFNUNG'])} + Vorschreibungen/Nachbelastungen {eur(vorschreibungen)} "
+        f"− Zahlungen {eur(summen['ZAHLUNG'])} − Gutschriften {eur(summen['GUTSCHRIFT'])}"
+    )
+    if summen["KORREKTUR"]:
+        formel += f" + Korrekturen {eur(summen['KORREKTUR'])}"
+    return formel
 
 
 @router.get("/konto/{konto_id}", response_class=HTMLResponse)
@@ -428,21 +470,27 @@ def kontoauszug(request: Request, konto_id: str, session=Depends(_current_sessio
         <tr><th>Grund</th><th>Gesetzt am</th><th>Kommentar</th></tr>
         {sperren_zeilen}
       </table>
+      <p class="muted">Eine aktive Sperre blockiert die Mahnung UNABHÄNGIG davon, ob ein Teil des
+         Kontostands eine bekannte, bereits verstrichene Fälligkeit hat - "bekannte Fälligkeit" ist
+         keine Mahnfreigabe.</p>
     </div>"""
 
     zeilen = "".join(_op_zeile_html(p) for p in positionen)
     op_tabelle = f"""
     <div class="card">
       <h2>Kontoauszug — {h(konto_id)}</h2>
-      <p>Saldo: <strong>{eur(saldo.saldo_cent)}</strong> &nbsp;|&nbsp; fälliger unstrittiger Rest:
-         <strong>{eur(saldo.faelliger_unstrittiger_rest_cent)}</strong></p>
+      <p>Kontostand (offen/Guthaben): <strong>{eur(saldo.saldo_cent)}</strong> &nbsp;|&nbsp;
+         Davon mit bekannter Fälligkeit: <strong>{eur(saldo.faelliger_unstrittiger_rest_cent)}</strong></p>
+      <p class="muted">Rechenweg: {_rechenweg_html(saldo.positionen)}</p>
       {aktion}
       <table>
         <tr><th>#</th><th>Typ</th><th>Betrag</th><th>Belegdatum</th><th>Fälligkeit</th><th>Status</th>
             <th>Beleg-Referenz</th><th>Änderungsgrund</th><th></th></tr>
         {zeilen if positionen else '<tr><td colspan=9 class="muted">Keine Buchungen.</td></tr>'}
       </table>
-      <p class="muted">Zeilen ohne bekannte Fälligkeit werden nie automatisch gemahnt (siehe Mahnvorschau).</p>
+      <p class="muted">Zeilen ohne bekannte Fälligkeit werden nie automatisch gemahnt (siehe Mahnvorschau) -
+         eine UNBEKANNTE Fälligkeit gilt dabei NICHT automatisch als strittig, sie ist lediglich (noch)
+         nicht Teil von "Davon mit bekannter Fälligkeit".</p>
     </div>"""
 
     links = ""
@@ -2486,3 +2534,435 @@ def indexautomatik_vertragsende_mieterentwurf(request: Request, erinnerung_id: i
     except (MietinkassoError, ValueError) as exc:
         return _fehlerseite(session, "Vertragsende-Erinnerungen", str(exc), "/backoffice/indexautomatik/vertragsende")
     return RedirectResponse(url="/backoffice/indexautomatik/vertragsende", status_code=303)
+
+
+# -- Variable Monatsabrechnung (KURZZEITVERMIETUNG/SELFSTORAGE) --------------
+# Auftrag 13.09., HV-20260913-DASHBOARD.
+
+
+def _parse_optionalen_betrag(text: str | None) -> int | None:
+    if not (text or "").strip():
+        return None
+    return parse_eur_betrag(text)
+
+
+def _variable_abrechnung_einheiten_optionen(ausgewaehlt: str | None = None) -> str:
+    optionen = ['<option value="">-- Einheit wählen --</option>']
+    for objekt in _stammdaten_repo.list_objekte():
+        for einheit in _stammdaten_repo.list_einheiten_fuer_objekt(objekt.id):
+            if einheit.nutzungsstatus not in ("KURZZEITVERMIETUNG", "SELFSTORAGE"):
+                continue
+            label = f"{einheit.id} — {einheit.bezeichnung} ({objekt.bezeichnung}, {einheit.nutzungsstatus})"
+            optionen.append(option(einheit.id, label, selected=(einheit.id == ausgewaehlt)))
+    return "".join(optionen)
+
+
+def _variable_abrechnung_zeile_html(z) -> str:
+    netto_anteil_html = eur(z.unser_netto_anteil_cent) if z.unser_netto_anteil_cent is not None else '<span class="muted">unbekannt</span>'
+    return (
+        "<tr>"
+        f"<td>{h(z.einheit_id)}</td><td>{h(z.art)}</td><td>{h(z.leistungsmonat)}</td>"
+        f"<td>{h(z.status)}</td><td>v{z.version}</td>"
+        f"<td>{netto_anteil_html}</td>"
+        f"<td>{eur(z.berichteter_betrag_cent) if z.berichteter_betrag_cent is not None else '-'} "
+        f"{h(z.berichteter_betragsart or '')}</td>"
+        f"<td>{h(z.quelle_referenz)}</td>"
+        f"<td><a href=\"/backoffice/variable-abrechnung/{z.id}/korrigieren\">Korrigieren</a> | "
+        f"<a href=\"/backoffice/variable-abrechnung/versionen?einheit_id={h(z.einheit_id)}&art={h(z.art)}&monat={h(z.leistungsmonat)}\">Versionen</a></td>"
+        "</tr>"
+    )
+
+
+@router.get("/variable-abrechnung", response_class=HTMLResponse)
+def variable_abrechnung_liste(request: Request, monat: str | None = None, session=Depends(_current_session)) -> HTMLResponse:
+    zeilen = _variableabrechnung.service.liste_aktuelle(leistungsmonat=monat or None)
+    zeilen_html = "".join(_variable_abrechnung_zeile_html(z) for z in zeilen) or (
+        '<tr><td colspan=9 class="muted">Keine Monatsabrechnung vorhanden.</td></tr>'
+    )
+    inhalt = f"""
+    <div class="card">
+      <h1>Variable Monatsabrechnung — KURZZEITVERMIETUNG/SELFSTORAGE</h1>
+      <p class="muted">Nur Status BESTAETIGT (mit erfasstem, geprüftem Nettoanteil) fließt in eine
+         Erlössumme ein - ein ENTWURF bleibt sichtbar, aber unbestätigt. Kostenfelder sind rein
+         erläuternd; die tatsächliche Überweisung an den Eigentümer ist NICHT dasselbe wie der
+         Nettomieterlös.</p>
+      <form method="get" action="/backoffice/variable-abrechnung">
+        <label>Leistungsmonat (YYYY-MM)</label>
+        <input type="text" name="monat" value="{h(monat or '')}" placeholder="2026-08">
+        <button type="submit">Filtern</button>
+      </form>
+      <p>
+        <a href="/backoffice/variable-abrechnung/erfassen">+ Neu erfassen</a> &nbsp;|&nbsp;
+        <a href="/backoffice/variable-abrechnung/import">CSV-Import</a> &nbsp;|&nbsp;
+        <a href="/backoffice/dashboard/monatsuebersicht">Monatsübersicht (Nettomieterlös)</a>
+      </p>
+      <table>
+        <tr><th>Einheit</th><th>Art</th><th>Monat</th><th>Status</th><th>Version</th>
+            <th>Unser Nettoanteil</th><th>Gemeldeter Betrag</th><th>Quelle</th><th>Aktion</th></tr>
+        {zeilen_html}
+      </table>
+    </div>
+    """
+    return _layout(request, session, "Variable Monatsabrechnung", inhalt)
+
+
+def _variable_abrechnung_formularfelder(*, einheit_id: str | None = None, vorbelegung=None) -> str:
+    art_optionen = "".join(
+        option(a, a, selected=(vorbelegung.art == a if vorbelegung else False)) for a in ("KURZZEITVERMIETUNG", "SELFSTORAGE")
+    )
+    status_optionen = "".join(
+        option(s, s, selected=(vorbelegung.status == s if vorbelegung else s == "ENTWURF")) for s in ("ENTWURF", "BESTAETIGT")
+    )
+    betragsart_optionen = "".join(
+        option(b, b, selected=(vorbelegung.berichteter_betragsart == b if vorbelegung else False)) for b in ("", "BRUTTO", "NETTO", "UNGEKLAERT")
+    )
+
+    def _feldwert(name: str) -> str:
+        if vorbelegung is None:
+            return ""
+        wert = getattr(vorbelegung, name)
+        return "" if wert is None else str(wert)
+
+    return f"""
+        <fieldset>
+          <legend>Einheit/Art/Monat</legend>
+          <label>Einheit</label>
+          <select name="einheit_id" required {'disabled' if vorbelegung else ''}>{_variable_abrechnung_einheiten_optionen(einheit_id or (vorbelegung.einheit_id if vorbelegung else None))}</select>
+          {f'<input type="hidden" name="einheit_id" value="{h(vorbelegung.einheit_id)}">' if vorbelegung else ''}
+          <label>Art</label>
+          <select name="art" required {'disabled' if vorbelegung else ''}>{art_optionen}</select>
+          {f'<input type="hidden" name="art" value="{h(vorbelegung.art)}">' if vorbelegung else ''}
+          <label>Leistungsmonat (YYYY-MM)</label>
+          <input type="text" name="leistungsmonat" value="{h(vorbelegung.leistungsmonat) if vorbelegung else ''}" placeholder="2026-08" required {'readonly' if vorbelegung else ''}>
+        </fieldset>
+        <fieldset>
+          <legend>Beleg/Status</legend>
+          <label>Belegdatum</label>
+          <input type="date" name="belegdatum" value="{_feldwert('belegdatum')}" required>
+          <label>Quellenreferenz (Pflicht)</label>
+          <input type="text" name="quelle_referenz" value="{h(_feldwert('quelle_referenz'))}" required>
+          <label>Quellen-Hash (optional)</label>
+          <input type="text" name="quelle_hash" value="{h(_feldwert('quelle_hash'))}">
+          <label>Status</label>
+          <select name="status">{status_optionen}</select>
+        </fieldset>
+        <fieldset>
+          <legend>Beträge - berichteter Ursprungsbetrag (KEINE automatische USt-Umrechnung)</legend>
+          <label>Berichteter Betrag (EUR)</label>
+          <input type="text" name="berichteter_betrag">
+          <label>Betragsart</label>
+          <select name="berichteter_betragsart">{betragsart_optionen}</select>
+          <label>Unser Nettoanteil (EUR, MASSGEBLICH - Pflicht für Status BESTAETIGT)</label>
+          <input type="text" name="unser_netto_anteil">
+        </fieldset>
+        <fieldset>
+          <legend>Kostenfelder (REIN ERLÄUFTERND - bereits im Nettoanteil enthalten, wird nicht nochmals abgezogen)</legend>
+          <label>Betriebskosten-Hinweis (EUR)</label>
+          <input type="text" name="betriebskosten_hinweis">
+          <label>Reinigungskosten-Hinweis (EUR)</label>
+          <input type="text" name="reinigungskosten_hinweis">
+          <label>Verwaltungskosten-Hinweis (EUR)</label>
+          <input type="text" name="verwaltungskosten_hinweis">
+          <label>Tatsächlicher Zahlungseingang (EUR, NICHT gleich Nettomieterlös)</label>
+          <input type="text" name="tatsaechlicher_zahlungseingang">
+        </fieldset>
+        <fieldset>
+          <legend>Belegung (optional)</legend>
+          <label>Vermietete Einheiten</label>
+          <input type="number" name="vermietete_einheiten" min="0">
+          <label>Vermietete Fläche (qm)</label>
+          <input type="text" name="vermietete_flaeche_qm">
+        </fieldset>
+    """
+
+
+@router.get("/variable-abrechnung/erfassen", response_class=HTMLResponse)
+def variable_abrechnung_erfassen_formular(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    inhalt = f"""
+    <div class="card" style="max-width:640px;">
+      <h1>Variable Monatsabrechnung — neu erfassen</h1>
+      <form method="post" action="/backoffice/variable-abrechnung/erfassen">
+        {csrf_feld(session.csrf_token)}
+        {_variable_abrechnung_formularfelder()}
+        <button type="submit">Erfassen</button>
+      </form>
+    </div>"""
+    return _layout(request, session, "Variable Monatsabrechnung erfassen", inhalt)
+
+
+@router.post("/variable-abrechnung/erfassen")
+def variable_abrechnung_erfassen(
+    request: Request,
+    einheit_id: str = Form(...),
+    art: str = Form(...),
+    leistungsmonat: str = Form(...),
+    belegdatum: str = Form(...),
+    quelle_referenz: str = Form(...),
+    quelle_hash: str = Form(""),
+    status: str = Form("ENTWURF"),
+    berichteter_betrag: str = Form(""),
+    berichteter_betragsart: str = Form(""),
+    unser_netto_anteil: str = Form(""),
+    betriebskosten_hinweis: str = Form(""),
+    reinigungskosten_hinweis: str = Form(""),
+    verwaltungskosten_hinweis: str = Form(""),
+    tatsaechlicher_zahlungseingang: str = Form(""),
+    vermietete_einheiten: str = Form(""),
+    vermietete_flaeche_qm: str = Form(""),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    try:
+        _variableabrechnung.service.erfassen(
+            ctx=_ctx(session), einheit_id=einheit_id, art=art, leistungsmonat=leistungsmonat,
+            belegdatum=date.fromisoformat(belegdatum), quelle_referenz=quelle_referenz,
+            quelle_hash=quelle_hash or None, status=status,
+            berichteter_betrag_cent=_parse_optionalen_betrag(berichteter_betrag),
+            berichteter_betragsart=berichteter_betragsart or None,
+            unser_netto_anteil_cent=_parse_optionalen_betrag(unser_netto_anteil),
+            betriebskosten_hinweis_cent=_parse_optionalen_betrag(betriebskosten_hinweis),
+            reinigungskosten_hinweis_cent=_parse_optionalen_betrag(reinigungskosten_hinweis),
+            verwaltungskosten_hinweis_cent=_parse_optionalen_betrag(verwaltungskosten_hinweis),
+            tatsaechlicher_zahlungseingang_cent=_parse_optionalen_betrag(tatsaechlicher_zahlungseingang),
+            vermietete_einheiten=int(vermietete_einheiten) if vermietete_einheiten.strip() else None,
+            vermietete_flaeche_qm=Decimal(vermietete_flaeche_qm.replace(",", ".")) if vermietete_flaeche_qm.strip() else None,
+            erstellt_von=session.user_id,
+        )
+    except (MietinkassoError, ValueError, InvalidOperation) as exc:
+        return _fehlerseite(session, "Variable Monatsabrechnung", str(exc), "/backoffice/variable-abrechnung/erfassen")
+    return RedirectResponse(url="/backoffice/variable-abrechnung", status_code=303)
+
+
+@router.get("/variable-abrechnung/{id}/korrigieren", response_class=HTMLResponse)
+def variable_abrechnung_korrigieren_formular(request: Request, id: int, session=Depends(_current_session)) -> HTMLResponse:
+    zeile = _variableabrechnung.repository.get(id)
+    if zeile is None:
+        return _fehlerseite(session, "Variable Monatsabrechnung", f"Unbekannte Zeile {id}.", "/backoffice/variable-abrechnung")
+    inhalt = f"""
+    <div class="card" style="max-width:640px;">
+      <h1>Korrektur — {h(zeile.einheit_id)} / {h(zeile.art)} / {h(zeile.leistungsmonat)} (aktuell v{zeile.version})</h1>
+      <form method="post" action="/backoffice/variable-abrechnung/{zeile.id}/korrigieren">
+        {csrf_feld(session.csrf_token)}
+        {_variable_abrechnung_formularfelder(vorbelegung=zeile)}
+        <label>Änderungsgrund (Pflicht)</label>
+        <input type="text" name="aenderungsgrund" required>
+        <button type="submit">Als neue Version speichern</button>
+      </form>
+    </div>"""
+    return _layout(request, session, "Variable Monatsabrechnung korrigieren", inhalt)
+
+
+@router.post("/variable-abrechnung/{id}/korrigieren")
+def variable_abrechnung_korrigieren(
+    request: Request,
+    id: int,
+    belegdatum: str = Form(...),
+    quelle_referenz: str = Form(...),
+    quelle_hash: str = Form(""),
+    status: str = Form("ENTWURF"),
+    berichteter_betrag: str = Form(""),
+    berichteter_betragsart: str = Form(""),
+    unser_netto_anteil: str = Form(""),
+    betriebskosten_hinweis: str = Form(""),
+    reinigungskosten_hinweis: str = Form(""),
+    verwaltungskosten_hinweis: str = Form(""),
+    tatsaechlicher_zahlungseingang: str = Form(""),
+    vermietete_einheiten: str = Form(""),
+    vermietete_flaeche_qm: str = Form(""),
+    aenderungsgrund: str = Form(...),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    try:
+        _variableabrechnung.service.korrigieren(
+            ctx=_ctx(session), ausgehend_von_id=id, aenderungsgrund=aenderungsgrund,
+            belegdatum=date.fromisoformat(belegdatum), quelle_referenz=quelle_referenz,
+            quelle_hash=quelle_hash or None, status=status,
+            berichteter_betrag_cent=_parse_optionalen_betrag(berichteter_betrag),
+            berichteter_betragsart=berichteter_betragsart or None,
+            unser_netto_anteil_cent=_parse_optionalen_betrag(unser_netto_anteil),
+            betriebskosten_hinweis_cent=_parse_optionalen_betrag(betriebskosten_hinweis),
+            reinigungskosten_hinweis_cent=_parse_optionalen_betrag(reinigungskosten_hinweis),
+            verwaltungskosten_hinweis_cent=_parse_optionalen_betrag(verwaltungskosten_hinweis),
+            tatsaechlicher_zahlungseingang_cent=_parse_optionalen_betrag(tatsaechlicher_zahlungseingang),
+            vermietete_einheiten=int(vermietete_einheiten) if vermietete_einheiten.strip() else None,
+            vermietete_flaeche_qm=Decimal(vermietete_flaeche_qm.replace(",", ".")) if vermietete_flaeche_qm.strip() else None,
+            erstellt_von=session.user_id,
+        )
+    except (MietinkassoError, ValueError, InvalidOperation) as exc:
+        return _fehlerseite(session, "Variable Monatsabrechnung", str(exc), f"/backoffice/variable-abrechnung/{id}/korrigieren")
+    return RedirectResponse(url="/backoffice/variable-abrechnung", status_code=303)
+
+
+@router.get("/variable-abrechnung/versionen", response_class=HTMLResponse)
+def variable_abrechnung_versionen(
+    request: Request, einheit_id: str, art: str, monat: str, session=Depends(_current_session)
+) -> HTMLResponse:
+    versionen = _variableabrechnung.service.liste_versionen(einheit_id, art, monat)
+    zeilen = "".join(
+        "<tr>"
+        f"<td>v{z.version}</td><td>{h(z.status)}</td><td>{'AKTUELL' if z.ist_aktuell else h(str(z.ist_aktuell))}</td>"
+        f"<td>{eur(z.unser_netto_anteil_cent) if z.unser_netto_anteil_cent is not None else '-'}</td>"
+        f"<td>{h(z.quelle_referenz)}</td><td>{h(z.aenderungsgrund or '')}</td>"
+        f"<td>{h(z.erstellt_von)}</td><td>{z.erstellt_am.isoformat()}</td>"
+        "</tr>"
+        for z in versionen
+    ) or '<tr><td colspan=8 class="muted">Keine Versionen.</td></tr>'
+    inhalt = f"""
+    <div class="card">
+      <h1>Versionshistorie — {h(einheit_id)} / {h(art)} / {h(monat)}</h1>
+      <table>
+        <tr><th>Version</th><th>Status</th><th>Aktuell</th><th>Nettoanteil</th><th>Quelle</th>
+            <th>Änderungsgrund</th><th>Erstellt von</th><th>Erstellt am</th></tr>
+        {zeilen}
+      </table>
+      <p><a href="/backoffice/variable-abrechnung">&larr; zurück</a></p>
+    </div>"""
+    return _layout(request, session, "Versionshistorie", inhalt)
+
+
+@router.get("/variable-abrechnung/import", response_class=HTMLResponse)
+def variable_abrechnung_import_formular(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    inhalt = f"""
+    <div class="card" style="max-width:720px;">
+      <h1>Variable Monatsabrechnung — CSV-Import</h1>
+      <p class="muted">Erwartete Spalten: <code>einheit_id,art,leistungsmonat,belegdatum,quelle_referenz,status,
+         berichteter_betrag,berichteter_betragsart,unser_netto_anteil,tatsaechlicher_zahlungseingang,
+         vermietete_einheiten,vermietete_flaeche_qm,aenderungsgrund,import_id</code> (Beträge als EUR,
+         Datum YYYY-MM-DD, Monat YYYY-MM). Genau eine aktuelle Version je Einheit/Art/Monat - eine Zeile,
+         die von einer bestehenden aktuellen Version abweicht, benötigt einen <code>aenderungsgrund</code>
+         und wird nur nach expliziter Bestätigung als neue Version übernommen.</p>
+      <form method="post" action="/backoffice/variable-abrechnung/import/vorschau" enctype="multipart/form-data">
+        {csrf_feld(session.csrf_token)}
+        <label>CSV-Datei</label>
+        <input type="file" name="datei" accept=".csv,text/csv" required>
+        <button type="submit">Vorschau anzeigen</button>
+      </form>
+    </div>"""
+    return _layout(request, session, "Variable Monatsabrechnung — Import", inhalt)
+
+
+@router.post("/variable-abrechnung/import/vorschau", response_class=HTMLResponse)
+async def variable_abrechnung_import_vorschau(
+    request: Request, datei: UploadFile = File(...), csrf_token: str = Form(...), session=Depends(_current_session)
+) -> HTMLResponse:
+    _verify_csrf(session, csrf_token)
+    rohbytes = await datei.read()
+    text = rohbytes.decode("utf-8-sig")
+    try:
+        zeilen = _variable_abrechnung_parse_csv(text)
+    except (KeyError, ValueError) as exc:
+        return _fehlerseite(session, "Variable Monatsabrechnung — Import", f"Datei kann nicht gelesen werden: {exc}", "/backoffice/variable-abrechnung/import")
+    plan = _variable_abrechnung_erstelle_plan(zeilen, repository=_variableabrechnung.repository)
+
+    def _zeile_klasse(b) -> str:
+        return "gesperrt-row" if b.status in ("GESPERRT", "KONFLIKT") else ""
+
+    zeilen_html = "".join(
+        f"<tr class='{_zeile_klasse(b)}'>"
+        f"<td>{b.zeilennummer}</td><td>{h(b.einheit_id)}</td><td>{h(b.art)}</td><td>{h(b.leistungsmonat)}</td>"
+        f"<td>{h(b.status)}</td><td>{h(b.grund or '')}</td></tr>"
+        for b in plan.befunde
+    )
+    anwendbar_ohne_bestaetigung = plan.anwendbar(korrekturen_bestaetigt=False)
+    anwendbar_mit_bestaetigung = plan.anwendbar(korrekturen_bestaetigt=True)
+
+    if not anwendbar_mit_bestaetigung:
+        bestaetigen = flash_error("Datei enthält gesperrte/konfliktbehaftete Zeilen (siehe oben) - es wird NICHTS eingespielt, bitte korrigieren und erneut hochladen.")
+    else:
+        korrektur_hinweis = (
+            '<label><input type="checkbox" name="korrekturen_bestaetigt" value="1" required> '
+            "Ich bestätige die oben markierten KORREKTUR-Zeilen bewusst als neue Version.</label><br>"
+            if plan.korrektur else ""
+        )
+        bestaetigen = f"""
+        <form method="post" action="/backoffice/variable-abrechnung/import/uebernehmen">
+          {csrf_feld(session.csrf_token)}
+          <textarea name="datei_inhalt" hidden>{h(text)}</textarea>
+          <input type="hidden" name="plan_hash" value="{h(plan.plan_hash)}">
+          {korrektur_hinweis}
+          <button type="submit">Jetzt übernehmen ({len(zeilen)} Zeile(n): {len(plan.neu)} neu,
+            {len(plan.unveraendert)} unverändert, {len(plan.korrektur)} Korrektur)</button>
+        </form>"""
+
+    inhalt = f"""
+    <div class="card">
+      <h1>Vorschau — Variable Monatsabrechnung</h1>
+      <table>
+        <tr><th>Zeile</th><th>Einheit</th><th>Art</th><th>Monat</th><th>Status</th><th>Grund</th></tr>
+        {zeilen_html}
+      </table>
+      {bestaetigen}
+      <p><a href="/backoffice/variable-abrechnung/import">&larr; andere Datei wählen</a></p>
+    </div>"""
+    return _layout(request, session, "Vorschau — Variable Monatsabrechnung", inhalt)
+
+
+@router.post("/variable-abrechnung/import/uebernehmen", response_class=HTMLResponse)
+def variable_abrechnung_import_uebernehmen(
+    request: Request,
+    datei_inhalt: str = Form(...),
+    plan_hash: str = Form(...),
+    korrekturen_bestaetigt: str = Form(""),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+) -> HTMLResponse:
+    _verify_csrf(session, csrf_token)
+    zeilen = _variable_abrechnung_parse_csv(datei_inhalt)
+    try:
+        ergebnis = _variable_abrechnung_wende_an(
+            zeilen, ctx=_ctx(session), bestaetigter_hash=plan_hash, korrekturen_bestaetigt=bool(korrekturen_bestaetigt),
+            service=_variableabrechnung.service, repository=_variableabrechnung.repository, akteur=session.user_id,
+        )
+    except (MietinkassoError, ValueError, VariableAbrechnungImportNichtAnwendbarError) as exc:
+        return _fehlerseite(session, "Variable Monatsabrechnung — Import", f"Import abgebrochen, NICHTS wurde eingespielt: {exc}", "/backoffice/variable-abrechnung/import")
+    inhalt = flash_ok(
+        f"{ergebnis.anzahl_neu} neu, {ergebnis.anzahl_unveraendert} unverändert, "
+        f"{ergebnis.anzahl_korrektur} korrigiert."
+    ) + '<p><a href="/backoffice/variable-abrechnung">&larr; zur Übersicht</a></p>'
+    return _layout(request, session, "Import erfolgreich", inhalt)
+
+
+@router.get("/dashboard/monatsuebersicht", response_class=HTMLResponse)
+def dashboard_monatsuebersicht(request: Request, monat: str | None = None, session=Depends(_current_session)) -> HTMLResponse:
+    heute = date.today()
+    gewaehlter_monat = monat or f"{heute.year:04d}-{heute.month:02d}"
+    try:
+        uebersicht = berechne_monatsuebersicht(
+            leistungsmonat=gewaehlter_monat, stammdaten_repository=_stammdaten_repo,
+            variable_service=_variableabrechnung.service,
+        )
+    except ValueError as exc:
+        return _fehlerseite(session, "Monatsübersicht", f"Ungültiger Monat '{gewaehlter_monat}': {exc}", "/backoffice/dashboard/monatsuebersicht")
+
+    datenluecken_html = "".join(f"<li>{h(g)}</li>" for g in uebersicht.datenluecken) or "<li class='ok'>Keine Datenlücken erkannt.</li>"
+    vollstaendigkeits_hinweis = (
+        '<p class="ok">Keine offenen Datenlücken für diesen Monat.</p>'
+        if uebersicht.vollstaendig
+        else f'<p class="warn">{len(uebersicht.datenluecken)} Datenlücke(n) - die Summe unten ist deshalb NICHT als vollständig zu verstehen.</p>'
+    )
+    inhalt = f"""
+    <div class="card">
+      <h1>Monatsübersicht — Nettomieterlös laut Vorschreibung und Monatsabrechnungen</h1>
+      <form method="get" action="/backoffice/dashboard/monatsuebersicht">
+        <label>Monat (YYYY-MM)</label>
+        <input type="text" name="monat" value="{h(gewaehlter_monat)}" placeholder="2026-08">
+        <button type="submit">Anzeigen</button>
+      </form>
+      <table>
+        <tr><th>Dauermiete-Soll (netto, ohne BK/HK/USt)</th><td>{eur(uebersicht.dauermiete_soll_netto_cent)}</td></tr>
+        <tr><th>Kurzzeitvermietung — Nettoanteil (bestätigt)</th><td>{eur(uebersicht.kurzzeit_netto_anteil_cent)}</td></tr>
+        <tr><th>Selfstorage — Nettoanteil (bestätigt)</th><td>{eur(uebersicht.selfstorage_netto_anteil_cent)}</td></tr>
+        <tr><th><strong>Nettomieterlös laut Vorschreibung und Monatsabrechnungen</strong></th>
+            <td><strong>{eur(uebersicht.nettomieterloes_cent)}</strong></td></tr>
+      </table>
+      {vollstaendigkeits_hinweis}
+      <p class="muted">Diese Summe ist NIEMALS ein Bank-Ist (tatsächlicher Zahlungseingang) - sie beruht
+         ausschließlich auf Dauermiete-Vorschreibungsbasis und BESTÄTIGTEN Monatsabrechnungen.</p>
+      <h2>Datenlücken</h2>
+      <ul>{datenluecken_html}</ul>
+      <p><a href="/backoffice/variable-abrechnung">&larr; zur variablen Monatsabrechnung</a></p>
+    </div>"""
+    return _layout(request, session, "Monatsübersicht", inhalt)

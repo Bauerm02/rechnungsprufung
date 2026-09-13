@@ -324,6 +324,37 @@ class StammdatenRepository:
     def pruefe_konto_nicht_ausgeschlossen(self, konto: KontoTable, *, session: Session | None = None) -> None:
         self.pruefe_vertrag_nicht_ausgeschlossen(konto.vertrag_id, session=session)
 
+    def objekt_fuer_einheit(self, einheit_id: str, *, session: Session | None = None) -> ObjektTable:
+        """Wie `objekt_fuer_vertrag`, aber direkt über die Einheit - für
+        Fälle OHNE Vertrag (z. B. KURZZEITVERMIETUNG/SELFSTORAGE-
+        Monatsabrechnungen, `variableabrechnung/`), die keinen
+        Dauervermietungs-Vertrag voraussetzen."""
+
+        def _query(active_session: Session) -> ObjektTable:
+            einheit = active_session.get(EinheitTable, einheit_id)
+            if einheit is None:
+                raise ValueError(f"Unbekannte Einheit {einheit_id}")
+            objekt = active_session.get(ObjektTable, einheit.objekt_id)
+            if objekt is None:
+                raise ValueError(f"Unbekanntes Objekt {einheit.objekt_id}")
+            return objekt
+
+        if session is not None:
+            return _query(session)
+        with self._session_factory() as owned_session:
+            return _query(owned_session)
+
+    def pruefe_einheit_nicht_ausgeschlossen(self, einheit_id: str, *, session: Session | None = None) -> None:
+        """Wie `pruefe_vertrag_nicht_ausgeschlossen`, aber für einen
+        Schreibpfad, der nur eine Einheit (keinen Vertrag) referenziert."""
+
+        objekt = self.objekt_fuer_einheit(einheit_id, session=session)
+        if objekt.ausgeschlossen:
+            raise ObjektAusgeschlossenError(
+                f"Einheit {einheit_id} gehört zu Objekt {objekt.id}, das von der Pilotphase "
+                "ausgeschlossen ist (z. B. 107 Sieben Dörfer)."
+            )
+
     def add_komponente(
         self,
         *,

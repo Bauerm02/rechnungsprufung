@@ -148,6 +148,24 @@ class TransportFehlerUngewissError(MietinkassoError):
     manuellen Klärung (analog zu `mahnwesen/service.py::VersandUngewissError`)."""
 
 
+class OptimistischerLockKonfliktError(MietinkassoError):
+    """Eine Korrektur einer versionierten, unveränderlichen Zeile (z. B.
+    `VariableAbrechnungTable`) wurde gegen eine Ausgangsversion
+    abgesetzt, die inzwischen nicht mehr die aktuelle ist - ein anderer
+    Vorgang hat zwischenzeitlich bereits eine neuere Version angelegt.
+    Verhindert, dass ein zweiter, auf veraltetem Anzeigestand basierender
+    Korrekturversuch eine bereits überholte Korrektur stillschweigend
+    überschreibt; der Aufrufer muss den aktuellen Stand neu laden."""
+
+
+class VariableAbrechnungKonfliktError(MietinkassoError):
+    """Für dieselbe (Einheit, Art, Leistungsmonat) existiert bereits eine
+    aktuelle Version mit ABWEICHENDEM Inhalt - eine Korrektur ist nur
+    über die explizite `korrigieren`-Route (mit Angabe der
+    Ausgangsversion und einem Änderungsgrund) zulässig, nie durch
+    stillschweigendes Anlegen eines zweiten aktiven Datensatzes."""
+
+
 class ObjektAusgeschlossenError(MietinkassoError):
     """Objekt 107 (Sieben Dörfer) is explicitly out of scope for the pilot.
     Enforced centrally (Konto -> Vertrag -> Einheit -> Objekt) on every
