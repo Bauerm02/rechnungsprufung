@@ -241,7 +241,15 @@ class RechtsprofilService:
                     f"Komponente {komponente_id} hat die Art '{komponente.art}' - Betriebs-/Heizkosten("
                     "-Vorauszahlungen) und vergleichbare Aliasarten werden NIE automatisch indexiert."
                 )
-            if komponente.gueltig_von > referenzdatum:
+            # Historisierungs-Kette statt reiner Zeilenprüfung (Codex-Rückmeldung
+            # zu 8f499c9): eine Umsetzung schließt die alte Komponentenzeile und
+            # legt eine NEUE mit neuem `gueltig_von` (dem Anspruchsmonat) an -
+            # dieselbe, ununterbrochen fortbestehende Verpflichtung. Ein reiner
+            # `komponente.gueltig_von`-Vergleich würde die bewusst fortgeschriebene
+            # MieWeG-Bezugsbasis (siehe `umsetzung_service.py`, "Leerschritt")
+            # fälschlich als Rückdatierung ablehnen. Siehe
+            # `StammdatenRepository.ursprungs_gueltig_von`-Docstring.
+            if self._stammdaten_repository.ursprungs_gueltig_von(komponente) > referenzdatum:
                 raise ValueError(
                     f"Komponente {komponente_id} ist erst ab {komponente.gueltig_von.isoformat()} gültig - "
                     f"zum Bezugszeitpunkt {referenzdatum.isoformat()} hat sie noch nicht bestanden."

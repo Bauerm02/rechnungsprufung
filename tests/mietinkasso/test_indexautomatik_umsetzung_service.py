@@ -181,9 +181,13 @@ def _soll_umsetzung_offenes_schreiben(
             zahlungspflicht_ab=zahlungspflicht_ab,
             empfaenger_snapshot={"debitor_id": vertrag.debitor_id},
             komponenten_verteilung={
-                "komponente_id": komponente_id,
-                "alter_betrag_cent": alter_betrag_cent,
-                "neuer_betrag_cent": alter_betrag_cent + erhoehung_cent,
+                "eintraege": [
+                    {
+                        "komponente_id": komponente_id,
+                        "alter_betrag_cent": alter_betrag_cent,
+                        "neuer_betrag_cent": alter_betrag_cent + erhoehung_cent,
+                    }
+                ]
             },
         )
     )
@@ -245,6 +249,96 @@ def test_umsetzen_erfolgreich_historisiert_komponente_und_neues_rechtsprofil(
         assert zeile.neue_komponente_id == ergebnis.neue_komponente_id
         assert zeile.beendete_komponente_id == "K-1"
         assert zeile.wirksam_ab == date(2026, 4, 1)
+        assert zeile.neue_komponenten_ids == [ergebnis.neue_komponente_id]
+        assert zeile.beendete_komponenten_ids == ["K-1"]
+    assert ergebnis.neue_komponenten_ids == [ergebnis.neue_komponente_id]
+
+
+def test_umsetzen_mehrkomponenten_historisiert_alle_betroffenen_komponenten(
+    admin_ctx, basis_vertrag, umsetzung_service, outbox_repo, rechtsprofil_service, stammdaten_repo, session_factory,
+):
+    """Codex-Rückprüfung (499c36f/8f499c9): "Mehrkomponenten bleibt komplett
+    gesperrt, obwohl HMZ+Küche beauftragt - explizite centgenaue Verteilung
+    implementieren". Zwei referenzierte Komponenten (HMZ 100.000 Cent,
+    Küche 10.000 Cent), Gesamterhöhung 1.000 Cent, centgenau verteilt
+    (909/91 Cent, größte-Rest-Verfahren) - `umsetzen()` muss BEIDE
+    Komponenten in derselben Transaktion historisieren, beide neuen Zeilen
+    referenzieren, und das neue Rechtsprofil auf BEIDE neuen IDs zeigen."""
+
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.add_komponente(
+        id="K-1", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=100_000,
+        indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    stammdaten_repo.add_komponente(
+        id="K-2", vertrag_id=vertrag.id, art="KUECHE", bezeichnung="Küche", betrag_cent=10_000,
+        indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    entwurf = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
+        mrg_zinsbeschraenkung=False, mrg_zinsbeschraenkung_geprueft=True, ist_altvertrag=False, ist_hauptmiete=True,
+        foerderbindung=False, foerderbindung_geprueft=True,
+        mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
+        bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False,
+        basis_komponenten_ids=["K-1", "K-2"],
+        vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
+        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz=None,
+        erstellt_von="markus",
+    )
+    profil = rechtsprofil_service.freigeben(entwurf.id, ctx=admin_ctx, freigegeben_von="markus")
+
+    schreiben = outbox_repo.anlegen(
+        ErhoehungsschreibenTable(
+            vertrag_id=vertrag.id, ziel_bewertungsjahr=2026, rechtsprofil_id=profil.id,
+            rechtsprofil_version=profil.version, status="SOLL_UMSETZUNG_OFFEN", massgeblicher_termin=date(2026, 4, 1),
+            erhoehung_cent=1_000, schreiben_text="Testschreiben", idempotenzschluessel=f"{vertrag.id}:mieweg:2026",
+            versendet_am=datetime(2026, 3, 15, 9, 0, tzinfo=timezone.utc), externe_versandreferenz="MAILOPS-TEST-1",
+            zugangsform="EINSCHREIBEN", zugang_bestaetigt_am=date(2026, 4, 1), zugang_beleg="RSb-1",
+            zahlungspflicht_ab=date(2026, 4, 15), empfaenger_snapshot={"debitor_id": vertrag.debitor_id},
+            komponenten_verteilung={
+                "eintraege": [
+                    {"komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 100_909},
+                    {"komponente_id": "K-2", "alter_betrag_cent": 10_000, "neuer_betrag_cent": 10_091},
+                ]
+            },
+        )
+    )
+
+    ergebnis = umsetzung_service.umsetzen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 4, 20), akteur="markus",
+        soll_umsetzung_enabled=True,
+    )
+
+    assert ergebnis.status == "UMGESETZT"
+    assert ergebnis.neue_komponente_id is None  # Bequemlichkeitsfeld NUR im Ein-Komponenten-Fall gesetzt
+    assert len(ergebnis.neue_komponenten_ids) == 2
+
+    alte_k1 = stammdaten_repo.get_komponente("K-1")
+    alte_k2 = stammdaten_repo.get_komponente("K-2")
+    assert alte_k1.gueltig_bis == date(2026, 3, 31)
+    assert alte_k2.gueltig_bis == date(2026, 3, 31)
+    assert alte_k1.betrag_cent == 100_000 and alte_k2.betrag_cent == 10_000  # NIE in-place geändert
+
+    neue = {k.id: k for k in (stammdaten_repo.get_komponente(kid) for kid in ergebnis.neue_komponenten_ids)}
+    neue_k1 = next(k for k in neue.values() if k.historisiert_von_id == "K-1")
+    neue_k2 = next(k for k in neue.values() if k.historisiert_von_id == "K-2")
+    assert neue_k1.betrag_cent == 100_909
+    assert neue_k2.betrag_cent == 10_091
+    assert neue_k1.gueltig_von == date(2026, 4, 1) and neue_k2.gueltig_von == date(2026, 4, 1)
+
+    neues_profil = rechtsprofil_service.aktives_gueltiges_profil(vertrag.id, heute=date(2026, 4, 20))
+    assert neues_profil.id == ergebnis.neues_rechtsprofil_id
+    assert set(neues_profil.basis_komponenten_ids) == {neue_k1.id, neue_k2.id}
+
+    with session_factory() as session:
+        zeile = session.execute(
+            select(IndexSollUmsetzungTable).where(IndexSollUmsetzungTable.erhoehungsschreiben_id == schreiben.id)
+        ).scalar_one()
+        assert zeile.status == "UMGESETZT"
+        assert zeile.neue_komponente_id is None
+        assert zeile.beendete_komponente_id is None
+        assert set(zeile.neue_komponenten_ids) == {neue_k1.id, neue_k2.id}
+        assert set(zeile.beendete_komponenten_ids) == {"K-1", "K-2"}
 
 
 def test_umsetzen_bei_deaktiviertem_flag_bleibt_ohne_wirkung(
@@ -553,7 +647,9 @@ def test_umsetzen_manipulierte_verteilung_wird_blockiert(
             versendet_am=datetime(2026, 3, 15, 9, 0, tzinfo=timezone.utc), externe_versandreferenz="MAILOPS-TEST-1",
             zugangsform="EINSCHREIBEN", zugang_bestaetigt_am=date(2026, 4, 1), zugang_beleg="RSb-1",
             zahlungspflicht_ab=date(2026, 4, 15), empfaenger_snapshot={"debitor_id": vertrag.debitor_id},
-            komponenten_verteilung={"komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 999_999},
+            komponenten_verteilung={
+                "eintraege": [{"komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 999_999}]
+            },
         )
     )
 
@@ -598,7 +694,9 @@ def test_umsetzen_end_to_end_ueber_echten_versand_und_zugang_und_vorschreibung(
                     }
                 ],
             },
-            komponenten_verteilung={"komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 101_000},
+            komponenten_verteilung={
+                "eintraege": [{"komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 101_000}]
+            },
         )
     )
 
@@ -713,7 +811,7 @@ def test_umsetzen_zwei_echte_aufeinanderfolgende_monatslaeufe_ohne_wiederholte_a
     lauf_2 = indexautomatik_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2027, 4, 5), akteur="test")
     assert lauf_2.status == "ERHOEHUNG_ERZEUGT", lauf_2.blockiert_gruende
     schreiben_2 = outbox_repo.get(lauf_2.erhoehungsschreiben_id)
-    assert schreiben_2.komponenten_verteilung["komponente_id"] == ergebnis_1.neue_komponente_id
+    assert schreiben_2.komponenten_verteilung["eintraege"][0]["komponente_id"] == ergebnis_1.neue_komponente_id
 
     # Unabhängige Neuberechnung derselben Periode über den ECHTEN Rechner
     # (kein zweites, eigenes Rechenmodell) - beweist eine ECHTE, POSITIVE

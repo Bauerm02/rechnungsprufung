@@ -7,16 +7,22 @@ FESTGEHALTENEN SNAPSHOT erneut geprüft (analog
 oder ein inzwischen ausgeschlossener/abgelaufener Vertrag stoppt den
 Versand, statt mit veralteten Daten weiterzusenden.
 
-"Bei mehr als einer referenzierten Komponente wird BEWUSST KEINE
-Verteilungsregel für den neuen Gesamtbetrag erfunden" - ein solcher
-Fall wird HIER, vor jeder Texterzeugung, blockiert (Modellreview
-13.09.: "bei nicht unterstützter Mehrkomponentenverteilung vor Versand
-blockieren")."""
+Mehrkomponentenverteilung (Codex-Rückprüfung 499c36f/8f499c9: "Mehrkomponenten
+bleibt komplett gesperrt, obwohl HMZ+Küche beauftragt - explizite centgenaue
+Verteilung implementieren"): bei mehr als einer referenzierten Komponente wird
+die GESAMTE Erhöhung (`erhoehung_cent`) proportional zum jeweiligen Anteil
+jeder Komponente am referenzierten Gesamtbetrag verteilt, mit dem
+größte-Rest-Verfahren auf ganze Cent gerundet (siehe
+`_verteile_erhoehung_centgenau`) - KEINE gleichmäßige/geratene Aufteilung,
+sondern eine nachvollziehbare, für die Summe exakte Zuordnung. Die
+gespeicherte `komponenten_verteilung` trägt deshalb IMMER eine Liste
+(`eintraege`), auch im (weiterhin häufigsten) Ein-Komponenten-Fall."""
 
 from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from decimal import ROUND_FLOOR, Decimal
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import ZUGANGSFORMEN_ALLE, ZUGANGSFORMEN_AUSREICHEND, Rechtsordnung
@@ -46,6 +52,44 @@ class VersandErgebnis:
 
     def __repr__(self):
         return f"VersandErgebnis({self.status!r}, {self.grund!r})"
+
+
+def _verteile_erhoehung_centgenau(komponenten: list, erhoehung_cent: int) -> dict[str, int]:
+    """Verteilt eine GESAMTE Erhöhung (`erhoehung_cent`, aus dem
+    Gesamtbetrag ALLER referenzierten Komponenten berechnet) exakt
+    centgenau auf die einzelnen Komponenten - proportional zu ihrem
+    jeweiligen Anteil am referenzierten Gesamtbetrag, KEINE gleichmäßige
+    oder geratene Aufteilung. Größte-Rest-Verfahren: jede Komponente
+    erhält zunächst den ABGERUNDETEN proportionalen Anteil; die
+    verbleibenden (durch das Abrunden "übrig gebliebenen") Cent gehen an
+    die Komponenten mit dem größten abgeschnittenen Bruchteil - bei
+    exaktem Gleichstand deterministisch nach Komponenten-ID sortiert
+    (reproduzierbar, kein Zufall). Damit ist die Summe der neuen Beträge
+    IMMER exakt `alter_gesamt_cent + erhoehung_cent`, unabhängig von
+    Rundungsverlusten einzelner Anteile."""
+
+    if erhoehung_cent < 0:
+        raise ValueError(f"erhoehung_cent ({erhoehung_cent}) ist negativ - keine Verteilung einer Senkung.")
+    alter_gesamt_cent = sum(k.betrag_cent for k in komponenten)
+    if alter_gesamt_cent <= 0:
+        raise ValueError("Referenzierter Komponenten-Gesamtbetrag ist 0 oder negativ - keine Verteilung möglich.")
+
+    boden: dict[str, int] = {}
+    bruchteile: list[tuple[Decimal, str]] = []
+    verteilt_cent = 0
+    for komponente in komponenten:
+        anteil = Decimal(erhoehung_cent) * Decimal(komponente.betrag_cent) / Decimal(alter_gesamt_cent)
+        ganzzahliger_anteil = int(anteil.to_integral_value(rounding=ROUND_FLOOR))
+        boden[komponente.id] = ganzzahliger_anteil
+        verteilt_cent += ganzzahliger_anteil
+        bruchteile.append((anteil - ganzzahliger_anteil, komponente.id))
+
+    rest_cent = erhoehung_cent - verteilt_cent
+    bruchteile.sort(key=lambda eintrag: (-eintrag[0], eintrag[1]))
+    for _, komponente_id in bruchteile[:rest_cent]:
+        boden[komponente_id] += 1
+
+    return {komponente.id: komponente.betrag_cent + boden[komponente.id] for komponente in komponenten}
 
 
 #: Unabhängiger Review b31: "_ZUGANGSFRIST_UNTERSTUETZTE_RECHTSORDNUNGEN
@@ -130,7 +174,7 @@ class ErhoehungsschreibenOutboxService:
         return aktuelle
 
     def _entwurf_speichern(
-        self, row: ErhoehungsschreibenTable, *, mehrkomponenten_blockiert: bool, bestehende_id: int | None = None
+        self, row: ErhoehungsschreibenTable, *, bestehende_id: int | None = None
     ) -> ErhoehungsschreibenTable:
         """`bestehende_id`: Retry eines bereits vorhandenen, aber noch
         NICHT versendeten (ENTWURF/BLOCKIERT) Erhöhungsschreibens nach
@@ -148,12 +192,6 @@ class ErhoehungsschreibenOutboxService:
         empfaenger = row.empfaenger_snapshot
         if not (empfaenger.get("adresse") or "").strip():
             gruende.append("Kein gültige Postadresse für den Empfänger hinterlegt - kein Versand ohne Zustelladresse.")
-        if mehrkomponenten_blockiert:
-            gruende.append(
-                "Mehr als eine referenzierte Basis-Komponente - eine Verteilungsregel für den neuen "
-                "Gesamtbetrag auf einzelne Positionen wird bewusst nicht automatisch erfunden. Manuelle "
-                "Prüfung/Aufteilung erforderlich, kein automatischer Versand."
-            )
         row.status = "BLOCKIERT" if gruende else "BEREIT"
         row.blockiert_gruende = gruende
         if bestehende_id is not None:
@@ -202,14 +240,13 @@ class ErhoehungsschreibenOutboxService:
         einheit = self._stammdaten_repository.get_einheit(vertrag.einheit_id)
         debitor = self._stammdaten_repository.get_debitor(vertrag.debitor_id)
 
-        mehrkomponenten_blockiert = len(referenzierte_komponenten) != 1
-        neuer_gesamt_je_komponente = erhoehung_cent + sum(k.betrag_cent for k in referenzierte_komponenten)
+        neue_betraege_cent = _verteile_erhoehung_centgenau(referenzierte_komponenten, erhoehung_cent)
         geaenderte = [
             SchreibenKomponente(
                 art=k.art,
                 bezeichnung=k.bezeichnung,
                 alter_betrag_cent=k.betrag_cent,
-                neuer_betrag_cent=(k.betrag_cent + erhoehung_cent) if not mehrkomponenten_blockiert else k.betrag_cent,
+                neuer_betrag_cent=neue_betraege_cent[k.id],
                 ust_satz_promille=k.ust_satz_promille,
             )
             for k in referenzierte_komponenten
@@ -252,7 +289,7 @@ class ErhoehungsschreibenOutboxService:
             vertraglich_zulaessiger_betrag_cent=ergebnis.get("vertraglich_zulaessiger_betrag_cent"),
             vertraglicher_quellenbeleg=eingaben.get("vertraglicher_quellenbeleg"),
         )
-        text = "" if mehrkomponenten_blockiert else erhoehungsschreiben_text_mieweg(kontext)
+        text = erhoehungsschreiben_text_mieweg(kontext)
         row = ErhoehungsschreibenTable(
             vertrag_id=vertrag.id,
             ziel_bewertungsjahr=ziel_bewertungsjahr,
@@ -262,23 +299,24 @@ class ErhoehungsschreibenOutboxService:
             status="ENTWURF",
             massgeblicher_termin=massgeblicher_termin,
             erhoehung_cent=erhoehung_cent,
-            schreiben_text=text or "(blockiert - Mehrkomponenten-Verteilung nicht unterstützt)",
+            schreiben_text=text,
             idempotenzschluessel=f"{vertrag.id}:mieweg:{ziel_bewertungsjahr}",
             empfaenger_snapshot={
                 **self._empfaenger_snapshot(vertrag),
                 "komponenten_snapshot": self._komponenten_snapshot(referenzierte_komponenten + unveraenderte_komponenten),
             },
-            komponenten_verteilung=(
-                {}
-                if mehrkomponenten_blockiert
-                else {
-                    "komponente_id": referenzierte_komponenten[0].id,
-                    "alter_betrag_cent": referenzierte_komponenten[0].betrag_cent,
-                    "neuer_betrag_cent": referenzierte_komponenten[0].betrag_cent + erhoehung_cent,
-                }
-            ),
+            komponenten_verteilung={
+                "eintraege": [
+                    {
+                        "komponente_id": k.id,
+                        "alter_betrag_cent": k.betrag_cent,
+                        "neuer_betrag_cent": neue_betraege_cent[k.id],
+                    }
+                    for k in referenzierte_komponenten
+                ]
+            },
         )
-        return self._entwurf_speichern(row, mehrkomponenten_blockiert=mehrkomponenten_blockiert, bestehende_id=bestehende_id)
+        return self._entwurf_speichern(row, bestehende_id=bestehende_id)
 
     def erstellen_aus_index_anpassung(
         self,
@@ -300,13 +338,13 @@ class ErhoehungsschreibenOutboxService:
         einheit = self._stammdaten_repository.get_einheit(vertrag.einheit_id)
         debitor = self._stammdaten_repository.get_debitor(vertrag.debitor_id)
 
-        mehrkomponenten_blockiert = len(referenzierte_komponenten) != 1
+        neue_betraege_cent = _verteile_erhoehung_centgenau(referenzierte_komponenten, erhoehung_cent)
         geaenderte = [
             SchreibenKomponente(
                 art=k.art,
                 bezeichnung=k.bezeichnung,
                 alter_betrag_cent=k.betrag_cent,
-                neuer_betrag_cent=(k.betrag_cent + erhoehung_cent) if not mehrkomponenten_blockiert else k.betrag_cent,
+                neuer_betrag_cent=neue_betraege_cent[k.id],
                 ust_satz_promille=k.ust_satz_promille,
             )
             for k in referenzierte_komponenten
@@ -335,7 +373,7 @@ class ErhoehungsschreibenOutboxService:
             rechtsprofil_version=profil.version,
             jlb_signatur=self._jlb_signatur,
         )
-        text = "" if mehrkomponenten_blockiert else erhoehungsschreiben_text_klausel(kontext)
+        text = erhoehungsschreiben_text_klausel(kontext)
         row = ErhoehungsschreibenTable(
             vertrag_id=vertrag.id,
             ziel_bewertungsjahr=None,
@@ -345,23 +383,24 @@ class ErhoehungsschreibenOutboxService:
             status="ENTWURF",
             massgeblicher_termin=massgeblicher_termin,
             erhoehung_cent=erhoehung_cent,
-            schreiben_text=text or "(blockiert - Mehrkomponenten-Verteilung nicht unterstützt)",
+            schreiben_text=text,
             idempotenzschluessel=f"{vertrag.id}:klausel:{index_anpassung_id}",
             empfaenger_snapshot={
                 **self._empfaenger_snapshot(vertrag),
                 "komponenten_snapshot": self._komponenten_snapshot(referenzierte_komponenten + unveraenderte_komponenten),
             },
-            komponenten_verteilung=(
-                {}
-                if mehrkomponenten_blockiert
-                else {
-                    "komponente_id": referenzierte_komponenten[0].id,
-                    "alter_betrag_cent": referenzierte_komponenten[0].betrag_cent,
-                    "neuer_betrag_cent": referenzierte_komponenten[0].betrag_cent + erhoehung_cent,
-                }
-            ),
+            komponenten_verteilung={
+                "eintraege": [
+                    {
+                        "komponente_id": k.id,
+                        "alter_betrag_cent": k.betrag_cent,
+                        "neuer_betrag_cent": neue_betraege_cent[k.id],
+                    }
+                    for k in referenzierte_komponenten
+                ]
+            },
         )
-        return self._entwurf_speichern(row, mehrkomponenten_blockiert=mehrkomponenten_blockiert)
+        return self._entwurf_speichern(row)
 
     def versenden(
         self,

@@ -419,6 +419,38 @@ class StammdatenRepository:
         with self._session_factory() as owned_session:
             return owned_session.get(VertragsKomponenteTable, id)
 
+    def ursprungs_gueltig_von(self, komponente: VertragsKomponenteTable, *, session: Session | None = None) -> date:
+        """Verfolgt die explizite Historisierungs-Kette
+        (`VertragsKomponenteTable.historisiert_von_id`, ausschließlich von
+        `indexautomatik/umsetzung_service.py::umsetzen` gesetzt) bis zur
+        URSPRÜNGLICHEN Zeile zurück und liefert deren `gueltig_von`.
+
+        Eine Index-Umsetzung schließt die alte Komponentenzeile
+        (`gueltig_bis`) und legt eine NEUE mit neuer ID/neuem `gueltig_von`
+        (dem Anspruchsmonat) an - dieselbe, ununterbrochen fortbestehende
+        vertragliche Verpflichtung, nur eine neue DB-Zeile (append-only
+        Historisierung). Eine reine `komponente.gueltig_von`-Prüfung würde
+        deshalb nach JEDER Umsetzung fälschlich behaupten, die Komponente
+        habe zu einem davor liegenden, aber vollkommen legitimen
+        historischen Bezugszeitpunkt (z. B. dem bewusst fortgeschriebenen
+        MieWeG-`bezugsjahr`/`bezugsmonat`, siehe `umsetzung_service.py`-
+        Docstring zum "Leerschritt") noch nicht bestanden.
+        `historisiert_von_id` ist eine explizite, ausschließlich von
+        unserem eigenen Code gesetzte Fremdschlüsselreferenz - KEINE
+        ID-String-/Namens-Heuristik (AGENTS.md). Gemeinsam genutzt von
+        `mieweg_vorschau/service.py` und `indexautomatik/rechtsprofil.py`,
+        damit beide Existenzprüfungen konsistent bleiben."""
+
+        aktuelle = komponente
+        besucht = {aktuelle.id}
+        while aktuelle.historisiert_von_id is not None:
+            vorgaenger = self.get_komponente(aktuelle.historisiert_von_id, session=session)
+            if vorgaenger is None or vorgaenger.id in besucht:
+                break
+            besucht.add(vorgaenger.id)
+            aktuelle = vorgaenger
+        return aktuelle.gueltig_von
+
     def list_aktive_komponenten(self, vertrag_id: str, stichtag: date) -> list[VertragsKomponenteTable]:
         with self._session_factory() as session:
             statement = (

@@ -1335,7 +1335,9 @@ def test_indexautomatik_soll_umsetzung_liste_vorschau_und_flag_gesperrt(backoffi
             zugangsform="EINSCHREIBEN", zugang_bestaetigt_am=date(2026, 4, 1), zugang_beleg="RSb-1",
             zahlungspflicht_ab=date(2026, 4, 15), empfaenger_snapshot={"debitor_id": "DEB-1"},
             komponenten_verteilung={
-                "komponente_id": "K-601-SOLLUMS-HMZ", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 101_000,
+                "eintraege": [
+                    {"komponente_id": "K-601-SOLLUMS-HMZ", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 101_000}
+                ]
             },
         )
     )

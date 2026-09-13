@@ -77,7 +77,12 @@ _CLAIMBARE_STATUS = ("SOLL_UMSETZUNG_OFFEN", "SOLL_UMSETZUNG_BLOCKIERT")
 class UmsetzungsErgebnis:
     status: str  # "UMGESETZT" | "BLOCKIERT" | "BEREITS_VERARBEITET"
     gruende: list[str] = field(default_factory=list)
+    # Bequemlichkeitsfeld: NUR im Ein-Komponenten-Fall gesetzt (der
+    # weiterhin häufigste Fall) - bei Mehrkomponentenverteilung `None`,
+    # siehe `neue_komponenten_ids` für die generische, immer vollständige
+    # Liste (Ein- UND Mehrkomponenten-Fall).
     neue_komponente_id: str | None = None
+    neue_komponenten_ids: list[str] = field(default_factory=list)
     neues_rechtsprofil_id: int | None = None
 
 
@@ -153,61 +158,90 @@ class IndexSollUmsetzungService:
                 "für einen Zeitraum nach Vertragsende."
             )
 
+        # Mehrkomponentenverteilung (Codex-Rückprüfung 499c36f/8f499c9):
+        # `komponenten_verteilung` trägt eine LISTE von Einträgen
+        # (`eintraege`), auch im weiterhin häufigsten Ein-Komponenten-Fall -
+        # `outbox_service._verteile_erhoehung_centgenau` verteilt die
+        # Gesamterhöhung centgenau proportional auf jede referenzierte
+        # Komponente. JEDER Eintrag wird hier einzeln gegen den AKTUELLEN
+        # Stand re-validiert (analog dem bisherigen Ein-Komponenten-Fall);
+        # ein einziger fehlerhafter Eintrag blockiert die GESAMTE Umsetzung
+        # (keine Teilumsetzung einer Mehrkomponenten-Erhöhung).
         verteilung = schreiben.komponenten_verteilung or {}
-        alte_komponente: VertragsKomponenteTable | None = None
-        if not verteilung.get("komponente_id"):
+        eintraege = verteilung.get("eintraege") or []
+        alte_komponenten: list[tuple[VertragsKomponenteTable, int]] | None = None
+        if not eintraege:
             gruende.append(
-                "Kein eindeutig zugeordneter komponenten_verteilung-Eintrag (Mehrkomponenten-Fall oder "
-                "älteres Schreiben ohne diese Zuordnung) - keine automatische Umsetzung ohne centgenaue "
-                "Verteilung auf genau eine Komponente."
+                "Keine (oder leere) komponenten_verteilung-Einträge vorhanden - keine automatische "
+                "Umsetzung ohne centgenaue Verteilung auf mindestens eine Komponente."
             )
         else:
-            alte_komponente = session.get(VertragsKomponenteTable, verteilung["komponente_id"])
-            if alte_komponente is None or alte_komponente.vertrag_id != vertrag.id:
-                gruende.append(
-                    f"Komponente {verteilung['komponente_id']} ist nicht mehr auffindbar oder gehört nicht "
-                    "mehr zu diesem Vertrag - Stale-Snapshot, neue Prüfung erforderlich."
-                )
-                alte_komponente = None
-            elif alte_komponente.betrag_cent != verteilung.get("alter_betrag_cent"):
-                gruende.append(
-                    f"Komponente {alte_komponente.id} wurde seit Schreibenserstellung anderweitig auf "
-                    f"{alte_komponente.betrag_cent} Cent geändert (Schreiben ging von "
-                    f"{verteilung.get('alter_betrag_cent')} Cent aus) - Stale-Snapshot."
-                )
-                alte_komponente = None
-            elif verteilung.get("neuer_betrag_cent") != (verteilung.get("alter_betrag_cent") or 0) + schreiben.erhoehung_cent:
-                # Codex-Rückprüfung (499c36f, Fund d): der tatsächlich
-                # gebuchte neue Betrag muss EXAKT dem entsprechen, was im
-                # versendeten Schreiben (erhoehung_cent) tatsächlich
-                # mitgeteilt wurde - eine manipulierte/inkonsistente
-                # Verteilung (z. B. ein Tippfehler oder eine spätere
-                # Korrektur nur des Verteilungsfeldes) wird NIE blind
-                # gebucht, selbst wenn Komponenten-ID/Altbetrag noch passen.
-                gruende.append(
-                    f"Gespeicherte Verteilung ist inkonsistent mit dem versendeten Schreiben (alter Betrag "
-                    f"{verteilung.get('alter_betrag_cent')} + erhoehung_cent {schreiben.erhoehung_cent} "
-                    f"ergibt nicht den hinterlegten neuen Betrag {verteilung.get('neuer_betrag_cent')}) - "
-                    "keine Umsetzung auf einem unstimmigen Datensatz."
-                )
-                alte_komponente = None
-            elif alte_komponente.art in _NIE_INDEXIERBARE_ARTEN:
-                gruende.append(
-                    f"Komponente {alte_komponente.id} hat die Art '{alte_komponente.art}' - BK/HK/USt-"
-                    "Vorauszahlungen und vergleichbare Aliasarten werden nie mitindexiert/umgesetzt."
-                )
-                alte_komponente = None
-            elif (
-                alte_komponente.gueltig_bis is not None
-                and schreiben.zahlungspflicht_ab is not None
-                and alte_komponente.gueltig_bis < schreiben.zahlungspflicht_ab
-            ):
-                gruende.append(
-                    f"Komponente {alte_komponente.id} ist bereits ab {alte_komponente.gueltig_bis.isoformat()} "
-                    "befristet ausgelaufen - vor dem Wirksamkeitsdatum, keine Umsetzung auf eine beendete "
-                    "Position."
-                )
-                alte_komponente = None
+            kandidaten: list[tuple[VertragsKomponenteTable, int]] = []
+            ids_gesehen: set[str] = set()
+            fehlerhaft = False
+            for eintrag in eintraege:
+                komponente_id = eintrag.get("komponente_id")
+                if not komponente_id or komponente_id in ids_gesehen:
+                    gruende.append(
+                        f"Komponenten_verteilung enthält eine fehlende oder doppelte Komponenten-ID "
+                        f"({komponente_id!r}) - keine Umsetzung auf einem unstimmigen Datensatz."
+                    )
+                    fehlerhaft = True
+                    break
+                ids_gesehen.add(komponente_id)
+                komponente = session.get(VertragsKomponenteTable, komponente_id)
+                if komponente is None or komponente.vertrag_id != vertrag.id:
+                    gruende.append(
+                        f"Komponente {komponente_id} ist nicht mehr auffindbar oder gehört nicht mehr zu "
+                        "diesem Vertrag - Stale-Snapshot, neue Prüfung erforderlich."
+                    )
+                    fehlerhaft = True
+                    break
+                if komponente.betrag_cent != eintrag.get("alter_betrag_cent"):
+                    gruende.append(
+                        f"Komponente {komponente.id} wurde seit Schreibenserstellung anderweitig auf "
+                        f"{komponente.betrag_cent} Cent geändert (Schreiben ging von "
+                        f"{eintrag.get('alter_betrag_cent')} Cent aus) - Stale-Snapshot."
+                    )
+                    fehlerhaft = True
+                    break
+                if komponente.art in _NIE_INDEXIERBARE_ARTEN:
+                    gruende.append(
+                        f"Komponente {komponente.id} hat die Art '{komponente.art}' - BK/HK/USt-"
+                        "Vorauszahlungen und vergleichbare Aliasarten werden nie mitindexiert/umgesetzt."
+                    )
+                    fehlerhaft = True
+                    break
+                if (
+                    komponente.gueltig_bis is not None
+                    and schreiben.zahlungspflicht_ab is not None
+                    and komponente.gueltig_bis < schreiben.zahlungspflicht_ab
+                ):
+                    gruende.append(
+                        f"Komponente {komponente.id} ist bereits ab {komponente.gueltig_bis.isoformat()} "
+                        "befristet ausgelaufen - vor dem Wirksamkeitsdatum, keine Umsetzung auf eine "
+                        "beendete Position."
+                    )
+                    fehlerhaft = True
+                    break
+                kandidaten.append((komponente, eintrag.get("neuer_betrag_cent")))
+            if not fehlerhaft:
+                # Codex-Rückprüfung (499c36f, Fund d), jetzt über die
+                # GESAMTE Verteilung statt nur eine einzelne Komponente: die
+                # Summe der gespeicherten Delta-Beträge muss EXAKT der
+                # versendeten Gesamterhöhung entsprechen - eine
+                # manipulierte/inkonsistente Einzelverteilung, die in Summe
+                # trotzdem nicht passt, wird NIE blind gebucht.
+                alte_summe = sum((eintrag.get("alter_betrag_cent") or 0) for eintrag in eintraege)
+                neue_summe = sum((eintrag.get("neuer_betrag_cent") or 0) for eintrag in eintraege)
+                if neue_summe - alte_summe != schreiben.erhoehung_cent:
+                    gruende.append(
+                        f"Gespeicherte Verteilung ist inkonsistent mit dem versendeten Schreiben (Summe der "
+                        f"Delta-Beträge {neue_summe - alte_summe} Cent entspricht nicht der Gesamterhöhung "
+                        f"{schreiben.erhoehung_cent} Cent) - keine Umsetzung auf einem unstimmigen Datensatz."
+                    )
+                else:
+                    alte_komponenten = kandidaten
 
         profil = session.get(RechtsprofilTable, schreiben.rechtsprofil_id)
         if profil is None or profil.version != schreiben.rechtsprofil_version:
@@ -250,7 +284,7 @@ class IndexSollUmsetzungService:
                     "vorzunehmen."
                 )
 
-        if gruende or alte_komponente is None or profil is None:
+        if gruende or alte_komponenten is None or profil is None:
             return gruende, None
 
         # Codex-Rückprüfung (499c36f): `VorschreibungService.
@@ -261,15 +295,11 @@ class IndexSollUmsetzungService:
         # `_anspruchsmonat_start`-Docstring).
         anspruchsmonat = _anspruchsmonat_start(schreiben.zahlungspflicht_ab)
         plan = {
-            "alte_komponente": alte_komponente,
-            "neuer_betrag_cent": verteilung["neuer_betrag_cent"],
+            # list[(VertragsKomponenteTable, neuer_betrag_cent)] - eine oder
+            # mehrere betroffene Komponenten (Mehrkomponentenverteilung).
+            "alte_komponenten": alte_komponenten,
             "wirksam_ab": anspruchsmonat,
             "zahlungspflicht_ab": schreiben.zahlungspflicht_ab,
-            # Ein ursprünglich geplantes Enddatum der alten Komponente
-            # (z. B. eine befristete Klausel) darf durch die Umsetzung
-            # NICHT verloren gehen (Codex-Rückprüfung, Fund c) - es wird
-            # unverändert auf die NEUE Komponente übertragen.
-            "urspruengliches_gueltig_bis": alte_komponente.gueltig_bis,
             "profil": profil,
         }
         return [], plan
@@ -286,6 +316,8 @@ class IndexSollUmsetzungService:
         quelle_hash: str | None = None,
         neue_komponente_id: str | None = None,
         beendete_komponente_id: str | None = None,
+        neue_komponenten_ids: list[str] | None = None,
+        beendete_komponenten_ids: list[str] | None = None,
         neues_rechtsprofil_id: int | None = None,
         wirksam_ab: date | None = None,
     ) -> IndexSollUmsetzungTable:
@@ -293,7 +325,11 @@ class IndexSollUmsetzungService:
         Anlauf (nach behobener Blockierursache) AKTUALISIERT diese eine
         Zeile, statt eine zweite anzulegen (kein Unique-Konflikt, voller
         Verlauf bleibt trotzdem über `blockiert_gruende`/`status` je
-        aktuellem Stand nachvollziehbar)."""
+        aktuellem Stand nachvollziehbar). `neue_komponente_id`/
+        `beendete_komponente_id` bleiben die Bequemlichkeitsfelder für den
+        (weiterhin häufigsten) Ein-Komponenten-Fall; `neue_komponenten_ids`/
+        `beendete_komponenten_ids` sind die generische, bei Mehrkomponenten-
+        verteilung vollständige Quelle."""
 
         nachweis = session.execute(
             select(IndexSollUmsetzungTable).where(IndexSollUmsetzungTable.erhoehungsschreiben_id == schreiben_id)
@@ -310,6 +346,10 @@ class IndexSollUmsetzungService:
             nachweis.neue_komponente_id = neue_komponente_id
         if beendete_komponente_id is not None:
             nachweis.beendete_komponente_id = beendete_komponente_id
+        if neue_komponenten_ids is not None:
+            nachweis.neue_komponenten_ids = neue_komponenten_ids
+        if beendete_komponenten_ids is not None:
+            nachweis.beendete_komponenten_ids = beendete_komponenten_ids
         if neues_rechtsprofil_id is not None:
             nachweis.neues_rechtsprofil_id = neues_rechtsprofil_id
         if wirksam_ab is not None:
@@ -339,9 +379,14 @@ class IndexSollUmsetzungService:
         if plan is not None:
             ergebnis.update(
                 {
-                    "komponente_id": plan["alte_komponente"].id,
-                    "alter_betrag_cent": plan["alte_komponente"].betrag_cent,
-                    "neuer_betrag_cent": plan["neuer_betrag_cent"],
+                    "eintraege": [
+                        {
+                            "komponente_id": alte_komponente.id,
+                            "alter_betrag_cent": alte_komponente.betrag_cent,
+                            "neuer_betrag_cent": neuer_betrag_cent,
+                        }
+                        for alte_komponente, neuer_betrag_cent in plan["alte_komponenten"]
+                    ],
                     "wirksam_ab": plan["wirksam_ab"].isoformat(),
                 }
             )
@@ -411,43 +456,49 @@ class IndexSollUmsetzungService:
                 session.commit()
                 return UmsetzungsErgebnis(status="BLOCKIERT", gruende=gruende)
 
-            alte_komponente: VertragsKomponenteTable = plan["alte_komponente"]
-            neuer_betrag_cent: int = plan["neuer_betrag_cent"]
+            alte_komponenten: list[tuple[VertragsKomponenteTable, int]] = plan["alte_komponenten"]
             wirksam_ab: date = plan["wirksam_ab"]  # Anspruchsmonat-Start (Monatserster)
-            urspruengliches_gueltig_bis: date | None = plan["urspruengliches_gueltig_bis"]
             profil: RechtsprofilTable = plan["profil"]
 
             # Historisierung (append-only, wie überall in diesem
-            # Repository): die BESTEHENDE Komponentenzeile wird per
-            # gueltig_bis geschlossen, NIE `betrag_cent` in-place
-            # geändert - historische OP/Vorschreibungspositionen
-            # referenzieren betragsschnappschüsse, kein Live-Betrag.
-            alte_komponente.gueltig_bis = wirksam_ab - timedelta(days=1)
-            neue_komponente_id = f"{alte_komponente.id}-IDX{frisches_schreiben.id}"
-            self._stammdaten_repository.add_komponente(
-                id=neue_komponente_id,
-                vertrag_id=vertrag.id,
-                art=alte_komponente.art,
-                bezeichnung=alte_komponente.bezeichnung,
-                betrag_cent=neuer_betrag_cent,
-                ust_satz_promille=alte_komponente.ust_satz_promille,
-                indexierbar=alte_komponente.indexierbar,
-                gueltig_von=wirksam_ab,
-                # Codex-Rückprüfung (499c36f, Fund c): ein ursprünglich
-                # geplantes Enddatum der alten Komponente (z. B. eine
-                # befristete Klausel) darf durch die Umsetzung NICHT
-                # stillschweigend zu "unbefristet" werden - es wird
-                # unverändert auf die neue Komponente übertragen.
-                gueltig_bis=urspruengliches_gueltig_bis,
-                # Explizite Historisierungs-Kette (KEINE ID-String-Heuristik):
-                # `mieweg_vorschau/service.py`s Existenzprüfung verfolgt diese
-                # Referenz bis zur ursprünglichen Zeile zurück - die neue Zeile
-                # ist rechtlich dieselbe, ununterbrochen fortbestehende
-                # Verpflichtung wie `alte_komponente`, nur eine neue DB-Zeile
-                # (append-only Historisierung), keine neu vereinbarte Komponente.
-                historisiert_von_id=alte_komponente.id,
-                session=session,
-            )
+            # Repository): JEDE betroffene Komponentenzeile wird per
+            # gueltig_bis geschlossen, NIE `betrag_cent` in-place geändert -
+            # historische OP/Vorschreibungspositionen referenzieren
+            # Betragsschnappschüsse, kein Live-Betrag. Bei Mehrkomponenten-
+            # verteilung (z. B. HMZ+Küche) betrifft das mehrere Zeilen in
+            # dieser einen Transaktion, nie eine gemeinsame Zeile.
+            neue_komponenten_ids: list[str] = []
+            alt_zu_neu_id: dict[str, str] = {}
+            for alte_komponente, neuer_betrag_cent in alte_komponenten:
+                # Ein ursprünglich geplantes Enddatum der alten Komponente
+                # (z. B. eine befristete Klausel) darf durch die Umsetzung
+                # NICHT verloren gehen (Codex-Rückprüfung, Fund c) - es wird
+                # unverändert auf die NEUE Komponente übertragen.
+                urspruengliches_gueltig_bis = alte_komponente.gueltig_bis
+                alte_komponente.gueltig_bis = wirksam_ab - timedelta(days=1)
+                neue_komponente_id = f"{alte_komponente.id}-IDX{frisches_schreiben.id}"
+                self._stammdaten_repository.add_komponente(
+                    id=neue_komponente_id,
+                    vertrag_id=vertrag.id,
+                    art=alte_komponente.art,
+                    bezeichnung=alte_komponente.bezeichnung,
+                    betrag_cent=neuer_betrag_cent,
+                    ust_satz_promille=alte_komponente.ust_satz_promille,
+                    indexierbar=alte_komponente.indexierbar,
+                    gueltig_von=wirksam_ab,
+                    gueltig_bis=urspruengliches_gueltig_bis,
+                    # Explizite Historisierungs-Kette (KEINE ID-String-
+                    # Heuristik): `mieweg_vorschau/service.py`s Existenz-
+                    # prüfung verfolgt diese Referenz bis zur ursprünglichen
+                    # Zeile zurück - die neue Zeile ist rechtlich dieselbe,
+                    # ununterbrochen fortbestehende Verpflichtung wie
+                    # `alte_komponente`, nur eine neue DB-Zeile (append-only
+                    # Historisierung), keine neu vereinbarte Komponente.
+                    historisiert_von_id=alte_komponente.id,
+                    session=session,
+                )
+                neue_komponenten_ids.append(neue_komponente_id)
+                alt_zu_neu_id[alte_komponente.id] = neue_komponente_id
 
             # Neue Rechtsprofil-VERSION (nie in-place) - die für DIESES
             # Schreiben tatsächlich verwendete alte Version bleibt
@@ -485,12 +536,7 @@ class IndexSollUmsetzungService:
             neue_letzte_basis_war_jahresdurchschnitt = (
                 True if ist_mieweg_pfad else profil.letzte_basis_war_jahresdurchschnitt
             )
-            neue_basis_ids = sorted(
-                {
-                    (neue_komponente_id if kid == alte_komponente.id else kid)
-                    for kid in profil.basis_komponenten_ids
-                }
-            )
+            neue_basis_ids = sorted({alt_zu_neu_id.get(kid, kid) for kid in profil.basis_komponenten_ids})
             naechste_version = session.execute(
                 select(func.max(RechtsprofilTable.version)).where(RechtsprofilTable.vertrag_id == vertrag.id)
             ).scalar_one()
@@ -555,6 +601,7 @@ class IndexSollUmsetzungService:
             frisches_schreiben.status = "SOLL_UMGESETZT"
             frisches_schreiben.blockiert_gruende = []
 
+            beendete_komponenten_ids = [alte_komponente.id for alte_komponente, _ in alte_komponenten]
             self._ausfuehrungsnachweis_aktualisieren(
                 session,
                 schreiben_id=frisches_schreiben.id,
@@ -563,14 +610,17 @@ class IndexSollUmsetzungService:
                 gruende=[],
                 akteur=akteur,
                 quelle_hash=neuer_hash,
-                neue_komponente_id=neue_komponente_id,
-                beendete_komponente_id=alte_komponente.id,
+                neue_komponente_id=neue_komponenten_ids[0] if len(neue_komponenten_ids) == 1 else None,
+                beendete_komponente_id=beendete_komponenten_ids[0] if len(beendete_komponenten_ids) == 1 else None,
+                neue_komponenten_ids=neue_komponenten_ids,
+                beendete_komponenten_ids=beendete_komponenten_ids,
                 neues_rechtsprofil_id=neues_profil.id,
                 wirksam_ab=wirksam_ab,
             )
             session.commit()
             return UmsetzungsErgebnis(
                 status="UMGESETZT",
-                neue_komponente_id=neue_komponente_id,
+                neue_komponente_id=neue_komponenten_ids[0] if len(neue_komponenten_ids) == 1 else None,
+                neue_komponenten_ids=neue_komponenten_ids,
                 neues_rechtsprofil_id=neues_profil.id,
             )
