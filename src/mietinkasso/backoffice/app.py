@@ -2257,14 +2257,17 @@ def mieweg_vorschau_erstellen(
 
 
 def _rechtsprofil_zeile_html(p) -> str:
+    def ja_nein(wert, geprueft=True):
+        return "ungeklärt" if not geprueft or wert is None else "Ja" if wert else "Nein"
     aktion = ""
     if p.status == "ENTWURF":
         aktion = f"""<form method="post" action="/backoffice/indexautomatik/rechtsprofil/{p.id}/freigeben" class="inline">
           {{csrf}}<button type="submit" class="secondary">Freigeben</button></form>"""
     return (
         "<tr>"
-        f"<td>{p.version}</td><td>{h(p.rechtsordnung)}</td><td>{h(str(p.ist_wohnungsnutzung))}</td>"
-        f"<td>{h(str(p.ist_hauptmiete))}</td><td>{h(str(p.foerderbindung))}</td>"
+        f"<td>{p.version}</td><td>{h(p.rechtsordnung)}</td><td>{ja_nein(p.ist_wohnungsnutzung)}</td>"
+        f"<td>{ja_nein(p.ist_hauptmiete)}</td><td>{ja_nein(p.mrg_zinsbeschraenkung, p.mrg_zinsbeschraenkung_geprueft)}</td>"
+        f"<td>{ja_nein(p.foerderbindung, p.foerderbindung_geprueft)}</td>"
         f"<td>{p.bezugsjahr or '-'}-{p.bezugsmonat or '-'}</td>"
         f"<td>{eur(p.vertraglich_zulaessiger_betrag_cent) if p.vertraglich_zulaessiger_betrag_cent is not None else '-'}</td>"
         f"<td>{p.vertragsklausel_id or '-'}</td><td>{h(p.status)}</td><td>{h(p.freigegeben_von or '-')}</td>"
@@ -2297,7 +2300,7 @@ def rechtsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_
     )
     historie = _indexautomatik.rechtsprofil_service.liste_fuer_vertrag(vertrag_id)
     historie_html = "".join(_rechtsprofil_zeile_html(p).replace("{csrf}", csrf_feld(session.csrf_token)) for p in historie) or (
-        '<tr><td colspan=11 class="muted">Noch kein Rechtsprofil erfasst.</td></tr>'
+        '<tr><td colspan=12 class="muted">Noch kein Rechtsprofil erfasst.</td></tr>'
     )
 
     inhalt = f"""
@@ -2374,7 +2377,7 @@ def rechtsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_
     <div class="card">
       <h2>Historie</h2>
       <table>
-        <tr><th>Version</th><th>Wohnung</th><th>Hauptmiete</th><th>Förderbindung</th><th>Bezug</th>
+        <tr><th>Version</th><th>Rechtsordnung</th><th>Wohnung</th><th>Hauptmiete</th><th>MRG-Zinsbeschränkung</th><th>Förderbindung</th><th>Bezug</th>
           <th>Vertragl. Betrag</th><th>Klausel-ID</th><th>Status</th><th>Freigegeben von</th><th>Aktion</th></tr>
         {historie_html}
       </table>

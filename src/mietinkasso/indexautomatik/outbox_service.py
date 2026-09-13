@@ -536,12 +536,14 @@ class ErhoehungsschreibenOutboxService:
         if not self._repository.claim_fuer_versand(schreiben.id):
             return VersandErgebnis("BEREITS_VERARBEITET", "Ein anderer Worker verarbeitet diesen Fall bereits.")
 
+        objekt = self._stammdaten_repository.objekt_fuer_vertrag(vertrag.id)
+        einheit = self._stammdaten_repository.get_einheit(vertrag.einheit_id)
         auftrag = VersandAuftrag(
             referenz=schreiben.idempotenzschluessel,
             empfaenger_name=aktueller_snapshot["name"] or "",
             empfaenger_adresse=aktueller_snapshot["adresse"] or "",
             empfaenger_email=aktueller_snapshot["email"],
-            betreff=f"Anhebung des Mietzinses - Vertrag {vertrag.id}",
+            betreff=f"Mietanpassung – {objekt.bezeichnung}, {einheit.bezeichnung}",
             text=schreiben.schreiben_text,
             freigabe_referenz=f"RECHTSPROFIL:{aktuelles_profil.id}:{aktuelles_profil.version}:{aktuelles_profil.quelle_hash}",
         )

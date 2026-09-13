@@ -90,7 +90,7 @@ class HVMailversandService:
             deadline = heute + timedelta(days=contract.zahlungsfrist_tage)
             amount = f"{snapshot['betrag_cent']/100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
             subject = "Zahlungserinnerung" if row.stufe == 1 else "Zweite Mahnung"
-            text = (f"Sehr geehrte(r) {snapshot['empfaenger_name']},\n\n"
+            text = (f"Guten Tag {snapshot['empfaenger_name']},\n\n"
                 f"für {obj.bezeichnung}, {unit.bezeichnung}, ist die Forderung vom "
                 f"{debt.faelligkeit.strftime('%d.%m.%Y')} über {amount} EUR noch offen.\n\n"
                 f"Bitte begleichen Sie den offenen Betrag bis {deadline.strftime('%d.%m.%Y')} "
