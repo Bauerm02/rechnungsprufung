@@ -42,7 +42,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
 
 from mietinkasso.audit.service import AuditService
-from mietinkasso.auth.service import AuthContext, require_gesellschaft_access
+from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.backoffice.security import LoginRateLimiter, SessionStore, pruefe_passwort
 from mietinkasso.backoffice.indexklausel_form import klausel_formular, klausel_form_werte
 from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, ist_bekannte_demo_umgebung, option, parse_eur_betrag, seite
@@ -63,7 +63,7 @@ from mietinkasso.index.repository import IndexRepository
 from mietinkasso.index.service import UNTERSTUETZTE_BERECHNUNGSPROFILE, IndexService
 from mietinkasso.infrastructure.config import get_settings
 from mietinkasso.infrastructure.db.session import build_session_factory
-from mietinkasso.infrastructure.db.tables import IndexKlauselTable
+from mietinkasso.infrastructure.db.tables import IndexKlauselTable, VpiMonatswertTable
 from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
 from mietinkasso.mahnwesen.service import MahnwesenService
 from mietinkasso.op.eroeffnung_import import importiere_eroeffnung_csv_atomar, parse_eroeffnung_csv
@@ -2862,8 +2862,49 @@ def indexautomatik_vpi(request: Request, session=Depends(_current_session)) -> H
       <h2>Erfasste Jahreswerte</h2>
       <table><tr><th>Reihe</th><th>Jahr</th><th>Wert</th><th>Finalität</th><th>Quelle</th><th>Von</th></tr>{zeilen}</table>
     </div>
+    <div class="card"><h2>Veröffentlichung eines vorhandenen Monatswerts belegen</h2>
+      <p>Für publikationsabhängige Vertragsfristen. Der importierte VPI-Wert bleibt unverändert.</p>
+      <form method="post" action="/backoffice/indexautomatik/vpi/veroeffentlichung">
+        {csrf_feld(session.csrf_token)}
+        <label>Reihe</label><select name="reihe"><option>VPI20C18</option><option>VPI15C18</option><option>VPI00</option><option>VPI96</option></select>
+        <label>VPI-Monat</label><input type="month" name="monat" required>
+        <label>Amtliches Veröffentlichungsdatum</label><input type="date" name="veroeffentlicht_am" required>
+        <label>Beleg der Veröffentlichung</label><input name="quelle" required placeholder="Statistik Austria: Link und Fundstelle">
+        <button type="submit">Veröffentlichungsbeleg speichern</button>
+      </form></div>
     """
     return _layout(request, session, "VPI-Werte", inhalt)
+
+
+@router.post("/indexautomatik/vpi/veroeffentlichung")
+def vpi_veroeffentlichung_belegen(
+    request: Request, reihe: str = Form(...), monat: str = Form(...), veroeffentlicht_am: str = Form(...),
+    quelle: str = Form(...), csrf_token: str = Form(...), session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    require_schreibrecht(_ctx(session))
+    try:
+        periode = date.fromisoformat(monat + "-01")
+        datum = date.fromisoformat(veroeffentlicht_am)
+        if not quelle.strip() or len(quelle.strip()) > 256 or datum > heute_wien():
+            raise ValueError("Ein erfolgtes Veröffentlichungsdatum und ein Quellenbeleg bis 256 Zeichen sind erforderlich.")
+        with _session_factory() as db:
+            row = db.execute(select(VpiMonatswertTable).where(
+                VpiMonatswertTable.reihe == reihe, VpiMonatswertTable.jahr == periode.year,
+                VpiMonatswertTable.monat == periode.month,
+            )).scalar_one_or_none()
+            if row is None or row.finalitaet != "ENDGUELTIG":
+                raise ValueError("Kein entsprechender endgültiger Monatswert vorhanden.")
+            row.veroeffentlicht_am = datum
+            row.veroeffentlichung_quelle = quelle.strip()
+            from mietinkasso.infrastructure.db.tables import AuditEventTable
+            db.add(AuditEventTable(entity_typ="vpi_monatswert", entity_id=str(row.id),
+                aktion="VEROEFFENTLICHUNG_BELEGT", akteur=session.user_id,
+                payload={"reihe": reihe, "monat": monat, "datum": datum.isoformat(), "quelle": quelle.strip()}))
+            db.commit()
+    except ValueError as exc:
+        return _fehlerseite(session, "VPI-Veröffentlichung", str(exc), "/backoffice/indexautomatik/vpi")
+    return RedirectResponse("/backoffice/indexautomatik/vpi", status_code=303)
 
 
 @router.post("/indexautomatik/vpi/erfassen")

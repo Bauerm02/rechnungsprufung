@@ -90,6 +90,8 @@ class VpiRepository:
         veroeffentlicht_am: date | None = None,
         veroeffentlichung_quelle: str | None = None,
     ) -> VpiMonatswertTable:
+        if (veroeffentlicht_am is not None) != bool((veroeffentlichung_quelle or "").strip()):
+            raise ValueError("Veröffentlichungsdatum und Veröffentlichungsbeleg müssen gemeinsam angegeben werden.")
         with self._session_factory() as session:
             statement = select(VpiMonatswertTable).where(
                 VpiMonatswertTable.reihe == reihe, VpiMonatswertTable.jahr == jahr, VpiMonatswertTable.monat == monat
@@ -112,6 +114,7 @@ class VpiRepository:
                 )
                 session.add(row)
             else:
+                wert_geaendert = row.wert != wert or row.finalitaet != finalitaet
                 row.wert = wert
                 row.finalitaet = finalitaet
                 row.quelle_datei = quelle_datei
@@ -119,8 +122,9 @@ class VpiRepository:
                 row.quelle_hash = quelle_hash
                 row.abgerufen_am = abgerufen_am
                 row.importiert_von = importiert_von
-                row.veroeffentlicht_am = veroeffentlicht_am
-                row.veroeffentlichung_quelle = veroeffentlichung_quelle
+                if veroeffentlicht_am is not None or wert_geaendert:
+                    row.veroeffentlicht_am = veroeffentlicht_am
+                    row.veroeffentlichung_quelle = veroeffentlichung_quelle
             session.commit()
             session.refresh(row)
             return row
@@ -145,6 +149,9 @@ class VpiRepository:
                 if row is None:
                     session.add(VpiMonatswertTable(**zeile))
                 else:
+                    if row.wert != zeile["wert"] or row.finalitaet != zeile["finalitaet"]:
+                        row.veroeffentlicht_am = None
+                        row.veroeffentlichung_quelle = None
                     for feld, wert in zeile.items():
                         setattr(row, feld, wert)
             for zeile in jahreszeilen:
@@ -171,7 +178,7 @@ class VpiRepository:
     def get_monatswert(self, reihe: str, jahr: int, monat: int) -> VpiMonatswertTable | None:
         """Exakte Einzelzeile (Reihe, Jahr, Monat) - z. B. für eine
         vertragliche Wartefrist, die sich auf die amtliche
-        VERÖFFENTLICHUNG (`abgerufen_am`) statt auf die VPI-Periode
+        VERÖFFENTLICHUNG (`veroeffentlicht_am`) statt auf die VPI-Periode
         selbst bezieht (`indexautomatik/service.py::_monatslauf_klausel`)."""
 
         with self._session_factory() as session:

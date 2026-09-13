@@ -1341,6 +1341,30 @@ def test_indexautomatik_vpi_werte_erfassen_und_anzeigen(backoffice_client):
     assert "Statistik Austria Test" in liste.text
 
 
+def test_vpi_veroeffentlichungsbeleg_aendert_keinen_indexwert(backoffice_client):
+    from decimal import Decimal
+    from mietinkasso.indexautomatik.repository import VpiRepository
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    repo = VpiRepository(build_session_factory(get_settings().database_url))
+    repo.monatswert_erfassen(reihe="VPI20C18", jahr=2026, monat=1, wert=Decimal("130.0"),
+        finalitaet="ENDGUELTIG", quelle_datei="synthetisch", quelle_zeile=1, quelle_hash="test",
+        abgerufen_am=datetime.now(timezone.utc), importiert_von="test")
+    form = {"reihe": "VPI20C18", "monat": "2026-01", "veroeffentlicht_am": "2026-02-15",
+            "quelle": "Synthetischer Beleg", "csrf_token": "wrong"}
+    assert client.post("/backoffice/indexautomatik/vpi/veroeffentlichung", data=form).status_code == 403
+    form["csrf_token"] = csrf
+    assert client.post("/backoffice/indexautomatik/vpi/veroeffentlichung", data=form,
+                       follow_redirects=False).status_code == 303
+    row = repo.get_monatswert("VPI20C18", 2026, 1)
+    assert row.wert == Decimal("130.0") and row.veroeffentlicht_am == date(2026, 2, 15)
+    assert row.veroeffentlichung_quelle == "Synthetischer Beleg"
+
+
 def test_indexautomatik_outbox_und_vertragsende_seiten_erreichbar(backoffice_client):
     client, *_ = backoffice_client
     _login(client)

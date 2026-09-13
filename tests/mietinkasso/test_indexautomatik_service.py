@@ -301,6 +301,7 @@ def _seed_vpi_monat(bundle, *, jahr, monat, wert, reihe="VPI20C18", veroeffentli
         quelle_datei="synthetisch", quelle_zeile=1, quelle_hash=f"hash-{jahr}-{monat:02d}",
         abgerufen_am=__import__("datetime").datetime(jahr, monat, 20, tzinfo=__import__("datetime").timezone.utc),
         importiert_von="markus", veroeffentlicht_am=veroeffentlicht_am,
+        veroeffentlichung_quelle="Synthetischer Veröffentlichungsbeleg" if veroeffentlicht_am else None,
     )
 
 
@@ -626,7 +627,8 @@ def test_geschaeftsraum_intervall_ohne_fixen_monat_respektiert_mindestabstand(
 
     _seed_vpi_monat(bundle, jahr=2026, monat=10, wert="110")
     lauf_oktober = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 10, 13), akteur="test")
-    assert lauf_oktober.status == "TERMIN_NICHT_ERREICHT"  # erst 6 statt 12 Monate seit April vergangen
+    assert lauf_oktober.status == "BLOCKIERT"  # offener Brief, noch keine tatsächlich umgesetzte Anpassung
+    assert any("noch offen" in g for g in lauf_oktober.blockiert_gruende)
 
 
 def test_geschaeftsraum_wartefrist_anker_verschiebt_sich_nicht_mit_neuen_vpi_daten(
@@ -670,6 +672,39 @@ def test_geschaeftsraum_wartefrist_anker_verschiebt_sich_nicht_mit_neuen_vpi_dat
     assert lauf_april.status == "ERHOEHUNG_ERZEUGT", lauf_april.blockiert_gruende
     anpassung = bundle.index_repo.letzte_anpassung(vertrag.id)
     assert anpassung.vpi_jahr == 2025 and anpassung.vpi_monat == 2  # Anker bleibt Februar, nicht März
+
+
+def test_nullpruefung_startet_keine_neue_jahreswartezeit(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    vertrag, _ = basis_vertrag
+    stammdaten_repo.upsert_debitor(id="DEB-1001", name="Test", email="mieter@example.at", adresse="Testgasse 1")
+    _mit_komponente(stammdaten_repo, vertrag)
+    klausel = _mit_kalenderklausel(bundle, vertrag, terminmodus="INTERVALL", anpassungsmonat=None,
+                                 mindestintervall_monate=12, schwelle_prozent=Decimal("3"))
+    _freigegebenes_wohnungsprofil(admin_ctx, bundle.rechtsprofil_service, vertrag,
+        rechtsordnung="OESTERREICH_MRG_TEIL", ist_wohnungsnutzung=False,
+        vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None, vertragsklausel_id=klausel.id)
+    _seed_vpi_monat(bundle, jahr=2026, monat=4, wert="100")
+    assert bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag,
+        heute=date(2026, 4, 13), akteur="test").status == "KEIN_ERHOEHUNGSBEDARF"
+    _seed_vpi_monat(bundle, jahr=2026, monat=5, wert="105")
+    result = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag,
+        heute=date(2026, 5, 13), akteur="test")
+    assert result.status == "ERHOEHUNG_ERZEUGT", result.blockiert_gruende
+    profil = bundle.rechtsprofil_service.liste_fuer_vertrag(vertrag.id)[0]
+    with stammdaten_repo._session_factory() as db:
+        row = db.get(IndexKlauselTable, klausel.id)
+        row.terminmodus = "BEI_SCHWELLE"
+        db.commit()
+    assert not bundle.rechtsprofil_service.ist_noch_gueltig(profil, heute=date(2026, 5, 14))
+
+
+def test_vpi_neuabruf_bewahrt_nur_passenden_veroeffentlichungsbeleg(bundle):
+    _seed_vpi_monat(bundle, jahr=2026, monat=1, wert="105", veroeffentlicht_am=date(2026, 2, 15))
+    _seed_vpi_monat(bundle, jahr=2026, monat=1, wert="105")
+    assert bundle.vpi_repo.get_monatswert("VPI20C18", 2026, 1).veroeffentlicht_am == date(2026, 2, 15)
+    _seed_vpi_monat(bundle, jahr=2026, monat=1, wert="106")
+    row = bundle.vpi_repo.get_monatswert("VPI20C18", 2026, 1)
+    assert row.veroeffentlicht_am is None and row.veroeffentlichung_quelle is None
 
 
 def test_geschaeftsraum_senkung_erzeugt_pruefbedarf_statt_verstecktem_kein_erhoehungsbedarf(

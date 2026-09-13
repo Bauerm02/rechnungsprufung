@@ -410,24 +410,12 @@ class IndexautomatikService:
         if klausel is None or klausel.status != "FREIGEGEBEN":
             return _abschliessen("BLOCKIERT", ["Referenzierte Vertragsklausel ist nicht (mehr) freigegeben."])
 
-        # `klausel.letzte_anpassung_monat` wird NUR bei einer TATSÄCHLICHEN
-        # Umsetzung fortgeschrieben (umsetzung_service.py, nach Zugang/
-        # Zahlungspflicht) - bis dahin kann bereits ein noch unumgesetzter
-        # VORSCHLAG (IndexAnpassung) für GENAU DIESE Klauselversion
-        # existieren. Ohne diesen zusätzlich zu berücksichtigen, würde ein
-        # Folgemonat mit einem erneut veränderten VPI-Wert einen ZWEITEN,
-        # abweichenden Vorschlag erzeugen, obwohl der erste noch gar nicht
-        # umgesetzt ist - der spätere der beiden Zeitpunkte gilt.
+        # Nur eine tatsächlich umgesetzte Anpassung startet das Vertragsintervall.
         letzte_anpassung = self._index_repository.letzte_anpassung(vertrag.id)
         effektiver_letzter_anpassung_monat = klausel.letzte_anpassung_monat
-        if (
-            letzte_anpassung is not None
-            and letzte_anpassung.index_klausel_id == klausel.id
-            and letzte_anpassung.status != "VERWORFEN"
-        ):
-            kandidat_monat = f"{letzte_anpassung.stichtag.year:04d}-{letzte_anpassung.stichtag.month:02d}"
-            if effektiver_letzter_anpassung_monat is None or kandidat_monat > effektiver_letzter_anpassung_monat:
-                effektiver_letzter_anpassung_monat = kandidat_monat
+        # Ein Rechenvorschlag ist keine erfolgte Mietanpassung, insbesondere
+        # ein Nullergebnis darf keine neue Jahreswartezeit auslösen.
+        # Noch offene Schreiben sperren separat die parallele Verarbeitung.
 
         # Explizites Terminmodell (Codex-Rückprüfung zu 5535ae2 - "anpassungs-
         # monat ist zwingend und damit reine Schwellenklauseln ohne festen
@@ -539,6 +527,10 @@ class IndexautomatikService:
         # seit `basis_monat`, NIE "der jeweils neueste VPI-Wert" - sonst
         # verschiebt sich die Frist mit jedem neu veröffentlichten Monat
         # endlos weiter.
+        offene_schreiben = [s for s in self._outbox_repository.liste_fuer_vertrag(vertrag.id)
+                           if s.status not in {"VERWORFEN", "SOLL_UMGESETZT"}]
+        if offene_schreiben:
+            return _abschliessen("BLOCKIERT", [f"Erhöhungsschreiben {offene_schreiben[0].id} ist noch offen; zuerst abschließen oder verwerfen."])
         hat_wartefrist = klausel.wartefrist_monate_nach_indexereignis is not None
         if hat_wartefrist:
             ueberschreitung = self._erstes_ueberschreitungsereignis(klausel, heute)
@@ -556,7 +548,8 @@ class IndexautomatikService:
                 monatswert_zeile = self._vpi_repository.get_monatswert(
                     klausel.basis_reihe, ueberschreitung.jahr, ueberschreitung.monat
                 )
-                if monatswert_zeile is None or monatswert_zeile.veroeffentlicht_am is None:
+                if (monatswert_zeile is None or monatswert_zeile.veroeffentlicht_am is None
+                    or not (monatswert_zeile.veroeffentlichung_quelle or "").strip()):
                     return _abschliessen(
                         "BLOCKIERT",
                         [
@@ -618,6 +611,7 @@ class IndexautomatikService:
             and letzte_anpassung.index_klausel_id == klausel.id
             and letzte_anpassung.alter_wert == klausel.basis_wert
             and letzte_anpassung.neuer_wert == aktueller_vpi
+            and letzte_anpassung.erhoehung_cent > 0
             and letzte_anpassung.status != "VERWORFEN"
         ):
             return _abschliessen(
