@@ -85,6 +85,7 @@ from mietinkasso.variableabrechnung.csv_import import (
     wende_an as _variable_abrechnung_wende_an,
 )
 from mietinkasso.variableabrechnung.dashboard import berechne_monatsuebersicht
+from mietinkasso.rueckstaende.service import berechne_rueckstandsuebersicht
 
 router = APIRouter(prefix="/backoffice", tags=["backoffice"])
 
@@ -275,111 +276,177 @@ def logout(csrf_token: str = Form(...), session_cookie: str | None = Cookie(defa
 # -- Dashboard: Gesellschaft/Objekt -> Mietkontenübersicht -------------------
 
 
-@router.get("/", response_class=HTMLResponse)
-def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_current_session)) -> HTMLResponse:
-    gesellschaften = _stammdaten_repo.list_gesellschaften()
-    options = ['<option value="">-- Objekt wählen --</option>']
-    for gesellschaft in gesellschaften:
-        objekte = _stammdaten_repo.list_objekte(gesellschaft_id=gesellschaft.id)
-        if not objekte:
-            continue
-        options.append(f'<optgroup label="{h(gesellschaft.name)}">')
-        for objekt in objekte:
-            label = objekt.bezeichnung + (" [GESPERRT]" if objekt.ausgeschlossen else "")
-            options.append(option(objekt.id, label, selected=(objekt.id == objekt_id)))
+def _rueckstaende_objekt_filter_form(uebersicht, *, action: str = "/backoffice/") -> str:
+    options = [option("", "Alle Objekte", selected=(uebersicht.objekt_filter is None))]
+    je_gesellschaft: dict[str, list] = {}
+    for o in uebersicht.objekt_optionen:
+        je_gesellschaft.setdefault(o.gesellschaft_name, []).append(o)
+    for gesellschaft_name, objekte in je_gesellschaft.items():
+        options.append(f'<optgroup label="{h(gesellschaft_name)}">')
+        for o in objekte:
+            options.append(option(o.id, o.bezeichnung, selected=(o.id == uebersicht.objekt_filter)))
         options.append("</optgroup>")
-
-    auswahl_form = f"""
+    return f"""
     <div class="card">
-      <form method="get" action="/backoffice/">
+      <form method="get" action="{h(action)}">
         <label>Objekt</label>
         <select name="objekt_id" onchange="this.form.submit()">{''.join(options)}</select>
         <noscript><button type="submit">Anzeigen</button></noscript>
       </form>
     </div>"""
 
-    tabelle = ""
-    if objekt_id:
-        objekt = _stammdaten_repo.get_objekt(objekt_id)
-        if objekt is None:
-            tabelle = flash_error(f"Unbekanntes Objekt {objekt_id}.")
-        else:
-            gesperrt = objekt.ausgeschlossen
-            banner = (
-                flash_error(
-                    f"Objekt {objekt.id} ({objekt.bezeichnung}) ist von der Pilotphase ausgeschlossen - "
-                    "nur Ansicht, KEINE Buchung/Vorschreibung/Mahnung möglich."
-                )
-                if gesperrt
-                else ""
-            )
-            vertraege = _stammdaten_repo.list_vertraege_fuer_objekt(objekt_id)
-            zeilen = []
-            for vertrag in vertraege:
-                einheit = _stammdaten_repo.get_einheit(vertrag.einheit_id)
-                debitor = _stammdaten_repo.get_debitor(vertrag.debitor_id)
-                konto = _stammdaten_repo.get_konto_by_vertrag(vertrag.id)
-                saldo = _op_service.berechne_saldo(konto.id) if konto else None
-                historisch = vertrag.gueltig_bis is not None and vertrag.gueltig_bis < date.today()
-                status_tags = []
-                if historisch:
-                    status_tags.append('<span class="warn">historisch</span>')
-                if einheit and einheit.nutzungsstatus == "LEERSTAND":
-                    status_tags.append('<span class="warn">Leerstand</span>')
-                aktive_sperren_zeile = _stammdaten_repo.aktive_sperren(vertrag.id)
-                if aktive_sperren_zeile:
-                    gruende_kurz = ", ".join(h(s.grund) for s in aktive_sperren_zeile)
-                    status_tags.append(f'<span class="error">Mahnsperre ({gruende_kurz})</span>')
-                konto_link = f'<a href="/backoffice/konto/{h(konto.id)}">{h(konto.id)}</a>' if konto else "-"
-                zeilen.append(
-                    f"<tr class='{'gesperrt-row' if gesperrt else ''}'>"
-                    f"<td>{h(vertrag.id)}</td><td>{h(einheit.bezeichnung) if einheit else '-'}</td>"
-                    f"<td>{h(einheit.nutzungsstatus) if einheit else '-'}</td>"
-                    f"<td>{h(debitor.name) if debitor else '-'}</td>"
-                    f"<td>{konto_link}</td>"
-                    f"<td>{eur(saldo.saldo_cent) if saldo else '-'}</td>"
-                    f"<td>{eur(saldo.faelliger_unstrittiger_rest_cent) if saldo else '-'}</td>"
-                    f"<td>{' '.join(status_tags)}</td>"
-                    "</tr>"
-                )
-            einheiten_ohne_vertrag = [
-                einheit
-                for einheit in _stammdaten_repo.list_einheiten_fuer_objekt(objekt_id)
-                if einheit.id not in {v.einheit_id for v in vertraege}
-            ]
-            bestand_zeilen = "".join(
-                f"<tr><td>{h(einheit.id)}</td><td>{h(einheit.bezeichnung)}</td><td>{h(einheit.nutzungsstatus)}</td></tr>"
-                for einheit in einheiten_ohne_vertrag
-            )
-            bestand_tabelle = ""
-            if einheiten_ohne_vertrag:
-                bestand_tabelle = f"""
-                <h2>Einheiten ohne aktiven Vertrag — {h(objekt.bezeichnung)} ({h(objekt.id)})</h2>
-                <p class="muted">Nutzungsstatus wird eingespielt/gepflegt, unabhängig davon, ob eine
-                   Mietforderung besteht (z. B. Leerstand, Kurzzeitvermietung, Selfstorage,
-                   Eigennutzung) - "Leerstand" bedeutet hier den erfassten Status, nicht das
-                   Fehlen eines Vertrags per Namens-/Nullsaldo-Vermutung.</p>
-                <table>
-                  <tr><th>Einheit</th><th>Bezeichnung</th><th>Nutzungsstatus</th></tr>
-                  {bestand_zeilen}
-                </table>"""
 
-            tabelle = banner + f"""
-            <h2>Mietkontenübersicht — {h(objekt.bezeichnung)} ({h(objekt.id)})</h2>
-            <p class="muted">"Kontostand" = Eröffnung + Vorschreibungen − Zahlungen/Gutschriften (positiv:
-               offener Betrag; negativ: Guthaben). "Davon mit bekannter Fälligkeit" ist NUR die Teilmenge mit
-               bereits verstrichenem, bekanntem Fälligkeitsdatum - eine UNBEKANNTE Fälligkeit ist deshalb
-               NICHT automatisch strittig, sie ist schlicht (noch) nicht in dieser Spalte enthalten. Eine
-               bekannte Fälligkeit ist umgekehrt KEINE Mahnfreigabe - eine aktive Mahnsperre (Spalte
-               "Hinweise") blockiert unabhängig davon.</p>
-            <table>
-              <tr><th>Vertrag</th><th>Einheit</th><th>Nutzungsstatus</th><th>Debitor</th><th>Konto</th>
-                  <th>Kontostand (offen/Guthaben)</th><th>Davon mit bekannter Fälligkeit</th><th>Hinweise</th></tr>
-              {''.join(zeilen) if zeilen else '<tr><td colspan=8 class="muted">Keine Verträge.</td></tr>'}
-            </table>
-            {bestand_tabelle}"""
+def _rueckstaende_kpi_html(k) -> str:
+    def _kpi(label: str, cent: int) -> str:
+        return f'<div class="kpi"><span class="zahl">{eur(cent)}</span><span class="kpi-label">{h(label)}</span></div>'
 
-    return _layout(request, session, "Dashboard", auswahl_form + tabelle)
+    return f"""
+    <div class="kpi-grid">
+      {_kpi("Summe positiver Kontostände", k.summe_positiver_kontostaende_cent)}
+      {_kpi("Guthaben gesamt (nicht verrechnet)", k.summe_guthaben_cent)}
+      {_kpi("Überfällig (bekannte Fälligkeit)", k.ueberfaellig_cent)}
+      {_kpi("Noch nicht fällig", k.nicht_faellig_cent)}
+      {_kpi("Fälligkeit unbekannt", k.faelligkeit_unbekannt_cent)}
+    </div>"""
+
+
+def _rueckstaende_mietkonto_zeile_html(z) -> str:
+    status_tags = []
+    if z.historisch:
+        status_tags.append('<span class="badge badge-warn">historisch</span>')
+    if z.nutzungsstatus == "LEERSTAND":
+        status_tags.append('<span class="badge badge-warn">Leerstand</span>')
+    if z.sperrgruende:
+        status_tags.append(f'<span class="badge badge-error">Sperre: {h(", ".join(z.sperrgruende))}</span>')
+    if z.mahnfall_stufe is not None:
+        status_tags.append(f'<span class="badge badge-muted">Mahnstufe {z.mahnfall_stufe} ({h(z.mahnfall_status or "")})</span>')
+    konto_link = f'<a href="/backoffice/konto/{h(z.konto_id)}">{h(z.konto_id)}</a>' if z.konto_id else "-"
+    mahnvorschau_link = (
+        f'<a href="/backoffice/vertrag/{h(z.vertrag_id)}/mahnvorschau">Mahnvorschau</a>' if z.konto_id else ""
+    )
+    return (
+        f"<tr class='{'gesperrt-row' if z.sperrgruende else ''}'>"
+        f"<td>{h(z.objekt_bezeichnung)}</td>"
+        f"<td>{h(z.vertrag_id)}</td><td>{h(z.einheit_bezeichnung)}</td>"
+        f"<td>{h(z.nutzungsstatus)}</td>"
+        f"<td>{h(z.debitor_name)}</td>"
+        f"<td>{konto_link}</td>"
+        f"<td>{eur(z.saldo_cent) if z.saldo_cent is not None else '-'}</td>"
+        f"<td>{eur(z.faelliger_unstrittiger_rest_cent) if z.faelliger_unstrittiger_rest_cent is not None else '-'}</td>"
+        f"<td>{' '.join(status_tags)}</td>"
+        f"<td>{mahnvorschau_link}</td>"
+        "</tr>"
+    )
+
+
+_FAELLIGKEITSKLASSE_BADGE = {
+    "UEBERFAELLIG": '<span class="badge badge-error">überfällig</span>',
+    "NICHT_FAELLIG": '<span class="badge badge-muted">noch nicht fällig</span>',
+    "UNBEKANNT": '<span class="badge badge-warn">Fälligkeit unbekannt</span>',
+}
+
+
+def _rueckstaende_position_zeile_html(p) -> str:
+    faelligkeit_html = p.faelligkeit.isoformat() if p.faelligkeit else '<span class="muted">unbekannt</span>'
+    return (
+        "<tr>"
+        f"<td>{h(p.objekt_bezeichnung)}</td>"
+        f"<td>{h(p.vertrag_id)}</td><td>{h(p.debitor_name)}</td>"
+        f"<td>{h(p.art)}</td>"
+        f"<td>{h(p.leistungsperiode or '')}</td>"
+        f"<td>{p.belegdatum.isoformat()}</td>"
+        f"<td>{faelligkeit_html}</td>"
+        f"<td>{eur(p.rest_cent)}</td>"
+        f"<td>{_FAELLIGKEITSKLASSE_BADGE.get(p.faelligkeitsklasse, '')}</td>"
+        f"<td><a href='/backoffice/konto/{h(p.konto_id)}'>Konto</a></td>"
+        "</tr>"
+    )
+
+
+@router.get("/", response_class=HTMLResponse)
+def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_current_session)) -> HTMLResponse:
+    """Zentrale Rückstandsübersicht - Standard "Alle Objekte" (nur
+    erlaubte, nicht ausgeschlossene), mit gemeinsamem Objektfilter, der
+    Summen/Mietkontentabelle/Einzelpositionen/Mahnsperren-Anzeige
+    identisch mitfiltert (Auftrag 13.09.2026, HV-20260913-RUECKSTAENDE:
+    "Aktuell ist /backoffice/ ohne Objekt leer" - alle vier Ansichten
+    stammen jetzt aus GENAU EINER Berechnung,
+    `rueckstaende.service.berechne_rueckstandsuebersicht`, REIN LESEND,
+    keine Mahnplanung als GET-Seiteneffekt)."""
+
+    ctx = _ctx(session)
+    try:
+        uebersicht = berechne_rueckstandsuebersicht(
+            ctx=ctx, objekt_id=objekt_id or None, stammdaten_repository=_stammdaten_repo, op_service=_op_service,
+            mahn_fall_repository=_mahn_fall_repo,
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Rückstandsübersicht", str(exc), "/backoffice/")
+
+    auswahl_form = _rueckstaende_objekt_filter_form(uebersicht)
+    kpi_html = _rueckstaende_kpi_html(uebersicht.kennzahlen)
+
+    if uebersicht.objekt_filter is None:
+        titel_zusatz = "Alle Objekte"
+    else:
+        gefiltertes_objekt = next((o for o in uebersicht.objekt_optionen if o.id == uebersicht.objekt_filter), None)
+        titel_zusatz = (
+            f"{h(gefiltertes_objekt.bezeichnung)} ({h(gefiltertes_objekt.id)})"
+            if gefiltertes_objekt is not None else h(uebersicht.objekt_filter)
+        )
+    mietkonten_html = "".join(_rueckstaende_mietkonto_zeile_html(z) for z in uebersicht.mietkonten)
+    mietkonten_tabelle = f"""
+    <div class="card">
+      <h2>Mietkontenübersicht — {titel_zusatz}</h2>
+      <p class="muted">"Kontostand" = Eröffnung + Vorschreibungen − Zahlungen/Gutschriften (positiv: offener
+         Betrag; negativ: Guthaben). "Davon mit bekannter Fälligkeit" ist NUR die Teilmenge mit bereits
+         verstrichenem, bekanntem Fälligkeitsdatum - eine UNBEKANNTE Fälligkeit ist deshalb NICHT
+         automatisch strittig. Eine bekannte Fälligkeit ist umgekehrt KEINE Mahnfreigabe - eine aktive
+         Sperre (Spalte "Hinweise") blockiert unabhängig davon; Mahnstufe/-status stammen aus zuvor bereits
+         geplanten Mahnfällen, diese Übersicht plant selbst keine neuen.</p>
+      <table>
+        <tr><th>Objekt</th><th>Vertrag</th><th>Einheit</th><th>Nutzungsstatus</th><th>Debitor</th><th>Konto</th>
+            <th>Kontostand (offen/Guthaben)</th><th>Davon mit bekannter Fälligkeit</th><th>Hinweise</th><th></th></tr>
+        {mietkonten_html or '<tr><td colspan=10 class="muted">Keine Verträge.</td></tr>'}
+      </table>
+    </div>"""
+
+    positionen_html = "".join(_rueckstaende_position_zeile_html(p) for p in uebersicht.offene_positionen)
+    positionen_tabelle = f"""
+    <div class="card">
+      <h2>Offene Einzelpositionen — {titel_zusatz}</h2>
+      <p class="muted">Je Forderung getrennt (nicht der Kontosaldo) - Zahlungen/Gutschriften sind bereits
+         FIFO zugeordnet, gezeigt wird nur der verbleibende Rest. Kann von der Kontostand-Spalte oben
+         abweichen (unterschiedliche, beide bestehende Berechnungen desselben Kontos) - das wird hier
+         bewusst NICHT glattgerechnet.</p>
+      <table>
+        <tr><th>Objekt</th><th>Vertrag</th><th>Debitor</th><th>Art</th><th>Zeitraum</th><th>Belegdatum</th>
+            <th>Fälligkeit</th><th>Rest</th><th>Status</th><th></th></tr>
+        {positionen_html or '<tr><td colspan=10 class="muted">Keine offenen Positionen.</td></tr>'}
+      </table>
+    </div>"""
+
+    bestand_html = "".join(
+        f"<tr><td>{h(e.objekt_bezeichnung)}</td><td>{h(e.einheit_id)}</td><td>{h(e.einheit_bezeichnung)}</td>"
+        f"<td>{h(e.nutzungsstatus)}</td></tr>"
+        for e in uebersicht.einheiten_ohne_konto
+    )
+    bestand_tabelle = f"""
+    <div class="card">
+      <h2>Einheiten ohne Mietkonto — {titel_zusatz}</h2>
+      <p class="muted">Nutzungsstatus wird eingespielt/gepflegt, unabhängig davon, ob eine Mietforderung
+         besteht (z. B. Leerstand, Kurzzeitvermietung, Selfstorage, Eigennutzung) - das ist BESTAND, kein
+         erfundener Nullsaldo/Rückstand.</p>
+      <table>
+        <tr><th>Objekt</th><th>Einheit</th><th>Bezeichnung</th><th>Nutzungsstatus</th></tr>
+        {bestand_html or '<tr><td colspan=4 class="muted">Keine Einheiten ohne Mietkonto.</td></tr>'}
+      </table>
+    </div>"""
+
+    return _layout(
+        request, session, "Rückstandsübersicht",
+        auswahl_form + kpi_html + mietkonten_tabelle + positionen_tabelle + bestand_tabelle,
+    )
 
 
 # -- Kontoauszug --------------------------------------------------------------

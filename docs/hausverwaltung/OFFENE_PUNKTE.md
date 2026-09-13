@@ -1434,3 +1434,106 @@ ursprünglichen Übergabestand.
   ergänzt (kein Alter einer produktiv befüllten Tabelle) -
   `create_all_tables()` legt weiterhin nur fehlende Tabellen an, kein
   eigenständiges Migrationswerkzeug.
+
+## Paket Rückstandsübersicht (Auftrag 13.09.2026, HV-20260913-RUECKSTAENDE)
+
+Neues, rein lesendes Modul `src/mietinkasso/rueckstaende/service.py`
+(`berechne_rueckstandsuebersicht`) plus komplett überarbeitete zentrale
+Backoffice-Route `/backoffice/` (`dashboard()`), die vorher OHNE
+gewähltes Objekt leer war. Der vollständige, wortgetreue Auftrag steht
+in `RAHMENPROGRAMM.md` (Abschnitt "HV-20260913-RUECKSTAENDE").
+`src/invoice_automation/` ist unverändert.
+
+### Was funktioniert (mit Tests belegt)
+
+- **Standard "Alle Objekte", ohne Auswahl nicht mehr leer.** `/backoffice/`
+  zeigt sofort eine gefüllte Übersicht über alle erlaubten, nicht
+  ausgeschlossenen Objekte; ein gemeinsamer Objektfilter (Dropdown,
+  gruppiert je Gesellschaft) schaltet auf genau ein Objekt um - Summen,
+  Mietkontentabelle, Einzelpositionsübersicht und "Einheiten ohne
+  Mietkonto" stammen alle aus DERSELBEN Berechnung
+  (`RueckstandsUebersicht`) und reagieren daher garantiert identisch auf
+  denselben Filter (mit einem dedizierten Regressionstest
+  `test_filterwirkung_identisch_zu_teilmenge_von_alle_objekte`
+  abgesichert).
+- **Fünf getrennte Kennzahlen statt einer Summe**: Summe positiver
+  Kontostände; Guthaben gesamt (wird NIE gegen positive Kontostände
+  anderer Mieter verrechnet - "Soll-/Habensalden je Konto getrennt");
+  überfällige/noch nicht fällige/Fälligkeit-unbekannte Summe der
+  EINZELPOSITIONEN (`OPService.offene_forderungen`, FIFO je Forderung).
+  Diese Positions-Sicht ist ausdrücklich NICHT dasselbe wie
+  `OPSaldo.faelliger_unstrittiger_rest_cent` (Konto-Sicht) - beide Werte
+  werden nebeneinander gezeigt (Mietkontentabelle: "Davon mit bekannter
+  Fälligkeit"; Kennzahlenleiste: "Fälligkeit unbekannt" etc.), nie
+  glattgerechnet. Ein dedizierter Test
+  (`test_kontosaldo_und_einzelposition_koennen_bewusst_abweichen`)
+  belegt einen Fall, in dem beide Zahlen tatsächlich auseinanderlaufen
+  (unbekannte Fälligkeit wird konto-seitig NICHT, positions-seitig SEHR
+  WOHL gezählt).
+- **Mietkontentabelle** jetzt mit Objekt-Spalte (funktioniert dadurch
+  sowohl gefiltert als auch über "Alle Objekte" hinweg), Konto- UND
+  Mahnvorschau-Link je Zeile, sowie einer Hinweis-Spalte, die aktive
+  Mahnsperren (Grund wörtlich aus `SperreTable.grund`, z. B. RATENPLAN/
+  RECHTSANWALT) UND den zuletzt bekannten Mahnfallstatus (Stufe +
+  Status aus dem NEUESTEN `MahnFallTable`-Eintrag je Vertrag, reiner
+  Read) gemeinsam zeigt - ohne dass eine bekannte Fälligkeit dabei
+  jemals als Mahnfreigabe dargestellt wird.
+- **Neue Einzelpositionsübersicht** über alle offenen Forderungen im
+  gefilterten Bestand: Objekt, Vertrag/Debitor, Art, Zeitraum
+  (Leistungsperiode), Belegdatum, Fälligkeit, Rest, Fälligkeitsklasse
+  als Badge, Konto-Link.
+- **Einheiten ohne Mietkonto** (Leerstand/Kurzzeitvermietung/
+  Selfstorage/Eigennutzung) erscheinen in einer eigenen Liste über alle
+  gefilterten Objekte - niemals als Mietkonto-Zeile mit erfundenem
+  Saldo 0.
+- **Serverseitige Zugriffsprüfung konsequent neu**: die Objekt-
+  Auswahlliste UND die "Alle Objekte"-Summen entstehen aus GENAU EINER
+  Schleife über `ctx.has_zugriff`-geprüfte Gesellschaften und deren
+  NICHT ausgeschlossene Objekte. Ein explizit angefordertes `objekt_id`,
+  das unbekannt ist, zu keiner zugänglichen Gesellschaft gehört, oder
+  ausgeschlossen ist, wird EINHEITLICH (derselbe Fehlertyp,
+  `UnbekanntesObjektFilterError`) abgelehnt - kein stiller Wechsel auf
+  "Alle Objekte", kein Erkenntnisgewinn für den Aufrufer, welcher der
+  drei Fälle vorliegt (HTTP: 400 mit verständlicher Fehlerseite statt
+  500 oder stillschweigendem Fallback).
+- **Vollständig GET-seiteneffektfrei**: die Übersicht kombiniert
+  ausschließlich bereits bestehende Lesepfade
+  (`StammdatenRepository`, `OPService.berechne_saldo`/
+  `offene_forderungen`, `MahnFallRepository.list_fuer_vertrag`) - NIE
+  `MahnwesenService.plane_forderung`/`plane_alle_offenen_forderungen`,
+  die neue `MahnFallTable`-Zeilen anlegen würden. Ein dedizierter Test
+  (`test_uebersicht_ist_vollstaendig_schreibfrei`) ruft die Berechnung
+  mehrfach auf und prüft, dass sich weder OP- noch Mahnfall-Zeilenzahl
+  ändert.
+- 21 neue Tests in `test_rueckstaende_service.py` (Scope/Ausschluss,
+  Guthaben-ohne-Verrechnung, Fälligkeitsklassen, Storno, historischer
+  Vertrag mit Rest, Leerstand/fehlendes Konto, Mahnsperre/-stufe,
+  Konto-vs-Position-Abweichung, identische Filterwirkung, einheitliche
+  Ablehnung fremd/ausgeschlossen/unbekannt, Schreibfreiheit) plus 2 neue
+  HTTP-Tests in `test_backoffice.py` (Standardansicht nicht mehr leer,
+  Objektfilter wirkt konsistent) und 2 angepasste Bestandstests
+  (Umbenennung "Einheiten ohne aktiven Vertrag" → "Einheiten ohne
+  Mietkonto"; Objekt 107 wird auf dieser Route jetzt aktiv abgelehnt
+  statt nur-lesend mit Banner gezeigt - Kontoauszug-Verhalten für 107
+  bleibt unverändert). Gesamter Mietinkasso-Testsatz: 752 Tests grün
+  (731 vorher + 21 neue in test_rueckstaende_service.py).
+
+### Was ausdrücklich NICHT geliefert ist (bewusste, offen benannte Lücken)
+
+- **Kein neuer Export/keine Fremddienst-Integration.** Wie beauftragt -
+  die Übersicht ist eine reine HTML-Seite im bestehenden Backoffice,
+  kein CSV-/Excel-Export, keine externe API.
+- **Keine eigene Verrechnungs-/Mahnlogik.** Alle Zahlen stammen 1:1 aus
+  `OPService`/`MahnFallRepository`; dieses Paket ändert an deren
+  Berechnung nichts und bucht/plant/versendet selbst nichts.
+- **Mahnstatus ist eine Momentaufnahme, keine Live-Berechnung.** Der
+  angezeigte Mahnfall-Status ist der zuletzt GESPEICHERTE (durch einen
+  früheren, an anderer Stelle ausgelösten Planungslauf), nicht was eine
+  Neuplanung JETZT ergäbe - für eine aktuelle Neuberechnung bleibt die
+  bestehende Mahnvorschau-Seite (verlinkt) zuständig, die aber selbst
+  weiterhin (wie schon vor diesem Paket) beim Aufruf tatsächlich plant.
+- **Keine Historisierung von `EinheitTable.nutzungsstatus`** (wie im
+  gesamten Repository) - "Einheiten ohne Mietkonto" zeigt den AKTUELLEN
+  Status, keine rückwirkende Tatsachenbehauptung für vergangene Monate.
+- **Keine Migrationsspalten-Änderung.** Reine Anwendungsschicht über
+  bestehenden Tabellen, keine neue Tabelle/Spalte in dieser Sitzung.

@@ -167,6 +167,38 @@ def test_login_und_dashboard_zeigt_objekte(backoffice_client):
     assert konto_id in dashboard.text
 
 
+def test_dashboard_ohne_objekt_zeigt_alle_objekte_nicht_leer(backoffice_client):
+    """Auftrag HV-20260913-RUECKSTAENDE: '/backoffice/ ohne Objekt ist
+    leer' - Standard ist jetzt eine gefüllte 'Alle Objekte'-Übersicht
+    mit Kennzahlen und Mietkontentabelle, nicht mehr eine leere Seite
+    mit nur einer Objektauswahl."""
+
+    client, konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    dashboard = client.get("/backoffice/")
+    assert dashboard.status_code == 200
+    assert "Alle Objekte" in dashboard.text
+    assert "Summe positiver Kontostände" in dashboard.text
+    assert "Mietkontenübersicht" in dashboard.text
+    assert "Offene Einzelpositionen" in dashboard.text
+    assert konto_id in dashboard.text  # Am Corso ist Teil der "Alle Objekte"-Summe
+
+
+def test_dashboard_objektfilter_wirkt_identisch_auf_alle_ansichten(backoffice_client):
+    """Summen/Mietkontentabelle/Einzelpositionen reagieren alle auf
+    denselben Objektfilter - eine mit ?objekt_id=601 gefilterte Seite
+    darf keine Zeile eines anderen Objekts (hier 107, ausgeschlossen)
+    enthalten und muss dieselbe Kontozeile wie die 'Alle Objekte'-Sicht
+    für 601 zeigen."""
+
+    client, konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    gefiltert = client.get("/backoffice/", params={"objekt_id": "601"})
+    assert gefiltert.status_code == 200
+    assert konto_id in gefiltert.text
+    assert 'value="107"' not in gefiltert.text  # ausgeschlossenes Objekt ist keine Filteroption
+
+
 def test_dashboard_zeigt_pilot_banner_in_development_umgebung(backoffice_client):
     """Diese Fixture importiert `api.app` mit `MIETINKASSO_ENVIRONMENT`
     unausgesprochen auf dem Default "development" - der Banner muss
@@ -194,7 +226,7 @@ def test_dashboard_zeigt_einheiten_ohne_vertrag(backoffice_client):
     _login(client)
     dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
     assert dashboard.status_code == 200
-    assert "Einheiten ohne aktiven Vertrag" in dashboard.text
+    assert "Einheiten ohne Mietkonto" in dashboard.text
     assert "601-TOP2" in dashboard.text
     assert "LEERSTAND" in dashboard.text
 
@@ -240,11 +272,22 @@ def test_hauptnavigation_verlinkt_alle_kontextlosen_arbeitsablaeufe(backoffice_c
 
 
 def test_objekt_107_ist_im_dashboard_nur_lesend(backoffice_client):
+    """Auftrag HV-20260913-RUECKSTAENDE: ein explizit angefordertes
+    ausgeschlossenes Objekt wird auf der zentralen Rückstandsübersicht
+    klar abgelehnt (kein stiller Wechsel auf "Alle Objekte", keine
+    Fachdaten) - anders als der Kontoauszug (der ein bereits bekanntes
+    Konto weiterhin nur-lesend zeigt), ist 107 hier auch keine
+    Filteroption."""
+
     client, _konto_id, konto_gesperrt_id, _op_service = backoffice_client
     _login(client)
     dashboard = client.get("/backoffice/", params={"objekt_id": "107"})
-    assert dashboard.status_code == 200
+    assert dashboard.status_code == 400
     assert "ausgeschlossen" in dashboard.text
+    # 107 taucht auch nicht als Filteroption auf der "Alle Objekte"-Seite auf.
+    alle_objekte = client.get("/backoffice/")
+    assert alle_objekte.status_code == 200
+    assert 'value="107"' not in alle_objekte.text
     # Kein Nachbuchungs-Link für ein gesperrtes Objekt im Kontoauszug.
     kontoauszug = client.get(f"/backoffice/konto/{konto_gesperrt_id}")
     assert "Objekt ist von der Pilotphase ausgeschlossen" in kontoauszug.text

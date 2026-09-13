@@ -180,6 +180,14 @@ def seite(
   .flash-ok {{ background: #e6f4ea; border: 1px solid #1a7f37; padding: 0.55rem 0.9rem; border-radius: 4px; margin-bottom: 1rem; }}
   .flash-error {{ background: #fbeaea; border: 1px solid #b00020; padding: 0.55rem 0.9rem; border-radius: 4px; margin-bottom: 1rem; }}
   .gesperrt-row {{ background: #fbeaea; }}
+  .kpi-grid {{ display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 0.75rem; }}
+  .kpi {{ background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 0.65rem 0.9rem; flex: 1 1 150px; min-width: 140px; }}
+  .kpi .zahl {{ font-size: 1.25rem; font-weight: 700; display: block; }}
+  .kpi .kpi-label {{ font-size: 0.76rem; color: #666; }}
+  .badge {{ display: inline-block; padding: 0.05rem 0.4rem; border-radius: 3px; font-size: 0.78rem; font-weight: 600; }}
+  .badge-error {{ background: #fbeaea; color: #b00020; }}
+  .badge-warn {{ background: #fdf0dc; color: #a15c00; }}
+  .badge-muted {{ background: #eee; color: #555; }}
   label {{ display: block; margin: 0.5rem 0 0.15rem; font-weight: 600; font-size: 0.85rem; }}
   input, select, textarea {{ width: 100%; box-sizing: border-box; padding: 0.35rem 0.5rem; font: inherit; border: 1px solid #ccc; border-radius: 4px; }}
   button, input[type=submit] {{ font: inherit; padding: 0.4rem 0.9rem; cursor: pointer; border-radius: 4px; border: 1px solid #14213d; background: #14213d; color: #fff; width: auto; margin-top: 0.6rem; }}

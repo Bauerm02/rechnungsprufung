@@ -712,3 +712,103 @@ gelten ab sofort als Teil dieses Auftrags:
   Objektausschluss wird dabei zusätzlich zum reinen Gesellschaftsscope
   geprüft (ein nachträglich ausgeschlossenes Objekt verschwindet damit
   automatisch aus alten Berichten/Summen).
+
+## Auftrag HV-20260913-RUECKSTAENDE (wortgetreu, 13.09.2026)
+
+Neuer beauftragter Schritt HV-20260913-RUECKSTAENDE, auf bestehendem
+Branch claude/bold-volta-7xovjq weiterimplementieren, nur generischer
+Code/synthetische Tests, keine Live-Daten/Server/Mails/Buchungen und
+`src/invoice_automation` unverändert. Sonnet 5 High, Fast aus reicht.
+
+Nutzerwunsch: Im Dashboard sollen alle Rückstandsübersichten liegen und
+je Objekt filterbar sein. Aktuell ist /backoffice/ ohne Objekt leer.
+Implementiere eine verständliche zentrale Übersicht: Standard Alle
+Objekte (nur erlaubte, nicht ausgeschlossene), gemeinsamer Objektfilter;
+sämtliche Summen, Mietkontentabelle, offene Einzelpositionen,
+Mahnsperren/Anwalt/Ratenplan und vorhandene Mahnfallstatus müssen auf
+exakt denselben gefilterten Bestand reagieren. Übersichtslinks allein
+reichen nicht: Beträge und zugehörige Mieter/Objekte direkt sichtbar,
+Detailkonto/Mahnvorschau verlinken. Einheiten ohne Mietkonto (Leerstand/
+KZV/Selfstorage/Eigennutzung) als Bestand, niemals als erfundener
+Nullsaldo/Rückstand.
+
+Kennzahlen klar trennen: Summe positiver Kontostände; Guthaben separat
+ohne Verrechnung zwischen Mietern; tatsächlich überfällige offene
+Einzelpositionen (bekannte Fälligkeit); noch nicht fällige; Fälligkeit
+unbekannt. Zeige offene Positionen nach vorhandenem OP-Service/
+Verrechnung, keine neue Buchungs- oder Mahnlogik. Mahnsperren und
+bestehende Mahnstufen/Fallstatus anzeigen, aber bekannte Fälligkeit nie
+als automatische Mahnfreigabe darstellen. Keine Mahnplanung als
+GET-Seiteneffekt. Kein Name-/Saldo-Heurismus für strittig; nur belegte
+Sperr-/Fallinformationen. Bestehende Service-Unterschiede Kontosaldo vs
+offene Positionen erkennen und als Abweichung sichtbar halten, nicht
+glattrechnen.
+
+UX kompakt, deutsch, mobil lesbar, bestehende Gestaltung/Nutzungstypen
+erhalten. Standard alle Objekte und Option zum einzelnen Objekt.
+Kontoübersicht mit Objektspalte und klarer Sortierung, zusätzliche
+Einzelpositionsübersicht mit Zeitraum/Beleg/Fälligkeit/Rest und
+passenden Details. Vorhandene Mahnstatus können in passender Spalte/
+kleiner Tabelle eingebunden werden. Kein neuer Export oder Fremddienst
+nötig.
+
+Zugriffsprüfung serverseitig: Der bisherige Dashboard-Code filtert nicht
+sauber nach AuthContext. Gesellschaftsscope auf Objektoptionen, Daten,
+Summen und direkt manipulierte objekt_id anwenden; fremde/unbekannte IDs
+ohne Offenlegung/500 abweisen. Ausgeschlossene Objekte nicht in
+Alle-Summen oder Auswahl, kein stiller Scopewechsel.
+
+Teste aussagekräftig: zwei erlaubte Objekte plus fremde Gesellschaft und
+ausgeschlossenes Objekt; positive/negative/Nullsalden ohne
+Gegenverrechnung, Teilzahlung/Gutschrift/Storno, unbekannte/künftige
+Fälligkeit, historische Verträge mit Rest, leere Objekte und fehlendes
+Mietkonto, Mahnsperren/Stufe1/2, identische Filterwirkung und
+vollständig schreibfreie GETs. Bitte vollständigen Mietinkasso-Testsatz
+einmal am finalen Code ausführen, relevante Doku aktualisieren, Commit
+in denselben Branch pushen und genaue Revision/Prüfresultate
+zurückmelden. Codex bearbeitet parallel nur unabhängige Prüfungen und
+Betriebsskripte außerhalb des Repos. Keine unnötigen Mehrfachtests bei
+reinen Dokuänderungen.
+
+### Umsetzung/Konkretisierungen (diese Sitzung)
+
+- Neues, rein lesendes Modul `src/mietinkasso/rueckstaende/service.py`
+  (`berechne_rueckstandsuebersicht`) kombiniert AUSSCHLIESSLICH bereits
+  bestehende Services (`StammdatenRepository`, `OPService.
+  berechne_saldo`/`offene_forderungen`, `MahnFallRepository.
+  list_fuer_vertrag`) - keine eigene Saldo-/Verrechnungs-/Mahnlogik,
+  niemals `MahnwesenService.plane_forderung`/
+  `plane_alle_offenen_forderungen` (die neue `MahnFallTable`-Zeilen
+  anlegen würden) - die Übersicht ist ein GET-seiteneffektfreier
+  Lesepfad.
+- Erlaubter Bestand (Filter-Auswahlliste UND "Alle Objekte"-Summen)
+  entsteht aus GENAU EINER Schleife über `ctx.has_zugriff`-geprüfte
+  Gesellschaften und deren NICHT ausgeschlossene Objekte - beide Sichten
+  sehen dadurch garantiert denselben Bestand.
+- Ein explizit angefordertes `objekt_id`, das unbekannt ist, zu keiner
+  zugänglichen Gesellschaft gehört, oder ausgeschlossen ist, wird
+  EINHEITLICH über denselben Fehlertyp
+  (`UnbekanntesObjektFilterError`, eine `ValueError`-Unterklasse)
+  abgelehnt - kein stiller Wechsel auf "Alle Objekte", kein
+  Erkenntnisgewinn für den Aufrufer, welcher der drei Fälle vorliegt.
+- Fünf Kennzahlen bewusst GETRENNT geführt (`RueckstandsKennzahlen`):
+  Summe positiver Kontostände, Guthabensumme (nie gegen positive Salden
+  verrechnet), überfällige/noch nicht fällige/Fälligkeit-unbekannte
+  Summe der EINZELPOSITIONEN (`OPService.offene_forderungen`, FIFO-
+  Zuordnung je Forderung) - letztere drei sind ausdrücklich NICHT
+  dasselbe wie `OPSaldo.faelliger_unstrittiger_rest_cent` (Konto-Ebene);
+  beide Werte werden nebeneinander gezeigt, nie glattgerechnet.
+- Einheiten ohne (aktiven) Vertrag/Mietkonto erscheinen in einer
+  eigenen Liste (`EinheitOhneKontoZeile`), NIE als Mietkonto-Zeile mit
+  Saldo 0.
+- Mahnstatus stammt ausschließlich aus dem NEUESTEN bereits
+  gespeicherten `MahnFallTable`-Eintrag je Vertrag (reiner Read); Sperr-
+  gründe kommen unverändert aus `StammdatenRepository.aktive_sperren`.
+  Kein Namens-/Saldo-Heurismus für "strittig" - das Datenmodell kennt
+  bewusst kein solches Feld.
+- Backoffice-Route `/backoffice/` (`dashboard()`) wurde komplett auf
+  diese eine Berechnung umgestellt: Objektfilter, Kennzahlen,
+  Mietkontentabelle, neue Einzelpositionsübersicht und "Einheiten ohne
+  Mietkonto" stammen alle aus DERSELBEN `RueckstandsUebersicht` - keine
+  der vier Ansichten kann dadurch aus dem gefilterten Bestand
+  herausfallen.
