@@ -47,6 +47,24 @@ from mietinkasso.mieweg_vorschau.service import _NIE_INDEXIERBARE_ARTEN
 from mietinkasso.op.service import compute_content_hash
 from mietinkasso.stammdaten.repository import StammdatenRepository
 
+def _anspruchsmonat_start(datum: date) -> date:
+    """Trennt den ANSPRUCHSMONAT (der Kalendermonat, in den die
+    Zahlungspflicht fällt) von der konkreten FÄLLIGKEIT (Tag im Monat,
+    z. B. der 5./15.) - unabhängige Rückprüfung: `VorschreibungService.
+    entwurf_erstellen` liest aktive Komponenten IMMER zum Monatsersten
+    (`faelligkeitsdatum(monat, 1)`), nicht zum Fälligkeitstag. Eine
+    Komponentenwirksamkeit mitten im Monat (z. B. `gueltig_von` = der
+    15.) wäre am Monatsersten desselben Monats noch NICHT aktiv, und die
+    Monatsvorschreibung würde den alten Betrag für den GESAMTEN
+    Anspruchsmonat verwenden. Die TECHNISCHE Komponentenwirksamkeit wird
+    deshalb bewusst auf den 1. des Anspruchsmonats gelegt (keine
+    taggenaue Proration - dieses Repository unterstützt keine anteiligen
+    Monatsbeträge); die tatsächliche Fälligkeit bleibt davon unberührt
+    auf `ErhoehungsschreibenTable.zahlungspflicht_ab` sichtbar."""
+
+    return date(datum.year, datum.month, 1)
+
+
 #: Aus diesen beiden Status darf `umsetzen()` geclaimt werden - BLOCKIERT
 #: ist wie in `outbox_service.py` retryable (z. B. nach einer
 #: nachträglich belegten differenziellen Korrektur einer zuvor
@@ -100,10 +118,25 @@ class IndexSollUmsetzungService:
         except ObjektAusgeschlossenError as exc:
             gruende.append(str(exc))
 
-        if schreiben.zugang_bestaetigt_am is None or schreiben.zahlungspflicht_ab is None:
+        # Codex-Rückprüfung (499c36f, Fund a): ohne einen TATSÄCHLICHEN,
+        # vom Transport bestätigten Versand (versendet_am +
+        # externe_versandreferenz) darf niemals umgesetzt werden - ein
+        # (z. B. synthetisch fehlerhaft) direkt auf SOLL_UMSETZUNG_OFFEN
+        # gesetzter Fall OHNE durchlaufenen Versand ist kein zugegangenes
+        # Schreiben, egal was `zugang_bestaetigt_am` sagt.
+        if schreiben.versendet_am is None or not (schreiben.externe_versandreferenz or "").strip():
             gruende.append(
-                "Kein bestätigter Zugang bzw. keine daraus berechnete Zahlungspflicht vorhanden - "
+                "Kein tatsächlicher Versandbeleg (versendet_am/externe_versandreferenz) vorhanden - "
                 "Voraussetzung für eine Soll-Umsetzung fehlt."
+            )
+        if (
+            schreiben.zugang_bestaetigt_am is None
+            or not (schreiben.zugang_beleg or "").strip()
+            or schreiben.zahlungspflicht_ab is None
+        ):
+            gruende.append(
+                "Kein bestätigter Zugang MIT Belegreferenz bzw. keine daraus berechnete Zahlungspflicht "
+                "vorhanden - Voraussetzung für eine Soll-Umsetzung fehlt."
             )
         elif heute < schreiben.zahlungspflicht_ab:
             gruende.append(
@@ -143,6 +176,21 @@ class IndexSollUmsetzungService:
                     f"{verteilung.get('alter_betrag_cent')} Cent aus) - Stale-Snapshot."
                 )
                 alte_komponente = None
+            elif verteilung.get("neuer_betrag_cent") != (verteilung.get("alter_betrag_cent") or 0) + schreiben.erhoehung_cent:
+                # Codex-Rückprüfung (499c36f, Fund d): der tatsächlich
+                # gebuchte neue Betrag muss EXAKT dem entsprechen, was im
+                # versendeten Schreiben (erhoehung_cent) tatsächlich
+                # mitgeteilt wurde - eine manipulierte/inkonsistente
+                # Verteilung (z. B. ein Tippfehler oder eine spätere
+                # Korrektur nur des Verteilungsfeldes) wird NIE blind
+                # gebucht, selbst wenn Komponenten-ID/Altbetrag noch passen.
+                gruende.append(
+                    f"Gespeicherte Verteilung ist inkonsistent mit dem versendeten Schreiben (alter Betrag "
+                    f"{verteilung.get('alter_betrag_cent')} + erhoehung_cent {schreiben.erhoehung_cent} "
+                    f"ergibt nicht den hinterlegten neuen Betrag {verteilung.get('neuer_betrag_cent')}) - "
+                    "keine Umsetzung auf einem unstimmigen Datensatz."
+                )
+                alte_komponente = None
             elif alte_komponente.art in _NIE_INDEXIERBARE_ARTEN:
                 gruende.append(
                     f"Komponente {alte_komponente.id} hat die Art '{alte_komponente.art}' - BK/HK/USt-"
@@ -168,14 +216,20 @@ class IndexSollUmsetzungService:
         elif profil.status != "FREIGEGEBEN":
             gruende.append(f"Rechtsprofil hat Status '{profil.status}', ist nicht mehr FREIGEGEBEN.")
             profil = None
-        else:
-            aktueller_hash = compute_content_hash(self._rechtsprofil_service._quelle_snapshot(profil, vertrag))
-            if aktueller_hash != profil.quelle_hash:
-                gruende.append(
-                    "Vertrag/Komponenten/Klausel haben sich seit der Rechtsprofil-Freigabe geändert "
-                    "(Stale-Snapshot) - Umsetzung wird gesperrt, keine Umsetzung auf veraltetem Stand."
-                )
-                profil = None
+        elif not self._rechtsprofil_service.ist_noch_gueltig(profil, heute=heute):
+            # Codex-Rückprüfung (499c36f, Fund b): ein reiner Hash-
+            # Vergleich (wie zuvor hier) übersieht eine ABGELAUFENE
+            # `mietzinsobergrenze_gueltig_bis` - `ist_noch_gueltig` prüft
+            # BEIDES (Quelle UND zeitliche Gültigkeit des Obergrenze-
+            # Belegs), exakt wie jede andere reguläre Prüfung dieses
+            # Rechtsprofils (`indexautomatik/service.py`, `outbox_service.
+            # versenden`).
+            gruende.append(
+                "Rechtsprofil ist nicht mehr gültig (Quelle seit Freigabe geändert oder Mietzinsobergrenze-"
+                "Beleg zum heutigen Stichtag abgelaufen) - Umsetzung wird gesperrt, keine Umsetzung auf "
+                "veraltetem/abgelaufenem Stand."
+            )
+            profil = None
 
         if schreiben.zahlungspflicht_ab is not None:
             wirksam_monat = f"{schreiben.zahlungspflicht_ab.year:04d}-{schreiben.zahlungspflicht_ab.month:02d}"
@@ -199,10 +253,23 @@ class IndexSollUmsetzungService:
         if gruende or alte_komponente is None or profil is None:
             return gruende, None
 
+        # Codex-Rückprüfung (499c36f): `VorschreibungService.
+        # entwurf_erstellen` liest aktive Komponenten IMMER zum
+        # Monatsersten - die technische Komponentenwirksamkeit wird
+        # deshalb bewusst auf den Anspruchsmonat gelegt, GETRENNT von der
+        # tatsächlichen (taggenauen) Fälligkeit (siehe
+        # `_anspruchsmonat_start`-Docstring).
+        anspruchsmonat = _anspruchsmonat_start(schreiben.zahlungspflicht_ab)
         plan = {
             "alte_komponente": alte_komponente,
             "neuer_betrag_cent": verteilung["neuer_betrag_cent"],
-            "wirksam_ab": schreiben.zahlungspflicht_ab,
+            "wirksam_ab": anspruchsmonat,
+            "zahlungspflicht_ab": schreiben.zahlungspflicht_ab,
+            # Ein ursprünglich geplantes Enddatum der alten Komponente
+            # (z. B. eine befristete Klausel) darf durch die Umsetzung
+            # NICHT verloren gehen (Codex-Rückprüfung, Fund c) - es wird
+            # unverändert auf die NEUE Komponente übertragen.
+            "urspruengliches_gueltig_bis": alte_komponente.gueltig_bis,
             "profil": profil,
         }
         return [], plan
@@ -346,7 +413,8 @@ class IndexSollUmsetzungService:
 
             alte_komponente: VertragsKomponenteTable = plan["alte_komponente"]
             neuer_betrag_cent: int = plan["neuer_betrag_cent"]
-            wirksam_ab: date = plan["wirksam_ab"]
+            wirksam_ab: date = plan["wirksam_ab"]  # Anspruchsmonat-Start (Monatserster)
+            urspruengliches_gueltig_bis: date | None = plan["urspruengliches_gueltig_bis"]
             profil: RechtsprofilTable = plan["profil"]
 
             # Historisierung (append-only, wie überall in diesem
@@ -365,20 +433,42 @@ class IndexSollUmsetzungService:
                 ust_satz_promille=alte_komponente.ust_satz_promille,
                 indexierbar=alte_komponente.indexierbar,
                 gueltig_von=wirksam_ab,
-                gueltig_bis=None,
+                # Codex-Rückprüfung (499c36f, Fund c): ein ursprünglich
+                # geplantes Enddatum der alten Komponente (z. B. eine
+                # befristete Klausel) darf durch die Umsetzung NICHT
+                # stillschweigend zu "unbefristet" werden - es wird
+                # unverändert auf die neue Komponente übertragen.
+                gueltig_bis=urspruengliches_gueltig_bis,
                 session=session,
             )
 
             # Neue Rechtsprofil-VERSION (nie in-place) - die für DIESES
             # Schreiben tatsächlich verwendete alte Version bleibt
             # unverändert nachvollziehbar. basis_komponenten_ids zeigt
-            # jetzt auf die NEUE Komponente; bezugsjahr wird beim
-            # MieWeG-Pfad auf das verarbeitete Bewertungsjahr
-            # vorgezogen, damit `_monatslauf_mieweg` den nächsten Zyklus
-            # nicht dauerhaft mit TERMIN_NICHT_ERREICHT blockiert (der
-            # Geschäftsraum-/Klausel-Pfad hat kein `ziel_bewertungsjahr`
-            # und damit auch kein analoges Gate - `bezugsjahr` bleibt
-            # dort unverändert).
+            # jetzt auf die NEUE Komponente. Beim MieWeG-Pfad werden
+            # bezugsjahr/-monat/letzte_basis_war_jahresdurchschnitt
+            # gemeinsam auf die neue Jahresbasis fortgeschrieben (Codex-
+            # Rückprüfung 499c36f: "bezugsmonat/letzte_basis_war_
+            # jahresdurchschnitt müssen konsistent fortgeführt werden,
+            # keine wiederholte Erstjahres-Aliquotierung") -
+            # `letzte_basis_war_jahresdurchschnitt=True` UND
+            # `bezugsmonat=12` signalisieren dem nächsten Zyklus, dass die
+            # neue Basis ein VOLLES Jahr abbildet (siehe
+            # `mieweg_vorschau/berechnung.py::berechne_gesetzliche_
+            # hoechstgrenze`: der `anteil`-Faktor < 1 gilt AUSSCHLIESSLICH
+            # für das allererste, u. U. unterjährige Bezugsjahr - würde
+            # `bezugsmonat` auf dem ursprünglichen, u. U. unterjährigen
+            # Wert stehen bleiben, würde diese Aliquotierung beim
+            # nächsten automatischen Zyklus fälschlich ERNEUT angewandt).
+            # Der Geschäftsraum-/Klausel-Pfad hat kein `ziel_bewertungsjahr`
+            # und damit kein analoges Gate - alle drei Felder bleiben dort
+            # unverändert.
+            ist_mieweg_pfad = frisches_schreiben.ziel_bewertungsjahr is not None
+            neues_bezugsjahr = frisches_schreiben.ziel_bewertungsjahr if ist_mieweg_pfad else profil.bezugsjahr
+            neuer_bezugsmonat = 12 if ist_mieweg_pfad else profil.bezugsmonat
+            neue_letzte_basis_war_jahresdurchschnitt = (
+                True if ist_mieweg_pfad else profil.letzte_basis_war_jahresdurchschnitt
+            )
             neue_basis_ids = sorted(
                 {
                     (neue_komponente_id if kid == alte_komponente.id else kid)
@@ -400,9 +490,9 @@ class IndexSollUmsetzungService:
                 mietzinsobergrenze_cent=profil.mietzinsobergrenze_cent,
                 mietzinsobergrenze_quellenbeleg=profil.mietzinsobergrenze_quellenbeleg,
                 mietzinsobergrenze_gueltig_bis=profil.mietzinsobergrenze_gueltig_bis,
-                bezugsjahr=frisches_schreiben.ziel_bewertungsjahr or profil.bezugsjahr,
-                bezugsmonat=profil.bezugsmonat,
-                letzte_basis_war_jahresdurchschnitt=profil.letzte_basis_war_jahresdurchschnitt,
+                bezugsjahr=neues_bezugsjahr,
+                bezugsmonat=neuer_bezugsmonat,
+                letzte_basis_war_jahresdurchschnitt=neue_letzte_basis_war_jahresdurchschnitt,
                 basis_komponenten_ids=neue_basis_ids,
                 vpi_reihe=profil.vpi_reihe,
                 vertraglich_zulaessiger_betrag_cent=profil.vertraglich_zulaessiger_betrag_cent,

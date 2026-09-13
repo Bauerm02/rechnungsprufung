@@ -487,6 +487,26 @@ def test_mehrkomponenten_werden_vor_versand_blockiert(admin_ctx, basis_vertrag, 
     assert any("Mehr" in g for g in schreiben.blockiert_gruende)
     assert schreiben.komponenten_verteilung == {}
 
+    # Codex-Rückprüfung (499c36f): nach behobener Quelle (hier: nur noch
+    # EINE statt zwei referenzierte Komponenten) muss ein Retry über
+    # `bestehende_id` die VERALTETE (leere) `komponenten_verteilung`
+    # durch die frisch berechnete ersetzen - nicht stillschweigend leer
+    # lassen.
+    debitor = stammdaten_repo.get_debitor(vertrag.debitor_id)
+    stammdaten_repo.upsert_debitor(id=debitor.id, name=debitor.name, email=debitor.email, adresse="Corsogasse 1/3, 1010 Wien")
+    komponente = stammdaten_repo.get_komponente("K-1")
+    erneuert = outbox_service.erstellen_aus_mieweg(
+        ctx=admin_ctx, vertrag=vertrag, profil=profil, vorschau=vorschau, ziel_bewertungsjahr=2026,
+        massgeblicher_termin=date(2026, 4, 1), erhoehung_cent=1000, aktuell_verrechnet_cent=100_000,
+        referenzierte_komponenten=[komponente], unveraenderte_komponenten=[], akteur="test",
+        bestehende_id=schreiben.id,
+    )
+    assert erneuert.id == schreiben.id
+    assert erneuert.status == "BEREIT"
+    assert erneuert.komponenten_verteilung == {
+        "komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 101_000,
+    }
+
 
 def test_erstellen_aus_mieweg_befuellt_komponenten_verteilung_bei_genau_einer_komponente(
     admin_ctx, basis_vertrag, outbox_service, rechtsprofil_service, stammdaten_repo

@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -1329,6 +1329,7 @@ def test_indexautomatik_soll_umsetzung_liste_vorschau_und_flag_gesperrt(backoffi
             vertrag_id="V-601-SOLLUMS", ziel_bewertungsjahr=2026, rechtsprofil_id=profil.id,
             rechtsprofil_version=profil.version, status="SOLL_UMSETZUNG_OFFEN", massgeblicher_termin=date(2026, 4, 1),
             erhoehung_cent=1000, schreiben_text="Test", idempotenzschluessel="V-601-SOLLUMS:mieweg:2026",
+            versendet_am=datetime(2026, 3, 15, 9, 0, tzinfo=timezone.utc), externe_versandreferenz="MAILOPS-TEST-1",
             zugangsform="EINSCHREIBEN", zugang_bestaetigt_am=date(2026, 4, 1), zugang_beleg="RSb-1",
             zahlungspflicht_ab=date(2026, 4, 15), empfaenger_snapshot={"debitor_id": "DEB-1"},
             komponenten_verteilung={

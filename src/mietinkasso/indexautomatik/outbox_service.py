@@ -168,6 +168,12 @@ class ErhoehungsschreibenOutboxService:
                 rechtsprofil_version=row.rechtsprofil_version,
                 mieweg_vorschau_id=row.mieweg_vorschau_id,
                 empfaenger_snapshot=row.empfaenger_snapshot,
+                # Codex-Rückprüfung (499c36f): fehlte hier - ein erneuter
+                # Entwurf nach behobener Blockierursache behielt sonst die
+                # ALTE (ggf. leere, weil zuvor mehrkomponenten-blockierte)
+                # Verteilung, obwohl `row.komponenten_verteilung` bereits
+                # die frisch berechnete, aktuelle Zuordnung trägt.
+                komponenten_verteilung=row.komponenten_verteilung,
             )
         return self._repository.anlegen(row)
 

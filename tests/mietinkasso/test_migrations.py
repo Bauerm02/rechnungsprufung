@@ -253,5 +253,10 @@ def test_ensure_additive_columns_bei_frischer_db_no_op():
         engine = sa.create_engine(f"sqlite:///{tmp}/frisch.db", future=True)
         from mietinkasso.infrastructure.db.base import Base
 
-        Base.metadata.create_all(engine)
-        assert ensure_additive_columns(engine) == []
+        try:
+            Base.metadata.create_all(engine)
+            assert ensure_additive_columns(engine) == []
+        finally:
+            # Ohne dispose() bleibt die Datei-Handle unter Windows offen und
+            # blockiert TemporaryDirectory beim Aufräumen (PermissionError).
+            engine.dispose()

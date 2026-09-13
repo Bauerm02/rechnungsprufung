@@ -13,18 +13,21 @@ Transaktionsatomarität bei einem Fehler mitten in der Umsetzung."""
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 from sqlalchemy import select, update as sa_update
 
 from mietinkasso.domain.exceptions import CrossTenantError
 from mietinkasso.index.repository import IndexRepository
+from mietinkasso.indexautomatik.outbox_service import ErhoehungsschreibenOutboxService
 from mietinkasso.indexautomatik.rechtsprofil import RechtsprofilService
 from mietinkasso.indexautomatik.repository import ErhoehungsschreibenRepository, RechtsprofilRepository
+from mietinkasso.indexautomatik.transport import FakeTransportadapter
 from mietinkasso.indexautomatik.umsetzung_service import IndexSollUmsetzungService
 from mietinkasso.infrastructure.db.tables import ErhoehungsschreibenTable, IndexSollUmsetzungTable, RechtsprofilTable
 from mietinkasso.vorschreibung.repository import VorschreibungRepository
+from mietinkasso.vorschreibung.service import VorschreibungService
 
 
 @pytest.fixture
@@ -57,16 +60,33 @@ def umsetzung_service(session_factory, stammdaten_repo, rechtsprofil_service, ou
     )
 
 
-def _profil_und_komponente(admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag, *, komponente_id="K-1"):
+@pytest.fixture
+def outbox_service(outbox_repo, stammdaten_repo, rechtsprofil_repo, rechtsprofil_service) -> ErhoehungsschreibenOutboxService:
+    return ErhoehungsschreibenOutboxService(
+        outbox_repo, stammdaten_repo, rechtsprofil_repo, rechtsprofil_service, jlb_signatur="JLB Projects GmbH"
+    )
+
+
+@pytest.fixture
+def vorschreibung_service(session_factory, stammdaten_repo, op_service) -> VorschreibungService:
+    return VorschreibungService(VorschreibungRepository(session_factory), stammdaten_repo, op_service)
+
+
+def _profil_und_komponente(
+    admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag, *,
+    komponente_id="K-1", komponente_gueltig_bis=None, bezugsjahr=2024, bezugsmonat=1,
+    letzte_basis_war_jahresdurchschnitt=False,
+):
     stammdaten_repo.add_komponente(
         id=komponente_id, vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=100_000,
-        indexierbar=True, gueltig_von=date(2024, 1, 1),
+        indexierbar=True, gueltig_von=date(2024, 1, 1), gueltig_bis=komponente_gueltig_bis,
     )
     entwurf = rechtsprofil_service.entwurf_anlegen(
         ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_VOLL", ist_wohnungsnutzung=True,
         mrg_zinsbeschraenkung=False, ist_altvertrag=False, ist_hauptmiete=True, foerderbindung=False,
         mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
-        bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=[komponente_id],
+        bezugsjahr=bezugsjahr, bezugsmonat=bezugsmonat, letzte_basis_war_jahresdurchschnitt=letzte_basis_war_jahresdurchschnitt,
+        basis_komponenten_ids=[komponente_id],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
         vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz=None,
         erstellt_von="markus",
@@ -82,20 +102,35 @@ def _soll_umsetzung_offenes_schreiben(
     komponente_id="K-1",
     alter_betrag_cent=100_000,
     erhoehung_cent=1_000,
+    ziel_bewertungsjahr=2026,
     zahlungspflicht_ab=date(2026, 4, 15),
     zugang_bestaetigt_am=date(2026, 4, 1),
+    versendet_am=datetime(2026, 3, 15, 9, 0, tzinfo=timezone.utc),
+    externe_versandreferenz="MAILOPS-TEST-1",
 ) -> ErhoehungsschreibenTable:
+    """Direkt konstruierte Zeile für gezielte Unit-Tests EINZELNER
+    Validierungszweige (Stale-Snapshot, falscher Mandant, ...) - der
+    tatsächliche Versand-/Zugangs-Ablauf über `outbox_service` selbst
+    wird separat, End-to-End, in
+    `test_umsetzen_end_to_end_ueber_echten_versand_und_zugang` geprüft
+    (Codex-Rückprüfung 499c36f: "tatsächlichen Versand + qualifizierten
+    Zugang vollständig prüfen"). `versendet_am`/`externe_versandreferenz`
+    sind hier bewusst PFLICHTPARAMETER-artig mit realistischen Default-
+    werten belegt, nicht mehr stillschweigend leer wie zuvor."""
+
     return outbox_repo.anlegen(
         ErhoehungsschreibenTable(
             vertrag_id=vertrag.id,
-            ziel_bewertungsjahr=2026,
+            ziel_bewertungsjahr=ziel_bewertungsjahr,
             rechtsprofil_id=profil.id,
             rechtsprofil_version=profil.version,
             status="SOLL_UMSETZUNG_OFFEN",
-            massgeblicher_termin=date(2026, 4, 1),
+            massgeblicher_termin=date(ziel_bewertungsjahr, 4, 1),
             erhoehung_cent=erhoehung_cent,
             schreiben_text="Testschreiben",
-            idempotenzschluessel=f"{vertrag.id}:mieweg:2026",
+            idempotenzschluessel=f"{vertrag.id}:mieweg:{ziel_bewertungsjahr}",
+            versendet_am=versendet_am,
+            externe_versandreferenz=externe_versandreferenz,
             zugangsform="EINSCHREIBEN",
             zugang_bestaetigt_am=zugang_bestaetigt_am,
             zugang_beleg="RSb-1",
@@ -131,13 +166,16 @@ def test_umsetzen_erfolgreich_historisiert_komponente_und_neues_rechtsprofil(
     assert aktualisiertes_schreiben.status == "SOLL_UMGESETZT"
 
     alte_komponente = stammdaten_repo.get_komponente("K-1")
-    assert alte_komponente.gueltig_bis == date(2026, 4, 14)
+    # Anspruchsmonat = April (zahlungspflicht_ab=15.4.) - die technische
+    # Komponentenwirksamkeit liegt bewusst auf dem Monatsersten (siehe
+    # `_anspruchsmonat_start`), NICHT auf dem taggenauen 15.4.
+    assert alte_komponente.gueltig_bis == date(2026, 3, 31)
     assert alte_komponente.betrag_cent == 100_000  # NIE in-place geändert
 
     neue_komponente = stammdaten_repo.get_komponente(ergebnis.neue_komponente_id)
     assert neue_komponente is not None
     assert neue_komponente.betrag_cent == 101_000
-    assert neue_komponente.gueltig_von == date(2026, 4, 15)
+    assert neue_komponente.gueltig_von == date(2026, 4, 1)
     assert neue_komponente.gueltig_bis is None
     assert neue_komponente.art == "HMZ"
 
@@ -162,7 +200,7 @@ def test_umsetzen_erfolgreich_historisiert_komponente_und_neues_rechtsprofil(
         assert zeile.status == "UMGESETZT"
         assert zeile.neue_komponente_id == ergebnis.neue_komponente_id
         assert zeile.beendete_komponente_id == "K-1"
-        assert zeile.wirksam_ab == date(2026, 4, 15)
+        assert zeile.wirksam_ab == date(2026, 4, 1)
 
 
 def test_umsetzen_bei_deaktiviertem_flag_bleibt_ohne_wirkung(
@@ -271,7 +309,7 @@ def test_umsetzen_stale_snapshot_rechtsprofil_seither_invalidiert_blockiert(
     ergebnis = umsetzung_service.umsetzen(ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 4, 20), akteur="markus", soll_umsetzung_enabled=True)
 
     assert ergebnis.status == "BLOCKIERT"
-    assert any("Rechtsprofil-Freigabe geändert" in g for g in ergebnis.gruende)
+    assert any("Rechtsprofil ist nicht mehr gültig" in g for g in ergebnis.gruende)
     assert rechtsprofil_repo.get(profil.id).status == "FREIGEGEBEN"  # unverändert, keine stille Invalidierung durch umsetzen()
 
 
@@ -376,3 +414,234 @@ def test_umsetzen_transaktion_bricht_bei_fehler_vollstaendig_ab(
     monkeypatch.undo()
     ergebnis = umsetzung_service.umsetzen(ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 4, 20), akteur="markus", soll_umsetzung_enabled=True)
     assert ergebnis.status == "UMGESETZT"
+
+
+def test_umsetzen_ohne_versandbeleg_wird_blockiert(
+    admin_ctx, basis_vertrag, umsetzung_service, outbox_repo, rechtsprofil_service, stammdaten_repo
+):
+    """Codex-Rückprüfung (499c36f, Fund a): ein Fall OHNE tatsächlichen,
+    vom Transport bestätigten Versand (versendet_am/
+    externe_versandreferenz) darf nie umgesetzt werden - unabhängig
+    davon, was `zugang_bestaetigt_am` sagt."""
+
+    vertrag, _konto = basis_vertrag
+    profil = _profil_und_komponente(admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag)
+    schreiben = _soll_umsetzung_offenes_schreiben(outbox_repo, vertrag, profil, versendet_am=None, externe_versandreferenz=None)
+
+    ergebnis = umsetzung_service.umsetzen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 4, 20), akteur="markus",
+        soll_umsetzung_enabled=True,
+    )
+
+    assert ergebnis.status == "BLOCKIERT"
+    assert any("Versandbeleg" in g for g in ergebnis.gruende)
+    assert stammdaten_repo.get_komponente("K-1").betrag_cent == 100_000
+
+
+def test_umsetzen_bei_abgelaufener_mietzinsobergrenze_blockiert(
+    admin_ctx, basis_vertrag, umsetzung_service, outbox_repo, rechtsprofil_service, rechtsprofil_repo, stammdaten_repo
+):
+    """Codex-Rückprüfung (499c36f, Fund b): ein reiner Hash-Vergleich
+    übersieht eine seither VERSTRICHENE `mietzinsobergrenze_gueltig_bis`
+    - `ist_noch_gueltig()` deckt das jetzt ab."""
+
+    vertrag, _konto = basis_vertrag
+    profil = _profil_und_komponente(admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag)
+    with stammdaten_repo._session_factory() as session:
+        row = session.get(RechtsprofilTable, profil.id)
+        row.mietzinsobergrenze_cent = 150_000
+        row.mietzinsobergrenze_quellenbeleg = "Förderzusicherung"
+        row.mietzinsobergrenze_gueltig_bis = date(2026, 4, 10)
+        session.commit()
+
+    schreiben = _soll_umsetzung_offenes_schreiben(outbox_repo, vertrag, profil)
+
+    ergebnis = umsetzung_service.umsetzen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 4, 20), akteur="markus",
+        soll_umsetzung_enabled=True,
+    )
+
+    assert ergebnis.status == "BLOCKIERT"
+    assert any("abgelaufen" in g for g in ergebnis.gruende)
+    assert stammdaten_repo.get_komponente("K-1").betrag_cent == 100_000
+
+
+def test_umsetzen_bewahrt_urspruengliches_enddatum_der_alten_komponente(
+    admin_ctx, basis_vertrag, umsetzung_service, outbox_repo, rechtsprofil_service, stammdaten_repo
+):
+    """Codex-Rückprüfung (499c36f, Fund c): die alte Komponente hat ein
+    ursprünglich geplantes Enddatum (z. B. eine befristete Klausel) -
+    das darf durch die Umsetzung nicht zu "unbefristet" werden, sondern
+    muss auf die neue Komponente übertragen werden."""
+
+    vertrag, _konto = basis_vertrag
+    profil = _profil_und_komponente(
+        admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag, komponente_gueltig_bis=date(2026, 6, 30)
+    )
+
+    schreiben = _soll_umsetzung_offenes_schreiben(outbox_repo, vertrag, profil)
+    ergebnis = umsetzung_service.umsetzen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 4, 20), akteur="markus",
+        soll_umsetzung_enabled=True,
+    )
+
+    assert ergebnis.status == "UMGESETZT"
+    alte_komponente = stammdaten_repo.get_komponente("K-1")
+    assert alte_komponente.gueltig_bis == date(2026, 3, 31)  # letzter Tag vor dem Anspruchsmonat
+    neue_komponente = stammdaten_repo.get_komponente(ergebnis.neue_komponente_id)
+    assert neue_komponente.gueltig_bis == date(2026, 6, 30)  # ursprüngliches Enddatum erhalten
+
+
+def test_umsetzen_manipulierte_verteilung_wird_blockiert(
+    admin_ctx, basis_vertrag, umsetzung_service, outbox_repo, rechtsprofil_service, stammdaten_repo
+):
+    """Codex-Rückprüfung (499c36f, Fund d): `neuer_betrag_cent` muss
+    exakt `alter_betrag_cent + erhoehung_cent` entsprechen - eine
+    abweichende/manipulierte Verteilung wird nie blind gebucht."""
+
+    vertrag, _konto = basis_vertrag
+    profil = _profil_und_komponente(admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag)
+    schreiben = outbox_repo.anlegen(
+        ErhoehungsschreibenTable(
+            vertrag_id=vertrag.id, ziel_bewertungsjahr=2026, rechtsprofil_id=profil.id,
+            rechtsprofil_version=profil.version, status="SOLL_UMSETZUNG_OFFEN", massgeblicher_termin=date(2026, 4, 1),
+            erhoehung_cent=1_000, schreiben_text="Testschreiben", idempotenzschluessel=f"{vertrag.id}:mieweg:2026",
+            versendet_am=datetime(2026, 3, 15, 9, 0, tzinfo=timezone.utc), externe_versandreferenz="MAILOPS-TEST-1",
+            zugangsform="EINSCHREIBEN", zugang_bestaetigt_am=date(2026, 4, 1), zugang_beleg="RSb-1",
+            zahlungspflicht_ab=date(2026, 4, 15), empfaenger_snapshot={"debitor_id": vertrag.debitor_id},
+            komponenten_verteilung={"komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 999_999},
+        )
+    )
+
+    ergebnis = umsetzung_service.umsetzen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 4, 20), akteur="markus",
+        soll_umsetzung_enabled=True,
+    )
+
+    assert ergebnis.status == "BLOCKIERT"
+    assert any("inkonsistent" in g for g in ergebnis.gruende)
+    assert stammdaten_repo.get_komponente("K-1").betrag_cent == 100_000
+
+
+def test_umsetzen_end_to_end_ueber_echten_versand_und_zugang_und_vorschreibung(
+    admin_ctx, basis_vertrag, umsetzung_service, outbox_service, outbox_repo, rechtsprofil_service, stammdaten_repo,
+    vorschreibung_service, op_service,
+):
+    """Codex-Rückprüfung (499c36f): End-to-End über den ECHTEN Versand-/
+    Zugangs-Ablauf (`outbox_service.versenden`/`zugang_bestaetigen`/
+    `taegliche_pflege`), nicht nur eine direkt konstruierte Zeile - UND
+    Nachweis über eine echte `VorschreibungService.entwurf_erstellen`,
+    dass der Anspruchsmonat tatsächlich den NEUEN Betrag verwendet
+    (Komponentenwirksamkeit korrekt auf den Monatsersten gelegt)."""
+
+    vertrag, konto = basis_vertrag
+    profil = _profil_und_komponente(admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag)
+    debitor = stammdaten_repo.get_debitor(vertrag.debitor_id)
+    stammdaten_repo.upsert_debitor(id=debitor.id, name=debitor.name, email=debitor.email, adresse="Corsogasse 1/3, 1010 Wien")
+
+    schreiben = outbox_repo.anlegen(
+        ErhoehungsschreibenTable(
+            vertrag_id=vertrag.id, ziel_bewertungsjahr=2026, rechtsprofil_id=profil.id,
+            rechtsprofil_version=profil.version, status="BEREIT", massgeblicher_termin=date(2026, 3, 1),
+            erhoehung_cent=1_000, schreiben_text="Testschreiben", idempotenzschluessel=f"{vertrag.id}:mieweg:2026",
+            empfaenger_snapshot={
+                "debitor_id": vertrag.debitor_id, "name": debitor.name, "adresse": "Corsogasse 1/3, 1010 Wien",
+                "email": debitor.email, "vertrag_gueltig_bis": None, "vertrag_rechtsordnung": vertrag.rechtsordnung,
+                "komponenten_snapshot": [
+                    {
+                        "id": "K-1", "betrag_cent": 100_000, "art": "HMZ", "ust_satz_promille": 10_000,
+                        "gueltig_von": "2024-01-01", "gueltig_bis": None,
+                    }
+                ],
+            },
+            komponenten_verteilung={"komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 101_000},
+        )
+    )
+
+    versand = outbox_service.versenden(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 3, 1), send_enabled=True,
+        mailops_allowlist_bestaetigt=True, transport=FakeTransportadapter(),
+    )
+    assert versand.status == "GESENDET"
+
+    zugang = outbox_service.zugang_bestaetigen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 3, 5), zugang_datum=date(2026, 3, 1),
+        zugangsform="EINSCHREIBEN_RUECKSCHEIN", zugang_beleg="Rückschein Post AG Nr. 123",
+    )
+    assert zugang.status == "ZUGANG_BESTAETIGT"
+    zahlungspflicht_ab = zugang.zahlungspflicht_ab
+    assert zahlungspflicht_ab is not None
+
+    faellige = outbox_service.taegliche_pflege(heute=zahlungspflicht_ab)
+    assert len(faellige) == 1
+    assert outbox_repo.get(schreiben.id).status == "SOLL_UMSETZUNG_OFFEN"
+
+    ergebnis = umsetzung_service.umsetzen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=zahlungspflicht_ab, akteur="markus",
+        soll_umsetzung_enabled=True,
+    )
+    assert ergebnis.status == "UMGESETZT"
+
+    anspruchsmonat = f"{zahlungspflicht_ab.year:04d}-{zahlungspflicht_ab.month:02d}"
+    vorschreibungs_ergebnis = vorschreibung_service.entwurf_erstellen(ctx=admin_ctx, vertrag=vertrag, monat=anspruchsmonat)
+    assert vorschreibungs_ergebnis.summe_cent == 101_000  # NICHT mehr der alte Betrag (100_000)
+
+
+def test_umsetzen_zwei_aufeinanderfolgende_jahreszyklen_ohne_wiederholte_aliquotierung(
+    admin_ctx, basis_vertrag, umsetzung_service, outbox_repo, rechtsprofil_repo, rechtsprofil_service, stammdaten_repo,
+    vorschreibung_service,
+):
+    """Codex-Rückprüfung (499c36f): nach einer echten Umsetzung muss
+    bezugsjahr/-monat/letzte_basis_war_jahresdurchschnitt so
+    fortgeschrieben werden, dass ein ZWEITER, unmittelbar folgender
+    Zyklus NICHT erneut die (nur für das allererste Bezugsjahr gültige)
+    unterjährige Aliquotierung anwendet (`mieweg_vorschau/berechnung.py`:
+    `anteil < 1` nur für `ist_erstes_jahr`)."""
+
+    vertrag, _konto = basis_vertrag
+    # Ursprüngliches Profil: unterjähriger erster Bezug (Bezugsmonat 7 -
+    # ein NEUER Vertrag/Komponente, noch KEIN Jahresdurchschnitt).
+    profil = _profil_und_komponente(
+        admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag,
+        bezugsjahr=2024, bezugsmonat=7, letzte_basis_war_jahresdurchschnitt=False,
+    )
+
+    schreiben_1 = _soll_umsetzung_offenes_schreiben(
+        outbox_repo, vertrag, profil, alter_betrag_cent=100_000, erhoehung_cent=1_000,
+        zahlungspflicht_ab=date(2026, 4, 15), zugang_bestaetigt_am=date(2026, 4, 1),
+    )
+    ergebnis_1 = umsetzung_service.umsetzen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben_1.id, heute=date(2026, 4, 20), akteur="markus",
+        soll_umsetzung_enabled=True,
+    )
+    assert ergebnis_1.status == "UMGESETZT"
+
+    neues_profil_1 = rechtsprofil_repo.get(ergebnis_1.neues_rechtsprofil_id)
+    assert neues_profil_1.bezugsjahr == 2026
+    assert neues_profil_1.bezugsmonat == 12
+    assert neues_profil_1.letzte_basis_war_jahresdurchschnitt is True
+
+    # ZWEITER Zyklus, unmittelbar im Folgejahr: eine neue Erhöhung auf
+    # Basis der NEUEN Komponente/des NEUEN Profils.
+    schreiben_2 = _soll_umsetzung_offenes_schreiben(
+        outbox_repo, vertrag, neues_profil_1, komponente_id=ergebnis_1.neue_komponente_id,
+        alter_betrag_cent=101_000, erhoehung_cent=2_000, ziel_bewertungsjahr=2027,
+        zahlungspflicht_ab=date(2027, 4, 15), zugang_bestaetigt_am=date(2027, 4, 1),
+        versendet_am=datetime(2027, 3, 15, 9, 0, tzinfo=timezone.utc), externe_versandreferenz="MAILOPS-TEST-2",
+    )
+    ergebnis_2 = umsetzung_service.umsetzen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben_2.id, heute=date(2027, 4, 20), akteur="markus",
+        soll_umsetzung_enabled=True,
+    )
+    assert ergebnis_2.status == "UMGESETZT"
+
+    neues_profil_2 = rechtsprofil_repo.get(ergebnis_2.neues_rechtsprofil_id)
+    assert neues_profil_2.bezugsjahr == 2027
+    assert neues_profil_2.bezugsmonat == 12
+    assert neues_profil_2.letzte_basis_war_jahresdurchschnitt is True
+
+    neue_komponente_2 = stammdaten_repo.get_komponente(ergebnis_2.neue_komponente_id)
+    assert neue_komponente_2.betrag_cent == 103_000
+
+    vorschreibungs_ergebnis = vorschreibung_service.entwurf_erstellen(ctx=admin_ctx, vertrag=vertrag, monat="2027-04")
+    assert vorschreibungs_ergebnis.summe_cent == 103_000

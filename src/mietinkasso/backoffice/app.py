@@ -2567,7 +2567,23 @@ def indexautomatik_soll_umsetzung(request: Request, session=Depends(_current_ses
     Komponenten-/Rechtsprofiländerung, siehe umsetzung_service.py). GET
     ist rein lesend - keine Statusänderung, kein Claim."""
 
-    alle = [o for o in _indexautomatik.outbox_repository.liste_alle() if o.status in _SOLL_UMSETZUNG_STATUS]
+    # Codex-Rückprüfung (499c36f): "listet ungefiltert alle Gesellschaften
+    # statt ctx-Scope" - `_ctx(session)` ist im aktuellen Ein-Operator-
+    # Pilotmodul zwar immer ADMIN/gesellschaft_ids=None (siehe `_ctx`-
+    # Docstring), aber der Filter gehört trotzdem hierher, konsistent mit
+    # jeder anderen Listenroute über mehrere Verträge
+    # (`indexautomatik/service.py::monatslauf_alle`,
+    # `vertragsende_service.py::plane_alle`) - kein stillschweigend
+    # ausgelassener Scope-Check, der bei einer künftigen Mehrbenutzer-
+    # Rolle sofort zur Datenlücke würde.
+    ctx = _ctx(session)
+    alle = [
+        o
+        for o in _indexautomatik.outbox_repository.liste_alle()
+        if o.status in _SOLL_UMSETZUNG_STATUS
+        and (vertrag := _stammdaten_repo.get_vertrag(o.vertrag_id)) is not None
+        and ctx.has_zugriff(vertrag.gesellschaft_id)
+    ]
     zeilen = "".join(_soll_umsetzung_zeile_html(o) for o in alle) or (
         '<tr><td colspan=6 class="muted">Kein Fall mit fälliger/bereits umgesetzter Soll-Umsetzung.</td></tr>'
     )

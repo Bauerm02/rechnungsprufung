@@ -1359,6 +1359,86 @@ ist und WAS ES BEWUSST NICHT TUT.
   Korrekturbuchung zu erfinden; die tatsächliche Korrektur bleibt ein
   dokumentierter, manueller Folgeschritt.
 
+### Codex-Rückprüfung Commit 499c36f — behoben
+
+Unabhängige Gegenproben gegen den ersten Soll-Umsetzung-Commit fanden
+mehrere reale Buchungsfehler, alle in einem Nachfolgecommit auf
+demselben Branch behoben, mit dediziertem Regressionstest je Fund:
+
+- **(a) Fehlender Versandbeleg wurde nicht geprüft**: `umsetzen()`
+  verlangte bisher nur einen bestätigten Zugang, nicht den tatsächlichen
+  Versandnachweis (`versendet_am`/`externe_versandreferenz`) - ein
+  (z. B. fehlerhaft) direkt auf `SOLL_UMSETZUNG_OFFEN` gesetzter Fall
+  ohne echten Versand wurde umgesetzt. Jetzt Pflichtprüfung.
+- **(b) Abgelaufene Mietzinsobergrenze wurde übersehen**: die Stale-
+  Snapshot-Prüfung verglich nur einen Content-Hash, nicht die zeitliche
+  Gültigkeit (`mietzinsobergrenze_gueltig_bis`) - jetzt über
+  `RechtsprofilService.ist_noch_gueltig()` (identisch zu jeder anderen
+  Prüfung dieses Rechtsprofils) abgedeckt.
+- **(c) Ein geplantes Enddatum der alten Komponente ging verloren**: die
+  neue Komponente bekam unabhängig vom Ausgangszustand immer
+  `gueltig_bis=None` - ein ursprünglich befristetes Enddatum wird jetzt
+  unverändert auf die neue Komponente übertragen.
+- **(d) Der gebuchte neue Betrag wurde nicht gegen das versendete
+  Schreiben verifiziert**: `komponenten_verteilung.neuer_betrag_cent`
+  wurde ungeprüft übernommen - jetzt Pflichtabgleich gegen
+  `alter_betrag_cent + erhoehung_cent`.
+- **Anspruchsmonat/Fälligkeit/technische Komponentenwirksamkeit waren
+  vermischt**: `VorschreibungService.entwurf_erstellen` liest aktive
+  Komponenten IMMER zum Monatsersten - eine Komponentenwirksamkeit
+  mitten im Monat (taggenaue `zahlungspflicht_ab`, z. B. der 5./15.)
+  hätte im Anspruchsmonat selbst noch den ALTEN Betrag verwendet. Die
+  technische Wirksamkeit liegt jetzt bewusst auf dem 1. des
+  Anspruchsmonats (`_anspruchsmonat_start`); die tatsächliche Fälligkeit
+  bleibt separat auf dem Erhöhungsschreiben sichtbar. Ein End-to-End-Test
+  über eine echte `VorschreibungService.entwurf_erstellen` belegt das.
+- **Wiederholte Erstjahres-Aliquotierung im Folgezyklus drohte**:
+  `bezugsjahr` wurde nach einer Umsetzung fortgeschrieben, `bezugsmonat`/
+  `letzte_basis_war_jahresdurchschnitt` aber nicht - ein unmittelbar
+  folgender zweiter Zyklus hätte die (nur für das allererste,
+  unterjährige Bezugsjahr gültige) Aliquotierung
+  (`mieweg_vorschau/berechnung.py`) fälschlich ein zweites Mal
+  angewendet. Jetzt werden alle drei Felder beim MieWeG-Pfad gemeinsam
+  auf die neue Jahresbasis (`bezugsmonat=12`,
+  `letzte_basis_war_jahresdurchschnitt=True`) fortgeschrieben, mit einem
+  Zwei-Zyklen-End-to-End-Test.
+- **`outbox_service._entwurf_speichern` aktualisierte
+  `komponenten_verteilung` bei einem Retry (`bestehende_id`) nicht** -
+  ein zuvor mehrkomponenten-blockierter, dann behobener Entwurf behielt
+  die alte/leere Verteilung. Jetzt mit übernommen.
+- **Backoffice-Liste `/indexautomatik/soll-umsetzung` filterte nicht
+  nach Gesellschaftsscope** (anders als `monatslauf_alle`/`plane_alle`)
+  - im aktuellen Ein-Operator-Pilotmodul (`_ctx()` ist immer
+  ADMIN/`gesellschaft_ids=None`) praktisch folgenlos, aber ohne den
+  Filter wäre eine künftige Mehrbenutzer-Rolle sofort eine Datenlücke.
+  Jetzt mit demselben `ctx.has_zugriff(...)`-Muster gefiltert.
+
+Weiterhin OFFEN aus derselben Rückprüfung, noch NICHT umgesetzt (siehe
+Codex-Formulierung, geplant als eigener Folgecommit):
+
+- **Mehrkomponenten-Verteilung bleibt vollständig gesperrt.** Ein Fall
+  mit z. B. HMZ+Küche beauftragt bleibt weiterhin komplett blockiert
+  (keine erfundene Verteilungsregel) - eine explizite, centgenaue
+  Verteilung auf MEHRERE Komponenten ist noch nicht implementiert.
+- **Geschäftsraum-/Klausel-Pfad schreibt `basis_wert`/`basis_monat`
+  der `IndexKlauselTable` nach einer freigegebenen `IndexAnpassung`
+  nicht fort** - eine wiederholte Indexierung auf einen bereits
+  erhöhten Betrag droht, sobald dieser Pfad (der aktuell ohnehin jeden
+  automatischen Vorschlag blockiert, siehe oben) um einen
+  Wirksamkeitstermin ergänzt wird.
+- **Tri-State MRG-Zinsbeschränkung/Förderbindung** (`unbekannt` darf
+  bei einer Freigabe nicht stillschweigend `False` werden) ist noch
+  nicht umgesetzt. Explizit zu beachten bei der Umsetzung: die
+  bestehenden Spalten `mrg_zinsbeschraenkung`/`foerderbindung` sind in
+  der bereits produktiven Datenbank NOT-NULL-Spalten - `ensure_
+  additive_columns` ändert NIE bestehende Spalten-Constraints
+  (additive-only). Ein reines `nullable=True` im Modell würde deshalb
+  nur auf frischen Test-/CI-Datenbanken funktionieren, nicht auf der
+  echten Produktions-DB. Geplanter Ansatz: separate, additive
+  `*_geprueft`-Flags (Default `False`) statt einer gelockerten
+  bestehenden Spalte, mit Freigabe-Pflicht `geprueft=True` - keine
+  pauschale Automatikfreigabe durch den Default.
+
 ## Paket Dashboard/Variable Monatsabrechnung (Auftrag 13.09.2026, HV-20260913-DASHBOARD)
 
 Neues Modul `src/mietinkasso/variableabrechnung/` (versionierte
