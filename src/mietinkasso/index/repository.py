@@ -71,6 +71,16 @@ class IndexRepository:
             )
             return session.execute(statement).scalar_one_or_none()
 
+    def letzte_anpassung(self, vertrag_id: str) -> IndexAnpassungTable | None:
+        with self._session_factory() as session:
+            statement = (
+                select(IndexAnpassungTable)
+                .where(IndexAnpassungTable.vertrag_id == vertrag_id)
+                .order_by(IndexAnpassungTable.id.desc())
+                .limit(1)
+            )
+            return session.execute(statement).scalars().first()
+
     def speichere_anpassung(self, anpassung: IndexAnpassungTable) -> IndexAnpassungTable:
         with self._session_factory() as session:
             session.add(anpassung)

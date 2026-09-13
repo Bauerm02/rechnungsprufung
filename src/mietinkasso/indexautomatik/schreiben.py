@@ -170,11 +170,26 @@ def _abschluss(kontext: SchreibenKontext) -> list[str]:
 
 
 def erhoehungsschreiben_text_mieweg(kontext: SchreibenKontext) -> str:
+    """Zitiert § 16 Abs 9 MRG NUR bei MRG-Vollanwendung mit
+    Zuversicht - bei MRG-Teilanwendung (unabhängiger Review,
+    fd8c2b2-Folgereview: "MRG-Teil im Wohnungstext NICHT pauschal
+    § 16(9) behaupten") wird eine qualifizierte, nicht pauschal
+    behauptende Formulierung verwendet, da die genaue Anwendbarkeit
+    dieser Verfahrensvorschrift bei Teilanwendung nicht unabhängig
+    verifiziert wurde."""
+
     zeilen = _kopf_und_positionen(kontext, betreff_zusatz="Anhebung des Hauptmietzinses nach MieWeG 2026")
-    zeilen.append(
-        "hiermit teilen wir Ihnen gemäß § 1 MieWeG 2026 in Verbindung mit § 16 Abs 9 MRG die Anhebung "
-        f"des wertgesicherten Hauptmietzinses für {kontext.einheit_bezeichnung} mit."
-    )
+    if kontext.rechtsordnung == "OESTERREICH_MRG_VOLL":
+        zeilen.append(
+            "hiermit teilen wir Ihnen gemäß § 1 MieWeG 2026 in Verbindung mit § 16 Abs 9 MRG die Anhebung "
+            f"des wertgesicherten Hauptmietzinses für {kontext.einheit_bezeichnung} mit."
+        )
+    else:
+        zeilen.append(
+            "hiermit teilen wir Ihnen gemäß § 1 MieWeG 2026 die Anhebung des wertgesicherten "
+            f"Hauptmietzinses für {kontext.einheit_bezeichnung} mit. Die für Ihren Vertrag konkret "
+            "anwendbaren Zustellungs-/Fristenbestimmungen (ggf. § 16 Abs 9 MRG) sind gesondert zu prüfen."
+        )
     zeilen.append("")
     zeilen.append(
         f"Vertragliche Grundlage: {kontext.klausel_referenz or '(keine gesonderte Klauselreferenz erfasst)'}; "
@@ -205,11 +220,19 @@ def erhoehungsschreiben_text_mieweg(kontext: SchreibenKontext) -> str:
         f"Wirksamkeitstermin der gesetzlichen/vertraglichen Höchstgrenze: {kontext.massgeblicher_termin.isoformat()} "
         "(1. April des Ziel-Bewertungsjahres)."
     )
-    zeilen.append(
-        "Ihre tatsächliche Zahlungspflicht für den erhöhten Betrag beginnt gemäß § 16 Abs 9 MRG erst mit dem "
-        "nächsten Zinstermin, der mindestens 14 Tage NACH dem nachgewiesenen Zugang dieses Schreibens bei "
-        "Ihnen liegt - nicht rückwirkend und nicht automatisch zum oben genannten Wirksamkeitstermin."
-    )
+    if kontext.rechtsordnung == "OESTERREICH_MRG_VOLL":
+        zeilen.append(
+            "Ihre tatsächliche Zahlungspflicht für den erhöhten Betrag beginnt gemäß § 16 Abs 9 MRG erst mit dem "
+            "nächsten Zinstermin, der mindestens 14 Tage NACH dem nachgewiesenen Zugang dieses Schreibens bei "
+            "Ihnen liegt - nicht rückwirkend und nicht automatisch zum oben genannten Wirksamkeitstermin."
+        )
+    else:
+        zeilen.append(
+            "Ihre tatsächliche Zahlungspflicht für den erhöhten Betrag beginnt erst mit einem späteren "
+            "Zinstermin nach nachgewiesenem Zugang dieses Schreibens - nicht rückwirkend und nicht "
+            "automatisch zum oben genannten Wirksamkeitstermin. Die konkrete Frist ist für Ihren Vertrag "
+            "gesondert zu prüfen."
+        )
     zeilen.append("")
     zeilen.extend(_abschluss(kontext))
     return "\n".join(zeilen)

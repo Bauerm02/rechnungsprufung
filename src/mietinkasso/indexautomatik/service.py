@@ -2,11 +2,11 @@
 - idempotent je (Vertrag, Kalendermonat), reine Orchestrierung über
 bereits abgenommene Rechner: `mieweg_vorschau_service.vorschau_erstellen`
 für den geprüften MieWeG-Wohnungsrechner-Fall (MRG-Voll-/Teilanwendung
-UND bestätigte Wohnungsnutzung), `index/service.py::IndexService.
-berechne_vorschlag` (über eine referenzierte, versionierte
-`IndexKlauselTable`) für JEDEN anderen Fall mit einer geprüften
-Vertragsklausel (insbesondere Geschäftsraum) - KEIN paralleler
-Rohrechner, KEINE pauschale Rechtsklassifikation.
+UND bestätigte Wohnungsnutzung - Haupt- ODER geprüfte Untermiete, siehe
+unten), `index/service.py::IndexService.berechne_vorschlag` (über eine
+referenzierte, versionierte `IndexKlauselTable`) für JEDEN anderen Fall
+mit einer geprüften Vertragsklausel (insbesondere Geschäftsraum) - KEIN
+paralleler Rohrechner, KEINE pauschale Rechtsklassifikation.
 
 Ungeklärte/unvollständige Daten blockieren NUR den einzelnen Fall
 (sichtbare `IndexautomatikLaufTable`-Zeile mit Gründen), nie den
@@ -74,30 +74,6 @@ class IndexautomatikService:
         self._index_service = index_service
         self._outbox_service = outbox_service
 
-    def _anlegen_lauf(
-        self,
-        vertrag_id: str,
-        periode: str,
-        *,
-        status: str,
-        gruende: list[str] | None = None,
-        profil: RechtsprofilTable | None = None,
-        mieweg_vorschau_id: int | None = None,
-        erhoehungsschreiben_id: int | None = None,
-    ) -> IndexautomatikLaufTable:
-        return self._lauf_repository.anlegen(
-            IndexautomatikLaufTable(
-                vertrag_id=vertrag_id,
-                periode=periode,
-                status=status,
-                blockiert_gruende=list(gruende or []),
-                rechtsprofil_id=profil.id if profil else None,
-                rechtsprofil_version=profil.version if profil else None,
-                mieweg_vorschau_id=mieweg_vorschau_id,
-                erhoehungsschreiben_id=erhoehungsschreiben_id,
-            )
-        )
-
     def _unveraenderte_komponenten(self, vertrag_id: str, heute: date, referenzierte_ids: set[str]) -> list:
         return [
             k
@@ -108,69 +84,126 @@ class IndexautomatikService:
     def monatslauf_fuer_vertrag(
         self, *, ctx: AuthContext, vertrag: VertragTable, heute: date, akteur: str
     ) -> IndexautomatikLaufTable:
-        periode = f"{heute.year:04d}-{heute.month:02d}"
-        vorhandener = self._lauf_repository.get_by_periode(vertrag.id, periode)
-        if vorhandener is not None:
-            return vorhandener
-
+        # Unabhängiger Review (994e786-Folgereview): Auth MUSS vor jedem
+        # Rückgabepfad geprüft werden, auch dem "es gibt schon eine
+        # Zeile"-Kurzschluss - sonst könnte ein Aufrufer ohne Zugriff auf
+        # diese Gesellschaft trotzdem eine bereits existierende
+        # IndexautomatikLaufTable-Zeile für einen fremden Vertrag lesen.
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
         self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
 
-        profil = self._rechtsprofil_service.aktives_gueltiges_profil(vertrag.id, heute=heute)
-        if profil is None:
-            return self._anlegen_lauf(
-                vertrag.id, periode, status="BLOCKIERT",
-                gruende=["Kein gültiges, freigegebenes Rechtsprofil (fehlt, nie freigegeben, oder seit Freigabe entwertet)."],
+        periode = f"{heute.year:04d}-{heute.month:02d}"
+        claim = self._lauf_repository.claim_periode(vertrag.id, periode)
+        if claim is None:
+            bestehender = self._lauf_repository.get_by_periode(vertrag.id, periode)
+            if bestehender is not None:
+                return bestehender
+            raise RuntimeError(
+                f"Indexautomatik-Lauf für Vertrag {vertrag.id}, Periode {periode} wird gerade von einem "
+                "anderen Worker verarbeitet."
             )
 
-        if profil.ist_hauptmiete is not True:
-            return self._anlegen_lauf(
-                vertrag.id, periode, status="BLOCKIERT", profil=profil,
-                gruende=["Hauptmiete nicht bestätigt (Untermiete/ungeklärt) - keine automatische Rechtsannahme zur Anwendbarkeit."],
+        try:
+            return self._verarbeiten(ctx, vertrag, heute, periode, akteur, claim.id)
+        except _BEHANDELBARE_FEHLER as exc:
+            return self._lauf_repository.abschliessen(claim.id, status="BLOCKIERT", blockiert_gruende=[str(exc)])
+
+    def _verarbeiten(
+        self, ctx: AuthContext, vertrag: VertragTable, heute: date, periode: str, akteur: str, claim_id: int
+    ) -> IndexautomatikLaufTable:
+        profil = self._rechtsprofil_service.aktives_gueltiges_profil(vertrag.id, heute=heute)
+        if profil is None:
+            return self._lauf_repository.abschliessen(
+                claim_id, status="BLOCKIERT",
+                blockiert_gruende=["Kein gültiges, freigegebenes Rechtsprofil (fehlt, nie freigegeben, oder seit Freigabe entwertet)."],
+            )
+
+        # Dreiwertig (siehe RechtsprofilTable-Docstring): NUR `None`
+        # (ungeklärt) sperrt - `False` ist eine GEPRÜFTE, bestätigte
+        # Untermiete, die MieWeG ausdrücklich mit abdeckt (Modellreview
+        # 13.09.: "ist_hauptmiete is not True sperrt pauschal UNTERMIETEN").
+        if profil.ist_hauptmiete is None:
+            return self._lauf_repository.abschliessen(
+                claim_id, status="BLOCKIERT", rechtsprofil_id=profil.id, rechtsprofil_version=profil.version,
+                blockiert_gruende=["Haupt-/Untermiete nicht geprüft (ungeklärt) - keine automatische Rechtsannahme."],
             )
         if profil.rechtsordnung == Rechtsordnung.UNGEKLAERT.value:
-            return self._anlegen_lauf(
-                vertrag.id, periode, status="BLOCKIERT", profil=profil, gruende=["Rechtsordnung UNGEKLAERT."]
+            return self._lauf_repository.abschliessen(
+                claim_id, status="BLOCKIERT", rechtsprofil_id=profil.id, rechtsprofil_version=profil.version,
+                blockiert_gruende=["Rechtsordnung UNGEKLAERT."],
             )
 
         ist_wohnungsrechner = profil.rechtsordnung in _WOHNUNGSRECHNER_RECHTSORDNUNGEN and profil.ist_wohnungsnutzung is True
 
-        try:
-            if ist_wohnungsrechner:
-                return self._monatslauf_mieweg(ctx, vertrag, profil, heute, periode, akteur)
-            if profil.vertragsklausel_id is not None:
-                return self._monatslauf_klausel(ctx, vertrag, profil, heute, periode, akteur)
-            return self._anlegen_lauf(
-                vertrag.id, periode, status="BLOCKIERT", profil=profil,
-                gruende=[
-                    "Kein MieWeG-Wohnungsrechner-Fall (Geschäftsraum/WGG/Gewerbe/unklares Profil) und keine "
-                    "geprüfte Vertragsklausel hinterlegt - nur manuelle Prüfung, keine automatische Berechnung."
-                ],
+        if ist_wohnungsrechner:
+            return self._monatslauf_mieweg(ctx, vertrag, profil, heute, periode, akteur, claim_id)
+        if profil.vertragsklausel_id is not None:
+            return self._monatslauf_klausel(ctx, vertrag, profil, heute, periode, akteur, claim_id)
+        return self._lauf_repository.abschliessen(
+            claim_id, status="BLOCKIERT", rechtsprofil_id=profil.id, rechtsprofil_version=profil.version,
+            blockiert_gruende=[
+                "Kein MieWeG-Wohnungsrechner-Fall (Geschäftsraum/WGG/Gewerbe/unklares Profil) und keine "
+                "geprüfte Vertragsklausel hinterlegt - nur manuelle Prüfung, keine automatische Berechnung."
+            ],
+        )
+
+    def _pruefe_und_kappe_mietzinsobergrenze(
+        self, profil: RechtsprofilTable, massgeblich_cent: int, heute: date
+    ) -> tuple[int | None, str | None]:
+        """Die Mietzinsobergrenze wirkt IMMER, wenn sie erfasst ist -
+        unabhängig davon, ob `foerderbindung` gesetzt ist (unabhängiger
+        Review, fd8c2b2-Folgereview: "Die harte Mietzinsobergrenze gilt
+        bei MRG-Voll unabhängig davon, ob foerderbindung gesetzt ist;
+        nicht nur als Förderobergrenze behandeln"). Liefert
+        `(gekappter_betrag, blockierender_grund)` - genau einer der
+        beiden ist `None`."""
+
+        if profil.mietzinsobergrenze_cent is None:
+            return massgeblich_cent, None
+        if profil.mietzinsobergrenze_gueltig_bis is not None and heute > profil.mietzinsobergrenze_gueltig_bis:
+            return None, (
+                f"Mietzinsobergrenze-Beleg ist seit {profil.mietzinsobergrenze_gueltig_bis.isoformat()} "
+                "abgelaufen - keine fiktiv unbegrenzte Weitergeltung."
             )
-        except _BEHANDELBARE_FEHLER as exc:
-            return self._anlegen_lauf(vertrag.id, periode, status="BLOCKIERT", profil=profil, gruende=[str(exc)])
+        return min(massgeblich_cent, profil.mietzinsobergrenze_cent), None
 
     def _monatslauf_mieweg(
-        self, ctx: AuthContext, vertrag: VertragTable, profil: RechtsprofilTable, heute: date, periode: str, akteur: str
+        self, ctx: AuthContext, vertrag: VertragTable, profil: RechtsprofilTable, heute: date, periode: str,
+        akteur: str, claim_id: int,
     ) -> IndexautomatikLaufTable:
+        def _abschliessen(status: str, gruende: list[str] | None = None, **felder) -> IndexautomatikLaufTable:
+            return self._lauf_repository.abschliessen(
+                claim_id, status=status, blockiert_gruende=gruende or [], rechtsprofil_id=profil.id,
+                rechtsprofil_version=profil.version, **felder,
+            )
+
         ziel_jahr = heute.year if heute >= date(heute.year, 4, 1) else heute.year - 1
         if profil.bezugsjahr is None or ziel_jahr <= profil.bezugsjahr:
-            return self._anlegen_lauf(vertrag.id, periode, status="TERMIN_NICHT_ERREICHT", profil=profil)
+            return _abschliessen("TERMIN_NICHT_ERREICHT")
 
         bestehendes = self._outbox_repository.get_by_ziel(vertrag.id, ziel_jahr)
+        bestehende_id: int | None = None
         if bestehendes is not None:
-            return self._anlegen_lauf(
-                vertrag.id, periode, status="BEREITS_ERFASST", profil=profil,
-                mieweg_vorschau_id=bestehendes.mieweg_vorschau_id, erhoehungsschreiben_id=bestehendes.id,
-            )
+            if bestehendes.status != "BLOCKIERT":
+                # Bereits GESENDET/ZUGANG_BESTAETIGT/AUSGEFUEHRT/UNKLAR/
+                # BEREIT (in Versand) - unveränderlich, kein Retry.
+                return _abschliessen(
+                    "BEREITS_ERFASST", mieweg_vorschau_id=bestehendes.mieweg_vorschau_id,
+                    erhoehungsschreiben_id=bestehendes.id,
+                )
+            # Ein noch NICHT versendetes, blockiertes Schreiben darf nach
+            # einer behobenen Quelle erneut versucht werden - der ganze
+            # April-Zyklus wird sonst dauerhaft "verschluckt" (unabhängiger
+            # Review, fd8c2b2-Folgereview).
+            bestehende_id = bestehendes.id
 
         aktive_komponenten = {k.id: k for k in self._stammdaten_repository.list_aktive_komponenten(vertrag.id, heute)}
         fehlend = [kid for kid in profil.basis_komponenten_ids if kid not in aktive_komponenten]
         if fehlend:
-            return self._anlegen_lauf(
-                vertrag.id, periode, status="BLOCKIERT", profil=profil,
-                gruende=[f"Referenzierte Komponente(n) {fehlend} zum heutigen Stichtag {heute.isoformat()} nicht mehr aktiv/gültig."],
+            return _abschliessen(
+                "BLOCKIERT",
+                [f"Referenzierte Komponente(n) {fehlend} zum heutigen Stichtag {heute.isoformat()} nicht mehr aktiv/gültig."],
             )
         referenzierte = [aktive_komponenten[kid] for kid in profil.basis_komponenten_ids]
         aktuell_cent = sum(k.betrag_cent for k in referenzierte)
@@ -189,15 +222,11 @@ class IndexautomatikService:
         if profil.vertragsklausel_id is not None:
             klausel = self._index_repository.get_klausel(profil.vertragsklausel_id)
             if klausel is None or klausel.status != "FREIGEGEBEN":
-                return self._anlegen_lauf(
-                    vertrag.id, periode, status="BLOCKIERT", profil=profil,
-                    gruende=["Referenzierte Vertragsklausel ist nicht (mehr) freigegeben."],
-                )
+                return _abschliessen("BLOCKIERT", ["Referenzierte Vertragsklausel ist nicht (mehr) freigegeben."])
             aktueller_vpi = self._vpi_repository.neuester_endgueltiger_monatswert(klausel.basis_reihe, heute)
             if aktueller_vpi is None:
-                return self._anlegen_lauf(
-                    vertrag.id, periode, status="BLOCKIERT", profil=profil,
-                    gruende=[f"Kein amtlicher, endgültiger VPI-Monatswert für Reihe {klausel.basis_reihe} verfügbar."],
+                return _abschliessen(
+                    "BLOCKIERT", [f"Kein amtlicher, endgültiger VPI-Monatswert für Reihe {klausel.basis_reihe} verfügbar."]
                 )
             vertraglich_zulaessig_cent = berechne_vertragliche_spur_cent(
                 klausel=klausel, aktueller_vpi_wert=aktueller_vpi, basis_betrag_cent=aktuell_cent
@@ -236,21 +265,22 @@ class IndexautomatikService:
         )
         ergebnis = json.loads(vorschau.ergebnis_json)
         if ergebnis["blockiert_grund"] is not None:
-            return self._anlegen_lauf(
-                vertrag.id, periode, status="BLOCKIERT", profil=profil, mieweg_vorschau_id=vorschau.id,
-                gruende=[ergebnis["blockiert_grund"]],
-            )
+            return _abschliessen("BLOCKIERT", [ergebnis["blockiert_grund"]], mieweg_vorschau_id=vorschau.id)
         if ergebnis["massgeblicher_hoechstbetrag_cent"] is None or ergebnis["fruehester_termin_gesamt"] is None:
-            return self._anlegen_lauf(
-                vertrag.id, periode, status="BLOCKIERT", profil=profil, mieweg_vorschau_id=vorschau.id,
-                gruende=list(ergebnis["offene_nachweise"]) or ["Berechnung unvollständig."],
+            return _abschliessen(
+                "BLOCKIERT", list(ergebnis["offene_nachweise"]) or ["Berechnung unvollständig."],
+                mieweg_vorschau_id=vorschau.id,
             )
 
-        differenz_cent = ergebnis["rechnerische_differenz_cent"]
+        massgeblich_cent, obergrenze_grund = self._pruefe_und_kappe_mietzinsobergrenze(
+            profil, ergebnis["massgeblicher_hoechstbetrag_cent"], heute
+        )
+        if obergrenze_grund is not None:
+            return _abschliessen("BLOCKIERT", [obergrenze_grund], mieweg_vorschau_id=vorschau.id)
+
+        differenz_cent = max(0, massgeblich_cent - aktuell_cent)
         if not differenz_cent:
-            return self._anlegen_lauf(
-                vertrag.id, periode, status="KEIN_ERHOEHUNGSBEDARF", profil=profil, mieweg_vorschau_id=vorschau.id
-            )
+            return _abschliessen("KEIN_ERHOEHUNGSBEDARF", mieweg_vorschau_id=vorschau.id)
 
         schreiben = self._outbox_service.erstellen_aus_mieweg(
             ctx=ctx,
@@ -264,26 +294,50 @@ class IndexautomatikService:
             referenzierte_komponenten=referenzierte,
             unveraenderte_komponenten=unveraendert,
             akteur=akteur,
+            bestehende_id=bestehende_id,
         )
-        return self._anlegen_lauf(
-            vertrag.id, periode, status="ERHOEHUNG_ERZEUGT", profil=profil, mieweg_vorschau_id=vorschau.id,
-            erhoehungsschreiben_id=schreiben.id,
-        )
+        return _abschliessen("ERHOEHUNG_ERZEUGT", mieweg_vorschau_id=vorschau.id, erhoehungsschreiben_id=schreiben.id)
 
     def _monatslauf_klausel(
-        self, ctx: AuthContext, vertrag: VertragTable, profil: RechtsprofilTable, heute: date, periode: str, akteur: str
+        self, ctx: AuthContext, vertrag: VertragTable, profil: RechtsprofilTable, heute: date, periode: str,
+        akteur: str, claim_id: int,
     ) -> IndexautomatikLaufTable:
+        def _abschliessen(status: str, gruende: list[str] | None = None, **felder) -> IndexautomatikLaufTable:
+            return self._lauf_repository.abschliessen(
+                claim_id, status=status, blockiert_gruende=gruende or [], rechtsprofil_id=profil.id,
+                rechtsprofil_version=profil.version, **felder,
+            )
+
         klausel = self._index_repository.get_klausel(profil.vertragsklausel_id)
         if klausel is None or klausel.status != "FREIGEGEBEN":
-            return self._anlegen_lauf(
-                vertrag.id, periode, status="BLOCKIERT", profil=profil,
-                gruende=["Referenzierte Vertragsklausel ist nicht (mehr) freigegeben."],
-            )
+            return _abschliessen("BLOCKIERT", ["Referenzierte Vertragsklausel ist nicht (mehr) freigegeben."])
         aktueller_vpi = self._vpi_repository.neuester_endgueltiger_monatswert(klausel.basis_reihe, heute)
         if aktueller_vpi is None:
-            return self._anlegen_lauf(
-                vertrag.id, periode, status="BLOCKIERT", profil=profil,
-                gruende=[f"Kein amtlicher, endgültiger VPI-Monatswert für Reihe {klausel.basis_reihe} verfügbar."],
+            return _abschliessen(
+                "BLOCKIERT", [f"Kein amtlicher, endgültiger VPI-Monatswert für Reihe {klausel.basis_reihe} verfügbar."]
+            )
+
+        # Idempotenz an die FACHLICHE Anpassung (identischer Vergleich:
+        # gleiche Klausel-Basis, gleicher aktueller VPI-Wert) binden,
+        # nicht allein an eine neue technische index_anpassung_id -
+        # solange sich weder Basis noch amtlicher Wert geändert haben,
+        # erzeugt ein Folgemonat KEINEN zweiten, inhaltlich identischen
+        # Vorschlag (unabhängiger Review, fd8c2b2-Folgereview).
+        letzte_anpassung = self._index_repository.letzte_anpassung(vertrag.id)
+        if (
+            letzte_anpassung is not None
+            and letzte_anpassung.index_klausel_id == klausel.id
+            and letzte_anpassung.alter_wert == klausel.basis_wert
+            and letzte_anpassung.neuer_wert == aktueller_vpi
+            and letzte_anpassung.status != "VERWORFEN"
+        ):
+            return _abschliessen(
+                "BLOCKIERT",
+                [
+                    f"Bereits erfasster Vorschlag (IndexAnpassung {letzte_anpassung.id}) für denselben "
+                    f"Vergleich (Basis {klausel.basis_wert}, aktueller VPI-Wert {aktueller_vpi}) - kein "
+                    "zweiter, inhaltlich identischer Vorschlag."
+                ],
             )
 
         vorschlag = self._index_service.berechne_vorschlag(
@@ -296,25 +350,24 @@ class IndexautomatikService:
             ),
         )
         if vorschlag.erhoehung_cent <= 0:
-            return self._anlegen_lauf(vertrag.id, periode, status="KEIN_ERHOEHUNGSBEDARF", profil=profil)
+            return _abschliessen("KEIN_ERHOEHUNGSBEDARF")
 
-        aktive_komponenten = {k.id: k for k in self._stammdaten_repository.list_aktive_komponenten(vertrag.id, heute)}
-        referenzierte_ids = set(profil.basis_komponenten_ids) & set(aktive_komponenten)
-        referenzierte = [aktive_komponenten[kid] for kid in referenzierte_ids]
-        unveraendert = self._unveraenderte_komponenten(vertrag.id, heute, referenzierte_ids)
-
-        schreiben = self._outbox_service.erstellen_aus_index_anpassung(
-            ctx=ctx,
-            vertrag=vertrag,
-            profil=profil,
-            index_anpassung_id=vorschlag.id,
-            massgeblicher_termin=heute,
-            erhoehung_cent=vorschlag.erhoehung_cent,
-            referenzierte_komponenten=referenzierte,
-            unveraenderte_komponenten=unveraendert,
-            akteur=akteur,
+        # Kein unabhängig verifizierter automatischer Wirksamkeitstermin
+        # für diesen Pfad (Geschäftsraum/generische Klausel) - "kein
+        # heutiges Datum als frei erfundenen Erhöhungstermin" (Modellreview
+        # 13.09.). Der rechnerische Vorschlag liegt geprüft vor
+        # (IndexAnpassungTable, bereits abgenommener Rechner), aber KEIN
+        # automatisches Erhöhungsschreiben/keine Outbox-Zeile wird daraus
+        # erzeugt - siehe OFFENE_PUNKTE.md.
+        return _abschliessen(
+            "BLOCKIERT",
+            [
+                f"Rechnerischer Vorschlag liegt vor (IndexAnpassung {vorschlag.id}, Erhöhung "
+                f"{vorschlag.erhoehung_cent} Cent) - ein automatischer Wirksamkeitstermin für den "
+                "Geschäftsraum-/Klausel-Pfad wird noch nicht unterstützt. Bitte Termin manuell prüfen "
+                "und bestätigen (kein erfundenes Datum)."
+            ],
         )
-        return self._anlegen_lauf(vertrag.id, periode, status="ERHOEHUNG_ERZEUGT", profil=profil, erhoehungsschreiben_id=schreiben.id)
 
     def monatslauf_alle(self, *, ctx: AuthContext, heute: date, akteur: str) -> list[IndexautomatikLaufTable]:
         ergebnisse: list[IndexautomatikLaufTable] = []
@@ -324,6 +377,8 @@ class IndexautomatikService:
                 self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
             except ObjektAusgeschlossenError:
                 continue
+            if vertrag.gueltig_von > heute:
+                continue  # Vertrag hat noch nicht begonnen
             if vertrag.gueltig_bis is not None and vertrag.gueltig_bis < heute:
                 # Abgelaufener Vertrag: keine künftige Erhöhung mehr sinnvoll,
                 # kein Indexautomatik-Fall wird angelegt.
@@ -331,10 +386,13 @@ class IndexautomatikService:
             try:
                 ergebnisse.append(self.monatslauf_fuer_vertrag(ctx=ctx, vertrag=vertrag, heute=heute, akteur=akteur))
             except Exception as exc:  # ein fehlerhafter Vertrag darf den Batch nicht abbrechen
-                ergebnisse.append(
-                    self._anlegen_lauf(
-                        vertrag.id, periode, status="BLOCKIERT",
-                        gruende=[f"Unerwarteter Fehler im Automatiklauf: {exc}"],
-                    )
-                )
+                bestehender = self._lauf_repository.get_by_periode(vertrag.id, periode)
+                if bestehender is None:
+                    claim = self._lauf_repository.claim_periode(vertrag.id, periode)
+                    if claim is not None:
+                        bestehender = self._lauf_repository.abschliessen(
+                            claim.id, status="BLOCKIERT", blockiert_gruende=[f"Unerwarteter Fehler im Automatiklauf: {exc}"]
+                        )
+                if bestehender is not None:
+                    ergebnisse.append(bestehender)
         return ergebnisse

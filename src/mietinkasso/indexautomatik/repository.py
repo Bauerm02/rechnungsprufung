@@ -27,7 +27,15 @@ class VpiRepository:
 
     # -- Jahresdurchschnitt-Override (manuell, mit Beleg) --------------------
     def jahreswert_erfassen(
-        self, *, reihe: str, jahr: int, wert: Decimal, quelle: str, quelle_datum: date, erfasst_von: str
+        self,
+        *,
+        reihe: str,
+        jahr: int,
+        wert: Decimal,
+        quelle: str,
+        quelle_datum: date,
+        erfasst_von: str,
+        finalitaet: str = "ENDGUELTIG",
     ) -> VpiJahreswertTable:
         with self._session_factory() as session:
             statement = select(VpiJahreswertTable).where(
@@ -36,11 +44,13 @@ class VpiRepository:
             row = session.execute(statement).scalars().first()
             if row is None:
                 row = VpiJahreswertTable(
-                    reihe=reihe, jahr=jahr, wert=wert, quelle=quelle, quelle_datum=quelle_datum, erfasst_von=erfasst_von
+                    reihe=reihe, jahr=jahr, wert=wert, finalitaet=finalitaet, quelle=quelle,
+                    quelle_datum=quelle_datum, erfasst_von=erfasst_von,
                 )
                 session.add(row)
             else:
                 row.wert = wert
+                row.finalitaet = finalitaet
                 row.quelle = quelle
                 row.quelle_datum = quelle_datum
                 row.erfasst_von = erfasst_von
@@ -155,7 +165,7 @@ class VpiRepository:
                 VpiJahreswertTable.reihe == reihe, VpiJahreswertTable.jahr == jahr
             )
             override = session.execute(override_statement).scalars().first()
-            if override is not None:
+            if override is not None and override.finalitaet == "ENDGUELTIG":
                 return override.wert
             monate = self.monatswerte_liste(reihe, jahr)
             if len(monate) != 12:
@@ -268,6 +278,16 @@ class RechtsprofilRepository:
             session.commit()
 
 
+#: Ein Lauf in einem dieser Zustände darf erneut versucht werden (z. B.
+#: nachdem eine fehlende VPI-Publikation nachträglich erfasst wurde),
+#: OHNE ein bereits erzeugtes Erhöhungsschreiben zu verdoppeln -
+#: Modellreview 13.09.: "Begründet blockierte Fälle müssen nach
+#: Quellen-/Profiländerung sicher erneut prüfbar sein, ohne fertige
+#: Schreiben zu verdoppeln". Ein TERMINALER Status (ERHOEHUNG_ERZEUGT/
+#: KEIN_ERHOEHUNGSBEDARF/BEREITS_ERFASST) wird NIE erneut versucht.
+_RETRYABLE_LAUF_STATUS = {"LAEUFT", "BLOCKIERT", "TERMIN_NICHT_ERREICHT"}
+
+
 class IndexautomatikLaufRepository:
     def __init__(self, session_factory: sessionmaker[Session]):
         self._session_factory = session_factory
@@ -279,23 +299,61 @@ class IndexautomatikLaufRepository:
             )
             return session.execute(statement).scalars().first()
 
-    def anlegen(self, row: IndexautomatikLaufTable) -> IndexautomatikLaufTable:
-        """Idempotent über den (vertrag_id, periode)-Unique-Constraint:
-        ein zweiter Versuch für denselben Monat (Parallelstart/Neustart
-        nach Absturz) schlägt mit `IntegrityError` fehl; der Aufrufer
-        bekommt dann die bereits existierende Zeile zurück statt eines
-        Duplikats."""
+    def claim_periode(self, vertrag_id: str, periode: str) -> IndexautomatikLaufTable | None:
+        """Atomarer Erzeugungsclaim VOR jeder seiteneffektbehafteten
+        Berechnung (Modellreview 13.09.: "Pro Vertrag+Monat atomarer
+        Erzeugungsclaim (Geschäftsraum-Duplikate derzeit möglich)") -
+        ohne diesen Claim könnten zwei parallele Worker beide den
+        "existiert noch nicht"-Zustand sehen und beide
+        `IndexService.berechne_vorschlag`/ein Erhöhungsschreiben
+        erzeugen, bevor die abschließende `IndexautomatikLaufTable`-
+        Unique-Zeile das verhindert. Liefert die geclaimte Zeile
+        (Status LAEUFT) zurück - `None`, wenn bereits ein TERMINALER
+        Lauf existiert oder ein anderer Worker gerade selbst claimt."""
 
         with self._session_factory() as session:
-            session.add(row)
+            neu = IndexautomatikLaufTable(vertrag_id=vertrag_id, periode=periode, status="LAEUFT", blockiert_gruende=[])
+            session.add(neu)
             try:
                 session.commit()
+                session.refresh(neu)
+                return neu
             except IntegrityError:
                 session.rollback()
-                bestehend = self.get_by_periode(row.vertrag_id, row.periode)
-                if bestehend is None:
-                    raise
-                return bestehend
+
+            result = session.execute(
+                update(IndexautomatikLaufTable)
+                .where(IndexautomatikLaufTable.vertrag_id == vertrag_id, IndexautomatikLaufTable.periode == periode)
+                .where(IndexautomatikLaufTable.status.in_(_RETRYABLE_LAUF_STATUS))
+                .values(status="LAEUFT")
+            )
+            session.commit()
+            if result.rowcount == 0:
+                return None
+            return self.get_by_periode(vertrag_id, periode)
+
+    def abschliessen(
+        self,
+        id: int,
+        *,
+        status: str,
+        blockiert_gruende: list[str] | None = None,
+        rechtsprofil_id: int | None = None,
+        rechtsprofil_version: int | None = None,
+        mieweg_vorschau_id: int | None = None,
+        erhoehungsschreiben_id: int | None = None,
+    ) -> IndexautomatikLaufTable:
+        with self._session_factory() as session:
+            row = session.get(IndexautomatikLaufTable, id)
+            if row is None:
+                raise ValueError(f"Unbekannter IndexautomatikLauf {id}")
+            row.status = status
+            row.blockiert_gruende = list(blockiert_gruende or [])
+            row.rechtsprofil_id = rechtsprofil_id
+            row.rechtsprofil_version = rechtsprofil_version
+            row.mieweg_vorschau_id = mieweg_vorschau_id
+            row.erhoehungsschreiben_id = erhoehungsschreiben_id
+            session.commit()
             session.refresh(row)
             return row
 
@@ -394,6 +452,23 @@ class ErhoehungsschreibenRepository:
                 ErhoehungsschreibenTable.versand_beansprucht_am < aelter_als,
             )
             return list(session.execute(statement).scalars().all())
+
+    def aktualisieren(self, id: int, **felder) -> ErhoehungsschreibenTable:
+        """Überschreibt ein bestehendes ENTWURF/BLOCKIERT-Schreiben mit
+        neu berechneten Feldern (Retry nach behobener Quelle) - NIEMALS
+        für ein bereits GESENDET/ZUGANG_BESTAETIGT/AUSGEFUEHRT-Schreiben
+        aufrufen (das bleibt unveränderlich, siehe Aufrufer in
+        `service.py`)."""
+
+        with self._session_factory() as session:
+            row = session.get(ErhoehungsschreibenTable, id)
+            if row is None:
+                raise ValueError(f"Unbekanntes Erhoehungsschreiben {id}")
+            for feld, wert in felder.items():
+                setattr(row, feld, wert)
+            session.commit()
+            session.refresh(row)
+            return row
 
     def set_status(self, id: int, status: str, **felder) -> ErhoehungsschreibenTable:
         with self._session_factory() as session:
@@ -506,6 +581,30 @@ class VertragsendeErinnerungRepository:
             session.commit()
             session.refresh(row)
             return row
+
+    def claim_fuer_versand(self, id: int, *, jetzt: datetime | None = None) -> bool:
+        """Atomarer CAS OFFEN->IN_VERSAND (analog
+        `ErhoehungsschreibenRepository.claim_fuer_versand`) - verhindert,
+        dass zwei parallele Läufe dieselbe fällige Erinnerung doppelt
+        an den Eigentümer versenden."""
+
+        with self._session_factory() as session:
+            result = session.execute(
+                update(VertragsendeErinnerungTable)
+                .where(VertragsendeErinnerungTable.id == id)
+                .where(VertragsendeErinnerungTable.status == "OFFEN")
+                .values(status="IN_VERSAND", versand_beansprucht_am=jetzt or datetime.now(timezone.utc))
+            )
+            session.commit()
+            return result.rowcount > 0
+
+    def verwaiste_in_versand(self, *, aelter_als: datetime) -> list[VertragsendeErinnerungTable]:
+        with self._session_factory() as session:
+            statement = select(VertragsendeErinnerungTable).where(
+                VertragsendeErinnerungTable.status == "IN_VERSAND",
+                VertragsendeErinnerungTable.versand_beansprucht_am < aelter_als,
+            )
+            return list(session.execute(statement).scalars().all())
 
     def liste_faellig(self, *, heute: date) -> list[VertragsendeErinnerungTable]:
         with self._session_factory() as session:

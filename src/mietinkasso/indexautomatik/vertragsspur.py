@@ -16,9 +16,9 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from mietinkasso.domain.money import round_index_half_cent_down
 from mietinkasso.index.service import IndexService
 from mietinkasso.infrastructure.db.tables import IndexKlauselTable
+from mietinkasso.mieweg_vorschau.berechnung import runde_halbcent
 
 
 def berechne_vertragliche_spur_cent(
@@ -40,5 +40,16 @@ def berechne_vertragliche_spur_cent(
     if unterhalb_schwelle:
         effektive_veraenderung = Decimal("0")
 
+    # Unabhängiger Review (fd8c2b2-Folgereview, synthetisch reproduziert:
+    # Basis 12345 Cent, VPI 100->102, erwartet 12592, tatsächlich 12591):
+    # `neuer_betrag_decimal` ist bereits CENT-denominiert - `domain/
+    # money.py::round_index_half_cent_down` erwartet dagegen einen
+    # EURO-Betrag (quantisiert auf 0.01 = 1 Cent) und hätte einen
+    # gebrochenen Cent-Rest (12591.9) nur auf "12591.90" gerundet, den
+    # anschließende `int()`-Aufruf dann Richtung Null ABGESCHNITTEN statt
+    # gerundet. `berechnung.py::runde_halbcent` ist die für bereits
+    # Cent-denominierte Werte korrekte Funktion (quantisiert auf ganze
+    # Cent, exakter Halbcent rundet ab) - exakt dieselbe Wiederverwendung
+    # wie in `mieweg_vorschau/berechnung.py` selbst.
     neuer_betrag_decimal = Decimal(basis_betrag_cent) * (Decimal("1") + effektive_veraenderung / Decimal("100"))
-    return int(round_index_half_cent_down(neuer_betrag_decimal))
+    return int(runde_halbcent(neuer_betrag_decimal))

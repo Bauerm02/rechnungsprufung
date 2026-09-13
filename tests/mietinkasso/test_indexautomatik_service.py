@@ -45,7 +45,9 @@ def bundle(session_factory, stammdaten_repo) -> Bundle:
     rechtsprofil_service = RechtsprofilService(rechtsprofil_repo, stammdaten_repo, index_repo)
     mieweg_service = MieWegVorschauService(mieweg_repo, stammdaten_repo)
     index_service = IndexService(index_repo, stammdaten_repo)
-    outbox_service = ErhoehungsschreibenOutboxService(outbox_repo, stammdaten_repo, jlb_signatur="JLB Projects GmbH")
+    outbox_service = ErhoehungsschreibenOutboxService(
+        outbox_repo, stammdaten_repo, rechtsprofil_repo, rechtsprofil_service, jlb_signatur="JLB Projects GmbH"
+    )
 
     automatik = IndexautomatikService(
         stammdaten_repository=stammdaten_repo,
@@ -151,6 +153,8 @@ def test_bereits_erfasstes_ziel_bewertungsjahr_erzeugt_kein_zweites_schreiben(ad
     die tatsächliche Garantie)."""
 
     vertrag, _konto = basis_vertrag
+    debitor = stammdaten_repo.get_debitor(vertrag.debitor_id)
+    stammdaten_repo.upsert_debitor(id=debitor.id, name=debitor.name, email=debitor.email, adresse="Corsogasse 1/3, 1010 Wien")
     _mit_komponente(stammdaten_repo, vertrag)
     _freigegebenes_wohnungsprofil(admin_ctx, bundle.rechtsprofil_service, vertrag)
     _seed_vpi(bundle.vpi_repo, jahre_werte={2023: "100", 2024: "102", 2025: "104"})
@@ -162,19 +166,62 @@ def test_bereits_erfasstes_ziel_bewertungsjahr_erzeugt_kein_zweites_schreiben(ad
     assert len(bundle.outbox_repo.liste_fuer_vertrag(vertrag.id)) == 1
 
 
+def test_blockiertes_erhoehungsschreiben_wird_nach_behobener_adresse_erneuert_ohne_duplikat(
+    admin_ctx, basis_vertrag, bundle, stammdaten_repo
+):
+    """Unabhängiger Review (fd8c2b2-Folgereview): "Ein unsent BLOCKIERTer
+    MieWeG-Fall muss nach behobener Quelle dagegen erneuerbar sein;
+    dauerhaftes BEREITS_ERFASST darf den ganzen Aprilzyklus nicht
+    verschlucken." - fehlende Adresse blockiert im ersten Monat; nach
+    Korrektur wird im Folgemonat DERSELBE Outbox-Datensatz (kein
+    Duplikat) auf BEREIT aktualisiert."""
+
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    _freigegebenes_wohnungsprofil(admin_ctx, bundle.rechtsprofil_service, vertrag)
+    _seed_vpi(bundle.vpi_repo, jahre_werte={2023: "100", 2024: "102", 2025: "104"})
+
+    erster = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 9, 13), akteur="test")
+    erstes_schreiben = bundle.outbox_repo.get(erster.erhoehungsschreiben_id)
+    assert erstes_schreiben.status == "BLOCKIERT"  # Debitor in basis_vertrag hat keine Adresse
+
+    debitor = stammdaten_repo.get_debitor(vertrag.debitor_id)
+    stammdaten_repo.upsert_debitor(id=debitor.id, name=debitor.name, email=debitor.email, adresse="Corsogasse 1/3, 1010 Wien")
+
+    zweiter = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 10, 13), akteur="test")
+    zweites_schreiben = bundle.outbox_repo.get(zweiter.erhoehungsschreiben_id)
+    assert zweites_schreiben.status == "BEREIT"
+    assert zweites_schreiben.id == erstes_schreiben.id  # dieselbe Zeile aktualisiert, kein Duplikat
+    assert len(bundle.outbox_repo.liste_fuer_vertrag(vertrag.id)) == 1
+
+
 def test_kein_rechtsprofil_blockiert_ohne_rechtsannahme(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
     vertrag, _konto = basis_vertrag
     lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 9, 13), akteur="test")
     assert lauf.status == "BLOCKIERT"
 
 
-def test_untermiete_ungeklaert_blockiert(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+def test_haupt_untermiete_ungeklaert_blockiert(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
     vertrag, _konto = basis_vertrag
     _mit_komponente(stammdaten_repo, vertrag)
-    _freigegebenes_wohnungsprofil(admin_ctx, bundle.rechtsprofil_service, vertrag, ist_hauptmiete=False)
+    _freigegebenes_wohnungsprofil(admin_ctx, bundle.rechtsprofil_service, vertrag, ist_hauptmiete=None)
     lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 9, 13), akteur="test")
     assert lauf.status == "BLOCKIERT"
     assert any("Untermiete" in g or "Hauptmiete" in g for g in lauf.blockiert_gruende)
+
+
+def test_geprueft_bestaetigte_untermiete_wird_nicht_gesperrt(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    """Modellreview 13.09.: "ist_hauptmiete is not True sperrt pauschal
+    UNTERMIETEN, obwohl MieWeG ausdrücklich auch Wohnungsuntermiete
+    umfasst" - `False` (GEPRÜFTE Untermiete) läuft normal über den
+    Wohnungsrechner-Pfad, nur `None` (ungeklärt) sperrt."""
+
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    _freigegebenes_wohnungsprofil(admin_ctx, bundle.rechtsprofil_service, vertrag, ist_hauptmiete=False)
+    _seed_vpi(bundle.vpi_repo, jahre_werte={2023: "100", 2024: "102", 2025: "104"})
+    lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 9, 13), akteur="test")
+    assert lauf.status == "ERHOEHUNG_ERZEUGT"
 
 
 def test_geschaeftsraum_ohne_klausel_blockiert_kein_pauschales_mieweg(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
@@ -221,11 +268,114 @@ def test_geschaeftsraum_mit_klausel_berechnet_ueber_index_service(admin_ctx, bas
     )
 
     lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 9, 13), akteur="test")
+    # Kein verifizierter automatischer Wirksamkeitstermin für den
+    # Geschäftsraum-/Klausel-Pfad (Modellreview 13.09.: "kein heutiges
+    # Datum als frei erfundenen Erhöhungstermin") - der Rechenweg über
+    # index/service.py läuft real, erzeugt aber bewusst KEIN
+    # automatisches Erhöhungsschreiben.
+    assert lauf.status == "BLOCKIERT"
+    assert any("IndexAnpassung" in g for g in lauf.blockiert_gruende)
+    assert lauf.erhoehungsschreiben_id is None
+
+    erste_anpassung_id = bundle.index_repo.letzte_anpassung(vertrag.id).id
+
+    # Folgemonat, UNVERÄNDERTER amtlicher VPI-Wert - unabhängiger Review
+    # (fd8c2b2-Folgereview): "solange ... tatsächliche Basis/Komponenten
+    # unverändert bleiben, darf der Folgemonat nicht wegen einer neuen
+    # index_anpassung_id ein zweites gleiches Schreiben erzeugen".
+    lauf_oktober = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 10, 13), akteur="test")
+    assert lauf_oktober.status == "BLOCKIERT"
+    assert any(str(erste_anpassung_id) in g for g in lauf_oktober.blockiert_gruende)
+    anpassungen_gesamt = bundle.index_repo.letzte_anpassung(vertrag.id)
+    assert anpassungen_gesamt.id == erste_anpassung_id  # keine zweite IndexAnpassung erzeugt
+
+
+def test_mietzinsobergrenze_kappt_erhoehung_unabhaengig_von_foerderbindung(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    """Unabhängiger Review (fd8c2b2-Folgereview): "Die harte
+    Mietzinsobergrenze gilt bei MRG-Voll unabhängig davon, ob
+    foerderbindung gesetzt ist" - die Kappung wirkt bereits, wenn
+    mietzinsobergrenze_cent erfasst ist, ohne foerderbindung=True."""
+
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    _freigegebenes_wohnungsprofil(
+        admin_ctx, bundle.rechtsprofil_service, vertrag, foerderbindung=False,
+        mietzinsobergrenze_cent=100_500, mietzinsobergrenze_quellenbeleg="Bescheid XY",
+    )
+    _seed_vpi(bundle.vpi_repo, jahre_werte={2023: "100", 2024: "102", 2025: "104"})
+
+    lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 9, 13), akteur="test")
     assert lauf.status == "ERHOEHUNG_ERZEUGT"
     schreiben = bundle.outbox_repo.get(lauf.erhoehungsschreiben_id)
-    assert schreiben.ziel_bewertungsjahr is None
-    assert schreiben.index_anpassung_id is not None
-    assert schreiben.erhoehung_cent > 0
+    assert schreiben.erhoehung_cent == 500  # gekappt auf 100.500 statt des höheren gesetzlichen/vertraglichen Werts
+
+
+def test_abgelaufene_mietzinsobergrenze_blockiert(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    _freigegebenes_wohnungsprofil(
+        admin_ctx, bundle.rechtsprofil_service, vertrag, mietzinsobergrenze_cent=100_500,
+        mietzinsobergrenze_quellenbeleg="Bescheid XY", mietzinsobergrenze_gueltig_bis=date(2025, 12, 31),
+    )
+    _seed_vpi(bundle.vpi_repo, jahre_werte={2023: "100", 2024: "102", 2025: "104"})
+
+    lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 9, 13), akteur="test")
+    # Bereits RechtsprofilService.ist_noch_gueltig erkennt die
+    # verstrichene Mietzinsobergrenze-Gültigkeit und entwertet die
+    # Freigabe zeitbasiert (siehe test_indexautomatik_rechtsprofil.py) -
+    # der Fall bleibt dadurch sicher blockiert, auch ohne dass die
+    # zusätzliche Kappungsprüfung in service.py je erreicht wird.
+    assert lauf.status == "BLOCKIERT"
+    assert any("Rechtsprofil" in g for g in lauf.blockiert_gruende)
+
+
+def test_auth_wird_vor_bestehendem_lauf_geprueft(admin_ctx, ctx_factory, basis_vertrag, bundle, stammdaten_repo):
+    """Unabhängiger Review (fd8c2b2-Folgereview): "monatslauf_fuer_vertrag
+    gibt vorhandenen Lauf VOR Auth zurück" - ein Aufrufer ohne Zugriff
+    auf die Gesellschaft darf eine bereits existierende Zeile nicht
+    einmal lesen können."""
+
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    _freigegebenes_wohnungsprofil(admin_ctx, bundle.rechtsprofil_service, vertrag)
+    _seed_vpi(bundle.vpi_repo, jahre_werte={2023: "100", 2024: "102", 2025: "104"})
+    bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 9, 13), akteur="test")
+
+    fremder_ctx = ctx_factory("ANDERE-GESELLSCHAFT")
+    with pytest.raises(Exception):
+        bundle.index_service.monatslauf_fuer_vertrag(ctx=fremder_ctx, vertrag=vertrag, heute=date(2026, 9, 13), akteur="test")
+
+
+def test_zukuenftiger_vertrag_wird_im_batch_uebersprungen(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.upsert_vertrag(
+        id=vertrag.id, einheit_id=vertrag.einheit_id, debitor_id=vertrag.debitor_id,
+        gesellschaft_id=vertrag.gesellschaft_id, rechtsordnung=vertrag.rechtsordnung, gueltig_von=date(2027, 1, 1),
+    )
+    laeufe = bundle.index_service.monatslauf_alle(ctx=admin_ctx, heute=date(2026, 9, 13), akteur="test")
+    assert laeufe == []
+
+
+def test_blockierter_lauf_wird_im_folgemonat_erneut_versucht_ohne_terminalen_status_zu_verlieren(
+    admin_ctx, basis_vertrag, bundle, stammdaten_repo
+):
+    """"Begründet blockierte Fälle müssen nach Quellen-/Profiländerung
+    sicher erneut prüfbar sein" - ein BLOCKIERTer Fall (fehlende VPI)
+    wird, nachdem der Wert nachgetragen wurde, in einem NEUEN
+    Kalendermonat erfolgreich abgeschlossen (die Perioden-Idempotenz
+    bleibt dabei intakt: kein doppeltes Erhöhungsschreiben)."""
+
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    _freigegebenes_wohnungsprofil(admin_ctx, bundle.rechtsprofil_service, vertrag)
+
+    erster = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 9, 13), akteur="test")
+    assert erster.status == "BLOCKIERT"
+
+    _seed_vpi(bundle.vpi_repo, jahre_werte={2023: "100", 2024: "102", 2025: "104"})
+    zweiter = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 10, 13), akteur="test")
+    assert zweiter.status == "ERHOEHUNG_ERZEUGT"
+    assert len(bundle.outbox_repo.liste_fuer_vertrag(vertrag.id)) == 1
 
 
 def test_abgelaufener_vertrag_wird_im_batch_uebersprungen(admin_ctx, basis_vertrag, bundle, stammdaten_repo):

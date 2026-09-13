@@ -191,11 +191,19 @@ def importiere_ogd_csv(
         }
         for (jahr, monat), (wert, zeilennummer) in monats_kandidaten.items()
     ]
+    # Ein Jahresdurchschnitt ist erst ENDGUELTIG, wenn dieselbe Datei
+    # auch den Jänner des FOLGEJahres enthält ("Jahresdurchschnitt
+    # endgültig mit Jänner-Publikation im Februar") - unabhängiger
+    # Review (fd8c2b2-Folgereview): eine Januar-Publikation mit
+    # Dezember+Jahreswert desselben Jahres hätte den Jahreswert sonst
+    # fälschlich sofort als verwendbar ausgewiesen, obwohl er nur eine
+    # vorläufige Schätzung ist.
     jahreszeilen = [
         {
             "reihe": reihe,
             "jahr": jahr,
             "wert": wert,
+            "finalitaet": "ENDGUELTIG" if (jahr + 1, 1) in monats_kandidaten else "VORLAEUFIG",
             "quelle": f"{tatsaechliche_url} (amtlicher Jahresdurchschnitt, Zeile {zeilennummer})",
             "quelle_datum": abgerufen_am.date(),
             "erfasst_von": importiert_von,

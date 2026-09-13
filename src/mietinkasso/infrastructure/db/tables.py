@@ -545,6 +545,16 @@ class VpiJahreswertTable(Base):
     reihe: Mapped[str] = mapped_column(String(32))
     jahr: Mapped[int] = mapped_column(Integer)
     wert: Mapped[Decimal] = mapped_column(Numeric(12, 4))
+    # Unabhängiger Review (fd8c2b2-Folgereview): ein in einer OGD-Datei
+    # enthaltener Jahresdurchschnitt (VPIZR-YYYY) ist ERST dann amtlich
+    # ENDGUELTIG, wenn dieselbe Publikationsreihe auch den Jänner des
+    # FOLGEJahres enthält ("Jahresdurchschnitt endgültig mit
+    # Jänner-Publikation im Februar") - vorher bleibt er VORLAEUFIG und
+    # darf NICHT als verwendbarer Wert durchgereicht werden, selbst wenn
+    # er numerisch bereits vorliegt. Ein manuell erfasster Override
+    # (`VpiRepository.jahreswert_erfassen`) ist per Default ENDGUELTIG
+    # (Operator bestätigt damit ausdrücklich eine amtliche Publikation).
+    finalitaet: Mapped[str] = mapped_column(String(16), default="ENDGUELTIG")
     quelle: Mapped[str] = mapped_column(String(256))
     quelle_datum: Mapped[date] = mapped_column(Date)
     erfasst_von: Mapped[str] = mapped_column(String(128))
@@ -613,8 +623,20 @@ class RechtsprofilTable(Base):
     ist_wohnungsnutzung: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     mrg_zinsbeschraenkung: Mapped[bool] = mapped_column(Boolean, default=False)
     ist_altvertrag: Mapped[bool] = mapped_column(Boolean, default=False)
+    # DREIWERTIG, kein Boolean-Ersatz für "ungeklärt": `None` = noch
+    # nicht geprüft (sperrt die Automatik, keine Rechtsannahme);
+    # `False` = GEPRÜFTE, bestätigte Untermiete - MieWeG erfasst
+    # Wohnungsuntermiete ausdrücklich mit, wird deshalb NICHT gesperrt
+    # und läuft über denselben Wohnungsrechner-Pfad wie Hauptmiete
+    # (Modellreview 13.09.: "ist_hauptmiete is not True sperrt pauschal
+    # UNTERMIETEN... None=ungeklärt von False=geprüfte Untermiete
+    # unterscheiden"); `True` = geprüfte Hauptmiete.
     ist_hauptmiete: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     foerderbindung: Mapped[bool] = mapped_column(Boolean, default=False)
+    # BRUTTO (verbindliche Konvention dieses Repositories, siehe
+    # domain/money.py::zerlege_brutto_cent) - wirkt als zusätzliche
+    # harte Kappung von `massgeblicher_hoechstbetrag_cent` im
+    # MieWeG-Wohnungsrechner-Pfad (indexautomatik/service.py).
     mietzinsobergrenze_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mietzinsobergrenze_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
     mietzinsobergrenze_gueltig_bis: Mapped[date | None] = mapped_column(Date, nullable=True)
@@ -759,6 +781,8 @@ class VertragsendeErinnerungTable(Base):
     end_datum: Mapped[date] = mapped_column(Date)
     faellig_am: Mapped[date] = mapped_column(Date)
     status: Mapped[str] = mapped_column(String(24), default="OFFEN")
+    versand_beansprucht_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fehlergrund: Mapped[str | None] = mapped_column(Text, nullable=True)
     benachrichtigt_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     entscheidung: Mapped[str | None] = mapped_column(String(32), nullable=True)
     entschieden_von: Mapped[str | None] = mapped_column(String(128), nullable=True)

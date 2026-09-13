@@ -10,10 +10,17 @@ from mietinkasso.indexautomatik.vpi_import import VpiImportFehlerError, importie
 
 _HEADER = "C-VPIZR-0;C-VPICOICOP18_5-0;F-VPIMZBM;sonstige_ogd_spalte\n"
 #: Öffentliche amtliche Beispielwerte, wörtlich aus dem unabhängigen
-#: Zwischenreview 34c6fdd (verifiziertes reales OGD-Schema).
+#: Zwischenreview 34c6fdd (verifiziertes reales OGD-Schema). Die
+#: Jänner-Monatszeilen 202501/202601 sind synthetisch ergänzt, damit
+#: die Jahreswerte 2024/2025 im Test den "Jänner-des-Folgejahres
+#: vorhanden"-Finalitätsnachweis erfüllen (echte Statistik-Austria-
+#: Dateien enthalten die volle historische Monatsreihe, ein
+#: verkürzter Testausschnitt sonst nicht).
 _ECHTE_BEISPIELZEILEN = [
     "VPIZR-2024;VPICOICOP18-0;123,80000;x",
     "VPIZR-2025;VPICOICOP18-0;128,20000;x",
+    "VPIZR-202501;VPICOICOP18-0;125,00000;x",
+    "VPIZR-202601;VPICOICOP18-0;130,00000;x",
     "VPIZR-202606;VPICOICOP18-0;132,20000;x",
     "VPIZR-202607;VPICOICOP18-0;132,20000;x",
 ]
@@ -37,8 +44,8 @@ def test_import_echter_ogd_beispieldaten(tmp_path, vpi_repo):
         abgerufen_am=datetime(2026, 8, 3, tzinfo=timezone.utc),
     )
     assert ergebnis.jahreszeilen == 2
-    assert ergebnis.monatszeilen == 2
-    assert ergebnis.endgueltige_monatszeilen == 1
+    assert ergebnis.monatszeilen == 4
+    assert ergebnis.endgueltige_monatszeilen == 3
     assert ergebnis.vorlaeufige_monatszeilen == 1
 
 
@@ -73,7 +80,7 @@ def test_teilindex_zeilen_werden_gefiltert_nicht_importiert(tmp_path, vpi_repo):
         pfad, reihe="VPI20C18", repository=vpi_repo, importiert_von="markus",
         abgerufen_am=datetime(2026, 8, 3, tzinfo=timezone.utc),
     )
-    assert ergebnis.monatszeilen == 2  # Teilindex-Zeile nicht mitgezählt
+    assert ergebnis.monatszeilen == 4  # Teilindex-Zeile nicht mitgezählt
 
 
 def test_doppelte_periode_blockiert_gesamten_import(tmp_path, vpi_repo):
@@ -146,6 +153,37 @@ def test_verschiedene_reihen_sind_unabhaengig(tmp_path, vpi_repo):
     )
     assert vpi_repo.jahresdurchschnitt("VPI20C18", 2025) is None
     assert vpi_repo.jahresdurchschnitt("VPI15C18", 2025) == Decimal("128.20000")
+
+
+def test_jahreswert_ohne_folgejaenner_bleibt_vorlaeufig_nicht_verwendbar(tmp_path, vpi_repo):
+    """Unabhängiger Review (fd8c2b2-Folgereview): eine Datei mit
+    Dezember + Jahreswert desselben Jahres, aber OHNE Jänner des
+    Folgejahres, darf den Jahreswert NICHT als sofort verwendbar
+    ausweisen - "Jahresdurchschnitt endgültig mit Jänner-Publikation im
+    Februar"."""
+
+    pfad = _schreibe_csv(tmp_path, ["VPIZR-202612;VPICOICOP18-0;134,00000;x", "VPIZR-2026;VPICOICOP18-0;135,00000;x"])
+    importiere_ogd_csv(
+        pfad, reihe="VPI20C18", repository=vpi_repo, importiert_von="markus",
+        abgerufen_am=datetime(2027, 1, 20, tzinfo=timezone.utc),
+    )
+    assert vpi_repo.jahresdurchschnitt("VPI20C18", 2026) is None
+
+
+def test_jahreswert_wird_nach_folgejaenner_endgueltig_verwendbar(tmp_path, vpi_repo):
+    pfad = _schreibe_csv(
+        tmp_path,
+        [
+            "VPIZR-202612;VPICOICOP18-0;134,00000;x",
+            "VPIZR-2026;VPICOICOP18-0;135,00000;x",
+            "VPIZR-202701;VPICOICOP18-0;136,00000;x",
+        ],
+    )
+    importiere_ogd_csv(
+        pfad, reihe="VPI20C18", repository=vpi_repo, importiert_von="markus",
+        abgerufen_am=datetime(2027, 2, 17, tzinfo=timezone.utc),
+    )
+    assert vpi_repo.jahresdurchschnitt("VPI20C18", 2026) == Decimal("135.00000")
 
 
 def test_manueller_jahreswert_override_bleibt_moeglich(vpi_repo):

@@ -108,6 +108,55 @@ def test_owner_ist_einziger_empfaenger_kein_mieter_fallback(admin_ctx, basis_ver
     assert empfaenger == ["markus@jlb-projects.at"]
 
 
+def test_deaktivierter_versand_belaesst_status_offen_statt_benachrichtigt(admin_ctx, basis_vertrag, service_mit_owner, stammdaten_repo, erinnerung_repo):
+    """Unabhängiger Review (fd8c2b2-Folgereview, synthetisch reproduziert:
+    "0 Senderaufrufe, Status trotzdem BENACHRICHTIGT statt OFFEN"): bei
+    send_enabled=False darf NICHTS als benachrichtigt gelten, sonst geht
+    die Erinnerung für einen künftig echten Versand verloren."""
+
+    vertrag, _konto = basis_vertrag
+    vertrag = _befristeter_vertrag(stammdaten_repo, vertrag, date(2026, 12, 31))
+    erinnerung = service_mit_owner.plane_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 1, 1))
+
+    aufrufe = []
+    ergebnis = service_mit_owner.benachrichtige_faellige(heute=date(2026, 9, 30), send_enabled=False, versand_fn=lambda a: aufrufe.append(a))
+
+    assert ergebnis == []
+    assert aufrufe == []
+    assert erinnerung_repo.get(erinnerung.id).status == "OFFEN"
+
+
+def test_transportfehler_setzt_unklar_kein_blinder_retry(admin_ctx, basis_vertrag, service_mit_owner, stammdaten_repo, erinnerung_repo):
+    from mietinkasso.domain.exceptions import TransportFehlerUngewissError
+
+    vertrag, _konto = basis_vertrag
+    vertrag = _befristeter_vertrag(stammdaten_repo, vertrag, date(2026, 12, 31))
+    erinnerung = service_mit_owner.plane_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 1, 1))
+
+    def _kaputter_versand(auftrag):
+        raise TransportFehlerUngewissError("Fake-Timeout")
+
+    ergebnis = service_mit_owner.benachrichtige_faellige(heute=date(2026, 9, 30), send_enabled=True, versand_fn=_kaputter_versand)
+    assert ergebnis == []
+    assert erinnerung_repo.get(erinnerung.id).status == "UNKLAR"
+
+
+def test_entscheidung_nach_geaendertem_enddatum_wird_abgelehnt(admin_ctx, basis_vertrag, service_mit_owner, stammdaten_repo):
+    vertrag, _konto = basis_vertrag
+    vertrag = _befristeter_vertrag(stammdaten_repo, vertrag, date(2026, 12, 31))
+    erinnerung = service_mit_owner.plane_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 1, 1))
+
+    # Vertragsende ändert sich DIREKT in den Stammdaten, ohne dass
+    # invalidiere_veraltete zwischenzeitlich erneut gelaufen ist.
+    stammdaten_repo.upsert_vertrag(
+        id=vertrag.id, einheit_id=vertrag.einheit_id, debitor_id=vertrag.debitor_id,
+        gesellschaft_id=vertrag.gesellschaft_id, rechtsordnung=vertrag.rechtsordnung, gueltig_von=vertrag.gueltig_von,
+        gueltig_bis=date(2028, 1, 1),
+    )
+    with pytest.raises(ValueError):
+        service_mit_owner.entscheiden(ctx=admin_ctx, erinnerung_id=erinnerung.id, entscheidung="VERLAENGERN_PRUEFEN", entschieden_von="markus")
+
+
 def test_ohne_konfigurierten_owner_wird_nicht_versendet(admin_ctx, basis_vertrag, service_ohne_owner, stammdaten_repo):
     vertrag, _konto = basis_vertrag
     vertrag = _befristeter_vertrag(stammdaten_repo, vertrag, date(2026, 12, 31))

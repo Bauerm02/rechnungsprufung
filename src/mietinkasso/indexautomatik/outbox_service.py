@@ -19,9 +19,10 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
-from mietinkasso.domain.enums import ZUGANGSFORMEN_ALLE, ZUGANGSFORMEN_AUSREICHEND
+from mietinkasso.domain.enums import ZUGANGSFORMEN_ALLE, ZUGANGSFORMEN_AUSREICHEND, Rechtsordnung
 from mietinkasso.domain.exceptions import ObjektAusgeschlossenError, QuellenbelegFehltError, TransportFehlerUngewissError
-from mietinkasso.indexautomatik.repository import ErhoehungsschreibenRepository
+from mietinkasso.indexautomatik.rechtsprofil import RechtsprofilService
+from mietinkasso.indexautomatik.repository import ErhoehungsschreibenRepository, RechtsprofilRepository
 from mietinkasso.indexautomatik.schreiben import (
     SchreibenJahresschritt,
     SchreibenKomponente,
@@ -47,17 +48,27 @@ class VersandErgebnis:
         return f"VersandErgebnis({self.status!r}, {self.grund!r})"
 
 
+_ZUGANGSFRIST_UNTERSTUETZTE_RECHTSORDNUNGEN = {
+    Rechtsordnung.OESTERREICH_MRG_VOLL.value,
+    Rechtsordnung.OESTERREICH_MRG_TEIL.value,
+}
+
+
 class ErhoehungsschreibenOutboxService:
     def __init__(
         self,
         repository: ErhoehungsschreibenRepository,
         stammdaten_repository: StammdatenRepository,
+        rechtsprofil_repository: RechtsprofilRepository,
+        rechtsprofil_service: RechtsprofilService,
         *,
         jlb_signatur: str,
     ):
         self._repository = repository
         self._stammdaten_repository = stammdaten_repository
         self._jlb_signatur = jlb_signatur
+        self._rechtsprofil_repository = rechtsprofil_repository
+        self._rechtsprofil_service = rechtsprofil_service
 
     def _empfaenger_snapshot(self, vertrag: VertragTable) -> dict:
         debitor = self._stammdaten_repository.get_debitor(vertrag.debitor_id)
@@ -71,8 +82,20 @@ class ErhoehungsschreibenOutboxService:
         }
 
     def _entwurf_speichern(
-        self, row: ErhoehungsschreibenTable, *, mehrkomponenten_blockiert: bool
+        self, row: ErhoehungsschreibenTable, *, mehrkomponenten_blockiert: bool, bestehende_id: int | None = None
     ) -> ErhoehungsschreibenTable:
+        """`bestehende_id`: Retry eines bereits vorhandenen, aber noch
+        NICHT versendeten (ENTWURF/BLOCKIERT) Erhöhungsschreibens nach
+        einer behobenen Quelle - überschreibt dessen Inhalt IN PLACE
+        statt einen zweiten, gegen den partiellen Unique-Index
+        verstoßenden Versuch zu unternehmen (unabhängiger Review,
+        fd8c2b2-Folgereview: "Ein unsent BLOCKIERTer MieWeG-Fall muss
+        nach behobener Quelle dagegen erneuerbar sein; dauerhaftes
+        BEREITS_ERFASST darf den ganzen Aprilzyklus nicht verschlucken").
+        Der Aufrufer (`service.py`) garantiert, dass `bestehende_id` nur
+        für eine Zeile im Status ENTWURF/BLOCKIERT übergeben wird -
+        niemals für eine bereits GESENDETe."""
+
         gruende: list[str] = []
         empfaenger = row.empfaenger_snapshot
         if not (empfaenger.get("adresse") or "").strip():
@@ -85,6 +108,19 @@ class ErhoehungsschreibenOutboxService:
             )
         row.status = "BLOCKIERT" if gruende else "BEREIT"
         row.blockiert_gruende = gruende
+        if bestehende_id is not None:
+            return self._repository.aktualisieren(
+                bestehende_id,
+                status=row.status,
+                blockiert_gruende=row.blockiert_gruende,
+                erhoehung_cent=row.erhoehung_cent,
+                massgeblicher_termin=row.massgeblicher_termin,
+                schreiben_text=row.schreiben_text,
+                rechtsprofil_id=row.rechtsprofil_id,
+                rechtsprofil_version=row.rechtsprofil_version,
+                mieweg_vorschau_id=row.mieweg_vorschau_id,
+                empfaenger_snapshot=row.empfaenger_snapshot,
+            )
         return self._repository.anlegen(row)
 
     def erstellen_aus_mieweg(
@@ -101,6 +137,7 @@ class ErhoehungsschreibenOutboxService:
         referenzierte_komponenten: list,
         unveraenderte_komponenten: list,
         akteur: str,
+        bestehende_id: int | None = None,
     ) -> ErhoehungsschreibenTable:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
@@ -175,7 +212,7 @@ class ErhoehungsschreibenOutboxService:
             idempotenzschluessel=f"{vertrag.id}:mieweg:{ziel_bewertungsjahr}",
             empfaenger_snapshot=self._empfaenger_snapshot(vertrag),
         )
-        return self._entwurf_speichern(row, mehrkomponenten_blockiert=mehrkomponenten_blockiert)
+        return self._entwurf_speichern(row, mehrkomponenten_blockiert=mehrkomponenten_blockiert, bestehende_id=bestehende_id)
 
     def erstellen_aus_index_anpassung(
         self,
@@ -253,10 +290,20 @@ class ErhoehungsschreibenOutboxService:
         *,
         ctx: AuthContext,
         erhoehungsschreiben_id: int,
+        heute,
         send_enabled: bool,
         mailops_allowlist_bestaetigt: bool,
         transport: Transportadapter,
     ) -> VersandErgebnis:
+        """Unabhängiger Review (fd8c2b2-Folgereview): der bisherige
+        Versand prüfte NUR den Empfänger-Snapshot - weder das aktuelle
+        Datum (ein Vertrag konnte inzwischen abgelaufen sein), noch ob
+        `massgeblicher_termin` überhaupt schon erreicht ist (kein
+        verfrühter Versand vor Wirksamkeit), noch ob das zugrunde
+        liegende Rechtsprofil seit der Entwurfserstellung invalidiert
+        wurde (geänderte Quelle/Basis/Klausel). Alle drei werden jetzt
+        UNMITTELBAR vor dem Claim erneut geprüft."""
+
         schreiben = self._repository.get(erhoehungsschreiben_id)
         if schreiben is None:
             raise ValueError(f"Unbekanntes Erhoehungsschreiben {erhoehungsschreiben_id}")
@@ -274,6 +321,32 @@ class ErhoehungsschreibenOutboxService:
         except ObjektAusgeschlossenError as exc:
             self._repository.set_status(schreiben.id, "BLOCKIERT", blockiert_gruende=[str(exc)])
             return VersandErgebnis("BLOCKIERT", str(exc))
+
+        if vertrag.gueltig_bis is not None and vertrag.gueltig_bis < heute:
+            grund = f"Vertrag ist seit {vertrag.gueltig_bis.isoformat()} abgelaufen - kein Versand mehr."
+            self._repository.set_status(schreiben.id, "BLOCKIERT", blockiert_gruende=[grund])
+            return VersandErgebnis("BLOCKIERT", grund)
+
+        if schreiben.massgeblicher_termin > heute:
+            grund = (
+                f"Wirksamkeitstermin ({schreiben.massgeblicher_termin.isoformat()}) liegt noch in der Zukunft "
+                "- kein verfrühter Versand vor Wirksamkeit."
+            )
+            self._repository.set_status(schreiben.id, "BLOCKIERT", blockiert_gruende=[grund])
+            return VersandErgebnis("BLOCKIERT", grund)
+
+        aktuelles_profil = self._rechtsprofil_service.aktives_gueltiges_profil(vertrag.id, heute=heute)
+        if (
+            aktuelles_profil is None
+            or aktuelles_profil.id != schreiben.rechtsprofil_id
+            or aktuelles_profil.version != schreiben.rechtsprofil_version
+        ):
+            grund = (
+                "Das zugrunde liegende Rechtsprofil ist seit der Entwurfserstellung nicht mehr die "
+                "aktuell gültige, freigegebene Version - neue Prüfung/Entwurf erforderlich."
+            )
+            self._repository.set_status(schreiben.id, "BLOCKIERT", blockiert_gruende=[grund])
+            return VersandErgebnis("BLOCKIERT", grund)
 
         aktueller_snapshot = self._empfaenger_snapshot(vertrag)
         if aktueller_snapshot != schreiben.empfaenger_snapshot:
@@ -311,7 +384,7 @@ class ErhoehungsschreibenOutboxService:
         self._repository.set_status(
             schreiben.id,
             "GESENDET",
-            versendet_am=datetime.now(timezone.utc),
+            versendet_am=datetime.combine(heute, datetime.min.time(), tzinfo=timezone.utc),
             externe_versandreferenz=bestaetigung.externe_referenz,
         )
         return VersandErgebnis("GESENDET", "Versand angenommen - Zugang muss gesondert bestätigt werden.")
@@ -328,6 +401,7 @@ class ErhoehungsschreibenOutboxService:
         *,
         ctx: AuthContext,
         erhoehungsschreiben_id: int,
+        heute,
         zugang_datum,
         zugangsform: str,
         zugang_beleg: str,
@@ -346,6 +420,13 @@ class ErhoehungsschreibenOutboxService:
                 f"Nur ein GESENDETes Schreiben kann einen Zugang bestätigt bekommen (aktueller Status: "
                 f"{schreiben.status})."
             )
+        if zugang_datum > heute:
+            raise ValueError("Zugangsdatum darf nicht in der Zukunft liegen.")
+        if schreiben.versendet_am is not None and zugang_datum < schreiben.versendet_am.date():
+            raise ValueError(
+                f"Zugangsdatum ({zugang_datum.isoformat()}) liegt vor dem tatsächlichen Versanddatum "
+                f"({schreiben.versendet_am.date().isoformat()}) - unplausible Eingabe."
+            )
         if zugangsform not in ZUGANGSFORMEN_ALLE:
             raise ValueError(f"Unbekannte Zugangsform '{zugangsform}'.")
         if not (zugang_beleg or "").strip():
@@ -356,6 +437,15 @@ class ErhoehungsschreibenOutboxService:
                 "fristauslösender Zugang (z. B. eine bloß versendete, unbestätigte E-Mail - keine "
                 "automatische Gleichsetzung von SMTP/HTTP-accepted mit Zugang). Bitte einen formal "
                 "ausreichenden Nachweis erfassen oder den Fall manuell klären."
+            )
+
+        profil = self._rechtsprofil_repository.get(schreiben.rechtsprofil_id)
+        if profil is None or profil.rechtsordnung not in _ZUGANGSFRIST_UNTERSTUETZTE_RECHTSORDNUNGEN:
+            raise ValueError(
+                f"Automatische Zustellungs-/Zahlungspflichtfristen (§ 16 Abs 9 MRG, 14 Tage) sind für die "
+                f"Rechtsordnung {profil.rechtsordnung if profil else 'unbekannt'} hier nicht unterstützt - "
+                "ungeklärte Fristenlage wird intern gesperrt, nicht mit einem geratenen Termin an den "
+                "Mieter kommuniziert. Bitte manuell klären."
             )
 
         fruehester = zugang_datum + timedelta(days=14)

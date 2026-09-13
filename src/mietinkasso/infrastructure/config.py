@@ -86,6 +86,12 @@ class Settings(BaseSettings):
     # Internetzugriff in dieser Sitzung nicht gegen den echten Endpunkt
     # verifiziert - Codex muss das vor Aktivierung prüfen.
     indexautomatik_vpi_automatischer_abruf: bool = False
+    # Generischer HTTP-Transport (indexautomatik/transport.py::
+    # HttpTransportadapter) - ohne konfigurierten Endpunkt bleibt der
+    # tägliche Versandlauf strukturell blockiert (kein Fallback auf
+    # einen erfundenen Endpunkt).
+    indexautomatik_transport_endpoint_url: str | None = None
+    indexautomatik_transport_api_key: str | None = None
 
 
 class ProduktionskonfigurationUngueltigError(RuntimeError):
