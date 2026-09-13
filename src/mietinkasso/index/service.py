@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import IndexAnpassungStatus, IndexKlauselStatus, rechtsordnung_geklaert
@@ -49,6 +49,28 @@ UNTERSTUETZTE_BERECHNUNGSPROFILE = frozenset({EINFACHER_SCHWELLENVERGLEICH})
 #: bleibt eine konfigurierte Wartefrist gesperrt (siehe
 #: `indexautomatik/service.py::_monatslauf_klausel`).
 _WARTEFRIST_BEZUEGE = frozenset({"VPI_PERIODE", "VEROEFFENTLICHUNG"})
+
+#: Explizites Terminmodell (Codex-Rückprüfung zu 5535ae2 - "anpassungsmonat
+#: ist zwingend und damit reine Schwellenklauseln ohne festen Monat sowie
+#: maximal-einmal-jährlich ohne fixen Monat nicht darstellbar"). Siehe
+#: `IndexKlauselTable.terminmodus`-Docstring in `infrastructure/db/tables.py`
+#: für die vollständige Beschreibung je Modus und
+#: `indexautomatik/service.py::_monatslauf_klausel` für die Fachlogik.
+_TERMINMODI = frozenset({"FIXER_MONAT", "BEI_SCHWELLE", "INTERVALL"})
+
+
+def _ist_gueltiges_jahr_monat(wert: str) -> bool:
+    """Formatprüfung für 'YYYY-MM' (z. B. `basis_monat`, `letzte_anpassung_
+    monat`) - kein Rateversuch bei einem unbrauchbaren/unparsbaren Wert."""
+
+    teile = wert.split("-")
+    if len(teile) != 2 or len(teile[0]) != 4:
+        return False
+    try:
+        jahr, monat = int(teile[0]), int(teile[1])
+    except ValueError:
+        return False
+    return jahr > 0 and 1 <= monat <= 12
 
 
 @dataclass(frozen=True)
@@ -81,15 +103,18 @@ class IndexService:
         basis_reihe: str,
         basis_wert: Decimal,
         basis_monat: str,
+        letzte_anpassung_monat: str | None = None,
         schwelle_prozent: Decimal = Decimal("0"),
         schwelle_inklusive: bool = True,
         daempfung_prozent: Decimal | None = None,
         vertragliche_grenze_prozent: Decimal | None = None,
         indexierbare_komponenten: list[str] | None = None,
         klausel_text: str | None = None,
+        terminmodus: str | None = None,
         anpassungsmonat: int | None = None,
         mindestintervall_monate: int | None = None,
         indexwert_rundung_dezimalstellen: int | None = None,
+        schwellenkorridor_rundung_dezimalstellen: int | None = None,
         wartefrist_monate_nach_indexereignis: int | None = None,
         wartefrist_bezug: str | None = None,
     ) -> IndexKlauselTable:
@@ -102,13 +127,44 @@ class IndexService:
                 f"Vertrag {vertrag_id}: Rechtsordnung ist UNGEKLAERT; eine IndexKlausel darf nicht "
                 "angelegt werden, bis die rechtliche Einordnung feststeht."
             )
+        if terminmodus is not None and terminmodus not in _TERMINMODI:
+            raise ValueError(f"terminmodus muss einer von {sorted(_TERMINMODI)} sein, war {terminmodus!r}.")
+        if letzte_anpassung_monat is not None and not _ist_gueltiges_jahr_monat(letzte_anpassung_monat):
+            raise ValueError(f"letzte_anpassung_monat muss das Format 'YYYY-MM' haben, war {letzte_anpassung_monat!r}.")
         if anpassungsmonat is not None and not (1 <= anpassungsmonat <= 12):
             raise ValueError(f"anpassungsmonat muss 1-12 sein, war {anpassungsmonat}.")
         if mindestintervall_monate is not None and mindestintervall_monate <= 0:
             raise ValueError(f"mindestintervall_monate muss positiv sein, war {mindestintervall_monate}.")
+        # Jeder Terminmodus stellt EIGENE Anforderungen an
+        # anpassungsmonat/mindestintervall_monate (Codex-Rückprüfung zu
+        # 5535ae2) - kein impliziter Rateversuch, welche Kombination
+        # gemeint sein könnte.
+        if terminmodus == "FIXER_MONAT" and (anpassungsmonat is None or mindestintervall_monate is None):
+            raise ValueError(
+                "Terminmodell FIXER_MONAT verlangt sowohl anpassungsmonat als auch mindestintervall_monate."
+            )
+        if terminmodus == "INTERVALL":
+            if mindestintervall_monate is None:
+                raise ValueError("Terminmodell INTERVALL verlangt mindestintervall_monate.")
+            if anpassungsmonat is not None:
+                raise ValueError(
+                    "Terminmodell INTERVALL darf keinen fixen anpassungsmonat haben (sonst FIXER_MONAT verwenden)."
+                )
+        if terminmodus == "BEI_SCHWELLE" and anpassungsmonat is not None:
+            raise ValueError("Terminmodell BEI_SCHWELLE darf keinen fixen anpassungsmonat haben.")
+        if terminmodus is None and (anpassungsmonat is not None or mindestintervall_monate is not None):
+            raise ValueError(
+                "anpassungsmonat/mindestintervall_monate sind nur zusammen mit einem gesetzten terminmodus "
+                "sinnvoll - ohne Terminmodell bleibt der automatische Wirksamkeitstermin ohnehin gesperrt."
+            )
         if indexwert_rundung_dezimalstellen is not None and indexwert_rundung_dezimalstellen < 0:
             raise ValueError(
                 f"indexwert_rundung_dezimalstellen darf nicht negativ sein, war {indexwert_rundung_dezimalstellen}."
+            )
+        if schwellenkorridor_rundung_dezimalstellen is not None and schwellenkorridor_rundung_dezimalstellen < 0:
+            raise ValueError(
+                "schwellenkorridor_rundung_dezimalstellen darf nicht negativ sein, war "
+                f"{schwellenkorridor_rundung_dezimalstellen}."
             )
         # Beide zusammen oder keines - eine Wartefrist ohne eindeutigen
         # Bezug (VPI-Periode ODER Veröffentlichung) wäre ein Rateversuch,
@@ -135,14 +191,22 @@ class IndexService:
             basis_reihe=basis_reihe,
             basis_wert=basis_wert,
             basis_monat=basis_monat,
+            # Auftrag Markus (Portal-Anforderung): eine belegte BESTEHENDE
+            # Anpassungsperiode muss bei Neuanlage (z. B. Migration eines
+            # Altvertrags mit bereits erfolgten Anpassungen) explizit
+            # eingegeben werden können - ohne diese Angabe bleibt es bei
+            # `None` (unbekannte/keine Vorbasis), NIE eine Annahme.
+            letzte_anpassung_monat=letzte_anpassung_monat,
             schwelle_prozent=schwelle_prozent,
             schwelle_inklusive=schwelle_inklusive,
             daempfung_prozent=daempfung_prozent,
             vertragliche_grenze_prozent=vertragliche_grenze_prozent,
             indexierbare_komponenten=list(indexierbare_komponenten or []),
+            terminmodus=terminmodus,
             anpassungsmonat=anpassungsmonat,
             mindestintervall_monate=mindestintervall_monate,
             indexwert_rundung_dezimalstellen=indexwert_rundung_dezimalstellen,
+            schwellenkorridor_rundung_dezimalstellen=schwellenkorridor_rundung_dezimalstellen,
             wartefrist_monate_nach_indexereignis=wartefrist_monate_nach_indexereignis,
             wartefrist_bezug=wartefrist_bezug,
             status=IndexKlauselStatus.ENTWURF.value,
@@ -194,25 +258,29 @@ class IndexService:
             )
 
         rohe_veraenderung = (neuer_wert - klausel.basis_wert) / klausel.basis_wert * 100
-        effektive_veraenderung = self._daempfe(rohe_veraenderung, klausel.daempfung_prozent)
-
-        if (
-            klausel.vertragliche_grenze_prozent is not None
-            and effektive_veraenderung > klausel.vertragliche_grenze_prozent
-        ):
-            effektive_veraenderung = klausel.vertragliche_grenze_prozent
-
-        # Schwelle wirkt auf den BETRAG der Veränderung (Betragsschwelle
-        # absolut, nicht gerichtet): eine Senkung um 5% ist bei Schwelle 3%
-        # genauso wirksam wie eine Erhöhung um 5%. Inklusive/exklusive
-        # Grenze ist eine explizite Vertragsklausel: "ab X%" (inklusive)
-        # löst schon EXAKT bei der Schwelle aus, "über X%" (exklusiv)
-        # erst STRIKT darüber - viele reale Verträge verlangen Letzteres.
-        if klausel.schwelle_inklusive:
-            unterhalb_schwelle = abs(effektive_veraenderung) < klausel.schwelle_prozent
+        effektive_veraenderung = self.effektive_veraenderung_prozent(
+            alter_wert=klausel.basis_wert,
+            neuer_wert=neuer_wert,
+            daempfung_prozent=klausel.daempfung_prozent,
+            vertragliche_grenze_prozent=klausel.vertragliche_grenze_prozent,
+        )
+        if klausel.schwellenkorridor_rundung_dezimalstellen is not None:
+            obergrenze, untergrenze = self.schwellenkorridor_grenzwerte(
+                basis_wert=klausel.basis_wert, schwelle_prozent=klausel.schwelle_prozent,
+                rundung_dezimalstellen=klausel.schwellenkorridor_rundung_dezimalstellen,
+            )
+            ueberschritten = self.ueberschreitet_schwelle_grenzwerte(
+                neuer_wert, obergrenze=obergrenze, untergrenze=untergrenze, schwelle_inklusive=klausel.schwelle_inklusive
+            )
         else:
-            unterhalb_schwelle = abs(effektive_veraenderung) <= klausel.schwelle_prozent
-        if unterhalb_schwelle:
+            ueberschritten = self.ueberschreitet_schwelle(
+                effektive_veraenderung, schwelle_prozent=klausel.schwelle_prozent, schwelle_inklusive=klausel.schwelle_inklusive
+            )
+        if not ueberschritten:
+            # "Berechnungsbetrag weiterhin aus unverkürztem Indexquotienten"
+            # (Präzisierung Markus): die Korridor-Grenzwertrundung
+            # entscheidet NUR, OB überhaupt ausgelöst wird - der Betrag
+            # selbst bleibt IMMER die volle, unverkürzte Veränderung.
             effektive_veraenderung = Decimal("0")
 
         indexierbare_basis_cent = self._indexierbare_basis_cent(vertrag_id, klausel, stichtag)
@@ -269,6 +337,85 @@ class IndexService:
             return rohe_veraenderung
         ueberschuss = rohe_veraenderung - daempfung_schwelle_prozent
         return daempfung_schwelle_prozent + (ueberschuss / 2)
+
+    @staticmethod
+    def effektive_veraenderung_prozent(
+        *,
+        alter_wert: Decimal,
+        neuer_wert: Decimal,
+        daempfung_prozent: Decimal | None,
+        vertragliche_grenze_prozent: Decimal | None,
+    ) -> Decimal:
+        """Rohe Veränderung -> Dämpfung -> vertragliche Grenze, IN DIESER
+        REIHENFOLGE - identisch zu `berechne_vorschlag`s bisheriger
+        Inline-Logik, hier als wiederverwendbarer statischer Baustein
+        (Codex-Rückprüfung zu 5535ae2: `indexautomatik/service.py`s Suche
+        nach dem maßgeblichen Überschreitungsereignis braucht GENAU
+        dieselbe Berechnung, nicht eine zweite, potenziell abweichende
+        Kopie). Liefert IMMER den vollen, unverkürzten Wert - eine
+        etwaige Schwellenkorridor-Rundung (siehe `schwellenkorridor_
+        grenzwerte`) betrifft NUR die TRIGGER-Entscheidung, NIEMALS den
+        für die Erhöhung tatsächlich verwendeten Betrag (Präzisierung
+        Markus: "Berechnungsbetrag weiterhin aus unverkürztem
+        Indexquotienten")."""
+
+        rohe_veraenderung = (neuer_wert - alter_wert) / alter_wert * 100
+        effektive_veraenderung = IndexService._daempfe(rohe_veraenderung, daempfung_prozent)
+        if vertragliche_grenze_prozent is not None and effektive_veraenderung > vertragliche_grenze_prozent:
+            effektive_veraenderung = vertragliche_grenze_prozent
+        return effektive_veraenderung
+
+    @staticmethod
+    def ueberschreitet_schwelle(effektive_veraenderung: Decimal, *, schwelle_prozent: Decimal, schwelle_inklusive: bool) -> bool:
+        """Schwelle wirkt auf den BETRAG der Veränderung (Betragsschwelle
+        absolut, nicht gerichtet): eine Senkung um 5% ist bei Schwelle 3%
+        genauso wirksam wie eine Erhöhung um 5%. Inklusive/exklusive
+        Grenze ist eine explizite Vertragsklausel: "ab X%" (inklusive)
+        löst schon EXAKT bei der Schwelle aus, "über X%" (exklusiv) erst
+        STRIKT darüber - viele reale Verträge verlangen Letzteres."""
+
+        if schwelle_inklusive:
+            return abs(effektive_veraenderung) >= schwelle_prozent
+        return abs(effektive_veraenderung) > schwelle_prozent
+
+    @staticmethod
+    def schwellenkorridor_grenzwerte(
+        *, basis_wert: Decimal, schwelle_prozent: Decimal, rundung_dezimalstellen: int
+    ) -> tuple[Decimal, Decimal]:
+        """Ober-/Untergrenze des Schwellenkorridors in INDEXPUNKTEN (NICHT
+        Prozent) - `basis_wert*(1±schwelle/100)`, gerundet auf
+        `rundung_dezimalstellen` Nachkommastellen. Präzisierung Markus
+        (vor Commit korrigiert): eine belegte Altvertragsklausel rundet
+        die GRENZWERTE des Korridors, NICHT die daraus berechnete
+        Veränderungsprozentzahl - Beispiel Basis 300, Schwelle 3% strikt:
+        oberer Grenzwert = 300*1,03 = 309,0 (bereits exakt eine
+        Dezimalstelle); ein amtlicher Wert 309,1 überschreitet ihn direkt
+        (309,1 > 309,0), obwohl die gerundete Veränderung selbst
+        fälschlich noch 3,0% ergäbe und NICHT auslösen würde - die
+        Rundung der Prozentzahl ist NICHT dieselbe Rundung wie die der
+        Grenzwerte (siehe `ueberschreitet_schwelle_grenzwerte`, die
+        NUR gegen diese gerundeten Grenzwerte vergleicht, nie gegen eine
+        gerundete Prozentzahl)."""
+
+        quant = Decimal(1).scaleb(-rundung_dezimalstellen)
+        faktor = schwelle_prozent / 100
+        obergrenze = (basis_wert * (1 + faktor)).quantize(quant, rounding=ROUND_HALF_UP)
+        untergrenze = (basis_wert * (1 - faktor)).quantize(quant, rounding=ROUND_HALF_UP)
+        return obergrenze, untergrenze
+
+    @staticmethod
+    def ueberschreitet_schwelle_grenzwerte(
+        neuer_wert: Decimal, *, obergrenze: Decimal, untergrenze: Decimal, schwelle_inklusive: bool
+    ) -> bool:
+        """Vergleicht den TATSÄCHLICHEN (unveränderten) amtlichen
+        Indexwert direkt gegen die gerundeten Korridor-Grenzwerte - siehe
+        `schwellenkorridor_grenzwerte`-Docstring für das Beispiel, warum
+        das NICHT dasselbe Ergebnis liefert wie ein Vergleich der
+        gerundeten Veränderungsprozentzahl gegen `schwelle_prozent`."""
+
+        if schwelle_inklusive:
+            return neuer_wert >= obergrenze or neuer_wert <= untergrenze
+        return neuer_wert > obergrenze or neuer_wert < untergrenze
 
     def _indexierbare_basis_cent(self, vertrag_id: str, klausel: IndexKlauselTable, stichtag: date) -> int:
         komponenten = self._stammdaten_repository.list_aktive_komponenten(vertrag_id, stichtag)

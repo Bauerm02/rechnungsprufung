@@ -87,6 +87,8 @@ class VpiRepository:
         quelle_hash: str,
         abgerufen_am: datetime,
         importiert_von: str,
+        veroeffentlicht_am: date | None = None,
+        veroeffentlichung_quelle: str | None = None,
     ) -> VpiMonatswertTable:
         with self._session_factory() as session:
             statement = select(VpiMonatswertTable).where(
@@ -105,6 +107,8 @@ class VpiRepository:
                     quelle_hash=quelle_hash,
                     abgerufen_am=abgerufen_am,
                     importiert_von=importiert_von,
+                    veroeffentlicht_am=veroeffentlicht_am,
+                    veroeffentlichung_quelle=veroeffentlichung_quelle,
                 )
                 session.add(row)
             else:
@@ -115,6 +119,8 @@ class VpiRepository:
                 row.quelle_hash = quelle_hash
                 row.abgerufen_am = abgerufen_am
                 row.importiert_von = importiert_von
+                row.veroeffentlicht_am = veroeffentlicht_am
+                row.veroeffentlichung_quelle = veroeffentlichung_quelle
             session.commit()
             session.refresh(row)
             return row
@@ -239,6 +245,33 @@ class VpiRepository:
             )
             row = session.execute(statement).scalars().first()
             return VpiMonatswertMitPeriode(wert=row.wert, jahr=row.jahr, monat=row.monat) if row else None
+
+    def endgueltige_monatswerte_zwischen(
+        self, reihe: str, *, nach_jahr: int, nach_monat: int, bis: date
+    ) -> list[VpiMonatswertMitPeriode]:
+        """ENDGUELTIGe Monatswerte NACH (nach_jahr, nach_monat) - exklusiv,
+        das ist typischerweise der `basis_monat` einer IndexKlausel und
+        selbst kein Vergleichskandidat - bis EINSCHLIESSLICH `bis`,
+        AUFSTEIGEND sortiert. Für die Suche nach dem MASSGEBLICHEN
+        (=ersten) Überschreitungsereignis einer Schwelle (Codex-
+        Rückprüfung zu 5535ae2: "Wartefrist läuft vom maßgeblichen
+        Überschreitungsereignis, nicht immer neuesten VPI, sonst
+        verschiebt sie sich endlos") - eine reine chronologische
+        Vorwärtssuche ab demselben festen Startpunkt ist über beliebig
+        viele spätere Läufe stabil (liefert immer dasselbe erste Ereignis),
+        anders als "der jeweils neueste verfügbare Wert"."""
+
+        with self._session_factory() as session:
+            statement = (
+                select(VpiMonatswertTable)
+                .where(VpiMonatswertTable.reihe == reihe)
+                .where(VpiMonatswertTable.finalitaet == "ENDGUELTIG")
+                .where((VpiMonatswertTable.jahr > nach_jahr) | ((VpiMonatswertTable.jahr == nach_jahr) & (VpiMonatswertTable.monat > nach_monat)))
+                .where((VpiMonatswertTable.jahr < bis.year) | ((VpiMonatswertTable.jahr == bis.year) & (VpiMonatswertTable.monat <= bis.month)))
+                .order_by(VpiMonatswertTable.jahr.asc(), VpiMonatswertTable.monat.asc())
+            )
+            rows = session.execute(statement).scalars().all()
+            return [VpiMonatswertMitPeriode(wert=row.wert, jahr=row.jahr, monat=row.monat) for row in rows]
 
     def jahresdurchschnitte_fuer(self, reihe: str, jahre: set[int]) -> dict[int, Decimal]:
         ergebnis: dict[int, Decimal] = {}

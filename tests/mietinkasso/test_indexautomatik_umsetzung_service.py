@@ -283,7 +283,8 @@ def test_umsetzen_klausel_pfad_schreibt_basis_fort(
             berechnungsprofil="EINFACHER_SCHWELLENVERGLEICH", abschlussdatum=date(2020, 1, 1),
             basis_reihe="VPI2020", basis_wert=Decimal("100"), basis_monat="2024-01",
             schwelle_prozent=Decimal("0"), schwelle_inklusive=True, status="ENTWURF",
-            anpassungsmonat=1, mindestintervall_monate=12,
+            terminmodus="FIXER_MONAT", anpassungsmonat=1, mindestintervall_monate=12,
+            schwellenkorridor_rundung_dezimalstellen=1,
         )
     )
     klausel = index_repo.freigeben(klausel.id, freigegeben_von="markus")
@@ -356,8 +357,82 @@ def test_umsetzen_klausel_pfad_schreibt_basis_fort(
     # Neues Kalender-/Intervallregelprofil bleibt bei mechanischer
     # Fortschreibung unverändert erhalten (kein stillschweigender
     # Fachentscheid durch die Basisfortschreibung).
+    assert neue_klausel.terminmodus == klausel.terminmodus
     assert neue_klausel.anpassungsmonat == klausel.anpassungsmonat
     assert neue_klausel.mindestintervall_monate == klausel.mindestintervall_monate
+    assert neue_klausel.schwellenkorridor_rundung_dezimalstellen == klausel.schwellenkorridor_rundung_dezimalstellen
+
+
+def test_umsetzen_klausel_pfad_blockiert_ohne_vpi_quellmonat(
+    admin_ctx, basis_vertrag, umsetzung_service, outbox_repo, rechtsprofil_service, stammdaten_repo, index_repo,
+):
+    """Codex-Rückprüfung zu 5535ae2 (Punkt 4): ein Rollforward OHNE
+    belegten VPI-Quellmonat (vpi_jahr/vpi_monat) auf der IndexAnpassung
+    darf NICHT stillschweigend den Anspruchsmonat als VPI-Quellmonat
+    eintragen - die Umsetzung wird stattdessen blockiert."""
+
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.add_komponente(
+        id="K-2", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=100_000,
+        indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    klausel = index_repo.anlegen(
+        IndexKlauselTable(
+            vertrag_id=vertrag.id, version=1, rechtsordnung="OESTERREICH_MRG_TEIL",
+            berechnungsprofil="EINFACHER_SCHWELLENVERGLEICH", abschlussdatum=date(2020, 1, 1),
+            basis_reihe="VPI2020", basis_wert=Decimal("100"), basis_monat="2024-01",
+            schwelle_prozent=Decimal("0"), schwelle_inklusive=True, status="ENTWURF",
+            terminmodus="FIXER_MONAT", anpassungsmonat=1, mindestintervall_monate=12,
+        )
+    )
+    klausel = index_repo.freigeben(klausel.id, freigegeben_von="markus")
+
+    # KEIN vpi_jahr/vpi_monat - z. B. eine ältere, vor der VPI-
+    # Periodenverfolgung erzeugte Anpassung.
+    anpassung = index_repo.speichere_anpassung(
+        IndexAnpassungTable(
+            index_klausel_id=klausel.id, index_klausel_version=klausel.version, vertrag_id=vertrag.id,
+            stichtag=date(2026, 4, 1), alter_wert=Decimal("100"), neuer_wert=Decimal("105"),
+            veraenderung_prozent=Decimal("5"), erhoehung_cent=5_000, status="FREIGEGEBEN",
+            quelle_referenz="Test",
+        )
+    )
+
+    entwurf = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_TEIL", ist_wohnungsnutzung=False,
+        mrg_zinsbeschraenkung=False, mrg_zinsbeschraenkung_geprueft=True, ist_altvertrag=False, ist_hauptmiete=True,
+        foerderbindung=False, foerderbindung_geprueft=True,
+        mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
+        bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False,
+        basis_komponenten_ids=["K-2"], vertragsklausel_id=klausel.id,
+        vertrag_beleg_referenz="Vertrag", klausel_referenz="Punkt 7", erstellt_von="markus",
+    )
+    profil = rechtsprofil_service.freigeben(entwurf.id, ctx=admin_ctx, freigegeben_von="markus")
+
+    schreiben = outbox_repo.anlegen(
+        ErhoehungsschreibenTable(
+            vertrag_id=vertrag.id, ziel_bewertungsjahr=None, rechtsprofil_id=profil.id,
+            rechtsprofil_version=profil.version, index_anpassung_id=anpassung.id,
+            status="SOLL_UMSETZUNG_OFFEN", massgeblicher_termin=date(2026, 4, 1),
+            erhoehung_cent=5_000, schreiben_text="Testschreiben", idempotenzschluessel=f"{vertrag.id}:klausel:{anpassung.id}",
+            versendet_am=datetime(2026, 3, 15, 9, 0, tzinfo=timezone.utc), externe_versandreferenz="MAILOPS-TEST-2",
+            zugangsform="EINSCHREIBEN", zugang_bestaetigt_am=date(2026, 4, 1), zugang_beleg="RSb-2",
+            zahlungspflicht_ab=date(2026, 4, 15), empfaenger_snapshot={"debitor_id": vertrag.debitor_id},
+            komponenten_verteilung={
+                "eintraege": [{"komponente_id": "K-2", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 105_000}]
+            },
+        )
+    )
+
+    ergebnis = umsetzung_service.umsetzen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 4, 20), akteur="markus",
+        soll_umsetzung_enabled=True,
+    )
+    assert ergebnis.status == "BLOCKIERT"
+    assert any("VPI-Quellmonat" in g for g in ergebnis.gruende)
+
+    unveraendert = index_repo.get_klausel(klausel.id)
+    assert unveraendert.status == "FREIGEGEBEN"  # keine Fortschreibung, keine Sperrung der alten Version
 
 
 def test_umsetzen_mehrkomponenten_historisiert_alle_betroffenen_komponenten(

@@ -1479,22 +1479,87 @@ Aus derselben Rückprüfung inzwischen behoben (Commits `8f499c9`,
   im Text und bleibt unverändert. Interne Versions-/Hash-Nachweise
   bleiben ausschließlich im `IndexSollUmsetzungTable`-Ausführungsnachweis.
 
+Zwischenzeitlich umgesetzt (Commit `5535ae2` und Folgecommit,
+Codex-Rückprüfungen zu 28ca323/c01ceb2/5535ae2) - der Geschäftsraum-/
+Klausel-Pfad hat jetzt einen echten, belegten automatischen
+Wirksamkeitstermin:
+
+- **Betragsabgleich + Belegdatum-Semantik** (`mieweg_vorschau/
+  service.py::belegte_historische_basis_gueltig`): der Belegbetrag wird
+  jetzt exakt gegen den tatsächlich verrechneten Betrag geprüft (ein
+  1-Cent-Beleg kann keine unabhängige, weit höhere Komponente mehr
+  freischalten); das Belegdatum ist rein dokumentarisch und wird NICHT
+  mehr gegen den vertraglichen Bezugsmonat gesperrt.
+- **Explizites Terminmodell** (`IndexKlauselTable.terminmodus`, GENAU
+  EINER von `FIXER_MONAT`/`BEI_SCHWELLE`/`INTERVALL`): löst die frühere
+  starre Pflichtkombination `anpassungsmonat`+`mindestintervall_monate`
+  ab, die reine Schwellenklauseln ohne festen Monat und "maximal einmal
+  jährlich ohne fixen Monat" nicht darstellen konnte. Erster möglicher
+  Termin (ab Vertragsbeginn) und Mindestabstand seit einer bereits
+  erfolgten ANPASSUNG (nicht nur seit einer tatsächlichen UMSETZUNG,
+  die separat und oft deutlich später erfolgt) sind getrennte, korrekt
+  verkettete Prüfungen.
+- **Belegte amtliche Veröffentlichung statt Abrufzeitpunkt**
+  (`VpiMonatswertTable.veroeffentlicht_am`/`veroeffentlichung_quelle`,
+  additiv/nullable): eine Wartefrist mit `wartefrist_bezug=
+  "VEROEFFENTLICHUNG"` verwendet ausschließlich dieses belegte Datum,
+  NIE `abgerufen_am` (das ist nur der eigene Abrufzeitpunkt). Die
+  Wartefrist selbst wird TAGGENAU (nicht auf den Monatsersten gekürzt)
+  über `_kalendermonate_addieren_exakt` berechnet.
+- **Wartefrist-Anker fixiert auf das ERSTE Überschreitungsereignis**
+  (`indexautomatik/service.py::_erstes_ueberschreitungsereignis`,
+  `VpiRepository.endgueltige_monatswerte_zwischen`): eine reine
+  Vorwärtssuche ab `basis_monat` liefert über beliebig viele spätere
+  Läufe immer dasselbe erste Ergebnis - die Frist "wandert" nicht mehr
+  mit jedem neu veröffentlichten VPI-Monat weiter in die Zukunft.
+- **Rollforward ohne belegten VPI-Quellmonat wird blockiert**
+  (`umsetzung_service.py::_pruefen`): eine Umsetzung, deren
+  `IndexAnpassung` kein `vpi_jahr`/`vpi_monat` trägt, wird nicht mehr
+  mechanisch fortgeschrieben (das hätte sonst den Anspruchsmonat als
+  falschen VPI-Quellmonat eingetragen), sondern explizit blockiert.
+- **Negative Anpassung ist sichtbar** (`IndexautomatikLaufStatus.
+  SENKUNG_PRUEFBEDARF`): eine tatsächliche Senkung verschwindet nicht
+  mehr unter `KEIN_ERHOEHUNGSBEDARF` - automatische Senkungen bleiben
+  NICHT implementiert (kein automatisches Schreiben), aber der Fall ist
+  als interner Prüfbedarf erkennbar.
+- **Schwellenkorridor-Grenzwertrundung als eigenes Feld**
+  (`IndexKlauselTable.schwellenkorridor_rundung_dezimalstellen`,
+  `IndexService.schwellenkorridor_grenzwerte`/
+  `ueberschreitet_schwelle_grenzwerte`): rundet die Ober-/Untergrenze
+  des Korridors (`basis_wert*(1±schwelle/100)`) in INDEXPUNKTEN, NICHT
+  die daraus berechnete Veränderungsprozentzahl - beide Rundungen sind
+  NICHT dasselbe (Beispiel Basis 300, Schwelle 3% strikt: gerundeter
+  Grenzwert 309,0, ein amtlicher Wert 309,1 überschreitet ihn direkt,
+  obwohl die gerundete Veränderung selbst fälschlich noch 3,0% ergäbe).
+  Der tatsächlich für eine ausgelöste Erhöhung verwendete Betrag bleibt
+  immer aus dem vollen, unverkürzten Indexquotienten berechnet - diese
+  Rundung wirkt NUR auf die Trigger-Entscheidung. Getrennt von
+  `indexwert_rundung_dezimalstellen` (rundet den amtlichen Indexwert
+  selbst).
+- **`letzte_anpassung_monat` bei Klausel-Neuanlage belegbar**
+  (`IndexService.klausel_anlegen(..., letzte_anpassung_monat=...)`):
+  eine bei Migration eines Altvertrags bereits bekannte, bestehende
+  Anpassungsperiode kann jetzt explizit eingegeben werden, statt
+  implizit als Erstanpassung ab Vertragsbeginn behandelt zu werden -
+  ohne Angabe bleibt es bei `None` (keine Annahme).
+
+Alle sieben Punkte mit gezielten Regressionstests in `test_index.py`,
+`test_indexautomatik_service.py`, `test_indexautomatik_rechtsprofil.py`
+und `test_indexautomatik_umsetzung_service.py` belegt. Gesamter
+Mietinkasso-Testsatz zu diesem Zeitpunkt: 747 Tests grün.
+
 Weiterhin OFFEN, NICHT Teil dieser Korrekturrunde (echte Fachentscheidung
 nötig, siehe AGENTS.md - Claude baut keine eigenen Rechtsregeln):
 
-- **Punkt 1 der Codex-Regel-Verfeinerungen (Kalender-/Intervall-/
-  Rundungsfelder für `IndexKlauselTable`) ist NICHT umgesetzt.** Ein
-  automatischer Wirksamkeitstermin für den Geschäftsraum-/Klausel-Pfad
-  bleibt deshalb weiterhin gesperrt (`_monatslauf_klausel` gibt
-  unverändert `BLOCKIERT` mit "kein erfundenes Datum" zurück, sobald ein
-  rechnerischer Vorschlag vorliegt). Welche konkreten Kalendermonate/
-  Mindestintervalle/Rundungsregeln je Vertrag gelten (z. B. "nur Jänner
-  UND strikt >3%-Schwelle" versus "Jänner ohne Schwelle" versus
-  "maximal einmal jährlich ohne fixen Monat"), ist eine echte, vertrags-
-  individuelle Rechtsfrage - das Datenmodell/die Prüflogik dafür sollte
-  erst entworfen werden, wenn die konkreten, zu unterstützenden
-  Regelformen feststehen, statt ein Schema zu erraten, das an der
-  tatsächlichen Anforderung vorbeigeht.
+- **Welches Terminmodell/welche konkreten Parameter (Anpassungsmonat,
+  Mindestintervall, Schwelle, Rundungsmodus, Wartefrist) für einen
+  KONKRETEN Bestandsvertrag tatsächlich gelten**, ist weiterhin eine
+  echte, vertragsindividuelle Rechtsfrage - das Datenmodell/die
+  Prüflogik unterstützt jetzt mehrere Regelformen, ersetzt aber nicht
+  die fachliche Prüfung/Eingabe je Vertrag durch Markus/Codex.
+- **Eine automatische Senkung wird weiterhin NICHT ausgeführt** -
+  `SENKUNG_PRUEFBEDARF` macht den Fall nur sichtbar, eine etwaige
+  Mieterinformation/Gutschrift bleibt manuell.
 
 ## Paket Dashboard/Variable Monatsabrechnung (Auftrag 13.09.2026, HV-20260913-DASHBOARD)
 
