@@ -283,6 +283,7 @@ def test_umsetzen_klausel_pfad_schreibt_basis_fort(
             berechnungsprofil="EINFACHER_SCHWELLENVERGLEICH", abschlussdatum=date(2020, 1, 1),
             basis_reihe="VPI2020", basis_wert=Decimal("100"), basis_monat="2024-01",
             schwelle_prozent=Decimal("0"), schwelle_inklusive=True, status="ENTWURF",
+            anpassungsmonat=1, mindestintervall_monate=12,
         )
     )
     klausel = index_repo.freigeben(klausel.id, freigegeben_von="markus")
@@ -293,6 +294,10 @@ def test_umsetzen_klausel_pfad_schreibt_basis_fort(
             stichtag=date(2026, 4, 1), alter_wert=Decimal("100"), neuer_wert=Decimal("105"),
             veraenderung_prozent=Decimal("5"), erhoehung_cent=5_000, status="FREIGEGEBEN",
             quelle_referenz="Test",
+            # Der tatsächliche VPI-Quellmonat (Dezember 2025) - bewusst
+            # VERSCHIEDEN vom späteren Anspruchsmonat (April 2026), um die
+            # Unterscheidung nachzuweisen (Codex-Rückprüfung zu c01ceb2).
+            vpi_jahr=2025, vpi_monat=12,
         )
     )
 
@@ -337,7 +342,10 @@ def test_umsetzen_klausel_pfad_schreibt_basis_fort(
     assert neue_klausel.id != klausel.id
     assert neue_klausel.id == alte_klausel.ersetzt_id
     assert neue_klausel.basis_wert == Decimal("105")
-    assert neue_klausel.basis_monat == "2026-04"
+    # basis_monat ist der tatsächliche VPI-Quellmonat (Dezember 2025) der
+    # Anpassung, nicht der Anspruchsmonat (April 2026) - Codex-Rückprüfung
+    # zu c01ceb2 (basis_monat=Anspruchsmonat ist kein VPI-Quellmonat).
+    assert neue_klausel.basis_monat == "2025-12"
     assert neue_klausel.letzte_anpassung_monat == "2026-04"
     assert neue_klausel.status == "FREIGEGEBEN"
     assert neue_klausel.version == klausel.version + 1
@@ -345,6 +353,11 @@ def test_umsetzen_klausel_pfad_schreibt_basis_fort(
     # Fachänderung durch die reine Basisfortschreibung).
     assert neue_klausel.schwelle_prozent == klausel.schwelle_prozent
     assert neue_klausel.basis_reihe == klausel.basis_reihe
+    # Neues Kalender-/Intervallregelprofil bleibt bei mechanischer
+    # Fortschreibung unverändert erhalten (kein stillschweigender
+    # Fachentscheid durch die Basisfortschreibung).
+    assert neue_klausel.anpassungsmonat == klausel.anpassungsmonat
+    assert neue_klausel.mindestintervall_monate == klausel.mindestintervall_monate
 
 
 def test_umsetzen_mehrkomponenten_historisiert_alle_betroffenen_komponenten(

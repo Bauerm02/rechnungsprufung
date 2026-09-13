@@ -16,7 +16,7 @@ from mietinkasso.indexautomatik.repository import (
     RechtsprofilRepository,
     VpiRepository,
 )
-from mietinkasso.indexautomatik.service import IndexautomatikService
+from mietinkasso.indexautomatik.service import IndexautomatikService, _monate_addieren, _naechster_gueltiger_kalendermonat
 from mietinkasso.infrastructure.db.tables import IndexKlauselTable
 from mietinkasso.mieweg_vorschau.repository import MieWegVorschauRepository
 from mietinkasso.mieweg_vorschau.service import MieWegVorschauService
@@ -241,9 +241,11 @@ def test_geschaeftsraum_ohne_klausel_blockiert_kein_pauschales_mieweg(admin_ctx,
     assert any("Geschäftsraum" in g or "Vertragsklausel" in g for g in lauf.blockiert_gruende)
 
 
-def test_geschaeftsraum_mit_klausel_berechnet_ueber_index_service(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
-    """Geschäftsraum mit einer geprüften, freigegebenen IndexKlausel
-    wird über index/service.py berechnet, NICHT über MieWeG."""
+def test_geschaeftsraum_klausel_ohne_kalenderregel_bleibt_gesperrt(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    """Geschäftsraum mit einer geprüften, freigegebenen IndexKlausel wird
+    über index/service.py berechnet, NICHT über MieWeG - OHNE ein belegtes
+    Kalender-/Intervallregelprofil (Auftrag Markus) bleibt der Pfad
+    weiterhin gesperrt, KEIN Termin wird aus dem heutigen Datum erfunden."""
 
     vertrag, _konto = basis_vertrag
     _mit_komponente(stammdaten_repo, vertrag, betrag_cent=200_000)
@@ -270,26 +272,251 @@ def test_geschaeftsraum_mit_klausel_berechnet_ueber_index_service(admin_ctx, bas
     )
 
     lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 9, 13), akteur="test")
-    # Kein verifizierter automatischer Wirksamkeitstermin für den
-    # Geschäftsraum-/Klausel-Pfad (Modellreview 13.09.: "kein heutiges
-    # Datum als frei erfundenen Erhöhungstermin") - der Rechenweg über
-    # index/service.py läuft real, erzeugt aber bewusst KEIN
-    # automatisches Erhöhungsschreiben.
     assert lauf.status == "BLOCKIERT"
-    assert any("IndexAnpassung" in g for g in lauf.blockiert_gruende)
+    assert any("Kalender-/Intervallregelprofil" in g for g in lauf.blockiert_gruende)
+    assert lauf.erhoehungsschreiben_id is None
+    assert bundle.index_repo.letzte_anpassung(vertrag.id) is None  # keine IndexAnpassung ohne belegte Regel
+
+
+def _mit_kalenderklausel(
+    bundle, vertrag, *, schwelle_prozent=Decimal("0"), schwelle_inklusive=True,
+    anpassungsmonat=1, mindestintervall_monate=12,
+) -> IndexKlauselTable:
+    klausel = bundle.index_repo.anlegen(
+        IndexKlauselTable(
+            vertrag_id=vertrag.id, version=1, rechtsordnung="OESTERREICH_MRG_TEIL",
+            berechnungsprofil="EINFACHER_SCHWELLENVERGLEICH", abschlussdatum=date(2024, 1, 1),
+            basis_reihe="VPI20C18", basis_wert=Decimal("100"), basis_monat="2024-01",
+            schwelle_prozent=schwelle_prozent, schwelle_inklusive=schwelle_inklusive,
+            indexierbare_komponenten=["HMZ"], anpassungsmonat=anpassungsmonat,
+            mindestintervall_monate=mindestintervall_monate,
+        )
+    )
+    return bundle.index_repo.freigeben(klausel.id, freigegeben_von="markus")
+
+
+def _seed_vpi_monat(bundle, *, jahr, monat, wert, reihe="VPI20C18"):
+    bundle.vpi_repo.monatswert_erfassen(
+        reihe=reihe, jahr=jahr, monat=monat, wert=Decimal(wert), finalitaet="ENDGUELTIG",
+        quelle_datei="synthetisch", quelle_zeile=1, quelle_hash=f"hash-{jahr}-{monat:02d}",
+        abgerufen_am=__import__("datetime").datetime(jahr, monat, 20, tzinfo=__import__("datetime").timezone.utc),
+        importiert_von="markus",
+    )
+
+
+def test_geschaeftsraum_ausserhalb_anpassungsmonat_kein_brief(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    """Auftrag Markus: außerhalb des belegten Anpassungsmonats (hier
+    Jänner) darf niemals ein Erhöhungsschreiben entstehen."""
+
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    klausel = _mit_kalenderklausel(bundle, vertrag)
+    _freigegebenes_wohnungsprofil(
+        admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
+        ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
+        vertragsklausel_id=klausel.id,
+    )
+    _seed_vpi_monat(bundle, jahr=2026, monat=5, wert="110")
+
+    lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 6, 13), akteur="test")
+    assert lauf.status == "TERMIN_NICHT_ERREICHT"
+    assert lauf.erhoehungsschreiben_id is None
+    assert bundle.index_repo.letzte_anpassung(vertrag.id) is None
+
+
+def test_geschaeftsraum_januar_unter_schwelle_kein_brief(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    """Auftrag Markus: im richtigen Kalendermonat, aber unterhalb der
+    vertraglichen Schwelle, entsteht ebenfalls kein Brief."""
+
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    klausel = _mit_kalenderklausel(bundle, vertrag, schwelle_prozent=Decimal("5"))
+    _freigegebenes_wohnungsprofil(
+        admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
+        ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
+        vertragsklausel_id=klausel.id,
+    )
+    _seed_vpi_monat(bundle, jahr=2025, monat=12, wert="102")  # +2%, unter der 5%-Schwelle
+
+    lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 1, 13), akteur="test")
+    assert lauf.status == "KEIN_ERHOEHUNGSBEDARF"
     assert lauf.erhoehungsschreiben_id is None
 
-    erste_anpassung_id = bundle.index_repo.letzte_anpassung(vertrag.id).id
 
-    # Folgemonat, UNVERÄNDERTER amtlicher VPI-Wert - unabhängiger Review
-    # (fd8c2b2-Folgereview): "solange ... tatsächliche Basis/Komponenten
-    # unverändert bleiben, darf der Folgemonat nicht wegen einer neuen
-    # index_anpassung_id ein zweites gleiches Schreiben erzeugen".
-    lauf_oktober = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 10, 13), akteur="test")
-    assert lauf_oktober.status == "BLOCKIERT"
-    assert any(str(erste_anpassung_id) in g for g in lauf_oktober.blockiert_gruende)
-    anpassungen_gesamt = bundle.index_repo.letzte_anpassung(vertrag.id)
-    assert anpassungen_gesamt.id == erste_anpassung_id  # keine zweite IndexAnpassung erzeugt
+def test_geschaeftsraum_berechtigter_januarfall_bis_outbox_kein_doppelbrief(
+    admin_ctx, basis_vertrag, bundle, stammdaten_repo
+):
+    """Auftrag Markus: ein berechtigter Jännerfall muss über den echten
+    Monatslauf bis zu einer BEREITen Outbox-Zeile führen; der
+    unveränderte Folgemonat (Februar, außerhalb des Anpassungsmonats)
+    darf keinen zweiten Brief erzeugen."""
+
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.upsert_debitor(id="DEB-1001", name="Max Mustermieter", email="mieter@example.at", adresse="Corsogasse 1/3, 1010 Wien")
+    _mit_komponente(stammdaten_repo, vertrag)
+    klausel = _mit_kalenderklausel(bundle, vertrag)
+    _freigegebenes_wohnungsprofil(
+        admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
+        ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
+        vertragsklausel_id=klausel.id,
+    )
+    _seed_vpi_monat(bundle, jahr=2025, monat=12, wert="110")  # +10%
+
+    lauf_januar = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 1, 13), akteur="test")
+    assert lauf_januar.status == "ERHOEHUNG_ERZEUGT", lauf_januar.blockiert_gruende
+    assert lauf_januar.erhoehungsschreiben_id is not None
+    schreiben = bundle.outbox_repo.get(lauf_januar.erhoehungsschreiben_id)
+    assert schreiben.status == "BEREIT"
+    assert schreiben.erhoehung_cent == 10_000
+    assert schreiben.massgeblicher_termin == date(2026, 1, 1)
+
+    anpassung = bundle.index_repo.letzte_anpassung(vertrag.id)
+    assert anpassung.vpi_jahr == 2025 and anpassung.vpi_monat == 12
+
+    neue_klausel = bundle.index_repo.get_klausel(klausel.id)  # ursprüngliche Version bleibt unverändert (append-only)
+    assert neue_klausel.basis_wert == Decimal("100")
+
+    lauf_februar = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 2, 13), akteur="test")
+    assert lauf_februar.status == "TERMIN_NICHT_ERREICHT"
+    assert lauf_februar.erhoehungsschreiben_id is None
+    assert bundle.index_repo.letzte_anpassung(vertrag.id).id == anpassung.id  # keine zweite IndexAnpassung
+
+
+def test_naechster_gueltiger_kalendermonat_ist_kein_erfundenes_zwoelf_monats_intervall():
+    """Auftrag Markus: "Jährlich am 01.01. bedeutet bei Beginn 01.04.2026
+    den ersten möglichen Termin 01.01.2027; nicht automatisch zwölf
+    Monate Wartezeit ab Mietbeginn erfinden" - der erste zulässige Termin
+    ist die nächste TATSÄCHLICHE Kalendermonats-Wiederkehr, nicht
+    Vertragsbeginn + 12 Monate (der wäre 01.04.2027)."""
+
+    assert _naechster_gueltiger_kalendermonat(date(2026, 4, 1), 1) == date(2027, 1, 1)
+    # Ein bereits gültiger Zieltag bleibt unverändert (keine künstliche
+    # Verschiebung um ein volles Jahr).
+    assert _naechster_gueltiger_kalendermonat(date(2026, 1, 1), 1) == date(2026, 1, 1)
+    assert _naechster_gueltiger_kalendermonat(date(2026, 1, 2), 1) == date(2027, 1, 1)
+
+
+def test_monate_addieren_rechnet_kalendermonate_nicht_tage():
+    """Auftrag Markus: "keine pauschale Umrechnung zwei Monate=60 Tage" -
+    Monatsaddition landet immer auf dem 1. des Zielmonats, unabhängig von
+    der tatsächlichen Tageszahl der durchlaufenen Monate."""
+
+    assert _monate_addieren(date(2026, 1, 15), 2) == date(2026, 3, 1)
+    assert _monate_addieren(date(2026, 12, 1), 2) == date(2027, 2, 1)
+    assert _monate_addieren(date(2026, 1, 1), 12) == date(2027, 1, 1)
+
+
+def test_geschaeftsraum_erster_termin_ist_naechste_kalenderwiederkehr_nicht_beginn_plus_zwoelf(
+    admin_ctx, bundle, stammdaten_repo
+):
+    """End-to-End-Beleg zum obigen Einheitstest: Vertragsbeginn 1.4.2026,
+    Anpassungsmonat Jänner - im Jänner 2027 (9 Monate nach Vertragsbeginn)
+    muss die Anpassung bereits möglich sein, nicht erst im April 2027."""
+
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")
+    stammdaten_repo.upsert_einheit(id="601-TOP9", objekt_id="601", bezeichnung="Top 9", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-9", name="Geschäftsraum-Mieterin", email="gr@example.at", adresse="Corsogasse 1/9, 1010 Wien")
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-9", einheit_id="601-TOP9", debitor_id="DEB-9", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_TEIL", gueltig_von=date(2026, 4, 1),
+    )
+    vertrag = stammdaten_repo.get_vertrag("V-601-9")
+    stammdaten_repo.get_or_create_konto(vertrag=vertrag)
+    _mit_komponente(stammdaten_repo, vertrag)
+    klausel = _mit_kalenderklausel(bundle, vertrag)
+    _freigegebenes_wohnungsprofil(
+        admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
+        ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
+        vertragsklausel_id=klausel.id,
+    )
+    _seed_vpi_monat(bundle, jahr=2026, monat=12, wert="110")
+
+    lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2027, 1, 13), akteur="test")
+    assert lauf.status == "ERHOEHUNG_ERZEUGT", lauf.blockiert_gruende
+
+
+def test_geschaeftsraum_indexwert_rundung_auf_eine_dezimalstelle(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    """Auftrag Markus: bekannte vertragliche Rundung des Indexwerts auf
+    eine Dezimalstelle explizit unterstützen - ein Wert, der erst nach
+    Rundung die Schwelle erreicht, muss dann auch tatsächlich auslösen."""
+
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.upsert_debitor(id="DEB-1001", name="Max Mustermieter", email="mieter@example.at", adresse="Corsogasse 1/3, 1010 Wien")
+    _mit_komponente(stammdaten_repo, vertrag)
+    klausel_id = bundle.index_repo.anlegen(
+        IndexKlauselTable(
+            vertrag_id=vertrag.id, version=1, rechtsordnung="OESTERREICH_MRG_TEIL",
+            berechnungsprofil="EINFACHER_SCHWELLENVERGLEICH", abschlussdatum=date(2024, 1, 1),
+            basis_reihe="VPI20C18", basis_wert=Decimal("100"), basis_monat="2024-01",
+            schwelle_prozent=Decimal("5"), schwelle_inklusive=True, indexierbare_komponenten=["HMZ"],
+            anpassungsmonat=1, mindestintervall_monate=12, indexwert_rundung_dezimalstellen=1,
+        )
+    ).id
+    bundle.index_repo.freigeben(klausel_id, freigegeben_von="markus")
+    _freigegebenes_wohnungsprofil(
+        admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
+        ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
+        vertragsklausel_id=klausel_id,
+    )
+    # Roher amtlicher Wert 104.96 -> rohe Veränderung 4,96% - UNGERUNDET
+    # unter der 5%-Schwelle, löst NICHT aus. Auf eine Dezimalstelle
+    # gerundet 105.0 -> exakt 5,0%, bei schwelle_inklusive=True auslösend.
+    # Beweist, dass die Rundung tatsächlich VOR dem Schwellenvergleich
+    # angewendet wird (nicht nur eine wirkungslose Zier-Option).
+    _seed_vpi_monat(bundle, jahr=2025, monat=12, wert="104.96")
+
+    lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 1, 13), akteur="test")
+    assert lauf.status == "ERHOEHUNG_ERZEUGT", lauf.blockiert_gruende
+
+
+def test_geschaeftsraum_wartefrist_ohne_bezug_blockiert_anlage(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    """Auftrag Markus: eine Wartefrist ohne eindeutigen Bezug (VPI_PERIODE
+    ODER VEROEFFENTLICHUNG) ist ein Rateversuch und wird bereits bei der
+    Klauselanlage (vor jedem DB-Zugriff) abgelehnt."""
+
+    vertrag, _konto = basis_vertrag
+    index_service = IndexService(bundle.index_repo, stammdaten_repo)
+    with pytest.raises(ValueError, match="wartefrist"):
+        index_service.klausel_anlegen(
+            ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_TEIL",
+            berechnungsprofil="EINFACHER_SCHWELLENVERGLEICH", abschlussdatum=date(2024, 1, 1),
+            basis_reihe="VPI20C18", basis_wert=Decimal("100"), basis_monat="2024-01",
+            wartefrist_monate_nach_indexereignis=2, wartefrist_bezug=None,
+        )
+
+
+def test_geschaeftsraum_wartefrist_nach_veroeffentlichung(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    """Auftrag Markus: eine vertragliche Wartefrist NACH der amtlichen
+    Veröffentlichung/Abruf des Indexwerts (nicht nach der VPI-Periode
+    selbst) - explizit belegt über `wartefrist_bezug="VEROEFFENTLICHUNG"`."""
+
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.upsert_debitor(id="DEB-1001", name="Max Mustermieter", email="mieter@example.at", adresse="Corsogasse 1/3, 1010 Wien")
+    _mit_komponente(stammdaten_repo, vertrag)
+    klausel_id = bundle.index_repo.anlegen(
+        IndexKlauselTable(
+            vertrag_id=vertrag.id, version=1, rechtsordnung="OESTERREICH_MRG_TEIL",
+            berechnungsprofil="EINFACHER_SCHWELLENVERGLEICH", abschlussdatum=date(2024, 1, 1),
+            basis_reihe="VPI20C18", basis_wert=Decimal("100"), basis_monat="2024-01",
+            schwelle_prozent=Decimal("0"), indexierbare_komponenten=["HMZ"],
+            anpassungsmonat=1, mindestintervall_monate=12,
+            wartefrist_monate_nach_indexereignis=2, wartefrist_bezug="VEROEFFENTLICHUNG",
+        )
+    ).id
+    bundle.index_repo.freigeben(klausel_id, freigegeben_von="markus")
+    _freigegebenes_wohnungsprofil(
+        admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
+        ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
+        vertragsklausel_id=klausel_id,
+    )
+    # Veröffentlicht/abgerufen am 2025-12-20 - zwei Kalendermonate Wartefrist
+    # enden am 2026-02-20, also NACH dem Jänner-Anpassungsmonat.
+    _seed_vpi_monat(bundle, jahr=2025, monat=12, wert="110")
+
+    lauf_januar = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 1, 13), akteur="test")
+    assert lauf_januar.status == "TERMIN_NICHT_ERREICHT"
+    assert lauf_januar.erhoehungsschreiben_id is None
 
 
 def test_mietzinsobergrenze_kappt_erhoehung_unabhaengig_von_foerderbindung(admin_ctx, basis_vertrag, bundle, stammdaten_repo):

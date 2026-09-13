@@ -76,7 +76,7 @@ _NIE_INDEXIERBARE_ARTEN = frozenset({
 })
 
 
-def belegte_historische_basis_gueltig(beleg: dict | None, referenzdatum: date) -> bool:
+def belegte_historische_basis_gueltig(beleg: dict | None, *, erwarteter_betrag_cent: int) -> bool:
     """Codex-Rückprüfung: "Historisierungskette löst noch nicht initial
     importierte Bestandskomponenten" - ein Mietvertrag/eine belegte
     Indexbasis kann zeitlich VOR der erst später importierten
@@ -91,29 +91,45 @@ def belegte_historische_basis_gueltig(beleg: dict | None, referenzdatum: date) -
     Diese Funktion prüft einen EXPLIZITEN, vom Operator erfassten
     Ausnahmenachweis (`RechtsprofilTable.historische_basis_belege[
     komponente_id]`, Form `{"betrag_cent": int, "datum": "YYYY-MM-DD",
-    "quellenbeleg": str}`) - NUR ein vollständiger Beleg (alle drei
-    Felder gesetzt, `datum` auf oder vor `referenzdatum`) darf die
-    Existenzprüfung ersetzen. Kein Rateversuch: ein fehlender/
+    "quellenbeleg": str}`). Kein Rateversuch: ein fehlender/
     unvollständiger Beleg liefert `False`, die Sperre bleibt bestehen.
     Ändert NIEMALS die technische Komponentenzeile selbst - rein
-    dokumentarischer Nachweis, fließt in KEINE Berechnung ein."""
+    dokumentarischer Nachweis, fließt in KEINE Berechnung ein.
+
+    Zweite unabhängige Abnahme (Codex-Rückprüfung zu 28ca323): der
+    belegte Betrag MUSS exakt dem tatsächlich für die Berechnung
+    verwendeten aktuellen Komponentenbetrag entsprechen
+    (`erwarteter_betrag_cent`) - ohne diesen Abgleich hätte ein
+    beliebiger, insbesondere ein trivial niedriger Belegbetrag (z. B.
+    1 Cent) die Existenzsperre für eine völlig unabhängig davon
+    verrechnete, viel höhere Komponente aufgehoben.
+
+    `datum` ist AUSSCHLIESSLICH eine dokumentarische Angabe (wann der
+    Beleg selbst ausgestellt/unterfertigt wurde) - es wird NICHT gegen
+    den vertraglichen Bezugsmonat (`RechtsprofilTable.bezugsjahr/
+    -monat`) geprüft; beide bleiben ausdrücklich getrennte Konzepte
+    (Codex-Rückprüfung: Vertragsunterzeichnung im März kann eine
+    vertraglich vereinbarte VPI-Basis Februar dokumentieren - das
+    Beleg-/Unterschriftsdatum liegt dabei bewusst NACH dem belegten
+    Bezugsmonat; ein früheres Belegdatum darf dafür nicht erfunden
+    werden)."""
 
     if not beleg:
         return False
     betrag_cent = beleg.get("betrag_cent")
     quellenbeleg = beleg.get("quellenbeleg")
     datum_str = beleg.get("datum")
-    if not isinstance(betrag_cent, int) or betrag_cent <= 0:
+    if not isinstance(betrag_cent, int) or betrag_cent != erwarteter_betrag_cent:
         return False
     if not isinstance(quellenbeleg, str) or not quellenbeleg.strip():
         return False
     if not isinstance(datum_str, str):
         return False
     try:
-        datum = date.fromisoformat(datum_str)
+        date.fromisoformat(datum_str)
     except ValueError:
         return False
-    return datum <= referenzdatum
+    return True
 
 
 def _naechster_gueltiger_april(datum: date) -> date:
@@ -262,7 +278,7 @@ class MieWegVorschauService:
                 referenzdatum is not None
                 and self._stammdaten_repository.ursprungs_gueltig_von(komponente) > referenzdatum
                 and not belegte_historische_basis_gueltig(
-                    (historische_basis_belege or {}).get(komponente_id), referenzdatum
+                    (historische_basis_belege or {}).get(komponente_id), erwarteter_betrag_cent=komponente.betrag_cent
                 )
             ):
                 raise ValueError(

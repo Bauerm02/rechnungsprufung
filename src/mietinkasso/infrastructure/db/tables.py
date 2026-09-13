@@ -418,6 +418,30 @@ class IndexKlauselTable(Base):
     daempfung_prozent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
     vertragliche_grenze_prozent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
     indexierbare_komponenten: Mapped[list] = mapped_column(JSON, default=list)
+    # Additiv, nullable: belegtes Kalender-/Intervallregelprofil (Auftrag
+    # Markus, Geschäftsraum-/Klausel-Pfad) - OHNE beide Felder bleibt der
+    # automatische Wirksamkeitstermin in `indexautomatik/service.py::
+    # _monatslauf_klausel` gesperrt (kein erfundenes Datum). Beide
+    # zusammen ersetzen den früheren einmaligen
+    # `vertraglicher_fruehestmoeglicher_termin` (der ab seinem Eintritt
+    # pauschal ALLES erlaubte) durch eine wiederkehrende, tatsächlich
+    # geprüfte Vertragsregel.
+    anpassungsmonat: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mindestintervall_monate: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Optional: bekannte vertragliche Rundung des amtlichen Indexwerts auf
+    # N Nachkommastellen VOR dem Schwellenvergleich (z. B. "eine
+    # Dezimalstelle") - explizit zu erfassen, sonst bleibt der volle,
+    # ungerundete amtliche Wert maßgeblich (unverändertes Verhalten).
+    indexwert_rundung_dezimalstellen: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Optional: zusätzliche vertragliche Wartefrist in KALENDERMONATEN
+    # nach dem maßgeblichen Indexereignis - NIE über eine Tage-Umrechnung
+    # (2 Monate != 60 Tage). `wartefrist_bezug` legt EINDEUTIG fest, ob
+    # sich die Frist auf die VPI-Periode selbst ("VPI_PERIODE") oder auf
+    # deren amtliche Veröffentlichung/Abruf ("VEROEFFENTLICHUNG") bezieht
+    # - beide zusammen oder keines, nie nur eines (sonst gesperrt, kein
+    # Rateversuch bei fehlendem Ereignis-/Datumsbeleg).
+    wartefrist_monate_nach_indexereignis: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    wartefrist_bezug: Mapped[str | None] = mapped_column(String(24), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="ENTWURF")
     freigegeben_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     freigegeben_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -438,6 +462,14 @@ class IndexAnpassungTable(Base):
     erhoehung_cent: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(16), default="VORSCHLAG")
     quelle_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Additiv, nullable: der tatsächliche VPI-QUELLMONAT von `neuer_wert`
+    # (Codex-Rückprüfung zu c01ceb2: "basis_monat=Anspruchsmonat ist kein
+    # VPI-Quellmonat" - `umsetzung_service.py`s Klausel-Basisfortschreibung
+    # braucht den echten Bezugsmonat des verwendeten amtlichen Werts, NICHT
+    # den Monat, in dem die neue Miete wirksam wird). `None` bei älteren,
+    # vor dieser Nachverfolgung erzeugten Zeilen.
+    vpi_jahr: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    vpi_monat: Mapped[int | None] = mapped_column(Integer, nullable=True)
     berechnungs_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

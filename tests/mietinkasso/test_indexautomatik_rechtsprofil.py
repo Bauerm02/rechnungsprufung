@@ -203,6 +203,13 @@ def test_spaet_importierte_komponente_ohne_beleg_blockiert_freigabe(
 def test_belegte_historische_basis_hebt_sperre_fuer_spaeten_import_auf(
     admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo
 ):
+    """Codex-Rückprüfung zu 28ca323: Belegdatum und vertraglicher
+    Bezugsmonat sind GETRENNTE Konzepte - Vertragsunterzeichnung im März
+    dokumentiert hier eine vertraglich vereinbarte VPI-Basis Februar; das
+    Beleg-/Unterschriftsdatum liegt bewusst NACH dem belegten
+    Bezugsmonat und darf trotzdem nicht künstlich vorverlegt werden
+    müssen."""
+
     vertrag, _konto = basis_vertrag
     stammdaten_repo.add_komponente(
         id="K-1", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Pauschale", betrag_cent=50_000,
@@ -214,8 +221,8 @@ def test_belegte_historische_basis_hebt_sperre_fuer_spaeten_import_auf(
             bezugsjahr=2026, bezugsmonat=2, basis_komponenten_ids=["K-1"],
             historische_basis_belege={
                 "K-1": {
-                    "betrag_cent": 50_000, "datum": "2026-02-01",
-                    "quellenbeleg": "Mietvertrag Punkt 3, Altbestand seit Vertragsbeginn",
+                    "betrag_cent": 50_000, "datum": "2026-03-01",
+                    "quellenbeleg": "Mietvertrag Punkt 3, unterfertigt 2026-03-01, vereinbarte VPI-Basis Februar 2026",
                 },
             },
         ),
@@ -241,6 +248,33 @@ def test_unvollstaendiger_historischer_beleg_hebt_sperre_nicht_auf(
         **_standard_kwargs(
             bezugsjahr=2026, bezugsmonat=2, basis_komponenten_ids=["K-1"],
             historische_basis_belege={"K-1": {"betrag_cent": 50_000, "datum": "2026-02-01", "quellenbeleg": ""}},
+        ),
+    )
+    with pytest.raises(ValueError, match="hat sie noch nicht bestanden"):
+        rechtsprofil_service.freigeben(entwurf.id, ctx=admin_ctx, freigegeben_von="markus")
+
+
+def test_abweichender_belegbetrag_hebt_sperre_nicht_auf(
+    admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo
+):
+    """Zweite unabhängige Abnahme (Codex-Rückprüfung zu 28ca323): ein
+    Nachweis über einen von der tatsächlich verrechneten Komponente
+    ABWEICHENDEN Betrag (hier 1 Cent statt 100.000 Cent) darf die Sperre
+    NICHT aufheben - sonst könnte ein trivialer Belegbetrag eine völlig
+    unabhängig davon verrechnete, viel höhere Komponente freigeben."""
+
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.add_komponente(
+        id="K-1", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Pauschale", betrag_cent=100_000,
+        indexierbar=True, gueltig_von=date(2026, 8, 1),
+    )
+    entwurf = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx, vertrag_id=vertrag.id,
+        **_standard_kwargs(
+            bezugsjahr=2026, bezugsmonat=2, basis_komponenten_ids=["K-1"],
+            historische_basis_belege={
+                "K-1": {"betrag_cent": 1, "datum": "2026-02-01", "quellenbeleg": "Manipulierter Nachweis"},
+            },
         ),
     )
     with pytest.raises(ValueError, match="hat sie noch nicht bestanden"):

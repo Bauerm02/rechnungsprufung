@@ -42,6 +42,14 @@ _NIE_INDEXIERBARE_ARTEN = {"BK_VORAUSZAHLUNG", "HEIZ_WW_VORAUSZAHLUNG"}
 EINFACHER_SCHWELLENVERGLEICH = "EINFACHER_SCHWELLENVERGLEICH"
 UNTERSTUETZTE_BERECHNUNGSPROFILE = frozenset({EINFACHER_SCHWELLENVERGLEICH})
 
+#: Eindeutiger Bezug einer vertraglichen Wartefrist nach dem "maßgeblichen
+#: Indexereignis" (Auftrag Markus) - entweder die VPI-PERIODE selbst
+#: (der referenzierte Kalendermonat) oder deren amtliche VEROEFFENTLICHUNG/
+#: Abruf. Kein Rateversuch: ohne einen dieser beiden eindeutigen Bezüge
+#: bleibt eine konfigurierte Wartefrist gesperrt (siehe
+#: `indexautomatik/service.py::_monatslauf_klausel`).
+_WARTEFRIST_BEZUEGE = frozenset({"VPI_PERIODE", "VEROEFFENTLICHUNG"})
+
 
 @dataclass(frozen=True)
 class IndexVorschlag:
@@ -79,6 +87,11 @@ class IndexService:
         vertragliche_grenze_prozent: Decimal | None = None,
         indexierbare_komponenten: list[str] | None = None,
         klausel_text: str | None = None,
+        anpassungsmonat: int | None = None,
+        mindestintervall_monate: int | None = None,
+        indexwert_rundung_dezimalstellen: int | None = None,
+        wartefrist_monate_nach_indexereignis: int | None = None,
+        wartefrist_bezug: str | None = None,
     ) -> IndexKlauselTable:
         vertrag = self._vertrag_oder_fehler(vertrag_id)
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
@@ -89,6 +102,28 @@ class IndexService:
                 f"Vertrag {vertrag_id}: Rechtsordnung ist UNGEKLAERT; eine IndexKlausel darf nicht "
                 "angelegt werden, bis die rechtliche Einordnung feststeht."
             )
+        if anpassungsmonat is not None and not (1 <= anpassungsmonat <= 12):
+            raise ValueError(f"anpassungsmonat muss 1-12 sein, war {anpassungsmonat}.")
+        if mindestintervall_monate is not None and mindestintervall_monate <= 0:
+            raise ValueError(f"mindestintervall_monate muss positiv sein, war {mindestintervall_monate}.")
+        if indexwert_rundung_dezimalstellen is not None and indexwert_rundung_dezimalstellen < 0:
+            raise ValueError(
+                f"indexwert_rundung_dezimalstellen darf nicht negativ sein, war {indexwert_rundung_dezimalstellen}."
+            )
+        # Beide zusammen oder keines - eine Wartefrist ohne eindeutigen
+        # Bezug (VPI-Periode ODER Veröffentlichung) wäre ein Rateversuch,
+        # ein Bezug ohne Fristlänge eine wirkungslose Angabe.
+        if (wartefrist_monate_nach_indexereignis is None) != (wartefrist_bezug is None):
+            raise ValueError(
+                "wartefrist_monate_nach_indexereignis und wartefrist_bezug müssen zusammen (oder gar nicht) "
+                "gesetzt werden - kein Rateversuch bei nur teilweise erfasster Wartefrist."
+            )
+        if wartefrist_monate_nach_indexereignis is not None and wartefrist_monate_nach_indexereignis <= 0:
+            raise ValueError(
+                f"wartefrist_monate_nach_indexereignis muss positiv sein, war {wartefrist_monate_nach_indexereignis}."
+            )
+        if wartefrist_bezug is not None and wartefrist_bezug not in _WARTEFRIST_BEZUEGE:
+            raise ValueError(f"wartefrist_bezug muss einer von {sorted(_WARTEFRIST_BEZUEGE)} sein, war {wartefrist_bezug!r}.")
         version = self._repository.naechste_version(vertrag_id)
         klausel = IndexKlauselTable(
             vertrag_id=vertrag_id,
@@ -105,6 +140,11 @@ class IndexService:
             daempfung_prozent=daempfung_prozent,
             vertragliche_grenze_prozent=vertragliche_grenze_prozent,
             indexierbare_komponenten=list(indexierbare_komponenten or []),
+            anpassungsmonat=anpassungsmonat,
+            mindestintervall_monate=mindestintervall_monate,
+            indexwert_rundung_dezimalstellen=indexwert_rundung_dezimalstellen,
+            wartefrist_monate_nach_indexereignis=wartefrist_monate_nach_indexereignis,
+            wartefrist_bezug=wartefrist_bezug,
             status=IndexKlauselStatus.ENTWURF.value,
         )
         return self._repository.anlegen(klausel)
@@ -126,6 +166,8 @@ class IndexService:
         stichtag: date,
         neuer_wert: Decimal,
         quelle_referenz: str,
+        neuer_wert_jahr: int | None = None,
+        neuer_wert_monat: int | None = None,
     ) -> IndexVorschlag:
         vertrag = self._vertrag_oder_fehler(vertrag_id)
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
@@ -189,6 +231,13 @@ class IndexService:
             erhoehung_cent=erhoehung_cent,
             status=IndexAnpassungStatus.VORSCHLAG.value,
             quelle_referenz=quelle_referenz,
+            # Codex-Rückprüfung zu c01ceb2: der tatsächliche VPI-
+            # Quellmonat von `neuer_wert` (falls vom Aufrufer bekannt) -
+            # NICHT der Anspruchsmonat der später wirksamen Miete. Wird
+            # z. B. von `umsetzung_service.py`s Klausel-
+            # Basisfortschreibung benötigt.
+            vpi_jahr=neuer_wert_jahr,
+            vpi_monat=neuer_wert_monat,
             berechnungs_snapshot={
                 "berechnungsprofil": klausel.berechnungsprofil,
                 "rohe_veraenderung_prozent": str(rohe_veraenderung),
