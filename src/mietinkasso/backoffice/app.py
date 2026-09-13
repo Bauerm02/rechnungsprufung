@@ -2319,7 +2319,9 @@ def rechtsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_
           <legend>Rechtsklassifikation</legend>
           <label>Rechtsordnung</label>
           <select name="rechtsordnung" required>{rechtsordnung_optionen}</select>
-          <label><input type="checkbox" name="ist_wohnungsnutzung" value="1"> Wohnungsnutzung bestätigt</label><br>
+          <label>Nutzung</label>
+          <select name="ist_wohnungsnutzung"><option value="">ungeklärt</option>
+            <option value="1">Wohnung (geprüft)</option><option value="0">Geschäftsraum (geprüft)</option></select><br>
           <label>Haupt-/Untermiete</label>
           <select name="ist_hauptmiete"><option value="">ungeklärt</option><option value="1">Hauptmiete (geprüft)</option>
             <option value="0">Untermiete (geprüft)</option></select>
@@ -2417,7 +2419,7 @@ def rechtsprofil_erstellen(
     try:
         _indexautomatik.rechtsprofil_service.entwurf_anlegen(
             ctx=_ctx(session), vertrag_id=vertrag_id, rechtsordnung=rechtsordnung,
-            ist_wohnungsnutzung=bool(ist_wohnungsnutzung),
+            ist_wohnungsnutzung=(None if ist_wohnungsnutzung == "" else bool(int(ist_wohnungsnutzung))),
             ist_hauptmiete=(None if ist_hauptmiete == "" else bool(int(ist_hauptmiete))),
             # Tri-State wie `ist_hauptmiete`: "" = ungeklärt (Wert bleibt
             # False, `_geprueft` bleibt False - eine Freigabe verlangt
