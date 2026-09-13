@@ -560,3 +560,109 @@ Punkte in `docs/hausverwaltung/OFFENE_PUNKTE.md`.
   das bleibt ein bewusst offener, in `OFFENE_PUNKTE.md` benannter
   manueller Folgeschritt (entspricht der bestehenden
   "keine Produktivbuchungen durch Claude"-Grenze).
+
+## Auftrag HV-20260913-DASHBOARD (wortgetreu, 13.09.2026)
+
+Neuer klar begrenzter Nutzerauftrag HV-20260913-DASHBOARD, auf
+bestehendem Branch claude/bold-volta-7xovjq, aufbauend auf 1da3843.
+Bitte implementieren, testen, committen und nur diesen Branch pushen.
+Bestehende Index-/EBICS-/Mail-Restarbeiten bleiben separat. Codex
+übernimmt Quellen und Deployment; du ausschließlich generischer Code
+und synthetische Daten, keine Serverzugriffe oder Produktivdaten.
+Sonnet 5 High, Fast aus beibehalten.
+
+1) Dashboard/Konto: "Saldo" verständlich als "Kontostand (offen /
+   Guthaben)", "fälliger unstrittiger Rest" als "Davon mit bekannter
+   Fälligkeit" beschriften. Rechenweg Eröffnung + Vorschreibungen -
+   Zahlungen/Gutschriften zeigen. Unbekannte Fälligkeit ist nicht
+   automatisch strittig. Aktive Mahnsperren einschließlich Gründe
+   sichtbar darstellen; bekannte Fälligkeit ist keine Mahnfreigabe.
+   Reine Darstellung, keine Änderung bestehender OP.
+
+2) Bestehendes Backoffice um monatliche Abrechnungen für
+   KURZZEITVERMIETUNG und SELFSTORAGE erweitern. Eingabe: bestehende
+   Objekt-/Einheit-ID, Leistungsmonat, Belegdatum, Quellenreferenz/
+   Hash, berichteter Nettoumsatz, unser Nettoanteil (maßgeblich),
+   optionale Abzüge, vermietete Einheiten/Fläche. Bericht/Anteil und
+   tatsächlicher Zahlungseingang getrennt. Keine pauschale
+   USt-Umrechnung; fehlende Werte bleiben unbekannt. Keine OP-/
+   Bankbuchungen aus Reporting.
+
+3) Bedienbare Erfassung und Korrektur: unveränderliche Versionen,
+   Änderungsgrund, optimistic lock. Genau ein aktiver Datensatz pro
+   Einheit/Art/Monat, keine Summierung desselben Reports aus Import
+   und manueller Erfassung. Atomarer idempotenter CSV-Import mit
+   Vorschau und bewusster Übernahme als deterministische Schnittstelle,
+   synthetische Vorlage/Doku. Korrigierte Quelle nur explizit als neue
+   Version. Keine eigene Mailpipeline, externe API oder Secrets.
+   Bestehende Auth/Gesellschaftsscope/Rollen/CSRF auf allen Routen und
+   Services. Fremde/ausgeschlossene Objekte sperren.
+
+4) Dashboard mit Monatsauswahl: Dauermiet-Soll netto ohne BK/HK/USt
+   etc., Kurzzeit-Nettoanteil und Selfstorage-Nettoanteil sowie
+   "Nettomieterlös laut Vorschreibung und Monatsabrechnungen". Nie
+   Bank-Ist behaupten. Unklare Komponenten/Pauschalaufteilung und
+   fehlende Monatsreports als Datenlücken, keine scheinbar vollständige
+   Summe. Küchen-/Parkplatzmiete soweit explizite Mietkomponenten
+   berücksichtigen. Doppelzählung Dauermiete plus variabler Report
+   derselben Einheit/Periode verhindern; Nutzungsstatus und
+   Vertragsgültigkeit beachten.
+
+5) Additive Migration, kein Seed. Tests für Mandantentrennung, CSRF/
+   Leserechte, Idempotenz/abweichende Importe, Korrekturkonflikt,
+   falsche Periode/Status, fehlend vs Null, Centgenauigkeit,
+   Mahnsperranzeige und unveränderte OP. Regressionen des bestehenden
+   Moduls ausführen. Ein sauberer vollständiger Implementierungsstand
+   mit Commit und tatsächlichen offenen Grenzen; kein neues
+   Architekturprojekt. Keine echten Namen, Beträge, Quellen oder
+   Kontodaten verwenden.
+
+### Quellenbedingte Präzisierung (13.09.2026, während der Umsetzung)
+
+Monatsberichte enthalten häufig zunächst nur Buchungsumsatz brutto und
+noch KEIN bestätigtes Eigentümer-Netto. Bitte ENTWURF/UNGEKLAERT mit
+optional leerem nettoanteil_cent ermöglichen; berichteter
+Originalbetrag plus Betragsart BRUTTO/NETTO/UNGEKLAERT separat,
+unbekannt bleibt None. Keine Division durch erfundene USt. Nur
+geprüfte/eindeutig netto bestätigte eigene Anteile in die Erlössumme;
+Entwürfe sichtbar mit fehlendem Netto-/Abschlussnachweis. Betriebs-,
+Reinigungs- und Verwaltungskosten können bereits im ausgewiesenen
+Anteil enthalten sein: optionale Kostenfelder rein erläuternd, nicht
+nochmals abziehen. Überweisung an Eigentümer kann Kostenersatz
+enthalten und ist nicht gleich Nettomieterlös. Bei historischer
+Periode keine aus aktuellem Status erfundene Vertrags-/
+Nutzungsverteilung. Die schon angelegten sieben Kurzzeit-Einheiten
+plus eine Selfstorage-Einheit bleiben der Bestandsumfang; generischer
+Code, echte Zuordnung durch Codex.
+
+### Umsetzung/Konkretisierungen (diese Sitzung)
+
+- `status` (ENTWURF/BESTAETIGT) ist von `berichteter_betragsart`
+  (BRUTTO/NETTO/UNGEKLAERT) UNABHÄNGIG - ein BESTAETIGT verlangt nur
+  einen erfassten `unser_netto_anteil_cent`, unabhängig davon, in
+  welcher Betragsart der ursprünglich gemeldete Betrag vorlag.
+- Kostenfelder (`betriebskosten_hinweis_cent`/
+  `reinigungskosten_hinweis_cent`/`verwaltungskosten_hinweis_cent`)
+  sind ausdrücklich in KEINEM Code-Pfad an einer Berechnung beteiligt
+  - reine Anzeige-/Dokumentationsfelder.
+- Optimistic Lock: `korrigieren` bindet sich an `ausgehend_von_id`
+  (die vom Aufrufer zuletzt gesehene aktuelle Version); weicht die
+  tatsächlich aktuelle Version zum Zeitpunkt der Korrektur davon ab,
+  wird `OptimistischerLockKonfliktError` geworfen statt die
+  zwischenzeitliche fremde Korrektur stillschweigend zu überschreiben.
+- CSV-Import: `erstelle_plan`/`wende_an` teilen sich dieselbe
+  Prüffunktion (`_pruefe_paket`/`_pruefe_einzelzeile`) wie der
+  bestehende generische Intake (`intake/planner.py`) - kein separater
+  Prüfpfad. Eine Zeile, die von der aktuellen Version abweicht, ohne
+  `aenderungsgrund` zu tragen, gilt als KONFLIKT (blockiert den
+  gesamten Import); mit `aenderungsgrund` als KORREKTUR (nur nach
+  explizitem `korrekturen_bestaetigt=True` anwendbar). Die GESAMTE
+  Datei läuft in einer Transaktion.
+- Monatsübersicht (`variableabrechnung/dashboard.py`) verwendet für
+  das Dauermiete-Soll die VERTRAGSGÜLTIGKEIT (`gueltig_von`/
+  `gueltig_bis`), nicht `EinheitTable.nutzungsstatus` (das hat keine
+  Historie) - historische Monate werden dadurch nicht anhand des
+  heutigen Status verzerrt. Ein Hinweis auf einen fehlenden
+  Monatsbericht nutzt dagegen bewusst den AKTUELLEN Nutzungsstatus als
+  Heuristik und ist als solche gekennzeichnet, keine rückwirkende
+  Tatsachenbehauptung.

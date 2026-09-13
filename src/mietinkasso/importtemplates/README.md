@@ -156,6 +156,39 @@ ausschließlich Zeilen, die auf beide Parameter passen. Das jüngste
 Buchungsdatum in der Datei ist kein Beweis für eine bis zum Abrufdatum
 lückenlose Bankanbindung (siehe `docs/hausverwaltung/OFFENE_PUNKTE.md`).
 
+## `variable_abrechnung.csv`
+
+Für den atomaren, idempotenten CSV-Import monatlicher variabler
+Nutzungsentgelt-Meldungen (KURZZEITVERMIETUNG/SELFSTORAGE, Auftrag
+13.09., HV-20260913-DASHBOARD). Wird geparst mit
+`mietinkasso.variableabrechnung.csv_import.parse_csv`, geprüft mit
+`erstelle_plan` (rein lesend) und übernommen mit `wende_an` (bindet
+sich an den Plan-Hash der geprüften Datei).
+
+- `einheit_id` muss eine bestehende `EinheitTable`-ID sein (keine
+  automatische Anlage neuer Stammdaten aus dieser Datei).
+- `art` ist `KURZZEITVERMIETUNG` oder `SELFSTORAGE`.
+- `leistungsmonat` im Format `YYYY-MM`, `belegdatum` im Format
+  `YYYY-MM-DD`.
+- `status` ist `ENTWURF` (Standard, wenn leer) oder `BESTAETIGT` -
+  `BESTAETIGT` setzt einen gefüllten `unser_netto_anteil` voraus.
+- `berichteter_betrag`/`berichteter_betragsart` gehören zusammen
+  (BRUTTO/NETTO/UNGEKLAERT) und bilden NUR den roh gemeldeten
+  Ursprungsbetrag ab - es gibt keine automatische Netto-Umrechnung über
+  einen angenommenen USt-Satz. `unser_netto_anteil` ist der für die
+  Erlössumme MASSGEBLICHE, unabhängig davon erfasste Wert.
+  `tatsaechlicher_zahlungseingang` ist rein informativ und NICHT
+  gleichzusetzen mit dem Nettomieterlös.
+- Eine Zeile, die von der aktuellen Version für dieselbe
+  (`einheit_id`, `art`, `leistungsmonat`) abweicht, benötigt einen
+  nicht-leeren `aenderungsgrund` (sonst KONFLIKT, gesamter Import
+  blockiert) und wird nur nach expliziter Bestätigung
+  (`korrekturen_bestaetigt=True`) als neue Version übernommen -
+  "Korrigierte Quelle nur explizit als neue Version".
+- `import_id` ist optional - fehlt sie, wird sie deterministisch aus
+  Einheit/Art/Monat und den übrigen Feldern abgeleitet (ein
+  Wiederholimport mit identischem Inhalt bleibt wirkungslos).
+
 ## Zinsliste (Vertragskomponenten) — noch kein automatischer Import
 
 Für die Übernahme bestehender Zinslisten in `VertragsKomponenteTable`

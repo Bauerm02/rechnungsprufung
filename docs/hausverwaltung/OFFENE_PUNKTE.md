@@ -1218,3 +1218,118 @@ ist und WAS ES BEWUSST NICHT TUT.
   Hinweise übernommen (siehe Paket-C-Abschnitt oben). Die MRG-Teil-
   Formulierung im Erhöhungsschreiben zitiert § 16 Abs 9 deshalb bewusst
   qualifiziert statt zuversichtlich.
+
+## Paket Dashboard/Variable Monatsabrechnung (Auftrag 13.09.2026, HV-20260913-DASHBOARD)
+
+Neues Modul `src/mietinkasso/variableabrechnung/` (versionierte
+Monatsabrechnungen für KURZZEITVERMIETUNG/SELFSTORAGE, CSV-Import,
+Monatsübersicht) plus reine Anzeige-Präzisierungen im bestehenden
+Dashboard/Kontoauszug. Der vollständige, wortgetreue Auftrag inkl. der
+Quellenpräzisierung steht in `RAHMENPROGRAMM.md` (Abschnitt
+"HV-20260913-DASHBOARD").
+
+### Was funktioniert (mit Tests belegt)
+
+- **Dashboard/Konto-Relabeling, rein darstellend**: "Saldo" heißt jetzt
+  "Kontostand (offen/Guthaben)", "fälliger unstrittiger Rest" heißt
+  "Davon mit bekannter Fälligkeit"; ein Rechenweg (Eröffnung +
+  Vorschreibungen/Nachbelastungen − Zahlungen − Gutschriften, optional
+  + Korrekturen) wird aus denselben `OPSaldo.positionen` angezeigt, die
+  `OPService.berechne_saldo` bereits verwendet - `op/service.py` selbst
+  wurde NICHT verändert. Aktive Mahnsperren samt Gründen erscheinen
+  sowohl in der Objektübersicht als auch am Kontoauszug, mit
+  ausdrücklichem Hinweis, dass eine bekannte Fälligkeit KEINE
+  Mahnfreigabe ist und eine unbekannte Fälligkeit NICHT automatisch als
+  strittig gilt.
+- **Versionierte, unveränderliche Monatsabrechnung**
+  (`VariableAbrechnungTable`/`VariableAbrechnungService`): jede
+  Erfassung/Korrektur ist eine neue Zeile; ein partieller Unique-Index
+  (`uq_variable_abrechnung_aktuell`) erzwingt genau eine aktuelle
+  Version je (Einheit, Art, Leistungsmonat) auch auf DB-Ebene.
+  `korrigieren` bindet sich per optimistic lock an die vom Aufrufer
+  zuletzt gesehene Version (`ausgehend_von_id`) und lehnt eine
+  inzwischen überholte Ausgangsversion mit
+  `OptimistischerLockKonfliktError` ab. Ein `erfassen`-Aufruf auf eine
+  bereits bestehende Gruppe ist NUR bei identischem Inhalt ein
+  sicherer No-Op (Wiederholimport); bei abweichendem Inhalt verweist
+  `VariableAbrechnungKonfliktError` auf die explizite
+  Korrektur-Route.
+- **Entwurf/Betragsart-Trennung ohne erfundene USt-Umrechnung**:
+  `berichteter_betrag_cent`/`berichteter_betragsart`
+  (BRUTTO/NETTO/UNGEKLAERT) halten fest, WIE ein Betrag gemeldet wurde;
+  `unser_netto_anteil_cent` (der für die Erlössumme MASSGEBLICHE Wert)
+  bleibt davon unabhängig und optional, bis er tatsächlich geprüft ist
+  (`status=BESTAETIGT`, das einen erfassten Nettoanteil voraussetzt).
+  Kostenfelder (Betriebs-/Reinigungs-/Verwaltungskosten-Hinweis) und
+  der tatsächliche Zahlungseingang sind rein informativ und werden an
+  KEINER Stelle im Code von `unser_netto_anteil_cent` abgezogen oder
+  damit verrechnet.
+- **Atomarer, idempotenter CSV-Import** (`variableabrechnung/
+  csv_import.py`) - Vorschau (`erstelle_plan`, rein lesend) und
+  bewusste Übernahme (`wende_an`, bindet sich an den Plan-Hash der
+  geprüften Datei) getrennt, analog zum bestehenden generischen Intake
+  (`intake/planner.py`/`intake/apply.py`) und Eröffnungsimport
+  (`op/eroeffnung_import.py`). Eine Zeile, die von der aktuellen
+  Version abweicht, OHNE `aenderungsgrund` zu tragen, blockiert den
+  GESAMTEN Import (KONFLIKT); mit `aenderungsgrund` wird sie erst nach
+  expliziter `korrekturen_bestaetigt`-Bestätigung als neue Version
+  übernommen. Die gesamte Datei läuft in EINER Transaktion - eine
+  gesperrte/konfliktbehaftete Zeile verhindert auch die Übernahme der
+  unproblematischen Zeilen derselben Datei.
+- **Monatsübersicht** (`variableabrechnung/dashboard.py`,
+  Backoffice-Route `/dashboard/monatsuebersicht`): Dauermiete-Soll
+  netto (Summe aktiver Vertragskomponenten OHNE BK/HK/USt, über
+  Verträge, die den gewählten Monat GÜLTIGKEITSMÄSSIG abdecken - nicht
+  über den aktuellen `Einheit.nutzungsstatus`, der für eine historische
+  Periode keine Aussagekraft hätte) plus bestätigte Kurzzeit-/
+  Selfstorage-Nettoanteile. Eine Einheit mit SOWOHL Dauermiete-Soll ALS
+  AUCH einem Report für denselben Monat wird als Doppelzählungs-
+  Konflikt erkannt und der Report von der Summe ausgeschlossen (nicht
+  addiert). ENTWURF-Zeilen und fehlende Monatsberichte erscheinen als
+  benannte Datenlücken statt in einer scheinbar vollständigen Summe zu
+  verschwinden; `tatsaechlicher_zahlungseingang_cent` fließt an keiner
+  Stelle in die Summe ein ("nie Bank-Ist behaupten").
+- **Auth/Scope/CSRF/Objektausschluss** wie im übrigen Repository:
+  `require_gesellschaft_access`/`require_schreibrecht` auf jeder
+  Service-Methode, `pruefe_einheit_nicht_ausgeschlossen` (neu in
+  `stammdaten/repository.py`, analog `pruefe_vertrag_nicht_
+  ausgeschlossen`) sperrt Objekt-107-artige Fälle, jede POST-Route
+  verlangt ein gültiges `csrf_token`.
+- 711 Tests insgesamt (665 zuvor + 46 neu: Service, CSV-Import,
+  Dashboard-Aggregation, Backoffice-HTTP inkl. Objektsperre,
+  Centgenauigkeit/negative Beträge, fehlend-vs-Null bei
+  `berichteter_betragsart`, und ein expliziter Test, dass eine variable
+  Monatsabrechnung den bestehenden OP-Kontostand NICHT verändert).
+
+### Was ausdrücklich NICHT geliefert ist (bewusste, offen benannte Lücken)
+
+- **Echte Bestandszuordnung bleibt bei Codex.** Dieses Modul ist
+  generischer Code über beliebige `EinheitTable`-IDs mit Nutzungsstatus
+  KURZZEITVERMIETUNG/SELFSTORAGE - welche konkreten sieben
+  Kurzzeit-Einheiten und die eine Selfstorage-Einheit real existieren
+  und wie ihre Leistungsmonate tatsächlich zugeordnet werden, ist NICHT
+  Teil dieser Sitzung (synthetische Testdaten/Tests ausgenommen).
+- **Kein CSV-Datei-Upload-Assistent/keine Vorlagen-Datei im Repo.** Der
+  Import erwartet die Spaltenreihenfolge aus dem Hinweistext der
+  Backoffice-Seite (`/backoffice/variable-abrechnung/import`); eine
+  separate, herunterladbare CSV-Vorlagendatei existiert (noch) nicht.
+- **Keine Backoffice-seitige Massenkorrektur.** Jede Korrektur läuft
+  über GENAU eine Zeile (Formular ODER eine einzelne CSV-Zeile mit
+  `aenderungsgrund`) - es gibt keine "alle Zeilen eines Monats auf
+  einmal korrigieren"-Funktion.
+- **Keine Historisierung von `EinheitTable.nutzungsstatus`.** Das Feld
+  bleibt (wie im gesamten Repository) ein einzelner aktueller Zustand
+  ohne Verlauf; die Monatsübersicht kompensiert das für die
+  Dauermiete-Summe über die Vertragsgültigkeit, verwendet den aktuellen
+  Status aber weiterhin als (klar gekennzeichnete) Heuristik für den
+  "fehlender Monatsbericht"-Hinweis - eine Einheit, deren Nutzungsart
+  sich zwischenzeitlich geändert hat, kann hier einen nicht ganz
+  treffenden Hinweis erzeugen.
+- **Keine automatische Verknüpfung zu `VorschreibungTable`/OP.** Die
+  variable Monatsabrechnung ist bewusst eine EIGENE, von
+  `OPPositionTable` vollständig getrennte Datenquelle (Reporting) -
+  kein Code-Pfad dieses Pakets bucht, ändert oder storniert einen OP
+  oder eine Vorschreibung.
+- **Keine Migrationsspalten-Änderung.** Wie im gesamten Repository ist
+  `variable_abrechnungen` rein additiv; `create_all_tables()` legt nur
+  fehlende Tabellen an.

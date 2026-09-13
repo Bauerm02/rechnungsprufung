@@ -197,3 +197,22 @@ def test_wende_an_gesperrte_zeile_blockiert_gesamten_import(admin_ctx, kurzzeit_
             service=service, repository=repo, akteur="markus",
         )
     assert repo.aktuelle_version("601-KURZ1", "KURZZEITVERMIETUNG", "2026-08") is None
+
+
+def test_synthetische_importvorlage_ist_gueltig():
+    """Die im Repo mitgelieferte Vorlage (`importtemplates/
+    variable_abrechnung.csv`, siehe README.md) muss sich mit `parse_csv`
+    fehlerfrei einlesen lassen - stellt sicher, dass Vorlage und Parser
+    nicht auseinanderlaufen."""
+
+    from pathlib import Path
+
+    pfad = Path(__file__).resolve().parents[2] / "src" / "mietinkasso" / "importtemplates" / "variable_abrechnung.csv"
+    text = pfad.read_text(encoding="utf-8")
+    zeilen = parse_csv(text)
+    assert len(zeilen) == 3
+    assert zeilen[0].art == "KURZZEITVERMIETUNG"
+    assert zeilen[0].status == "ENTWURF"
+    assert zeilen[1].art == "SELFSTORAGE"
+    assert zeilen[1].unser_netto_anteil_cent == 86_000
+    assert zeilen[2].aenderungsgrund == "Nettoanteil vom Betreiber final bestätigt"

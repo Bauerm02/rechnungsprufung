@@ -1,0 +1,4 @@
+einheit_id,art,leistungsmonat,belegdatum,quelle_referenz,status,berichteter_betrag,berichteter_betragsart,unser_netto_anteil,tatsaechlicher_zahlungseingang,vermietete_einheiten,vermietete_flaeche_qm,aenderungsgrund,import_id
+601-KURZ1,KURZZEITVERMIETUNG,2026-08,2026-09-05,Betreiberreport August 2026 (synthetisch),ENTWURF,5200.00,BRUTTO,,,,,,
+601-STOR1,SELFSTORAGE,2026-08,2026-09-05,Storage-Report August 2026 (synthetisch),BESTAETIGT,,,860.00,820.00,7,42.5,,
+601-KURZ1,KURZZEITVERMIETUNG,2026-08,2026-09-20,Korrigierter Betreiberreport (synthetisch),BESTAETIGT,,,4300.00,4100.00,,,Nettoanteil vom Betreiber final bestätigt,
