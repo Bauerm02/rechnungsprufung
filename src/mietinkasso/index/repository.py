@@ -42,9 +42,24 @@ class IndexRepository:
             session.refresh(klausel)
             return klausel
 
-    def get_klausel(self, klausel_id: int) -> IndexKlauselTable | None:
-        with self._session_factory() as session:
+    def get_klausel(self, klausel_id: int, *, session: Session | None = None) -> IndexKlauselTable | None:
+        """`session`: siehe `StammdatenRepository.get_komponente` - Pflicht,
+        wenn die gesuchte Klausel innerhalb einer noch NICHT committeten
+        äußeren Transaktion erst neu angelegt wurde (z. B.
+        `indexautomatik/umsetzung_service.py::umsetzen`, Klausel-
+        Basisfortschreibung). Eine separat geöffnete Session (der bisherige
+        `with self._session_factory() as session`-Zweig) sähe eine solche
+        Zeile nicht nur nicht - auf SQLite mit gemeinsam genutzter
+        In-Memory-Connection (Tests) kann eine zweite, unabhängig
+        geöffnete Session dieselbe zugrunde liegende DBAPI-Connection
+        einer noch offenen äußeren Transaktion stören (beobachtet als
+        `StaleDataError` bei einem späteren UPDATE der äußeren
+        Transaktion)."""
+
+        if session is not None:
             return session.get(IndexKlauselTable, klausel_id)
+        with self._session_factory() as owned_session:
+            return owned_session.get(IndexKlauselTable, klausel_id)
 
     def freigeben(self, klausel_id: int, *, freigegeben_von: str) -> IndexKlauselTable:
         from datetime import datetime, timezone

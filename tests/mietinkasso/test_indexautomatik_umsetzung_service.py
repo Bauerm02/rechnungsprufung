@@ -34,7 +34,13 @@ from mietinkasso.indexautomatik.repository import (
 from mietinkasso.indexautomatik.service import IndexautomatikService
 from mietinkasso.indexautomatik.transport import FakeTransportadapter
 from mietinkasso.indexautomatik.umsetzung_service import IndexSollUmsetzungService
-from mietinkasso.infrastructure.db.tables import ErhoehungsschreibenTable, IndexSollUmsetzungTable, RechtsprofilTable
+from mietinkasso.infrastructure.db.tables import (
+    ErhoehungsschreibenTable,
+    IndexAnpassungTable,
+    IndexKlauselTable,
+    IndexSollUmsetzungTable,
+    RechtsprofilTable,
+)
 from mietinkasso.mieweg_vorschau.repository import MieWegVorschauRepository
 from mietinkasso.mieweg_vorschau.service import MieWegVorschauService
 from mietinkasso.vorschreibung.repository import VorschreibungRepository
@@ -252,6 +258,93 @@ def test_umsetzen_erfolgreich_historisiert_komponente_und_neues_rechtsprofil(
         assert zeile.neue_komponenten_ids == [ergebnis.neue_komponente_id]
         assert zeile.beendete_komponenten_ids == ["K-1"]
     assert ergebnis.neue_komponenten_ids == [ergebnis.neue_komponente_id]
+
+
+def test_umsetzen_klausel_pfad_schreibt_basis_fort(
+    admin_ctx, basis_vertrag, umsetzung_service, outbox_repo, rechtsprofil_service, rechtsprofil_repo,
+    stammdaten_repo, index_repo,
+):
+    """Codex-Rückprüfung: Geschäftsraum-/generischer-Klausel-Pfad schrieb
+    basis_wert/basis_monat/letzte_anpassung NICHT fort - eine bereits
+    umgesetzte Erhöhung würde beim nächsten Vergleich denselben VPI-Sprung
+    ein zweites Mal als Erhöhung ausweisen. `umsetzen()` legt jetzt eine
+    NEUE IndexKlausel-Version an (append-only, wie überall in diesem
+    Repository), markiert die alte GESPERRT und lässt das neue Rechtsprofil
+    auf die neue Version verweisen."""
+
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.add_komponente(
+        id="K-1", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=100_000,
+        indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+    klausel = index_repo.anlegen(
+        IndexKlauselTable(
+            vertrag_id=vertrag.id, version=1, rechtsordnung="OESTERREICH_MRG_TEIL",
+            berechnungsprofil="EINFACHER_SCHWELLENVERGLEICH", abschlussdatum=date(2020, 1, 1),
+            basis_reihe="VPI2020", basis_wert=Decimal("100"), basis_monat="2024-01",
+            schwelle_prozent=Decimal("0"), schwelle_inklusive=True, status="ENTWURF",
+        )
+    )
+    klausel = index_repo.freigeben(klausel.id, freigegeben_von="markus")
+
+    anpassung = index_repo.speichere_anpassung(
+        IndexAnpassungTable(
+            index_klausel_id=klausel.id, index_klausel_version=klausel.version, vertrag_id=vertrag.id,
+            stichtag=date(2026, 4, 1), alter_wert=Decimal("100"), neuer_wert=Decimal("105"),
+            veraenderung_prozent=Decimal("5"), erhoehung_cent=5_000, status="FREIGEGEBEN",
+            quelle_referenz="Test",
+        )
+    )
+
+    entwurf = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx, vertrag_id=vertrag.id, rechtsordnung="OESTERREICH_MRG_TEIL", ist_wohnungsnutzung=False,
+        mrg_zinsbeschraenkung=False, mrg_zinsbeschraenkung_geprueft=True, ist_altvertrag=False, ist_hauptmiete=True,
+        foerderbindung=False, foerderbindung_geprueft=True,
+        mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
+        bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False,
+        basis_komponenten_ids=["K-1"], vertragsklausel_id=klausel.id,
+        vertrag_beleg_referenz="Vertrag", klausel_referenz="Punkt 7", erstellt_von="markus",
+    )
+    profil = rechtsprofil_service.freigeben(entwurf.id, ctx=admin_ctx, freigegeben_von="markus")
+
+    schreiben = outbox_repo.anlegen(
+        ErhoehungsschreibenTable(
+            vertrag_id=vertrag.id, ziel_bewertungsjahr=None, rechtsprofil_id=profil.id,
+            rechtsprofil_version=profil.version, index_anpassung_id=anpassung.id,
+            status="SOLL_UMSETZUNG_OFFEN", massgeblicher_termin=date(2026, 4, 1),
+            erhoehung_cent=5_000, schreiben_text="Testschreiben", idempotenzschluessel=f"{vertrag.id}:klausel:{anpassung.id}",
+            versendet_am=datetime(2026, 3, 15, 9, 0, tzinfo=timezone.utc), externe_versandreferenz="MAILOPS-TEST-1",
+            zugangsform="EINSCHREIBEN", zugang_bestaetigt_am=date(2026, 4, 1), zugang_beleg="RSb-1",
+            zahlungspflicht_ab=date(2026, 4, 15), empfaenger_snapshot={"debitor_id": vertrag.debitor_id},
+            komponenten_verteilung={
+                "eintraege": [{"komponente_id": "K-1", "alter_betrag_cent": 100_000, "neuer_betrag_cent": 105_000}]
+            },
+        )
+    )
+
+    ergebnis = umsetzung_service.umsetzen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 4, 20), akteur="markus",
+        soll_umsetzung_enabled=True,
+    )
+    assert ergebnis.status == "UMGESETZT", ergebnis.gruende
+
+    alte_klausel = index_repo.get_klausel(klausel.id)
+    assert alte_klausel.status == "GESPERRT"
+    assert alte_klausel.ersetzt_id is not None
+
+    neues_profil = rechtsprofil_repo.get(ergebnis.neues_rechtsprofil_id)
+    neue_klausel = index_repo.get_klausel(neues_profil.vertragsklausel_id)
+    assert neue_klausel.id != klausel.id
+    assert neue_klausel.id == alte_klausel.ersetzt_id
+    assert neue_klausel.basis_wert == Decimal("105")
+    assert neue_klausel.basis_monat == "2026-04"
+    assert neue_klausel.letzte_anpassung_monat == "2026-04"
+    assert neue_klausel.status == "FREIGEGEBEN"
+    assert neue_klausel.version == klausel.version + 1
+    # Unveränderte Klauselfelder bleiben erhalten (keine stillschweigende
+    # Fachänderung durch die reine Basisfortschreibung).
+    assert neue_klausel.schwelle_prozent == klausel.schwelle_prozent
+    assert neue_klausel.basis_reihe == klausel.basis_reihe
 
 
 def test_umsetzen_mehrkomponenten_historisiert_alle_betroffenen_komponenten(
@@ -514,6 +607,50 @@ def test_umsetzen_bereits_gebuchte_folgeperiode_blockiert_keine_doppelbuchung(
     assert ergebnis.status == "BLOCKIERT"
     assert any("Bereits gebuchte Monatsvorschreibung" in g for g in ergebnis.gruende)
     assert stammdaten_repo.get_komponente("K-1").betrag_cent == 100_000
+
+
+def test_umsetzen_aktualisiert_bereits_bestehenden_offenen_vorschreibungsentwurf(
+    admin_ctx, basis_vertrag, umsetzung_service, outbox_repo, rechtsprofil_service, stammdaten_repo, session_factory,
+    vorschreibung_service,
+):
+    """Codex-Rückprüfung: `VorschreibungService.entwurf_erstellen` befüllt
+    eine Monatsvorschreibung NUR beim allerersten Aufruf - ein bereits
+    VORHER (z. B. zu Monatsbeginn) angelegter, noch nicht gebuchter
+    ENTWURF für den Wirksamkeitsmonat bliebe sonst dauerhaft auf dem ALTEN
+    Komponentenstand stehen. `umsetzen()` muss einen solchen offenen
+    Entwurf in DERSELBEN Transaktion aus dem neu historisierten
+    Komponentenstand neu aufbauen - inklusive einer unveränderten
+    BK-Position. Eine bereits GEBUCHTE Periode bleibt weiterhin vollständig
+    gesperrt (siehe vorheriger Test), das ist hier NICHT der Fall."""
+
+    vertrag, _konto = basis_vertrag
+    profil = _profil_und_komponente(admin_ctx, rechtsprofil_service, stammdaten_repo, vertrag)
+    stammdaten_repo.add_komponente(
+        id="BK-1", vertrag_id=vertrag.id, art="BK_VORAUSZAHLUNG", bezeichnung="Betriebskosten", betrag_cent=15_000,
+        indexierbar=False, gueltig_von=date(2024, 1, 1),
+    )
+    schreiben = _soll_umsetzung_offenes_schreiben(outbox_repo, vertrag, profil)
+
+    # Vorab bereits angelegter, noch NICHT gebuchter Entwurf für den
+    # Wirksamkeitsmonat - mit dem ALTEN Betrag (100.000 HMZ + 15.000 BK).
+    vorab = vorschreibung_service.entwurf_erstellen(ctx=admin_ctx, vertrag=vertrag, monat="2026-04")
+    assert vorab.summe_cent == 115_000
+
+    ergebnis = umsetzung_service.umsetzen(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 4, 20), akteur="markus",
+        soll_umsetzung_enabled=True,
+    )
+    assert ergebnis.status == "UMGESETZT", ergebnis.gruende
+
+    vorschreibung_repo = VorschreibungRepository(session_factory)
+    aktualisiert = vorschreibung_repo.get(vertrag.id, "2026-04")
+    assert aktualisiert.id == vorab.vorschreibung_id  # dieselbe Zeile, nicht neu angelegt
+    assert aktualisiert.status == "ENTWURF"  # weiterhin nicht gebucht
+    positionen = vorschreibung_repo.list_positionen(aktualisiert.id)
+    arten = {p.art: p.betrag_cent for p in positionen}
+    assert arten["HMZ"] == 101_000  # neuer, umgesetzter Betrag
+    assert arten["BK_VORAUSZAHLUNG"] == 15_000  # unverändert, aber trotzdem aktualisiert übernommen
+    assert sum(p.betrag_cent for p in positionen) == 116_000
 
 
 def test_umsetzen_transaktion_bricht_bei_fehler_vollstaendig_ab(
