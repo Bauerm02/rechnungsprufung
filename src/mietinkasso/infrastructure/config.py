@@ -82,6 +82,10 @@ class Settings(BaseSettings):
     # dieser Sitzung false.
     indexautomatik_mailops_allowlist_bestaetigt: bool = False
     indexautomatik_jlb_signatur: str = "JLB Projects GmbH - Hausverwaltung"
+    # Default AUS: `statistik_austria_client.py` wurde mangels
+    # Internetzugriff in dieser Sitzung nicht gegen den echten Endpunkt
+    # verifiziert - Codex muss das vor Aktivierung prüfen.
+    indexautomatik_vpi_automatischer_abruf: bool = False
 
 
 class ProduktionskonfigurationUngueltigError(RuntimeError):

@@ -101,6 +101,40 @@ class VpiRepository:
             session.refresh(row)
             return row
 
+    def batch_erfassen(
+        self, *, monatszeilen: list[dict], jahreszeilen: list[dict]
+    ) -> None:
+        """Ein kompletter OGD-Import (`vpi_import.py::importiere_ogd_csv`)
+        in EINER Transaktion - Zwischenreview (34c6fdd): "die aktuelle
+        Schleife commit je Zeile ist trotz Docstring nicht atomar bei
+        DB-Fehler/Absturz". Ein Fehler bei irgendeiner Zeile lässt die
+        GESAMTE Transaktion zurückrollen, kein Teilimport."""
+
+        with self._session_factory() as session:
+            for zeile in monatszeilen:
+                statement = select(VpiMonatswertTable).where(
+                    VpiMonatswertTable.reihe == zeile["reihe"],
+                    VpiMonatswertTable.jahr == zeile["jahr"],
+                    VpiMonatswertTable.monat == zeile["monat"],
+                )
+                row = session.execute(statement).scalars().first()
+                if row is None:
+                    session.add(VpiMonatswertTable(**zeile))
+                else:
+                    for feld, wert in zeile.items():
+                        setattr(row, feld, wert)
+            for zeile in jahreszeilen:
+                statement = select(VpiJahreswertTable).where(
+                    VpiJahreswertTable.reihe == zeile["reihe"], VpiJahreswertTable.jahr == zeile["jahr"]
+                )
+                row = session.execute(statement).scalars().first()
+                if row is None:
+                    session.add(VpiJahreswertTable(**zeile))
+                else:
+                    for feld, wert in zeile.items():
+                        setattr(row, feld, wert)
+            session.commit()
+
     def monatswerte_liste(self, reihe: str, jahr: int) -> list[VpiMonatswertTable]:
         with self._session_factory() as session:
             statement = (
@@ -129,6 +163,28 @@ class VpiRepository:
             if any(m.finalitaet != "ENDGUELTIG" for m in monate):
                 return None
             return sum((m.wert for m in monate), Decimal("0")) / 12
+
+    def neuester_endgueltiger_monatswert(self, reihe: str, bis: date) -> Decimal | None:
+        """Für die vertragliche Klausel-Spur (`vertragsspur.py`): der
+        jüngste ENDGUELTIGe Monatswert auf oder vor `bis` - ein noch
+        VORLAEUFIGer letzter Monat (Statistik-Austria-Praxis: der
+        jeweils letzte veröffentlichte Monat ist vorläufig, wird erst
+        mit dem Folgemonat final) wird bewusst NICHT verwendet."""
+
+        with self._session_factory() as session:
+            statement = (
+                select(VpiMonatswertTable)
+                .where(VpiMonatswertTable.reihe == reihe)
+                .where(VpiMonatswertTable.finalitaet == "ENDGUELTIG")
+                .where(
+                    (VpiMonatswertTable.jahr < bis.year)
+                    | ((VpiMonatswertTable.jahr == bis.year) & (VpiMonatswertTable.monat <= bis.month))
+                )
+                .order_by(VpiMonatswertTable.jahr.desc(), VpiMonatswertTable.monat.desc())
+                .limit(1)
+            )
+            row = session.execute(statement).scalars().first()
+            return row.wert if row else None
 
     def jahresdurchschnitte_fuer(self, reihe: str, jahre: set[int]) -> dict[int, Decimal]:
         ergebnis: dict[int, Decimal] = {}
