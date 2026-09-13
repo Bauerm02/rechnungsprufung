@@ -1223,10 +1223,19 @@ ist und WAS ES BEWUSST NICHT TUT.
 
 Neues Modul `src/mietinkasso/variableabrechnung/` (versionierte
 Monatsabrechnungen für KURZZEITVERMIETUNG/SELFSTORAGE, CSV-Import,
-Monatsübersicht) plus reine Anzeige-Präzisierungen im bestehenden
-Dashboard/Kontoauszug. Der vollständige, wortgetreue Auftrag inkl. der
-Quellenpräzisierung steht in `RAHMENPROGRAMM.md` (Abschnitt
-"HV-20260913-DASHBOARD").
+Monatsübersicht, separate Netto-Mietanteil-Freigabe) plus reine
+Anzeige-Präzisierungen im bestehenden Dashboard/Kontoauszug. Der
+vollständige, wortgetreue Auftrag inkl. der Quellenpräzisierung steht
+in `RAHMENPROGRAMM.md` (Abschnitt "HV-20260913-DASHBOARD").
+
+**Historie der unabhängigen Abnahme:** Der erste Übergabestand
+(`ee6bd8b`) wurde in einer unabhängigen Gegenprüfung mit 6 konkret
+reproduzierten Fehlern zurückgewiesen (Commit `60eb9c4` behebt sie plus
+zwei bei der Prüfung zusätzlich gefundene Datenvertrags-/
+Idempotenzlücken); eine zweite Gegenprüfung von `60eb9c4` fand vier
+weitere konkrete Fehler (Commit `8a9d036` behebt sie). Der folgende
+Abschnitt beschreibt den STAND NACH BEIDEN Korrekturrunden, nicht den
+ursprünglichen Übergabestand.
 
 ### Was funktioniert (mit Tests belegt)
 
@@ -1247,13 +1256,19 @@ Quellenpräzisierung steht in `RAHMENPROGRAMM.md` (Abschnitt
   (`uq_variable_abrechnung_aktuell`) erzwingt genau eine aktuelle
   Version je (Einheit, Art, Leistungsmonat) auch auf DB-Ebene.
   `korrigieren` bindet sich per optimistic lock an die vom Aufrufer
-  zuletzt gesehene Version (`ausgehend_von_id`) und lehnt eine
-  inzwischen überholte Ausgangsversion mit
-  `OptimistischerLockKonfliktError` ab. Ein `erfassen`-Aufruf auf eine
-  bereits bestehende Gruppe ist NUR bei identischem Inhalt ein
-  sicherer No-Op (Wiederholimport); bei abweichendem Inhalt verweist
-  `VariableAbrechnungKonfliktError` auf die explizite
-  Korrektur-Route.
+  zuletzt gesehene Version (`ausgehend_von_id`); die eigentliche
+  Durchsetzung ist eine ATOMARE bedingte UPDATE-Anweisung in
+  `VariableAbrechnungRepository.neue_version_anlegen`
+  (`WHERE id=alte_id AND ist_aktuell=True`) - eine reine
+  Prüfen-dann-Schreiben-Logik hätte (wie in der ersten Gegenprüfung
+  reproduziert) ein enges Zeitfenster offengelassen, in dem eine
+  zwischenzeitliche fremde Korrektur stillschweigend überschrieben
+  werden konnte. Ein `erfassen`-Aufruf auf eine bereits bestehende
+  Gruppe ist NUR bei identischem Inhalt ein sicherer No-Op
+  (Wiederholimport, `vermietete_flaeche_qm` wird dabei kanonisch als
+  `Decimal` verglichen, NICHT als String - "10" und "10.00" gelten
+  als gleich); bei abweichendem Inhalt verweist
+  `VariableAbrechnungKonfliktError` auf die explizite Korrektur-Route.
 - **Entwurf/Betragsart-Trennung ohne erfundene USt-Umrechnung**:
   `berichteter_betrag_cent`/`berichteter_betragsart`
   (BRUTTO/NETTO/UNGEKLAERT) halten fest, WIE ein Betrag gemeldet wurde;
@@ -1264,6 +1279,29 @@ Quellenpräzisierung steht in `RAHMENPROGRAMM.md` (Abschnitt
   der tatsächliche Zahlungseingang sind rein informativ und werden an
   KEINER Stelle im Code von `unser_netto_anteil_cent` abgezogen oder
   damit verrechnet.
+- **Separate Netto-Mietanteil-Freigabe für Dauermiete-Komponenten**
+  (`KomponentenNettoMietFreigabeTable`/`komponenten_freigabe.py`, neu
+  in der ersten Korrekturrunde): `VertragsKomponenteTable.betrag_cent`
+  wird NIE als Netto-Mietbasis übernommen - der Bestand enthält
+  historisch auch BRUTTO gespeicherte Beträge, auch bei
+  art=HMZ/KUECHE/PARKPLATZ (die `ust_satz_promille`-Spalte beweist
+  allein keine Betragsbasis); eine positive Whitelist plausibler
+  Mietarten (`_MOEGLICHE_MIET_ARTEN`) ist NOTWENDIG, aber NICHT
+  hinreichend. Nur eine explizit erfasste, belegte Freigabe mit
+  eigenem `bestaetigter_netto_betrag_cent` (kann von `betrag_cent`
+  ABWEICHEN), Quellenbeleg und eigener Gültigkeit zählt für die
+  Monatsübersicht; sie entwertet sich automatisch (`quelle_hash`,
+  analog `RechtsprofilTable`), sobald sich die zugrunde liegende
+  Komponente ändert. Eine neue Freigabe entwertet NUR zeitlich
+  überlappende frühere Freigaben derselben Komponente (atomar per
+  CAS-Update mit `rowcount`-Prüfung) - eine nicht überlappende
+  historische Freigabe (z. B. ein anderer Monat) bleibt unberührt; eine
+  Überschneidung erfordert zusätzlich einen expliziten
+  `aenderungsgrund`, sonst wird NICHTS geschrieben (in der zweiten
+  Gegenprüfung reproduziert: eine pauschale "entwerte alle" hätte eine
+  unabhängige historische Freigabe rückwirkend zerstört).
+  `VertragsKomponenteTable`/`OPPositionTable` werden von diesem Modul
+  NIE geschrieben.
 - **Atomarer, idempotenter CSV-Import** (`variableabrechnung/
   csv_import.py`) - Vorschau (`erstelle_plan`, rein lesend) und
   bewusste Übernahme (`wende_an`, bindet sich an den Plan-Hash der
@@ -1275,31 +1313,74 @@ Quellenpräzisierung steht in `RAHMENPROGRAMM.md` (Abschnitt
   expliziter `korrekturen_bestaetigt`-Bestätigung als neue Version
   übernommen. Die gesamte Datei läuft in EINER Transaktion - eine
   gesperrte/konfliktbehaftete Zeile verhindert auch die Übernahme der
-  unproblematischen Zeilen derselben Datei.
+  unproblematischen Zeilen derselben Datei. `plan_hash` bindet sich
+  zusätzlich an die je Zeile GESEHENE aktuelle Version
+  (`aktuelle_version_id`); `wende_an` prüft unmittelbar vor dem
+  Schreiben mit einer FRISCHEN Neuprüfung erneut gegen den bestätigten
+  Hash - eine zwischenzeitliche fremde Änderung (nicht nur ein
+  geänderter Dateiinhalt) lässt den gesamten Import fehlschlagen,
+  statt still auf den zwischenzeitlichen Stand umzubasieren (in der
+  ersten Gegenprüfung als "CSV-Stale-Preview" reproduziert und über
+  einen dedizierten Regressionstest abgesichert). `erstelle_plan`
+  verlangt jetzt ebenfalls `ctx` und markiert Zeilen ohne
+  Gesellschaftszugriff bereits in der Vorschau als GESPERRT, ohne
+  Fachdaten preiszugeben; `wende_an` prüft Gesellschaftszugriff/
+  Schreibrecht für JEDE Zeile, auch eine inhaltlich UNVERAENDERTE.
 - **Monatsübersicht** (`variableabrechnung/dashboard.py`,
   Backoffice-Route `/dashboard/monatsuebersicht`): Dauermiete-Soll
-  netto (Summe aktiver Vertragskomponenten OHNE BK/HK/USt, über
-  Verträge, die den gewählten Monat GÜLTIGKEITSMÄSSIG abdecken - nicht
-  über den aktuellen `Einheit.nutzungsstatus`, der für eine historische
-  Periode keine Aussagekraft hätte) plus bestätigte Kurzzeit-/
-  Selfstorage-Nettoanteile. Eine Einheit mit SOWOHL Dauermiete-Soll ALS
-  AUCH einem Report für denselben Monat wird als Doppelzählungs-
-  Konflikt erkannt und der Report von der Summe ausgeschlossen (nicht
-  addiert). ENTWURF-Zeilen und fehlende Monatsberichte erscheinen als
-  benannte Datenlücken statt in einer scheinbar vollständigen Summe zu
-  verschwinden; `tatsaechlicher_zahlungseingang_cent` fließt an keiner
-  Stelle in die Summe ein ("nie Bank-Ist behaupten").
-- **Auth/Scope/CSRF/Objektausschluss** wie im übrigen Repository:
+  netto ist die Summe der oben beschriebenen, geprüften
+  Netto-Mietanteil-Freigaben für Vertragskomponenten, die den
+  gewählten Monat VOLLSTÄNDIG abdecken (nicht nur zum Monatsersten
+  aktiv - ALLE den Monat überlappenden Komponenten werden geprüft,
+  damit eine erst untermonatlich beginnende/endende Komponente sichtbar
+  bleibt, statt unbemerkt zu verschwinden), plus bestätigte Kurzzeit-/
+  Selfstorage-Nettoanteile. Ein Vertrag/eine Komponente, die den Monat
+  nur UNTERmonatlich abdeckt, liefert keinen automatisch berechneten
+  anteiligen Wert, sondern eine explizite Datenlücke (keine erfundene
+  Proration); ein aktiver Vertrag ganz ohne qualifizierende Komponente
+  ebenso. Eine Einheit mit Berichten für MEHRERE Arten im selben Monat
+  (z. B. gleichzeitig KURZZEITVERMIETUNG und SELFSTORAGE) ist ein
+  Artenkonflikt - alle betroffenen Berichte werden von der Summe
+  ausgeschlossen und als EIN konsolidierter Hinweis gemeldet, statt
+  stillschweigend addiert zu werden. Eine Einheit mit SOWOHL
+  Dauermiete-Soll ALS AUCH einem Report für denselben Monat wird als
+  Doppelzählungs-Konflikt erkannt und der Report von der Summe
+  ausgeschlossen (nicht addiert). ENTWURF-Zeilen und fehlende
+  Monatsberichte erscheinen als benannte Datenlücken statt in einer
+  scheinbar vollständigen Summe zu verschwinden;
+  `tatsaechlicher_zahlungseingang_cent` fließt an keiner Stelle in die
+  Summe ein ("nie Bank-Ist behaupten"). Ein Objekt-Ausschluss wird an
+  JEDER Stelle berücksichtigt: beim Summieren, bei den
+  "fehlender Bericht"-Hinweisen UND bei den zugrunde liegenden
+  `variable_service.liste_aktuelle`-Zeilen selbst (siehe nächster
+  Punkt) - ein Bericht, dessen Objekt ERST NACH der Erfassung
+  ausgeschlossen wird, verschwindet dadurch automatisch aus der Summe.
+- **Auth/Scope/CSRF/Objektausschluss konsequent auch auf Lesepfaden**:
   `require_gesellschaft_access`/`require_schreibrecht` auf jeder
-  Service-Methode, `pruefe_einheit_nicht_ausgeschlossen` (neu in
-  `stammdaten/repository.py`, analog `pruefe_vertrag_nicht_
-  ausgeschlossen`) sperrt Objekt-107-artige Fälle, jede POST-Route
+  Service-Methode, `pruefe_einheit_nicht_ausgeschlossen` (analog
+  `pruefe_vertrag_nicht_ausgeschlossen`) sperrt Objekt-107-artige
+  Fälle. Über die reine Gesellschaftsscope-Prüfung hinaus (in der
+  zweiten Gegenprüfung als Lücke reproduziert) filtern
+  `liste_aktuelle`/`liste_alle` jetzt zusätzlich Berichte
+  ausgeschlossener Objekte heraus (auch mit explizit angegebener
+  `gesellschaft_id`), und `aktuelle_version`/`liste_versionen` lehnen
+  eine ausgeschlossene Einheit aktiv ab; die Backoffice-Routen
+  Korrektur-GET, Versionen-GET und die neue
+  Komponentenfreigabe-GET/POST fangen `CrossTenantError`/
+  `ObjektAusgeschlossenError` in eine verständliche Fehlerseite ab
+  statt einer rohen 500-Antwort. Die Komponentenfreigabe-POST-Route
+  verifiziert zusätzlich, dass die übergebene `komponente_id`
+  tatsächlich zum `vertrag_id` im Pfad gehört. Jede POST-Route
   verlangt ein gültiges `csrf_token`.
-- 711 Tests insgesamt (665 zuvor + 46 neu: Service, CSV-Import,
-  Dashboard-Aggregation, Backoffice-HTTP inkl. Objektsperre,
-  Centgenauigkeit/negative Beträge, fehlend-vs-Null bei
-  `berichteter_betragsart`, und ein expliziter Test, dass eine variable
-  Monatsabrechnung den bestehenden OP-Kontostand NICHT verändert).
+- 731 Tests insgesamt (665 vor diesem Paket + 66 neu über beide
+  Korrekturrunden: Service, CSV-Import inkl. Stale-Preview-/
+  Idempotenz-Regressionstests, Netto-Mietanteil-Freigabe inkl.
+  Überlappungs-/Invalidierungs-Regressionstests, Dashboard-Aggregation
+  inkl. Ausschluss-/Artenkonflikt-/Untermonatlich-Regressionstests,
+  Backoffice-HTTP inkl. Objektsperre, Centgenauigkeit/negative Beträge,
+  fehlend-vs-Null bei `berichteter_betragsart`, und ein expliziter
+  Test, dass eine variable Monatsabrechnung den bestehenden
+  OP-Kontostand NICHT verändert).
 
 ### Was ausdrücklich NICHT geliefert ist (bewusste, offen benannte Lücken)
 
@@ -1309,14 +1390,23 @@ Quellenpräzisierung steht in `RAHMENPROGRAMM.md` (Abschnitt
   Kurzzeit-Einheiten und die eine Selfstorage-Einheit real existieren
   und wie ihre Leistungsmonate tatsächlich zugeordnet werden, ist NICHT
   Teil dieser Sitzung (synthetische Testdaten/Tests ausgenommen).
+  Ebenso befüllt Codex die echten Netto-Mietanteil-Freigaben je
+  Bestandskomponente (Quellenbeleg/Gültigkeit) außerhalb dieses Repos -
+  ohne eine solche Freigabe bleibt jede Dauermiete-Komponente in der
+  Monatsübersicht eine Datenlücke, das ist gewolltes Verhalten, kein
+  Bug.
 - **Kein CSV-Datei-Upload-Assistent/keine Vorlagen-Datei im Repo.** Der
   Import erwartet die Spaltenreihenfolge aus dem Hinweistext der
   Backoffice-Seite (`/backoffice/variable-abrechnung/import`); eine
-  separate, herunterladbare CSV-Vorlagendatei existiert (noch) nicht.
+  separate, herunterladbare CSV-Vorlagendatei existiert (noch) nicht
+  (die synthetische `importtemplates/variable_abrechnung.csv` dient nur
+  Tests/Doku).
 - **Keine Backoffice-seitige Massenkorrektur.** Jede Korrektur läuft
   über GENAU eine Zeile (Formular ODER eine einzelne CSV-Zeile mit
   `aenderungsgrund`) - es gibt keine "alle Zeilen eines Monats auf
-  einmal korrigieren"-Funktion.
+  einmal korrigieren"-Funktion. Das gilt analog für die
+  Netto-Mietanteil-Freigabe: jede Freigabe wird einzeln je Komponente
+  erfasst.
 - **Keine Historisierung von `EinheitTable.nutzungsstatus`.** Das Feld
   bleibt (wie im gesamten Repository) ein einzelner aktueller Zustand
   ohne Verlauf; die Monatsübersicht kompensiert das für die
@@ -1326,10 +1416,21 @@ Quellenpräzisierung steht in `RAHMENPROGRAMM.md` (Abschnitt
   sich zwischenzeitlich geändert hat, kann hier einen nicht ganz
   treffenden Hinweis erzeugen.
 - **Keine automatische Verknüpfung zu `VorschreibungTable`/OP.** Die
-  variable Monatsabrechnung ist bewusst eine EIGENE, von
-  `OPPositionTable` vollständig getrennte Datenquelle (Reporting) -
-  kein Code-Pfad dieses Pakets bucht, ändert oder storniert einen OP
-  oder eine Vorschreibung.
-- **Keine Migrationsspalten-Änderung.** Wie im gesamten Repository ist
-  `variable_abrechnungen` rein additiv; `create_all_tables()` legt nur
-  fehlende Tabellen an.
+  variable Monatsabrechnung UND die Netto-Mietanteil-Freigabe sind
+  bewusst EIGENE, von `OPPositionTable` vollständig getrennte
+  Datenquellen (Reporting) - kein Code-Pfad dieses Pakets bucht, ändert
+  oder storniert einen OP oder eine Vorschreibung, oder schreibt in
+  `VertragsKomponenteTable`.
+- **Keine anteilige (untermonatliche) Berechnung.** Eine Komponente
+  oder ein Vertrag, die/der einen Monat nur teilweise abdeckt, liefert
+  bewusst KEINEN automatisch berechneten Teilbetrag, sondern
+  ausschließlich eine Datenlücke - eine anteilige Zuordnung wäre ohne
+  echte Quelle erfunden.
+- **Keine Migrationsspalten-Änderung mehr nötig, aber Schemaerweiterung
+  in dieser Sitzung.** `variable_abrechnungen` und
+  `komponenten_netto_miet_freigaben` sind rein additiv;
+  `komponenten_netto_miet_freigaben.aenderungsgrund` wurde in der
+  zweiten Korrekturrunde NOCH VOR jeder Erstbefüllung mit echten Daten
+  ergänzt (kein Alter einer produktiv befüllten Tabelle) -
+  `create_all_tables()` legt weiterhin nur fehlende Tabellen an, kein
+  eigenständiges Migrationswerkzeug.

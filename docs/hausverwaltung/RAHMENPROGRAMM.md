@@ -666,3 +666,49 @@ Code, echte Zuordnung durch Codex.
   Monatsbericht nutzt dagegen bewusst den AKTUELLEN Nutzungsstatus als
   Heuristik und ist als solche gekennzeichnet, keine rückwirkende
   Tatsachenbehauptung.
+
+### Konkretisierungen aus zwei Runden unabhängiger Abnahme (13.09.2026)
+
+Der Übergabestand wurde zweimal mit konkret reproduzierten Fehlern
+zurückgewiesen, bevor er freigegeben wurde (Details/Historie siehe
+`OFFENE_PUNKTE.md`, Abschnitt "Paket Dashboard/Variable
+Monatsabrechnung"). Die dabei entstandenen fachlichen Konkretisierungen
+gelten ab sofort als Teil dieses Auftrags:
+
+- **`VertragsKomponenteTable.betrag_cent` ist NIE automatisch die
+  Netto-Mietbasis.** Weder Art (auch HMZ/KUECHE/PARKPLATZ) noch
+  `ust_satz_promille` allein belegen, dass ein gespeicherter Betrag
+  netto ist - der Bestand enthält nachweislich auch BRUTTO gespeicherte
+  Beträge und Pauschalen unter diesen Arten. Eine separate,
+  eigenständige Netto-Mietanteil-Freigabe (`komponenten_freigabe.py`)
+  mit eigenem Betrag, Quellenbeleg und Gültigkeit ist Pflichtvoraus-
+  setzung für jede Dauermiete-Zählung; ihre Erfassung ist Sache von
+  Codex (echte Nachweise außerhalb des Repos), nicht dieses generischen
+  Codes.
+- **Untermonatliche Gültigkeit (Vertrag, Komponente UND Freigabe) zählt
+  nie als voller Monatsbetrag**, auch nicht anteilig - nur eine
+  Datenlücke. Alle den gewählten Monat überlappenden Komponenten werden
+  geprüft (nicht nur die zum Monatsersten aktiven), damit eine erst
+  untermonatlich beginnende/endende Komponente sichtbar bleibt.
+- **Artenkonflikt-Erkennung**: hat eine Einheit im selben Monat
+  bestätigte Berichte für mehr als eine Art (z. B. gleichzeitig
+  KURZZEITVERMIETUNG und SELFSTORAGE), werden ALLE betroffenen Berichte
+  von der Summe ausgeschlossen statt addiert.
+- **Optimistic Lock wird atomar auf Repository-Ebene durchgesetzt**
+  (bedingte UPDATE-Anweisung mit `rowcount`-Prüfung), nicht nur durch
+  eine vorgelagerte Prüfung - sowohl bei `VariableAbrechnungTable`-
+  Korrekturen als auch bei der Invalidierung überlappender
+  Netto-Mietanteil-Freigaben. Eine neue Freigabe entwertet dabei
+  ausschließlich ZEITLICH ÜBERLAPPENDE frühere Freigaben derselben
+  Komponente, nie pauschal alle - eine Überschneidung erfordert
+  zusätzlich einen Änderungsgrund.
+- **CSV-Plan-Hash bindet sich an den beim Planen gesehenen Zustand**
+  (`aktuelle_version_id` je Zeile), nicht nur an den Dateiinhalt;
+  `wende_an` prüft unmittelbar vor dem Schreiben mit einer frischen
+  Neuprüfung erneut dagegen.
+- **Ctx-/Gesellschaftsscope- und Objektausschluss-Prüfung gilt auch für
+  Lesepfade**, nicht nur für Schreibaktionen: Listen-/Versions-/
+  Vorschau-Routen und -Services filtern bzw. lehnen konsequent ab,
+  Objektausschluss wird dabei zusätzlich zum reinen Gesellschaftsscope
+  geprüft (ein nachträglich ausgeschlossenes Objekt verschwindet damit
+  automatisch aus alten Berichten/Summen).
