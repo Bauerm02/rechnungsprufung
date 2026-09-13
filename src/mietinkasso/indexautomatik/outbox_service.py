@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal
+from zoneinfo import ZoneInfo
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import ZUGANGSFORMEN_ALLE, ZUGANGSFORMEN_AUSREICHEND, Rechtsordnung
@@ -37,6 +38,7 @@ from mietinkasso.indexautomatik.schreiben import (
     erhoehungsschreiben_text_mieweg,
 )
 from mietinkasso.indexautomatik.transport import Transportadapter, VersandAuftrag
+from mietinkasso.indexautomatik.mailnachweis import nachweis_daten, versand_belegen
 from mietinkasso.indexautomatik.zeit import naechster_zinstermin_ab
 from mietinkasso.infrastructure.db.tables import ErhoehungsschreibenTable, MieWegVorschauTable, RechtsprofilTable, VertragTable
 from mietinkasso.stammdaten.repository import StammdatenRepository
@@ -541,20 +543,30 @@ class ErhoehungsschreibenOutboxService:
             empfaenger_email=aktueller_snapshot["email"],
             betreff=f"Anhebung des Mietzinses - Vertrag {vertrag.id}",
             text=schreiben.schreiben_text,
+            freigabe_referenz=f"RECHTSPROFIL:{aktuelles_profil.id}:{aktuelles_profil.version}:{aktuelles_profil.quelle_hash}",
         )
         try:
             bestaetigung = transport.senden(auftrag)
         except TransportFehlerUngewissError as exc:
             self._repository.set_status(schreiben.id, "UNKLAR", fehlergrund=str(exc))
             return VersandErgebnis("UNKLAR", str(exc))
+        except ValueError:
+            grund = "Versandauftrag wurde lokal abgelehnt; kein Versandnachweis vorhanden."
+            self._repository.set_status(schreiben.id, "UNKLAR", fehlergrund=grund)
+            return VersandErgebnis("UNKLAR", grund)
 
-        self._repository.set_status(
-            schreiben.id,
-            "GESENDET",
-            versendet_am=datetime.combine(heute, datetime.min.time(), tzinfo=timezone.utc),
-            externe_versandreferenz=bestaetigung.externe_referenz,
+        if nachweis_daten(bestaetigung) is None:
+            grund = "Noch kein tatsächlicher Versand belegt. Status wird abgefragt; kein erneutes Senden."
+            self._repository.set_status(schreiben.id, "UNKLAR", fehlergrund=grund)
+            return VersandErgebnis("UNKLAR", grund)
+        changed = versand_belegen(
+            self._repository._session_factory, ErhoehungsschreibenTable, schreiben.id,
+            ergebnis=bestaetigung, erlaubt={"IN_VERSAND"}, neuer_status="GESENDET",
+            zeitfeld="versendet_am", referenz=schreiben.idempotenzschluessel,
+            referenzfeld="externe_versandreferenz",
         )
-        return VersandErgebnis("GESENDET", "Versand angenommen - Zugang muss gesondert bestätigt werden.")
+        return VersandErgebnis("GESENDET" if changed else "BEREITS_VERARBEITET",
+            "Tatsächlicher Versand belegt. Zugang muss gesondert bestätigt werden.")
 
     def markiere_verwaiste_als_unklar(self, *, jetzt: datetime | None = None, max_alter: timedelta = timedelta(minutes=15)):
         grenze = (jetzt or datetime.now(timezone.utc)) - max_alter
@@ -589,10 +601,16 @@ class ErhoehungsschreibenOutboxService:
             )
         if zugang_datum > heute:
             raise ValueError("Zugangsdatum darf nicht in der Zukunft liegen.")
-        if schreiben.versendet_am is not None and zugang_datum < schreiben.versendet_am.date():
+        versandtag = None
+        if schreiben.versendet_am is not None:
+            sent = schreiben.versendet_am
+            if sent.tzinfo is None:
+                sent = sent.replace(tzinfo=timezone.utc)
+            versandtag = sent.astimezone(ZoneInfo("Europe/Vienna")).date()
+        if versandtag is not None and zugang_datum < versandtag:
             raise ValueError(
                 f"Zugangsdatum ({zugang_datum.isoformat()}) liegt vor dem tatsächlichen Versanddatum "
-                f"({schreiben.versendet_am.date().isoformat()}) - unplausible Eingabe."
+                f"({versandtag.isoformat()}) - unplausible Eingabe."
             )
         if zugangsform not in ZUGANGSFORMEN_ALLE:
             raise ValueError(f"Unbekannte Zugangsform '{zugangsform}'.")

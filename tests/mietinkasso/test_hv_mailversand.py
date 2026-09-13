@@ -72,6 +72,13 @@ def test_mahnung_acceptance_then_actual_sending_get_only_and_stage2_clock(hv, ba
     with session_factory() as s:
         evidence = list(s.execute(select(AuditEventTable).where(AuditEventTable.aktion == "MAILVERSAND_BESTAETIGT")).scalars())
     assert len(evidence) == 1 and evidence[0].payload["zugang_bestaetigt"] is False
+    shown = service.versanduebersicht(ctx=admin_ctx)
+    assert len(shown) == 1 and shown[0]["status"] == "GESENDET"
+    assert shown[0]["provider_referenz"] == "SYNTHETIC-SENT-1"
+    from mietinkasso.auth.service import AuthContext
+    from mietinkasso.domain.enums import Rolle
+    outsider = AuthContext(user_id="OTHER", rolle=Rolle.ADMIN, gesellschaft_ids={"OTHER"})
+    assert service.versanduebersicht(ctx=outsider) == []
     service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="SYNTHETIC-BANK",
         bestaetigt_bis=date(2026, 9, 28), bestaetigt_von="SYNTHETIC-TEST")
     # Actual sending was 15 September in Vienna, not the 13 September dispatch attempt.

@@ -70,7 +70,7 @@ from mietinkasso.stammdaten.repository import StammdatenRepository
 from mietinkasso.mieweg_vorschau.repository import MieWegVorschauRepository
 from mietinkasso.mieweg_vorschau.service import MieWegVorschauService, VpiWert
 from mietinkasso.indexautomatik.bootstrap import bauen as _indexautomatik_bauen
-from mietinkasso.indexautomatik.transport import HttpTransportadapter
+from mietinkasso.indexautomatik.mailversand_service import HVMailversandService, bank_freigabe_ableiten
 from mietinkasso.indexautomatik.zeit import heute_wien
 from mietinkasso.vertragspruefung.repository import IndexPruefbedarfRepository, VertragPruefungRepository
 from mietinkasso.vertragspruefung.service import VertragspruefungService
@@ -119,6 +119,7 @@ _mieweg_vorschau_repo = MieWegVorschauRepository(_session_factory)
 _mieweg_vorschau_service = MieWegVorschauService(_mieweg_vorschau_repo, _stammdaten_repo)
 _audit_service = AuditService(_session_factory)
 _indexautomatik = _indexautomatik_bauen(_session_factory, _settings)
+_hv_mail = HVMailversandService(_session_factory, _indexautomatik, _settings)
 _variableabrechnung = _variableabrechnung_bauen(_session_factory, _stammdaten_repo)
 
 _sessions = SessionStore(ttl_sekunden=_settings.backoffice_session_ttl_minuten * 60)
@@ -1401,18 +1402,7 @@ def _bank_freigabe_ableiten(gesellschaft_id: str, vertrag_id: str) -> tuple[date
     (sonst könnte eine Vorschau eine Mahnung freischalten, die die echten
     Bankdaten nicht hergeben)."""
 
-    bank_konten = _bank_repo.list_bank_konten(gesellschaft_id=gesellschaft_id)
-    if not bank_konten:
-        return None, False
-    bestaetigungen = [_bank_service.bankvollstaendigkeit_bestaetigt_bis(bk.id) for bk in bank_konten]
-    if any(b is None for b in bestaetigungen):
-        bank_bestaetigt_bis = None
-    else:
-        bank_bestaetigt_bis = min(bestaetigungen)
-    ungeklaert = any(
-        _bank_service.hat_ungeklaerte_relevante_eingaenge(bank_konto_id=bk.id, vertrag_id=vertrag_id) for bk in bank_konten
-    )
-    return bank_bestaetigt_bis, ungeklaert
+    return bank_freigabe_ableiten(_bank_repo, _bank_service, gesellschaft_id, vertrag_id)
 
 
 @router.get("/vertrag/{vertrag_id}/mahnvorschau", response_class=HTMLResponse)
@@ -1455,6 +1445,11 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
               {csrf_feld(session.csrf_token)}
               <button type="submit" class="secondary">Sendebereitschaft prüfen (kein Versand)</button>
             </form>"""
+            if _settings.send_enabled and _settings.hv_mail_allowlist_bestaetigt and _hv_mail.client:
+                sende_check += f"""<form method="post" action="/backoffice/mahnfall/{ergebnis.mahnfall_id}/versenden" class="inline">
+                  {csrf_feld(session.csrf_token)}
+                  <button type="submit">Mahnung senden</button>
+                </form>"""
         zeilen.append(f"""
         <tr>
           <td>OP #{forderung.op_position_id}</td><td>{h(forderung.art)}</td><td>{eur(forderung.rest_cent)}</td>
@@ -1472,7 +1467,7 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
         <tr><th>Forderung</th><th>Art</th><th>Rest</th><th>Fälligkeit</th><th>Status</th><th>Grund</th><th></th></tr>
         {''.join(zeilen) if zeilen else '<tr><td colspan=7 class="muted">Keine offenen Forderungen.</td></tr>'}
       </table>
-      <p class="muted">Pilot: ausschließlich Entwürfe/Planung. Kein Senden-Button löst einen echten Mailversand aus.</p>
+      <p class="muted">Die Vorschau versendet keine Nachricht. Der separate Versand prüft unmittelbar davor den aktuellen Bank- und Forderungsstand.</p>
     </div>"""
     return _layout(request, session, "Mahnvorschau", inhalt)
 
@@ -1494,6 +1489,60 @@ def mahnfall_sendebereitschaft(request: Request, mahnfall_id: int, csrf_token: s
 
 
 # -- Mahnstufen-Konfiguration (genau 2 Stufen, HV-20260912-ECHTBETRIEB) ------
+
+
+@router.post("/mahnfall/{mahnfall_id}/versenden", response_class=HTMLResponse)
+def mahnfall_versenden(request: Request, mahnfall_id: int, csrf_token: str = Form(...), session=Depends(_current_session)):
+    _verify_csrf(session, csrf_token)
+    try:
+        result = _hv_mail.mahnung_senden(ctx=_ctx(session), row_id=mahnfall_id, heute=heute_wien())
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Mahnversand", str(exc), "/backoffice/mailversand")
+    return _layout(request, session, "Mahnversand", flash_ok(f"{result.status} — {result.grund}") +
+        '<p><a href="/backoffice/mailversand">Versandnachweise ansehen</a></p>')
+
+
+@router.get("/mailversand", response_class=HTMLResponse)
+def mailversand_uebersicht(request: Request, session=Depends(_current_session)):
+    ready = bool(_hv_mail.client and _settings.hv_mail_allowlist_bestaetigt)
+    modes = [("Mahnungen", _settings.send_enabled),
+             ("Indexanpassungen", _settings.indexautomatik_send_enabled),
+             ("Vertragsende an Markus", _settings.vertragsende_erinnerung_send_enabled)]
+    modes_html = " · ".join(f"{name}: {'aktiv' if ready and enabled else 'gesperrt'}" for name, enabled in modes)
+    rows = []
+    for row in _hv_mail.versanduebersicht(ctx=_ctx(session)):
+        sent = row["versendet_am"]
+        if sent and sent.tzinfo is None:
+            sent = sent.replace(tzinfo=timezone.utc)
+        if sent:
+            from zoneinfo import ZoneInfo
+            sent_text = sent.astimezone(ZoneInfo("Europe/Vienna")).strftime("%d.%m.%Y %H:%M")
+        else:
+            sent_text = "Noch nicht belegt"
+        evidence = h(row["nachweis"]) if row["nachweis"] else "—"
+        if row["provider_referenz"]:
+            evidence += f'<details><summary>Microsoft-Nachweis</summary>{h(row["provider_referenz"])}</details>'
+        rows.append(f'<tr><td>{h(row["art"])}</td><td>{h(row["objekt"])}, {h(row["einheit"])}</td>'
+            f'<td>{h(row["status"])}</td><td>{sent_text}</td><td>{evidence}</td></tr>')
+    content = f'''<div class="card"><h1>Mailversand und Nachweise</h1>
+      <p>Absender: hausverwaltung@jlb-immo.at · Originale JLB-Signatur</p>
+      <p>{modes_html}</p>
+      <p>Ein belegter Versand bestätigt noch keinen rechtlich ausreichenden Zugang beim Mieter.
+      Unklare Versandfälle werden abgefragt und nicht automatisch erneut versendet.</p>
+      <form method="post" action="/backoffice/mailversand/status-abgleichen">
+        {csrf_feld(session.csrf_token)}<button type="submit">Offene Versandnachweise abfragen</button>
+      </form></div><div class="card"><table>
+      <tr><th>Art</th><th>Objekt / Einheit</th><th>Status</th><th>Versandzeit Wien</th><th>Nachweis</th></tr>
+      {''.join(rows) if rows else '<tr><td colspan="5">Noch keine Versandvorgänge vorhanden.</td></tr>'}
+      </table></div>'''
+    return _layout(request, session, "Mailversand", content)
+
+
+@router.post("/mailversand/status-abgleichen")
+def mailversand_status_abgleichen(request: Request, csrf_token: str = Form(...), session=Depends(_current_session)):
+    _verify_csrf(session, csrf_token)
+    _hv_mail.status_abgleichen(ctx=_ctx(session))
+    return RedirectResponse("/backoffice/mailversand", status_code=303)
 
 
 def _policy_zeile_html(policy) -> str:
@@ -2500,28 +2549,15 @@ def indexautomatik_laeufe(request: Request, session=Depends(_current_session)) -
 def indexautomatik_outbox_versenden(request: Request, erhoehungsschreiben_id: int, csrf_token: str = Form(...), session=Depends(_current_session)):
     _verify_csrf(session, csrf_token)
     heute = heute_wien()
-    # UI-Endprüfung (6317f96): kein FakeTransportadapter()-Fallback im
-    # Produktivpfad - ohne konfigurierten echten Transport-Endpunkt wird
-    # HART blockiert, statt bei gesetzten Flags einen Fake-Versand als
-    # "GESENDET" auszugeben.
-    if not (_settings.indexautomatik_transport_endpoint_url and _settings.indexautomatik_transport_api_key):
+    if _hv_mail.client is None:
         return _fehlerseite(
             session, "Indexautomatik-Outbox",
             "Kein Versandweg eingerichtet - Versand ist strukturell gesperrt. Es wird niemals ein "
             "Test-Versand im Produktivbetrieb durchgeführt.",
             "/backoffice/indexautomatik/outbox",
         )
-    transport = HttpTransportadapter(
-        endpoint_url=_settings.indexautomatik_transport_endpoint_url,
-        api_key=_settings.indexautomatik_transport_api_key,
-    )
     try:
-        ergebnis = _indexautomatik.outbox_service.versenden(
-            ctx=_ctx(session), erhoehungsschreiben_id=erhoehungsschreiben_id, heute=heute,
-            send_enabled=_settings.indexautomatik_send_enabled,
-            mailops_allowlist_bestaetigt=_settings.indexautomatik_mailops_allowlist_bestaetigt,
-            transport=transport,
-        )
+        ergebnis = _hv_mail.index_senden(ctx=_ctx(session), row_id=erhoehungsschreiben_id, heute=heute)
     except (MietinkassoError, ValueError) as exc:
         return _fehlerseite(session, "Indexautomatik-Outbox", str(exc), "/backoffice/indexautomatik/outbox")
     inhalt = flash_ok(f"Versand: {ergebnis.status} — {ergebnis.grund}") + (

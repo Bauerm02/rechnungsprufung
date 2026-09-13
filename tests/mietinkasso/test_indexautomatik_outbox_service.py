@@ -257,7 +257,8 @@ def test_zugang_vor_versanddatum_wird_abgelehnt(admin_ctx, basis_vertrag, outbox
     schreiben = _bereites_schreiben(admin_ctx, outbox_repo, rechtsprofil_service, stammdaten_repo, vertrag)
     outbox_service.versenden(
         ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 9, 5), send_enabled=True,
-        mailops_allowlist_bestaetigt=True, transport=FakeTransportadapter(),
+        mailops_allowlist_bestaetigt=True,
+        transport=FakeTransportadapter(versendet_am=datetime(2026, 9, 5, 22, 30, tzinfo=timezone.utc)),
     )
     with pytest.raises(ValueError):
         outbox_service.zugang_bestaetigen(

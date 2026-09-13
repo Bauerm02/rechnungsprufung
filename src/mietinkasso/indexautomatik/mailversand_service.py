@@ -10,7 +10,7 @@ from mietinkasso.domain.exceptions import ObjektAusgeschlossenError, TransportFe
 from mietinkasso.indexautomatik.mailnachweis import nachweis_daten, versand_belegen
 from mietinkasso.indexautomatik.mailops_client import MailOpsAuftrag, MailOpsClient
 from mietinkasso.indexautomatik.mailops_transport import MailOpsTransportadapter
-from mietinkasso.infrastructure.db.tables import ErhoehungsschreibenTable, MahnFallTable, VertragsendeErinnerungTable
+from mietinkasso.infrastructure.db.tables import AuditEventTable, ErhoehungsschreibenTable, MahnFallTable, VertragsendeErinnerungTable
 from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
 from mietinkasso.mahnwesen.service import MahnwesenService
 from mietinkasso.op.repository import OPRepository
@@ -166,3 +166,29 @@ class HVMailversandService:
                     count += int(versand_belegen(self.sf, table, row.id, ergebnis=result, erlaubt=pending,
                         neuer_status=done, zeitfeld=field, referenz=ref, referenzfeld=ref_field))
         return count
+
+    def versanduebersicht(self, *, ctx):
+        result = []
+        specs = [(ErhoehungsschreibenTable, "Indexanpassung", "versendet_am"),
+                 (MahnFallTable, "Mahnung", "gesendet_am"),
+                 (VertragsendeErinnerungTable, "Vertragsende an Markus", "benachrichtigt_am")]
+        with self.sf() as session:
+            for table, kind, field in specs:
+                for row in session.execute(select(table)).scalars():
+                    contract = self.bundle.stammdaten_repository.get_vertrag(row.vertrag_id)
+                    if contract is None or not ctx.has_zugriff(contract.gesellschaft_id):
+                        continue
+                    unit = self.bundle.stammdaten_repository.get_einheit(contract.einheit_id)
+                    obj = self.bundle.stammdaten_repository.objekt_fuer_vertrag(contract.id)
+                    event = session.execute(select(AuditEventTable).where(
+                        AuditEventTable.entity_typ == table.__tablename__,
+                        AuditEventTable.entity_id == str(row.id),
+                        AuditEventTable.aktion == "MAILVERSAND_BESTAETIGT"
+                    ).order_by(AuditEventTable.id.desc())).scalars().first()
+                    proof = event.payload if event else {}
+                    result.append({"art": kind, "objekt": obj.bezeichnung,
+                        "einheit": unit.bezeichnung, "vertrag_id": contract.id,
+                        "status": row.status, "versendet_am": getattr(row, field),
+                        "nachweis": proof.get("externe_referenz", ""),
+                        "provider_referenz": proof.get("provider_referenz", "")})
+        return result

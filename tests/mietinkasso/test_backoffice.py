@@ -693,7 +693,8 @@ def test_mahnvorschau_blockiert_ohne_bankbestaetigung_und_sendet_nie_echt(backof
     assert "BLOCKIERT" in vorschau.text
     assert "keine ausreichend aktuelle" in vorschau.text
     assert "sendebereitschaft" not in vorschau.text  # kein Sendebereitschafts-Button für einen BLOCKIERTEN Fall
-    assert "Kein Senden-Button löst einen echten Mailversand aus" in vorschau.text
+    assert "Die Vorschau versendet keine Nachricht" in vorschau.text
+    assert 'action="/backoffice/mahnfall/' not in vorschau.text
 
 
 def test_mahnpolicy_seite_zeigt_genau_zwei_stufen_und_erzwingt_null_zinsen_gebuehr(backoffice_client):
@@ -1558,6 +1559,18 @@ def test_bestehende_op_unveraendert_nach_variable_abrechnung(backoffice_client):
     )
     saldo_nachher = op_service.berechne_saldo(konto_id).saldo_cent
     assert saldo_nachher == saldo_vorher
+
+
+def test_mailversand_seite_und_csrf_ohne_versand(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    response = client.get("/backoffice/mailversand")
+    assert response.status_code == 200
+    assert "hausverwaltung@jlb-immo.at" in response.text
+    assert "Originale JLB-Signatur" in response.text
+    assert "Mahnungen: gesperrt" in response.text
+    assert client.post("/backoffice/mailversand/status-abgleichen", data={"csrf_token": "wrong"}).status_code == 403
+    assert client.post("/backoffice/mahnfall/1/versenden", data={"csrf_token": "wrong"}).status_code == 403
 
 
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):

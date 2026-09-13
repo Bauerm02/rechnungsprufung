@@ -123,8 +123,9 @@ class FakeTransportadapter:
     `aufrufe` auf, damit Tests Idempotenz/Retry-Verhalten prüfen
     können."""
 
-    def __init__(self, *, verhalten: str = "ANGENOMMEN"):
+    def __init__(self, *, verhalten: str = "ANGENOMMEN", versendet_am: datetime | None = None):
         self._verhalten = verhalten
+        self._versendet_am = versendet_am or datetime(2026, 1, 1, 9, tzinfo=timezone.utc)
         self.aufrufe: list[VersandAuftrag] = []
 
     def senden(self, auftrag: VersandAuftrag) -> VersandBestaetigung:
@@ -133,4 +134,4 @@ class FakeTransportadapter:
             raise TransportFehlerUngewissError(f"Fake-Timeout für {auftrag.referenz!r} (Test).")
         # Explicit synthetic sending receipt, never used by production wiring.
         return VersandBestaetigung(externe_referenz=f"FAKE-{len(self.aufrufe)}", status="GESENDET",
-            provider_referenz="SYNTHETIC-SENT", versendet_am=datetime(2026, 1, 1, 9, tzinfo=timezone.utc))
+            provider_referenz="SYNTHETIC-SENT", versendet_am=self._versendet_am)
