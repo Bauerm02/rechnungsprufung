@@ -351,6 +351,7 @@ class VariableAbrechnungService:
     ) -> VariableAbrechnungTable | None:
         objekt = self._stammdaten_repository.objekt_fuer_einheit(einheit_id)
         require_gesellschaft_access(ctx, objekt.gesellschaft_id)
+        self._stammdaten_repository.pruefe_einheit_nicht_ausgeschlossen(einheit_id)
         return self._repository.aktuelle_version(einheit_id, art, leistungsmonat)
 
     def liste_versionen(
@@ -358,7 +359,29 @@ class VariableAbrechnungService:
     ) -> list[VariableAbrechnungTable]:
         objekt = self._stammdaten_repository.objekt_fuer_einheit(einheit_id)
         require_gesellschaft_access(ctx, objekt.gesellschaft_id)
+        self._stammdaten_repository.pruefe_einheit_nicht_ausgeschlossen(einheit_id)
         return self._repository.liste_versionen(einheit_id, art, leistungsmonat)
+
+    def _ohne_ausgeschlossene_objekte(self, zeilen: list[VariableAbrechnungTable]) -> list[VariableAbrechnungTable]:
+        """Unabhängiger Review: Berichte, deren Objekt ERST NACH der
+        Erfassung ausgeschlossen wurde, blieben über die Listen-/
+        Summierungspfade (Backoffice-Liste UND
+        `dashboard.berechne_monatsuebersicht`, die beide auf
+        `liste_aktuelle` aufbauen) weiterhin sichtbar und wurden auch
+        summiert - der bisherige Filter prüfte nur den Gesellschafts-
+        scope (`ctx.has_zugriff`), nie den Objektausschluss selbst.
+        Diese Filterung läuft daher zentral HIER, statt an jeder
+        Aufrufstelle separat wiederholt zu werden."""
+
+        ergebnis = []
+        for zeile in zeilen:
+            try:
+                objekt = self._stammdaten_repository.objekt_fuer_einheit(zeile.einheit_id)
+            except ValueError:
+                continue  # Einheit inzwischen unbekannt - defensiv ausblenden, nicht werfen
+            if not objekt.ausgeschlossen:
+                ergebnis.append(zeile)
+        return ergebnis
 
     def liste_aktuelle(
         self, *, ctx: AuthContext, leistungsmonat: str | None = None, gesellschaft_id: str | None = None
@@ -369,13 +392,17 @@ class VariableAbrechnungService:
         NUR seine eigenen) - eine LESEZUGRIFF-/Fremdgesellschafts-Rolle
         darf über diesen Weg nie fremde Monatsabrechnungen sehen. Mit
         explizit angegebener `gesellschaft_id` wird der Zugriff darauf
-        zusätzlich hart geprüft."""
+        zusätzlich hart geprüft. In BEIDEN Fällen werden zusätzlich
+        Berichte ausgeschlossener Objekte herausgefiltert (siehe
+        `_ohne_ausgeschlossene_objekte`)."""
 
         if gesellschaft_id is not None:
             require_gesellschaft_access(ctx, gesellschaft_id)
-            return self._repository.liste_aktuelle(leistungsmonat=leistungsmonat, gesellschaft_id=gesellschaft_id)
+            alle = self._repository.liste_aktuelle(leistungsmonat=leistungsmonat, gesellschaft_id=gesellschaft_id)
+            return self._ohne_ausgeschlossene_objekte(alle)
         alle = self._repository.liste_aktuelle(leistungsmonat=leistungsmonat, gesellschaft_id=None)
-        return [zeile for zeile in alle if ctx.has_zugriff(zeile.gesellschaft_id)]
+        return self._ohne_ausgeschlossene_objekte([zeile for zeile in alle if ctx.has_zugriff(zeile.gesellschaft_id)])
 
     def liste_alle(self, *, ctx: AuthContext) -> list[VariableAbrechnungTable]:
-        return [zeile for zeile in self._repository.liste_alle() if ctx.has_zugriff(zeile.gesellschaft_id)]
+        gescoped = [zeile for zeile in self._repository.liste_alle() if ctx.has_zugriff(zeile.gesellschaft_id)]
+        return self._ohne_ausgeschlossene_objekte(gescoped)

@@ -901,6 +901,11 @@ class KomponentenNettoMietFreigabeTable(Base):
     gueltig_bis: Mapped[date | None] = mapped_column(Date, nullable=True)
     quelle_hash: Mapped[str] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(16), default="FREIGEGEBEN")
+    # Pflicht, sobald diese Freigabe eine ZEITLICH ÜBERLAPPENDE frühere
+    # Freigabe derselben Komponente entwertet (siehe
+    # `komponenten_freigabe.py::freigeben`) - eine neue, nicht
+    # überlappende Freigabe (z. B. ein anderer Monat) braucht keinen.
+    aenderungsgrund: Mapped[str | None] = mapped_column(String(500), nullable=True)
     freigegeben_von: Mapped[str] = mapped_column(String(128))
     freigegeben_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

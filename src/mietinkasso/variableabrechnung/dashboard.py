@@ -116,12 +116,29 @@ def berechne_monatsuebersicht(
             )
             continue
 
-        komponenten = stammdaten_repository.list_aktive_komponenten(vertrag.id, monatsanfang)
-        kandidaten = [
-            k for k in komponenten
-            if k.art in _MOEGLICHE_MIET_ARTEN and _deckt_vollen_monat(k.gueltig_von, k.gueltig_bis, monatsanfang, monatsende)
-        ]
-        if not kandidaten:
+        # Unabhängiger Review: `list_aktive_komponenten(vertrag.id,
+        # monatsanfang)` prüft NUR einen einzigen Stichtag (den 1. des
+        # Monats) - eine Komponente, die MITTEN im Monat beginnt oder
+        # endet (z. B. Küchenmiete ab 15.08.), war dadurch für den
+        # gewählten Monat komplett UNSICHTBAR, statt als untermonatliche
+        # Datenlücke gemeldet zu werden, selbst wenn eine ANDERE
+        # Komponente (z. B. HMZ) den vollen Monat abdeckt. Deshalb werden
+        # ALLE den Monat ÜBERLAPPENDEN Komponenten geprüft, nicht nur die
+        # zum Monatsersten aktiven.
+        ueberlappende_komponenten = stammdaten_repository.list_komponenten_im_zeitraum(vertrag.id, monatsanfang, monatsende)
+        relevante = [k for k in ueberlappende_komponenten if k.art in _MOEGLICHE_MIET_ARTEN]
+        vollmonatliche = [k for k in relevante if _deckt_vollen_monat(k.gueltig_von, k.gueltig_bis, monatsanfang, monatsende)]
+        vollmonatliche_ids = {k.id for k in vollmonatliche}
+        for komponente in relevante:
+            if komponente.id in vollmonatliche_ids:
+                continue
+            datenluecken.append(
+                f"Komponente '{komponente.id}' (Vertrag '{vertrag.id}', Art {komponente.art}): deckt "
+                f"{leistungsmonat} nur UNTERmonatlich ab (gültig {komponente.gueltig_von.isoformat()} bis "
+                f"{komponente.gueltig_bis.isoformat() if komponente.gueltig_bis else 'unbefristet'}) - kein "
+                "automatisch berechneter anteiliger Wert, nicht in der Summe enthalten."
+            )
+        if not vollmonatliche:
             datenluecken.append(
                 f"Vertrag '{vertrag.id}' (Einheit '{vertrag.einheit_id}'): aktiv in {leistungsmonat}, aber "
                 "keine für den vollen Monat gültige Mietkomponente (HMZ/Küche/Parkplatz/Stellplatz) - "
@@ -131,7 +148,7 @@ def berechne_monatsuebersicht(
 
         vertrag_summe = 0
         hatte_freigabe = False
-        for komponente in kandidaten:
+        for komponente in vollmonatliche:
             freigabe = komponenten_freigabe_service.aktive_freigabe_fuer_monat(
                 komponente.id, monatsanfang=monatsanfang, monatsende=monatsende
             )

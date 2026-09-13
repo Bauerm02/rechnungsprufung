@@ -2744,12 +2744,17 @@ def variable_abrechnung_korrigieren_formular(request: Request, id: int, session=
     # Repository ohne jede ctx-/Scopeprüfung - eine LESEZUGRIFF-Rolle
     # oder ein fremdgesellschafts-gebundener ctx konnte so Fachdaten
     # (Beträge, Quelle, Änderungsgrund) EINER FREMDEN Gesellschaft über
-    # das Korrekturformular einsehen. Objektausschluss ist hier bewusst
-    # NICHT zusätzlich geprüft - eine bereits bestehende Zeile eines
-    # zwischenzeitlich ausgeschlossenen Objekts darf weiterhin betrachtet
-    # (aber laut `service.korrigieren` nicht mehr geschrieben) werden.
-    objekt = _stammdaten_repo.objekt_fuer_einheit(zeile.einheit_id)
-    require_gesellschaft_access(_ctx(session), objekt.gesellschaft_id)
+    # das Korrekturformular einsehen. Ein nicht abgefangener
+    # `CrossTenantError`/`ObjektAusgeschlossenError` hier würde als
+    # rohe 500-Antwort statt einer verständlichen Ablehnung enden -
+    # deshalb wie an anderen Stellen dieser Route in `_fehlerseite`
+    # übersetzt.
+    try:
+        objekt = _stammdaten_repo.objekt_fuer_einheit(zeile.einheit_id)
+        require_gesellschaft_access(_ctx(session), objekt.gesellschaft_id)
+        _stammdaten_repo.pruefe_einheit_nicht_ausgeschlossen(zeile.einheit_id)
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Variable Monatsabrechnung", str(exc), "/backoffice/variable-abrechnung")
     inhalt = f"""
     <div class="card" style="max-width:640px;">
       <h1>Korrektur — {h(zeile.einheit_id)} / {h(zeile.art)} / {h(zeile.leistungsmonat)} (aktuell v{zeile.version})</h1>
@@ -2811,7 +2816,10 @@ def variable_abrechnung_korrigieren(
 def variable_abrechnung_versionen(
     request: Request, einheit_id: str, art: str, monat: str, session=Depends(_current_session)
 ) -> HTMLResponse:
-    versionen = _variableabrechnung.service.liste_versionen(ctx=_ctx(session), einheit_id=einheit_id, art=art, leistungsmonat=monat)
+    try:
+        versionen = _variableabrechnung.service.liste_versionen(ctx=_ctx(session), einheit_id=einheit_id, art=art, leistungsmonat=monat)
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Versionshistorie", str(exc), "/backoffice/variable-abrechnung")
     zeilen = "".join(
         "<tr>"
         f"<td>v{z.version}</td><td>{h(z.status)}</td><td>{'AKTUELL' if z.ist_aktuell else h(str(z.ist_aktuell))}</td>"
@@ -2991,10 +2999,18 @@ def komponenten_freigabe_formular(request: Request, vertrag_id: str, session=Dep
     vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
     if vertrag is None:
         return _fehlerseite(session, "Netto-Mietanteil-Freigabe", f"Unbekannter Vertrag {vertrag_id}.")
+    # Unabhängiger Review: dieses GET las Vertrag/Komponenten bislang
+    # ohne jede ctx-/Scopeprüfung - ein fremdgesellschafts-gebundener
+    # ctx konnte so Komponentenbeträge/Freigabestatus einer FREMDEN
+    # Gesellschaft einsehen.
+    try:
+        require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Netto-Mietanteil-Freigabe", str(exc), "/backoffice/")
     komponenten = _stammdaten_repo.list_aktive_komponenten(vertrag_id, date.today())
     zeilen = []
     for k in komponenten:
-        freigaben = _variableabrechnung.komponenten_freigabe_service.liste_fuer_komponente(k.id)
+        freigaben = _variableabrechnung.komponenten_freigabe_service.liste_fuer_komponente(ctx=_ctx(session), komponente_id=k.id)
         aktuelle_freigabe = next((f for f in freigaben if f.status == "FREIGEGEBEN"), None)
         freigabe_html = (
             f"AKTIV: {eur(aktuelle_freigabe.bestaetigter_netto_betrag_cent)} ab {aktuelle_freigabe.gueltig_von.isoformat()}"
@@ -3014,6 +3030,7 @@ def komponenten_freigabe_formular(request: Request, vertrag_id: str, session=Dep
               <input type="text" name="quellenbeleg_referenz" placeholder="Quellenbeleg" required style="width:10em;">
               <input type="date" name="gueltig_von" required>
               <input type="date" name="gueltig_bis" placeholder="optional">
+              <input type="text" name="aenderungsgrund" placeholder="Änderungsgrund (nur bei Überschneidung mit bestehender Freigabe nötig)" style="width:16em;">
               <button type="submit" class="secondary">Freigeben</button>
             </form>
           </td>
@@ -3045,17 +3062,32 @@ def komponenten_freigabe_erstellen(
     quellenbeleg_referenz: str = Form(...),
     gueltig_von: str = Form(...),
     gueltig_bis: str = Form(""),
+    aenderungsgrund: str = Form(""),
     csrf_token: str = Form(...),
     session=Depends(_current_session),
 ):
     _verify_csrf(session, csrf_token)
+    # Unabhängiger Review: der Pfad behauptet über `vertrag_id`, zu
+    # welchem Vertrag `komponente_id` gehört, ohne das je zu prüfen -
+    # `service.freigeben` leitet den tatsächlichen Vertrag/Scope zwar
+    # SELBST korrekt über `komponente.vertrag_id` ab (kein Sicherheits-
+    # loch), aber eine manipulierte/veraltete `vertrag_id` im Pfad würde
+    # sonst unbemerkt eine Komponente EINES ANDEREN Vertrags freigeben
+    # und den Nutzer nach dem falschen Formular zurückleiten.
+    komponente = _stammdaten_repo.get_komponente(komponente_id)
+    if komponente is None or komponente.vertrag_id != vertrag_id:
+        return _fehlerseite(
+            session, "Netto-Mietanteil-Freigabe",
+            f"Komponente {komponente_id} gehört nicht zu Vertrag {vertrag_id}.",
+            f"/backoffice/vertrag/{vertrag_id}/komponenten-freigabe",
+        )
     try:
         _variableabrechnung.komponenten_freigabe_service.freigeben(
             ctx=_ctx(session), komponente_id=komponente_id,
             bestaetigter_netto_betrag_cent=parse_eur_betrag(bestaetigter_netto_betrag),
             quellenbeleg_referenz=quellenbeleg_referenz, gueltig_von=date.fromisoformat(gueltig_von),
             gueltig_bis=date.fromisoformat(gueltig_bis) if gueltig_bis.strip() else None,
-            freigegeben_von=session.user_id,
+            freigegeben_von=session.user_id, aenderungsgrund=aenderungsgrund or None,
         )
     except (MietinkassoError, ValueError, InvalidOperation) as exc:
         return _fehlerseite(session, "Netto-Mietanteil-Freigabe", str(exc), f"/backoffice/vertrag/{vertrag_id}/komponenten-freigabe")

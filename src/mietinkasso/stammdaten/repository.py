@@ -422,6 +422,28 @@ class StammdatenRepository:
             )
             return list(session.execute(statement).scalars().all())
 
+    def list_komponenten_im_zeitraum(self, vertrag_id: str, von: date, bis: date) -> list[VertragsKomponenteTable]:
+        """Anders als `list_aktive_komponenten` (EIN Stichtag) liefert
+        diese Methode JEDE Komponente, die den Zeitraum [von, bis]
+        IRGENDWIE ÜBERLAPPT - auch eine Komponente, die erst MITTEN im
+        Zeitraum beginnt oder mittendrin endet. Unabhängiger Review: eine
+        Monatsübersicht, die nur zum Monatsersten aktive Komponenten
+        prüft, macht eine unter dem Monat neu hinzugekommene/geänderte
+        Komponente (z. B. Küchenmiete ab 15.08.) unsichtbar, statt sie
+        als Datenlücke zu melden."""
+
+        with self._session_factory() as session:
+            statement = (
+                select(VertragsKomponenteTable)
+                .where(VertragsKomponenteTable.vertrag_id == vertrag_id)
+                .where(VertragsKomponenteTable.gueltig_von <= bis)
+                .where(
+                    (VertragsKomponenteTable.gueltig_bis.is_(None))
+                    | (VertragsKomponenteTable.gueltig_bis >= von)
+                )
+            )
+            return list(session.execute(statement).scalars().all())
+
     # -- Kaution (strictly separate from OP) ---------------------------------
     def set_kaution(self, *, id: str, vertrag_id: str, betrag_cent: int, stichtag: date, referenz: str | None = None) -> None:
         with self._session_factory() as session:
