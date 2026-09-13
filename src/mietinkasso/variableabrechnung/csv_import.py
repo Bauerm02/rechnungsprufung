@@ -27,7 +27,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from mietinkasso.auth.service import AuthContext
+from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.exceptions import MietinkassoError
 from mietinkasso.domain.money import to_cents
 from mietinkasso.infrastructure.db.tables import EinheitTable, ObjektTable
@@ -171,7 +171,21 @@ def parse_csv(text: str) -> list[VariableAbrechnungCsvZeile]:
     return zeilen
 
 
-def plan_hash(zeilen: list[VariableAbrechnungCsvZeile]) -> str:
+def plan_hash(zeilen: list[VariableAbrechnungCsvZeile], befunde: tuple[ZeilenBefund, ...]) -> str:
+    """Bindet den Hash NICHT nur an den Dateiinhalt, sondern zusätzlich
+    an die je Zeile GESEHENE aktuelle Version (`ZeilenBefund.
+    aktuelle_version_id`, `None` für eine neue Gruppe) - unabhängiger
+    Review: "Planhash nur Dateidaten genügt nicht. Gesehene
+    Versions-IDs/Zustandsfingerprint an Vorschau binden". Ändert sich
+    zwischen Planung und Übernahme die aktuelle Version irgendeiner
+    betroffenen Zeile (z. B. durch eine zwischenzeitliche manuelle
+    Korrektur), weicht der bei der erneuten Prüfung unmittelbar vor dem
+    Schreiben (`wende_an`) frisch berechnete Hash vom vom Aufrufer
+    bestätigten Hash ab - der gesamte Import wird dann abgelehnt, STATT
+    die Korrektur auf die inzwischen andere aktuelle Version
+    umzubasieren und diese damit stillschweigend zu überschreiben."""
+
+    befund_je_zeile = {b.zeilennummer: b for b in befunde}
     kanonisch = "\n".join(
         "|".join(
             str(wert)
@@ -181,6 +195,7 @@ def plan_hash(zeilen: list[VariableAbrechnungCsvZeile]) -> str:
                 z.betriebskosten_hinweis_cent, z.reinigungskosten_hinweis_cent, z.verwaltungskosten_hinweis_cent,
                 z.tatsaechlicher_zahlungseingang_cent, z.vermietete_einheiten, z.vermietete_flaeche_qm,
                 z.aenderungsgrund, z.import_id,
+                f"gesehen={befund_je_zeile[z.zeilennummer].aktuelle_version_id}",
             )
         )
         for z in zeilen
@@ -189,7 +204,7 @@ def plan_hash(zeilen: list[VariableAbrechnungCsvZeile]) -> str:
 
 
 def _pruefe_paket(
-    zeilen: list[VariableAbrechnungCsvZeile], *, session: Session, repository: VariableAbrechnungRepository
+    zeilen: list[VariableAbrechnungCsvZeile], *, ctx: AuthContext, session: Session, repository: VariableAbrechnungRepository
 ) -> tuple[ZeilenBefund, ...]:
     befunde: list[ZeilenBefund] = []
     gesehene_gruppen: set[tuple[str, str, str]] = set()
@@ -205,12 +220,12 @@ def _pruefe_paket(
             )
             continue
         gesehene_gruppen.add(gruppe)
-        befunde.append(_pruefe_einzelzeile(z, session=session, repository=repository))
+        befunde.append(_pruefe_einzelzeile(z, ctx=ctx, session=session, repository=repository))
     return tuple(befunde)
 
 
 def _pruefe_einzelzeile(
-    z: VariableAbrechnungCsvZeile, *, session: Session, repository: VariableAbrechnungRepository
+    z: VariableAbrechnungCsvZeile, *, ctx: AuthContext, session: Session, repository: VariableAbrechnungRepository
 ) -> ZeilenBefund:
     einheit = session.get(EinheitTable, z.einheit_id)
     if einheit is None:
@@ -222,6 +237,20 @@ def _pruefe_einzelzeile(
         return ZeilenBefund(
             z.zeilennummer, z.einheit_id, z.art, z.leistungsmonat, "GESPERRT",
             f"Einheit '{z.einheit_id}' gehört zu einem ausgeschlossenen/unbekannten Objekt.",
+        )
+    # Unabhängiger Review: "Neue Lese-/Planservices und Routen sind ohne
+    # ctx/Scopeprüfung (... Vorschau ...)" - die Planungsprüfung (aus
+    # `erstelle_plan` UND aus `wende_an` unmittelbar vor dem Schreiben
+    # aufgerufen) liest sonst JEDE Einheit/JEDES Objekt über alle
+    # Gesellschaften hinweg unrestringiert. Ein scope-gebundener oder
+    # LESEZUGRIFF-Ctx ohne Zugriff auf die Gesellschaft der Zeile erhält
+    # daher schon in der Vorschau NUR ein generisches GESPERRT statt
+    # Fachdaten der fremden Zeile (z. B. ob dort ohnehin schon eine
+    # aktuelle Version existiert).
+    if not ctx.has_zugriff(objekt.gesellschaft_id):
+        return ZeilenBefund(
+            z.zeilennummer, z.einheit_id, z.art, z.leistungsmonat, "GESPERRT",
+            f"Kein Zugriff auf die Gesellschaft der Einheit '{z.einheit_id}'.",
         )
 
     try:
@@ -252,7 +281,7 @@ def _pruefe_einzelzeile(
         "reinigungskosten_hinweis_cent": z.reinigungskosten_hinweis_cent,
         "verwaltungskosten_hinweis_cent": z.verwaltungskosten_hinweis_cent,
         "tatsaechlicher_zahlungseingang_cent": z.tatsaechlicher_zahlungseingang_cent,
-        "vermietete_einheiten": z.vermietete_einheiten, "vermietete_flaeche_qm": z.vermietete_flaeche_qm,
+        "vermietete_einheiten": z.vermietete_einheiten, "vermietete_flaeche_qm": z.vermietete_flaeche_qm_decimal,
     }
     if inhalts_felder(aktuelle) == neue_felder:
         return ZeilenBefund(z.zeilennummer, z.einheit_id, z.art, z.leistungsmonat, "UNVERAENDERT", aktuelle_version_id=aktuelle.id)
@@ -270,14 +299,16 @@ def _pruefe_einzelzeile(
 
 
 def erstelle_plan(
-    zeilen: list[VariableAbrechnungCsvZeile], *, repository: VariableAbrechnungRepository
+    zeilen: list[VariableAbrechnungCsvZeile], *, ctx: AuthContext, repository: VariableAbrechnungRepository
 ) -> VariableAbrechnungPlan:
     """Öffentlicher Dry-run-Einstieg: öffnet eine reine Lesesession (es
-    wird nie geschrieben/committet)."""
+    wird nie geschrieben/committet). `ctx` wird bereits hier durchgereicht,
+    damit die Vorschau selbst keine Fachdaten fremder Gesellschaften
+    offenlegt (siehe `_pruefe_einzelzeile`)."""
 
     with repository.session_factory() as session:
-        befunde = _pruefe_paket(zeilen, session=session, repository=repository)
-    return VariableAbrechnungPlan(plan_hash=plan_hash(zeilen), befunde=befunde)
+        befunde = _pruefe_paket(zeilen, ctx=ctx, session=session, repository=repository)
+    return VariableAbrechnungPlan(plan_hash=plan_hash(zeilen, befunde), befunde=befunde)
 
 
 @dataclass(frozen=True)
@@ -298,17 +329,24 @@ def wende_an(
     repository: VariableAbrechnungRepository,
     akteur: str,
 ) -> VariableAbrechnungImportErgebnis:
-    aktueller_hash = plan_hash(zeilen)
-    if aktueller_hash != bestaetigter_hash:
-        raise ValueError(
-            f"Bestätigter Hash ({bestaetigter_hash}) stimmt nicht mit dem aktuellen Dateiinhalt "
-            f"({aktueller_hash}) überein - die Datei hat sich seit dem letzten Plan-Lauf geändert. "
-            "Nichts wurde eingespielt; bitte erneut planen und den NEUEN Hash bestätigen."
-        )
-
     with repository.session_factory() as session:
         try:
-            befunde = _pruefe_paket(zeilen, session=session, repository=repository)
+            # Der Plan-Hash wird ERST nach einer FRISCHEN Prüfung
+            # (`_pruefe_paket`, dieselbe Session wie die spätere
+            # Schreibung) berechnet und dann GEGEN den vom Aufrufer
+            # bestätigten Hash geprüft - so erkennt der Vergleich nicht
+            # nur eine geänderte Datei, sondern auch eine zwischen
+            # Planung und Übernahme veränderte AKTUELLE Version
+            # irgendeiner betroffenen Zeile (siehe `plan_hash`-Docstring).
+            befunde = _pruefe_paket(zeilen, ctx=ctx, session=session, repository=repository)
+            aktueller_hash = plan_hash(zeilen, befunde)
+            if aktueller_hash != bestaetigter_hash:
+                raise ValueError(
+                    f"Bestätigter Hash ({bestaetigter_hash}) stimmt nicht mehr mit dem aktuellen Stand "
+                    f"({aktueller_hash}) überein - entweder hat sich die Datei geändert ODER es gab "
+                    "zwischenzeitlich eine andere Änderung an mindestens einer betroffenen Zeile. Nichts "
+                    "wurde eingespielt; bitte erneut planen und den NEUEN Stand bestätigen."
+                )
             plan = VariableAbrechnungPlan(plan_hash=aktueller_hash, befunde=befunde)
             if not plan.anwendbar(korrekturen_bestaetigt=korrekturen_bestaetigt):
                 relevante = [
@@ -327,6 +365,16 @@ def wende_an(
             anzahl_neu = anzahl_unveraendert = anzahl_korrektur = 0
             for z in zeilen:
                 befund = befund_je_zeile[z.zeilennummer]
+                # Auth-/Scope-Prüfung für JEDE Zeile, AUCH UNVERAENDERT -
+                # unabhängiger Review: "Ein UNVERAENDERT-CSV-Zweig umgeht
+                # aktuell auch Schreib-/Scopeprüfung in wende_an." Bis
+                # hierher ist jede verbleibende Zeile NEU/UNVERAENDERT/
+                # KORREKTUR (KONFLIKT/GESPERRT wurden oben bereits
+                # abgefangen), Einheit/Objekt existieren also sicher.
+                einheit = session.get(EinheitTable, z.einheit_id)
+                objekt = session.get(ObjektTable, einheit.objekt_id)
+                require_gesellschaft_access(ctx, objekt.gesellschaft_id)
+                require_schreibrecht(ctx)
                 if befund.status == "UNVERAENDERT":
                     anzahl_unveraendert += 1
                     continue

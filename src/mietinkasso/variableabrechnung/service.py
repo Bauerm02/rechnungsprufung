@@ -16,6 +16,7 @@ import re
 from datetime import date
 from decimal import Decimal
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
@@ -29,6 +30,22 @@ _GUELTIGE_ARTEN = {e.value for e in VariableAbrechnungArt}
 _GUELTIGE_STATUS = {e.value for e in VariableAbrechnungStatus}
 _GUELTIGE_BETRAGSARTEN = {e.value for e in VariableAbrechnungBetragsart}
 _LEISTUNGSMONAT_MUSTER = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+def _kanonische_flaeche(wert: Decimal | str | None) -> Decimal | None:
+    """`Decimal("10")` und `Decimal("10.00")` sind rechnerisch GLEICH
+    (`Decimal("10") == Decimal("10.00")` ist `True`), aber ein naiver
+    String-Vergleich ("10" vs. "10.00") behandelt sie als abweichend -
+    unabhängiger Review, reproduziert: identische CSV-Datei erneut
+    geplant ergab KONFLIKT statt UNVERAENDERT, weil das gespeicherte
+    `Decimal("10.00")` zu `str(...)` -> "10.00" wurde, während die neu
+    eingelesene CSV-Zeichenkette "10" blieb. Beide Seiten des
+    Inhaltsvergleichs werden deshalb IMMER zu `Decimal` normalisiert und
+    NIE als Zeichenkette verglichen."""
+
+    if wert is None:
+        return None
+    return wert if isinstance(wert, Decimal) else Decimal(wert)
 
 
 def inhalts_felder(zeile: VariableAbrechnungTable) -> dict:
@@ -52,7 +69,7 @@ def inhalts_felder(zeile: VariableAbrechnungTable) -> dict:
         "verwaltungskosten_hinweis_cent": zeile.verwaltungskosten_hinweis_cent,
         "tatsaechlicher_zahlungseingang_cent": zeile.tatsaechlicher_zahlungseingang_cent,
         "vermietete_einheiten": zeile.vermietete_einheiten,
-        "vermietete_flaeche_qm": str(zeile.vermietete_flaeche_qm) if zeile.vermietete_flaeche_qm is not None else None,
+        "vermietete_flaeche_qm": _kanonische_flaeche(zeile.vermietete_flaeche_qm),
     }
 
 
@@ -184,7 +201,7 @@ class VariableAbrechnungService:
             "verwaltungskosten_hinweis_cent": verwaltungskosten_hinweis_cent,
             "tatsaechlicher_zahlungseingang_cent": tatsaechlicher_zahlungseingang_cent,
             "vermietete_einheiten": vermietete_einheiten,
-            "vermietete_flaeche_qm": str(vermietete_flaeche_qm) if vermietete_flaeche_qm is not None else None,
+            "vermietete_flaeche_qm": _kanonische_flaeche(vermietete_flaeche_qm),
         }
 
         if import_id is not None:
@@ -219,7 +236,18 @@ class VariableAbrechnungService:
             vermietete_einheiten=vermietete_einheiten, vermietete_flaeche_qm=vermietete_flaeche_qm,
             aenderungsgrund=None, quelle_system=quelle_system, import_id=import_id, erstellt_von=erstellt_von,
         )
-        return self._repository.neue_version_anlegen(row, alte_id=None, session=session)
+        try:
+            ergebnis = self._repository.neue_version_anlegen(row, alte_id=None, session=session)
+        except IntegrityError as exc:
+            # Race zwischen zwei gleichzeitigen ERSTEN Erfassungen
+            # derselben neuen Gruppe - vom partiellen Unique-Index
+            # `uq_variable_abrechnung_aktuell` auf DB-Ebene abgefangen.
+            raise VariableAbrechnungKonfliktError(
+                f"Gleichzeitige Erfassung für Einheit '{einheit_id}', Art '{art}', Leistungsmonat "
+                f"'{leistungsmonat}' erkannt (DB-Constraint) - bitte aktuellen Stand neu laden."
+            ) from exc
+        assert ergebnis is not None  # alte_id=None -> neue_version_anlegen gibt nie None zurück
+        return ergebnis
 
     def korrigieren(
         self,
@@ -301,18 +329,53 @@ class VariableAbrechnungService:
             aenderungsgrund=aenderungsgrund, quelle_system=quelle_system, import_id=import_id,
             erstellt_von=erstellt_von,
         )
-        return self._repository.neue_version_anlegen(neue_zeile, alte_id=ausgehend.id, session=session)
+        # Der VORHERGEHENDE Vergleich (`aktuelle.id != ausgehend.id` oben)
+        # prüft-dann-schreibt und lässt daher ein enges Zeitfenster für
+        # eine Race offen. Die tatsächliche, ATOMARE Durchsetzung ist die
+        # bedingte UPDATE-Anweisung in `neue_version_anlegen` - liefert
+        # sie `None`, hat zwischen der Prüfung oben und diesem Schreiben
+        # eine andere Korrektur gewonnen, und NICHTS wird geschrieben
+        # (unabhängiger Review: genau diese Lücke ließ eine zwischen-
+        # zeitliche fremde Korrektur stillschweigend überschreiben).
+        ergebnis = self._repository.neue_version_anlegen(neue_zeile, alte_id=ausgehend.id, session=session)
+        if ergebnis is None:
+            raise OptimistischerLockKonfliktError(
+                f"Ausgangsversion #{ausgehend_von_id} wurde zwischen Prüfung und Schreibung bereits "
+                "anderweitig korrigiert (atomare Prüfung) - bitte den aktuellen Stand neu laden und "
+                "erneut korrigieren."
+            )
+        return ergebnis
 
-    def aktuelle_version(self, einheit_id: str, art: str, leistungsmonat: str) -> VariableAbrechnungTable | None:
+    def aktuelle_version(
+        self, *, ctx: AuthContext, einheit_id: str, art: str, leistungsmonat: str
+    ) -> VariableAbrechnungTable | None:
+        objekt = self._stammdaten_repository.objekt_fuer_einheit(einheit_id)
+        require_gesellschaft_access(ctx, objekt.gesellschaft_id)
         return self._repository.aktuelle_version(einheit_id, art, leistungsmonat)
 
-    def liste_versionen(self, einheit_id: str, art: str, leistungsmonat: str) -> list[VariableAbrechnungTable]:
+    def liste_versionen(
+        self, *, ctx: AuthContext, einheit_id: str, art: str, leistungsmonat: str
+    ) -> list[VariableAbrechnungTable]:
+        objekt = self._stammdaten_repository.objekt_fuer_einheit(einheit_id)
+        require_gesellschaft_access(ctx, objekt.gesellschaft_id)
         return self._repository.liste_versionen(einheit_id, art, leistungsmonat)
 
     def liste_aktuelle(
-        self, *, leistungsmonat: str | None = None, gesellschaft_id: str | None = None
+        self, *, ctx: AuthContext, leistungsmonat: str | None = None, gesellschaft_id: str | None = None
     ) -> list[VariableAbrechnungTable]:
-        return self._repository.liste_aktuelle(leistungsmonat=leistungsmonat, gesellschaft_id=gesellschaft_id)
+        """Ohne `gesellschaft_id` filtert diese Methode das Ergebnis auf
+        genau die Gesellschaften, auf die `ctx` Zugriff hat (ADMIN mit
+        `gesellschaft_ids=None` sieht alles; ein scope-gebundener ctx
+        NUR seine eigenen) - eine LESEZUGRIFF-/Fremdgesellschafts-Rolle
+        darf über diesen Weg nie fremde Monatsabrechnungen sehen. Mit
+        explizit angegebener `gesellschaft_id` wird der Zugriff darauf
+        zusätzlich hart geprüft."""
 
-    def liste_alle(self) -> list[VariableAbrechnungTable]:
-        return self._repository.liste_alle()
+        if gesellschaft_id is not None:
+            require_gesellschaft_access(ctx, gesellschaft_id)
+            return self._repository.liste_aktuelle(leistungsmonat=leistungsmonat, gesellschaft_id=gesellschaft_id)
+        alle = self._repository.liste_aktuelle(leistungsmonat=leistungsmonat, gesellschaft_id=None)
+        return [zeile for zeile in alle if ctx.has_zugriff(zeile.gesellschaft_id)]
+
+    def liste_alle(self, *, ctx: AuthContext) -> list[VariableAbrechnungTable]:
+        return [zeile for zeile in self._repository.liste_alle() if ctx.has_zugriff(zeile.gesellschaft_id)]

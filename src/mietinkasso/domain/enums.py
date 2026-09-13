@@ -236,6 +236,20 @@ class VariableAbrechnungStatus(str, enum.Enum):
     BESTAETIGT = "BESTAETIGT"
 
 
+class KomponentenNettoMietFreigabeStatus(str, enum.Enum):
+    """Auftrag 13.09., unabhängiger Review: `VertragsKomponenteTable.
+    betrag_cent` ist im Bestand teils BRUTTO gespeichert (auch bei
+    HMZ/KUECHE/PARKPLATZ) - `ust_satz_promille` allein beweist keine
+    Betragsbasis. Diese separate, additive Freigabe bestätigt EXPLIZIT
+    einen geprüften Netto-Mietanteil für Reporting-Zwecke, OHNE
+    `VertragsKomponenteTable`/`OPPositionTable` zu verändern. Wie bei
+    `RechtsprofilStatus` entwertet eine spätere Änderung der
+    referenzierten Komponente die Freigabe automatisch (`quelle_hash`)."""
+
+    FREIGEGEBEN = "FREIGEGEBEN"
+    INVALIDIERT = "INVALIDIERT"
+
+
 class VariableAbrechnungBetragsart(str, enum.Enum):
     """Betragsart des ROH gemeldeten Ursprungsbetrags
     (`berichteter_betrag_cent`) - getrennt von `unser_netto_anteil_cent`.

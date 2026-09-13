@@ -6,7 +6,7 @@ lock, genau eine aktuelle Version je Gruppe) leben in
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.infrastructure.db.tables import VariableAbrechnungTable
@@ -84,20 +84,40 @@ class VariableAbrechnungRepository:
 
     def neue_version_anlegen(
         self, row: VariableAbrechnungTable, *, alte_id: int | None, session: Session | None = None
-    ) -> VariableAbrechnungTable:
-        """Setzt (falls vorhanden) die bisherige aktuelle Zeile
-        `ist_aktuell=False` und fügt `row` (bereits `ist_aktuell=True`)
-        EINEM einzigen DB-Vorgang hinzu - der partielle Unique-Index
-        `uq_variable_abrechnung_aktuell` verhindert zusätzlich auf
-        DB-Ebene, dass jemals zwei aktuelle Zeilen derselben Gruppe
-        gleichzeitig bestehen (auch bei einer Race zwischen zwei
-        gleichzeitigen Korrekturen)."""
+    ) -> VariableAbrechnungTable | None:
+        """Wenn `alte_id` gesetzt ist, wird die bisherige aktuelle Zeile
+        NUR über eine ATOMARE bedingte UPDATE-Anweisung
+        (`ist_aktuell: True -> False`, `WHERE id=alte_id AND
+        ist_aktuell=True`) entwertet - trifft diese Bedingung nicht mehr
+        zu (`rowcount != 1`, weil zwischenzeitlich bereits eine andere
+        Korrektur `alte_id` entwertet hat), wird GAR NICHTS geschrieben
+        und `None` zurückgegeben.
 
-        def _schreiben(active_session: Session) -> VariableAbrechnungTable:
+        Unabhängiger Review: ein reines "lesen, dann schreiben"
+        (`session.get` + Attributzuweisung) schließt die Lücke zwischen
+        Prüfung und Schreibung NICHT - ein CSV-Import, dessen Plan-Hash
+        beim erneuten Prüfen `unmittelbar vor dem Schreiben` zufällig
+        wieder zur inzwischen aktuellen (aber fremden) Version passt,
+        konnte so eine zwischenzeitliche fremde Korrektur stillschweigend
+        überschreiben. Die bedingte UPDATE-Anweisung ist die
+        tatsächliche, atomare Durchsetzung des optimistic locks - nicht
+        nur eine vorgelagerte Prüfung.
+
+        Der partielle Unique-Index `uq_variable_abrechnung_aktuell`
+        bleibt als zusätzliche, unabhängige DB-Garantie bestehen (auch
+        bei `alte_id=None`, also einer ganz neuen Gruppe, verhindert er
+        zwei gleichzeitig aktuelle Zeilen)."""
+
+        def _schreiben(active_session: Session) -> VariableAbrechnungTable | None:
             if alte_id is not None:
-                alte = active_session.get(VariableAbrechnungTable, alte_id)
-                if alte is not None:
-                    alte.ist_aktuell = False
+                ergebnis = active_session.execute(
+                    update(VariableAbrechnungTable)
+                    .where(VariableAbrechnungTable.id == alte_id)
+                    .where(VariableAbrechnungTable.ist_aktuell.is_(True))
+                    .values(ist_aktuell=False)
+                )
+                if ergebnis.rowcount != 1:
+                    return None
             active_session.add(row)
             active_session.flush()
             return row
@@ -106,6 +126,9 @@ class VariableAbrechnungRepository:
             return _schreiben(session)
         with self._session_factory() as owned_session:
             ergebnis = _schreiben(owned_session)
+            if ergebnis is None:
+                owned_session.rollback()
+                return None
             owned_session.commit()
             owned_session.refresh(ergebnis)
             return ergebnis

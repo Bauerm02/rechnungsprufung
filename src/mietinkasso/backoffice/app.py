@@ -41,7 +41,7 @@ from fastapi import APIRouter, Cookie, Depends, File, Form, HTTPException, Reque
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from mietinkasso.audit.service import AuditService
-from mietinkasso.auth.service import AuthContext
+from mietinkasso.auth.service import AuthContext, require_gesellschaft_access
 from mietinkasso.backoffice.security import LoginRateLimiter, SessionStore, pruefe_passwort
 from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, ist_bekannte_demo_umgebung, option, parse_eur_betrag, seite
 from mietinkasso.bank.importer import (
@@ -500,7 +500,8 @@ def kontoauszug(request: Request, konto_id: str, session=Depends(_current_sessio
           <a href="/backoffice/vertrag/{h(vertrag.id)}/vorschreibung">Vorschreibungsentwurf</a> &nbsp;|&nbsp;
           <a href="/backoffice/vertrag/{h(vertrag.id)}/mahnvorschau">Mahnvorschau</a> &nbsp;|&nbsp;
           <a href="/backoffice/vertrag/{h(vertrag.id)}/pruefung">Vertragsprüfung</a> &nbsp;|&nbsp;
-          <a href="/backoffice/vertrag/{h(vertrag.id)}/mieweg-vorschau">MieWeG-Vorschau</a>
+          <a href="/backoffice/vertrag/{h(vertrag.id)}/mieweg-vorschau">MieWeG-Vorschau</a> &nbsp;|&nbsp;
+          <a href="/backoffice/vertrag/{h(vertrag.id)}/komponenten-freigabe">Netto-Mietanteil-Freigabe</a>
         </p>"""
 
     return _layout(request, session, f"Kontoauszug {konto_id}", banner + stammdaten_karte + sperren_karte + op_tabelle + links)
@@ -2575,7 +2576,7 @@ def _variable_abrechnung_zeile_html(z) -> str:
 
 @router.get("/variable-abrechnung", response_class=HTMLResponse)
 def variable_abrechnung_liste(request: Request, monat: str | None = None, session=Depends(_current_session)) -> HTMLResponse:
-    zeilen = _variableabrechnung.service.liste_aktuelle(leistungsmonat=monat or None)
+    zeilen = _variableabrechnung.service.liste_aktuelle(ctx=_ctx(session), leistungsmonat=monat or None)
     zeilen_html = "".join(_variable_abrechnung_zeile_html(z) for z in zeilen) or (
         '<tr><td colspan=9 class="muted">Keine Monatsabrechnung vorhanden.</td></tr>'
     )
@@ -2739,6 +2740,16 @@ def variable_abrechnung_korrigieren_formular(request: Request, id: int, session=
     zeile = _variableabrechnung.repository.get(id)
     if zeile is None:
         return _fehlerseite(session, "Variable Monatsabrechnung", f"Unbekannte Zeile {id}.", "/backoffice/variable-abrechnung")
+    # Unabhängiger Review: "Korrektur-GET" las bislang direkt über das
+    # Repository ohne jede ctx-/Scopeprüfung - eine LESEZUGRIFF-Rolle
+    # oder ein fremdgesellschafts-gebundener ctx konnte so Fachdaten
+    # (Beträge, Quelle, Änderungsgrund) EINER FREMDEN Gesellschaft über
+    # das Korrekturformular einsehen. Objektausschluss ist hier bewusst
+    # NICHT zusätzlich geprüft - eine bereits bestehende Zeile eines
+    # zwischenzeitlich ausgeschlossenen Objekts darf weiterhin betrachtet
+    # (aber laut `service.korrigieren` nicht mehr geschrieben) werden.
+    objekt = _stammdaten_repo.objekt_fuer_einheit(zeile.einheit_id)
+    require_gesellschaft_access(_ctx(session), objekt.gesellschaft_id)
     inhalt = f"""
     <div class="card" style="max-width:640px;">
       <h1>Korrektur — {h(zeile.einheit_id)} / {h(zeile.art)} / {h(zeile.leistungsmonat)} (aktuell v{zeile.version})</h1>
@@ -2800,7 +2811,7 @@ def variable_abrechnung_korrigieren(
 def variable_abrechnung_versionen(
     request: Request, einheit_id: str, art: str, monat: str, session=Depends(_current_session)
 ) -> HTMLResponse:
-    versionen = _variableabrechnung.service.liste_versionen(einheit_id, art, monat)
+    versionen = _variableabrechnung.service.liste_versionen(ctx=_ctx(session), einheit_id=einheit_id, art=art, leistungsmonat=monat)
     zeilen = "".join(
         "<tr>"
         f"<td>v{z.version}</td><td>{h(z.status)}</td><td>{'AKTUELL' if z.ist_aktuell else h(str(z.ist_aktuell))}</td>"
@@ -2855,7 +2866,7 @@ async def variable_abrechnung_import_vorschau(
         zeilen = _variable_abrechnung_parse_csv(text)
     except (KeyError, ValueError) as exc:
         return _fehlerseite(session, "Variable Monatsabrechnung — Import", f"Datei kann nicht gelesen werden: {exc}", "/backoffice/variable-abrechnung/import")
-    plan = _variable_abrechnung_erstelle_plan(zeilen, repository=_variableabrechnung.repository)
+    plan = _variable_abrechnung_erstelle_plan(zeilen, ctx=_ctx(session), repository=_variableabrechnung.repository)
 
     def _zeile_klasse(b) -> str:
         return "gesperrt-row" if b.status in ("GESPERRT", "KONFLIKT") else ""
@@ -2931,8 +2942,9 @@ def dashboard_monatsuebersicht(request: Request, monat: str | None = None, sessi
     gewaehlter_monat = monat or f"{heute.year:04d}-{heute.month:02d}"
     try:
         uebersicht = berechne_monatsuebersicht(
-            leistungsmonat=gewaehlter_monat, stammdaten_repository=_stammdaten_repo,
+            ctx=_ctx(session), leistungsmonat=gewaehlter_monat, stammdaten_repository=_stammdaten_repo,
             variable_service=_variableabrechnung.service,
+            komponenten_freigabe_service=_variableabrechnung.komponenten_freigabe_service,
         )
     except ValueError as exc:
         return _fehlerseite(session, "Monatsübersicht", f"Ungültiger Monat '{gewaehlter_monat}': {exc}", "/backoffice/dashboard/monatsuebersicht")
@@ -2966,3 +2978,85 @@ def dashboard_monatsuebersicht(request: Request, monat: str | None = None, sessi
       <p><a href="/backoffice/variable-abrechnung">&larr; zur variablen Monatsabrechnung</a></p>
     </div>"""
     return _layout(request, session, "Monatsübersicht", inhalt)
+
+
+# -- Netto-Mietanteil-Freigabe je Vertragskomponente -------------------------
+# Auftrag 13.09., unabhängiger Review: Art/USt-Satz allein sind kein Beleg
+# für einen tatsächlich NETTO gespeicherten Komponentenbetrag - erst eine
+# hier explizit erfasste, belegte Freigabe zählt für die Monatsübersicht.
+
+
+@router.get("/vertrag/{vertrag_id}/komponenten-freigabe", response_class=HTMLResponse)
+def komponenten_freigabe_formular(request: Request, vertrag_id: str, session=Depends(_current_session)) -> HTMLResponse:
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Netto-Mietanteil-Freigabe", f"Unbekannter Vertrag {vertrag_id}.")
+    komponenten = _stammdaten_repo.list_aktive_komponenten(vertrag_id, date.today())
+    zeilen = []
+    for k in komponenten:
+        freigaben = _variableabrechnung.komponenten_freigabe_service.liste_fuer_komponente(k.id)
+        aktuelle_freigabe = next((f for f in freigaben if f.status == "FREIGEGEBEN"), None)
+        freigabe_html = (
+            f"AKTIV: {eur(aktuelle_freigabe.bestaetigter_netto_betrag_cent)} ab {aktuelle_freigabe.gueltig_von.isoformat()}"
+            + (f" bis {aktuelle_freigabe.gueltig_bis.isoformat()}" if aktuelle_freigabe.gueltig_bis else " (unbefristet)")
+            + (" [ENTWERTET - Komponente seither geändert]" if aktuelle_freigabe and not _variableabrechnung.komponenten_freigabe_service.ist_noch_gueltig(aktuelle_freigabe) else "")
+            if aktuelle_freigabe else '<span class="muted">keine aktive Freigabe - Datenlücke in der Monatsübersicht</span>'
+        )
+        zeilen.append(f"""
+        <tr>
+          <td>{h(k.id)}</td><td>{h(k.art)}</td><td>{h(k.bezeichnung)}</td>
+          <td>{eur(k.betrag_cent)} (gespeichert, Basis ungeprüft)</td>
+          <td>{freigabe_html}</td>
+          <td>
+            <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/komponenten-freigabe/{h(k.id)}/freigeben" class="inline">
+              {csrf_feld(session.csrf_token)}
+              <input type="text" name="bestaetigter_netto_betrag" placeholder="Netto-Betrag EUR" required style="width:8em;">
+              <input type="text" name="quellenbeleg_referenz" placeholder="Quellenbeleg" required style="width:10em;">
+              <input type="date" name="gueltig_von" required>
+              <input type="date" name="gueltig_bis" placeholder="optional">
+              <button type="submit" class="secondary">Freigeben</button>
+            </form>
+          </td>
+        </tr>""")
+    inhalt = f"""
+    <div class="card">
+      <h1>Netto-Mietanteil-Freigabe — Vertrag {h(vertrag_id)}</h1>
+      <p class="muted">Der gespeicherte Komponentenbetrag ist historisch teils BRUTTO erfasst (auch bei
+         HMZ/Küche/Parkplatz) - Art und USt-Satz allein sind kein Beleg. Nur ein hier explizit
+         bestätigter, belegter Netto-Betrag fließt in die Nettomieterlös-Monatsübersicht ein. Eine
+         Freigabe entwertet sich automatisch, sobald sich die zugrunde liegende Komponente ändert.
+         `VertragsKomponenteTable`/OP-Buchungen bleiben davon unberührt.</p>
+      <table>
+        <tr><th>Komponente</th><th>Art</th><th>Bezeichnung</th><th>Gespeicherter Betrag</th>
+            <th>Freigabestatus</th><th>Neu freigeben</th></tr>
+        {''.join(zeilen) if zeilen else '<tr><td colspan=6 class="muted">Keine aktiven Komponenten.</td></tr>'}
+      </table>
+      <p><a href="/backoffice/konto/{h(_stammdaten_repo.get_konto_by_vertrag(vertrag_id).id) if _stammdaten_repo.get_konto_by_vertrag(vertrag_id) else ''}">&larr; zurück zum Kontoauszug</a></p>
+    </div>"""
+    return _layout(request, session, "Netto-Mietanteil-Freigabe", inhalt)
+
+
+@router.post("/vertrag/{vertrag_id}/komponenten-freigabe/{komponente_id}/freigeben")
+def komponenten_freigabe_erstellen(
+    request: Request,
+    vertrag_id: str,
+    komponente_id: str,
+    bestaetigter_netto_betrag: str = Form(...),
+    quellenbeleg_referenz: str = Form(...),
+    gueltig_von: str = Form(...),
+    gueltig_bis: str = Form(""),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    try:
+        _variableabrechnung.komponenten_freigabe_service.freigeben(
+            ctx=_ctx(session), komponente_id=komponente_id,
+            bestaetigter_netto_betrag_cent=parse_eur_betrag(bestaetigter_netto_betrag),
+            quellenbeleg_referenz=quellenbeleg_referenz, gueltig_von=date.fromisoformat(gueltig_von),
+            gueltig_bis=date.fromisoformat(gueltig_bis) if gueltig_bis.strip() else None,
+            freigegeben_von=session.user_id,
+        )
+    except (MietinkassoError, ValueError, InvalidOperation) as exc:
+        return _fehlerseite(session, "Netto-Mietanteil-Freigabe", str(exc), f"/backoffice/vertrag/{vertrag_id}/komponenten-freigabe")
+    return RedirectResponse(url=f"/backoffice/vertrag/{vertrag_id}/komponenten-freigabe", status_code=303)

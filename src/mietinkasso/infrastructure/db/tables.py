@@ -867,6 +867,44 @@ class VariableAbrechnungTable(Base):
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class KomponentenNettoMietFreigabeTable(Base):
+    """Separate, additive Bestätigung eines geprüften NETTO-Mietanteils
+    für GENAU EINE `VertragsKomponenteTable`-Zeile, ausschließlich für
+    die Nettomieterlös-Monatsübersicht (`variableabrechnung/
+    dashboard.py`) - Auftrag 13.09., unabhängiger Review: "Bestehende
+    Vertragskomponenten sind historisch teilweise BRUTTO gespeichert,
+    auch bei art=HMZ/KUECHE/PARKPLATZ; ust_satz_promille ist vorhanden,
+    beweist allein aber keine Betragsbasis."
+
+    Ändert NIE `VertragsKomponenteTable.betrag_cent` oder
+    `OPPositionTable` - Altbeträge/OP bleiben unverändert.
+    `bestaetigter_netto_betrag_cent` kann von `betrag_cent` ABWEICHEN
+    (z. B. wenn `betrag_cent` tatsächlich brutto ist). `quelle_hash`
+    bindet die Freigabe an den Stand der referenzierten Komponente zum
+    Freigabezeitpunkt (Betrag/Art/Gültigkeit/USt-Satz) - jede spätere
+    Änderung entwertet die Freigabe automatisch (siehe
+    `komponenten_freigabe.py::ist_noch_gueltig`, analog
+    `RechtsprofilTable`). `gueltig_von`/`gueltig_bis` grenzen
+    zusätzlich ein, für welchen Zeitraum der bestätigte Nettoanteil
+    TATSÄCHLICH gilt - eine Freigabe ist keine dauerhafte
+    Blankettermächtigung. Eine ungeprüfte Bestandskomponente OHNE
+    aktive Freigabe bleibt in der Monatsübersicht eine Datenlücke,
+    NIEMALS ein pauschal angenommener Nettobetrag."""
+
+    __tablename__ = "komponenten_netto_miet_freigaben"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    komponente_id: Mapped[str] = mapped_column(ForeignKey("vertrags_komponenten.id"), index=True)
+    bestaetigter_netto_betrag_cent: Mapped[int] = mapped_column(Integer)
+    quellenbeleg_referenz: Mapped[str] = mapped_column(String(256))
+    gueltig_von: Mapped[date] = mapped_column(Date)
+    gueltig_bis: Mapped[date | None] = mapped_column(Date, nullable=True)
+    quelle_hash: Mapped[str] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(16), default="FREIGEGEBEN")
+    freigegeben_von: Mapped[str] = mapped_column(String(128))
+    freigegeben_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class JobLockTable(Base):
     """Mutual-exclusion row: a unique (job_name, fachschluessel) prevents a
     second worker (or a restarted first worker) from repeating a job that
