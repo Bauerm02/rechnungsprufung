@@ -1072,6 +1072,99 @@ def test_mieweg_vorschau_ungeklaertes_rechtsprofil_wird_nicht_hineingeraten(back
     assert "kein Rateversuch" in historie.text or "keine ausführbare Anpassung" in historie.text
 
 
+def test_indexautomatik_rechtsprofil_erstellen_und_freigeben(backoffice_client):
+    """Indexautomatik (Auftrag 13.09.): Rechtsprofil-Entwurf über HTTP
+    anlegen und freigeben - keine automatische Berechnung/kein Versand
+    ausgelöst, nur die Freigabe selbst."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-IDXAUTO", objekt_id="601", bezeichnung="Top Indexautomatik", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-IDXAUTO", einheit_id="601-TOP-IDXAUTO", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    stammdaten.add_komponente(
+        id="K-601-IDXAUTO-HMZ", vertrag_id="V-601-IDXAUTO", art="HMZ", bezeichnung="Hauptmietzins",
+        betrag_cent=100_000, indexierbar=True, gueltig_von=date(2024, 1, 1),
+    )
+
+    seite = client.get("/backoffice/vertrag/V-601-IDXAUTO/rechtsprofil")
+    assert seite.status_code == 200
+    assert "Rechtsprofil" in seite.text
+
+    erstellt = client.post(
+        "/backoffice/vertrag/V-601-IDXAUTO/rechtsprofil/erstellen",
+        data={
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "ist_wohnungsnutzung": "1", "ist_hauptmiete": "1",
+            "bezugsjahr": "2024", "bezugsmonat": "1", "vpi_reihe": "VPI20C18",
+            "basis_komponenten_ids": ["K-601-IDXAUTO-HMZ"],
+            "vertraglicher_betrag": "2.000,00", "vertraglicher_quellenbeleg": "Mietvertrag Punkt 5",
+            "vertraglicher_termin": "2026-04-01", "vertrag_beleg_referenz": "Mietvertrag V-601-IDXAUTO",
+            "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert erstellt.status_code == 303
+
+    historie = client.get("/backoffice/vertrag/V-601-IDXAUTO/rechtsprofil")
+    assert "ENTWURF" in historie.text
+    treffer = re.search(r'/indexautomatik/rechtsprofil/(\d+)/freigeben', historie.text)
+    assert treffer is not None
+    rechtsprofil_id = treffer.group(1)
+
+    freigegeben = client.post(
+        f"/backoffice/indexautomatik/rechtsprofil/{rechtsprofil_id}/freigeben",
+        data={"csrf_token": csrf}, follow_redirects=False,
+    )
+    assert freigegeben.status_code == 303
+    historie_danach = client.get("/backoffice/vertrag/V-601-IDXAUTO/rechtsprofil")
+    assert "FREIGEGEBEN" in historie_danach.text
+
+
+def test_indexautomatik_vpi_werte_erfassen_und_anzeigen(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seite = client.get("/backoffice/indexautomatik/vpi")
+    assert seite.status_code == 200
+
+    erfasst = client.post(
+        "/backoffice/indexautomatik/vpi/erfassen",
+        data={"reihe": "VPI20C18", "jahr": "2024", "wert": "123,8", "quelle": "Statistik Austria Test", "quelle_datum": "2025-02-17", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert erfasst.status_code == 303
+
+    liste = client.get("/backoffice/indexautomatik/vpi")
+    assert "123.8" in liste.text or "123,8" in liste.text
+    assert "Statistik Austria Test" in liste.text
+
+
+def test_indexautomatik_outbox_und_vertragsende_seiten_erreichbar(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    assert client.get("/backoffice/indexautomatik/outbox").status_code == 200
+    assert client.get("/backoffice/indexautomatik/vertragsende").status_code == 200
+
+
+def test_indexautomatik_rechtsprofil_freigabe_ohne_csrf_wird_abgelehnt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    antwort = client.post(
+        "/backoffice/indexautomatik/rechtsprofil/999999/freigeben", data={"csrf_token": "falsch"},
+    )
+    assert antwort.status_code == 403
+
+
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
     unten) - der Login-Ratelimiter ist ein globaler, prozessweiter

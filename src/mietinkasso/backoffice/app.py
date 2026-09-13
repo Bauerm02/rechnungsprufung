@@ -55,6 +55,7 @@ from mietinkasso.bank.importer import (
 from mietinkasso.bank.repository import BankRepository
 from mietinkasso.bank.service import BankImportService
 from mietinkasso.domain.enums import OPTyp, Rolle
+from mietinkasso.domain.enums import ZUGANGSFORMEN_ALLE as _ZUGANGSFORMEN_ALLE
 from mietinkasso.domain.exceptions import MietinkassoError
 from mietinkasso.index.repository import IndexRepository
 from mietinkasso.index.service import UNTERSTUETZTE_BERECHNUNGSPROFILE, IndexService
@@ -68,6 +69,9 @@ from mietinkasso.op.service import OPService
 from mietinkasso.stammdaten.repository import StammdatenRepository
 from mietinkasso.mieweg_vorschau.repository import MieWegVorschauRepository
 from mietinkasso.mieweg_vorschau.service import MieWegVorschauService, VpiWert
+from mietinkasso.indexautomatik.bootstrap import bauen as _indexautomatik_bauen
+from mietinkasso.indexautomatik.transport import FakeTransportadapter, HttpTransportadapter
+from mietinkasso.indexautomatik.zeit import heute_wien
 from mietinkasso.vertragspruefung.repository import IndexPruefbedarfRepository, VertragPruefungRepository
 from mietinkasso.vertragspruefung.service import VertragspruefungService
 from mietinkasso.vorschreibung.repository import VorschreibungRepository
@@ -104,6 +108,7 @@ _vertragspruefung_service = VertragspruefungService(_vertragspruefung_repo, _ind
 _mieweg_vorschau_repo = MieWegVorschauRepository(_session_factory)
 _mieweg_vorschau_service = MieWegVorschauService(_mieweg_vorschau_repo, _stammdaten_repo)
 _audit_service = AuditService(_session_factory)
+_indexautomatik = _indexautomatik_bauen(_session_factory, _settings)
 
 _sessions = SessionStore(ttl_sekunden=_settings.backoffice_session_ttl_minuten * 60)
 # 5 Fehlversuche innerhalb von 5 Minuten -> 5 Minuten GLOBALE Sperre (siehe
@@ -2018,3 +2023,414 @@ def mieweg_vorschau_erstellen(
     except (MietinkassoError, ValueError) as exc:
         return _fehlerseite(session, "MieWeG-Vorschau", str(exc), f"/backoffice/vertrag/{vertrag_id}/mieweg-vorschau")
     return RedirectResponse(url=f"/backoffice/vertrag/{vertrag_id}/mieweg-vorschau", status_code=303)
+
+
+# -- Indexautomatik (Auftrag 13.09., HV-20260913-INDEXAUTOMATIK) -------------------
+#
+# Rechtsprofil-Freigabe, Monatslauf-Übersicht, Erhöhungsschreiben-Outbox,
+# VPI-Werte-Pflege und Vertragsende-Erinnerungen. Der eigentliche
+# Monats-/Tageslauf läuft NICHT über HTTP (siehe scripts/indexautomatik_*.py) -
+# dieser Abschnitt ist ausschließlich Einsicht/Freigabe/manuelle Pflege.
+
+
+def _rechtsprofil_zeile_html(p) -> str:
+    aktion = ""
+    if p.status == "ENTWURF":
+        aktion = f"""<form method="post" action="/backoffice/indexautomatik/rechtsprofil/{p.id}/freigeben" class="inline">
+          {{csrf}}<button type="submit" class="secondary">Freigeben</button></form>"""
+    return (
+        "<tr>"
+        f"<td>{p.version}</td><td>{h(p.rechtsordnung)}</td><td>{h(str(p.ist_wohnungsnutzung))}</td>"
+        f"<td>{h(str(p.ist_hauptmiete))}</td><td>{h(str(p.foerderbindung))}</td>"
+        f"<td>{p.bezugsjahr or '-'}-{p.bezugsmonat or '-'}</td>"
+        f"<td>{eur(p.vertraglich_zulaessiger_betrag_cent) if p.vertraglich_zulaessiger_betrag_cent is not None else '-'}</td>"
+        f"<td>{p.vertragsklausel_id or '-'}</td><td>{h(p.status)}</td><td>{h(p.freigegeben_von or '-')}</td>"
+        f"<td>{aktion}</td></tr>"
+    )
+
+
+@router.get("/vertrag/{vertrag_id}/rechtsprofil", response_class=HTMLResponse)
+def rechtsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_current_session)) -> HTMLResponse:
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Rechtsprofil", f"Unbekannter Vertrag {vertrag_id}.")
+    if _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Rechtsprofil", "Objekt ist gesperrt; kein Rechtsprofil möglich.")
+
+    rechtsordnung_optionen = "".join(
+        option(r, r, selected=(r == vertrag.rechtsordnung)) for r in _RECHTSORDNUNGEN_FUER_AUSWAHL
+    )
+    komponenten = _stammdaten_repo.list_aktive_komponenten(vertrag_id, date.today())
+    komponenten_html = "".join(
+        f'<label class="muted"><input type="checkbox" name="basis_komponenten_ids" value="{h(k.id)}"> '
+        f"{h(k.bezeichnung)} ({eur(k.betrag_cent)}, {h(k.art)})</label><br>"
+        for k in komponenten if k.indexierbar
+    ) or '<p class="muted">Keine als indexierbar markierte Komponente vorhanden.</p>'
+    klauseln = _indexautomatik.index_repository.freigegebene_klausel(vertrag_id)
+    klausel_hinweis = (
+        f'<p class="muted">Freigegebene IndexKlausel: #{klauseln.id} (Basis {klauseln.basis_reihe}={klauseln.basis_wert}, '
+        f"Bezugsmonat {klauseln.basis_monat})</p>"
+        if klauseln else '<p class="muted">Keine freigegebene IndexKlausel für diesen Vertrag vorhanden (siehe Index-Modul).</p>'
+    )
+    historie = _indexautomatik.rechtsprofil_service.liste_fuer_vertrag(vertrag_id)
+    historie_html = "".join(_rechtsprofil_zeile_html(p).replace("{csrf}", csrf_feld(session.csrf_token)) for p in historie) or (
+        '<tr><td colspan=11 class="muted">Noch kein Rechtsprofil erfasst.</td></tr>'
+    )
+
+    inhalt = f"""
+    <div class="card">
+      <h1>Rechtsprofil (Indexautomatik) — {h(vertrag_id)}</h1>
+      <p class="muted">Nur GENAU EIN freigegebenes Rechtsprofil treibt die monatliche Indexautomatik an.
+         Änderungen an Vertrag/Komponenten/Klausel nach der Freigabe entwerten sie automatisch - eine
+         neue Freigabe ist dann erforderlich.</p>
+    </div>
+    <div class="card">
+      <h2>Neues Rechtsprofil (Entwurf)</h2>
+      {klausel_hinweis}
+      <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/rechtsprofil/erstellen">
+        {csrf_feld(session.csrf_token)}
+        <fieldset>
+          <legend>Rechtsklassifikation</legend>
+          <label>Rechtsordnung</label>
+          <select name="rechtsordnung" required>{rechtsordnung_optionen}</select>
+          <label><input type="checkbox" name="ist_wohnungsnutzung" value="1"> Wohnungsnutzung bestätigt</label><br>
+          <label>Haupt-/Untermiete</label>
+          <select name="ist_hauptmiete"><option value="">ungeklärt</option><option value="1">Hauptmiete (geprüft)</option>
+            <option value="0">Untermiete (geprüft)</option></select>
+          <label><input type="checkbox" name="mrg_zinsbeschraenkung" value="1"> MRG-Zinsbeschränkung</label><br>
+          <label><input type="checkbox" name="ist_altvertrag" value="1"> Altvertrag</label>
+        </fieldset>
+        <fieldset>
+          <legend>Förderbindung/Mietzinsobergrenze (BRUTTO, wirkt unabhängig von foerderbindung als Kappung)</legend>
+          <label><input type="checkbox" name="foerderbindung" value="1"> Förderbindung</label><br>
+          <label>Mietzinsobergrenze (EUR, BRUTTO)</label>
+          <input type="text" name="mietzinsobergrenze">
+          <label>Quellenbeleg</label>
+          <input type="text" name="mietzinsobergrenze_quellenbeleg">
+          <label>Gültig bis</label>
+          <input type="date" name="mietzinsobergrenze_gueltig_bis">
+        </fieldset>
+        <fieldset>
+          <legend>Letzte tatsächlich verwendete Indexbasis</legend>
+          <label>Bezugsjahr</label><input type="number" name="bezugsjahr" min="1990" max="2100">
+          <label>Bezugsmonat (1-12)</label><input type="number" name="bezugsmonat" min="1" max="12">
+          <label><input type="checkbox" name="letzte_basis_war_jahresdurchschnitt" value="1"> War Jahresdurchschnitt</label>
+          <label>VPI-Reihe</label>
+          <select name="vpi_reihe">{option("VPI20C18","VPI20C18",selected=True)}{option("VPI15C18","VPI15C18")}{option("VPI00","VPI00")}{option("VPI96","VPI96")}</select>
+          <label>Referenzierte Basis-Komponenten</label>
+          {komponenten_html}
+        </fieldset>
+        <fieldset>
+          <legend>Vertragliche Spur - GENAU EINE der beiden Varianten</legend>
+          <label>Statischer vertraglich zulässiger Betrag (EUR, BRUTTO)</label>
+          <input type="text" name="vertraglicher_betrag">
+          <label>Quellenbeleg</label>
+          <input type="text" name="vertraglicher_quellenbeleg">
+          <label>Vertraglich frühestmöglicher Termin</label>
+          <input type="date" name="vertraglicher_termin">
+          <p class="muted">ODER: ID einer freigegebenen IndexKlausel (dynamisch berechnete Spur, siehe oben)</p>
+          <label>Vertragsklausel-ID</label>
+          <input type="number" name="vertragsklausel_id">
+        </fieldset>
+        <fieldset>
+          <legend>Belege</legend>
+          <label>Vertragsbeleg-Referenz (Pflicht)</label>
+          <input type="text" name="vertrag_beleg_referenz" required>
+          <label>Klauselreferenz</label>
+          <input type="text" name="klausel_referenz">
+        </fieldset>
+        <button type="submit">Rechtsprofil als Entwurf speichern</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Historie</h2>
+      <table>
+        <tr><th>Version</th><th>Wohnung</th><th>Hauptmiete</th><th>Förderbindung</th><th>Bezug</th>
+          <th>Vertragl. Betrag</th><th>Klausel-ID</th><th>Status</th><th>Freigegeben von</th><th>Aktion</th></tr>
+        {historie_html}
+      </table>
+    </div>
+    """
+    return _layout(request, session, "Rechtsprofil", inhalt)
+
+
+@router.post("/vertrag/{vertrag_id}/rechtsprofil/erstellen")
+def rechtsprofil_erstellen(
+    request: Request,
+    vertrag_id: str,
+    rechtsordnung: str = Form(...),
+    ist_wohnungsnutzung: str = Form(""),
+    ist_hauptmiete: str = Form(""),
+    mrg_zinsbeschraenkung: str = Form(""),
+    ist_altvertrag: str = Form(""),
+    foerderbindung: str = Form(""),
+    mietzinsobergrenze: str = Form(""),
+    mietzinsobergrenze_quellenbeleg: str = Form(""),
+    mietzinsobergrenze_gueltig_bis: str = Form(""),
+    bezugsjahr: str = Form(""),
+    bezugsmonat: str = Form(""),
+    letzte_basis_war_jahresdurchschnitt: str = Form(""),
+    vpi_reihe: str = Form("VPI20C18"),
+    basis_komponenten_ids: list[str] = Form([]),
+    vertraglicher_betrag: str = Form(""),
+    vertraglicher_quellenbeleg: str = Form(""),
+    vertraglicher_termin: str = Form(""),
+    vertragsklausel_id: str = Form(""),
+    vertrag_beleg_referenz: str = Form(...),
+    klausel_referenz: str = Form(""),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    try:
+        _indexautomatik.rechtsprofil_service.entwurf_anlegen(
+            ctx=_ctx(session), vertrag_id=vertrag_id, rechtsordnung=rechtsordnung,
+            ist_wohnungsnutzung=bool(ist_wohnungsnutzung),
+            ist_hauptmiete=(None if ist_hauptmiete == "" else bool(int(ist_hauptmiete))),
+            mrg_zinsbeschraenkung=bool(mrg_zinsbeschraenkung), ist_altvertrag=bool(ist_altvertrag),
+            foerderbindung=bool(foerderbindung),
+            mietzinsobergrenze_cent=parse_eur_betrag(mietzinsobergrenze) if mietzinsobergrenze.strip() else None,
+            mietzinsobergrenze_quellenbeleg=mietzinsobergrenze_quellenbeleg or None,
+            mietzinsobergrenze_gueltig_bis=(
+                date.fromisoformat(mietzinsobergrenze_gueltig_bis) if mietzinsobergrenze_gueltig_bis.strip() else None
+            ),
+            bezugsjahr=int(bezugsjahr) if bezugsjahr.strip() else None,
+            bezugsmonat=int(bezugsmonat) if bezugsmonat.strip() else None,
+            letzte_basis_war_jahresdurchschnitt=bool(letzte_basis_war_jahresdurchschnitt),
+            basis_komponenten_ids=basis_komponenten_ids, vpi_reihe=vpi_reihe,
+            vertraglich_zulaessiger_betrag_cent=parse_eur_betrag(vertraglicher_betrag) if vertraglicher_betrag.strip() else None,
+            vertraglicher_quellenbeleg=vertraglicher_quellenbeleg or None,
+            vertraglicher_fruehestmoeglicher_termin=(
+                date.fromisoformat(vertraglicher_termin) if vertraglicher_termin.strip() else None
+            ),
+            vertragsklausel_id=int(vertragsklausel_id) if vertragsklausel_id.strip() else None,
+            vertrag_beleg_referenz=vertrag_beleg_referenz, klausel_referenz=klausel_referenz or None,
+            erstellt_von=session.user_id,
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Rechtsprofil", str(exc), f"/backoffice/vertrag/{vertrag_id}/rechtsprofil")
+    return RedirectResponse(url=f"/backoffice/vertrag/{vertrag_id}/rechtsprofil", status_code=303)
+
+
+@router.post("/indexautomatik/rechtsprofil/{rechtsprofil_id}/freigeben")
+def rechtsprofil_freigeben(request: Request, rechtsprofil_id: int, csrf_token: str = Form(...), session=Depends(_current_session)):
+    _verify_csrf(session, csrf_token)
+    profil = _indexautomatik.rechtsprofil_repository.get(rechtsprofil_id)
+    if profil is None:
+        return _fehlerseite(session, "Rechtsprofil", f"Unbekanntes Rechtsprofil {rechtsprofil_id}.")
+    try:
+        _indexautomatik.rechtsprofil_service.freigeben(rechtsprofil_id, ctx=_ctx(session), freigegeben_von=session.user_id)
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Rechtsprofil", str(exc), f"/backoffice/vertrag/{profil.vertrag_id}/rechtsprofil")
+    return RedirectResponse(url=f"/backoffice/vertrag/{profil.vertrag_id}/rechtsprofil", status_code=303)
+
+
+def _outbox_zeile_html(o) -> str:
+    aktion = ""
+    if o.status == "BEREIT":
+        aktion = f"""<form method="post" action="/backoffice/indexautomatik/outbox/{o.id}/versenden" class="inline">
+          {{csrf}}<button type="submit" class="secondary">Versenden</button></form>"""
+    elif o.status == "GESENDET":
+        aktion = f"""<form method="post" action="/backoffice/indexautomatik/outbox/{o.id}/zugang-bestaetigen" class="inline">
+          {{csrf}}
+          <select name="zugangsform">{"".join(option(f, f) for f in sorted(_ZUGANGSFORMEN_ALLE))}</select>
+          <input type="date" name="zugang_datum" required>
+          <input type="text" name="zugang_beleg" placeholder="Belegreferenz" required>
+          <button type="submit" class="secondary">Zugang bestätigen</button></form>"""
+    gruende = "<br>".join(h(g) for g in (o.blockiert_gruende or [])) or "-"
+    return (
+        "<tr>"
+        f"<td>{h(o.vertrag_id)}</td><td>{o.ziel_bewertungsjahr or '-'}</td><td>{o.index_anpassung_id or '-'}</td>"
+        f"<td>{eur(o.erhoehung_cent)}</td><td>{o.massgeblicher_termin.isoformat()}</td><td>{h(o.status)}</td>"
+        f"<td>{gruende}</td><td>{o.zahlungspflicht_ab.isoformat() if o.zahlungspflicht_ab else '-'}</td>"
+        f"<td>{aktion}</td></tr>"
+    )
+
+
+@router.get("/indexautomatik/outbox", response_class=HTMLResponse)
+def indexautomatik_outbox(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    schreiben = _indexautomatik.outbox_repository.liste_alle()
+    zeilen = "".join(_outbox_zeile_html(o).replace("{csrf}", csrf_feld(session.csrf_token)) for o in schreiben) or (
+        '<tr><td colspan=9 class="muted">Noch kein Erhöhungsschreiben vorhanden.</td></tr>'
+    )
+    inhalt = f"""
+    <div class="card">
+      <h1>Erhöhungsschreiben-Outbox</h1>
+      <p class="muted">Realer Versand erfordert MIETINKASSO_INDEXAUTOMATIK_SEND_ENABLED UND
+         MIETINKASSO_INDEXAUTOMATIK_MAILOPS_ALLOWLIST_BESTAETIGT (beide Default false) sowie einen
+         konfigurierten Transport-Endpunkt - ohne das bleibt "Versenden" eine reine Vorschau.</p>
+      <table>
+        <tr><th>Vertrag</th><th>Ziel-Jahr</th><th>IndexAnpassung</th><th>Erhöhung</th><th>Termin</th>
+          <th>Status</th><th>Gründe</th><th>Zahlungspflicht ab</th><th>Aktion</th></tr>
+        {zeilen}
+      </table>
+    </div>
+    """
+    return _layout(request, session, "Indexautomatik-Outbox", inhalt)
+
+
+@router.post("/indexautomatik/outbox/{erhoehungsschreiben_id}/versenden")
+def indexautomatik_outbox_versenden(request: Request, erhoehungsschreiben_id: int, csrf_token: str = Form(...), session=Depends(_current_session)):
+    _verify_csrf(session, csrf_token)
+    heute = heute_wien()
+    transport = (
+        HttpTransportadapter(
+            endpoint_url=_settings.indexautomatik_transport_endpoint_url,
+            api_key=_settings.indexautomatik_transport_api_key,
+        )
+        if _settings.indexautomatik_transport_endpoint_url and _settings.indexautomatik_transport_api_key
+        else FakeTransportadapter()
+    )
+    try:
+        ergebnis = _indexautomatik.outbox_service.versenden(
+            ctx=_ctx(session), erhoehungsschreiben_id=erhoehungsschreiben_id, heute=heute,
+            send_enabled=_settings.indexautomatik_send_enabled,
+            mailops_allowlist_bestaetigt=_settings.indexautomatik_mailops_allowlist_bestaetigt,
+            transport=transport,
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Indexautomatik-Outbox", str(exc), "/backoffice/indexautomatik/outbox")
+    inhalt = flash_ok(f"Versand: {ergebnis.status} — {ergebnis.grund}") + (
+        '<p><a href="/backoffice/indexautomatik/outbox">&larr; zurück</a></p>'
+    )
+    return _layout(request, session, "Indexautomatik-Outbox", inhalt)
+
+
+@router.post("/indexautomatik/outbox/{erhoehungsschreiben_id}/zugang-bestaetigen")
+def indexautomatik_outbox_zugang_bestaetigen(
+    request: Request,
+    erhoehungsschreiben_id: int,
+    zugangsform: str = Form(...),
+    zugang_datum: str = Form(...),
+    zugang_beleg: str = Form(...),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    try:
+        _indexautomatik.outbox_service.zugang_bestaetigen(
+            ctx=_ctx(session), erhoehungsschreiben_id=erhoehungsschreiben_id, heute=heute_wien(),
+            zugang_datum=date.fromisoformat(zugang_datum), zugangsform=zugangsform, zugang_beleg=zugang_beleg,
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Indexautomatik-Outbox", str(exc), "/backoffice/indexautomatik/outbox")
+    return RedirectResponse(url="/backoffice/indexautomatik/outbox", status_code=303)
+
+
+@router.get("/indexautomatik/vpi", response_class=HTMLResponse)
+def indexautomatik_vpi(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    werte = _indexautomatik.vpi_repository.jahreswert_liste()
+    zeilen = "".join(
+        f"<tr><td>{h(w.reihe)}</td><td>{w.jahr}</td><td>{w.wert}</td><td>{h(w.finalitaet)}</td>"
+        f"<td>{h(w.quelle)}</td><td>{h(w.erfasst_von)}</td></tr>"
+        for w in werte
+    ) or '<tr><td colspan=6 class="muted">Noch kein Jahreswert erfasst.</td></tr>'
+    inhalt = f"""
+    <div class="card">
+      <h1>VPI-Jahresdurchschnittswerte (manueller Override)</h1>
+      <p class="muted">Für den amtlichen Monatswerte-Import siehe scripts/indexautomatik_*.py bzw. den
+         nativen OGD-Parser (indexautomatik/vpi_import.py) - hier nur ein manuell belegter
+         Jahresdurchschnitt-Override mit Publikationsbeleg.</p>
+      <form method="post" action="/backoffice/indexautomatik/vpi/erfassen">
+        {csrf_feld(session.csrf_token)}
+        <label>Reihe</label>
+        <select name="reihe">{option("VPI20C18","VPI20C18",selected=True)}{option("VPI15C18","VPI15C18")}{option("VPI00","VPI00")}{option("VPI96","VPI96")}</select>
+        <label>Jahr</label><input type="number" name="jahr" min="1990" max="2100" required>
+        <label>Wert</label><input type="text" name="wert" required>
+        <label>Quelle</label><input type="text" name="quelle" required placeholder="z. B. Statistik Austria Pressemitteilung">
+        <label>Quelldatum</label><input type="date" name="quelle_datum" required>
+        <button type="submit">Jahreswert erfassen</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Erfasste Jahreswerte</h2>
+      <table><tr><th>Reihe</th><th>Jahr</th><th>Wert</th><th>Finalität</th><th>Quelle</th><th>Von</th></tr>{zeilen}</table>
+    </div>
+    """
+    return _layout(request, session, "VPI-Werte", inhalt)
+
+
+@router.post("/indexautomatik/vpi/erfassen")
+def indexautomatik_vpi_erfassen(
+    request: Request,
+    reihe: str = Form(...),
+    jahr: int = Form(...),
+    wert: str = Form(...),
+    quelle: str = Form(...),
+    quelle_datum: str = Form(...),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    try:
+        _indexautomatik.vpi_repository.jahreswert_erfassen(
+            reihe=reihe, jahr=jahr, wert=Decimal(wert.replace(",", ".")), quelle=quelle,
+            quelle_datum=date.fromisoformat(quelle_datum), erfasst_von=session.user_id,
+        )
+    except (InvalidOperation, ValueError) as exc:
+        return _fehlerseite(session, "VPI-Werte", f"Ungültiger Wert: {exc}", "/backoffice/indexautomatik/vpi")
+    return RedirectResponse(url="/backoffice/indexautomatik/vpi", status_code=303)
+
+
+def _vertragsende_zeile_html(e) -> str:
+    aktion = ""
+    if e.status in ("OFFEN", "BENACHRICHTIGT", "UNKLAR"):
+        aktion = f"""<form method="post" action="/backoffice/indexautomatik/vertragsende/{e.id}/entscheiden" class="inline">
+          {{csrf}}
+          <select name="entscheidung">{"".join(option(v, v) for v in ("VERLAENGERN_PRUEFEN","NICHT_VERLAENGERN_PRUEFEN","RUECKFRAGE"))}</select>
+          <button type="submit" class="secondary">Entscheiden</button></form>"""
+    elif e.status == "ENTSCHIEDEN" and not e.mieterentwurf_text:
+        aktion = f"""<form method="post" action="/backoffice/indexautomatik/vertragsende/{e.id}/mieterentwurf" class="inline">
+          {{csrf}}<button type="submit" class="secondary">Mieterentwurf erzeugen</button></form>"""
+    entwurf_hinweis = '<br><span class="muted">Entwurf vorhanden (nur intern, nie automatisch versendet)</span>' if e.mieterentwurf_text else ""
+    return (
+        "<tr>"
+        f"<td>{h(e.vertrag_id)}</td><td>{e.end_datum.isoformat()}</td><td>{e.faellig_am.isoformat()}</td>"
+        f"<td>{h(e.status)}</td><td>{h(e.entscheidung or '-')}{entwurf_hinweis}</td><td>{aktion}</td></tr>"
+    )
+
+
+@router.get("/indexautomatik/vertragsende", response_class=HTMLResponse)
+def indexautomatik_vertragsende(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    erinnerungen = _indexautomatik.vertragsende_repository.liste_alle()
+    zeilen = "".join(_vertragsende_zeile_html(e).replace("{csrf}", csrf_feld(session.csrf_token)) for e in erinnerungen) or (
+        '<tr><td colspan=6 class="muted">Noch keine Vertragsende-Erinnerung geplant.</td></tr>'
+    )
+    inhalt = f"""
+    <div class="card">
+      <h1>Vertragsende-Erinnerungen</h1>
+      <p class="muted">Empfänger ist ausschließlich der intern konfigurierte Eigentümer
+         (MIETINKASSO_OWNER_EMAIL) - nie der Mieter. Der Mieter wird ERST nach einer hier gespeicherten
+         Entscheidung überhaupt adressiert, und dann höchstens über einen manuell zu prüfenden Entwurf.</p>
+      <table>
+        <tr><th>Vertrag</th><th>Ende</th><th>Fällig am</th><th>Status</th><th>Entscheidung</th><th>Aktion</th></tr>
+        {zeilen}
+      </table>
+    </div>
+    """
+    return _layout(request, session, "Vertragsende-Erinnerungen", inhalt)
+
+
+@router.post("/indexautomatik/vertragsende/{erinnerung_id}/entscheiden")
+def indexautomatik_vertragsende_entscheiden(
+    request: Request, erinnerung_id: int, entscheidung: str = Form(...), csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    try:
+        _indexautomatik.vertragsende_service.entscheiden(
+            ctx=_ctx(session), erinnerung_id=erinnerung_id, entscheidung=entscheidung, entschieden_von=session.user_id,
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Vertragsende-Erinnerungen", str(exc), "/backoffice/indexautomatik/vertragsende")
+    return RedirectResponse(url="/backoffice/indexautomatik/vertragsende", status_code=303)
+
+
+@router.post("/indexautomatik/vertragsende/{erinnerung_id}/mieterentwurf")
+def indexautomatik_vertragsende_mieterentwurf(request: Request, erinnerung_id: int, csrf_token: str = Form(...), session=Depends(_current_session)):
+    _verify_csrf(session, csrf_token)
+    try:
+        _indexautomatik.vertragsende_service.mieterentwurf_erzeugen(ctx=_ctx(session), erinnerung_id=erinnerung_id)
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Vertragsende-Erinnerungen", str(exc), "/backoffice/indexautomatik/vertragsende")
+    return RedirectResponse(url="/backoffice/indexautomatik/vertragsende", status_code=303)
