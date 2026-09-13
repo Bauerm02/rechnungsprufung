@@ -252,6 +252,58 @@ def test_faelligkeitsklassen_ueberfaellig_kuenftig_unbekannt(admin_ctx, bestand,
     assert set(klassen.values()) == {"UEBERFAELLIG", "NICHT_FAELLIG", "UNBEKANNT"}
 
 
+def test_offene_position_zeigt_op_id_und_belegreferenz(admin_ctx, bestand, stammdaten_repo, op_service, mahn_fall_repo):
+    """Unabhängiger Review: 'Derzeit nur Belegdatum, damit kann man
+    ähnliche Forderungen nicht zuordnen.' - jede Einzelposition muss die
+    OP-ID UND die tatsächliche Belegreferenz der zugrunde liegenden
+    OP-Zeile tragen."""
+
+    uebersicht = berechne_rueckstandsuebersicht(
+        ctx=admin_ctx, objekt_id="601", stammdaten_repository=stammdaten_repo, op_service=op_service,
+        mahn_fall_repository=mahn_fall_repo, heute=_HEUTE,
+    )
+    v1_position = next(p for p in uebersicht.offene_positionen if p.vertrag_id == "V-601-1")
+    assert v1_position.op_position_id > 0
+    assert v1_position.beleg_referenz == "Miete August"
+    original = op_service.get_position(v1_position.op_position_id)
+    assert original is not None and original.beleg_referenz == v1_position.beleg_referenz
+
+
+def test_kontostand_ohne_entsprechende_einzelposition_zeigt_abweichung(
+    admin_ctx, stammdaten_repo, op_service, mahn_fall_repo
+):
+    """Unabhängiger Review, exakt reproduziert: eine positive KORREKTUR-
+    Buchung von 777 Cent erhöht den Kontostand auf 7,77 EUR, erzeugt aber
+    KEINE eigene offene Einzelposition (KORREKTUR ist keine Forderungsart
+    in `OPService.offene_forderungen`) - die Abweichung (7,77 EUR) muss
+    explizit an der Mietkonto-Zeile ausgewiesen werden, statt beide Werte
+    fälschlich gleichzusetzen."""
+
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")
+    stammdaten_repo.upsert_einheit(id="601-TOP1", objekt_id="601", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-1", name="Mieter Eins")
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-1", einheit_id="601-TOP1", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    vertrag = stammdaten_repo.get_vertrag("V-601-1")
+    konto = stammdaten_repo.get_or_create_konto(vertrag=vertrag)
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.KORREKTUR, betrag_cent=777, belegdatum=date(2026, 8, 1),
+        buchungsdatum=date(2026, 8, 1), faelligkeit=None, beleg_referenz="Manuelle Korrektur ohne Forderung",
+    )
+    uebersicht = berechne_rueckstandsuebersicht(
+        ctx=admin_ctx, objekt_id="601", stammdaten_repository=stammdaten_repo, op_service=op_service,
+        mahn_fall_repository=mahn_fall_repo, heute=_HEUTE,
+    )
+    zeile = uebersicht.mietkonten[0]
+    assert zeile.saldo_cent == 777
+    assert zeile.positionen_rest_gesamt_cent == 0
+    assert zeile.abweichung_saldo_zu_positionen_cent == 777
+    assert not any(p.vertrag_id == "V-601-1" for p in uebersicht.offene_positionen)
+
+
 def test_kontosaldo_und_einzelposition_koennen_bewusst_abweichen(
     admin_ctx, bestand, stammdaten_repo, op_service, mahn_fall_repo
 ):
@@ -339,24 +391,45 @@ def test_vertrag_ohne_konto_erscheint_ohne_saldo_nicht_als_absturz(admin_ctx, st
     assert zeile.saldo_cent is None
 
 
-def test_mahnsperre_und_mahnfallstufe_sichtbar(admin_ctx, bestand, stammdaten_repo, op_service, mahn_fall_repo):
+def test_mahnsperre_sichtbar(admin_ctx, bestand, stammdaten_repo, op_service, mahn_fall_repo):
     stammdaten_repo.sperre_setzen(vertrag_id="V-601-3", grund="RATENPLAN", kommentar="Ratenplan vereinbart")
-    _mahnfall_anlegen(
-        mahn_fall_repo, vertrag_id="V-601-1", gesellschaft_id="7DI", forderung_op_position_id=1,
-        stufe=1, outbox_key="MF-1",
-    )
-    _mahnfall_anlegen(
-        mahn_fall_repo, vertrag_id="V-601-1", gesellschaft_id="7DI", forderung_op_position_id=1,
-        stufe=2, outbox_key="MF-2",
-    )
     uebersicht = berechne_rueckstandsuebersicht(
         ctx=admin_ctx, objekt_id="601", stammdaten_repository=stammdaten_repo, op_service=op_service,
         mahn_fall_repository=mahn_fall_repo, heute=_HEUTE,
     )
     v3_zeile = next(z for z in uebersicht.mietkonten if z.vertrag_id == "V-601-3")
     assert "RATENPLAN" in v3_zeile.sperrgruende
+
+
+def test_alle_mahnfaelle_je_vertrag_sichtbar_nicht_nur_der_neueste(
+    admin_ctx, bestand, stammdaten_repo, op_service, mahn_fall_repo
+):
+    """Unabhängiger Review: 'nur mahnfaelle[0] pro Vertrag blendet andere
+    Forderungen/Stufen aus.' - Stufe 1 UND Stufe 2 (unterschiedliche
+    Forderungen) müssen BEIDE in der dedizierten Mahnfall-Übersicht
+    auftauchen, nicht nur die zuletzt angelegte Zeile."""
+
+    _mahnfall_anlegen(
+        mahn_fall_repo, vertrag_id="V-601-1", gesellschaft_id="7DI", forderung_op_position_id=1,
+        stufe=1, outbox_key="MF-1",
+    )
+    _mahnfall_anlegen(
+        mahn_fall_repo, vertrag_id="V-601-1", gesellschaft_id="7DI", forderung_op_position_id=2,
+        stufe=2, outbox_key="MF-2",
+    )
+    uebersicht = berechne_rueckstandsuebersicht(
+        ctx=admin_ctx, objekt_id="601", stammdaten_repository=stammdaten_repo, op_service=op_service,
+        mahn_fall_repository=mahn_fall_repo, heute=_HEUTE,
+    )
+    faelle_v1 = [m for m in uebersicht.mahnfaelle if m.vertrag_id == "V-601-1"]
+    assert {(m.stufe, m.forderung_op_position_id) for m in faelle_v1} == {(1, 1), (2, 2)}
     v1_zeile = next(z for z in uebersicht.mietkonten if z.vertrag_id == "V-601-1")
-    assert v1_zeile.mahnfall_stufe == 2  # der ZULETZT angelegte (neueste) Fall
+    assert v1_zeile.mahnfaelle_anzahl == 2
+    # Der ursprüngliche Fallbetrag ist rein informativ und darf NIRGENDS
+    # in die OP-Kennzahlen einfließen - V-601-1s Rest bleibt exakt 300 EUR
+    # (überfällig), obwohl ZWEI Mahnfälle à 100 EUR dafür existieren.
+    assert all(m.betrag_cent == 10_000 for m in faelle_v1)
+    assert uebersicht.kennzahlen.ueberfaellig_cent == 30_000
 
 
 def test_bekannte_faelligkeit_ist_keine_mahnfreigabe_und_unbekannte_nicht_automatisch_strittig():
@@ -441,6 +514,58 @@ def test_fremder_ctx_sieht_gar_nichts(ctx_factory, bestand, stammdaten_repo, op_
     assert {o.id for o in uebersicht.objekt_optionen} == {"900"}
     assert uebersicht.mietkonten and all(z.objekt_id == "900" for z in uebersicht.mietkonten)
     assert not any(z.objekt_id in ("601", "602") for z in uebersicht.mietkonten)
+
+
+def test_inkonsistenter_vertrag_unter_erlaubtem_objekt_wird_ausgeblendet(
+    ctx_factory, stammdaten_repo, op_service, mahn_fall_repo
+):
+    """Unabhängiger Review: 'fremde Gesellschaft an Vertrag oder Konto
+    unter sonst erlaubtem Objekt darf keine Daten durchlassen.' -
+    `list_vertraege_fuer_objekt` filtert NUR über Einheit->Objekt, nie
+    über das eigene `gesellschaft_id`-Feld des Vertrags. Ein Vertrag
+    (und das davon abgeleitete Konto), der unter einer erlaubten
+    Gesellschaft/Objekt hängt, aber selbst `gesellschaft_id='ANDERE'`
+    trägt (Dateninkonsistenz), darf für einen auf '7DI' beschränkten ctx
+    trotzdem NICHT sichtbar werden."""
+
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_gesellschaft(id="ANDERE", name="Andere GmbH")
+    stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")
+    stammdaten_repo.upsert_einheit(id="601-TOP1", objekt_id="601", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-1", name="Inkonsistenter Mieter")
+    # Einheit gehört zu Objekt 601 (Gesellschaft 7DI), der Vertrag TRÄGT
+    # ABER selbst gesellschaft_id="ANDERE" - eine Dateninkonsistenz, die
+    # `upsert_vertrag` technisch zulässt (keine Querprüfung).
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-INKONSISTENT", einheit_id="601-TOP1", debitor_id="DEB-1", gesellschaft_id="ANDERE",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    vertrag = stammdaten_repo.get_vertrag("V-601-INKONSISTENT")
+    konto = stammdaten_repo.get_or_create_konto(vertrag=vertrag)
+    ctx_admin_fuer_buchung = ctx_factory("ANDERE")  # Buchung selbst braucht Zugriff auf konto.gesellschaft_id
+    op_service.buchen(
+        ctx=ctx_admin_fuer_buchung, konto=konto, typ=OPTyp.SOLL, betrag_cent=123_456, belegdatum=date(2026, 8, 1),
+        buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 1), beleg_referenz="Darf für 7DI nie sichtbar sein",
+    )
+
+    scoped_ctx = ctx_factory("7DI")
+    uebersicht = berechne_rueckstandsuebersicht(
+        ctx=scoped_ctx, objekt_id="601", stammdaten_repository=stammdaten_repo, op_service=op_service,
+        mahn_fall_repository=mahn_fall_repo, heute=_HEUTE,
+    )
+    assert not any(z.vertrag_id == "V-601-INKONSISTENT" for z in uebersicht.mietkonten)
+    assert not any(p.vertrag_id == "V-601-INKONSISTENT" for p in uebersicht.offene_positionen)
+    # Die Einheit gilt trotzdem als "belegt" - sie darf NICHT fälschlich
+    # als "ohne Mietkonto" auftauchen, nur weil ihr (inkonsistenter)
+    # Vertrag ausgeblendet wurde.
+    assert not any(e.einheit_id == "601-TOP1" for e in uebersicht.einheiten_ohne_konto)
+    # Auch über "Alle Objekte" (kein expliziter Filter) bleibt sie unsichtbar.
+    alle = berechne_rueckstandsuebersicht(
+        ctx=scoped_ctx, objekt_id=None, stammdaten_repository=stammdaten_repo, op_service=op_service,
+        mahn_fall_repository=mahn_fall_repo, heute=_HEUTE,
+    )
+    assert not any(z.vertrag_id == "V-601-INKONSISTENT" for z in alle.mietkonten)
+    assert alle.kennzahlen.summe_positiver_kontostaende_cent == 0  # NICHT 123.456 EUR
 
 
 def test_uebersicht_ist_vollstaendig_schreibfrei(admin_ctx, bestand, stammdaten_repo, op_service, mahn_fall_repo):

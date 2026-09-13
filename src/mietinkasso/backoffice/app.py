@@ -304,7 +304,7 @@ def _rueckstaende_kpi_html(k) -> str:
     <div class="kpi-grid">
       {_kpi("Summe positiver Kontostände", k.summe_positiver_kontostaende_cent)}
       {_kpi("Guthaben gesamt (nicht verrechnet)", k.summe_guthaben_cent)}
-      {_kpi("Überfällig (bekannte Fälligkeit)", k.ueberfaellig_cent)}
+      {_kpi("Fällig/überfällig (bekanntes Datum)", k.ueberfaellig_cent)}
       {_kpi("Noch nicht fällig", k.nicht_faellig_cent)}
       {_kpi("Fälligkeit unbekannt", k.faelligkeit_unbekannt_cent)}
     </div>"""
@@ -318,12 +318,22 @@ def _rueckstaende_mietkonto_zeile_html(z) -> str:
         status_tags.append('<span class="badge badge-warn">Leerstand</span>')
     if z.sperrgruende:
         status_tags.append(f'<span class="badge badge-error">Sperre: {h(", ".join(z.sperrgruende))}</span>')
-    if z.mahnfall_stufe is not None:
-        status_tags.append(f'<span class="badge badge-muted">Mahnstufe {z.mahnfall_stufe} ({h(z.mahnfall_status or "")})</span>')
+    if z.mahnfaelle_anzahl:
+        status_tags.append(f'<span class="badge badge-muted">{z.mahnfaelle_anzahl} Mahnfall(e), siehe Tabelle unten</span>')
     konto_link = f'<a href="/backoffice/konto/{h(z.konto_id)}">{h(z.konto_id)}</a>' if z.konto_id else "-"
     mahnvorschau_link = (
         f'<a href="/backoffice/vertrag/{h(z.vertrag_id)}/mahnvorschau">Mahnvorschau</a>' if z.konto_id else ""
     )
+    # Abweichung Kontostand <-> Summe der Einzelpositionen NIE
+    # verschweigen (z. B. eine Korrekturbuchung ohne eigene offene
+    # Position) - nur bei Gleichstand "–" zeigen, sonst deutlich als
+    # Betrag mit Vorzeichen.
+    if z.abweichung_saldo_zu_positionen_cent:
+        abweichung_html = f'<span class="badge badge-warn">{eur(z.abweichung_saldo_zu_positionen_cent)}</span>'
+    elif z.abweichung_saldo_zu_positionen_cent == 0:
+        abweichung_html = "–"
+    else:
+        abweichung_html = "-"
     return (
         f"<tr class='{'gesperrt-row' if z.sperrgruende else ''}'>"
         f"<td>{h(z.objekt_bezeichnung)}</td>"
@@ -333,6 +343,9 @@ def _rueckstaende_mietkonto_zeile_html(z) -> str:
         f"<td>{konto_link}</td>"
         f"<td>{eur(z.saldo_cent) if z.saldo_cent is not None else '-'}</td>"
         f"<td>{eur(z.faelliger_unstrittiger_rest_cent) if z.faelliger_unstrittiger_rest_cent is not None else '-'}</td>"
+        f"<td>{eur(z.positionen_faelliger_rest_cent) if z.positionen_faelliger_rest_cent is not None else '-'}</td>"
+        f"<td>{eur(z.positionen_rest_gesamt_cent) if z.positionen_rest_gesamt_cent is not None else '-'}</td>"
+        f"<td>{abweichung_html}</td>"
         f"<td>{' '.join(status_tags)}</td>"
         f"<td>{mahnvorschau_link}</td>"
         "</tr>"
@@ -340,18 +353,25 @@ def _rueckstaende_mietkonto_zeile_html(z) -> str:
 
 
 _FAELLIGKEITSKLASSE_BADGE = {
-    "UEBERFAELLIG": '<span class="badge badge-error">überfällig</span>',
+    "UEBERFAELLIG": '<span class="badge badge-error">fällig/überfällig</span>',
     "NICHT_FAELLIG": '<span class="badge badge-muted">noch nicht fällig</span>',
     "UNBEKANNT": '<span class="badge badge-warn">Fälligkeit unbekannt</span>',
 }
 
 
 def _rueckstaende_position_zeile_html(p) -> str:
-    faelligkeit_html = p.faelligkeit.isoformat() if p.faelligkeit else '<span class="muted">unbekannt</span>'
+    # `faelligkeit_bekannt` ist die maßgebliche Angabe - ein trotzdem
+    # gespeichertes Datum bei faelligkeit_bekannt=False (inkonsistente
+    # Altdaten) darf NIE wie ein bestätigtes Datum aussehen.
+    faelligkeit_html = (
+        p.faelligkeit.isoformat() if (p.faelligkeit_bekannt and p.faelligkeit) else '<span class="muted">unbekannt</span>'
+    )
     return (
         "<tr>"
         f"<td>{h(p.objekt_bezeichnung)}</td>"
         f"<td>{h(p.vertrag_id)}</td><td>{h(p.debitor_name)}</td>"
+        f"<td>#{p.op_position_id}</td>"
+        f"<td>{h(p.beleg_referenz)}</td>"
         f"<td>{h(p.art)}</td>"
         f"<td>{h(p.leistungsperiode or '')}</td>"
         f"<td>{p.belegdatum.isoformat()}</td>"
@@ -359,6 +379,18 @@ def _rueckstaende_position_zeile_html(p) -> str:
         f"<td>{eur(p.rest_cent)}</td>"
         f"<td>{_FAELLIGKEITSKLASSE_BADGE.get(p.faelligkeitsklasse, '')}</td>"
         f"<td><a href='/backoffice/konto/{h(p.konto_id)}'>Konto</a></td>"
+        "</tr>"
+    )
+
+
+def _rueckstaende_mahnfall_zeile_html(m) -> str:
+    return (
+        "<tr>"
+        f"<td>{h(m.objekt_bezeichnung)}</td><td>{h(m.vertrag_id)}</td>"
+        f"<td>#{m.forderung_op_position_id}</td>"
+        f"<td>{m.stufe}</td><td>{h(m.status)}</td>"
+        f"<td>{eur(m.betrag_cent)}</td>"
+        f"<td>{m.geplant_am.date().isoformat()}</td>"
         "</tr>"
     )
 
@@ -399,31 +431,55 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
     <div class="card">
       <h2>Mietkontenübersicht — {titel_zusatz}</h2>
       <p class="muted">"Kontostand" = Eröffnung + Vorschreibungen − Zahlungen/Gutschriften (positiv: offener
-         Betrag; negativ: Guthaben). "Davon mit bekannter Fälligkeit" ist NUR die Teilmenge mit bereits
-         verstrichenem, bekanntem Fälligkeitsdatum - eine UNBEKANNTE Fälligkeit ist deshalb NICHT
-         automatisch strittig. Eine bekannte Fälligkeit ist umgekehrt KEINE Mahnfreigabe - eine aktive
-         Sperre (Spalte "Hinweise") blockiert unabhängig davon; Mahnstufe/-status stammen aus zuvor bereits
-         geplanten Mahnfällen, diese Übersicht plant selbst keine neuen.</p>
+         Betrag; negativ: Guthaben). Zwei getrennte Berechnungen desselben Kontos stehen nebeneinander:
+         "Fällig (Kontoberechnung)" ist die bestehende Kontostand-Rechnung, "Fällig (Positionen)"/
+         "Rest gesamt (Positionen)" ist die Summe der einzelnen offenen Posten weiter unten - beide können
+         voneinander abweichen (z. B. bei einer Korrekturbuchung ohne eigene Einzelposition), die Spalte
+         "Abweichung" zeigt das dann als Betrag statt es zu verstecken. Eine unbekannte Fälligkeit ist
+         NICHT automatisch strittig, und eine bekannte Fälligkeit ist KEINE Mahnfreigabe - eine aktive
+         Sperre (Spalte "Hinweise") blockiert unabhängig davon; Mahnfälle stammen aus zuvor bereits
+         geplanten Fällen (Tabelle weiter unten), diese Übersicht plant selbst keine neuen.</p>
+      <div class="tabelle-scroll">
       <table>
-        <tr><th>Objekt</th><th>Vertrag</th><th>Einheit</th><th>Nutzungsstatus</th><th>Debitor</th><th>Konto</th>
-            <th>Kontostand (offen/Guthaben)</th><th>Davon mit bekannter Fälligkeit</th><th>Hinweise</th><th></th></tr>
-        {mietkonten_html or '<tr><td colspan=10 class="muted">Keine Verträge.</td></tr>'}
+        <tr><th>Objekt</th><th>Vertrag</th><th>Einheit</th><th>Nutzungsstatus</th><th>Mieter</th><th>Konto</th>
+            <th>Kontostand (offen/Guthaben)</th><th>Fällig (Kontoberechnung)</th><th>Fällig (Positionen)</th>
+            <th>Rest gesamt (Positionen)</th><th>Abweichung</th><th>Hinweise</th><th></th></tr>
+        {mietkonten_html or '<tr><td colspan=13 class="muted">Keine Verträge.</td></tr>'}
       </table>
+      </div>
     </div>"""
 
     positionen_html = "".join(_rueckstaende_position_zeile_html(p) for p in uebersicht.offene_positionen)
     positionen_tabelle = f"""
     <div class="card">
       <h2>Offene Einzelpositionen — {titel_zusatz}</h2>
-      <p class="muted">Je Forderung getrennt (nicht der Kontosaldo) - Zahlungen/Gutschriften sind bereits
-         FIFO zugeordnet, gezeigt wird nur der verbleibende Rest. Kann von der Kontostand-Spalte oben
-         abweichen (unterschiedliche, beide bestehende Berechnungen desselben Kontos) - das wird hier
-         bewusst NICHT glattgerechnet.</p>
+      <p class="muted">Jede Zeile ist ein einzelner offener Posten (nicht der Kontosaldo) - eine Zahlung
+         wird zuerst der ältesten offenen Position zugeordnet, gezeigt wird nur der danach verbleibende
+         Rest. OP-Nr. und Beleg identifizieren die zugrunde liegende Buchung eindeutig, auch wenn mehrere
+         Positionen ähnlich aussehen.</p>
+      <div class="tabelle-scroll">
       <table>
-        <tr><th>Objekt</th><th>Vertrag</th><th>Debitor</th><th>Art</th><th>Zeitraum</th><th>Belegdatum</th>
-            <th>Fälligkeit</th><th>Rest</th><th>Status</th><th></th></tr>
-        {positionen_html or '<tr><td colspan=10 class="muted">Keine offenen Positionen.</td></tr>'}
+        <tr><th>Objekt</th><th>Vertrag</th><th>Mieter</th><th>OP-Nr.</th><th>Beleg</th><th>Art</th>
+            <th>Zeitraum</th><th>Belegdatum</th><th>Fälligkeit</th><th>Rest</th><th>Status</th><th></th></tr>
+        {positionen_html or '<tr><td colspan=12 class="muted">Keine offenen Positionen.</td></tr>'}
       </table>
+      </div>
+    </div>"""
+
+    mahnfaelle_html = "".join(_rueckstaende_mahnfall_zeile_html(m) for m in uebersicht.mahnfaelle)
+    mahnfaelle_tabelle = f"""
+    <div class="card">
+      <h2>Mahnfälle — {titel_zusatz}</h2>
+      <p class="muted">Alle bereits geplanten Mahnfälle je Forderung, nicht nur der zuletzt angelegte - so
+         bleiben auch ältere Stufen/Forderungen nachvollziehbar. Der Fallbetrag ist der ursprünglich
+         festgehaltene Betrag zum Planungszeitpunkt und fließt in KEINE Summe oben ein. Diese Übersicht
+         plant selbst keine neuen Mahnfälle.</p>
+      <div class="tabelle-scroll">
+      <table>
+        <tr><th>Objekt</th><th>Vertrag</th><th>OP-Nr.</th><th>Stufe</th><th>Status</th><th>Fallbetrag</th><th>Geplant am</th></tr>
+        {mahnfaelle_html or '<tr><td colspan=7 class="muted">Keine Mahnfälle.</td></tr>'}
+      </table>
+      </div>
     </div>"""
 
     bestand_html = "".join(
@@ -437,15 +493,17 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
       <p class="muted">Nutzungsstatus wird eingespielt/gepflegt, unabhängig davon, ob eine Mietforderung
          besteht (z. B. Leerstand, Kurzzeitvermietung, Selfstorage, Eigennutzung) - das ist BESTAND, kein
          erfundener Nullsaldo/Rückstand.</p>
+      <div class="tabelle-scroll">
       <table>
         <tr><th>Objekt</th><th>Einheit</th><th>Bezeichnung</th><th>Nutzungsstatus</th></tr>
         {bestand_html or '<tr><td colspan=4 class="muted">Keine Einheiten ohne Mietkonto.</td></tr>'}
       </table>
+      </div>
     </div>"""
 
     return _layout(
         request, session, "Rückstandsübersicht",
-        auswahl_form + kpi_html + mietkonten_tabelle + positionen_tabelle + bestand_tabelle,
+        auswahl_form + kpi_html + mietkonten_tabelle + positionen_tabelle + mahnfaelle_tabelle + bestand_tabelle,
     )
 
 

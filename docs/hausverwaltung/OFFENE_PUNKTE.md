@@ -1459,29 +1459,43 @@ in `RAHMENPROGRAMM.md` (Abschnitt "HV-20260913-RUECKSTAENDE").
 - **Fünf getrennte Kennzahlen statt einer Summe**: Summe positiver
   Kontostände; Guthaben gesamt (wird NIE gegen positive Kontostände
   anderer Mieter verrechnet - "Soll-/Habensalden je Konto getrennt");
-  überfällige/noch nicht fällige/Fälligkeit-unbekannte Summe der
-  EINZELPOSITIONEN (`OPService.offene_forderungen`, FIFO je Forderung).
-  Diese Positions-Sicht ist ausdrücklich NICHT dasselbe wie
-  `OPSaldo.faelliger_unstrittiger_rest_cent` (Konto-Sicht) - beide Werte
-  werden nebeneinander gezeigt (Mietkontentabelle: "Davon mit bekannter
-  Fälligkeit"; Kennzahlenleiste: "Fälligkeit unbekannt" etc.), nie
-  glattgerechnet. Ein dedizierter Test
-  (`test_kontosaldo_und_einzelposition_koennen_bewusst_abweichen`)
-  belegt einen Fall, in dem beide Zahlen tatsächlich auseinanderlaufen
-  (unbekannte Fälligkeit wird konto-seitig NICHT, positions-seitig SEHR
-  WOHL gezählt).
+  Summe "fällig/überfällig" (heute fällig ist noch nicht überfällig,
+  daher diese Formulierung statt eines pauschalen "überfällig")/noch
+  nicht fällige/Fälligkeit-unbekannte Summe der EINZELPOSITIONEN
+  (`OPService.offene_forderungen`). Diese Positions-Sicht ist
+  ausdrücklich NICHT dasselbe wie `OPSaldo.faelliger_unstrittiger_
+  rest_cent` (Konto-Sicht) - **Nachbesserung (Codex-Rückprüfung
+  abc4530):** die Mietkontentabelle zeigt jetzt BEIDE Zahlen je Konto
+  als eigene Spalten ("Fällig (Kontoberechnung)" und "Fällig
+  (Positionen)"/"Rest gesamt (Positionen)") PLUS eine explizite
+  numerische `abweichung_saldo_zu_positionen_cent`-Spalte, statt nur
+  eines pauschalen Hinweistexts. Ein dedizierter Test
+  (`test_kontostand_ohne_entsprechende_einzelposition_zeigt_abweichung`)
+  reproduziert exakt den gemeldeten Fall (positive KORREKTUR-Buchung
+  777 Cent: Kontostand 7,77 €, Einzelpositionen 0,00 €, Abweichung
+  7,77 € sichtbar).
 - **Mietkontentabelle** jetzt mit Objekt-Spalte (funktioniert dadurch
   sowohl gefiltert als auch über "Alle Objekte" hinweg), Konto- UND
-  Mahnvorschau-Link je Zeile, sowie einer Hinweis-Spalte, die aktive
+  Mahnvorschau-Link je Zeile, sowie einer Hinweis-Spalte für aktive
   Mahnsperren (Grund wörtlich aus `SperreTable.grund`, z. B. RATENPLAN/
-  RECHTSANWALT) UND den zuletzt bekannten Mahnfallstatus (Stufe +
-  Status aus dem NEUESTEN `MahnFallTable`-Eintrag je Vertrag, reiner
-  Read) gemeinsam zeigt - ohne dass eine bekannte Fälligkeit dabei
-  jemals als Mahnfreigabe dargestellt wird.
+  RECHTSANWALT). **Nachbesserung:** eine neue, eigene Mahnfälle-Tabelle
+  (`RueckstandsUebersicht.mahnfaelle`) zeigt JEDEN gespeicherten
+  Mahnfall (OP-Nr., Stufe, Status, ursprünglicher Fallbetrag, Datum) -
+  vorher wurde pro Vertrag nur der zuletzt angelegte Fall gezeigt, was
+  frühere Stufen/andere Forderungen ausblendete. Der Fallbetrag fließt
+  in KEINE OP-Kennzahl ein (Test:
+  `test_alle_mahnfaelle_je_vertrag_sichtbar_nicht_nur_der_neueste`).
+  Spaltenbezeichnung "Mieter" statt "Debitor"; Erklärungstexte ohne
+  interne Begriffe (kein "FIFO"/"Service"/"glattgerechnet").
 - **Neue Einzelpositionsübersicht** über alle offenen Forderungen im
-  gefilterten Bestand: Objekt, Vertrag/Debitor, Art, Zeitraum
+  gefilterten Bestand: Objekt, Vertrag/Mieter, **OP-Nr. und
+  Belegreferenz** (Nachbesserung - vorher nur Belegdatum, ähnliche
+  Forderungen waren nicht unterscheidbar), Art, Zeitraum
   (Leistungsperiode), Belegdatum, Fälligkeit, Rest, Fälligkeitsklasse
-  als Badge, Konto-Link.
+  als Badge, Konto-Link. Eine unbekannte Fälligkeit (`faelligkeit_
+  bekannt=False`) zeigt IMMER "unbekannt", selbst wenn inkonsistente
+  Altdaten trotzdem ein Datum gespeichert hätten - nie ein scheinbar
+  bestätigtes Datum.
 - **Einheiten ohne Mietkonto** (Leerstand/Kurzzeitvermietung/
   Selfstorage/Eigennutzung) erscheinen in einer eigenen Liste über alle
   gefilterten Objekte - niemals als Mietkonto-Zeile mit erfundenem
@@ -1495,7 +1509,14 @@ in `RAHMENPROGRAMM.md` (Abschnitt "HV-20260913-RUECKSTAENDE").
   `UnbekanntesObjektFilterError`) abgelehnt - kein stiller Wechsel auf
   "Alle Objekte", kein Erkenntnisgewinn für den Aufrufer, welcher der
   drei Fälle vorliegt (HTTP: 400 mit verständlicher Fehlerseite statt
-  500 oder stillschweigendem Fallback).
+  500 oder stillschweigendem Fallback). **Nachbesserung:** zusätzlich
+  wird JEDER Vertrag (und ein davon abgeleitetes Konto) zusätzlich
+  gegen sein EIGENES `gesellschaft_id`-Feld geprüft und übersprungen,
+  falls das nicht im `ctx`-Zugriff liegt - `list_vertraege_fuer_objekt`
+  filtert nur über Einheit->Objekt, nie über dieses Feld, ein
+  inkonsistenter Vertrag unter einem sonst erlaubten Objekt hätte sonst
+  Finanzdaten einer fremden Gesellschaft durchgelassen (Test:
+  `test_inkonsistenter_vertrag_unter_erlaubtem_objekt_wird_ausgeblendet`).
 - **Vollständig GET-seiteneffektfrei**: die Übersicht kombiniert
   ausschließlich bereits bestehende Lesepfade
   (`StammdatenRepository`, `OPService.berechne_saldo`/
@@ -1505,18 +1526,24 @@ in `RAHMENPROGRAMM.md` (Abschnitt "HV-20260913-RUECKSTAENDE").
   (`test_uebersicht_ist_vollstaendig_schreibfrei`) ruft die Berechnung
   mehrfach auf und prüft, dass sich weder OP- noch Mahnfall-Zeilenzahl
   ändert.
-- 21 neue Tests in `test_rueckstaende_service.py` (Scope/Ausschluss,
+- 25 Tests in `test_rueckstaende_service.py` (Scope/Ausschluss,
   Guthaben-ohne-Verrechnung, Fälligkeitsklassen, Storno, historischer
-  Vertrag mit Rest, Leerstand/fehlendes Konto, Mahnsperre/-stufe,
-  Konto-vs-Position-Abweichung, identische Filterwirkung, einheitliche
-  Ablehnung fremd/ausgeschlossen/unbekannt, Schreibfreiheit) plus 2 neue
+  Vertrag mit Rest, Leerstand/fehlendes Konto, Mahnsperre, ALLE
+  Mahnfälle je Vertrag statt nur der neueste, Konto-vs-Position-
+  Abweichung inkl. der 777-Cent-KORREKTUR-Gegenprobe, OP-ID/
+  Belegreferenz je Einzelposition, inkonsistenter Vertrag/Konto unter
+  erlaubtem Objekt, identische Filterwirkung, einheitliche Ablehnung
+  fremd/ausgeschlossen/unbekannt, Schreibfreiheit) plus 3 neue
   HTTP-Tests in `test_backoffice.py` (Standardansicht nicht mehr leer,
-  Objektfilter wirkt konsistent) und 2 angepasste Bestandstests
-  (Umbenennung "Einheiten ohne aktiven Vertrag" → "Einheiten ohne
-  Mietkonto"; Objekt 107 wird auf dieser Route jetzt aktiv abgelehnt
-  statt nur-lesend mit Banner gezeigt - Kontoauszug-Verhalten für 107
-  bleibt unverändert). Gesamter Mietinkasso-Testsatz: 752 Tests grün
-  (731 vorher + 21 neue in test_rueckstaende_service.py).
+  Objektfilter wirkt konsistent, OP-Nr./Belegreferenz sichtbar) und 3
+  angepasste Bestandstests (Umbenennung "Einheiten ohne aktiven
+  Vertrag" → "Einheiten ohne Mietkonto"; Objekt 107 wird auf dieser
+  Route jetzt aktiv abgelehnt statt nur-lesend mit Banner gezeigt -
+  Kontoauszug-Verhalten für 107 bleibt unverändert; Spaltenbeschriftung
+  "Fällig (Kontoberechnung)"/"Fällig (Positionen)" statt der
+  mehrdeutigen "Davon mit bekannter Fälligkeit" NUR auf dieser Route -
+  der Kontoauszug selbst behält seine Beschriftung). Gesamter
+  Mietinkasso-Testsatz: 757 Tests grün.
 
 ### Was ausdrücklich NICHT geliefert ist (bewusste, offen benannte Lücken)
 

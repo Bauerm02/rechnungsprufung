@@ -801,14 +801,34 @@ reinen Dokuänderungen.
 - Einheiten ohne (aktiven) Vertrag/Mietkonto erscheinen in einer
   eigenen Liste (`EinheitOhneKontoZeile`), NIE als Mietkonto-Zeile mit
   Saldo 0.
-- Mahnstatus stammt ausschließlich aus dem NEUESTEN bereits
-  gespeicherten `MahnFallTable`-Eintrag je Vertrag (reiner Read); Sperr-
-  gründe kommen unverändert aus `StammdatenRepository.aktive_sperren`.
-  Kein Namens-/Saldo-Heurismus für "strittig" - das Datenmodell kennt
-  bewusst kein solches Feld.
+- Mahnstatus stammt ausschließlich aus bereits gespeicherten
+  `MahnFallTable`-Einträgen (reiner Read); Sperrgründe kommen
+  unverändert aus `StammdatenRepository.aktive_sperren`. Kein Namens-/
+  Saldo-Heurismus für "strittig" - das Datenmodell kennt bewusst kein
+  solches Feld.
 - Backoffice-Route `/backoffice/` (`dashboard()`) wurde komplett auf
   diese eine Berechnung umgestellt: Objektfilter, Kennzahlen,
-  Mietkontentabelle, neue Einzelpositionsübersicht und "Einheiten ohne
-  Mietkonto" stammen alle aus DERSELBEN `RueckstandsUebersicht` - keine
-  der vier Ansichten kann dadurch aus dem gefilterten Bestand
-  herausfallen.
+  Mietkontentabelle, Einzelpositionsübersicht, Mahnfälle-Übersicht und
+  "Einheiten ohne Mietkonto" stammen alle aus DERSELBEN
+  `RueckstandsUebersicht` - keine der Ansichten kann dadurch aus dem
+  gefilterten Bestand herausfallen.
+
+### Nachbesserung nach Codex-Rückprüfung `abc4530` (13.09.2026)
+
+Kleine gezielte Korrektur, kein Neuentwurf: (1) jede Einzelposition
+zeigt jetzt OP-Nr. UND Belegreferenz der zugrunde liegenden OP-Zeile;
+(2) eine neue, eigene Mahnfälle-Tabelle zeigt JEDEN gespeicherten
+Mahnfall je Forderung (vorher nur der zuletzt angelegte pro Vertrag),
+Fallbetrag bleibt informativ und fließt in keine OP-Kennzahl ein; (3)
+je Mietkonto-Zeile eine explizite numerische Abweichung zwischen
+Kontostand und Summe der Einzelpositionen, plus getrennte "Fällig
+(Kontoberechnung)"/"Fällig (Positionen)"-Spalten statt eines pauschalen
+Hinweistexts; (4) Anzeige verständlicher (Mieter statt Debitor, keine
+FIFO-/Service-/glattgerechnet-Begriffe, "fällig/überfällig" statt
+pauschal "überfällig", `faelligkeit_bekannt` statt bloßer Datums-
+Truthiness); (5) ein Vertrag/Konto, dessen eigenes `gesellschaft_id`
+nicht zum ctx-Zugriff passt, wird jetzt auch unter einem sonst
+erlaubten Objekt übersprungen (Dateninkonsistenz-Schutz). Zusätzlich:
+Dashboard-Tabellen liegen jetzt in einem horizontal scrollbaren
+Container (`.tabelle-scroll`, nur diese Tabellen betroffen), damit die
+zusätzlichen Spalten die Seite bei schmaler Anzeige nicht verbreitern.

@@ -199,6 +199,43 @@ def test_dashboard_objektfilter_wirkt_identisch_auf_alle_ansichten(backoffice_cl
     assert 'value="107"' not in gefiltert.text  # ausgeschlossenes Objekt ist keine Filteroption
 
 
+def test_dashboard_einzelposition_zeigt_op_nr_und_belegreferenz(backoffice_client):
+    """Codex-Rückprüfung zu abc4530: 'Derzeit nur Belegdatum, damit kann
+    man ähnliche Forderungen nicht zuordnen.' - jede offene Einzelposition
+    muss ihre OP-Nummer und die tatsächliche Belegreferenz zeigen. Eigene,
+    isolierte Einheit/Vertrag/Konto - das gemeinsam genutzte V-601-1 wird
+    von saldo-sensitiven Tests an anderer Stelle in dieser Datei erwartet
+    und darf hier nicht zusätzlich bebucht werden."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-OPNR", objekt_id="601", bezeichnung="Top OP-Nr", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-OPNR", einheit_id="601-TOP-OPNR", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-OPNR"))
+
+    synthetische_referenz = "Synthetischer Beleg RP-4711"
+    position = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=12_300,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
+        beleg_referenz=synthetische_referenz,
+    )
+    dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+    assert dashboard.status_code == 200
+    assert "OP-Nr." in dashboard.text
+    assert f"#{position.id}" in dashboard.text
+    assert synthetische_referenz in dashboard.text
+
+
 def test_dashboard_zeigt_pilot_banner_in_development_umgebung(backoffice_client):
     """Diese Fixture importiert `api.app` mit `MIETINKASSO_ENVIRONMENT`
     unausgesprochen auf dem Default "development" - der Banner muss
@@ -1366,7 +1403,13 @@ def test_dashboard_relabeling_kontostand_und_faelligkeit(backoffice_client):
     _login(client)
     objekt_seite = client.get("/backoffice/?objekt_id=601")
     assert "Kontostand (offen/Guthaben)" in objekt_seite.text
-    assert "Davon mit bekannter Fälligkeit" in objekt_seite.text
+    # Auftrag HV-20260913-RUECKSTAENDE, Nachbesserung: die Rückstands-
+    # übersicht zeigt die bestehende Kontoberechnung und die Summe der
+    # Einzelpositionen jetzt EXPLIZIT als zwei getrennt beschriftete
+    # Spalten (statt eines einzigen, mehrdeutigen "Davon mit bekannter
+    # Fälligkeit").
+    assert "Fällig (Kontoberechnung)" in objekt_seite.text
+    assert "Fällig (Positionen)" in objekt_seite.text
 
     konto_seite = client.get(f"/backoffice/konto/{konto_id}")
     assert "Kontostand (offen/Guthaben)" in konto_seite.text

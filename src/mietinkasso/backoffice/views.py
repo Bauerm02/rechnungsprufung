@@ -188,6 +188,7 @@ def seite(
   .badge-error {{ background: #fbeaea; color: #b00020; }}
   .badge-warn {{ background: #fdf0dc; color: #a15c00; }}
   .badge-muted {{ background: #eee; color: #555; }}
+  .tabelle-scroll {{ overflow-x: auto; max-width: 100%; }}
   label {{ display: block; margin: 0.5rem 0 0.15rem; font-weight: 600; font-size: 0.85rem; }}
   input, select, textarea {{ width: 100%; box-sizing: border-box; padding: 0.35rem 0.5rem; font: inherit; border: 1px solid #ccc; border-radius: 4px; }}
   button, input[type=submit] {{ font: inherit; padding: 0.4rem 0.9rem; cursor: pointer; border-radius: 4px; border: 1px solid #14213d; background: #14213d; color: #fff; width: auto; margin-top: 0.6rem; }}
