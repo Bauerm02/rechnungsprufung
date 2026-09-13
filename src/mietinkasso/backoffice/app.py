@@ -45,6 +45,7 @@ from mietinkasso.audit.service import AuditService
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.backoffice.security import LoginRateLimiter, SessionStore, pruefe_passwort
 from mietinkasso.backoffice.indexklausel_form import klausel_formular, klausel_form_werte
+from mietinkasso.backoffice.zinsprofil_form import basiszinssatz_formular, zinsprofil_form_werte, zinsprofil_formular
 from mietinkasso.backoffice.vertragsanlage_form import (
     bestehende_werte as _vertragsanlage_bestehende_werte,
     detail_ansicht as _vertragsanlage_detail_ansicht,
@@ -77,6 +78,7 @@ from mietinkasso.index.service import UNTERSTUETZTE_BERECHNUNGSPROFILE, IndexSer
 from mietinkasso.infrastructure.config import get_settings
 from mietinkasso.infrastructure.db.session import build_session_factory
 from mietinkasso.infrastructure.db.tables import IndexKlauselTable, VpiMonatswertTable
+from mietinkasso.infrastructure.db.tables import ZinsprofilTable as _ZinsprofilTable
 from mietinkasso.intake.apply import wende_an as _intake_wende_an
 from mietinkasso.intake.parser import IntakeFormatFehlerError, parse_json_paket as _intake_parse_json_paket
 from mietinkasso.intake.planner import erstelle_plan as _intake_erstelle_plan
@@ -1503,7 +1505,51 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
       </table>
       <p class="muted">Die Vorschau versendet keine Nachricht. Der separate Versand prüft unmittelbar davor den aktuellen Bank- und Forderungsstand.</p>
     </div>"""
+    inhalt += _mahnkosten_vorschau_block(vertrag_id, heute_datum)
     return _layout(request, session, "Mahnvorschau", inhalt)
+
+
+def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
+    """Mahngebühren-/Verzugszinsenvorschau je Stufe (Auftrag Markus
+    13.09.2026) - reine Anzeige, bucht nichts. Zeigt Hauptforderung,
+    bereits gebuchte Nebenkosten, neue zulässige Gebühr und Zinsen
+    (mit Satz/Zeitraum) GETRENNT je Mahnstufe, wie ausdrücklich
+    gefordert. `_hv_mail.mahnkosten_service` ist dieselbe Instanz, die
+    auch den tatsächlichen Versand bucht (siehe
+    `indexautomatik/mailversand_service.py`)."""
+
+    zeilen = []
+    for stufe in (1, 2):
+        vorschau = _hv_mail.mahnkosten_service.vorschau(vertrag_id=vertrag_id, stufe=stufe, heute=heute_datum)
+        if vorschau is None:
+            continue
+        satz_text = f"{vorschau.zinssatz_prozent} % p.a." if vorschau.zinssatz_prozent is not None else "ungeklärt"
+        zeitraum_text = (
+            f"{vorschau.zins_von.isoformat()} – {vorschau.zins_bis.isoformat()}"
+            if vorschau.zins_von and vorschau.zins_bis else "–"
+        )
+        gebuehr_text = eur(vorschau.gebuehr_cent) if vorschau.gebuehr_cent is not None else "keine (bereits gebucht oder ungeklärt)"
+        hinweise_html = "".join(f"<li>{h(hw)}</li>" for hw in vorschau.hinweise)
+        ausgeschlossen_html = "".join(f"<li class='warn'>{h(hw)}</li>" for hw in vorschau.ausgeschlossene_forderungen_hinweis)
+        zeilen.append(f"""
+        <div class="card">
+          <h3>Stufe {stufe}</h3>
+          <table>
+            <tr><th>Hauptforderung</th><td>{eur(vorschau.hauptforderung_cent)}</td></tr>
+            <tr><th>Bereits gebuchte Zinsen (vertragsweit, alle Stufen)</th><td>{eur(vorschau.bereits_gebuchte_zinsen_cent)}</td></tr>
+            <tr><th>Neu zu bebuchende Zinsen (Delta)</th><td>{eur(max(vorschau.neue_zinsen_cent - vorschau.bereits_gebuchte_zinsen_cent, 0))}</td></tr>
+            <tr><th>Zinssatz / Basis</th><td>{h(satz_text)} ({h(vorschau.zinsbasis)})</td></tr>
+            <tr><th>Zinszeitraum</th><td>{h(zeitraum_text)}</td></tr>
+            <tr><th>Neue Mahngebühr</th><td>{h(gebuehr_text)}{f" ({h(vorschau.gebuehr_rechtsgrundlage)})" if vorschau.gebuehr_rechtsgrundlage else ""}</td></tr>
+          </table>
+          <ul class="muted">{hinweise_html}</ul>
+          {"<ul>" + ausgeschlossen_html + "</ul>" if ausgeschlossen_html else ""}
+        </div>""")
+    if not zeilen:
+        return ""
+    return f"""<div class="card"><h2>Mahnkosten (Verzugszinsen/Mahngebühren) — reine Vorschau, keine Buchung</h2>
+      <p><a href="/backoffice/vertrag/{h(vertrag_id)}/zinsprofil">Zinsprofil erfassen/prüfen</a> &nbsp;|&nbsp;
+      <a href="/backoffice/basiszinssatz">OeNB-Basiszinssatz erfassen</a></p></div>{''.join(zeilen)}"""
 
 
 @router.post("/mahnfall/{mahnfall_id}/sendebereitschaft", response_class=HTMLResponse)
@@ -1534,6 +1580,87 @@ def mahnfall_versenden(request: Request, mahnfall_id: int, csrf_token: str = For
         return _fehlerseite(session, "Mahnversand", str(exc), "/backoffice/mailversand")
     return _layout(request, session, "Mahnversand", flash_ok(f"{result.status} — {result.grund}") +
         '<p><a href="/backoffice/mailversand">Versandnachweise ansehen</a></p>')
+
+
+# -- Zinsprofil / OeNB-Basiszinssatz (Mahnkosten, Auftrag Markus 13.09.2026) -
+
+
+@router.get("/vertrag/{vertrag_id}/zinsprofil", response_class=HTMLResponse)
+def zinsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_current_session)) -> HTMLResponse:
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Zinsprofil", "Vertrag nicht verfügbar.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    profile = _hv_mail.mahnkosten_repo.liste_fuer_vertrag(vertrag_id)
+    return _layout(request, session, "Zinsprofil", zinsprofil_formular(vertrag, profile, session.csrf_token))
+
+
+@router.post("/vertrag/{vertrag_id}/zinsprofil/erstellen")
+async def zinsprofil_erstellen(request: Request, vertrag_id: str, session=Depends(_current_session)):
+    form = await request.form()
+    _verify_csrf(session, str(form.get("csrf_token", "")))
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Zinsprofil", "Vertrag nicht verfügbar.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    require_schreibrecht(_ctx(session))
+    try:
+        werte = zinsprofil_form_werte(form)
+        profil = _hv_mail.mahnkosten_repo.zinsprofil_anlegen(vertrag_id=vertrag_id, erstellt_von=session.user_id, **werte)
+        _audit_service.log(entity_typ="zinsprofil", entity_id=str(profil.id), aktion="ENTWURF_ERFASST",
+                           akteur=session.user_id, payload={"vertrag_id": vertrag_id, "version": profil.version})
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Zinsprofil", str(exc), f"/backoffice/vertrag/{vertrag_id}/zinsprofil")
+    return RedirectResponse(f"/backoffice/vertrag/{vertrag_id}/zinsprofil", status_code=303)
+
+
+@router.post("/zinsprofil/{zinsprofil_id}/freigeben")
+def zinsprofil_freigeben(request: Request, zinsprofil_id: int, csrf_token: str = Form(...), session=Depends(_current_session)):
+    _verify_csrf(session, csrf_token)
+    with _session_factory() as db:
+        row = db.get(_ZinsprofilTable, zinsprofil_id)
+        vertrag_id = row.vertrag_id if row is not None else None
+    if row is None or row.status != "ENTWURF" or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Zinsprofil", "Kein bestätigbarer Zinsprofil-Entwurf vorhanden.")
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    require_schreibrecht(_ctx(session))
+    try:
+        _hv_mail.mahnkosten_repo.zinsprofil_freigeben(zinsprofil_id, freigegeben_von=session.user_id)
+        _audit_service.log(entity_typ="zinsprofil", entity_id=str(zinsprofil_id), aktion="ZINSPROFIL_BESTAETIGT",
+                           akteur=session.user_id, payload={"vertrag_id": vertrag_id})
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Zinsprofil", str(exc))
+    return RedirectResponse(f"/backoffice/vertrag/{vertrag_id}/zinsprofil", status_code=303)
+
+
+@router.get("/basiszinssatz", response_class=HTMLResponse)
+def basiszinssatz_uebersicht(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    basiszinssaetze = _hv_mail.mahnkosten_repo.liste_basiszinssaetze()
+    return _layout(request, session, "OeNB-Basiszinssatz", basiszinssatz_formular(basiszinssaetze, session.csrf_token))
+
+
+@router.post("/basiszinssatz/erfassen")
+async def basiszinssatz_erfassen(request: Request, session=Depends(_current_session)):
+    form = await request.form()
+    _verify_csrf(session, str(form.get("csrf_token", "")))
+    require_schreibrecht(_ctx(session))
+    try:
+        from decimal import Decimal, InvalidOperation
+        try:
+            satz = Decimal(str(form.get("basiszinssatz_prozent", "")).strip().replace(",", "."))
+        except InvalidOperation as exc:
+            raise ValueError("Ungültiger Basiszinssatz.") from exc
+        _hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+            id=str(form.get("id", "")).strip(),
+            gueltig_von=date.fromisoformat(str(form.get("gueltig_von", "")).strip()),
+            gueltig_bis=date.fromisoformat(str(form.get("gueltig_bis", "")).strip()),
+            basiszinssatz_prozent=satz, erfasst_von=session.user_id,
+            quelle_referenz=str(form.get("quelle_referenz", "")).strip(),
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "OeNB-Basiszinssatz", str(exc), "/backoffice/basiszinssatz")
+    return RedirectResponse("/backoffice/basiszinssatz", status_code=303)
 
 
 @router.get("/mailversand", response_class=HTMLResponse)

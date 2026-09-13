@@ -96,12 +96,18 @@ class MahnwesenService:
         mahn_policy_repository: MahnPolicyRepository,
         *,
         bank_stand_max_age_days: int = 2,
+        mahnkosten_service=None,
     ):
         self._repository = repository
         self._stammdaten_repository = stammdaten_repository
         self._op_service = op_service
         self._mahn_policy_repository = mahn_policy_repository
         self._bank_stand_max_age_days = bank_stand_max_age_days
+        # Optional (siehe `mahnwesen/kosten_service.py`) - ohne konfigurierten
+        # Service bleibt das Verhalten UNVERÄNDERT gegenüber vor Auftrag
+        # HV-20260913-MAHNKOSTEN (keine Kostenbuchung beim Versand), damit
+        # bestehende Aufrufer/Tests ohne Anpassung weiterlaufen.
+        self._mahnkosten_service = mahnkosten_service
 
     def _naechste_stufe_fuer_forderung(self, forderung_op_position_id: int) -> MahnStufe | None:
         letzter = self._repository.letzter_mahnfall_fuer_forderung(forderung_op_position_id)
@@ -404,6 +410,21 @@ class MahnwesenService:
         versand_belegen(self._repository._session_factory, MahnFallTable, mahnfall_id,
             ergebnis=beleg, erlaubt={"IN_VERSAND", "UNSICHER"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
             referenz="mahnung:" + mahnfall.outbox_key)
+
+        # Mahnkosten (Verzugszinsen/Mahnspesen, Auftrag Markus 13.09.2026)
+        # werden AUSSCHLIESSLICH hier, unmittelbar nach dem bestätigten
+        # Versandnachweis, gebucht - nie bei einer Vorschau, einem
+        # fehlgeschlagenen Versand oder einem Retry ohne neuen Nachweis
+        # (siehe `kosten_service.py`-Moduldoc). Ein Fehler hier darf den
+        # bereits abgeschlossenen Versand NICHT rückgängig machen - die
+        # Mahnung ist unabhängig von der Kostenbuchung bereits gültig
+        # zugestellt; ein Buchungsfehler wird geloggt/propagiert nicht
+        # als Versandfehler.
+        if self._mahnkosten_service is not None:
+            self._mahnkosten_service.buche_bei_versand(
+                ctx=ctx, vertrag_id=vertrag.id, stufe=mahnfall.stufe, heute=heute,
+                versandnachweis_referenz="mahnung:" + mahnfall.outbox_key, akteur=ctx.user_id,
+            )
         return VersandErgebnis("GESENDET", "Tatsächlicher Versand im Maildienst nachgewiesen.")
 
     def markiere_verwaiste_als_unsicher(self, *, jetzt: datetime | None = None, max_alter: timedelta = timedelta(minutes=15)) -> list[MahnFallTable]:

@@ -919,3 +919,67 @@ erlaubten Objekt übersprungen (Dateninkonsistenz-Schutz). Zusätzlich:
 Dashboard-Tabellen liegen jetzt in einem horizontal scrollbaren
 Container (`.tabelle-scroll`, nur diese Tabellen betroffen), damit die
 zusätzlichen Spalten die Seite bei schmaler Anzeige nicht verbreitern.
+
+## Auftrag Mahnkosten (Verzugszinsen/Mahngebühren, 13.09.2026)
+
+Nutzerauftrag (verbatim, gekürzt um Wiederholungen): "pro Mahnlauf
+Mahngebühren, und die Zinsen dazu, soviel wie gesetzlich erlaubt ist.
+Bestehende gebuchte Spesen/Zinsen bleiben erhalten [...] Die alte
+pauschale Nullgebührenvorgabe ist durch diesen Nutzerauftrag überholt;
+keine Fantasie-Höchstpauschale."
+
+Fachliche Leitplanken (von Codex nach Primärquellenprüfung, verbatim
+festgehalten - bindend für jede Berechnung in `mahnwesen/kosten.py`):
+
+- **ABGB §§1000/1333**: gesetzlich grundsätzlich 4 % p.a.; zulässige
+  abweichende Vereinbarungen müssen separat nachgewiesen sein. §1333
+  Abs 2 erlaubt nur notwendige, zweckmäßige, schuldhaft verursachte
+  tatsächliche Kosten in angemessenem Verhältnis zur Hauptforderung.
+  Eine gelesene Vertragsklausel allein ist noch KEINE
+  Wirksamkeitsfreigabe; keine pauschalen 20 EUR für alle.
+- **KSchG §6 Abs 1 Z 13 / OGH 7Ob111/25m**: die Fünf-Prozentpunkte-
+  Grenze ist KEINE generelle Erlaubnis, jede darunterliegende Klausel
+  zu verwenden. Keine automatische 8 %-Verbraucherklausel ohne Prüfung.
+- **§456 UGB (ab 16.03.2013)**: 9,2 Prozentpunkte über der
+  Halbjahresbasis NUR bei beiderseits unternehmensbezogenem Geschäft
+  und zu verantwortendem Verzug, sonst gesetzliche 4 %. Alte Verträge
+  vor 16.03.2013 werden separat behandelt bzw. gezielt vom §456-Pfad
+  ausgeschlossen, nie fälschlich mit 9,2 % versehen. OeNB-Basiszinssatz
+  je Halbjahr manuell erfasst (z. B. 01.01./01.07.2026 je 1,53 %, ergibt
+  B2B 10,73 %); zukünftige Halbjahre führen NIE stillschweigend den
+  alten Wert fort.
+- **§458 UGB**: die Mahnspesen-Pauschale (hier: die geprüfte
+  Kostenbasis aus `ZinsprofilTable`) wird NUR EINMAL je zugrunde
+  liegendem Mahnlauf (Vertrag+Stufe, vertragsweit über alle Stufen
+  geprüft) angesetzt, NIE je einzelner OP-Zeile/Mietkomponente.
+- Quellen: RIS ABGB §1000, RIS ABGB §1333, OeNB Anknüpfungszinssätze,
+  Parlament.gv.at (UGB-Novellierungsmaterialien 16.03.2013), OGH
+  7Ob111/25m.
+
+Ergänzender Reviewpunkt (vor Umsetzung, verbatim gekürzt): "`service.py
+plane_alle_offenen_forderungen` läuft je OP-Zeile. Unsere
+Monatsvorschreibungen haben getrennte HMZ/BK/HK/Küche/Parkplatz-Zeilen.
+'Pro Mahnlauf' darf dadurch keinesfalls 5-10 Gebühren oder 5-10
+einzelne Mails je Mieter/Monat erzeugen. Kosten an ein tatsächlich
+gemeinsames Mahnschreiben/Mahnlauf-ID je Vertrag/Stufe binden; §458 nur
+einmal je zugrunde liegender Entgeltforderung, niemals je
+Komponenten-OP. [...] Zinssatz aus gültiger konkreter Vereinbarung hat
+ggf. Vorrang, nicht pauschal max(Vertrag, Gesetz) wählen."
+
+Umsetzung: `mahnwesen/kosten.py` (reine Berechnung, `bestimme_
+zinssatz`/`balance_zeitreihe_fuer_forderung`/`berechne_
+verzugszinsen_cent`/`berechne_mahnkosten_vorschau` - aggregiert ALLE
+offenen Forderungen eines Vertrags zu EINEM kombinierten Zins-/
+Gebührenbetrag je Mahnlauf, siehe Reviewpunkt oben), `mahnwesen/
+kosten_repository.py` (`ZinsprofilTable`/`OenbBasiszinssatzTable`/
+`MahnkostenBuchungTable`), `mahnwesen/kosten_service.py`
+(`MahnkostenService.vorschau`/`.buche_bei_versand`, verdrahtet in
+`MahnwesenService.versenden()`s GESENDET-Zweig, ausschließlich an einen
+bestätigten Versandnachweis gekoppelt). Vertragsweite, deltabasierte
+Idempotenz (nicht je Stufe) verhindert, dass Stufe 2 bei Stufe 1
+bereits fakturierte Zinstage erneut ansetzt. Vollständige Grenzen und
+bewusst offene Punkte (u. a. der weiterhin nicht umgebaute Mahnfall-/
+Mail-Dispatcher, kein Halbjahres-Split innerhalb einer laufenden
+Verzinsungsperiode) in `OFFENE_PUNKTE.md`, Abschnitt "Paket
+Mahnkosten". Import-/Profilformat für Markus' privates Mapping in
+`IMPORT_MAHNKOSTEN.md`.

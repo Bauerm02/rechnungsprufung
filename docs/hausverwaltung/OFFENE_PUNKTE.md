@@ -2096,3 +2096,152 @@ abgelehnt).
 Bearbeitung von Mietbestandteilen für einen BESTEHENDEN Vertrag über
 diesen Ablauf (dafür bleibt die bestehende Komponenten-Freigabe-Route
 zuständig), kein automatischer Konflikt-Merge-Assistent, keine OCR.
+
+## Paket Mahnkosten (Verzugszinsen/Mahngebühren, Auftrag Markus 13.09.2026)
+
+Nutzerauftrag: "pro Mahnlauf Mahngebühren, und die Zinsen dazu, soviel
+wie gesetzlich erlaubt ist" - mit ausführlichen fachlichen Leitplanken
+von Codex nach Primärquellenprüfung (ABGB §§1000/1333, KSchG §6 Abs 1
+Z 13/OGH 7Ob111/25m, §§456/458 UGB, OeNB-Basiszinssätze). Neue Module:
+`mahnwesen/kosten.py` (reine Berechnung), `mahnwesen/kosten_repository.py`
+(Persistenz: `ZinsprofilTable`, `OenbBasiszinssatzTable`,
+`MahnkostenBuchungTable`), `mahnwesen/kosten_service.py`
+(`MahnkostenService.vorschau`/`.buche_bei_versand`). Getestet in
+`tests/mietinkasso/test_mahnwesen_kosten.py` (13 Fälle) und
+`tests/mietinkasso/test_backoffice.py` (4 zusätzliche HTTP-Tests).
+
+### Was funktioniert und ist getestet
+
+1. **Zinssatzauswahl mit Rangfolge** (`bestimme_zinssatz`): geprüfte
+   vereinbarte Klausel > §456-UGB-B2B-Satz (nur bei Vertragsdatum ab
+   16.03.2013 UND erfasstem Basiszinssatz fürs benötigte Halbjahr) >
+   gesetzliche 4 % p.a. (§1000 ABGB). Ein Altvertrag vor dem UGB-
+   Stichtag fällt korrekt auf die gesetzliche Basis zurück, statt
+   fälschlich 9,2 Prozentpunkte aufzuschlagen. Ein zukünftiges Halbjahr
+   ohne erfassten Basiszinssatz bleibt explizit "Basis ungeklärt" -
+   NIE stillschweigende Fortschreibung des letzten bekannten Werts.
+2. **Taggenaue, nicht zusammengesetzte Verzinsung** je Forderung
+   (`balance_zeitreihe_fuer_forderung`/`berechne_verzugszinsen_cent`):
+   reproduziert exakt dieselbe FIFO-Zuordnung wie
+   `OPService.offene_forderungen`, behält aber die Reduktionsdaten für
+   eine korrekte Periodisierung bei datierten Teilzahlungen. Eine
+   Forderung ohne bekannte Fälligkeit (z. B. eine ungegliederte
+   GESAMTSALDO-Eröffnung) wird NIE fiktiv ab einem erfundenen Datum
+   verzinst, zählt aber weiterhin zur Hauptforderung.
+3. **Genau EIN kombinierter Betrag je Mahnlauf** (`berechne_
+   mahnkosten_vorschau`): aggregiert ALLE offenen Forderungen eines
+   Vertrags zu einer Hauptforderungssumme plus einer Zinssumme plus
+   höchstens einer Gebühr - der ausdrücklich geforderte Reviewpunkt
+   ("keine 5-10 Gebühren/Mails je Monatsvorschreibung mit HMZ/BK/HK/
+   Küche/Parkplatz-Einzelzeilen") ist damit strukturell auf
+   Berechnungs-/Buchungsebene gelöst, siehe Test
+   `test_zwei_komponenten_derselben_miete_ergeben_eine_kombinierte_vorschau`.
+4. **Vertragsweite, deltabasierte Idempotenz statt Existenzabfrage**:
+   `MahnkostenService.buche_bei_versand` bucht bei jedem Aufruf nur die
+   Differenz aus `neue_zinsen_cent` und der vertragsweit (über ALLE
+   Stufen) bereits gebuchten Zinssumme. Ein Wiederholaufruf am selben
+   Tag bucht dadurch natürlich nichts Neues (`test_zwei_laeufe_am_
+   selben_tag_buchen_nicht_doppelt`), und Stufe 2 rechnet nur die seit
+   Stufe 1 zusätzlich verstrichenen Tage ab statt die gesamte Periode
+   erneut (`test_stufe_zwei_rechnet_nur_das_delta_seit_stufe_eins_ab`).
+   Die DB-Unique-Constraint `uq_mahnkosten_lauf`
+   (`vertrag_id, stufe, zins_bis`) ist NUR ein Race-Condition-
+   Sicherheitsnetz für zwei gleichzeitige Aufrufe, nicht der primäre
+   Idempotenzmechanismus.
+5. **§458 UGB einmal je Vertrag/Mahnlauf**: eine Mahngebühr wird nur
+   angesetzt, solange noch keine für diesen Vertrag gebucht wurde
+   (`gebuehr_bereits_gebucht`, vertragsweit über alle Stufen geprüft) -
+   Stufe 2 setzt NIE eine zweite Gebühr an
+   (`test_mahngebuehr_wird_nur_einmal_ueber_beide_stufen_angesetzt`).
+6. **Hauptforderung wird nie durch eine unklare Zusatzposition
+   blockiert**: fehlt ein geprüftes Zinsprofil oder eine erfasste
+   Basiszinssatz-Periode, bleibt NUR der Zins-/Gebührenanteil auf
+   "Klärung erforderlich"/gesetzliche Basis, die Hauptforderungssumme
+   selbst ist davon unabhängig
+   (`test_fehlendes_zinsprofil_blockiert_hauptforderung_nicht_nur_
+   gebuehr_klaerungsbeduerftig`,
+   `test_b2b_ohne_erfassten_basiszinssatz_fuer_das_halbjahr_bleibt_
+   blockiert`).
+7. **Buchung nur an bestätigten Versandnachweis gekoppelt**:
+   `MahnkostenService.buche_bei_versand` ist einzig in
+   `MahnwesenService.versenden()`s GESENDET-Zweig verdrahtet
+   (unmittelbar NACH `versand_belegen(...)`), sowohl in
+   `indexautomatik/mailversand_service.py::HVMailversandService` (der
+   tatsächliche, von `mahnung_senden`/`/backoffice/mahnfall/{id}/
+   versenden` genutzte Versandpfad) als auch konzeptionell für jede
+   künftige weitere `MahnwesenService`-Instanz. Eine reine Vorschau,
+   ein `send_enabled=false`-Lauf (weiterhin Standard) oder ein
+   fehlgeschlagener Versand bucht dadurch strukturell nichts.
+8. **Backoffice-UI**: `/backoffice/vertrag/{id}/zinsprofil` (Entwurf
+   anlegen/Freigabe, analog zur bestehenden Indexklausel-Seite),
+   `/backoffice/basiszinssatz` (Halbjahreswerte erfassen, unveränderlich
+   je Halbjahr-ID), und ein neuer Abschnitt auf der bestehenden
+   `/backoffice/vertrag/{id}/mahnvorschau`-Seite, der je Mahnstufe
+   Hauptforderung, bereits gebuchte Zinsen, neu zu bebuchendes Delta,
+   Zinssatz/Basis, Zinszeitraum und eine etwaige neue Mahngebühr
+   GETRENNT anzeigt - reine Anzeige, bucht nichts.
+9. **Import-/Profilformat** für Markus' privates Mapping:
+   `docs/hausverwaltung/IMPORT_MAHNKOSTEN.md` (`zinsprofile[]`/
+   `basiszinssaetze[]`).
+
+### Was in dieser Runde bewusst NICHT gelöst ist (ehrlich offen)
+
+- **Kein Umbau des bestehenden Mahnfall-/Mail-Dispatchers**: Die
+  bestehende `MahnFallTable`/`MahnFallRepository`-Logik plant weiterhin
+  je EINZELNER OP-Zeile (`plane_alle_offenen_forderungen`), d. h. eine
+  Monatsvorschreibung mit getrennten HMZ/BK/HK/Küche/Parkplatz-Zeilen
+  kann weiterhin zu mehreren `MahnFallTable`-Zeilen bzw. mehreren
+  einzelnen Versandvorgängen führen. `berechne_mahnkosten_vorschau`
+  wurde bewusst als SEPARATE, vertragsweite Aggregationsschicht gebaut
+  (siehe Punkt 3 oben), die verhindert, dass daraus mehrere Gebühren/
+  Zinsbeträge entstehen - das eigentliche Mail-/Fallvolumen (wie viele
+  einzelne Mahnschreiben pro Monat verschickt werden) ist dadurch
+  NICHT verändert. Ein echter Umbau auf ein wirklich gebündeltes
+  Mahnschreiben je Vertrag/Stufe (eine Mail statt mehrerer
+  Einzelforderungs-Mails) wurde aus Umfangs-/Risikogründen nicht in
+  dieser Runde angegangen und bleibt ein offener Folgeauftrag.
+- **Kein Halbjahres-Split innerhalb einer Verzinsungsperiode**: Der
+  Zinssatz wird einmal für `heute` (den Berechnungszeitpunkt) bestimmt
+  und auf die GESAMTE offene Periode angewendet. Fällt ein
+  Basiszinssatz-Wechsel mitten in eine noch offene Verzinsungsperiode,
+  wird NICHT rückwirkend ab dem exakten Wechseldatum mit zwei
+  unterschiedlichen Sätzen gerechnet - der zum Berechnungszeitpunkt
+  gültige Satz gilt für die gesamte offene Periode. Das ist
+  konservativ in der Richtung "keine überhöhte rückwirkende
+  Verzinsung", aber fachlich nicht abschließend geprüft.
+- **Mahntext/E-Mail-Inhalt zeigt Mahnkosten (noch) nicht**: Der
+  bestehende Mahntext-Generator (`mailversand_service.py::
+  mahnung_senden.provider`) verwendet weiterhin die ALTE, separate
+  `MahnPolicyRepository`-Gebühren-/Zinslogik für den Mailtext und
+  blockiert dort explizit jede Policy mit Gebühr/Zins ungleich Null
+  ("Mahngebühren/Zinsen benötigen eine eigene belegte Berechnung.").
+  Diese Guard-Klausel wurde bewusst NICHT angetastet (sie schützt vor
+  falschen Beträgen im Mailtext einer älteren, unabhängigen
+  Policy-Struktur) - die neue `MahnkostenService`-Berechnung bucht die
+  OP-Positionen zwar korrekt, ihr Ergebnis erscheint aber noch nicht
+  automatisch im Mahnschreiben-Text selbst. Vor echtem Versand mit
+  Kostenausweis muss der Mahntext-Generator entsprechend erweitert
+  werden.
+- **Kein automatisches Erfassen von OeNB-Basiszinssätzen**: jedes
+  Halbjahr muss manuell (Backoffice-Formular oder Importformat)
+  nachgetragen werden; es gibt keinen automatischen Abruf.
+- **Import-/Profilformat ist nicht Teil des atomaren `intake/`-Pakets**:
+  `zinsprofile[]`/`basiszinssaetze[]` (siehe
+  `IMPORT_MAHNKOSTEN.md`) werden über eigene, direkte Repository-
+  Methoden angewendet (bzw. über die Backoffice-Formulare), NICHT über
+  den dry-run-geprüften, hash-gebundenen `intake/`-Mechanismus wie
+  `kautionen[]`/`mietvertragsprofile[]`. Ein Zinsprofil-Anlegen ist
+  zudem NICHT idempotent gegen einen blind wiederholten Import -
+  jeder Aufruf von `zinsprofil_anlegen` erzeugt eine neue Version,
+  unabhängig davon, ob sich Inhalte geändert haben (anders als der
+  Stammdaten-Intake mit `UNVERAENDERT`-Erkennung). Ein Importskript
+  für Markus' privates Mapping sollte deshalb vor jedem Anlegen selbst
+  gegen `neuestes_zinsprofil`/`liste_basiszinssaetze` prüfen.
+- **Rundung**: einfache (nicht zusammengesetzte) Verzinsung wird über
+  alle Perioden einer Forderung aufsummiert und erst am Ende auf ganze
+  Cent gerundet (kaufmännisch); es gibt keine Rundung je Einzeltag.
+- **Keine automatische Verzinsung bereits gebuchter alter Spesen**:
+  bewusst so gebaut (Auftrag: "keine Zinseszinsen oder automatische
+  Verzinsung alter Spesen") - eine bereits gebuchte Mahnspesen-Zeile
+  fließt nicht selbst wieder in die Zinsbemessungsgrundlage ein, nur
+  die tatsächliche Hauptforderung (Miete/BK/HK/etc.) wird verzinst.

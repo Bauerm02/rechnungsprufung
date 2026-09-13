@@ -11,6 +11,8 @@ from mietinkasso.indexautomatik.mailnachweis import nachweis_daten, versand_bele
 from mietinkasso.indexautomatik.mailops_client import MailOpsAuftrag, MailOpsClient
 from mietinkasso.indexautomatik.mailops_transport import MailOpsTransportadapter
 from mietinkasso.infrastructure.db.tables import AuditEventTable, ErhoehungsschreibenTable, MahnFallTable, VertragsendeErinnerungTable
+from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
+from mietinkasso.mahnwesen.kosten_service import MahnkostenService
 from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
 from mietinkasso.mahnwesen.service import MahnwesenService
 from mietinkasso.op.repository import OPRepository
@@ -43,8 +45,11 @@ class HVMailversandService:
         self.bank_service = BankImportService(self.bank_repo, bundle.stammdaten_repository, self.op_service)
         self.mahn_repo = MahnFallRepository(session_factory)
         self.policy_repo = MahnPolicyRepository(session_factory)
+        self.mahnkosten_repo = MahnkostenRepository(session_factory)
+        self.mahnkosten_service = MahnkostenService(self.mahnkosten_repo, self.op_service, bundle.stammdaten_repository)
         self.mahn_service = MahnwesenService(self.mahn_repo, bundle.stammdaten_repository,
-            self.op_service, self.policy_repo, bank_stand_max_age_days=settings.bank_stand_max_age_days)
+            self.op_service, self.policy_repo, bank_stand_max_age_days=settings.bank_stand_max_age_days,
+            mahnkosten_service=self.mahnkosten_service)
 
     def owner_senden(self, auftrag):
         if self.client is None or not self.settings.hv_mail_allowlist_bestaetigt:

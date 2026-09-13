@@ -1226,3 +1226,110 @@ class JobLockTable(Base):
     ergebnis: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     beendet_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ZinsprofilTable(Base):
+    """Versioniertes, EINMALIG geprüftes und freigegebenes Zins-/
+    Gebührenprofil je Vertrag (Auftrag Markus 13.09.2026: "pro Mahnlauf
+    Mahngebühren, und die Zinsen dazu, soviel wie gesetzlich erlaubt
+    ist"). Mirrors `RechtsprofilTable`s Governance-Muster: `ENTWURF`
+    ändert NICHTS an der wirksamen Kostenberechnung, erst `GEPRUEFT`
+    (menschliche Fachprüfung) treibt `mahnwesen/kosten.py` an.
+
+    `vereinbarter_zinssatz_prozent` wird NUR verwendet, wenn
+    `vereinbarung_geprueft=True` - eine gelesene Vertragsklausel ist
+    laut KSchG §6 Abs 1 Z 13/OGH 7Ob111/25m KEINE automatische
+    Wirksamkeitsfreigabe, insbesondere bei einem Verbraucher-Mieter
+    (`ist_b2b=False`). `mahngebuehr_kostenbasis_cent` ist die laut
+    §1333 Abs 2 ABGB / §458 UGB geprüfte, tatsächliche/zweckmäßige
+    Kostenbasis - NIE eine erfundene Pauschale."""
+
+    __tablename__ = "zinsprofile"
+    __table_args__ = (UniqueConstraint("vertrag_id", "version", name="uq_zinsprofil_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default="ENTWURF", server_default=text("'ENTWURF'"))
+    # Beiderseits unternehmensbezogenes Geschäft - Voraussetzung für §456
+    # UGB. NIE aus Rechtsordnung/Nutzungsart abgeleitet (dieselbe
+    # Nie-Ableiten-Regel wie überall in diesem Repository).
+    ist_b2b: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
+    vertragsdatum: Mapped[date | None] = mapped_column(Date, nullable=True)
+    vereinbarter_zinssatz_prozent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
+    vereinbarung_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
+    vereinbarung_beleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    mahngebuehr_kostenbasis_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mahngebuehr_kostenbasis_beleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    geprueft_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    geprueft_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OenbBasiszinssatzTable(Base):
+    """Amtlicher OeNB-Basiszinssatz je Halbjahr (§456 UGB) - manuell mit
+    Quellenbeleg erfasst, wie `VpiMonatswertTable`. OHNE erfassten
+    Eintrag für das benötigte Halbjahr bleibt eine B2B-Zinsberechnung
+    nach §456 UGB explizit "Basis ungeklärt" blockiert - NIE wird der
+    letzte bekannte Wert für ein neues Halbjahr stillschweigend
+    fortgeschrieben (siehe `mahnwesen/kosten.py::bestimme_zinssatz`)."""
+
+    __tablename__ = "oenb_basiszinssaetze"
+
+    id: Mapped[str] = mapped_column(String(16), primary_key=True)  # z. B. "2026-1", "2026-2"
+    gueltig_von: Mapped[date] = mapped_column(Date)
+    gueltig_bis: Mapped[date] = mapped_column(Date)
+    basiszinssatz_prozent: Mapped[Decimal] = mapped_column(Numeric(6, 3))
+    erfasst_von: Mapped[str] = mapped_column(String(128))
+    erfasst_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    quelle_referenz: Mapped[str] = mapped_column(String(256))
+
+
+class MahnkostenBuchungTable(Base):
+    """EIN Ledger-Eintrag je tatsächlich abgeschlossenem Mahnlauf-
+    Kostenvorgang (Vertrag+Stufe) - garantiert GENAU EINE gebuchte
+    Gebühr/Zinsposition pro Mahnlauf, unabhängig davon, wie viele
+    einzelne OP-Zeilen/Mietkomponenten (HMZ/BK/HK/Küche/Parkplatz)
+    diesen Mahnlauf technisch zusammensetzen (siehe
+    `mahnwesen/kosten.py`-Moduldoc: "keine 5-10 Gebühren pro Monat").
+
+    Wird AUSSCHLIESSLICH von `mahnwesen/kosten_service.py::MahnkostenService.
+    buche_bei_versand` angelegt, NIEMALS bei einer bloßen Vorschau, einer
+    fehlgeschlagenen Sendung oder einem Retry - siehe dort. Die
+    Verzugszinsen werden dabei IMMER nur als DELTA zur Summe aller
+    bereits für diesen Vertrag gebuchten Zinsen (über ALLE Mahnstufen
+    hinweg, siehe `MahnkostenRepository.bereits_gebuchte_zinsen_cent`)
+    angesetzt - Stufe 2 rechnet dieselben, bei Stufe 1 bereits
+    fakturierten Tage NIE erneut ab; ein Delta von 0 (z. B. ein zweiter
+    Lauf am selben Tag ohne neu verstrichene Zeit) bucht nichts, ohne
+    dass dafür ein eigener Sperrmechanismus nötig ist. `uq_mahnkosten_
+    lauf` fängt nur eine ECHTE gleichzeitige Doppelausführung für
+    denselben Stichtag ab (Idempotenz-Sicherheitsnetz, kein fachliches
+    Gate)."""
+
+    __tablename__ = "mahnkosten_buchungen"
+    __table_args__ = (UniqueConstraint("vertrag_id", "stufe", "zins_bis", name="uq_mahnkosten_lauf"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    stufe: Mapped[int] = mapped_column(Integer)
+    # Rein deskriptiv/für Audit: welche Forderungs-OP-IDs zum
+    # Buchungszeitpunkt in die Hauptforderung eingeflossen sind - NICHT
+    # Teil der Idempotenz-/Delta-Logik (die läuft ausschließlich über die
+    # vertragsweite Zinsensumme, siehe oben).
+    mahnlauf_schluessel: Mapped[str] = mapped_column(String(128))
+    forderung_op_position_ids: Mapped[str] = mapped_column(Text)  # JSON-Liste von OPPositionTable.id
+    hauptforderung_cent: Mapped[int] = mapped_column(Integer)
+    zinsbasis: Mapped[str] = mapped_column(String(32))
+    zinssatz_prozent: Mapped[Decimal] = mapped_column(Numeric(6, 3))
+    zins_von: Mapped[date] = mapped_column(Date)
+    zins_bis: Mapped[date] = mapped_column(Date)
+    zinsen_cent: Mapped[int] = mapped_column(Integer)
+    gebuehr_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rechtsgrundlage_gebuehr: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    versandnachweis_referenz: Mapped[str] = mapped_column(String(256))
+    zinsen_op_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gebuehr_op_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gebucht_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    erstellt_von: Mapped[str] = mapped_column(String(128))

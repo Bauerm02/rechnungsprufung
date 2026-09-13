@@ -2304,6 +2304,98 @@ def test_uebernehmen_bei_zwischenzeitlich_geaendertem_profil_erzwingt_neue_pruef
     assert len(versionen) == 1  # keine dritte/blinde Version durch den veralteten Vorgang
 
 
+def test_zinsprofil_anlegen_und_freigeben_end_to_end(backoffice_client):
+    """Auftrag Markus 13.09.2026 (Mahnkosten): ein Zinsprofil startet als
+    ENTWURF und wirkt erst nach ausdrücklicher Freigabe - eine vereinbarte
+    Verbraucherklausel ist vorher keine gültige Berechnungsgrundlage
+    (KSchG §6 Abs 1 Z 13/OGH 7Ob111/25m)."""
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    antwort = client.post(
+        "/backoffice/vertrag/V-601-1/zinsprofil/erstellen",
+        data={
+            "csrf_token": csrf, "ist_b2b": "1", "vertragsdatum": "2020-01-01",
+            "vereinbarter_zinssatz_prozent": "5,0", "vereinbarung_geprueft": "1",
+            "vereinbarung_beleg": "Vertrag §7", "mahngebuehr_kostenbasis_cent": "1500",
+            "mahngebuehr_kostenbasis_beleg": "Portokosten-Nachweis",
+        },
+        follow_redirects=False,
+    )
+    assert antwort.status_code == 303
+
+    uebersicht = client.get("/backoffice/vertrag/V-601-1/zinsprofil")
+    assert uebersicht.status_code == 200
+    assert "ENTWURF" in uebersicht.text
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
+
+    kosten_repo = MahnkostenRepository(build_session_factory(get_settings().database_url))
+    profil = kosten_repo.neuestes_zinsprofil("V-601-1")
+    assert profil is not None
+    assert profil.status == "ENTWURF"
+
+    freigabe = client.post(f"/backoffice/zinsprofil/{profil.id}/freigeben", data={"csrf_token": csrf}, follow_redirects=False)
+    assert freigabe.status_code == 303
+    profil_geprueft = kosten_repo.geprueftes_zinsprofil("V-601-1")
+    assert profil_geprueft is not None
+    assert profil_geprueft.id == profil.id
+
+
+def test_zinsprofil_fuer_ausgeschlossenes_objekt_wird_abgelehnt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    antwort = client.get("/backoffice/vertrag/V-107-1/zinsprofil")
+    assert antwort.status_code == 400
+    assert "nicht verfügbar" in antwort.text or "gesperrt" in antwort.text
+
+
+def test_mahnvorschau_zeigt_mahnkosten_block_ohne_zu_buchen(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+
+    antwort = client.get("/backoffice/vertrag/V-601-1/mahnvorschau")
+    assert antwort.status_code == 200
+    assert "Mahnkosten" in antwort.text
+    assert "reine Vorschau, keine Buchung" in antwort.text
+
+
+def test_basiszinssatz_erfassen_und_duplikat_wird_abgelehnt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    antwort = client.post(
+        "/backoffice/basiszinssatz/erfassen",
+        data={
+            "csrf_token": csrf, "id": "TEST-HALBJAHR-1", "gueltig_von": "2026-01-01",
+            "gueltig_bis": "2026-06-30", "basiszinssatz_prozent": "1,53",
+            "quelle_referenz": "OeNB-Kundmachung (Test)",
+        },
+        follow_redirects=False,
+    )
+    assert antwort.status_code == 303
+
+    uebersicht = client.get("/backoffice/basiszinssatz")
+    assert uebersicht.status_code == 200
+    assert "TEST-HALBJAHR-1" in uebersicht.text
+
+    duplikat = client.post(
+        "/backoffice/basiszinssatz/erfassen",
+        data={
+            "csrf_token": csrf, "id": "TEST-HALBJAHR-1", "gueltig_von": "2026-01-01",
+            "gueltig_bis": "2026-06-30", "basiszinssatz_prozent": "9,99",
+            "quelle_referenz": "Zweiter Versuch",
+        },
+    )
+    assert duplikat.status_code == 400
+    assert "unveränderlich" in duplikat.text
+
+
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
     unten) - der Login-Ratelimiter ist ein globaler, prozessweiter
