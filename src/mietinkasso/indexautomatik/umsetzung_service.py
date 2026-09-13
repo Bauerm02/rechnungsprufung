@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
@@ -37,10 +37,13 @@ from mietinkasso.indexautomatik.rechtsprofil import RechtsprofilService
 from mietinkasso.indexautomatik.repository import ErhoehungsschreibenRepository
 from mietinkasso.infrastructure.db.tables import (
     ErhoehungsschreibenTable,
+    IndexAnpassungTable,
+    IndexKlauselTable,
     IndexSollUmsetzungTable,
     RechtsprofilTable,
     VertragsKomponenteTable,
     VertragTable,
+    VorschreibungPositionTable,
     VorschreibungTable,
 )
 from mietinkasso.mieweg_vorschau.service import _NIE_INDEXIERBARE_ARTEN
@@ -537,6 +540,67 @@ class IndexSollUmsetzungService:
                 True if ist_mieweg_pfad else profil.letzte_basis_war_jahresdurchschnitt
             )
             neue_basis_ids = sorted({alt_zu_neu_id.get(kid, kid) for kid in profil.basis_komponenten_ids})
+
+            # Klausel-Basisfortschreibung (Geschäftsraum-/generischer-
+            # Klausel-Pfad, Codex-Rückprüfung: "basis_wert/basis_monat/
+            # letzte_anpassung werden NICHT fortgeschrieben -> wiederholte
+            # Indexierung auf schon erhöhten Betrag droht"). Rein
+            # mechanische Bestandskorrektur (KEINE neue Rechtsentscheidung
+            # zu Fristen/Terminen - dafür bleibt `_monatslauf_klausel`
+            # bewusst gesperrt, siehe dort): eine bereits umgesetzte
+            # Erhöhung darf beim NÄCHSTEN Vergleich nicht erneut gegen den
+            # ALTEN `basis_wert` gerechnet werden, sonst würde derselbe
+            # VPI-Sprung ein zweites Mal als Erhöhung ausgewiesen. Wie bei
+            # `VertragsKomponenteTable`/`RechtsprofilTable` append-only:
+            # eine NEUE `IndexKlauselTable`-Version ersetzt die alte
+            # (`GESPERRT`+`ersetzt_id`), NIE ein In-Place-Update von
+            # `basis_wert` auf der bestehenden Zeile.
+            neue_vertragsklausel_id = profil.vertragsklausel_id
+            if profil.vertragsklausel_id is not None and frisches_schreiben.index_anpassung_id is not None:
+                alte_klausel = session.get(IndexKlauselTable, profil.vertragsklausel_id)
+                anpassung = session.get(IndexAnpassungTable, frisches_schreiben.index_anpassung_id)
+                if alte_klausel is not None and anpassung is not None:
+                    anspruchsmonat_str = f"{wirksam_ab.year:04d}-{wirksam_ab.month:02d}"
+                    naechste_klausel_version = session.execute(
+                        select(func.max(IndexKlauselTable.version)).where(
+                            IndexKlauselTable.vertrag_id == alte_klausel.vertrag_id
+                        )
+                    ).scalar_one()
+                    neue_klausel = IndexKlauselTable(
+                        vertrag_id=alte_klausel.vertrag_id,
+                        version=(naechste_klausel_version or 0) + 1,
+                        rechtsordnung=alte_klausel.rechtsordnung,
+                        berechnungsprofil=alte_klausel.berechnungsprofil,
+                        klausel_text=alte_klausel.klausel_text,
+                        abschlussdatum=alte_klausel.abschlussdatum,
+                        basis_reihe=alte_klausel.basis_reihe,
+                        # Fortgeschrieben auf den tatsächlich für DIESE
+                        # Anpassung verwendeten Wert - der Kern der
+                        # Korrektur, verhindert die wiederholte Indexierung.
+                        basis_wert=anpassung.neuer_wert,
+                        # `basis_monat` fließt in KEINE Berechnung ein (rein
+                        # dokumentarisch, siehe IndexKlauselTable/
+                        # vertragsspur.py) - dokumentiert hier bewusst den
+                        # Anspruchsmonat DIESER Fortschreibung, statt den
+                        # genauen (hier nicht sicher rekonstruierbaren)
+                        # VPI-Quellmonat zu erfinden.
+                        basis_monat=anspruchsmonat_str,
+                        letzte_anpassung_monat=anspruchsmonat_str,
+                        schwelle_prozent=alte_klausel.schwelle_prozent,
+                        schwelle_inklusive=alte_klausel.schwelle_inklusive,
+                        daempfung_prozent=alte_klausel.daempfung_prozent,
+                        vertragliche_grenze_prozent=alte_klausel.vertragliche_grenze_prozent,
+                        indexierbare_komponenten=list(alte_klausel.indexierbare_komponenten or []),
+                        status="FREIGEGEBEN",
+                        freigegeben_am=datetime.now(timezone.utc),
+                        freigegeben_von=akteur,
+                    )
+                    session.add(neue_klausel)
+                    session.flush()
+                    alte_klausel.status = "GESPERRT"
+                    alte_klausel.ersetzt_id = neue_klausel.id
+                    neue_vertragsklausel_id = neue_klausel.id
+
             naechste_version = session.execute(
                 select(func.max(RechtsprofilTable.version)).where(RechtsprofilTable.vertrag_id == vertrag.id)
             ).scalar_one()
@@ -562,7 +626,7 @@ class IndexSollUmsetzungService:
                 vertraglich_zulaessiger_betrag_cent=profil.vertraglich_zulaessiger_betrag_cent,
                 vertraglicher_quellenbeleg=profil.vertraglicher_quellenbeleg,
                 vertraglicher_fruehestmoeglicher_termin=profil.vertraglicher_fruehestmoeglicher_termin,
-                vertragsklausel_id=profil.vertragsklausel_id,
+                vertragsklausel_id=neue_vertragsklausel_id,
                 vertrag_beleg_referenz=profil.vertrag_beleg_referenz,
                 klausel_referenz=profil.klausel_referenz,
                 frist_tage_zugang_bis_wirksamkeit=profil.frist_tage_zugang_bis_wirksamkeit,
@@ -597,6 +661,50 @@ class IndexSollUmsetzungService:
             neues_profil.freigegeben_von = akteur
             neues_profil.freigegeben_am = datetime.now(timezone.utc)
             neues_profil.quelle_hash = neuer_hash
+
+            # Codex-Rückprüfung: `VorschreibungService.entwurf_erstellen`
+            # befüllt eine Monatsvorschreibung NUR beim allerersten Aufruf
+            # (`if not bestehende_positionen`) - eine bereits VORHER
+            # angelegte, noch nicht gebuchte ENTWURF-Vorschreibung für den
+            # Wirksamkeitsmonat (oder einen späteren, ebenfalls noch
+            # offenen Monat) bliebe sonst dauerhaft auf dem ALTEN
+            # Komponentenstand stehen, obwohl die Umsetzung soeben neue
+            # Beträge historisiert hat. `_pruefen()` blockiert die
+            # Umsetzung bereits vollständig, wenn eine BEREITS GEBUCHTE
+            # Periode betroffen wäre (status != ENTWURF) - hier geht es
+            # NUR um noch offene Entwürfe, die in DERSELBEN Transaktion aus
+            # dem jetzt aktuellen (gerade historisierten) Komponentenstand
+            # neu aufgebaut werden, exakt wie ein frischer
+            # `entwurf_erstellen`-Aufruf es täte (inklusive unveränderter
+            # BK/HK-Positionen).
+            offene_entwuerfe = list(
+                session.execute(
+                    select(VorschreibungTable)
+                    .where(VorschreibungTable.vertrag_id == vertrag.id)
+                    .where(VorschreibungTable.monat >= f"{wirksam_ab.year:04d}-{wirksam_ab.month:02d}")
+                    .where(VorschreibungTable.status == "ENTWURF")
+                ).scalars()
+            )
+            for entwurf_zeile in offene_entwuerfe:
+                stichtag = date(int(entwurf_zeile.monat[:4]), int(entwurf_zeile.monat[5:7]), 1)
+                aktive_komponenten = self._stammdaten_repository.list_aktive_komponenten(
+                    vertrag.id, stichtag, session=session
+                )
+                session.execute(
+                    delete(VorschreibungPositionTable).where(
+                        VorschreibungPositionTable.vorschreibung_id == entwurf_zeile.id
+                    )
+                )
+                for komponente in aktive_komponenten:
+                    session.add(
+                        VorschreibungPositionTable(
+                            vorschreibung_id=entwurf_zeile.id,
+                            art=komponente.art,
+                            bezeichnung=komponente.bezeichnung,
+                            betrag_cent=komponente.betrag_cent,
+                            ust_satz_promille=komponente.ust_satz_promille,
+                        )
+                    )
 
             frisches_schreiben.status = "SOLL_UMGESETZT"
             frisches_schreiben.blockiert_gruende = []

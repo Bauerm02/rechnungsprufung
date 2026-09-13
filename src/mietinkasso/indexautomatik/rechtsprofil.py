@@ -291,7 +291,15 @@ class RechtsprofilService:
             )
         klausel_snapshot = None
         if profil.vertragsklausel_id is not None:
-            klausel = self._index_repository.get_klausel(profil.vertragsklausel_id)
+            # `session=session` mit derselben Begründung wie oben bei
+            # `get_komponente` - Pflicht, wenn `profil.vertragsklausel_id`
+            # innerhalb DIESER noch nicht committeten Transaktion neu
+            # angelegt wurde (`umsetzung_service.py::umsetzen`, Klausel-
+            # Basisfortschreibung) - siehe auch `IndexRepository.
+            # get_klausel`-Docstring zum beobachteten StaleDataError bei
+            # einer separat geöffneten zweiten Session auf derselben
+            # SQLite-In-Memory-Connection.
+            klausel = self._index_repository.get_klausel(profil.vertragsklausel_id, session=session)
             if klausel is not None:
                 klausel_snapshot = {
                     "id": klausel.id,

@@ -160,11 +160,6 @@ def _abschluss(kontext: SchreibenKontext) -> list[str]:
     zeilen.append(f"Neuer monatlicher Gesamtbetrag (brutto, alle Positionen): {_eur(neuer_gesamt_cent)}")
     zeilen.append(f"Erhöhungsbetrag (brutto, nur die geänderten Positionen): {_eur(kontext.erhoehung_cent)}")
     zeilen.append("")
-    zeilen.append(
-        f"Beleg-/Versionsreferenz: Rechtsprofil Version {kontext.rechtsprofil_version}, "
-        f"Vertragsbeleg {kontext.vertrag_beleg_referenz}."
-    )
-    zeilen.append("")
     zeilen.append(kontext.jlb_signatur)
     return zeilen
 

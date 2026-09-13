@@ -451,8 +451,16 @@ class StammdatenRepository:
             aktuelle = vorgaenger
         return aktuelle.gueltig_von
 
-    def list_aktive_komponenten(self, vertrag_id: str, stichtag: date) -> list[VertragsKomponenteTable]:
-        with self._session_factory() as session:
+    def list_aktive_komponenten(
+        self, vertrag_id: str, stichtag: date, *, session: Session | None = None
+    ) -> list[VertragsKomponenteTable]:
+        """`session`: siehe `get_komponente` - Pflicht, wenn eine soeben
+        (innerhalb derselben, noch NICHT committeten Transaktion) neu
+        historisierte Komponente bereits berücksichtigt werden muss
+        (`indexautomatik/umsetzung_service.py::umsetzen`, Aktualisierung
+        noch offener Monatsvorschreibungs-Entwürfe)."""
+
+        def _lesen(active_session: Session) -> list[VertragsKomponenteTable]:
             statement = (
                 select(VertragsKomponenteTable)
                 .where(VertragsKomponenteTable.vertrag_id == vertrag_id)
@@ -462,7 +470,12 @@ class StammdatenRepository:
                     | (VertragsKomponenteTable.gueltig_bis >= stichtag)
                 )
             )
-            return list(session.execute(statement).scalars().all())
+            return list(active_session.execute(statement).scalars().all())
+
+        if session is not None:
+            return _lesen(session)
+        with self._session_factory() as owned_session:
+            return _lesen(owned_session)
 
     def list_komponenten_im_zeitraum(self, vertrag_id: str, von: date, bis: date) -> list[VertragsKomponenteTable]:
         """Anders als `list_aktive_komponenten` (EIN Stichtag) liefert
