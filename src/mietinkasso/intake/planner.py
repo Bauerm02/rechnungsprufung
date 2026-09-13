@@ -11,6 +11,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
@@ -136,6 +137,33 @@ def _mehrfache_werte(werte: list[str]) -> set[str]:
     return mehrfach
 
 
+#: Feste Nachkommastellen-Skalierung, EXAKT wie die Spalten in
+#: `MietvertragsprofilTable` (`Numeric(12, 4)`/`Numeric(6, 3)`) - siehe
+#: `_dezimal_kanonisch`.
+_SKALIERUNG_INDEX_BASISWERT = Decimal("0.0001")
+_SKALIERUNG_INDEX_SCHWELLE_PROZENT = Decimal("0.001")
+
+
+def _dezimal_kanonisch(wert: Decimal | None, skalierung: Decimal) -> str | None:
+    """Kanonisiert einen `Decimal`-Wert auf die FESTE Spaltenskalierung,
+    BEVOR er zu Text wird - `str(Decimal(...))` behält die Anzahl der
+    ursprünglich eingegebenen Nachkommastellen bei (`Decimal("2.00")` !=
+    textuell `Decimal("2.000")`), obwohl beide denselben Wert darstellen
+    und die Datenbank (`Numeric(6, 3)`) ihn beim Rücklesen ohnehin auf
+    exakt diese Skalierung normalisiert. Ohne diese Kanonisierung würde
+    JEDER identische Wiederholimport mit einer anderen Nachkommastellen-
+    Schreibweise fälschlich als `AKTUALISIERUNG` statt `UNVERAENDERT`
+    erkannt - reine Formatierungsunterschiede sind KEINE inhaltliche
+    Änderung. `NaN`/`Infinity` werden explizit abgelehnt (ungültige
+    Eingabe, nie stillschweigend weiterverarbeitet)."""
+
+    if wert is None:
+        return None
+    if not wert.is_finite():
+        raise ValueError(f"Dezimalwert '{wert}' ist nicht endlich (NaN/Infinity) - ungültige Eingabe.")
+    return format(wert.quantize(skalierung), "f")
+
+
 def _felder_hash(felder: dict) -> str:
     kanonisch = json.dumps(felder, sort_keys=True, default=str, ensure_ascii=False)
     return hashlib.sha256(kanonisch.encode("utf-8")).hexdigest()
@@ -203,8 +231,8 @@ def _mietvertragsprofil_felder(
         "mahngebuehr_quellenbeleg": mahngebuehr_quellenbeleg,
         "index_reihe": index_reihe,
         "index_urspruenglicher_basismonat": index_urspruenglicher_basismonat,
-        "index_urspruenglicher_basiswert": str(index_urspruenglicher_basiswert) if index_urspruenglicher_basiswert is not None else None,
-        "index_schwelle_prozent": str(index_schwelle_prozent) if index_schwelle_prozent is not None else None,
+        "index_urspruenglicher_basiswert": _dezimal_kanonisch(index_urspruenglicher_basiswert, _SKALIERUNG_INDEX_BASISWERT),
+        "index_schwelle_prozent": _dezimal_kanonisch(index_schwelle_prozent, _SKALIERUNG_INDEX_SCHWELLE_PROZENT),
         "index_schwelle_inklusive": index_schwelle_inklusive,
         "index_anpassungsmonat": index_anpassungsmonat,
         "index_mindestintervall_monate": index_mindestintervall_monate,

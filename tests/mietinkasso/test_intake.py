@@ -909,6 +909,41 @@ def test_mietvertragsprofil_identischer_wiederholimport_erzeugt_keine_neue_versi
     assert len(stammdaten_repo.liste_mietvertragsprofil_versionen("V-1")) == 1
 
 
+def test_mietvertragsprofil_dezimalfelder_unterschiedliche_nachkommastellen_sind_unveraendert(session_factory, stammdaten_repo, op_service):
+    """Rückprüfung (Codex): `Numeric(12,4)`/`Numeric(6,3)` laden einen
+    Wert beim Rücklesen mit FESTER Skalierung (z. B. "128.8" wird zu
+    Decimal("128.8000")). Ein reiner str()-Vergleich ohne Kanonisierung
+    hätte JEDEN identischen Wiederholimport fälschlich als
+    AKTUALISIERUNG erkannt, nur weil die Anzahl der Nachkommastellen der
+    ursprünglichen Texteingabe ("128.8"/"2.00") von der beim Rücklesen
+    aus der DB normalisierten Form abweicht."""
+
+    paket = _paket(mietvertragsprofile=[{
+        "vertrag_id": "V-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL",
+        "index_urspruenglicher_basiswert": "128.8", "index_schwelle_prozent": "2.00",
+    }])
+    plan1 = _plan(paket, session_factory)
+    assert next(b for b in plan1.befunde if b.entitaet == "Mietvertragsprofil").status == "NEU"
+    _apply(paket, plan1, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+
+    plan2 = _plan(paket, session_factory)
+    befund = next(b for b in plan2.befunde if b.entitaet == "Mietvertragsprofil")
+    assert befund.status == "UNVERAENDERT"
+    _apply(paket, plan2, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    assert len(stammdaten_repo.liste_mietvertragsprofil_versionen("V-1")) == 1
+
+    # Gegenprobe mit äquivalent geschriebenem, aber numerisch IDENTISCHEM Wert
+    # (mehr/weniger Nachkommastellen) - bleibt weiterhin UNVERAENDERT.
+    paket_andere_schreibweise = _paket(mietvertragsprofile=[{
+        "vertrag_id": "V-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL",
+        "index_urspruenglicher_basiswert": "128.80000", "index_schwelle_prozent": "2",
+    }])
+    plan3 = _plan(paket_andere_schreibweise, session_factory)
+    befund3 = next(b for b in plan3.befunde if b.entitaet == "Mietvertragsprofil")
+    assert befund3.status == "UNVERAENDERT"
+    assert len(stammdaten_repo.liste_mietvertragsprofil_versionen("V-1")) == 1
+
+
 def test_mietvertragsprofil_buero_wird_nicht_als_mrg_frei_abgeleitet(session_factory, stammdaten_repo, op_service):
     """Nutzungsart ist unabhängig von Rechtsordnung - BUERO darf niemals
     implizit eine Rechtsordnungs-Ableitung/-Änderung auslösen."""

@@ -18,14 +18,18 @@ def build_text_pdf(zeilen: list[str]) -> bytes:
     for zeile in zeilen:
         operationen.append(f"BT /F1 11 Tf 72 {y} Td ({_escape(zeile)}) Tj ET")
         y -= 20
-    content = "\n".join(operationen).encode("latin-1", errors="replace")
+    # cp1252 (statt latin-1) UND ein explizit deklariertes
+    # /Encoding /WinAnsiEncoding, damit das Euro-Zeichen (in Latin-1 gar
+    # nicht enthalten) korrekt geschrieben UND von `extract_text()` beim
+    # Rücklesen wieder korrekt als "€" decodiert wird.
+    content = "\n".join(operationen).encode("cp1252", errors="replace")
 
     objekte = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
         b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
         b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n" + content + b"\nendstream",
     ]
     out = bytearray(b"%PDF-1.4\n")

@@ -12,7 +12,7 @@ from decimal import Decimal, InvalidOperation
 from html import escape as h
 
 from mietinkasso.backoffice.views import csrf_feld, eur, option, parse_eur_betrag
-from mietinkasso.domain.money import cents_to_decimal
+from mietinkasso.domain.money import cents_to_decimal, zerlege_brutto_cent
 
 NUTZUNGSARTEN = ["UNGEKLAERT", "WOHNUNG", "BUERO", "GESCHAEFTSLOKAL", "SONSTIGE"]
 RECHTSORDNUNGEN = [
@@ -96,16 +96,17 @@ def neu_kontext_formular(*, einheiten_mit_objekt: list[tuple], debitoren: list, 
         f'<option value="{h(einheit.id)}">{h(einheit_label(objekt, einheit))}</option>'
         for objekt, einheit in einheiten_mit_objekt
     )
-    debitor_optionen = "".join(option(d.id, f"{d.name} ({d.id})") for d in debitoren)
+    debitor_optionen = option("", "— aus Liste wählen —") + "".join(option(d.id, f"{d.name} ({d.id})") for d in debitoren)
     gesellschaft_optionen = "".join(option(g.id, f"{g.name} ({g.id})") for g in gesellschaften)
     rechtsordnung_optionen = "".join(option(r, r) for r in RECHTSORDNUNGEN)
     fehlerblock = f'<div class="flash-error">{h(fehler)}</div>' if fehler else ""
     return f"""
     <div class="card">
       <h1>Neuen Mietvertrag anlegen</h1>
-      <p class="muted">Objekt/Einheit, Gesellschaft und Mieter müssen bereits als Stammdaten vorhanden sein
-         (Einspielung über den Echtbetrieb-Intake). Dieser Ablauf legt den Mietvertrag selbst sowie das
-         Mietvertragsprofil an - optional vorausgefüllt aus einem hochgeladenen PDF.</p>
+      <p class="muted">Objekt/Einheit und Gesellschaft müssen bereits als Stammdaten vorhanden sein
+         (Einspielung über den Echtbetrieb-Intake). Der Mieter kann entweder aus der Liste gewählt oder
+         hier gleich neu angelegt werden - beides läuft im selben atomaren Vorgang. Dieser Ablauf legt den
+         Mietvertrag selbst sowie das Mietvertragsprofil an - optional vorausgefüllt aus einem hochgeladenen PDF.</p>
       {fehlerblock}
       <form method="post" action="/backoffice/vertragsanlage/pdf-hochladen" enctype="multipart/form-data">
         {csrf_feld(csrf)}
@@ -114,11 +115,27 @@ def neu_kontext_formular(*, einheiten_mit_objekt: list[tuple], debitoren: list, 
           <label>Vertrag-ID (frei wählbar, eindeutig)</label>
           <input name="vertrag_id" required placeholder="z. B. V-601-TOP4">
           <label>Einheit</label><select name="einheit_id" required>{einheit_optionen}</select>
-          <label>Mieter (Debitor)</label><select name="debitor_id" required>{debitor_optionen}</select>
           <label>Vermieter-Gesellschaft</label><select name="gesellschaft_id" required>{gesellschaft_optionen}</select>
           <label>Rechtsordnung</label><select name="rechtsordnung" required>{rechtsordnung_optionen}</select>
           <label>Vertragsbeginn (technisch, Sollstellung/OP)</label><input type="date" name="gueltig_von" required>
           <label>Vertragsende (leer lassen = unbefristet)</label><input type="date" name="gueltig_bis">
+        </fieldset>
+        <fieldset><legend>Mieter</legend>
+          <label>Vorhandenen Mieter wählen</label><select name="debitor_id">{debitor_optionen}</select>
+          <p class="muted">ODER neu anlegen (wenn ausgefüllt, hat das Vorrang vor der Auswahl oben):</p>
+          <label>Neue Mieter-ID</label><input name="neuer_debitor_id" placeholder="z. B. DEB-NEU-1">
+          <label>Name</label><input name="neuer_debitor_name">
+          <label>E-Mail</label><input name="neuer_debitor_email" type="email">
+          <label>Adresse</label><input name="neuer_debitor_adresse">
+        </fieldset>
+        <fieldset><legend>Mietbestandteile (optional, geprüfte Komponenten - keine historische Sollbuchung)</legend>
+          <p class="muted">Werden als aktive Vertragskomponenten ab Vertragsbeginn angelegt, lösen aber KEINE
+             rückwirkende OP-Buchung aus - die künftige Vorschreibung nutzt sie normal.</p>
+          <label>Hauptmietzins (brutto, EUR)</label><input name="komponente_hmz">
+          <label>Betriebskosten (brutto, EUR)</label><input name="komponente_bk">
+          <label>Heizkosten (brutto, EUR)</label><input name="komponente_hk">
+          <label>Küche (brutto, EUR)</label><input name="komponente_kueche">
+          <label>Parkplatz (brutto, EUR)</label><input name="komponente_parkplatz">
         </fieldset>
         <fieldset><legend>Optionale einmalige PDF-Aufnahme</legend>
           <p class="muted">Lokale Texterkennung ohne KI-/Cloud-Aufruf - liefert nur Vorschläge mit Seitenbeleg,
@@ -135,13 +152,28 @@ def neu_kontext_werte(form) -> dict:
     if not vertrag_id:
         raise ValueError("Vertrag-ID darf nicht leer sein.")
     einheit_id = str(form.get("einheit_id", "")).strip()
-    debitor_id = str(form.get("debitor_id", "")).strip()
     gesellschaft_id = str(form.get("gesellschaft_id", "")).strip()
     rechtsordnung = str(form.get("rechtsordnung", "")).strip()
     if rechtsordnung not in RECHTSORDNUNGEN:
         raise ValueError("Ungültige Rechtsordnung.")
+
+    neuer_debitor_name = str(form.get("neuer_debitor_name", "")).strip()
+    neuer_debitor: dict | None = None
+    if neuer_debitor_name:
+        neuer_debitor_id = str(form.get("neuer_debitor_id", "")).strip()
+        if not neuer_debitor_id:
+            raise ValueError("Neue Mieter-ID darf nicht leer sein.")
+        neuer_debitor = dict(
+            id=neuer_debitor_id, name=neuer_debitor_name,
+            email=str(form.get("neuer_debitor_email", "")).strip() or None,
+            adresse=str(form.get("neuer_debitor_adresse", "")).strip() or None,
+        )
+        debitor_id = neuer_debitor_id
+    else:
+        debitor_id = str(form.get("debitor_id", "")).strip()
+
     if not (einheit_id and debitor_id and gesellschaft_id):
-        raise ValueError("Einheit, Mieter und Gesellschaft sind Pflichtfelder.")
+        raise ValueError("Einheit, Mieter (Auswahl oder Neuanlage) und Gesellschaft sind Pflichtfelder.")
     gueltig_von_raw = str(form.get("gueltig_von", "")).strip()
     if not gueltig_von_raw:
         raise ValueError("Vertragsbeginn ist ein Pflichtfeld.")
@@ -152,7 +184,40 @@ def neu_kontext_werte(form) -> dict:
     return dict(
         vertrag_id=vertrag_id, einheit_id=einheit_id, debitor_id=debitor_id, gesellschaft_id=gesellschaft_id,
         rechtsordnung=rechtsordnung, gueltig_von=gueltig_von_raw, gueltig_bis=gueltig_bis_raw or None,
+        neuer_debitor=neuer_debitor,
     )
+
+
+#: (Formularfeld-Präfix, Komponentenart, Bezeichnung) - feste, einfache
+#: Auswahl gängiger Mietbestandteile (Auftrag: "Küche/Parkplatz/weitere
+#: Mietkomponenten"). Kein freies Hinzufügen beliebiger Arten in dieser
+#: Runde - das deckt die explizit genannten Fälle ab.
+_KOMPONENTEN_FELDER = (
+    ("komponente_hmz", "HMZ", "Hauptmietzins"),
+    ("komponente_bk", "BK_VORAUSZAHLUNG", "Betriebskosten"),
+    ("komponente_hk", "HEIZ_WW_VORAUSZAHLUNG", "Heizkosten"),
+    ("komponente_kueche", "KUECHE", "Küche"),
+    ("komponente_parkplatz", "PARKPLATZ", "Parkplatz"),
+)
+
+
+def komponenten_werte_aus_form(form, *, vertrag_id: str, gueltig_von: str) -> list[dict]:
+    """Baut aus den (optionalen) Mietbestandteile-Feldern im
+    Neuanlage-Formular `komponenten[]`-Rohdaten für den generischen
+    Intake - nur ausgefüllte Felder werden übernommen, kein erfundener
+    Nullbetrag für ein leer gelassenes Feld."""
+
+    ergebnis: list[dict] = []
+    for feldname, art, bezeichnung in _KOMPONENTEN_FELDER:
+        roh = str(form.get(feldname, "")).strip()
+        if not roh:
+            continue
+        betrag_cent = parse_eur_betrag(roh)
+        ergebnis.append(dict(
+            id=f"{vertrag_id}-{art}", art=art, bezeichnung=bezeichnung,
+            betrag_cent=betrag_cent, gueltig_von=gueltig_von,
+        ))
+    return ergebnis
 
 
 # ---------------------------------------------------------------------------
@@ -201,12 +266,51 @@ def pdf_upload_mini_formular(vertrag_id: str, csrf: str) -> str:
     </div>"""
 
 
+def _mehrdeutigkeit_block(mehrdeutigkeiten: dict) -> str:
+    if not mehrdeutigkeiten:
+        return ""
+    zeilen = []
+    for label, eintrag in mehrdeutigkeiten.items():
+        fundstellen = "; ".join(f"„{h(f.wert)}“ (Seite {f.seite})" for f in eintrag.funde)
+        zeilen.append(f"<li><strong>{h(label)}</strong>: mehrere unterschiedliche Fundstellen im Dokument — {fundstellen}. Bitte manuell entscheiden.</li>")
+    return f'<div class="flash-error"><strong>Mehrdeutige Angaben im Dokument gefunden (kein automatischer Vorschlag):</strong><ul>{"".join(zeilen)}</ul></div>'
+
+
+def _eckdaten_block(eckdaten: dict | None, pdf_hinweise: dict) -> str:
+    if not eckdaten:
+        return ""
+    mieter_hinweis = pdf_hinweise.get("mieter_name_hinweis")
+    vermieter_hinweis = pdf_hinweise.get("vermieter_name_hinweis")
+    mieter_vergleich = (
+        f' <span class="muted">(laut Dokument, Seite {mieter_hinweis.seite}: „{h(mieter_hinweis.formularwert)}“ — bitte mit Auswahl vergleichen)</span>'
+        if mieter_hinweis else ""
+    )
+    vermieter_vergleich = (
+        f' <span class="muted">(laut Dokument, Seite {vermieter_hinweis.seite}: „{h(vermieter_hinweis.formularwert)}“ — bitte mit Auswahl vergleichen)</span>'
+        if vermieter_hinweis else ""
+    )
+    return f"""
+    <div class="card"><h2>Eckdaten dieses Vorgangs</h2>
+      <table>
+        <tr><th>Vertrag-ID</th><td>{h(eckdaten.get('vertrag_id', ''))}</td></tr>
+        <tr><th>Objekt / Einheit</th><td>{h(eckdaten.get('objekt_einheit_label', ''))}</td></tr>
+        <tr><th>Mieter</th><td>{h(eckdaten.get('mieter_anzeige', ''))}{mieter_vergleich}</td></tr>
+        <tr><th>Vermieter-Gesellschaft</th><td>{h(eckdaten.get('gesellschaft_name', ''))}{vermieter_vergleich}</td></tr>
+        <tr><th>Rechtsordnung</th><td>{h(eckdaten.get('rechtsordnung', ''))}</td></tr>
+        <tr><th>Vertragsbeginn / -ende</th><td>{h(eckdaten.get('gueltig_von', ''))} – {h(eckdaten.get('gueltig_bis') or 'unbefristet')}</td></tr>
+      </table>
+    </div>"""
+
+
 def review_formular(
     *, ist_neu: bool, kontext_hidden: dict, werte: dict, vorschlaege: dict, warnungen: tuple[str, ...],
     csrf: str, aktion_url: str, zurueck_href: str, kaution_bereits_vorhanden: bool = False,
+    eckdaten: dict | None = None, mehrdeutigkeiten: dict | None = None,
 ) -> str:
     hidden_felder = "".join(f'<input type="hidden" name="{h(k)}" value="{h(str(v))}">' for k, v in kontext_hidden.items())
     warnblock = "".join(f'<p class="warn">{h(w)}</p>' for w in warnungen)
+    eckdaten_block = _eckdaten_block(eckdaten, vorschlaege)
+    mehrdeutigkeit_block = _mehrdeutigkeit_block(mehrdeutigkeiten or {})
     nutzungsart_optionen = "".join(
         option(n, n, selected=(werte.get("nutzungsart") or "UNGEKLAERT") == n) for n in NUTZUNGSARTEN
     )
@@ -222,6 +326,10 @@ def review_formular(
       <p class="muted">Lokal ausgelesene bzw. bereits gespeicherte Werte - jedes Feld bleibt editierbar.
          Fehlende/unklare Angaben bewusst offen lassen, nichts wird erfunden.</p>
       {warnblock}
+    </div>
+    {eckdaten_block}
+    {mehrdeutigkeit_block}
+    <div class="card">
       <form method="post" action="{h(aktion_url)}">
         {csrf_feld(csrf)}
         {hidden_felder}
@@ -443,12 +551,30 @@ def detail_ansicht(
     kaution_vereinbart_status = "bereit" if (profil and profil.vertragliche_kaution_cent is not None) else "Angabe fehlt"
     kaution_eingegangen_status = "bereit" if kaution is not None else "Angabe fehlt"
 
-    komponenten_zeilen = "".join(
-        f"<tr><td>{h(k.art)}</td><td>{h(k.bezeichnung)}</td><td>{eur(k.betrag_cent)}</td>"
-        f"<td>{k.ust_satz_promille / 100:.1f} %</td></tr>"
-        for k in komponenten
-    ) or "<tr><td colspan=4>Keine aktiven Mietkomponenten.</td></tr>"
-    summe_cent = sum(k.betrag_cent for k in komponenten)
+    # `VertragsKomponenteTable.betrag_cent` ist per Definition BRUTTO
+    # (siehe `domain/money.py::zerlege_brutto_cent`-Docstring) - der
+    # gebuchte/vorgeschriebene Betrag bleibt unverändert; Netto/USt werden
+    # NUR für den Ausweis über denselben kanonischen Helper zerlegt, den
+    # auch die Vorschreibung selbst verwendet (kein eigener, zweiter
+    # Rechenweg). `ust_satz_promille` ist ein Promille-Wert (10000 =
+    # 100 Promille der Basis = 10 %) - die Prozentanzeige teilt daher
+    # durch 1000, NICHT durch 100.
+    komponenten_zeilen = []
+    brutto_summe_cent = 0
+    netto_summe_cent = 0
+    ust_summe_cent = 0
+    for k in komponenten:
+        netto_cent, ust_cent = zerlege_brutto_cent(k.betrag_cent, k.ust_satz_promille)
+        brutto_summe_cent += k.betrag_cent
+        netto_summe_cent += netto_cent
+        ust_summe_cent += ust_cent
+        prozent_text = f"{k.ust_satz_promille / 1000:.1f}".replace(".", ",")
+        komponenten_zeilen.append(
+            f"<tr><td>{h(k.art)}</td><td>{h(k.bezeichnung)}</td>"
+            f"<td>{eur(netto_cent)}</td><td>{eur(ust_cent)}</td><td>{eur(k.betrag_cent)}</td>"
+            f"<td>{prozent_text} %</td></tr>"
+        )
+    komponenten_zeilen = "".join(komponenten_zeilen) or "<tr><td colspan=6>Keine aktiven Mietkomponenten.</td></tr>"
 
     versionen_zeilen = "".join(
         f"<tr><td>{v.version}</td><td>{h(v.quelle_typ)}</td><td>{h(v.quelle_referenz or '')}</td>"
@@ -479,7 +605,7 @@ def detail_ansicht(
     </div>
     <div class="card"><h2>Laufzeit</h2>
       <table>
-        <tr><th>Vertragsbeginn (technisch)</th><td>{vertrag.gueltig_von.isoformat()}</td></tr>
+        <tr><th>Vertragsbeginn</th><td>{vertrag.gueltig_von.isoformat()}</td></tr>
         <tr><th>Vertragsende</th><td>{vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else 'unbefristet'}</td></tr>
         <tr><th>Ursprünglicher tatsächlicher Mietbeginn</th>
             <td>{profil.urspruenglicher_mietbeginn.isoformat() if profil and profil.urspruenglicher_mietbeginn else '—'}
@@ -490,8 +616,9 @@ def detail_ansicht(
       </table>
     </div>
     <div class="card"><h2>Mietbestandteile (aktiv)</h2>
-      <table><tr><th>Art</th><th>Bezeichnung</th><th>Betrag</th><th>USt</th></tr>{komponenten_zeilen}</table>
-      <p><strong>Summe netto: {eur(summe_cent)}</strong> (USt je Komponente separat, siehe Vorschreibung für Bruttosumme)</p>
+      <table><tr><th>Art</th><th>Bezeichnung</th><th>Netto</th><th>USt</th><th>Brutto</th><th>USt-Satz</th></tr>{komponenten_zeilen}</table>
+      <p><strong>Summe netto: {eur(netto_summe_cent)}</strong> · Summe USt: {eur(ust_summe_cent)} ·
+         <strong>Summe brutto (tatsächlich vorgeschrieben): {eur(brutto_summe_cent)}</strong></p>
     </div>
     <div class="card"><h2>Kaution und Mahngebühren</h2>
       <table>
@@ -514,9 +641,15 @@ def detail_ansicht(
         <tr><th>Basismonat</th><td>{h(profil.index_urspruenglicher_basismonat) if profil and profil.index_urspruenglicher_basismonat else '—'}</td></tr>
         <tr><th>Basiswert</th><td>{profil.index_urspruenglicher_basiswert if profil and profil.index_urspruenglicher_basiswert is not None else '—'}</td></tr>
         <tr><th>Schwelle</th><td>{f"{profil.index_schwelle_prozent} % ({'ab' if profil.index_schwelle_inklusive else 'über'})" if profil and profil.index_schwelle_prozent is not None else '—'}</td></tr>
+        <tr><th>Anpassungsmonat</th><td>{profil.index_anpassungsmonat if profil and profil.index_anpassungsmonat else '—'}</td></tr>
+        <tr><th>Mindestabstand (Monate)</th><td>{profil.index_mindestintervall_monate if profil and profil.index_mindestintervall_monate else '—'}</td></tr>
       </table>
     </div>
     <details class="card"><summary>Quellen und Historie</summary>
+      <p class="muted">Technischer Vertragsbeginn = für Sollstellung/Buchung maßgebliches Feld
+         (<code>{h(vertrag.id)}</code>, Gesellschaft <code>{h(vertrag.gesellschaft_id)}</code>) - kann bei
+         Altobjekten von der Verwaltungsübernahme abweichen (siehe oben, "Ursprünglicher tatsächlicher Mietbeginn").
+         "Quelle" (PDF-Extraktion/manuell/Importformat) ist ein Herkunftsvermerk, KEINE fachliche Freigabe.</p>
       <h3>Freigegebenes Rechtsprofil</h3><p>{h(rechtsprofil_hinweis) if rechtsprofil_hinweis else 'Kein Rechtsprofil freigegeben.'}</p>
       <h3>Indexklausel</h3><p>{h(index_klausel_hinweis) if index_klausel_hinweis else 'Keine Indexklausel erfasst.'}</p>
       <h3>Mietvertragsprofil-Versionen</h3>

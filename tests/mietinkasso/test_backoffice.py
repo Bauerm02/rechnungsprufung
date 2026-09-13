@@ -16,6 +16,7 @@ importiert."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -1784,6 +1785,112 @@ def test_neuen_mietvertrag_mit_pdf_upload_end_to_end(backoffice_client):
     assert stammdaten.get_kaution("V-601-NEU1") is None
 
 
+def test_neuanlage_mit_neuem_mieter_und_mietbestandteilen_end_to_end(backoffice_client):
+    """P1-Nachbesserung: 'Neuanlage verlangt bereits bestehenden Debitor
+    ... kann keine Mietbestandteile erfassen.' Legt einen VÖLLIG neuen
+    Mieter UND zwei Mietbestandteile (Hauptmietzins, Küche) im selben
+    atomaren Vorgang an - keine zweite Buchungsstrecke, keine historische
+    Sollbuchung."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    hochgeladen = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "NEU", "csrf_token": csrf, "vertrag_id": "V-601-NEU2",
+            "einheit_id": "601-KURZ1", "gesellschaft_id": "7DI", "rechtsordnung": "OESTERREICH_MRG_VOLL",
+            "gueltig_von": "2026-09-01", "gueltig_bis": "",
+            "neuer_debitor_id": "DEB-NEU-2", "neuer_debitor_name": "Ganz Neuer Mieter",
+            "neuer_debitor_email": "neu@example.at",
+            "komponente_hmz": "500,00", "komponente_kueche": "30,00",
+        },
+    )
+    assert hochgeladen.status_code == 200
+    assert "Ganz Neuer Mieter (neu: DEB-NEU-2)" in hochgeladen.text  # sichtbare Eckdaten, nicht nur versteckt
+    marker = 'name="csrf_token" value="'
+    start = hochgeladen.text.index(marker) + len(marker)
+    ende = hochgeladen.text.index('"', start)
+    form_csrf = hochgeladen.text[start:ende]
+
+    vorschau = client.post(
+        "/backoffice/vertragsanlage/vorschau",
+        data={
+            "csrf_token": form_csrf, "modus": "NEU", "vertrag_id": "V-601-NEU2",
+            "einheit_id": "601-KURZ1", "gesellschaft_id": "7DI", "rechtsordnung": "OESTERREICH_MRG_VOLL",
+            "gueltig_von": "2026-09-01", "gueltig_bis": "", "quelle_typ": "MANUELL",
+            "neuer_debitor_id": "DEB-NEU-2", "neuer_debitor_name": "Ganz Neuer Mieter",
+            "neuer_debitor_email": "neu@example.at",
+            "komponente_hmz": "500,00", "komponente_kueche": "30,00",
+            "nutzungsart": "WOHNUNG",
+        },
+    )
+    assert vorschau.status_code == 200
+    assert "Debitor" in vorschau.text and "Komponente" in vorschau.text  # beide Bereiche in der Plan-Tabelle
+
+    paket_marker = 'name="paket_json" hidden>'
+    p_start = vorschau.text.index(paket_marker) + len(paket_marker)
+    p_ende = vorschau.text.index("</textarea>", p_start)
+    import html as _html
+    paket_json_roh = _html.unescape(vorschau.text[p_start:p_ende])
+
+    uebernommen = client.post(
+        "/backoffice/vertragsanlage/uebernehmen",
+        data={"csrf_token": form_csrf, "paket_json": paket_json_roh},
+        follow_redirects=False,
+    )
+    assert uebernommen.status_code == 303
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    debitor = stammdaten.get_debitor("DEB-NEU-2")
+    assert debitor is not None and debitor.name == "Ganz Neuer Mieter" and debitor.email == "neu@example.at"
+    vertrag = stammdaten.get_vertrag("V-601-NEU2")
+    assert vertrag is not None and vertrag.debitor_id == "DEB-NEU-2"
+    komponenten = stammdaten.list_aktive_komponenten("V-601-NEU2", date(2026, 9, 1))
+    arten = {k.art: k.betrag_cent for k in komponenten}
+    assert arten == {"HMZ": 50000, "KUECHE": 3000}
+    # Keine historische Sollbuchung/Konto durch die Komponentenanlage selbst.
+    assert stammdaten.get_konto_by_vertrag("V-601-NEU2") is None
+
+
+def test_neuanlage_mit_fremdem_debitor_im_paket_wird_abgelehnt(backoffice_client):
+    """Direkter Missbrauchsversuch gegen `pruefe_schmale_form`: ein Paket,
+    das einen ANDEREN Debitor enthält als den im (neuen) Vertrag
+    referenzierten, wird abgelehnt, unabhängig vom sonstigen Inhalt."""
+
+    from mietinkasso.vertragsanlage.paket_bau import PaketFormUngueltigError, pruefe_schmale_form
+    from mietinkasso.intake.parser import parse_json_paket
+    import json as _json
+
+    paket = parse_json_paket(_json.dumps({
+        "quelle": "t",
+        "vertraege": [{"id": "V-X", "einheit_id": "E1", "debitor_id": "D-ECHT", "gesellschaft_id": "G1", "rechtsordnung": "OESTERREICH_MRG_VOLL", "gueltig_von": "2026-01-01"}],
+        "debitoren": [{"id": "D-FREMD", "name": "Fremd"}],
+        "mietvertragsprofile": [{"vertrag_id": "V-X", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL"}],
+    }))
+    with pytest.raises(PaketFormUngueltigError):
+        pruefe_schmale_form(paket, erwarteter_vertrag_id="V-X")
+
+
+def test_neuanlage_mit_fremder_komponente_im_paket_wird_abgelehnt():
+    from mietinkasso.vertragsanlage.paket_bau import PaketFormUngueltigError, pruefe_schmale_form
+    from mietinkasso.intake.parser import parse_json_paket
+    import json as _json
+
+    paket = parse_json_paket(_json.dumps({
+        "quelle": "t",
+        "mietvertragsprofile": [{"vertrag_id": "V-X", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL"}],
+        "komponenten": [{"id": "K-1", "vertrag_id": "V-ANDERER", "art": "HMZ", "bezeichnung": "HMZ", "betrag_cent": 1000, "gueltig_von": "2026-01-01"}],
+    }))
+    with pytest.raises(PaketFormUngueltigError):
+        pruefe_schmale_form(paket, erwarteter_vertrag_id="V-X")
+
+
 def test_neuanlage_mit_bereits_vergebener_vertrag_id_wird_abgelehnt(backoffice_client):
     client, *_ = backoffice_client
     _login(client)
@@ -1874,6 +1981,27 @@ def test_bestehenden_vertrag_profil_manuell_aktualisieren_erzeugt_versionen(back
     assert "Version" in detail.text  # Quellen-und-Historie-Tabelle vorhanden
 
 
+def test_detail_ansicht_zeigt_korrekten_ust_satz_und_netto_brutto_getrennt(backoffice_client):
+    """Reproduktion: '100.0% bei ust 10000' und '550EUR BRUTTO als Summe
+    netto'. `VertragsKomponenteTable.betrag_cent` ist BRUTTO (siehe
+    `domain/money.py::zerlege_brutto_cent`); `ust_satz_promille=10000`
+    bedeutet 10 %, nicht 100 %. Die Detailansicht muss denselben
+    kanonischen Helper wie die Vorschreibung verwenden."""
+
+    client, *_ = backoffice_client
+    _login(client)
+    detail = client.get("/backoffice/vertrag/V-601-1")
+    assert detail.status_code == 200
+    # V-601-1 hat eine HMZ-Komponente mit betrag_cent=55_000 (BRUTTO,
+    # = 550,00 €), ust_satz_promille=10_000 (10 %) - siehe
+    # backoffice_client-Fixture. Netto = 55.000 / 1,10 = 50.000 Cent = 500,00 €.
+    assert "10,0 %" in detail.text
+    assert "100,0 %" not in detail.text
+    assert "500,00" in detail.text  # Netto
+    assert "50,00" in detail.text  # USt
+    assert "550,00" in detail.text  # Brutto bleibt unverändert (tatsächlich vorgeschrieben)
+
+
 def test_kaution_ueber_wizard_bucht_nie_in_op_saldo(backoffice_client):
     from mietinkasso.infrastructure.config import get_settings
     from mietinkasso.infrastructure.db.session import build_session_factory
@@ -1922,6 +2050,34 @@ def test_xss_im_pdf_text_wird_beim_review_escaped(backoffice_client):
     assert antwort.status_code == 200
     assert "<script>alert(1)</script>" not in antwort.text
     assert "&lt;script&gt;" in antwort.text
+
+
+def test_widerspruechliche_kaution_im_pdf_zeigt_mehrdeutigkeitswarnung(backoffice_client):
+    """Reproduktion: 'PDF Kaution 1.500 EUR + Nachtrag Kaution 2.000 EUR
+    ergibt 1.500 ohne Warnung.' Über die echte HTTP-Route muss die
+    Mehrdeutigkeit sichtbar werden UND das Kautionsfeld darf NICHT
+    stillschweigend mit einem der beiden Werte vorbefüllt sein."""
+
+    from tests.mietinkasso._pdf_test_helpers import build_text_pdf
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    pdf = build_text_pdf(["Kaution: 1.500,00 EUR", "Nachtrag zum Mietvertrag", "Kaution: 2.000,00 EUR"])
+    antwort = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={"modus": "BESTEHEND", "csrf_token": csrf, "vertrag_id": "V-601-1"},
+        files={"pdf_datei": ("nachtrag.pdf", pdf, "application/pdf")},
+    )
+    assert antwort.status_code == 200
+    assert "Mehrdeutige Angaben" in antwort.text
+    assert "1.500,00" in antwort.text and "2.000,00" in antwort.text
+    # Das Kautionsfeld selbst bleibt leer (kein automatischer Vorschlag).
+    marker = 'name="vertragliche_kaution_cent" value="'
+    start = antwort.text.index(marker) + len(marker)
+    ende = antwort.text.index('"', start)
+    assert antwort.text[start:ende] == ""
 
 
 def test_scan_ohne_textlage_zeigt_warnung_und_erfindet_nichts(backoffice_client):
@@ -1992,6 +2148,160 @@ def test_vertragsanlage_gesellschaftsscope_wird_serverseitig_geprueft(ctx_factor
     with pytest.raises(CrossTenantError):
         require_gesellschaft_access(fremd_ctx, "7DI")
     require_gesellschaft_access(fremd_ctx, "ANDERE-GESELLSCHAFT")  # eigene Gesellschaft bleibt erlaubt
+
+
+# -- Sicherheits-Rückprüfung a78717e (unabhängige Abnahme) -------------------
+
+
+def test_debitoren_filterung_zeigt_nur_gesellschaftsscope_erlaubte_debitoren(backoffice_client, ctx_factory):
+    """Reproduktion: 'GET /vertraege/neu zeigt FOREIGN-Debitor trotz
+    7DI-Scope'. Der aktuelle Pilot kennt nur EINEN ADMIN-Operator (sieht
+    strukturell alles) - die Filterlogik selbst (dieselbe, die die Route
+    verwendet) muss für eine künftige eingeschränkte Rolle trotzdem
+    korrekt greifen; das wird hier direkt gegen diese Logik geprüft."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    import mietinkasso.backoffice.app as backoffice_app
+
+    client, *_ = backoffice_client
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_gesellschaft(id="FREMD-GMBH", name="Fremde GmbH")
+    stammdaten.upsert_objekt(id="FREMD-OBJ", gesellschaft_id="FREMD-GMBH", bezeichnung="Fremdobjekt")
+    stammdaten.upsert_einheit(id="FREMD-TOP1", objekt_id="FREMD-OBJ", bezeichnung="Top 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_debitor(id="DEB-FREMD", name="Fremder Mieter")
+    stammdaten.upsert_vertrag(
+        id="V-FREMD-1", einheit_id="FREMD-TOP1", debitor_id="DEB-FREMD", gesellschaft_id="FREMD-GMBH",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+
+    scoped_ctx = ctx_factory("7DI")
+    alle_vertraege = backoffice_app._stammdaten_repo.list_alle_vertraege()
+    erlaubte_ids = {v.debitor_id for v in alle_vertraege if backoffice_app._hat_gesellschaft_zugriff(scoped_ctx, v.gesellschaft_id)}
+    sichtbare_debitoren = {d.id for d in backoffice_app._stammdaten_repo.list_alle_debitoren() if d.id in erlaubte_ids}
+    assert "DEB-1" in sichtbare_debitoren  # 7DI-Mieter bleibt sichtbar
+    assert "DEB-FREMD" not in sichtbare_debitoren  # fremder Mieter ausgeschlossen
+
+
+def test_uebernehmen_ohne_vorherige_vorschau_wird_abgelehnt_und_bucht_nichts(backoffice_client):
+    """Reproduktion: 'POST /vertragsanlage/uebernehmen mit erlaubtem
+    Profil plus nachbuchungen[SOLL 12300] OHNE vorherige Vorschau liefert
+    303 und OP-Anzahl 0→1.' `uebernehmen` MUSS ausschließlich den
+    serverseitig bei einer tatsächlich durchlaufenen Vorschau abgelegten
+    Stand anwenden - ein direkter POST ohne vorherige Sitzungs-Vorschau
+    dieser Sitzung darf NICHTS bewirken, unabhängig vom Inhalt."""
+
+    client, konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    boesartiges_paket = json.dumps({
+        "quelle": "angreifer", "mietvertragsprofile": [{"vertrag_id": "V-601-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL"}],
+        "nachbuchungen": [{
+            "import_id": "ANGRIFF-1", "vertrag_id": "V-601-1", "typ": "SOLL", "betrag_cent": 12300,
+            "belegdatum": "2026-09-01", "buchungsdatum": "2026-09-01",
+        }],
+    })
+    saldo_vorher = op_service.berechne_saldo(konto_id).saldo_cent
+    antwort = client.post(
+        "/backoffice/vertragsanlage/uebernehmen",
+        data={"csrf_token": csrf, "paket_json": boesartiges_paket},
+    )
+    assert antwort.status_code == 400
+    assert "Keine" in antwort.text and "Vorschau" in antwort.text
+    assert op_service.berechne_saldo(konto_id).saldo_cent == saldo_vorher
+
+
+def test_uebernehmen_ignoriert_manipuliertes_client_paket_json(backoffice_client):
+    """Reproduktion: '_ctx scoped nur 7DI, Paket[Profil7DI,ProfilFOREIGN]
+    liefert 303 und schreibt FOREIGN-Profil.' Nach einer ECHTEN Vorschau
+    für Vertrag V-601-1 darf ein am Client manipuliertes `paket_json`
+    (zusätzliches Profil für einen ANDEREN Vertrag, zusätzliche
+    Nachbuchung) beim Übernehmen KEINE Wirkung haben - der Server wendet
+    ausschließlich den bei der Vorschau selbst berechneten, serverseitig
+    gespeicherten Stand an."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-INJ", objekt_id="601", bezeichnung="Top Injektion", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-OPFER", einheit_id="601-TOP-INJ", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+
+    vorschau = client.post(
+        "/backoffice/vertragsanlage/vorschau",
+        data={"csrf_token": csrf, "modus": "BESTEHEND", "vertrag_id": "V-601-1", "quelle_typ": "MANUELL", "nutzungsart": "WOHNUNG"},
+    )
+    assert vorschau.status_code == 200
+
+    saldo_vorher = op_service.berechne_saldo(konto_id).saldo_cent
+    manipuliertes_paket = json.dumps({
+        "quelle": "angreifer",
+        "mietvertragsprofile": [
+            {"vertrag_id": "V-601-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL"},
+            {"vertrag_id": "V-601-OPFER", "nutzungsart": "GESCHAEFTSLOKAL", "quelle_typ": "MANUELL"},
+        ],
+        "nachbuchungen": [{
+            "import_id": "ANGRIFF-2", "vertrag_id": "V-601-1", "typ": "SOLL", "betrag_cent": 5000,
+            "belegdatum": "2026-09-01", "buchungsdatum": "2026-09-01",
+        }],
+    })
+    antwort = client.post(
+        "/backoffice/vertragsanlage/uebernehmen",
+        data={"csrf_token": csrf, "paket_json": manipuliertes_paket},
+        follow_redirects=False,
+    )
+    assert antwort.status_code == 303  # die ECHTE (kleine) Vorschau wird angewendet
+    assert op_service.berechne_saldo(konto_id).saldo_cent == saldo_vorher  # keine eingeschleuste Buchung
+    assert stammdaten.neuestes_mietvertragsprofil("V-601-OPFER") is None  # kein fremdes Profil geschrieben
+
+
+def test_uebernehmen_bei_zwischenzeitlich_geaendertem_profil_erzwingt_neue_pruefung(backoffice_client):
+    """'bei inzwischen verändertem Profil neuer Review statt blind neue
+    Version' - ändert sich das Mietvertragsprofil zwischen Vorschau und
+    Übernahme (z. B. ein zweiter, gleichzeitig laufender Vorgang), wird
+    NICHT blind auf dem alten Snapshot eine weitere Version erzeugt."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-STALE", objekt_id="601", bezeichnung="Top Stale", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-STALE", einheit_id="601-TOP-STALE", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+
+    vorschau = client.post(
+        "/backoffice/vertragsanlage/vorschau",
+        data={"csrf_token": csrf, "modus": "BESTEHEND", "vertrag_id": "V-601-STALE", "quelle_typ": "MANUELL", "nutzungsart": "WOHNUNG"},
+    )
+    assert vorschau.status_code == 200
+
+    # Konkurrierende Änderung zwischen Vorschau und Übernahme.
+    stammdaten.add_mietvertragsprofil(
+        vertrag_id="V-601-STALE", nutzungsart="BUERO", quelle_typ="MANUELL", erstellt_von="anderer-vorgang",
+    )
+
+    antwort = client.post("/backoffice/vertragsanlage/uebernehmen", data={"csrf_token": csrf})
+    assert antwort.status_code == 400
+    assert "geändert" in antwort.text
+    versionen = stammdaten.liste_mietvertragsprofil_versionen("V-601-STALE")
+    assert len(versionen) == 1  # keine dritte/blinde Version durch den veralteten Vorgang
 
 
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):

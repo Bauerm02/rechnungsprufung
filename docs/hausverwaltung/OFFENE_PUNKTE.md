@@ -2019,3 +2019,80 @@ in `RAHMENPROGRAMM.md` (Abschnitt "HV-20260913-RUECKSTAENDE").
   werden** - ohne Konfiguration bleibt jeder PDF-Upload mit HTTP 400
   blockiert (bewusst "closed by default", siehe
   `infrastructure/config.py`).
+
+### Rückprüfung a78717e (unabhängige Abnahme) — behoben
+
+Sieben konkret reproduzierte Befunde, alle mit gezielter Regression
+belegt (Gesamttestsatz danach: 836 grün):
+
+1. **P1 Sicherheitslücke**: `/vertragsanlage/uebernehmen` akzeptierte
+   ein vom Client mitgeschicktes `paket_json` ungeprüft (Preview
+   umgehbar, zusätzliche `nachbuchungen[]`/ein fremdes Vertragsprofil
+   einschleusbar). Behoben durch einen serverseitigen Sitzungsstand
+   (`BackofficeSession.vertragsanlage_review`): `/vorschau` speichert
+   das tatsächlich geprüfte Paket serverseitig, `/uebernehmen` liest
+   AUSSCHLIESSLICH diesen Stand und ignoriert jeden client-seitig
+   mitgeschickten Paketinhalt vollständig. Zusätzlich erzwingt
+   `vertragsanlage/paket_bau.py::pruefe_schmale_form` eine enge
+   Paketform (höchstens ein Vertrag/Profil/Kaution/Debitor, beliebig
+   viele aber ausschließlich zum selben Vertrag gehörende Komponenten,
+   keine Gesellschaften/Objekte/Einheiten/Eröffnungen/Nachbuchungen/
+   Sperren) - unabhängig von der Sitzungsbindung, als zweite
+   Verteidigungslinie. Bei zwischenzeitlich geändertem Profil/Kaution
+   wird eine neue Prüfung erzwungen statt blind eine weitere Version
+   anzulegen. `require_schreibrecht` ergänzt auf allen drei Routen.
+2. **P1**: `GET /vertraege/neu` listete ungefiltert ALLE Debitoren.
+   Gefiltert auf Debitoren mit mindestens einem Vertrag unter einer für
+   den aktuellen Akteur erlaubten Gesellschaft (im aktuellen Ein-
+   ADMIN-Pilotbetrieb ohne sichtbaren Effekt, aber für eine künftige
+   eingeschränkte Rolle korrekt).
+3. **P2**: Die Detailansicht zeigte `ust_satz_promille / 100` (100 %
+   statt 10 % bei 10000 Promille) und bezeichnete die BRUTTO-Summe
+   fälschlich als "netto". Auf den kanonischen `domain/money.py::
+   zerlege_brutto_cent`-Helfer umgestellt; Netto/USt/Brutto werden jetzt
+   getrennt und korrekt ausgewiesen.
+4. **P1**: `pdf_extraktion.py` erkannte nur "Betrag EUR", nicht "EUR
+   Betrag"/"in Höhe von EUR Betrag". Geldmuster erkennen jetzt beide
+   Reihenfolgen.
+5. **P1**: Zwei unterschiedliche Fundstellen desselben Feldes (z. B.
+   Kaution in der Präambel UND ein abweichender Betrag in einem
+   Nachtrag) ergaben stillschweigend den ERSTEN Treffer ohne Warnung.
+   `extrahiere()` sammelt jetzt ALLE Fundstellen je Feld; bei
+   widersprüchlichen Werten gibt es KEINEN automatischen Vorschlag,
+   sondern eine sichtbare "Mehrdeutige Angaben"-Warnung mit allen
+   Fundstellen im Review-Formular.
+6. Zusätzlich (eigene Prüfung während der Nachbesserung): Maxsize wird
+   jetzt VOR dem vollständigen Einlesen des Uploads durchgesetzt
+   (`_lese_begrenzt`, blockweises Lesen mit Abbruch bei Überschreitung)
+   statt erst nach `await file.read()`; fehlgeschlagene Seitenzugriffe
+   beim Textextrahieren werden als Warnung ausgewiesen statt
+   stillschweigend als vollständiger Erfolg zu gelten.
+7. **P1 "Kernumfang fehlt"**: Neuanlage verlangte zwingend einen
+   bereits bestehenden Debitor und konnte keine Mietbestandteile
+   erfassen; Datum/Parteien waren nur als versteckte Formularfelder
+   vorhanden. Ergänzt: neuer Mieter im selben atomaren Vorgang anlegbar
+   (nutzt das bereits bestehende `debitoren[]`-Intake-Entity, keine
+   zweite Buchungsstrecke), Mietbestandteile (Hauptmietzins/
+   Betriebskosten/Heizkosten/Küche/Parkplatz) als geprüfte
+   `komponenten[]` anlegbar (keine historische Sollbuchung), zusätzliche
+   Parser-Muster für Mieter-/Vermieter-Namenshinweis, Mietende und die
+   genannten Mietbestandteile, sichtbarer "Eckdaten dieses Vorgangs"-
+   Block (Vertrag-ID, Objekt/Einheit, Mieter, Gesellschaft,
+   Rechtsordnung, Laufzeit) im Review statt nur versteckter Felder,
+   Anpassungsmonat/Mindestabstand ergänzt in der Index-Detailansicht.
+
+**Zusätzlicher P1 (Idempotenz)**: `_mietvertragsprofil_felder` verglich
+`Decimal`-Werte über `str()` ohne Kanonisierung - `Numeric(12,4)`/
+`Numeric(6,3)` laden einen Wert beim Rücklesen mit fester Skalierung
+(z. B. `Decimal("128.8")` wird zu `Decimal("128.8000")`), wodurch JEDER
+identische Wiederholimport mit abweichender Nachkommastellen-Schreibweise
+fälschlich als `AKTUALISIERUNG` statt `UNVERAENDERT` erkannt wurde -
+betraf auch unverändert erneut abgesendete Formulare. Behoben durch
+`planner.py::_dezimal_kanonisch` (Quantisierung auf die exakte
+Spaltenskalierung vor dem Hash-Vergleich, `NaN`/`Infinity` werden
+abgelehnt).
+
+**Weiterhin bewusst nicht in dieser Runde**: kein Massen-Upload, keine
+Bearbeitung von Mietbestandteilen für einen BESTEHENDEN Vertrag über
+diesen Ablauf (dafür bleibt die bestehende Komponenten-Freigabe-Route
+zuständig), kein automatischer Konflikt-Merge-Assistent, keine OCR.

@@ -57,6 +57,16 @@ class BackofficeSession:
     csrf_token: str
     erstellt_um: float = field(default_factory=time.monotonic)
     zuletzt_aktiv_um: float = field(default_factory=time.monotonic)
+    # Serverseitig gehaltener Zwischenstand EINER laufenden Vertragsanlage-
+    # Prüfung (siehe `backoffice/app.py::vertragsanlage_vorschau`/
+    # `vertragsanlage_uebernehmen`) - der Browser überträgt NIE das
+    # tatsächliche Vorschau-Paket, sondern erhält nur eine Anzeige davon.
+    # `uebernehmen` wendet ausschließlich diesen serverseitigen Stand an,
+    # nie einen vom Client mitgeschickten Wert - ein manipulierter POST
+    # kann dadurch kein anderes Paket unterschieben als das zuvor GENAU
+    # AUF DIESER SITZUNG geprüfte. Ein Operator kann immer nur EINE
+    # Vertragsanlage gleichzeitig in Prüfung haben (Ein-Operator-Pilot).
+    vertragsanlage_review: dict | None = None
 
 
 class SessionStore:
