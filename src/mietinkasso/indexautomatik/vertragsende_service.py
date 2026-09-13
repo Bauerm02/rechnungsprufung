@@ -61,8 +61,18 @@ class VertragsendeErinnerungService:
         )
 
     def plane_alle(self, *, ctx: AuthContext, heute: date) -> list[VertragsendeErinnerungTable]:
+        """Unabhängiger Review (b31-Folgereview): derselbe
+        Gesellschaftsscope-Filter wie `IndexautomatikService.
+        monatslauf_alle` - ein Vertrag außerhalb von
+        `ctx.gesellschaft_ids` wird übersprungen, BEVOR
+        `plane_fuer_vertrag` (das intern `require_gesellschaft_access`
+        aufruft und sonst `CrossTenantError` werfen würde) überhaupt
+        aufgerufen wird."""
+
         ergebnisse: list[VertragsendeErinnerungTable] = []
         for vertrag in self._stammdaten_repository.list_alle_vertraege():
+            if not ctx.has_zugriff(vertrag.gesellschaft_id):
+                continue
             try:
                 self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
             except ObjektAusgeschlossenError:

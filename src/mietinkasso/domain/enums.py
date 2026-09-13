@@ -160,13 +160,19 @@ class IndexautomatikLaufStatus(str, enum.Enum):
 
 
 class ErhoehungsschreibenStatus(str, enum.Enum):
-    """Die sichtbaren Zustände entsprechen wortgleich dem Auftrag:
-    "Entwurf/blockiert/bereit/gesendet/Zugang bestätigt/ausgeführt/
-    unklar". `IN_VERSAND` ist ein zusätzlicher, rein interner
-    Zwischenzustand (wie `MahnStatus.IN_VERSAND` in `mahnwesen/`) für
-    den atomaren Claim zwischen "bereit" und "gesendet" - ohne ihn
-    bliebe die Zeile beim Claim auf BEREIT stehen und ein zweiter
-    Aufrufer könnte denselben Fall parallel claimen (Doppelversand)."""
+    """Der Auftrag nennt die Zustände wörtlich "Entwurf/blockiert/
+    bereit/gesendet/Zugang bestätigt/ausgeführt/unklar" - `ausgeführt`
+    wird hier bewusst als `SOLL_UMSETZUNG_OFFEN` geführt (unabhängiger
+    Review b31: "outbox_service.taegliche_pflege setzt weiterhin
+    AUSGEFUEHRT, obwohl keine Solländerung stattfindet"): dieses Modul
+    löst NIE automatisch eine Sollstellung/Vorschreibungsänderung aus
+    (siehe OFFENE_PUNKTE.md) - der Name muss das auch dann noch ehrlich
+    ausdrücken, wenn er vom wörtlichen Auftragstext abweicht.
+    `IN_VERSAND` ist ein zusätzlicher, rein interner Zwischenzustand
+    (wie `MahnStatus.IN_VERSAND` in `mahnwesen/`) für den atomaren Claim
+    zwischen "bereit" und "gesendet" - ohne ihn bliebe die Zeile beim
+    Claim auf BEREIT stehen und ein zweiter Aufrufer könnte denselben
+    Fall parallel claimen (Doppelversand)."""
 
     ENTWURF = "ENTWURF"
     BLOCKIERT = "BLOCKIERT"
@@ -174,7 +180,7 @@ class ErhoehungsschreibenStatus(str, enum.Enum):
     IN_VERSAND = "IN_VERSAND"
     GESENDET = "GESENDET"
     ZUGANG_BESTAETIGT = "ZUGANG_BESTAETIGT"
-    AUSGEFUEHRT = "AUSGEFUEHRT"
+    SOLL_UMSETZUNG_OFFEN = "SOLL_UMSETZUNG_OFFEN"
     UNKLAR = "UNKLAR"
 
 

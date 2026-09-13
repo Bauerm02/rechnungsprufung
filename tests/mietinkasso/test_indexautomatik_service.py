@@ -31,6 +31,7 @@ class Bundle:
     vpi_repo: VpiRepository
     index_repo: IndexRepository
     rechtsprofil_repo: RechtsprofilRepository
+    outbox_service: ErhoehungsschreibenOutboxService
 
 
 @pytest.fixture
@@ -60,7 +61,7 @@ def bundle(session_factory, stammdaten_repo) -> Bundle:
         index_service=index_service,
         outbox_service=outbox_service,
     )
-    return Bundle(rechtsprofil_service, automatik, outbox_repo, lauf_repo, vpi_repo, index_repo, rechtsprofil_repo)
+    return Bundle(rechtsprofil_service, automatik, outbox_repo, lauf_repo, vpi_repo, index_repo, rechtsprofil_repo, outbox_service)
 
 
 def _seed_vpi(vpi_repo, *, reihe="VPI20C18", jahre_werte: dict[int, str]):
@@ -376,6 +377,76 @@ def test_blockierter_lauf_wird_im_folgemonat_erneut_versucht_ohne_terminalen_sta
     zweiter = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 10, 13), akteur="test")
     assert zweiter.status == "ERHOEHUNG_ERZEUGT"
     assert len(bundle.outbox_repo.liste_fuer_vertrag(vertrag.id)) == 1
+
+
+def test_versand_wird_blockiert_wenn_unveraenderte_komponente_sich_seit_entwurf_geaendert_hat(
+    admin_ctx, basis_vertrag, bundle, stammdaten_repo
+):
+    """Ergänzender Repro (6317f96): "echter Monatslauf erzeugt BEREIT mit
+    HMZ 1000 + BK 100; danach BK_VORAUSZAHLUNG von 100 auf 200 ändern,
+    Profil unverändert (nur HMZ referenziert). versenden(...) ergibt
+    GESENDET/1 Aufruf mit veraltetem Gesamtbetrag. Erwartung BLOCKIERT/0."
+    Entwurf und Versand müssen an ALLE im Schreiben enthaltenen aktiven
+    Komponenten gebunden sein - auch die unveränderte BK, nicht nur an
+    Rechtsprofil-Hash/Empfänger."""
+
+    from mietinkasso.indexautomatik.transport import FakeTransportadapter
+    from mietinkasso.infrastructure.db.tables import VertragsKomponenteTable
+
+    vertrag, _konto = basis_vertrag
+    debitor = stammdaten_repo.get_debitor(vertrag.debitor_id)
+    stammdaten_repo.upsert_debitor(id=debitor.id, name=debitor.name, email=debitor.email, adresse="Corsogasse 1/3, 1010 Wien")
+    _mit_komponente(stammdaten_repo, vertrag)
+    stammdaten_repo.add_komponente(
+        id="K-BK", vertrag_id=vertrag.id, art="BK_VORAUSZAHLUNG", bezeichnung="Betriebskosten", betrag_cent=10_000,
+        indexierbar=False, gueltig_von=date(2024, 1, 1),
+    )
+    _freigegebenes_wohnungsprofil(admin_ctx, bundle.rechtsprofil_service, vertrag)
+    _seed_vpi(bundle.vpi_repo, jahre_werte={2023: "100", 2024: "102", 2025: "104"})
+
+    lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 9, 13), akteur="test")
+    assert lauf.status == "ERHOEHUNG_ERZEUGT"
+    schreiben = bundle.outbox_repo.get(lauf.erhoehungsschreiben_id)
+    assert schreiben.status == "BEREIT"
+
+    # BK ändert sich NACH Entwurfserstellung, VOR dem Versand - das
+    # Rechtsprofil selbst (nur HMZ referenziert) bleibt unverändert.
+    with stammdaten_repo._session_factory() as session:
+        komponente = session.get(VertragsKomponenteTable, "K-BK")
+        komponente.betrag_cent = 20_000
+        session.commit()
+
+    transport = FakeTransportadapter()
+    ergebnis = bundle.outbox_service.versenden(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 9, 20), send_enabled=True,
+        mailops_allowlist_bestaetigt=True, transport=transport,
+    )
+    assert ergebnis.status == "BLOCKIERT"
+    assert transport.aufrufe == []
+    assert bundle.outbox_repo.get(schreiben.id).status == "BLOCKIERT"
+
+
+def test_monatslauf_alle_ueberspringt_fremde_gesellschaft_ohne_lauf_zu_schreiben(
+    admin_ctx, ctx_factory, basis_vertrag, bundle, stammdaten_repo
+):
+    """Unabhängiger Review (b31-Folgereview, synthetisch mit "1 fremde
+    Rückgabe + fremde Laufzeile geschrieben" reproduziert):
+    monatslauf_alle fing bislang jeden Fehler (inklusive CrossTenantError)
+    unter einem breiten except ab und legte dabei eine BLOCKIERT-Zeile
+    für einen Vertrag außerhalb des Gesellschaftsscope des Aufrufers an.
+    Jetzt wird ein solcher Vertrag VOR jedem Zugriffsversuch komplett
+    übersprungen - weder gelesen noch geschrieben."""
+
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    _freigegebenes_wohnungsprofil(admin_ctx, bundle.rechtsprofil_service, vertrag)
+    _seed_vpi(bundle.vpi_repo, jahre_werte={2023: "100", 2024: "102", 2025: "104"})
+
+    fremder_ctx = ctx_factory("ANDERE-GESELLSCHAFT")
+    laeufe = bundle.index_service.monatslauf_alle(ctx=fremder_ctx, heute=date(2026, 9, 13), akteur="test")
+
+    assert laeufe == []
+    assert bundle.lauf_repo.get_by_periode(vertrag.id, "2026-09") is None
 
 
 def test_abgelaufener_vertrag_wird_im_batch_uebersprungen(admin_ctx, basis_vertrag, bundle, stammdaten_repo):

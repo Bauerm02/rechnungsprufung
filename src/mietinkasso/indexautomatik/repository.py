@@ -366,6 +366,16 @@ class IndexautomatikLaufRepository:
             )
             return list(session.execute(statement).scalars().all())
 
+    def liste_alle(self) -> list[IndexautomatikLaufTable]:
+        """Für die Backoffice-Übersicht (Ergänzende Abnahmepunkte:
+        "Portal braucht die internen BLOCKIERT-Gründe der Monatsläufe
+        sichtbar, nicht nur leere Outbox") - über ALLE Verträge, nicht
+        nur einen einzelnen."""
+
+        with self._session_factory() as session:
+            statement = select(IndexautomatikLaufTable).order_by(IndexautomatikLaufTable.id.desc())
+            return list(session.execute(statement).scalars().all())
+
 
 class ErhoehungsschreibenRepository:
     def __init__(self, session_factory: sessionmaker[Session]):

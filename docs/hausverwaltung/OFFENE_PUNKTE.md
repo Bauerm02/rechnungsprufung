@@ -1024,3 +1024,197 @@ Mietinkasso-Kontext:
   vorhanden) haben Vorrang vor jeder Neuanlage; ein tatsächliches
   Onboarding führt ausschließlich ein Mensch durch (Claude hat keinen
   Bankzugriff).
+
+## Paket Indexautomatik (Auftrag 13.09.2026, HV-20260913-INDEXAUTOMATIK)
+
+Neues Modul `src/mietinkasso/indexautomatik/` - monatliche MieWeG-/
+MRG-Indexprüfung, Erhöhungsschreiben-Outbox mit Zugangs-/
+Zahlungspflicht-Tracking, Vertragsende-Erinnerung (Owner-only). Der
+vollständige, wortgetreue Auftrag inkl. der fachlichen Nachträge und des
+Modellreviews steht in `RAHMENPROGRAMM.md` (Abschnitt
+"HV-20260913-INDEXAUTOMATIK"). Dieser Abschnitt listet, was geliefert
+ist und WAS ES BEWUSST NICHT TUT.
+
+### Was funktioniert (mit Tests belegt)
+
+- **Monatlicher, idempotenter Lauf je (Vertrag, Kalendermonat)**
+  (`IndexautomatikLaufRepository.claim_periode`/`abschliessen`) - ein
+  atomarer Erzeugungsclaim läuft VOR jeder seiteneffektbehafteten
+  Berechnung, nicht erst am Ende. Ein begründet BLOCKIERTer oder
+  TERMIN_NICHT_ERREICHTer Lauf bleibt im selben Monat erneut versuchbar
+  (z. B. nach nachgetragener VPI-Publikation), ein bereits
+  abgeschlossener (ERHOEHUNG_ERZEUGT/KEIN_ERHOEHUNGSBEDARF/
+  BEREITS_ERFASST) nicht.
+- **Zwei Berechnungspfade, beide Wiederverwendung bestehender,
+  abgenommener Rechner** - kein paralleler Rohrechner:
+  - MieWeG-Wohnungsrechner (`mieweg_vorschau_service.vorschau_erstellen`)
+    für MRG-Voll-/Teilanwendung mit bestätigter Wohnungsnutzung. Haupt-
+    UND geprüfte Untermiete laufen darüber (MieWeG deckt
+    Wohnungsuntermiete ausdrücklich mit ab) - nur eine UNGEKLÄRTE
+    Haupt-/Untermiete-Einordnung sperrt.
+  - Vertragsklausel-Pfad (`index/service.py::IndexService.
+    berechne_vorschlag` über eine versionierte, freigegebene
+    `IndexKlauselTable`) für jeden anderen Fall mit geprüfter Klausel,
+    insbesondere Geschäftsraum - ohne April-Bindung und ohne
+    künstliche Einmal-pro-Jahr-Grenze (partieller Unique-Index nur für
+    den MieWeG-Pfad).
+- **Rechtsprofil-Versionierung mit automatischer Entwertung**
+  (`RechtsprofilService`) - `quelle_hash` bindet die Freigabe an
+  Vertrag, referenzierte Komponenten UND eine ggf. referenzierte
+  IndexKlausel; jede Änderung entwertet die Freigabe beim nächsten
+  Zugriff automatisch. Eine verstrichene `mietzinsobergrenze_gueltig_bis`
+  entwertet zusätzlich zeitbasiert. Eine harte Mietzinsobergrenze wirkt
+  als Kappung UNABHÄNGIG von `foerderbindung`.
+- **Outbox mit echtem Doppelversand-Schutz**: atomarer CAS BEREIT->
+  IN_VERSAND (analog Mahnwesen), Recovery für verwaiste IN_VERSAND-
+  Fälle, erneute Prüfung von Empfänger/Vertragsstatus/Rechtsprofil-
+  Gültigkeit/Wirksamkeitstermin UNMITTELBAR vor jedem Versand. Diese
+  erneute Prüfung bindet mittlerweile auch ALLE im Schreiben
+  ausgewiesenen Komponenten - auch unveränderte Positionen wie BK/HK
+  - gegen ihren aktuellen Stammdatenstand: ändert sich z. B. eine
+  NICHT referenzierte BK-Vorauszahlung zwischen Entwurf und Versand,
+  blockiert der Versand statt mit einem veralteten Gesamtbetrag zu
+  senden (unabhängig reproduziert und behoben). Ein BLOCKIERTes (noch
+  nicht versendetes) Erhöhungsschreiben wird nach behobener Quelle IN
+  PLACE aktualisiert statt den ganzen April-Zyklus dauerhaft zu
+  blockieren. Mehr als eine referenzierte Basis-Komponente blockiert
+  bewusst vor Versand (keine erfundene Verteilungsregel). Ohne
+  konfigurierten echten Transport-Endpunkt ist der Versand (sowohl
+  Backoffice-Route als auch CLI) HART gesperrt - es gibt an keiner
+  produktiven Stelle einen Fake-/Test-Transport-Fallback mehr.
+- **Zugangs-/Zahlungspflicht-Logik**: eine bloß versendete, unbestätigte
+  E-Mail gilt nie automatisch als fristauslösender Zugang; die
+  automatische 14-Tage-Berechnung nach § 16 Abs 9 MRG ist auf
+  MRG-VOLLANWENDUNG begrenzt (NICHT MRG-Teilanwendung - eine
+  Teilanwendung hat kein pauschal geprüftes Fristenprofil). Diese
+  Sperre greift bereits beim Versandversuch selbst, nicht erst bei der
+  späteren Zugangsbestätigung - ein Mieterschreiben mit ungeklärter
+  Fristenlage geht dadurch nie automatisch heraus, auch nicht als
+  "GESENDET" mit ungeklärtem Folgezustand.
+- **VertragsendeErinnerungService**: Trigger exakt drei KALENDERmonate
+  vor Vertragsende (eigene Monatsarithmetik, korrekt für Schaltjahr/
+  Monatsende), Empfänger hart `Settings.owner_email`, kein
+  Mieter-Fallback/CC. Ein Mieterentwurf entsteht ausschließlich NACH
+  einer gespeicherten Entscheidung und wird NIE automatisch versendet.
+  Ein deaktivierter Versand markiert nichts als benachrichtigt (bleibt
+  OFFEN), damit ein später echt aktivierter Lauf nichts verliert.
+- **Nativer Statistik-Austria-OGD-Parser** (`vpi_import.py`) - gegen
+  vom Betreiber tatsächlich heruntergeladene, echte Dateien geprüft
+  (925 Gesamtindex-Zeilen aller vier Reihen korrekt importiert,
+  Atomarität bei Fehlerzeile bestanden). Finalität wird aus der
+  Publikationsregel abgeleitet (jüngster Monat vorläufig, frühere
+  endgültig; ein Jahresdurchschnitt gilt erst ENDGUELTIG, wenn dieselbe
+  Reihe auch den Jänner des Folgejahres enthält), nicht aus einer
+  Statusspalte (die gibt es im echten Format nicht). Quell-Hash/-URL/
+  Abrufzeit werden je Zeile gespeichert.
+- **Gesellschaftsscope-Filter in den Batchläufen**
+  (`IndexautomatikService.monatslauf_alle`,
+  `VertragsendeErinnerungService.plane_alle`) - ein Vertrag außerhalb
+  von `ctx.gesellschaft_ids` wird VOR jedem Zugriff komplett
+  übersprungen (kein `CrossTenantError` mehr, das in einer
+  BLOCKIERT-Fachlaufzeile landen konnte).
+- **Mietzinsobergrenze-Pflicht bei bestätigter MRG-Zinsbeschränkung**:
+  eine bestätigte MRG-Voll-Zinsbeschränkung OHNE erfasste
+  Mietzinsobergrenze blockiert die Freigabe - keine fiktiv
+  unbegrenzte Weitergeltung.
+- **MieWeG-Gesetzesspur ist auf VPI20C18 fixiert** (`vpi_reihe` wird
+  nur vom MieWeG-Wohnungsrechner-Pfad gelesen); eine vertragliche,
+  ggf. abweichende Reihe gehört als eigenständige, versionierte
+  IndexKlausel erfasst.
+- **StatistikAustriaClient ist in den Monatslauf verdrahtet**: bei
+  aktivem `MIETINKASSO_INDEXAUTOMATIK_VPI_AUTOMATISCHER_ABRUF` werden
+  die vier amtlichen Reihen VOR der Monatsprüfung abgerufen/importiert;
+  schlägt das fehl, scheitert der gesamte Lauf sichtbar (JobLockTable
+  FEHLGESCHLAGEN) statt mit veralteten Werten weiterzurechnen.
+- **Backoffice zeigt interne Blockiert-Gründe und volle Texte**: eine
+  eigene Lauf-Übersicht listet auch Fälle, die nie bis zur Outbox
+  kommen (samt Blockiert-Gründen); Erhöhungsschreiben und
+  Mieterentwurfstexte sind im Klartext einsehbar, nicht nur als
+  Statushinweis. Portaltexte nennen keine Umgebungsvariablen- oder
+  Skriptpfade mehr.
+- 665 Tests insgesamt für dieses Repository (Stand Abschlusscommit;
+  651 im ursprünglichen Übergabecommit, seither um gezielte
+  Regressionstests für die oben genannten Korrekturen ergänzt).
+
+### Was ausdrücklich NICHT geliefert ist (bewusste, offen benannte Lücken)
+
+- **Kein automatisches Nachziehen von Sollstellung/Vorschreibung.**
+  Ein Fall, der `SOLL_UMSETZUNG_OFFEN` erreicht (Zahlungspflicht laut
+  bestätigtem Zugang eingetreten), löst KEINE automatische Änderung
+  von `VertragsKomponenteTable.betrag_cent` oder eine neue
+  Vorschreibung aus - das bleibt ein manueller Folgeschritt (entspricht
+  der bestehenden "keine Produktivbuchungen durch Claude"-Grenze). Der
+  Auftrag nennt diesen Zustand wörtlich "ausgeführt"
+  (`ErhoehungsschreibenStatus.AUSGEFUEHRT` in einer früheren Fassung);
+  ein unabhängiger Review hat zu Recht angemerkt, dass dieser Name
+  missverständlich ist ("es wurde tatsächlich etwas ausgeführt"), und
+  eine ehrliche Umbenennung ausdrücklich verlangt statt einer bloßen
+  Doku-Anmerkung. Der Status heißt daher jetzt `SOLL_UMSETZUNG_OFFEN`
+  (Enum, Code, Tests, Backoffice-Anzeige, diese Doku) - das weicht vom
+  wörtlichen Auftragstext ab, drückt die tatsächliche Bedeutung aber
+  ehrlicher aus.
+- **Geschäftsraum-/Klausel-Pfad erzeugt aktuell KEIN automatisches
+  Erhöhungsschreiben.** Der Rechenweg über `index/service.py` läuft
+  real und ist an die fachliche Anpassung gebunden (identische Basis+
+  amtlicher VPI-Wert erzeugt keinen zweiten Vorschlag), aber es gibt
+  keinen unabhängig verifizierten automatischen Wirksamkeits-/
+  Zinstermin für diesen Pfad (keine "Jännervorgabe" oder vergleichbare
+  Konvention wurde primärquellenbelegt bestätigt) - jeder Fall mit
+  einer echten Erhöhung bleibt sichtbar BLOCKIERT mit Verweis auf die
+  konkrete `IndexAnpassungTable`-Zeile, bis ein Termin manuell bestätigt
+  wird. Kein erfundenes Datum wird verwendet.
+- **Förderrechtliche Mietzinsobergrenze wirkt nur im MieWeG-
+  Wohnungsrechner-Pfad**, nicht (noch) im Geschäftsraum-/Klausel-Pfad -
+  in der Praxis dürfte Förderbindung überwiegend Wohnungen betreffen,
+  aber das ist keine geprüfte Rechtsaussage, nur eine bewusste
+  Scope-Begrenzung.
+- **Statistik-Austria-URLs für VPI15C18/VPI00/VPI96 sind NICHT
+  einzeln bestätigt** - nur das Namensmuster der verbal bestätigten
+  VPI20C18-URL wurde übernommen. Codex hat die vier Original-Dateien
+  inzwischen unabhängig heruntergeladen und das Schema bestätigt; die
+  konkreten URLs für die drei übrigen Reihen sollten vor produktivem
+  automatischem Abruf trotzdem gegengeprüft werden.
+- **`StatistikAustriaClient` (HTTP-Abruf) wurde von Claude NICHT gegen
+  den echten Endpunkt ausgeführt** - Claude hat keinen Internetzugriff.
+  Codex hat die vier amtlichen OGD-Original-URLs unabhängig geprüft
+  (PUBLIC_CLIENT_REVIEW). Der Client ist jetzt in
+  `scripts/indexautomatik_monatslauf.py` verdrahtet (bei aktivem Flag
+  vor der Monatsprüfung, mit sichtbarem Scheitern des gesamten Laufs
+  bei Fehler) - `MIETINKASSO_INDEXAUTOMATIK_VPI_AUTOMATISCHER_ABRUF`
+  bleibt trotzdem Default aus, bis Codex den scharfen Betrieb final
+  freigibt.
+- **Kein echter Transport-Anbieter angebunden.** `HttpTransportadapter`
+  implementiert einen dokumentierten, generischen Request-/Response-
+  Vertrag; die tatsächliche JLB-MailOps-Strecke (gestaltete HTML-
+  Signatur mit Original-Logo, bestehende Mailstrecke) verlangt laut
+  Betreiber eine ECHTE manuelle CLICK_RELEASED-Freigabe und führt
+  Hausverwaltung noch NICHT in ihrer Mailbox-Allowlist (Stand
+  13.09.2026) - diese Freigabe wird hier an keiner Stelle simuliert.
+  Realer Versand bleibt an ZWEI unabhängige Flags
+  (`MIETINKASSO_INDEXAUTOMATIK_SEND_ENABLED` UND
+  `MIETINKASSO_INDEXAUTOMATIK_MAILOPS_ALLOWLIST_BESTAETIGT`) und einen
+  konfigurierten Endpunkt gebunden, alle Default aus/leer.
+- **Backoffice-UI deckt keinen CSV-Datei-Upload für den OGD-Import ab**
+  - die Bedienoberfläche bietet nur den manuellen Jahreswert-Override
+    (mit Beleg); der native Datei-Import läuft ausschließlich über
+    `vpi_import.py`/`StatistikAustriaClient`, aktuell nur aus einem
+    Skript/Python-Kontext aufrufbar, nicht über eine Backoffice-Route.
+- **Kein Phase-2-Abschlussbeleg über `mieweg_vorschau_service`.** Nach
+  bestätigtem Zugang wird `ausfuehrbare_erhoehung_cent` nicht durch
+  einen zweiten `vorschau_erstellen`-Aufruf mit jetzt vorliegendem
+  Zustellnachweis nachgezogen (`ErhoehungsschreibenTable.
+  mieweg_vorschau_final_id` existiert als Spalte, wird aber nicht
+  befüllt) - der Audit-Trail für "vollständig belegt" besteht
+  stattdessen aus `zugang_beleg`/`zugang_bestaetigt_am`/
+  `zahlungspflicht_ab` auf dem Erhöhungsschreiben selbst.
+- **Keine Migrationsspalten-Löschung/-Umbenennung.** Wie im gesamten
+  Repository (kein Migrationswerkzeug, siehe Paket A) sind alle neuen
+  Tabellen additiv; `create_all_tables()` legt nur fehlende Tabellen an,
+  ändert nie bestehende Spalten.
+- **Rundungs-/Berechnungsdetails synthetisch, nicht amtlich
+  gegengeprüft**: §1 Abs2 Z1/§1 Abs4 MieWeG und §16 Abs9 MRG wurden in
+  einer früheren Sitzung nicht selbst gegen `ris.bka.gv.at` verifiziert
+  (Netzwerk-Egress blockiert), sondern auf primärquellenbelegte
+  Hinweise übernommen (siehe Paket-C-Abschnitt oben). Die MRG-Teil-
+  Formulierung im Erhöhungsschreiben zitiert § 16 Abs 9 deshalb bewusst
+  qualifiziert statt zuversichtlich.

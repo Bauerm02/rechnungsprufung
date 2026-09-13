@@ -370,9 +370,23 @@ class IndexautomatikService:
         )
 
     def monatslauf_alle(self, *, ctx: AuthContext, heute: date, akteur: str) -> list[IndexautomatikLaufTable]:
+        """Unabhängiger Review (b31-Folgereview, synthetisch mit "1
+        fremde Rückgabe + fremde Laufzeile geschrieben" reproduziert):
+        VOR jeder Verarbeitung wird der Gesellschaftsscope des
+        Aufrufers geprüft - ein Vertrag außerhalb von
+        `ctx.gesellschaft_ids` wird komplett übersprungen (keine Zeile
+        gelesen, keine geschrieben, kein Rückgabewert). Zusätzlich fängt
+        der Batch nur noch die in `_BEHANDELBARE_FEHLER` gelisteten,
+        fachlich erwarteten Fehler ab - ein `CrossTenantError` (z. B.
+        durch eine Race zwischen Scope-Filter und Verarbeitung) darf NIE
+        in einer Fachlauf-Zeile landen, sondern muss den Aufrufer
+        erreichen."""
+
         ergebnisse: list[IndexautomatikLaufTable] = []
         periode = f"{heute.year:04d}-{heute.month:02d}"
         for vertrag in self._stammdaten_repository.list_alle_vertraege():
+            if not ctx.has_zugriff(vertrag.gesellschaft_id):
+                continue
             try:
                 self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
             except ObjektAusgeschlossenError:
@@ -385,7 +399,7 @@ class IndexautomatikService:
                 continue
             try:
                 ergebnisse.append(self.monatslauf_fuer_vertrag(ctx=ctx, vertrag=vertrag, heute=heute, akteur=akteur))
-            except Exception as exc:  # ein fehlerhafter Vertrag darf den Batch nicht abbrechen
+            except _BEHANDELBARE_FEHLER as exc:  # ein fachlich erwarteter Fehler darf den Batch nicht abbrechen
                 bestehender = self._lauf_repository.get_by_periode(vertrag.id, periode)
                 if bestehender is None:
                     claim = self._lauf_repository.claim_periode(vertrag.id, periode)

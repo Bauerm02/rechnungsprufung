@@ -214,3 +214,22 @@ def test_unbekannte_entscheidung_wird_abgelehnt(admin_ctx, basis_vertrag, servic
     erinnerung = service_mit_owner.plane_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 1, 1))
     with pytest.raises(ValueError):
         service_mit_owner.entscheiden(ctx=admin_ctx, erinnerung_id=erinnerung.id, entscheidung="IRGENDWAS", entschieden_von="markus")
+
+
+def test_plane_alle_ueberspringt_fremde_gesellschaft_ohne_erinnerung_zu_schreiben(
+    admin_ctx, ctx_factory, basis_vertrag, service_mit_owner, stammdaten_repo, erinnerung_repo
+):
+    """Unabhängiger Review (b31-Folgereview): "Erinnerungsbatch wirft
+    CrossTenantError statt scoped skip" - ein Aufrufer ohne Zugriff auf
+    die Gesellschaft des Vertrags darf weder eine Exception bekommen
+    noch eine Erinnerungszeile geschrieben sehen; der fremde Vertrag
+    wird VOR jedem Zugriff übersprungen."""
+
+    vertrag, _konto = basis_vertrag
+    vertrag = _befristeter_vertrag(stammdaten_repo, vertrag, date(2026, 12, 31))
+
+    fremder_ctx = ctx_factory("ANDERE-GESELLSCHAFT")
+    ergebnisse = service_mit_owner.plane_alle(ctx=fremder_ctx, heute=date(2026, 1, 1))
+
+    assert ergebnisse == []
+    assert erinnerung_repo.get_by_enddatum(vertrag.id, vertrag.gueltig_bis) is None

@@ -1,0 +1,23 @@
+# Vorlage für den Timer zu mietinkasso-indexautomatik-monatslauf.service
+# (Auftrag 13.09., HV-20260913-INDEXAUTOMATIK). NIEMALS mit echten Werten
+# committen - nur die Struktur. GENAU EIN Timer für GENAU EINEN
+# Monatslauf-Job - keinen zweiten Timer/Cron-Eintrag parallel aktivieren.
+
+[Unit]
+Description=Monatliche Indexautomatik-Pruefung (Mietinkasso Hausverwaltung)
+
+[Timer]
+# 1. jedes Monats, 06:00 Wien - siehe RAHMENPROGRAMM.md ("monatlich
+# Indexkontrolle, z.B. 1. um 06:00 Wien"). OnCalendar interpretiert die
+# Zeit in der Systemzeitzone des Servers - dort auf Europe/Vienna
+# stellen (timedatectl set-timezone Europe/Vienna), sonst mit
+# `OnCalendar=... Europe/Vienna` explizit angeben.
+OnCalendar=*-*-01 06:00:00 Europe/Vienna
+# Falls der Server zum geplanten Zeitpunkt aus war: beim nächsten Boot
+# nachholen, statt einen ganzen Monat auszulassen - der Job selbst ist
+# über den (vertrag_id, periode)-Unique-Constraint ohnehin idempotent.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

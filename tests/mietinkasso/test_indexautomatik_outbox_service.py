@@ -285,7 +285,7 @@ def test_ausreichender_zugang_berechnet_zahlungspflicht_und_ausfuehrung(admin_ct
     assert vor_faelligkeit == []
     nach_faelligkeit = outbox_service.taegliche_pflege(heute=date(2026, 5, 5))
     assert len(nach_faelligkeit) == 1
-    assert outbox_repo.get(schreiben.id).status == "AUSGEFUEHRT"
+    assert outbox_repo.get(schreiben.id).status == "SOLL_UMSETZUNG_OFFEN"
 
 
 def test_zugangsfrist_fuer_nicht_unterstuetzte_rechtsordnung_wird_gesperrt(admin_ctx, basis_vertrag, outbox_service, outbox_repo, rechtsprofil_service, rechtsprofil_repo, stammdaten_repo):
@@ -313,6 +313,37 @@ def test_zugangsfrist_fuer_nicht_unterstuetzte_rechtsordnung_wird_gesperrt(admin
             ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 3, 5), zugang_datum=date(2026, 3, 1),
             zugangsform="EINSCHREIBEN_RUECKSCHEIN", zugang_beleg="Rückschein",
         )
+
+
+def test_mrg_teil_wird_bereits_vor_versand_gesperrt(
+    admin_ctx, basis_vertrag, outbox_service, outbox_repo, rechtsprofil_service, rechtsprofil_repo, stammdaten_repo
+):
+    """Ergänzende Abnahmepunkte (Endprüfung): "MRG-Teil/sonstige
+    ungeklärte Fristen VOR Versand blockieren; ein Mieterschreiben
+    'Frist ist gesondert zu prüfen' darf niemals automatisch
+    herausgehen" - MRG_TEIL ist NICHT (mehr) in
+    _ZUGANGSFRIST_UNTERSTUETZTE_RECHTSORDNUNGEN und muss daher schon
+    beim Versandversuch blockiert werden, nicht erst bei der späteren
+    Zugangsbestätigung."""
+
+    vertrag, _konto = basis_vertrag
+    schreiben = _bereites_schreiben(admin_ctx, outbox_repo, rechtsprofil_service, stammdaten_repo, vertrag)
+    profil = rechtsprofil_repo.get(schreiben.rechtsprofil_id)
+    with stammdaten_repo._session_factory() as session:
+        from mietinkasso.infrastructure.db.tables import RechtsprofilTable
+
+        row = session.get(RechtsprofilTable, profil.id)
+        row.rechtsordnung = "OESTERREICH_MRG_TEIL"
+        session.commit()
+
+    transport = FakeTransportadapter()
+    ergebnis = outbox_service.versenden(
+        ctx=admin_ctx, erhoehungsschreiben_id=schreiben.id, heute=date(2026, 9, 1), send_enabled=True,
+        mailops_allowlist_bestaetigt=True, transport=transport,
+    )
+    assert ergebnis.status == "BLOCKIERT"
+    assert transport.aufrufe == []
+    assert outbox_repo.get(schreiben.id).status == "BLOCKIERT"
 
 
 def test_verwaiste_in_versand_werden_markiert(admin_ctx, basis_vertrag, outbox_service, outbox_repo, rechtsprofil_service, stammdaten_repo):

@@ -227,6 +227,36 @@ def test_abgelaufene_mietzinsobergrenze_entwertet_freigabe(admin_ctx, basis_vert
     assert rechtsprofil_service.ist_noch_gueltig(freigegeben, heute=date(2026, 1, 1)) is False
 
 
+def test_abweichende_vpi_reihe_fuer_mieweg_gesetzesspur_wird_abgelehnt(admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo):
+    """UI-Endprüfung (6317f96): "MieWeG-Gesetzesspur muss VPI20C18
+    verwenden" - eine abweichende Reihe wird bereits beim Entwurf
+    abgelehnt, nicht erst im Monatslauf."""
+
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    with pytest.raises(ValueError):
+        rechtsprofil_service.entwurf_anlegen(
+            ctx=admin_ctx, vertrag_id=vertrag.id, **_standard_kwargs(vpi_reihe="VPI15C18")
+        )
+
+
+def test_bestaetigte_mrg_zinsbeschraenkung_ohne_obergrenze_blockiert_freigabe(
+    admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo
+):
+    """UI-Endprüfung (6317f96): "Fehlende belegte Mietzinsobergrenze bei
+    MRG-Voll darf nicht als unbeschränkt gelten, mindestens für
+    bestätigte Zinsbeschränkung Pflicht bei Freigabe"."""
+
+    vertrag, _konto = basis_vertrag
+    _mit_komponente(stammdaten_repo, vertrag)
+    profil = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx, vertrag_id=vertrag.id,
+        **_standard_kwargs(mrg_zinsbeschraenkung=True, mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None),
+    )
+    with pytest.raises(ValueError):
+        rechtsprofil_service.freigeben(profil.id, ctx=admin_ctx, freigegeben_von="markus")
+
+
 def test_geaendertes_vertragsende_entwertet_freigabe(admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo):
     vertrag, _konto = basis_vertrag
     _mit_komponente(stammdaten_repo, vertrag)

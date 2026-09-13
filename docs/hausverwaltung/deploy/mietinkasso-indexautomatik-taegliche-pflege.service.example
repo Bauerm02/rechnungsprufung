@@ -1,0 +1,27 @@
+# Vorlage für GENAU EINEN Indexautomatik-Tagespflege-Job (Auftrag 13.09.,
+# HV-20260913-INDEXAUTOMATIK). NIEMALS mit echten Pfaden in Git
+# committen - dies ist nur die Struktur. Die reale Datei lebt außerhalb
+# dieses Repos, siehe mietinkasso-indexautomatik-monatslauf.service.example
+# für das allgemeine Muster.
+#
+# Zieht fällige Zustellungen (Outbox: Versand/Zahlungspflicht-Übergänge/
+# verwaiste-IN_VERSAND-Recovery) und fällige Vertragsende-Erinnerungen
+# (Owner-only) nach. Realer Versand bleibt an
+# MIETINKASSO_INDEXAUTOMATIK_SEND_ENABLED,
+# MIETINKASSO_INDEXAUTOMATIK_MAILOPS_ALLOWLIST_BESTAETIGT UND einen
+# konfigurierten Transport-Endpunkt gebunden (alle Default aus/leer).
+
+[Unit]
+Description=Mietinkasso Hausverwaltung - taegliche Indexautomatik-Pflege
+After=mietinkasso-hausverwaltung.service
+
+[Service]
+Type=oneshot
+User=mietinkasso-hausverwaltung
+Group=mietinkasso-hausverwaltung
+
+EnvironmentFile=/etc/mietinkasso-hausverwaltung/env
+
+ExecStart=/opt/mietinkasso-hausverwaltung/venv/bin/python \
+    /opt/mietinkasso-hausverwaltung/app/scripts/indexautomatik_taegliche_pflege.py \
+    --database-url ${MIETINKASSO_DATABASE_URL}

@@ -1,0 +1,17 @@
+# Vorlage für den Timer zu
+# mietinkasso-indexautomatik-taegliche-pflege.service (Auftrag 13.09.,
+# HV-20260913-INDEXAUTOMATIK). NIEMALS mit echten Werten committen - nur
+# die Struktur. GENAU EIN Timer für GENAU EINEN Tagespflege-Job.
+
+[Unit]
+Description=Taegliche Indexautomatik-Pflege (Zustellungen, Vertragsende-Erinnerungen)
+
+[Timer]
+# Täglich 07:00 Wien - nach dem Monatslauf (06:00), außerhalb der
+# üblichen Bürobetriebszeit.
+OnCalendar=*-*-* 07:00:00 Europe/Vienna
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

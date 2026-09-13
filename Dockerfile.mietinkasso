@@ -22,6 +22,10 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+# Indexautomatik-CLI-Skripte (Auftrag 13.09., HV-20260913-INDEXAUTOMATIK)
+# ins Image, damit die vorhandenen Container-Timer sie direkt unter
+# /app/scripts aufrufen können - kein separates Deployment-Artefakt nötig.
+COPY scripts/indexautomatik_monatslauf.py scripts/indexautomatik_taegliche_pflege.py ./scripts/
 
 RUN python -m pip install --upgrade pip && \
     python -m pip install .

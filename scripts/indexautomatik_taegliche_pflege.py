@@ -30,7 +30,7 @@ from mietinkasso.auth.service import AuthContext  # noqa: E402
 from mietinkasso.domain.enums import Rolle  # noqa: E402
 from mietinkasso.domain.exceptions import ObjektAusgeschlossenError  # noqa: E402
 from mietinkasso.indexautomatik.bootstrap import bauen  # noqa: E402
-from mietinkasso.indexautomatik.transport import FakeTransportadapter, HttpTransportadapter, Transportadapter  # noqa: E402
+from mietinkasso.indexautomatik.transport import HttpTransportadapter, Transportadapter, VersandAuftrag  # noqa: E402
 from mietinkasso.indexautomatik.zeit import heute_wien  # noqa: E402
 from mietinkasso.infrastructure.config import Settings  # noqa: E402
 from mietinkasso.infrastructure.db.session import build_session_factory, create_all_tables  # noqa: E402
@@ -54,6 +54,42 @@ def _transport_fuer(settings: Settings) -> Transportadapter | None:
     )
 
 
+def _owner_versand_fn(transport: Transportadapter):
+    """Echter Versandaufruf für Vertragsende-Erinnerungen über denselben
+    Transportadapter-Vertrag wie die Erhöhungsschreiben-Outbox - ersetzt
+    das vorherige `versand_fn=lambda auftrag: None` (unabhängiger Review
+    b31-Folgereview: "Keine No-op/Fake-Versandfunktion produktiv: echten
+    Adapter verdrahten, ohne Adapter hart blockieren"). Der stabile
+    Idempotenzschlüssel (`vertragsende:{vertrag_id}:{end_datum}`) wird
+    unverändert als `referenz` an den Transport weitergereicht, damit ein
+    Retry beim Provider erkennbar bleibt."""
+
+    def _senden(auftrag: dict) -> None:
+        transport.senden(
+            VersandAuftrag(
+                referenz=auftrag["idempotenzschluessel"],
+                empfaenger_name="",
+                empfaenger_adresse="",
+                empfaenger_email=auftrag["empfaenger"],
+                betreff="Vertragsende-Erinnerung",
+                text=auftrag["text"],
+            )
+        )
+
+    return _senden
+
+
+def _kein_transport_versand_fn(_auftrag: dict) -> None:
+    """Wird nie tatsächlich aufgerufen: `benachrichtige_faellige` prüft
+    `send_enabled` VOR jedem `versand_fn`-Aufruf, und `send_enabled`
+    wird unten hart auf False gesetzt, sobald kein Transport konfiguriert
+    ist. Diese Funktion ist nur eine defensive Absicherung gegen eine
+    künftige Änderung an dieser Reihenfolge - kein stiller No-op, der
+    fälschlich als Versand durchginge, sondern ein sichtbarer Fehler."""
+
+    raise RuntimeError("Kein Transport-Endpunkt konfiguriert - Versand darf nicht stattfinden.")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _baue_parser().parse_args(argv)
     settings = Settings(database_url=args.database_url)
@@ -68,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def _arbeit() -> dict:
         verwaiste = bundle.outbox_service.markiere_verwaiste_als_unklar()
+        verwaiste_erinnerungen = bundle.vertragsende_service.markiere_verwaiste_als_unklar()
 
         versendet, uebersprungen = 0, 0
         if transport is not None:
@@ -89,11 +126,20 @@ def main(argv: list[str] | None = None) -> int:
 
         ausgefuehrt = bundle.outbox_service.taegliche_pflege(heute=heute)
 
+        # Unabhängiger Review (b31-Folgereview): "Keine No-op/Fake-
+        # Versandfunktion produktiv: echten Adapter verdrahten, ohne
+        # Adapter hart blockieren" - `versand_fn=lambda auftrag: None`
+        # hätte bei SEND_ENABLED=True echte Erinnerungen fälschlich als
+        # BENACHRICHTIGT markiert, OHNE dass je eine Mail versendet
+        # wurde. `send_enabled` wird jetzt hart auf False gezwungen,
+        # sobald kein Transport konfiguriert ist - unabhängig vom
+        # gesetzten Konfigurationsflag.
+        vertragsende_send_enabled = settings.vertragsende_erinnerung_send_enabled and transport is not None
         vertragsende_geplant = bundle.vertragsende_service.plane_alle(ctx=_ADMIN_CTX, heute=heute)
         vertragsende_benachrichtigt = bundle.vertragsende_service.benachrichtige_faellige(
             heute=heute,
-            send_enabled=settings.vertragsende_erinnerung_send_enabled,
-            versand_fn=lambda auftrag: None,  # echter Versand ist Codex' Aufgabe, siehe OFFENE_PUNKTE.md
+            send_enabled=vertragsende_send_enabled,
+            versand_fn=_owner_versand_fn(transport) if transport is not None else _kein_transport_versand_fn,
         )
 
         return {
@@ -101,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
             "erhoehungsschreiben_versendet": versendet,
             "erhoehungsschreiben_uebersprungen_oder_blockiert": uebersprungen,
             "erhoehungsschreiben_ausgefuehrt": len(ausgefuehrt),
+            "vertragsende_verwaiste_als_unklar_markiert": len(verwaiste_erinnerungen),
             "vertragsende_neu_geplant": len(vertragsende_geplant),
             "vertragsende_benachrichtigt": len(vertragsende_benachrichtigt),
         }

@@ -48,9 +48,14 @@ class VersandErgebnis:
         return f"VersandErgebnis({self.status!r}, {self.grund!r})"
 
 
+#: Unabhängiger Review b31: "_ZUGANGSFRIST_UNTERSTUETZTE_RECHTSORDNUNGEN
+#: enthält weiter MRG_TEIL und wendet pauschal §16(9)/14 Tage an - das
+#: gilt nicht pauschal für Teilanwendung; ohne geprüftes vertragliches
+#: Fristenprofil intern blockieren". Ein solches geprüftes Fristenprofil
+#: für MRG-Teilanwendung existiert in diesem Modul noch nicht - bis
+#: dahin bleibt NUR MRG_VOLL unterstützt.
 _ZUGANGSFRIST_UNTERSTUETZTE_RECHTSORDNUNGEN = {
     Rechtsordnung.OESTERREICH_MRG_VOLL.value,
-    Rechtsordnung.OESTERREICH_MRG_TEIL.value,
 }
 
 
@@ -80,6 +85,49 @@ class ErhoehungsschreibenOutboxService:
             "vertrag_gueltig_bis": vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else None,
             "vertrag_rechtsordnung": vertrag.rechtsordnung,
         }
+
+    def _komponenten_snapshot(self, komponenten: list) -> list[dict]:
+        """Bindet den Entwurf an ALLE im Schreiben genannten aktiven
+        Komponenten - auch die UNVERÄNDERTEN (z. B. BK/HK), die zwar
+        nicht selbst indexiert werden, aber Teil des im Brief
+        ausgewiesenen neuen Gesamtbetrags sind (Ergänzender Repro
+        6317f96: "BK_VORAUSZAHLUNG von 100 auf 200 ändern, Profil
+        unverändert ... versenden(...) ergibt GESENDET/1 Aufruf mit
+        veraltetem Gesamtbetrag"). Ohne diese Bindung erkannte
+        `versenden()` nur eine geänderte Empfängeradresse, nicht einen
+        seither veränderten Betrag einer NICHT referenzierten Position."""
+
+        eintraege = [
+            {
+                "id": k.id,
+                "betrag_cent": k.betrag_cent,
+                "art": k.art,
+                "ust_satz_promille": k.ust_satz_promille,
+                "gueltig_von": k.gueltig_von.isoformat(),
+                "gueltig_bis": k.gueltig_bis.isoformat() if k.gueltig_bis else None,
+            }
+            for k in komponenten
+        ]
+        return sorted(eintraege, key=lambda e: e["id"])
+
+    def _aktuelle_komponenten_snapshot(self, gespeicherte: list[dict]) -> list[dict | None]:
+        aktuelle: list[dict | None] = []
+        for eintrag in gespeicherte:
+            komponente = self._stammdaten_repository.get_komponente(eintrag["id"])
+            if komponente is None:
+                aktuelle.append(None)
+                continue
+            aktuelle.append(
+                {
+                    "id": komponente.id,
+                    "betrag_cent": komponente.betrag_cent,
+                    "art": komponente.art,
+                    "ust_satz_promille": komponente.ust_satz_promille,
+                    "gueltig_von": komponente.gueltig_von.isoformat(),
+                    "gueltig_bis": komponente.gueltig_bis.isoformat() if komponente.gueltig_bis else None,
+                }
+            )
+        return aktuelle
 
     def _entwurf_speichern(
         self, row: ErhoehungsschreibenTable, *, mehrkomponenten_blockiert: bool, bestehende_id: int | None = None
@@ -210,7 +258,10 @@ class ErhoehungsschreibenOutboxService:
             erhoehung_cent=erhoehung_cent,
             schreiben_text=text or "(blockiert - Mehrkomponenten-Verteilung nicht unterstützt)",
             idempotenzschluessel=f"{vertrag.id}:mieweg:{ziel_bewertungsjahr}",
-            empfaenger_snapshot=self._empfaenger_snapshot(vertrag),
+            empfaenger_snapshot={
+                **self._empfaenger_snapshot(vertrag),
+                "komponenten_snapshot": self._komponenten_snapshot(referenzierte_komponenten + unveraenderte_komponenten),
+            },
         )
         return self._entwurf_speichern(row, mehrkomponenten_blockiert=mehrkomponenten_blockiert, bestehende_id=bestehende_id)
 
@@ -281,7 +332,10 @@ class ErhoehungsschreibenOutboxService:
             erhoehung_cent=erhoehung_cent,
             schreiben_text=text or "(blockiert - Mehrkomponenten-Verteilung nicht unterstützt)",
             idempotenzschluessel=f"{vertrag.id}:klausel:{index_anpassung_id}",
-            empfaenger_snapshot=self._empfaenger_snapshot(vertrag),
+            empfaenger_snapshot={
+                **self._empfaenger_snapshot(vertrag),
+                "komponenten_snapshot": self._komponenten_snapshot(referenzierte_komponenten + unveraenderte_komponenten),
+            },
         )
         return self._entwurf_speichern(row, mehrkomponenten_blockiert=mehrkomponenten_blockiert)
 
@@ -348,14 +402,55 @@ class ErhoehungsschreibenOutboxService:
             self._repository.set_status(schreiben.id, "BLOCKIERT", blockiert_gruende=[grund])
             return VersandErgebnis("BLOCKIERT", grund)
 
+        # Ergänzende Abnahmepunkte (Endprüfung): "MRG-Teil/sonstige
+        # ungeklärte Fristen VOR Versand blockieren; ein Mieterschreiben
+        # 'Frist ist gesondert zu prüfen' darf niemals automatisch
+        # herausgehen" - bisher prüfte NUR `zugang_bestaetigen` die
+        # unterstützte Rechtsordnung, wodurch ein MRG_TEIL-Fall bereits
+        # unwiderruflich VERSENDET werden konnte, bevor die fehlende
+        # Fristenunterstützung überhaupt auffiel. Der Versand selbst wird
+        # jetzt schon für eine nicht unterstützte Rechtsordnung gesperrt.
+        if aktuelles_profil.rechtsordnung not in _ZUGANGSFRIST_UNTERSTUETZTE_RECHTSORDNUNGEN:
+            grund = (
+                f"Rechtsordnung {aktuelles_profil.rechtsordnung} hat keine unterstützte automatische "
+                "Zugangsfrist-/Zahlungspflicht-Regel (§ 16 Abs 9 MRG gilt nicht pauschal für "
+                "Teilanwendung) - Versand wird VOR dem Versand gesperrt, kein Mieterschreiben mit "
+                "ungeklärter Fristenlage geht automatisch heraus. Bitte manuell klären."
+            )
+            self._repository.set_status(schreiben.id, "BLOCKIERT", blockiert_gruende=[grund])
+            return VersandErgebnis("BLOCKIERT", grund)
+
         aktueller_snapshot = self._empfaenger_snapshot(vertrag)
-        if aktueller_snapshot != schreiben.empfaenger_snapshot:
+        gespeicherter_snapshot = schreiben.empfaenger_snapshot or {}
+        gespeicherter_empfaenger = {k: v for k, v in gespeicherter_snapshot.items() if k != "komponenten_snapshot"}
+        if aktueller_snapshot != gespeicherter_empfaenger:
             grund = (
                 "Empfänger- oder Vertragsstatus hat sich seit der Entwurfserstellung geändert - neue "
                 "Prüfung/Entwurf erforderlich, kein Versand mit veralteten Daten."
             )
             self._repository.set_status(schreiben.id, "BLOCKIERT", blockiert_gruende=[grund])
             return VersandErgebnis("BLOCKIERT", grund)
+
+        # Ergänzender Repro (6317f96): "echter Monatslauf erzeugt BEREIT
+        # mit HMZ 1000 + BK 100; danach BK_VORAUSZAHLUNG von 100 auf 200
+        # ändern, Profil unverändert (nur HMZ referenziert) - versenden
+        # ergibt GESENDET/1 Aufruf mit veraltetem Gesamtbetrag" - der
+        # bisherige Empfänger-Snapshot band NUR Debitor/Vertrag, nicht
+        # die im Schreiben ausgewiesenen (auch unveränderten) Komponenten.
+        # Jede referenzierte ODER unveränderte Komponente wird jetzt vor
+        # dem Versand gegen ihren aktuellen Stammdatenstand geprüft.
+        gespeicherte_komponenten = gespeicherter_snapshot.get("komponenten_snapshot") or []
+        if gespeicherte_komponenten:
+            aktuelle_komponenten = self._aktuelle_komponenten_snapshot(gespeicherte_komponenten)
+            if aktuelle_komponenten != gespeicherte_komponenten:
+                grund = (
+                    "Mindestens eine im Schreiben berücksichtigte Komponente (auch eine unveränderte "
+                    "Position wie BK/HK) hat sich seit der Entwurfserstellung geändert, ist nicht mehr "
+                    "gültig oder wurde entfernt - neue Prüfung/Entwurf erforderlich, kein Versand mit "
+                    "veraltetem Gesamtbetrag."
+                )
+                self._repository.set_status(schreiben.id, "BLOCKIERT", blockiert_gruende=[grund])
+                return VersandErgebnis("BLOCKIERT", grund)
 
         if not send_enabled or not mailops_allowlist_bestaetigt:
             return VersandErgebnis(
@@ -462,11 +557,12 @@ class ErhoehungsschreibenOutboxService:
     def taegliche_pflege(self, *, heute) -> list[ErhoehungsschreibenTable]:
         """Reine Statuspflege ohne neue Fachentscheidung: sobald die
         Zahlungspflicht laut bestätigtem Zugang erreicht ist, wechselt
-        der Fall sichtbar auf AUSGEFUEHRT. Löst KEINE Sollstellung/
-        Vorschreibungsänderung aus (siehe OFFENE_PUNKTE.md)."""
+        der Fall sichtbar auf SOLL_UMSETZUNG_OFFEN. Löst KEINE
+        Sollstellung/Vorschreibungsänderung aus (siehe OFFENE_PUNKTE.md) -
+        der Name sagt das jetzt auch explizit (unabhängiger Review b31)."""
 
         aktualisiert = []
         for schreiben in self._repository.liste_nach_status("ZUGANG_BESTAETIGT"):
             if schreiben.zahlungspflicht_ab is not None and heute >= schreiben.zahlungspflicht_ab:
-                aktualisiert.append(self._repository.set_status(schreiben.id, "AUSGEFUEHRT"))
+                aktualisiert.append(self._repository.set_status(schreiben.id, "SOLL_UMSETZUNG_OFFEN"))
         return aktualisiert

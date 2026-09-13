@@ -1,0 +1,37 @@
+# Vorlage für GENAU EINEN Indexautomatik-Monatslauf-Job (Auftrag 13.09.,
+# HV-20260913-INDEXAUTOMATIK). NIEMALS mit echten Pfaden in Git
+# committen - dies ist nur die Struktur. Die reale Datei lebt außerhalb
+# dieses Repos, z. B. unter
+# /etc/systemd/system/mietinkasso-indexautomatik-monatslauf.service, und
+# wird zusammen mit der zugehörigen .timer-Datei von Codex auf dem
+# bestehenden Hetzner-Server angelegt/aktiviert.
+#
+# Oneshot-Service, ausgelöst durch mietinkasso-indexautomatik-
+# monatslauf.timer - läuft NIE parallel zu sich selbst (systemd startet
+# einen bereits laufenden Oneshot-Service nicht doppelt), und der Job
+# selbst ist über JobLockTable/(vertrag_id, periode) zusätzlich
+# idempotent, falls doch einmal zwei Instanzen gleichzeitig anliefen.
+
+[Unit]
+Description=Mietinkasso Hausverwaltung - monatlicher Indexautomatik-Lauf
+After=mietinkasso-hausverwaltung.service
+
+[Service]
+Type=oneshot
+User=mietinkasso-hausverwaltung
+Group=mietinkasso-hausverwaltung
+
+# Enthält MIETINKASSO_DATABASE_URL und alle MIETINKASSO_INDEXAUTOMATIK_*/
+# MIETINKASSO_OWNER_EMAIL-Werte - außerhalb von Git, siehe
+# env.production.example als Vorlage.
+EnvironmentFile=/etc/mietinkasso-hausverwaltung/env
+
+ExecStart=/opt/mietinkasso-hausverwaltung/venv/bin/python \
+    /opt/mietinkasso-hausverwaltung/app/scripts/indexautomatik_monatslauf.py \
+    --database-url ${MIETINKASSO_DATABASE_URL}
+
+# Ein fehlgeschlagener Lauf soll sichtbar sein (journalctl -u
+# mietinkasso-indexautomatik-monatslauf.service) - kein automatischer
+# Retry hier; ein blockierter Einzelfall wird ohnehin beim nächsten
+# regulären Lauf sichtbar (siehe Backoffice-Outbox), kein separater
+# Cron-Retry nötig.

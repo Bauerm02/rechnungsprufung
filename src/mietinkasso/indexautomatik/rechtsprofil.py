@@ -90,6 +90,21 @@ class RechtsprofilService:
         require_schreibrecht(ctx)
         self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag_id)
 
+        # UI-Endprüfung (6317f96): "MieWeG-Gesetzesspur muss VPI20C18
+        # verwenden (UI bietet derzeit andere Reihen, service nimmt
+        # profil.vpi_reihe); Vertragsklausel darf getrennt ihre eigene
+        # Reihe haben." `vpi_reihe` wird AUSSCHLIESSLICH vom
+        # MieWeG-Wohnungsrechner-Pfad gelesen (siehe
+        # `indexautomatik/service.py::_monatslauf_mieweg`) - der
+        # Klausel-Pfad hat mit `IndexKlauselTable.basis_reihe` eine
+        # eigene, unabhängige Reihe. VPI20C18 ist die aktuell amtlich
+        # verlautbarte Reihe für die gesetzliche MieWeG-Berechnung.
+        if vpi_reihe != "VPI20C18":
+            raise ValueError(
+                f"vpi_reihe '{vpi_reihe}' ist für die gesetzliche MieWeG-Spur nicht zulässig - nur "
+                "'VPI20C18' (aktuell amtlich verlautbarte Reihe). Eine abweichende vertragliche Reihe "
+                "gehört als eigenständige, versionierte IndexKlausel (vertragsklausel_id) erfasst."
+            )
         if not (vertrag_beleg_referenz or "").strip():
             raise QuellenbelegFehltError(
                 "Ein Rechtsprofil ohne Vertragsbeleg-Referenz wird abgelehnt - keine beleglose "
@@ -155,6 +170,23 @@ class RechtsprofilService:
         abgelehnt statt erst Monate später im automatischen Lauf
         aufzufallen (unabhängiger Review 0d65e2b)."""
 
+        # UI-Endprüfung (6317f96): "Fehlende belegte Mietzinsobergrenze
+        # bei MRG-Voll darf nicht als unbeschränkt gelten, mindestens
+        # für bestätigte Zinsbeschränkung Pflicht bei Freigabe" - eine
+        # bestätigte MRG-Zinsbeschränkung OHNE erfasste Obergrenze würde
+        # `_pruefe_und_kappe_mietzinsobergrenze` (service.py) fiktiv als
+        # unbegrenzt behandeln, weil die Kappung dort nur greift, wenn
+        # `mietzinsobergrenze_cent` überhaupt gesetzt ist.
+        if (
+            profil.rechtsordnung == Rechtsordnung.OESTERREICH_MRG_VOLL.value
+            and profil.mrg_zinsbeschraenkung
+            and profil.mietzinsobergrenze_cent is None
+        ):
+            raise ValueError(
+                "MRG-Zinsbeschränkung ist bestätigt, aber keine Mietzinsobergrenze erfasst - eine "
+                "bestätigte gesetzliche Zinsbeschränkung wird nie fiktiv als unbegrenzt behandelt. "
+                "Bitte Mietzinsobergrenze/Quellenbeleg vor Freigabe erfassen."
+            )
         if not profil.basis_komponenten_ids:
             raise ValueError("Mindestens eine referenzierte Basis-Komponente ist für eine Freigabe Pflicht.")
         if profil.bezugsjahr is None or profil.bezugsmonat is None:

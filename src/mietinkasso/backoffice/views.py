@@ -82,6 +82,7 @@ _NAV_LINKS = [
     ("/backoffice/bank/unzugeordnet", "Offene Zuordnungen"),
     ("/backoffice/bank/vollstaendigkeit", "Bankvollständigkeit"),
     ("/backoffice/mahnwesen/policy", "Mahnstufen-Konfiguration"),
+    ("/backoffice/indexautomatik/laeufe", "Indexautomatik-Monatsläufe"),
     ("/backoffice/indexautomatik/outbox", "Indexautomatik-Outbox"),
     ("/backoffice/indexautomatik/vpi", "VPI-Werte"),
     ("/backoffice/indexautomatik/vertragsende", "Vertragsende-Erinnerungen"),

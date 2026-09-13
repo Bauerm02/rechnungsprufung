@@ -82,10 +82,17 @@ class Settings(BaseSettings):
     # dieser Sitzung false.
     indexautomatik_mailops_allowlist_bestaetigt: bool = False
     indexautomatik_jlb_signatur: str = "JLB Projects GmbH - Hausverwaltung"
-    # Default AUS: `statistik_austria_client.py` wurde mangels
-    # Internetzugriff in dieser Sitzung nicht gegen den echten Endpunkt
-    # verifiziert - Codex muss das vor Aktivierung prüfen.
+    # Default AUS - `statistik_austria_client.py` konnte in dieser
+    # Sitzung mangels Internetzugriff nicht selbst gegen den echten
+    # Endpunkt ausgeführt werden. Codex hat die vier amtlichen
+    # OGD-Original-URLs unabhängig erfolgreich geprüft
+    # (PUBLIC_CLIENT_REVIEW) - die Aktivierung bleibt trotzdem eine
+    # bewusste, separate Betriebsentscheidung.
     indexautomatik_vpi_automatischer_abruf: bool = False
+    # Zielverzeichnis für die vier heruntergeladenen OGD-Rohdateien -
+    # AUSSERHALB des Repos, keine echten/produktiven Daten in Git.
+    # Pflicht, sobald `indexautomatik_vpi_automatischer_abruf=True`.
+    indexautomatik_vpi_ablage_verzeichnis: str | None = None
     # Generischer HTTP-Transport (indexautomatik/transport.py::
     # HttpTransportadapter) - ohne konfigurierten Endpunkt bleibt der
     # tägliche Versandlauf strukturell blockiert (kein Fallback auf

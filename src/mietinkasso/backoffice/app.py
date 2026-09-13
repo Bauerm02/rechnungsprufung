@@ -70,7 +70,7 @@ from mietinkasso.stammdaten.repository import StammdatenRepository
 from mietinkasso.mieweg_vorschau.repository import MieWegVorschauRepository
 from mietinkasso.mieweg_vorschau.service import MieWegVorschauService, VpiWert
 from mietinkasso.indexautomatik.bootstrap import bauen as _indexautomatik_bauen
-from mietinkasso.indexautomatik.transport import FakeTransportadapter, HttpTransportadapter
+from mietinkasso.indexautomatik.transport import HttpTransportadapter
 from mietinkasso.indexautomatik.zeit import heute_wien
 from mietinkasso.vertragspruefung.repository import IndexPruefbedarfRepository, VertragPruefungRepository
 from mietinkasso.vertragspruefung.service import VertragspruefungService
@@ -2115,8 +2115,10 @@ def rechtsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_
           <label>Bezugsjahr</label><input type="number" name="bezugsjahr" min="1990" max="2100">
           <label>Bezugsmonat (1-12)</label><input type="number" name="bezugsmonat" min="1" max="12">
           <label><input type="checkbox" name="letzte_basis_war_jahresdurchschnitt" value="1"> War Jahresdurchschnitt</label>
-          <label>VPI-Reihe</label>
-          <select name="vpi_reihe">{option("VPI20C18","VPI20C18",selected=True)}{option("VPI15C18","VPI15C18")}{option("VPI00","VPI00")}{option("VPI96","VPI96")}</select>
+          <label>VPI-Reihe (gesetzliche MieWeG-Spur, fix)</label>
+          <select name="vpi_reihe">{option("VPI20C18","VPI20C18",selected=True)}</select>
+          <p class="muted">Nur VPI20C18 (amtlich aktuelle Reihe) - eine abweichende vertragliche Reihe
+             gehört als eigene IndexKlausel unten erfasst.</p>
           <label>Referenzierte Basis-Komponenten</label>
           {komponenten_html}
         </fieldset>
@@ -2238,12 +2240,15 @@ def _outbox_zeile_html(o) -> str:
           <input type="text" name="zugang_beleg" placeholder="Belegreferenz" required>
           <button type="submit" class="secondary">Zugang bestätigen</button></form>"""
     gruende = "<br>".join(h(g) for g in (o.blockiert_gruende or [])) or "-"
+    schreiben_html = (
+        f"<details><summary>Text anzeigen</summary><pre>{h(o.schreiben_text or '(kein Text)')}</pre></details>"
+    )
     return (
         "<tr>"
         f"<td>{h(o.vertrag_id)}</td><td>{o.ziel_bewertungsjahr or '-'}</td><td>{o.index_anpassung_id or '-'}</td>"
         f"<td>{eur(o.erhoehung_cent)}</td><td>{o.massgeblicher_termin.isoformat()}</td><td>{h(o.status)}</td>"
         f"<td>{gruende}</td><td>{o.zahlungspflicht_ab.isoformat() if o.zahlungspflicht_ab else '-'}</td>"
-        f"<td>{aktion}</td></tr>"
+        f"<td>{schreiben_html}</td><td>{aktion}</td></tr>"
     )
 
 
@@ -2251,17 +2256,18 @@ def _outbox_zeile_html(o) -> str:
 def indexautomatik_outbox(request: Request, session=Depends(_current_session)) -> HTMLResponse:
     schreiben = _indexautomatik.outbox_repository.liste_alle()
     zeilen = "".join(_outbox_zeile_html(o).replace("{csrf}", csrf_feld(session.csrf_token)) for o in schreiben) or (
-        '<tr><td colspan=9 class="muted">Noch kein Erhöhungsschreiben vorhanden.</td></tr>'
+        '<tr><td colspan=10 class="muted">Noch kein Erhöhungsschreiben vorhanden.</td></tr>'
     )
     inhalt = f"""
     <div class="card">
       <h1>Erhöhungsschreiben-Outbox</h1>
-      <p class="muted">Realer Versand erfordert MIETINKASSO_INDEXAUTOMATIK_SEND_ENABLED UND
-         MIETINKASSO_INDEXAUTOMATIK_MAILOPS_ALLOWLIST_BESTAETIGT (beide Default false) sowie einen
-         konfigurierten Transport-Endpunkt - ohne das bleibt "Versenden" eine reine Vorschau.</p>
+      <p class="muted">Realer Versand ist erst nach zwei getrennten internen Freigaben (Versand generell
+         aktiviert UND die Mailbox-Freischaltung bestätigt) sowie mit einem eingerichteten Versandweg
+         möglich - ohne das bleibt "Versenden" eine reine Vorschau/Sperre, es wird niemals ein
+         Test-Versand als echt ausgegeben.</p>
       <table>
         <tr><th>Vertrag</th><th>Ziel-Jahr</th><th>IndexAnpassung</th><th>Erhöhung</th><th>Termin</th>
-          <th>Status</th><th>Gründe</th><th>Zahlungspflicht ab</th><th>Aktion</th></tr>
+          <th>Status</th><th>Gründe</th><th>Zahlungspflicht ab</th><th>Schreiben</th><th>Aktion</th></tr>
         {zeilen}
       </table>
     </div>
@@ -2269,17 +2275,60 @@ def indexautomatik_outbox(request: Request, session=Depends(_current_session)) -
     return _layout(request, session, "Indexautomatik-Outbox", inhalt)
 
 
+def _lauf_zeile_html(l) -> str:
+    gruende = "<br>".join(h(g) for g in (l.blockiert_gruende or [])) or "-"
+    return (
+        "<tr>"
+        f"<td>{h(l.vertrag_id)}</td><td>{h(l.periode)}</td><td>{h(l.status)}</td><td>{gruende}</td>"
+        f"<td>{l.erhoehungsschreiben_id or '-'}</td></tr>"
+    )
+
+
+@router.get("/indexautomatik/laeufe", response_class=HTMLResponse)
+def indexautomatik_laeufe(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    """Ergänzende Abnahmepunkte (Endprüfung): "Portal braucht die
+    internen BLOCKIERT-Gründe der Monatsläufe sichtbar (nicht nur leere
+    Outbox)" - ein Fall, der wegen fehlender/unklarer Daten gar nicht
+    erst bis zur Outbox kommt, war bisher nur in der Datenbank sichtbar,
+    nicht im Backoffice."""
+
+    laeufe = _indexautomatik.lauf_repository.liste_alle()
+    zeilen = "".join(_lauf_zeile_html(l) for l in laeufe) or (
+        '<tr><td colspan=5 class="muted">Noch kein Monatslauf durchgeführt.</td></tr>'
+    )
+    inhalt = f"""
+    <div class="card">
+      <h1>Indexautomatik-Monatsläufe</h1>
+      <p class="muted">Jeder Vertrag/Monat, den der Monatslauf geprüft hat - inklusive der Fälle, die
+         schon vor einem Erhöhungsschreiben blockiert wurden (z. B. fehlende Belege, ungeprüfte
+         Haupt-/Untermiete, fehlender amtlicher Indexwert).</p>
+      <table>
+        <tr><th>Vertrag</th><th>Periode</th><th>Status</th><th>Gründe</th><th>Erhöhungsschreiben</th></tr>
+        {zeilen}
+      </table>
+    </div>
+    """
+    return _layout(request, session, "Indexautomatik-Monatsläufe", inhalt)
+
+
 @router.post("/indexautomatik/outbox/{erhoehungsschreiben_id}/versenden")
 def indexautomatik_outbox_versenden(request: Request, erhoehungsschreiben_id: int, csrf_token: str = Form(...), session=Depends(_current_session)):
     _verify_csrf(session, csrf_token)
     heute = heute_wien()
-    transport = (
-        HttpTransportadapter(
-            endpoint_url=_settings.indexautomatik_transport_endpoint_url,
-            api_key=_settings.indexautomatik_transport_api_key,
+    # UI-Endprüfung (6317f96): kein FakeTransportadapter()-Fallback im
+    # Produktivpfad - ohne konfigurierten echten Transport-Endpunkt wird
+    # HART blockiert, statt bei gesetzten Flags einen Fake-Versand als
+    # "GESENDET" auszugeben.
+    if not (_settings.indexautomatik_transport_endpoint_url and _settings.indexautomatik_transport_api_key):
+        return _fehlerseite(
+            session, "Indexautomatik-Outbox",
+            "Kein Versandweg eingerichtet - Versand ist strukturell gesperrt. Es wird niemals ein "
+            "Test-Versand im Produktivbetrieb durchgeführt.",
+            "/backoffice/indexautomatik/outbox",
         )
-        if _settings.indexautomatik_transport_endpoint_url and _settings.indexautomatik_transport_api_key
-        else FakeTransportadapter()
+    transport = HttpTransportadapter(
+        endpoint_url=_settings.indexautomatik_transport_endpoint_url,
+        api_key=_settings.indexautomatik_transport_api_key,
     )
     try:
         ergebnis = _indexautomatik.outbox_service.versenden(
@@ -2328,9 +2377,8 @@ def indexautomatik_vpi(request: Request, session=Depends(_current_session)) -> H
     inhalt = f"""
     <div class="card">
       <h1>VPI-Jahresdurchschnittswerte (manueller Override)</h1>
-      <p class="muted">Für den amtlichen Monatswerte-Import siehe scripts/indexautomatik_*.py bzw. den
-         nativen OGD-Parser (indexautomatik/vpi_import.py) - hier nur ein manuell belegter
-         Jahresdurchschnitt-Override mit Publikationsbeleg.</p>
+      <p class="muted">Der amtliche Monatswerte-Import läuft über die eingerichtete tägliche Pflege -
+         hier nur ein manuell belegter Jahresdurchschnitt-Override mit Publikationsbeleg.</p>
       <form method="post" action="/backoffice/indexautomatik/vpi/erfassen">
         {csrf_feld(session.csrf_token)}
         <label>Reihe</label>
@@ -2382,7 +2430,11 @@ def _vertragsende_zeile_html(e) -> str:
     elif e.status == "ENTSCHIEDEN" and not e.mieterentwurf_text:
         aktion = f"""<form method="post" action="/backoffice/indexautomatik/vertragsende/{e.id}/mieterentwurf" class="inline">
           {{csrf}}<button type="submit" class="secondary">Mieterentwurf erzeugen</button></form>"""
-    entwurf_hinweis = '<br><span class="muted">Entwurf vorhanden (nur intern, nie automatisch versendet)</span>' if e.mieterentwurf_text else ""
+    entwurf_hinweis = (
+        f"<br><details><summary>Entwurf anzeigen (nur intern, nie automatisch versendet)</summary>"
+        f"<pre>{h(e.mieterentwurf_text)}</pre></details>"
+        if e.mieterentwurf_text else ""
+    )
     return (
         "<tr>"
         f"<td>{h(e.vertrag_id)}</td><td>{e.end_datum.isoformat()}</td><td>{e.faellig_am.isoformat()}</td>"
@@ -2399,9 +2451,9 @@ def indexautomatik_vertragsende(request: Request, session=Depends(_current_sessi
     inhalt = f"""
     <div class="card">
       <h1>Vertragsende-Erinnerungen</h1>
-      <p class="muted">Empfänger ist ausschließlich der intern konfigurierte Eigentümer
-         (MIETINKASSO_OWNER_EMAIL) - nie der Mieter. Der Mieter wird ERST nach einer hier gespeicherten
-         Entscheidung überhaupt adressiert, und dann höchstens über einen manuell zu prüfenden Entwurf.</p>
+      <p class="muted">Empfänger ist ausschließlich der intern konfigurierte Eigentümer - nie der Mieter.
+         Der Mieter wird ERST nach einer hier gespeicherten Entscheidung überhaupt adressiert, und dann
+         höchstens über einen manuell zu prüfenden Entwurf.</p>
       <table>
         <tr><th>Vertrag</th><th>Ende</th><th>Fällig am</th><th>Status</th><th>Entscheidung</th><th>Aktion</th></tr>
         {zeilen}

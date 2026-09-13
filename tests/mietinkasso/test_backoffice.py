@@ -1154,6 +1154,7 @@ def test_indexautomatik_outbox_und_vertragsende_seiten_erreichbar(backoffice_cli
     _login(client)
     assert client.get("/backoffice/indexautomatik/outbox").status_code == 200
     assert client.get("/backoffice/indexautomatik/vertragsende").status_code == 200
+    assert client.get("/backoffice/indexautomatik/laeufe").status_code == 200
 
 
 def test_indexautomatik_rechtsprofil_freigabe_ohne_csrf_wird_abgelehnt(backoffice_client):
