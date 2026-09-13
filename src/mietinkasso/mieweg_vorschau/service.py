@@ -76,6 +76,46 @@ _NIE_INDEXIERBARE_ARTEN = frozenset({
 })
 
 
+def belegte_historische_basis_gueltig(beleg: dict | None, referenzdatum: date) -> bool:
+    """Codex-Rückprüfung: "Historisierungskette löst noch nicht initial
+    importierte Bestandskomponenten" - ein Mietvertrag/eine belegte
+    Indexbasis kann zeitlich VOR der erst später importierten
+    `VertragsKomponenteTable`-Zeile liegen (z. B. Vertragsbeginn 1.4.,
+    belegte Indexbasis Februar, eine unveränderte Pauschale aber erst ab
+    August importiert). `StammdatenRepository.ursprungs_gueltig_von`
+    kann eine SPÄTER importierte Zeile nicht von einer tatsächlich
+    fehlenden Historie unterscheiden - eine reine Zeitprüfung würde
+    einen tatsächlich bestehenden, nur spät importierten Altbestand
+    fälschlich blockieren.
+
+    Diese Funktion prüft einen EXPLIZITEN, vom Operator erfassten
+    Ausnahmenachweis (`RechtsprofilTable.historische_basis_belege[
+    komponente_id]`, Form `{"betrag_cent": int, "datum": "YYYY-MM-DD",
+    "quellenbeleg": str}`) - NUR ein vollständiger Beleg (alle drei
+    Felder gesetzt, `datum` auf oder vor `referenzdatum`) darf die
+    Existenzprüfung ersetzen. Kein Rateversuch: ein fehlender/
+    unvollständiger Beleg liefert `False`, die Sperre bleibt bestehen.
+    Ändert NIEMALS die technische Komponentenzeile selbst - rein
+    dokumentarischer Nachweis, fließt in KEINE Berechnung ein."""
+
+    if not beleg:
+        return False
+    betrag_cent = beleg.get("betrag_cent")
+    quellenbeleg = beleg.get("quellenbeleg")
+    datum_str = beleg.get("datum")
+    if not isinstance(betrag_cent, int) or betrag_cent <= 0:
+        return False
+    if not isinstance(quellenbeleg, str) or not quellenbeleg.strip():
+        return False
+    if not isinstance(datum_str, str):
+        return False
+    try:
+        datum = date.fromisoformat(datum_str)
+    except ValueError:
+        return False
+    return datum <= referenzdatum
+
+
 def _naechster_gueltiger_april(datum: date) -> date:
     """MieWeG-Anpassungen sind ausschließlich zu einem 1. April wirksam
     (§ 1 Abs 4) - rundet ein beliebiges Datum auf den nächsten gültigen
@@ -135,6 +175,7 @@ class MieWegVorschauService:
         zustellnachweis_referenz: str | None,
         kommentar: str | None,
         akteur: str,
+        historische_basis_belege: dict[str, dict] | None = None,
     ) -> MieWegVorschauTable:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
@@ -217,11 +258,19 @@ class MieWegVorschauService:
                     f"unabhängig vom indexierbar-Flag (verteidigt gegen eine fehlerhaft gesetzte "
                     f"indexierbar=True-Markierung; ausgeschlossene Arten: {sorted(_NIE_INDEXIERBARE_ARTEN)})."
                 )
-            if referenzdatum is not None and self._stammdaten_repository.ursprungs_gueltig_von(komponente) > referenzdatum:
+            if (
+                referenzdatum is not None
+                and self._stammdaten_repository.ursprungs_gueltig_von(komponente) > referenzdatum
+                and not belegte_historische_basis_gueltig(
+                    (historische_basis_belege or {}).get(komponente_id), referenzdatum
+                )
+            ):
                 raise ValueError(
                     f"Komponente {komponente_id} ist erst ab {komponente.gueltig_von.isoformat()} gültig und "
                     f"hat zum angegebenen Bezugszeitpunkt {referenzdatum.isoformat()} noch nicht bestanden - "
-                    "sie darf nicht rückwirkend in die Basis einfließen."
+                    "sie darf nicht rückwirkend in die Basis einfließen. Ein expliziter, vollständiger "
+                    "Ausnahmenachweis (Betrag/Datum/Quellenbeleg, RechtsprofilTable."
+                    "historische_basis_belege) kann diese Sperre für GENAU diese Komponente aufheben."
                 )
             if referenzdatum is not None and komponente.gueltig_bis is not None and komponente.gueltig_bis < referenzdatum:
                 raise ValueError(
@@ -478,6 +527,7 @@ class MieWegVorschauService:
             "ziel_bewertungsjahr": ziel_bewertungsjahr,
             "basis_betrag_cent": basis_betrag_cent,
             "basis_komponenten_ids": list(basis_komponenten_ids),
+            "historische_basis_belege": historische_basis_belege or {},
             "vpi_jahresdurchschnitte": {str(jahr): asdict(eintrag) for jahr, eintrag in vpi_jahresdurchschnitte.items()},
             "vertraglich_zulaessiger_betrag_cent": vertraglich_zulaessiger_betrag_cent,
             "vertraglicher_quellenbeleg": vertraglicher_quellenbeleg,

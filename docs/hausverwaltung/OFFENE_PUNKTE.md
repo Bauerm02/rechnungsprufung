@@ -1413,31 +1413,88 @@ demselben Branch behoben, mit dediziertem Regressionstest je Fund:
   Filter wäre eine künftige Mehrbenutzer-Rolle sofort eine Datenlücke.
   Jetzt mit demselben `ctx.has_zugriff(...)`-Muster gefiltert.
 
-Weiterhin OFFEN aus derselben Rückprüfung, noch NICHT umgesetzt (siehe
-Codex-Formulierung, geplant als eigener Folgecommit):
+Aus derselben Rückprüfung inzwischen behoben (Commits `8f499c9`,
+`3139e19`, `c01ceb2`):
 
-- **Mehrkomponenten-Verteilung bleibt vollständig gesperrt.** Ein Fall
-  mit z. B. HMZ+Küche beauftragt bleibt weiterhin komplett blockiert
-  (keine erfundene Verteilungsregel) - eine explizite, centgenaue
-  Verteilung auf MEHRERE Komponenten ist noch nicht implementiert.
-- **Geschäftsraum-/Klausel-Pfad schreibt `basis_wert`/`basis_monat`
+- **Mehrkomponenten-Verteilung war vollständig gesperrt** - ein Fall
+  mit z. B. HMZ+Küche beauftragt wurde komplett blockiert. Jetzt
+  implementiert: `outbox_service._verteile_erhoehung_centgenau`
+  verteilt die Gesamterhöhung proportional zum jeweiligen Anteil jeder
+  Komponente am referenzierten Gesamtbetrag (größte-Rest-Verfahren,
+  Summe der Deltas ist immer exakt die Gesamterhöhung).
+  `komponenten_verteilung` trägt dafür eine Liste (`eintraege`) statt
+  eines einzelnen Eintrags; `umsetzung_service.umsetzen()` historisiert
+  entsprechend beliebig viele betroffene Komponenten in einer
+  Transaktion (`IndexSollUmsetzungTable.neue_komponenten_ids`/
+  `beendete_komponenten_ids` additiv ergänzt, die bisherigen
+  Einzelfelder bleiben für den Ein-Komponenten-Fall bequem gefüllt). Mit
+  E2E-Test (zwei Komponenten, zentgenaue Verteilung, beide historisiert).
+- **Geschäftsraum-/Klausel-Pfad schrieb `basis_wert`/`basis_monat`
   der `IndexKlauselTable` nach einer freigegebenen `IndexAnpassung`
-  nicht fort** - eine wiederholte Indexierung auf einen bereits
-  erhöhten Betrag droht, sobald dieser Pfad (der aktuell ohnehin jeden
-  automatischen Vorschlag blockiert, siehe oben) um einen
-  Wirksamkeitstermin ergänzt wird.
-- **Tri-State MRG-Zinsbeschränkung/Förderbindung** (`unbekannt` darf
-  bei einer Freigabe nicht stillschweigend `False` werden) ist noch
-  nicht umgesetzt. Explizit zu beachten bei der Umsetzung: die
-  bestehenden Spalten `mrg_zinsbeschraenkung`/`foerderbindung` sind in
-  der bereits produktiven Datenbank NOT-NULL-Spalten - `ensure_
-  additive_columns` ändert NIE bestehende Spalten-Constraints
-  (additive-only). Ein reines `nullable=True` im Modell würde deshalb
-  nur auf frischen Test-/CI-Datenbanken funktionieren, nicht auf der
-  echten Produktions-DB. Geplanter Ansatz: separate, additive
-  `*_geprueft`-Flags (Default `False`) statt einer gelockerten
-  bestehenden Spalte, mit Freigabe-Pflicht `geprueft=True` - keine
-  pauschale Automatikfreigabe durch den Default.
+  nicht fort.** Jetzt implementiert: `umsetzen()` legt bei einer
+  Klausel-basierten Umsetzung eine NEUE `IndexKlauselTable`-Version an
+  (append-only, alte `GESPERRT` + `ersetzt_id`), mit fortgeschriebenem
+  `basis_wert` (= tatsächlich verwendeter `IndexAnpassung.neuer_wert`).
+  Rein mechanische Bestandskorrektur, KEINE neue Rechtsentscheidung zu
+  Fristen/Terminen - der automatische Wirksamkeitstermin für diesen
+  Pfad bleibt weiterhin bewusst gesperrt (siehe unten, Punkt 1 der
+  Codex-Regel-Verfeinerungen ist NICHT Teil davon).
+- **Tri-State MRG-Zinsbeschränkung/Förderbindung** ist umgesetzt:
+  additive `mrg_zinsbeschraenkung_geprueft`/`foerderbindung_geprueft`-
+  Flags (Default `False`, `server_default text("0")`) statt einer
+  gelockerten bestehenden Spalte - `_validiere_vollstaendigkeit_fuer_
+  freigabe` verlangt jetzt `geprueft=True` für beide Felder, ein
+  `ENTWURF` darf weiterhin unbekannt bleiben.
+- **Komponenten-Existenzprüfung gegen die historische Bezugsbasis
+  (Punkt 3 der Codex-Regel-Verfeinerungen) verwechselte die aktuelle,
+  zuletzt historisierte Komponentenzeile mit der ursprünglichen
+  Verpflichtung.** Nach einer Umsetzung bekommt die neue Komponentenzeile
+  ein neues `gueltig_von` (der Anspruchsmonat) - eine reine
+  `gueltig_von`-Prüfung hätte die (korrekt fortgeschriebene) MieWeG-
+  Bezugsbasis der Vorperiode fälschlich als "Komponente hat noch nicht
+  bestanden" abgelehnt. Neue additive Spalte `VertragsKomponenteTable.
+  historisiert_von_id` (explizite, nur von `umsetzen()` gesetzte Kette,
+  KEINE ID-String-Heuristik) - `StammdatenRepository.
+  ursprungs_gueltig_von()` verfolgt sie bis zur Ursprungszeile zurück;
+  von `mieweg_vorschau/service.py` UND `rechtsprofil.py` gemeinsam
+  genutzt. Dieselbe Kette schützt auch vor dem umgekehrten, in Punkt 3
+  beschriebenen Fall (ein `bezugsjahr` Jahrzehnte vor einer gerade erst
+  importierten Komponentenfassung) - eine Komponente ohne
+  `historisiert_von_id` (z. B. ein frischer Intake-Import) liefert ihr
+  eigenes `gueltig_von` als Ursprung, die Prüfung blockiert dann
+  korrekt statt eine unbelegte historische Basis stillschweigend zu
+  akzeptieren.
+- **Bestehende, noch nicht gebuchte (ENTWURF) Monatsvorschreibungen
+  blieben nach einer Umsetzung auf dem alten Komponentenstand stehen**
+  (`VorschreibungService.entwurf_erstellen` befüllt eine Vorschreibung
+  nur beim allerersten Aufruf, aktualisiert eine bereits bestehende
+  nie). `umsetzen()` baut einen solchen offenen Entwurf ab dem
+  Wirksamkeitsmonat jetzt in derselben Transaktion aus dem neu
+  historisierten Komponentenstand neu auf (inklusive unveränderter
+  BK/HK-Positionen) - bereits gebuchte Perioden bleiben weiterhin
+  vollständig gesperrt (unverändert).
+- **Der Mietertext enthielt eine interne `Rechtsprofil Version N`-
+  Referenz** - entfernt; die Vertragsbeleg-/Klauselreferenz (ein
+  verständlicher Mietvertragsabschnitt) steht bereits an anderer Stelle
+  im Text und bleibt unverändert. Interne Versions-/Hash-Nachweise
+  bleiben ausschließlich im `IndexSollUmsetzungTable`-Ausführungsnachweis.
+
+Weiterhin OFFEN, NICHT Teil dieser Korrekturrunde (echte Fachentscheidung
+nötig, siehe AGENTS.md - Claude baut keine eigenen Rechtsregeln):
+
+- **Punkt 1 der Codex-Regel-Verfeinerungen (Kalender-/Intervall-/
+  Rundungsfelder für `IndexKlauselTable`) ist NICHT umgesetzt.** Ein
+  automatischer Wirksamkeitstermin für den Geschäftsraum-/Klausel-Pfad
+  bleibt deshalb weiterhin gesperrt (`_monatslauf_klausel` gibt
+  unverändert `BLOCKIERT` mit "kein erfundenes Datum" zurück, sobald ein
+  rechnerischer Vorschlag vorliegt). Welche konkreten Kalendermonate/
+  Mindestintervalle/Rundungsregeln je Vertrag gelten (z. B. "nur Jänner
+  UND strikt >3%-Schwelle" versus "Jänner ohne Schwelle" versus
+  "maximal einmal jährlich ohne fixen Monat"), ist eine echte, vertrags-
+  individuelle Rechtsfrage - das Datenmodell/die Prüflogik dafür sollte
+  erst entworfen werden, wenn die konkreten, zu unterstützenden
+  Regelformen feststehen, statt ein Schema zu erraten, das an der
+  tatsächlichen Anforderung vorbeigeht.
 
 ## Paket Dashboard/Variable Monatsabrechnung (Auftrag 13.09.2026, HV-20260913-DASHBOARD)
 

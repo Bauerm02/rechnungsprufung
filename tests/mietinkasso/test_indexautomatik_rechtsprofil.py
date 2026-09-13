@@ -176,6 +176,77 @@ def test_freigabe_ohne_komponenten_wird_abgelehnt(admin_ctx, basis_vertrag, rech
         rechtsprofil_service.freigeben(profil.id, ctx=admin_ctx, freigegeben_von="markus")
 
 
+def test_spaet_importierte_komponente_ohne_beleg_blockiert_freigabe(
+    admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo
+):
+    """Codex-Rückprüfung: "Historisierungskette löst noch nicht initial
+    importierte Bestandskomponenten" - Vertragsbeginn 1.4., belegte
+    Indexbasis Februar, eine unveränderte Pauschale aber erst ab 1.8. als
+    Komponente importiert. Ohne expliziten Ausnahmenachweis bleibt die
+    Freigabe gesperrt - ein bloß spät importierter Altbestand darf nicht
+    stillschweigend als "hat nicht bestanden" ODER als "hat bestanden"
+    angenommen werden."""
+
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.add_komponente(
+        id="K-1", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Pauschale", betrag_cent=50_000,
+        indexierbar=True, gueltig_von=date(2026, 8, 1),
+    )
+    entwurf = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx, vertrag_id=vertrag.id,
+        **_standard_kwargs(bezugsjahr=2026, bezugsmonat=2, basis_komponenten_ids=["K-1"]),
+    )
+    with pytest.raises(ValueError, match="hat sie noch nicht bestanden"):
+        rechtsprofil_service.freigeben(entwurf.id, ctx=admin_ctx, freigegeben_von="markus")
+
+
+def test_belegte_historische_basis_hebt_sperre_fuer_spaeten_import_auf(
+    admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo
+):
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.add_komponente(
+        id="K-1", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Pauschale", betrag_cent=50_000,
+        indexierbar=True, gueltig_von=date(2026, 8, 1),
+    )
+    entwurf = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx, vertrag_id=vertrag.id,
+        **_standard_kwargs(
+            bezugsjahr=2026, bezugsmonat=2, basis_komponenten_ids=["K-1"],
+            historische_basis_belege={
+                "K-1": {
+                    "betrag_cent": 50_000, "datum": "2026-02-01",
+                    "quellenbeleg": "Mietvertrag Punkt 3, Altbestand seit Vertragsbeginn",
+                },
+            },
+        ),
+    )
+    profil = rechtsprofil_service.freigeben(entwurf.id, ctx=admin_ctx, freigegeben_von="markus")
+    assert profil.status == "FREIGEGEBEN"
+
+
+def test_unvollstaendiger_historischer_beleg_hebt_sperre_nicht_auf(
+    admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo
+):
+    """Ein fehlender Quellenbeleg darf die Sperre NICHT aufheben - kein
+    Rateversuch, kein automatisches Durchwinken eines unvollständigen
+    Nachweises."""
+
+    vertrag, _konto = basis_vertrag
+    stammdaten_repo.add_komponente(
+        id="K-1", vertrag_id=vertrag.id, art="HMZ", bezeichnung="Pauschale", betrag_cent=50_000,
+        indexierbar=True, gueltig_von=date(2026, 8, 1),
+    )
+    entwurf = rechtsprofil_service.entwurf_anlegen(
+        ctx=admin_ctx, vertrag_id=vertrag.id,
+        **_standard_kwargs(
+            bezugsjahr=2026, bezugsmonat=2, basis_komponenten_ids=["K-1"],
+            historische_basis_belege={"K-1": {"betrag_cent": 50_000, "datum": "2026-02-01", "quellenbeleg": ""}},
+        ),
+    )
+    with pytest.raises(ValueError, match="hat sie noch nicht bestanden"):
+        rechtsprofil_service.freigeben(entwurf.id, ctx=admin_ctx, freigegeben_von="markus")
+
+
 def test_geaenderte_vertragsklausel_entwertet_freigabe(
     admin_ctx, basis_vertrag, rechtsprofil_service, stammdaten_repo, index_repo
 ):

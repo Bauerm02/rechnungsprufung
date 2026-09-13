@@ -540,6 +540,14 @@ class IndexSollUmsetzungService:
                 True if ist_mieweg_pfad else profil.letzte_basis_war_jahresdurchschnitt
             )
             neue_basis_ids = sorted({alt_zu_neu_id.get(kid, kid) for kid in profil.basis_komponenten_ids})
+            # Ein belegter Ausnahmenachweis (siehe `RechtsprofilTable.
+            # historische_basis_belege`-Docstring) bleibt an die
+            # KOMPONENTEN-ID gebunden - nach der Historisierung muss er
+            # deshalb auf die NEUE ID mitwandern, sonst würde er nach
+            # genau einem Zyklus stillschweigend wirkungslos.
+            neue_historische_basis_belege = {
+                alt_zu_neu_id.get(kid, kid): beleg for kid, beleg in (profil.historische_basis_belege or {}).items()
+            }
 
             # Klausel-Basisfortschreibung (Geschäftsraum-/generischer-
             # Klausel-Pfad, Codex-Rückprüfung: "basis_wert/basis_monat/
@@ -622,6 +630,7 @@ class IndexSollUmsetzungService:
                 bezugsmonat=neuer_bezugsmonat,
                 letzte_basis_war_jahresdurchschnitt=neue_letzte_basis_war_jahresdurchschnitt,
                 basis_komponenten_ids=neue_basis_ids,
+                historische_basis_belege=neue_historische_basis_belege,
                 vpi_reihe=profil.vpi_reihe,
                 vertraglich_zulaessiger_betrag_cent=profil.vertraglich_zulaessiger_betrag_cent,
                 vertraglicher_quellenbeleg=profil.vertraglicher_quellenbeleg,

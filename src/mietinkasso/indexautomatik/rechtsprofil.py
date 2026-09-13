@@ -31,6 +31,7 @@ from mietinkasso.index.repository import IndexRepository
 from mietinkasso.indexautomatik.repository import RechtsprofilRepository
 from mietinkasso.infrastructure.db.tables import RechtsprofilTable, VertragTable
 from mietinkasso.mieweg_vorschau.service import _NIE_INDEXIERBARE_ARTEN as _MIEWEG_NIE_INDEXIERBARE_ARTEN
+from mietinkasso.mieweg_vorschau.service import belegte_historische_basis_gueltig
 from mietinkasso.op.service import compute_content_hash
 from mietinkasso.stammdaten.repository import StammdatenRepository
 
@@ -80,6 +81,7 @@ class RechtsprofilService:
         bezugsmonat: int | None,
         letzte_basis_war_jahresdurchschnitt: bool,
         basis_komponenten_ids: list[str],
+        historische_basis_belege: dict[str, dict] | None = None,
         vpi_reihe: str = "VPI20C18",
         vertraglich_zulaessiger_betrag_cent: int | None = None,
         vertraglicher_quellenbeleg: str | None = None,
@@ -165,6 +167,7 @@ class RechtsprofilService:
             bezugsmonat=bezugsmonat,
             letzte_basis_war_jahresdurchschnitt=letzte_basis_war_jahresdurchschnitt,
             basis_komponenten_ids=list(basis_komponenten_ids),
+            historische_basis_belege=dict(historische_basis_belege or {}),
             vpi_reihe=vpi_reihe,
             vertraglich_zulaessiger_betrag_cent=vertraglich_zulaessiger_betrag_cent,
             vertraglicher_quellenbeleg=vertraglicher_quellenbeleg,
@@ -249,10 +252,17 @@ class RechtsprofilService:
             # MieWeG-Bezugsbasis (siehe `umsetzung_service.py`, "Leerschritt")
             # fälschlich als Rückdatierung ablehnen. Siehe
             # `StammdatenRepository.ursprungs_gueltig_von`-Docstring.
-            if self._stammdaten_repository.ursprungs_gueltig_von(komponente) > referenzdatum:
+            if self._stammdaten_repository.ursprungs_gueltig_von(
+                komponente
+            ) > referenzdatum and not belegte_historische_basis_gueltig(
+                (profil.historische_basis_belege or {}).get(komponente_id), referenzdatum
+            ):
                 raise ValueError(
                     f"Komponente {komponente_id} ist erst ab {komponente.gueltig_von.isoformat()} gültig - "
-                    f"zum Bezugszeitpunkt {referenzdatum.isoformat()} hat sie noch nicht bestanden."
+                    f"zum Bezugszeitpunkt {referenzdatum.isoformat()} hat sie noch nicht bestanden. Ein "
+                    "expliziter, vollständiger Ausnahmenachweis (Betrag/Datum/Quellenbeleg, "
+                    "RechtsprofilTable.historische_basis_belege) kann diese Sperre für GENAU diese "
+                    "Komponente aufheben."
                 )
             if komponente.gueltig_bis is not None and komponente.gueltig_bis < referenzdatum:
                 raise ValueError(
@@ -338,6 +348,7 @@ class RechtsprofilService:
                 "bezugsmonat": profil.bezugsmonat,
                 "letzte_basis_war_jahresdurchschnitt": profil.letzte_basis_war_jahresdurchschnitt,
                 "basis_komponenten_ids": sorted(profil.basis_komponenten_ids),
+                "historische_basis_belege": profil.historische_basis_belege or {},
                 "vpi_reihe": profil.vpi_reihe,
                 "vertraglich_zulaessiger_betrag_cent": profil.vertraglich_zulaessiger_betrag_cent,
                 "vertraglicher_quellenbeleg": profil.vertraglicher_quellenbeleg,

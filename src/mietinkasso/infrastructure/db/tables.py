@@ -678,6 +678,28 @@ class RechtsprofilTable(Base):
     bezugsmonat: Mapped[int | None] = mapped_column(Integer, nullable=True)
     letzte_basis_war_jahresdurchschnitt: Mapped[bool] = mapped_column(Boolean, default=False)
     basis_komponenten_ids: Mapped[list] = mapped_column(JSON, default=list)
+    # Additiv (Codex-Rückprüfung: "Historisierungskette löst noch nicht
+    # initial importierte Bestandskomponenten" - ein Mietvertrag/eine
+    # belegte Indexbasis kann zeitlich VOR der erst später importierten
+    # Komponentenzeile liegen, z. B. Vertragsbeginn 1.4., belegte
+    # Indexbasis Februar, eine unveränderte Pauschale aber erst ab
+    # August als `VertragsKomponenteTable`-Zeile importiert).
+    # `StammdatenRepository.ursprungs_gueltig_von` kann eine SPÄTER
+    # importierte Zeile nicht von einer tatsächlich fehlenden Historie
+    # unterscheiden - eine reine Zeitprüfung würde deshalb einen
+    # tatsächlich bestehenden, nur spät importierten Altbestand
+    # fälschlich blockieren. Dieses Feld erlaubt einen EXPLIZITEN,
+    # geprüften Ausnahmenachweis je Komponenten-ID: `{komponente_id:
+    # {"betrag_cent": int, "datum": "YYYY-MM-DD", "quellenbeleg": str}}`.
+    # Nur ein VOLLSTÄNDIGER Eintrag (alle drei Felder gesetzt, `datum`
+    # <= Bezugszeitpunkt) darf die Existenzprüfung für GENAU diese
+    # Komponente ersetzen - siehe `mieweg_vorschau/service.py::
+    # belegte_historische_basis_gueltig`. Ändert NIEMALS die technische
+    # Komponentenzeile selbst (kein Zurückdatieren von `gueltig_von`) -
+    # rein dokumentarischer Ausnahmenachweis, fließt in KEINE Berechnung
+    # ein (der tatsächlich verrechnete Betrag bleibt immer
+    # `komponente.betrag_cent` der aktuellen Zeile).
+    historische_basis_belege: Mapped[dict] = mapped_column(JSON, default=dict, server_default=text("'{}'"))
     # VPI-Reihe für die GESETZLICHE (MieWeG-)Spur dieses Vertrags (z. B.
     # "VPI20C18") - siehe `indexautomatik/vpi_import.py`/`VpiMonatswertTable`.
     vpi_reihe: Mapped[str] = mapped_column(String(32), default="VPI20C18")
@@ -861,8 +883,8 @@ class IndexSollUmsetzungTable(Base):
     # betroffenen Komponenten aber `None`. Diese beiden Listenfelder sind
     # IMMER vollständig (auch im Ein-Komponenten-Fall) und damit die
     # verbindliche, generische Quelle für den Ausführungsnachweis.
-    neue_komponenten_ids: Mapped[list] = mapped_column(JSON, default=list)
-    beendete_komponenten_ids: Mapped[list] = mapped_column(JSON, default=list)
+    neue_komponenten_ids: Mapped[list] = mapped_column(JSON, default=list, server_default=text("'[]'"))
+    beendete_komponenten_ids: Mapped[list] = mapped_column(JSON, default=list, server_default=text("'[]'"))
     neues_rechtsprofil_id: Mapped[int | None] = mapped_column(ForeignKey("rechtsprofile.id"), nullable=True)
     wirksam_ab: Mapped[date | None] = mapped_column(Date, nullable=True)
     akteur: Mapped[str | None] = mapped_column(String(128), nullable=True)
