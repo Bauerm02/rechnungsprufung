@@ -3188,13 +3188,56 @@ Testdaten, kein Deployment, kein Serverzugriff, kein Liveversand.
 3 neue/erweiterte Tests, 1020/1020 grün im Gesamtlauf. Nur synthetische
 Testdaten, kein Deployment, kein Serverzugriff, kein Liveversand.
 
-**Weiterhin ehrlich offen**: PDF/A-Exporter mit EinfachBrief-Layout
-(inkl. JLB-Briefkopf/-Farben/-Fonts, konfigurierbarer Asset-Pfad für das
-freigegebene Logo-PNG, PDF/A-Fonts/ICC-Abhängigkeiten im Docker-Build),
-die explizite Sichtbarmachung einer wegen fehlender Briefanbindung
-BLOCKIERT_TRANSIENT wartenden Stufe-2-Briefmahnung samt druckfertigem
-PDF im Portal - EinfachBrief sFTP/API ist weiterhin nicht freigeschaltet
-(`brief_transport_verfuegbar=False`), Stufe 2 fällt bei fehlendem
-Brieftransport NICHT auf E-Mail zurück, sondern bleibt `BLOCKIERT_
-TRANSIENT`/GEPLANT (bestehendes, unverändertes Verhalten, unabhängig
-bestätigt).
+**Weiterhin ehrlich offen** (bis Runde 9): PDF/A-Exporter mit
+EinfachBrief-Layout - siehe Runde 10.
+
+## Korrekturpaket Runde 10: PDF/A-Mahnbrief-Generator + Gesamtbetrag in E-Mail (14.09.2026)
+
+1. **`mahnwesen/brief_pdf.py`** (neu): reine Funktion
+   `erzeuge_mahnbrief_pdf(...)`, die aus GENAU denselben Werten wie
+   Portal-Vorschau/E-Mail (Hauptforderung, bereits offene Mahnkosten,
+   neue Zinsen/Gebühr, Gesamtbetrag) einen A4-Brief im EinfachBrief-
+   Fensterkuvert-Layout rendert (Fensterposition per DIN-5008-Standard,
+   über `MIETINKASSO_BRIEF_FENSTER_*` konfigurierbar). PDF/A-2B-
+   Konformität wird über `fpdf2`s `enforce_compliance="PDF/A-2B"`
+   erzwungen (>= 2.8.5, per Hinweis geprüft) statt selbst über XMP/
+   OutputIntent nachgebaut - ein Verstoß (z. B. eine nicht eingebettete
+   Basis-Schriftart) lässt die Erzeugung bereits hier laut
+   fehlschlagen. Schrift/Logo sind konfigurierbare Dateipfade
+   (`MIETINKASSO_BRIEF_FONT_*_PFAD`/`_LOGO_PFAD`) - ohne sie eine immer
+   vorhandene, offen lizenzierte Ersatzschrift (Liberation Serif,
+   `fonts-liberation` jetzt auch im Docker-Build) und KEIN gezeichnetes
+   Logo (kein erfundenes Signet). Absenderdaten (JLB Projects GmbH,
+   Adresse, FN, UID, Kontakt, Anthrazit/Gold) sind öffentliche CI-Daten
+   als Settings-Defaults hinterlegt. Amtliche PDF/A-Konformitätsprüfung
+   (veraPDF) bleibt wie vereinbart Sache von Codex am tatsächlich
+   erzeugten PDF.
+2. **Authentifizierter Download** `GET /backoffice/vertrag/{id}/
+   mahnbrief.pdf?stufe=&heute=`: berechnet dieselbe `MahnkostenService.
+   vorschau()` wie die bestehende Kostenvorschau, rendert daraus den
+   Brief und liefert ihn als Anhang - reiner Download, keine Buchung,
+   kein Versand. Der Dateiname trägt einen Hash über den zugrunde
+   liegenden Kostenstand (versioniert: derselbe Stand liefert denselben
+   Namen). Eine Kostenvorschau ist damit weiterhin ausdrücklich noch
+   kein "erzeugter Brief" - erst dieser Download-Schritt erzeugt eines.
+3. **Portalstatus für Kanal BRIEF ohne Transport**: `_mahnkosten_
+   vorschau_block` zeigt jetzt bei Kanal BRIEF ohne angebundenen
+   Transport ausdrücklich "📮 Brief wartet auf Anbindung ... KEIN
+   Ersatzversand per E-Mail" plus den Download-Link für das Brief-PDF
+   dieser Stufe - unverändert bestätigt: Stufe 2 fällt bei fehlendem
+   Brieftransport NIE auf E-Mail zurück (`_pruefe_frisch_
+   versandbereit`), bleibt `BLOCKIERT_TRANSIENT`/GEPLANT.
+4. **Gesamtbetrag fehlte als tatsächliche Zahl im gesendeten E-Mail-Text**
+   (unabhängige Rückprüfung, echter Lückenfall): der Mahntext nannte
+   bisher nur Einzelbausteine (Hauptforderung, ggf. Zinsen/Gebühr
+   getrennt) und erwähnte "bereits offene Mahnkosten" gar nicht - jetzt
+   eine explizite `Gesamtbetrag (...): X EUR`-Zeile plus "Noch offene
+   Kosten aus früheren Mahnläufen"-Baustein, identisch zur Portal-
+   Vorschau berechnet (`gesamt_cent + bereits_offene_mahnkosten_cent +
+   zusaetzlicher_betrag_cent`).
+
+7 neue Tests (`test_brief_pdf.py` + 2 Backoffice-Tests), 1027/1027 grün
+im Gesamtlauf. Kein Deployment, kein Serverzugriff, kein Liveversand
+durch Claude; physischer EinfachBrief-Transport bleibt mangels
+bestätigter sFTP/API-Spezifikation deaktiviert (`brief_transport_
+verfuegbar=False`) - kein erfundener Adapter.

@@ -2659,6 +2659,78 @@ def test_mahnvorschau_zaehlt_bereits_gebuchte_mahnkosten_nicht_doppelt_zur_haupt
     assert "Bereits gebuchte, noch offene Mahnkosten" in antwort.text
 
 
+def test_mahnbrief_pdf_download_zeigt_denselben_gesamtbetrag_wie_die_vorschau(backoffice_client):
+    """Authentifizierter PDF-Download aus demselben eingefrorenen Kosten-
+    /Forderungsstand wie die Vorschau/der E-Mail-Text - kein Versand,
+    keine Buchung, reine Vorbereitung."""
+
+    import io
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    from pypdf import PdfReader
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-BRIEFPDF", objekt_id="601", bezeichnung="Top Briefpdf", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-BRIEFPDF", einheit_id="601-TOP-BRIEFPDF", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-BRIEFPDF"))
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
+        beleg_referenz="HMZ August (Briefpdf-Test)",
+    )
+
+    antwort = client.get(f"/backoffice/vertrag/{konto.vertrag_id}/mahnbrief.pdf", params={"stufe": 1, "heute": "2026-09-01"})
+    assert antwort.status_code == 200
+    assert antwort.headers["content-type"] == "application/pdf"
+    assert "attachment; filename=" in antwort.headers["content-disposition"]
+    assert antwort.headers["content-disposition"].startswith('attachment; filename="Mahnbrief_V-601-BRIEFPDF_Stufe1_')
+
+    text = PdfReader(io.BytesIO(antwort.content)).pages[0].extract_text()
+    assert "Test Mieterin" in text  # DEB-1
+    assert "500,00" in text  # Hauptforderung 500 EUR
+
+
+def test_mahnvorschau_zeigt_brief_wartet_auf_anbindung_und_pdf_link_bei_kanal_brief(backoffice_client):
+    """Portalstatus für eine Stufe mit Kanal BRIEF muss eindeutig
+    "wartet auf Anbindung" zeigen, NIE stillschweigend wie EMAIL wirken -
+    und trotzdem die Vorbereitung/den Download des Brief-PDFs erlauben
+    (eine Kostenvorschau ist noch kein erzeugter Brief)."""
+
+    import mietinkasso.backoffice.app as backoffice_app
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.repository import MahnPolicyRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+
+    mahn_policy_repo = MahnPolicyRepository(build_session_factory(get_settings().database_url))
+    if mahn_policy_repo.aktuelle_freigegebene() is None:
+        policy = mahn_policy_repo.anlegen(
+            stufe1_tage_nach_faelligkeit=7, stufe2_mindesttage_nach_stufe1_versand=14, status="ENTWURF",
+        )
+        mahn_policy_repo.freigeben(policy.id)
+
+    if backoffice_app._mahn_kanalregel_repo.aktuelle_freigegebene() is None:
+        regel = backoffice_app._mahn_kanalregel_repo.anlegen(erstellt_von="test")
+        backoffice_app._mahn_kanalregel_repo.freigeben(regel.id, freigegeben_von="test")
+
+    antwort = client.get("/backoffice/vertrag/V-601-1/mahnvorschau", params={"heute": "2026-09-01"})
+    assert antwort.status_code == 200
+    assert "Stufe 2 (Kanal: BRIEF)" in antwort.text
+    assert "Brief wartet auf Anbindung" in antwort.text
+    assert "Ersatzversand per E-Mail" in antwort.text
+    assert "/backoffice/vertrag/V-601-1/mahnbrief.pdf?stufe=2" in antwort.text
+
+
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
     unten) - der Login-Ratelimiter ist ein globaler, prozessweiter

@@ -20,6 +20,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Fallback-Schriftart für den PDF/A-Mahnbrief (mahnwesen/brief_pdf.py):
+# PDF/A verlangt vollständig eingebettete Fonts - `fonts-liberation`
+# liefert eine immer vorhandene, offen lizenzierte TTF-Basis. Die
+# bevorzugten JLB-Fonts (Forum/EBGaramond) bleiben über
+# MIETINKASSO_BRIEF_FONT_*_PFAD konfigurierbar und werden von Codex beim
+# Deployment privat bereitgestellt.
+RUN apt-get update && apt-get install --no-install-recommends -y fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml README.md ./
 COPY src ./src
 # Indexautomatik-CLI-Skripte (Auftrag 13.09., HV-20260913-INDEXAUTOMATIK)

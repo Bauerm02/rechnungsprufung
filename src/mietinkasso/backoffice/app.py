@@ -32,13 +32,13 @@ Mehrbenutzer-Onlinebetrieb). Jede POST-Route verlangt ein gültiges
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from html import escape as h
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Cookie, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import select
 
 from mietinkasso.audit.service import AuditService
@@ -93,6 +93,8 @@ from mietinkasso.vertragsanlage.vorschlaege import (
     mehrdeutigkeiten_aus_extraktion as _vertragsanlage_mehrdeutigkeiten_aus_extraktion,
     vorschlaege_aus_extraktion as _vertragsanlage_vorschlaege_aus_extraktion,
 )
+from mietinkasso.mahnwesen.brief_pdf import Absender as _BriefAbsender, erzeuge_mahnbrief_pdf as _erzeuge_mahnbrief_pdf
+from mietinkasso.op.service import compute_content_hash as _compute_content_hash
 from mietinkasso.mahnwesen.repository import (
     BriefAnbieterProfilRepository, MahnFallRepository, MahnKanalregelRepository, MahnPolicyRepository,
 )
@@ -1666,9 +1668,23 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
                 <td>{eur(vorschau.versandkosten_anbieteraufwand_cent)}</td></tr>
             <tr><th>Davon ersatzfähig angesetzt (§1333 Abs 2 ABGB)</th>
                 <td>{eur(ersetzt_cent) if ersetzt_cent is not None else "0,00 €"}</td></tr>"""
+        brief_status_html = ""
+        if kanal == "BRIEF" and not _hv_mail.mahn_service._brief_transport_verfuegbar:
+            brief_status_html = (
+                '<p class="warn">📮 Brief wartet auf Anbindung: EinfachBrief-Versandtransport ist noch nicht '
+                "angebunden - es erfolgt KEIN automatischer Versand und KEIN Ersatzversand per E-Mail. "
+                "Der Brief kann bereits jetzt vorbereitet/heruntergeladen werden; das ist noch kein "
+                "erzeugter/versendeter Brief.</p>"
+            )
+        brief_pdf_link = (
+            f'<p><a href="/backoffice/vertrag/{h(vertrag_id)}/mahnbrief.pdf?stufe={stufe}&heute={heute_datum.isoformat()}">'
+            "Brief-PDF für diese Stufe vorbereiten &amp; herunterladen</a> "
+            '<span class="muted">(Vorschau-PDF aus diesem Kosten-/Forderungsstand, kein Zustellnachweis)</span></p>'
+        )
         zeilen.append(f"""
         <div class="card">
           <h3>Stufe {stufe} (Kanal: {h(kanal)})</h3>
+          {brief_status_html}
           <table>
             <tr><th>Hauptforderung</th><td>{eur(vorschau.hauptforderung_cent)}</td></tr>
             {bereits_offene_mahnkosten_zeile}
@@ -1681,6 +1697,7 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
             <tr><th><strong>Gesamtbetrag (Hauptforderung + bereits offene Mahnkosten + neue Zinsen + neue Gebühr)</strong></th>
                 <td><strong>{eur(gesamtbetrag_cent)}</strong></td></tr>
           </table>
+          {brief_pdf_link}
           {segmente_html}
           {gebuehr_segmente_html}
           <details><summary>Rechtliche Begründung</summary><ul class="muted">{hinweise_html}</ul></details>
@@ -1691,6 +1708,66 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
     return f"""<div class="card"><h2>Mahnkosten (Verzugszinsen/Mahngebühren) — reine Vorschau, keine Buchung</h2>
       <p><a href="/backoffice/vertrag/{h(vertrag_id)}/zinsprofil">Zinsprofil erfassen/prüfen</a> &nbsp;|&nbsp;
       <a href="/backoffice/basiszinssatz">OeNB-Basiszinssatz erfassen</a></p></div>{''.join(zeilen)}"""
+
+
+@router.get("/vertrag/{vertrag_id}/mahnbrief.pdf")
+def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session=Depends(_current_session)):
+    """Bereitet EINEN druckfertigen PDF/A-Mahnbrief aus GENAU demselben
+    Kosten-/Forderungsstand vor, den auch `_mahnkosten_vorschau_block`
+    anzeigt - reiner Download, keine Buchung, kein Versand, kein
+    Zustellnachweis. Der Dateiname trägt einen Hash über den
+    zugrundeliegenden Kostenstand: derselbe Stand liefert denselben
+    Namen (versioniert), ein veränderter Stand (z. B. nach einer
+    Zahlung) einen neuen."""
+
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    konto = _stammdaten_repo.get_konto_by_vertrag(vertrag_id) if vertrag else None
+    if vertrag is None or konto is None:
+        raise HTTPException(status_code=404, detail="Unbekannter Vertrag oder kein Konto.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+
+    heute_datum = date.fromisoformat(heute) if heute else date.today()
+    debitor = _stammdaten_repo.get_debitor(konto.debitor_id)
+    objekt = _stammdaten_repo.objekt_fuer_vertrag(vertrag_id)
+    einheit = _stammdaten_repo.get_einheit(vertrag.einheit_id)
+    if debitor is None or objekt is None or einheit is None:
+        raise HTTPException(status_code=404, detail="Stammdaten unvollständig.")
+
+    kanal = _hv_mail.mahn_service._resolve_kanal(stufe)
+    vorschau = _hv_mail.mahnkosten_service.vorschau(vertrag_id=vertrag_id, stufe=stufe, heute=heute_datum, kanal=kanal)
+    if vorschau is None:
+        raise HTTPException(status_code=404, detail="Keine Kostenvorschau für diesen Vertrag/diese Stufe verfügbar.")
+
+    gesamtbetrag_cent = vorschau.hauptforderung_cent + vorschau.bereits_offene_mahnkosten_cent + vorschau.zusaetzlicher_betrag_cent
+    zins_hinweis = (
+        f"Verzugszinsen ({vorschau.zinssatz_prozent} % p.a.)" if vorschau.zinssatz_prozent is not None
+        else "Verzugszinsen (mehrere Sätze, siehe Kostenvorschau)"
+    )
+    absender = _BriefAbsender(
+        name=_settings.brief_absender_name, adresse=_settings.brief_absender_adresse, fn=_settings.brief_absender_fn,
+        uid=_settings.brief_absender_uid, telefon=_settings.brief_absender_telefon, website=_settings.brief_absender_website,
+        email=_settings.brief_absender_email, farbe_anthrazit=_settings.brief_farbe_anthrazit, farbe_gold=_settings.brief_farbe_gold,
+        logo_pfad=_settings.brief_logo_pfad, font_regular_pfad=_settings.brief_font_regular_pfad, font_bold_pfad=_settings.brief_font_bold_pfad,
+        fenster_links_mm=_settings.brief_fenster_links_mm, fenster_oben_mm=_settings.brief_fenster_oben_mm,
+    )
+    pdf_bytes = _erzeuge_mahnbrief_pdf(
+        absender=absender, empfaenger_name=debitor.name, empfaenger_adresse=(debitor.adresse or "Postadresse fehlt").replace(", ", "\n"),
+        objekt_bezeichnung=objekt.bezeichnung, einheit_bezeichnung=einheit.bezeichnung, stufe=stufe, heute=heute_datum,
+        zahlungsfrist_bis=heute_datum + timedelta(days=vertrag.zahlungsfrist_tage),
+        hauptforderung_cent=vorschau.hauptforderung_cent, bereits_offene_mahnkosten_cent=vorschau.bereits_offene_mahnkosten_cent,
+        neue_zinsen_delta_cent=vorschau.neue_zinsen_delta_cent, neue_gebuehr_cent=(vorschau.gebuehr_cent or 0),
+        gebuehr_rechtsgrundlage=vorschau.gebuehr_rechtsgrundlage, zins_hinweis=zins_hinweis, gesamtbetrag_cent=gesamtbetrag_cent,
+    )
+    version = _compute_content_hash({
+        "vertrag_id": vertrag_id, "stufe": stufe, "gesamtbetrag_cent": gesamtbetrag_cent,
+        "hauptforderung_cent": vorschau.hauptforderung_cent, "bereits_offene_mahnkosten_cent": vorschau.bereits_offene_mahnkosten_cent,
+        "zusaetzlicher_betrag_cent": vorschau.zusaetzlicher_betrag_cent,
+    })[:12]
+    dateiname = f"Mahnbrief_{vertrag_id}_Stufe{stufe}_{heute_datum.isoformat()}_{version}.pdf"
+    return Response(
+        content=pdf_bytes, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{dateiname}"'},
+    )
 
 
 @router.post("/mahnfall/{mahnfall_id}/sendebereitschaft", response_class=HTMLResponse)

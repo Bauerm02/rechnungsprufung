@@ -123,6 +123,31 @@ class Settings(BaseSettings):
     vertragsanlage_max_upload_bytes: int = 15 * 1024 * 1024
     vertragsanlage_max_seiten: int = 60
 
+    # Mahnbrief-PDF (Auftrag HV-20260914-MAHNUNG-BRIEF): Absenderdaten
+    # sind öffentliche CI-Angaben (kein Secret). Logo/Fonts bleiben
+    # konfigurierbare Dateipfade - Codex legt die freigegebenen Assets
+    # beim Deployment privat ab; ohne sie bleibt der Brief ein
+    # textbasierter Brief ohne Signet/mit Ersatzschrift.
+    brief_absender_name: str = "JLB Projects GmbH"
+    brief_absender_adresse: str = "Marc-Aurel-Straße 4/16, 1010 Wien"
+    brief_absender_fn: str = "FN 631126b, Handelsgericht Wien"
+    brief_absender_uid: str = "ATU81269707"
+    brief_absender_telefon: str = "+43 1 435 10 11"
+    brief_absender_website: str = "jlb-immo.at"
+    brief_absender_email: str = "hausverwaltung@jlb-immo.at"
+    brief_farbe_anthrazit: str = "#1F2125"
+    brief_farbe_gold: str = "#C9A86A"
+    brief_logo_pfad: str | None = None
+    brief_font_regular_pfad: str | None = None
+    brief_font_bold_pfad: str | None = None
+    # DIN-5008-Standardposition für ein Fensterkuvert - Codex kann sie
+    # bei Bedarf auf die tatsächliche EinfachBrief-Fensterspezifikation
+    # nachjustieren, ohne Codeänderung.
+    brief_fenster_links_mm: float = 20.0
+    brief_fenster_oben_mm: float = 45.0
+    brief_fenster_breite_mm: float = 90.0
+    brief_fenster_hoehe_mm: float = 45.0
+
 
 class ProduktionskonfigurationUngueltigError(RuntimeError):
     """Wird beim Prozessstart geworfen, wenn `environment == "production"`

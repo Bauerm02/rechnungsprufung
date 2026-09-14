@@ -57,6 +57,8 @@ def _mahnkosten_text_baustein(vorschau) -> str:
     if vorschau is None:
         return ""
     zeilen: list[str] = []
+    if vorschau.bereits_offene_mahnkosten_cent > 0:
+        zeilen.append(f"Noch offene Kosten aus früheren Mahnläufen: {_eur_text(vorschau.bereits_offene_mahnkosten_cent)} EUR.")
     if vorschau.bereits_gebuchte_zinsen_cent > 0:
         zeilen.append(f"Bereits verrechnete Verzugszinsen aus früheren Mahnläufen: {_eur_text(vorschau.bereits_gebuchte_zinsen_cent)} EUR.")
     neu_zinsen = vorschau.neue_zinsen_delta_cent
@@ -194,6 +196,14 @@ class HVMailversandService:
             else:
                 vorschau = None
             kosten_text = _mahnkosten_text_baustein(vorschau)
+            # Rückprüfung 14.09.2026: der Brieftext nannte bisher nirgends
+            # den tatsächlichen Gesamtbetrag als Zahl - nur einzelne
+            # Bausteine (Hauptforderung, ggf. Zinsen/Gebühr getrennt).
+            # `zusaetzlicher_betrag_cent` deckt bereits neue Zinsen+Gebühr
+            # ab (siehe `MahnkostenVorschau`-Docstring).
+            gesamtbetrag_cent = gesamt_cent + (
+                (vorschau.bereits_offene_mahnkosten_cent + vorschau.zusaetzlicher_betrag_cent) if vorschau is not None else 0
+            )
 
             deadline = heute + timedelta(days=contract.zahlungsfrist_tage)
             subject = "Zahlungserinnerung" if mahnlauf.stufe == 1 else "Zweite Mahnung"
@@ -205,6 +215,8 @@ class HVMailversandService:
                 + "\n".join(posten_zeilen) +
                 f"\n\nHauptforderung gesamt: {_eur_text(gesamt_cent)} EUR.\n\n"
                 + kosten_text +
+                f"Gesamtbetrag (Hauptforderung inkl. noch offener früherer Kosten und neuer zulässiger "
+                f"Zinsen/Gebühr): {_eur_text(gesamtbetrag_cent)} EUR.\n\n"
                 f"Bitte begleichen Sie den offenen Gesamtbetrag bis {deadline.strftime('%d.%m.%Y')} "
                 "auf das Ihnen für dieses Mietverhältnis bekannt gegebene Konto. "
                 "Bei einer inzwischen erfolgten Zahlung senden Sie uns bitte den Zahlungsbeleg.\n\n"
