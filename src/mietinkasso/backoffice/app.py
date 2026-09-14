@@ -1470,19 +1470,35 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
     forderungen = _op_service.offene_forderungen(konto.id, heute=heute_datum)
     zeilen = []
     for forderung in forderungen:
-        ergebnis = _mahn_service.plane_forderung(
+        # Reine Lesevorschau OHNE Datenbankschreibzugriff (Auftrag Markus
+        # 14.09.2026: ein GET darf keine Mahnfälle anlegen) - das
+        # tatsächliche, dauerhafte Planen läuft NUR über den separaten,
+        # CSRF-geschützten POST-Endpunkt weiter unten.
+        ergebnis = _mahn_service.vorschau_forderung(
             ctx=_ctx(session), vertrag=vertrag, konto=konto, forderung=forderung, policy=policy, heute=heute_datum,
             bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaert,
         )
-        sende_check = ""
-        if ergebnis.status == "GEPLANT" and ergebnis.mahnfall_id is not None:
-            sende_check = f"""
+        aktion = ""
+        if ergebnis.status == "GEPLANT" and ergebnis.mahnfall_id is None:
+            # Noch nicht tatsächlich geplant (nur die reine Vorschau sagt
+            # "dürfte geplant werden") - das dauerhafte Anlegen braucht
+            # den ausdrücklich betätigten POST.
+            aktion = f"""
+            <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/forderung/{forderung.op_position_id}/planen?heute={heute_datum.isoformat()}" class="inline">
+              {csrf_feld(session.csrf_token)}
+              <button type="submit">Jetzt planen</button>
+            </form>"""
+        elif ergebnis.status == "GEPLANT" and ergebnis.mahnfall_id is not None:
+            # Bereits zuvor tatsächlich geplant (Lesezugriff auf einen
+            # bestehenden Fall, siehe `vorschau_forderung`) - normale
+            # Sendebereitschafts-/Versandaktionen wie bisher.
+            aktion = f"""
             <form method="post" action="/backoffice/mahnfall/{ergebnis.mahnfall_id}/sendebereitschaft" class="inline">
               {csrf_feld(session.csrf_token)}
               <button type="submit" class="secondary">Sendebereitschaft prüfen (kein Versand)</button>
             </form>"""
             if _settings.send_enabled and _settings.hv_mail_allowlist_bestaetigt and _hv_mail.client:
-                sende_check += f"""<form method="post" action="/backoffice/mahnfall/{ergebnis.mahnfall_id}/versenden" class="inline">
+                aktion += f"""<form method="post" action="/backoffice/mahnfall/{ergebnis.mahnfall_id}/versenden" class="inline">
                   {csrf_feld(session.csrf_token)}
                   <button type="submit">Mahnung senden</button>
                 </form>"""
@@ -1490,7 +1506,7 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
         <tr>
           <td>OP #{forderung.op_position_id}</td><td>{h(forderung.art)}</td><td>{eur(forderung.rest_cent)}</td>
           <td>{forderung.faelligkeit.isoformat() if forderung.faelligkeit else 'unbekannt'}</td>
-          <td>{h(ergebnis.status)}</td><td>{h(ergebnis.grund)}</td><td>{sende_check}</td>
+          <td>{h(ergebnis.status)}</td><td>{h(ergebnis.grund)}</td><td>{aktion}</td>
         </tr>""")
 
     bank_status = (
@@ -1507,6 +1523,62 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
     </div>"""
     inhalt += _mahnkosten_vorschau_block(vertrag_id, heute_datum)
     return _layout(request, session, "Mahnvorschau", inhalt)
+
+
+@router.post("/vertrag/{vertrag_id}/forderung/{op_position_id}/planen", response_class=HTMLResponse)
+def forderung_planen(
+    request: Request, vertrag_id: str, op_position_id: int, csrf_token: str = Form(...),
+    heute: str | None = None, session=Depends(_current_session),
+):
+    """Dauerhaftes, ausdrücklich betätigtes Anlegen EINES Mahnfalls
+    (Auftrag Markus 14.09.2026: "dauerhaftes Planen per ausdrücklich
+    betätigtem POST mit CSRF") - GENAU DIESELBE Prüfung wie die GET-
+    Vorschau (`vorschau_forderung`), aber über `plane_forderung`, das bei
+    "GEPLANT" tatsächlich einen `MahnFallTable`-Eintrag anlegt (idempotent
+    über den deterministischen `outbox_key` - ein erneuter Klick auf eine
+    bereits geplante Forderung legt keinen zweiten Fall an)."""
+
+    _verify_csrf(session, csrf_token)
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Mahnvorschau", f"Unbekannter Vertrag {vertrag_id}.")
+    if _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Mahnvorschau", "Objekt ist gesperrt; keine Mahnung möglich.")
+    konto = _stammdaten_repo.get_konto_by_vertrag(vertrag_id)
+    if konto is None:
+        return _fehlerseite(session, "Mahnvorschau", "Kein Konto für diesen Vertrag vorhanden.")
+    heute_datum = date.fromisoformat(heute) if heute else date.today()
+    policy = _mahn_policy_repo.aktuelle_freigegebene()
+    if policy is None:
+        return _fehlerseite(session, "Mahnvorschau", "Keine freigegebene MahnPolicy vorhanden; es kann nichts geplant werden.")
+
+    forderung = next(
+        (f for f in _op_service.offene_forderungen(konto.id, heute=heute_datum) if f.op_position_id == op_position_id),
+        None,
+    )
+    if forderung is None:
+        return _fehlerseite(
+            session, "Mahnvorschau", f"Forderung #{op_position_id} ist nicht (mehr) offen.",
+            f"/backoffice/vertrag/{vertrag_id}/mahnvorschau?heute={heute_datum.isoformat()}",
+        )
+    bank_bestaetigt_bis, ungeklaert = _bank_freigabe_ableiten(vertrag.gesellschaft_id, vertrag_id)
+    try:
+        ergebnis = _mahn_service.plane_forderung(
+            ctx=_ctx(session), vertrag=vertrag, konto=konto, forderung=forderung, policy=policy, heute=heute_datum,
+            bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaert,
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(
+            session, "Mahnvorschau", str(exc), f"/backoffice/vertrag/{vertrag_id}/mahnvorschau?heute={heute_datum.isoformat()}",
+        )
+    if ergebnis.status != "GEPLANT":
+        return _fehlerseite(
+            session, "Mahnvorschau", f"Forderung #{op_position_id} ist inzwischen nicht mehr planbar: {ergebnis.grund}",
+            f"/backoffice/vertrag/{vertrag_id}/mahnvorschau?heute={heute_datum.isoformat()}",
+        )
+    return RedirectResponse(
+        url=f"/backoffice/vertrag/{vertrag_id}/mahnvorschau?heute={heute_datum.isoformat()}", status_code=303,
+    )
 
 
 def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:

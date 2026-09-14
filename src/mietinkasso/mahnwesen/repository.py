@@ -195,6 +195,18 @@ class MahnFallRepository:
         with self._session_factory() as session:
             return session.get(MahnFallTable, mahnfall_id)
 
+    def get_by_outbox_key(self, outbox_key: str) -> MahnFallTable | None:
+        """Reiner Lesezugriff (KEIN `get_or_create`) - für eine Vorschau,
+        die einen ggf. bereits geplanten Fall anzeigen darf, ohne selbst
+        einen anzulegen (Auftrag Markus 14.09.2026: GET darf keine
+        Mahnfälle schreiben, siehe `MahnwesenService.vorschau_
+        forderung`)."""
+
+        with self._session_factory() as session:
+            return session.execute(
+                select(MahnFallTable).where(MahnFallTable.outbox_key == outbox_key)
+            ).scalar_one_or_none()
+
     def list_fuer_vertrag(self, vertrag_id: str) -> list[MahnFallTable]:
         with self._session_factory() as session:
             statement = (

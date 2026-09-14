@@ -96,7 +96,8 @@ class MahnkostenRepository:
         self, *, vertrag_id: str, ist_b2b: bool, vertragsdatum: date | None,
         vereinbarter_zinssatz_prozent=None, vereinbarung_geprueft: bool = False, vereinbarung_beleg: str | None = None,
         mahngebuehr_kostenbasis_cent: int | None = None, mahngebuehr_kostenbasis_beleg: str | None = None,
-        gueltig_ab: date | None = None, verzugsverantwortung_geprueft: bool = False, erstellt_von: str,
+        gueltig_ab: date | None = None, verzugsverantwortung_geprueft: bool = False,
+        versandkosten_ersatzfaehig_geprueft: bool = False, erstellt_von: str,
     ) -> ZinsprofilTable:
         with self._session_factory() as session:
             bisherige_version = session.execute(
@@ -107,6 +108,7 @@ class MahnkostenRepository:
                 vertrag_id=vertrag_id, version=(bisherige_version or 0) + 1, status="ENTWURF",
                 ist_b2b=ist_b2b, vertragsdatum=vertragsdatum, gueltig_ab=gueltig_ab,
                 verzugsverantwortung_geprueft=verzugsverantwortung_geprueft,
+                versandkosten_ersatzfaehig_geprueft=versandkosten_ersatzfaehig_geprueft,
                 vereinbarter_zinssatz_prozent=vereinbarter_zinssatz_prozent,
                 vereinbarung_geprueft=vereinbarung_geprueft, vereinbarung_beleg=vereinbarung_beleg,
                 mahngebuehr_kostenbasis_cent=mahngebuehr_kostenbasis_cent,

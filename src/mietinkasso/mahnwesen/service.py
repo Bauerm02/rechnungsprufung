@@ -134,6 +134,109 @@ class MahnwesenService:
             return True
         return (heute - bank_bestaetigt_bis).days > self._bank_stand_max_age_days
 
+    def _pruefe_forderung_planbar(
+        self, *, vertrag: VertragTable, konto: KontoTable, forderung: OffeneForderung, policy: MahnPolicyTable,
+        heute: date, bank_bestaetigt_bis: date | None, ungeklaerte_eingaenge_vorhanden: bool,
+    ) -> tuple[str, str, MahnStufe | None, dict | None]:
+        """Reine Prüfung OHNE Nebenwirkung ALLER Planungsvoraussetzungen
+        für GENAU EINE Forderung (Auftrag Markus 14.09.2026: "GET
+        /vertrag/{id}/mahnvorschau ruft plane_forderung auf und schreibt
+        dabei Mahnfälle - die neue Vorschau soll ohne Datenänderung
+        funktionieren"). Von `plane_forderung` (schreibt bei "GEPLANT"
+        tatsächlich einen `MahnFallTable`-Eintrag) UND `vorschau_
+        forderung` (reine Lesevorschau, NIE ein `get_or_create`) GEMEINSAM
+        verwendet, damit beide NIE auseinanderlaufen können - exakt
+        dasselbe Prinzip wie `_pruefe_frisch_versandbereit` für den
+        Versand.
+
+        Rückgabe `(status, grund, stufe, snapshot)`: `status` ist
+        "GEPLANT" nur, wenn tatsächlich geplant werden DÜRFTE - ob das
+        auch tatsächlich geschieht (ein `MahnFallTable`-Eintrag
+        angelegt/aktualisiert wird), entscheidet AUSSCHLIESSLICH der
+        Aufrufer. `stufe`/`snapshot` sind nur bei `status == "GEPLANT"`
+        gesetzt."""
+
+        if not rechtsordnung_geklaert(vertrag.rechtsordnung):
+            return (
+                "BLOCKIERT",
+                "Rechtsordnung des Vertrags ist UNGEKLAERT; Mahnung gesperrt, bis die rechtliche "
+                "Einordnung feststeht.",
+                None, None,
+            )
+
+        aktive_sperren = self._stammdaten_repository.aktive_sperren(vertrag.id)
+        if aktive_sperren:
+            gruende = ", ".join(s.grund for s in aktive_sperren)
+            return "BLOCKIERT", f"Aktive Sperre(n): {gruende}", None, None
+
+        if self._bankstand_veraltet(heute=heute, bank_bestaetigt_bis=bank_bestaetigt_bis):
+            return (
+                "BLOCKIERT",
+                f"Keine ausreichend aktuelle BESTÄTIGTE Bankvollständigkeit vorhanden "
+                f"(bestätigt bis: {bank_bestaetigt_bis}, max {self._bank_stand_max_age_days} Tage alt). "
+                "Das Datum der letzten importierten Zeile allein beweist keine Vollständigkeit.",
+                None, None,
+            )
+        if ungeklaerte_eingaenge_vorhanden:
+            return (
+                "BLOCKIERT",
+                "Es gibt ungeklärte oder nur teilzugeordnete Bankeingänge, die diesen Vertrag betreffen "
+                "könnten; Mahnung bleibt geschlossen, bis das aufgeklärt ist.",
+                None, None,
+            )
+
+        debitor = self._stammdaten_repository.get_debitor(konto.debitor_id)
+        if debitor is None or not (debitor.email or "").strip():
+            return "BLOCKIERT", f"Kein gültiger Empfänger (E-Mail) für Debitor {konto.debitor_id} hinterlegt.", None, None
+
+        if not forderung.faelligkeit_bekannt or forderung.faelligkeit is None:
+            return "KEIN_BETRAG", "Fälligkeit unbekannt (z. B. Gesamtsaldo-Eröffnung); wird nie automatisch gemahnt.", None, None
+        if forderung.rest_cent <= 0:
+            return "KEIN_BETRAG", "Forderung ist bereits ausgeglichen.", None, None
+
+        stufe = self._naechste_stufe_fuer_forderung(forderung.op_position_id)
+        if stufe is None:
+            return "BLOCKIERT", "Nach Stufe 2 ist nur ein interner Bearbeitungsfall zulässig, keine Stufe 3.", None, None
+
+        if stufe is MahnStufe.STUFE_1:
+            faellig_seit_tagen = (heute - forderung.faelligkeit).days
+            if faellig_seit_tagen < policy.stufe1_tage_nach_faelligkeit:
+                return (
+                    "ZU_FRUEH",
+                    f"Erst {faellig_seit_tagen}/{policy.stufe1_tage_nach_faelligkeit} Tage seit Fälligkeit vergangen.",
+                    None, None,
+                )
+        else:
+            letzte_stufe1 = self._repository.letzter_mahnfall_je_stufe_fuer_forderung(
+                forderung.op_position_id, MahnStufe.STUFE_1.value
+            )
+            if letzte_stufe1 is None or letzte_stufe1.status != MahnStatus.GESENDET.value or letzte_stufe1.gesendet_am is None:
+                raise MahnstufeReihenfolgeError(
+                    f"Forderung {forderung.op_position_id}: Stufe 2 verlangt eine erfolgreich gesendete Stufe 1."
+                )
+            tage_seit_versand = (heute - _versandtag_wien(letzte_stufe1.gesendet_am)).days
+            mindest_tage = max(policy.stufe2_mindesttage_nach_stufe1_versand, vertrag.zahlungsfrist_tage)
+            if tage_seit_versand < mindest_tage:
+                return (
+                    "ZU_FRUEH",
+                    f"Mindestabstand zu Stufe 1 noch nicht erreicht ({tage_seit_versand}/{mindest_tage} Tagen).",
+                    None, None,
+                )
+
+        snapshot = {
+            "vertrag_id": vertrag.id,
+            "debitor_id": konto.debitor_id,
+            "empfaenger_email": debitor.email,
+            "empfaenger_name": debitor.name,
+            "forderung_op_position_id": forderung.op_position_id,
+            "betrag_cent": forderung.rest_cent,
+            "stufe": stufe.value,
+            "policy_version": policy.version,
+            "zinsen_prozent": str(policy.zinsen_prozent),
+            "gebuehr_cent": policy.gebuehr_cent,
+        }
+        return "GEPLANT", "Geplant.", stufe, snapshot
+
     def plane_forderung(
         self,
         *,
@@ -157,76 +260,12 @@ class MahnwesenService:
                 "Policy darf Mahnfälle planen."
             )
 
-        if not rechtsordnung_geklaert(vertrag.rechtsordnung):
-            return PlanungsErgebnis(
-                "BLOCKIERT", None, None, forderung.op_position_id,
-                "Rechtsordnung des Vertrags ist UNGEKLAERT; Mahnung gesperrt, bis die rechtliche "
-                "Einordnung feststeht.",
-            )
-
-        aktive_sperren = self._stammdaten_repository.aktive_sperren(vertrag.id)
-        if aktive_sperren:
-            gruende = ", ".join(s.grund for s in aktive_sperren)
-            return PlanungsErgebnis("BLOCKIERT", None, None, forderung.op_position_id, f"Aktive Sperre(n): {gruende}")
-
-        if self._bankstand_veraltet(heute=heute, bank_bestaetigt_bis=bank_bestaetigt_bis):
-            return PlanungsErgebnis(
-                "BLOCKIERT", None, None, forderung.op_position_id,
-                f"Keine ausreichend aktuelle BESTÄTIGTE Bankvollständigkeit vorhanden "
-                f"(bestätigt bis: {bank_bestaetigt_bis}, max {self._bank_stand_max_age_days} Tage alt). "
-                "Das Datum der letzten importierten Zeile allein beweist keine Vollständigkeit.",
-            )
-        if ungeklaerte_eingaenge_vorhanden:
-            return PlanungsErgebnis(
-                "BLOCKIERT", None, None, forderung.op_position_id,
-                "Es gibt ungeklärte oder nur teilzugeordnete Bankeingänge, die diesen Vertrag betreffen "
-                "könnten; Mahnung bleibt geschlossen, bis das aufgeklärt ist.",
-            )
-
-        debitor = self._stammdaten_repository.get_debitor(konto.debitor_id)
-        if debitor is None or not (debitor.email or "").strip():
-            return PlanungsErgebnis(
-                "BLOCKIERT", None, None, forderung.op_position_id,
-                f"Kein gültiger Empfänger (E-Mail) für Debitor {konto.debitor_id} hinterlegt.",
-            )
-
-        if not forderung.faelligkeit_bekannt or forderung.faelligkeit is None:
-            return PlanungsErgebnis(
-                "KEIN_BETRAG", None, None, forderung.op_position_id,
-                "Fälligkeit unbekannt (z. B. Gesamtsaldo-Eröffnung); wird nie automatisch gemahnt.",
-            )
-        if forderung.rest_cent <= 0:
-            return PlanungsErgebnis("KEIN_BETRAG", None, None, forderung.op_position_id, "Forderung ist bereits ausgeglichen.")
-
-        stufe = self._naechste_stufe_fuer_forderung(forderung.op_position_id)
-        if stufe is None:
-            return PlanungsErgebnis(
-                "BLOCKIERT", None, None, forderung.op_position_id,
-                "Nach Stufe 2 ist nur ein interner Bearbeitungsfall zulässig, keine Stufe 3.",
-            )
-
-        if stufe is MahnStufe.STUFE_1:
-            faellig_seit_tagen = (heute - forderung.faelligkeit).days
-            if faellig_seit_tagen < policy.stufe1_tage_nach_faelligkeit:
-                return PlanungsErgebnis(
-                    "ZU_FRUEH", None, None, forderung.op_position_id,
-                    f"Erst {faellig_seit_tagen}/{policy.stufe1_tage_nach_faelligkeit} Tage seit Fälligkeit vergangen.",
-                )
-        else:
-            letzte_stufe1 = self._repository.letzter_mahnfall_je_stufe_fuer_forderung(
-                forderung.op_position_id, MahnStufe.STUFE_1.value
-            )
-            if letzte_stufe1 is None or letzte_stufe1.status != MahnStatus.GESENDET.value or letzte_stufe1.gesendet_am is None:
-                raise MahnstufeReihenfolgeError(
-                    f"Forderung {forderung.op_position_id}: Stufe 2 verlangt eine erfolgreich gesendete Stufe 1."
-                )
-            tage_seit_versand = (heute - _versandtag_wien(letzte_stufe1.gesendet_am)).days
-            mindest_tage = max(policy.stufe2_mindesttage_nach_stufe1_versand, vertrag.zahlungsfrist_tage)
-            if tage_seit_versand < mindest_tage:
-                return PlanungsErgebnis(
-                    "ZU_FRUEH", None, None, forderung.op_position_id,
-                    f"Mindestabstand zu Stufe 1 noch nicht erreicht ({tage_seit_versand}/{mindest_tage} Tagen).",
-                )
+        status, grund, stufe, snapshot = self._pruefe_forderung_planbar(
+            vertrag=vertrag, konto=konto, forderung=forderung, policy=policy, heute=heute,
+            bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
+        )
+        if status != "GEPLANT":
+            return PlanungsErgebnis(status, None, None, forderung.op_position_id, grund)
 
         forderungsumfang_hash = compute_content_hash(
             {"forderung_op_position_id": forderung.op_position_id, "betrag_cent": forderung.rest_cent, "stufe": stufe.value}
@@ -242,20 +281,62 @@ class MahnwesenService:
             policy_version=policy.version,
             betrag_cent=forderung.rest_cent,
             bank_stand_datum=heute,
-            snapshot={
-                "vertrag_id": vertrag.id,
-                "debitor_id": konto.debitor_id,
-                "empfaenger_email": debitor.email,
-                "empfaenger_name": debitor.name,
-                "forderung_op_position_id": forderung.op_position_id,
-                "betrag_cent": forderung.rest_cent,
-                "stufe": stufe.value,
-                "policy_version": policy.version,
-                "zinsen_prozent": str(policy.zinsen_prozent),
-                "gebuehr_cent": policy.gebuehr_cent,
-            },
+            snapshot=snapshot,
         )
         return PlanungsErgebnis("GEPLANT", mahnfall.id, mahnfall.stufe, forderung.op_position_id, "Geplant.")
+
+    def vorschau_forderung(
+        self,
+        *,
+        ctx: AuthContext,
+        vertrag: VertragTable,
+        konto: KontoTable,
+        forderung: OffeneForderung,
+        policy: MahnPolicyTable,
+        heute: date,
+        bank_bestaetigt_bis: date | None,
+        ungeklaerte_eingaenge_vorhanden: bool = False,
+    ) -> PlanungsErgebnis:
+        """Reine Lesevorschau OHNE JEDE Datenbankänderung (Auftrag Markus
+        14.09.2026: "die neue Vorschau soll ohne Datenänderung
+        funktionieren, dauerhaftes Planen per ausdrücklich betätigtem
+        POST") - identische Entscheidungslogik wie `plane_forderung`
+        (`_pruefe_forderung_planbar`), aber `mahnfall_id` bleibt IMMER
+        `None`, auch im GEPLANT-Fall - es wird NIE ein `MahnFallTable`-
+        Eintrag angelegt. Ein tatsächliches, dauerhaftes Planen braucht
+        den separaten, CSRF-geschützten POST-Endpunkt
+        `/vertrag/{id}/mahnfall/planen`. Dieselben Zugriffsprüfungen wie
+        `plane_forderung` außer `require_schreibrecht` (reine Lesevorschau
+        braucht kein Schreibrecht)."""
+
+        require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
+        if konto.vertrag_id != vertrag.id:
+            raise BindungInkonsistentError(f"Konto {konto.id} gehört nicht zu Vertrag {vertrag.id}.")
+        self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
+        if policy.status != "FREIGEGEBEN":
+            raise PolicyNichtFreigegebenError(
+                f"MahnPolicy Version {policy.version} ist im Status {policy.status}; nur eine FREIGEGEBENE "
+                "Policy darf Mahnfälle planen."
+            )
+
+        status, grund, stufe, _snapshot = self._pruefe_forderung_planbar(
+            vertrag=vertrag, konto=konto, forderung=forderung, policy=policy, heute=heute,
+            bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
+        )
+        if status != "GEPLANT":
+            return PlanungsErgebnis(status, None, None, forderung.op_position_id, grund)
+
+        # Reiner LESE-Zugriff (KEIN `get_or_create`): existiert bereits ein
+        # zuvor über den POST-Endpunkt tatsächlich geplanter Fall für
+        # GENAU diese Forderung/Stufe (derselbe deterministische
+        # `outbox_key`), wird dessen Id angezeigt, damit die Vorschau nach
+        # dem Planen weiterhin auf den bestehenden Fall (Sendebereitschaft/
+        # Versand) verweisen kann - das ist ein Lesen bereits persistierter
+        # Daten, keine neue Datenänderung.
+        outbox_key = f"{vertrag.gesellschaft_id}:{vertrag.id}:{forderung.op_position_id}:{stufe.value}"
+        bestehender = self._repository.get_by_outbox_key(outbox_key)
+        mahnfall_id = bestehender.id if bestehender is not None else None
+        return PlanungsErgebnis("GEPLANT", mahnfall_id, stufe.value, forderung.op_position_id, grund)
 
     def plane_alle_offenen_forderungen(
         self,

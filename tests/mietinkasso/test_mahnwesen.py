@@ -78,6 +78,14 @@ def _planen(mahn_service, *, ctx, vertrag, konto, forderung, policy, heute, bank
     )
 
 
+def _vorschau(mahn_service, *, ctx, vertrag, konto, forderung, policy, heute, bankstand_alter_tage=0, ungeklaert=False):
+    return mahn_service.vorschau_forderung(
+        ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung, policy=policy, heute=heute,
+        bank_bestaetigt_bis=heute - timedelta(days=bankstand_alter_tage),
+        ungeklaerte_eingaenge_vorhanden=ungeklaert,
+    )
+
+
 def _versenden(mahn_service, *, ctx, mahnfall_id, heute, bankstand_alter_tage=0, ungeklaert=False, send_enabled, versand_fn):
     return mahn_service.versenden(
         ctx=ctx, mahnfall_id=mahnfall_id, heute=heute,
@@ -165,6 +173,47 @@ def test_fehlende_bankbestaetigung_blockiert_mahnung(mahn_service, op_service, b
         heute=date(2026, 4, 20), bank_bestaetigt_bis=None,
     )
     assert ergebnis.status == "BLOCKIERT"
+
+
+def test_vorschau_forderung_ist_seiteneffektfrei_plane_forderung_legt_erst_dann_an(
+    mahn_service, mahn_fall_repo, op_service, basis_vertrag, ctx_factory, freigegebene_policy,
+):
+    """Auftrag Markus 14.09.2026: die GET-Vorschau (`vorschau_forderung`)
+    darf KEINEN Mahnfall anlegen, auch nicht bei mehrfachem Aufruf -
+    erst der ausdrückliche `plane_forderung`-Aufruf (der über den neuen,
+    CSRF-geschützten POST-Endpunkt getriggert wird) legt tatsächlich
+    einen `MahnFallTable`-Eintrag an. Beide teilen dieselbe Entscheidung
+    (`_pruefe_forderung_planbar`), damit sie nie auseinanderlaufen."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    _mit_faelligem_soll(op_service, konto, ctx)
+    forderung = _einzige_forderung(op_service, konto, date(2026, 4, 20))
+
+    vorschau1 = _vorschau(mahn_service, ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung, policy=freigegebene_policy, heute=date(2026, 4, 20))
+    assert vorschau1.status == "GEPLANT"
+    assert vorschau1.mahnfall_id is None
+    assert mahn_fall_repo.list_fuer_vertrag(vertrag.id) == []
+
+    # Ein zweiter Vorschau-Aufruf (z. B. ein Seiten-Reload) bleibt
+    # ebenso wirkungslos - keine Verdopplung, kein stiller Anlage-Effekt.
+    vorschau2 = _vorschau(mahn_service, ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung, policy=freigegebene_policy, heute=date(2026, 4, 20))
+    assert vorschau2.status == "GEPLANT"
+    assert vorschau2.mahnfall_id is None
+    assert mahn_fall_repo.list_fuer_vertrag(vertrag.id) == []
+
+    geplant = _planen(mahn_service, ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung, policy=freigegebene_policy, heute=date(2026, 4, 20))
+    assert geplant.status == "GEPLANT"
+    assert geplant.mahnfall_id is not None
+    bestehende = mahn_fall_repo.list_fuer_vertrag(vertrag.id)
+    assert len(bestehende) == 1
+
+    # Die Vorschau zeigt jetzt den bereits geplanten Fall (reiner
+    # Lesezugriff auf die bestehende Zeile), legt aber KEINE weitere an.
+    vorschau3 = _vorschau(mahn_service, ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung, policy=freigegebene_policy, heute=date(2026, 4, 20))
+    assert vorschau3.status == "GEPLANT"
+    assert vorschau3.mahnfall_id == geplant.mahnfall_id
+    assert len(mahn_fall_repo.list_fuer_vertrag(vertrag.id)) == 1
 
 
 def test_ungeklaerte_eingaenge_blockieren_mahnung(mahn_service, op_service, basis_vertrag, ctx_factory, freigegebene_policy):

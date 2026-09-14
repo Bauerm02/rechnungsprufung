@@ -2949,3 +2949,43 @@ Produktionsvorfahr `b70a20c` enthält `mahnkosten_buchungen`/
 Fixes sind reine Vorsorge vor dem finalen Paket. 2 neue Tests, 999/999
 grün im Gesamtlauf. Nur synthetische Testdaten, kein Deployment, kein
 Serverzugriff, kein Liveversand.
+
+## Portal-Integrationspunkte 14.09.2026 (Auftrag Markus: zwei konkrete Punkte für die ohnehin beauftragte Portalphase)
+
+1. **GET /vertrag/{id}/mahnvorschau schrieb Mahnfälle bei jedem Aufruf**:
+   die Vorschau rief bisher direkt `plane_forderung` auf, das bei
+   "GEPLANT" tatsächlich einen `MahnFallTable`-Eintrag anlegt (`get_or_
+   create`) - ein GET (auch ein bloßer Seiten-Reload) hatte damit einen
+   Schreibeffekt. Fix: `plane_forderung` in eine reine Prüfung
+   `_pruefe_forderung_planbar` (keine Nebenwirkung) und den eigentlichen
+   `get_or_create`-Aufruf aufgeteilt; neue `MahnwesenService.vorschau_
+   forderung` nutzt NUR die reine Prüfung, legt NIE einen Mahnfall an
+   (zeigt aber lesend die Id eines bereits existierenden, per POST
+   geplanten Falls). Die GET-Ansicht nutzt jetzt `vorschau_forderung`;
+   ein neuer, CSRF-geschützter POST `/vertrag/{id}/forderung/{op_id}/
+   planen` löst das tatsächliche, dauerhafte Planen aus (idempotent über
+   den deterministischen `outbox_key` wie bisher). Getestet:
+   `test_vorschau_forderung_ist_seiteneffektfrei_plane_forderung_legt_
+   erst_dann_an` (Service-Ebene) und `test_mahnvorschau_get_legt_nie_
+   einen_mahnfall_an` (Portal-Ebene, inkl. abgelehntem POST ohne
+   gültiges CSRF-Token).
+2. **zinsprofil_form.py zeigte/erfasste `gueltig_ab`, `verzugsverantwortung_
+   geprueft`, `versandkosten_ersatzfaehig_geprueft` nicht** und die
+   §458-Pauschale war als "notwendige, zweckmäßige tatsächliche
+   Betreibungskosten" beschriftet - das ist die §1333-Formel, nicht die
+   §458-UGB-Pauschale (fixer Betrag unabhängig vom tatsächlichen Porto).
+   Fix: Formular zeigt/erfasst alle drei fehlenden Felder (inkl.
+   Historientabelle), die §458-Sektion ist jetzt korrekt als
+   "Pauschalbetrag ... unabhängig vom tatsächlichen Porto, reduzierte
+   Altwerte bleiben gültig" beschriftet, eine eigene neue Sektion für
+   die §1333-Versandkosten-Ersatzfähigkeit ergänzt. Geldbeträge werden
+   jetzt in EUR eingegeben (`views.py::parse_eur_betrag`, dieselbe
+   Umrechnung wie überall sonst im Backoffice) statt roher Cent-Zahlen.
+   `MahnkostenRepository.zinsprofil_anlegen` um den fehlenden Parameter
+   `versandkosten_ersatzfaehig_geprueft` ergänzt. Getestet: `test_
+   zinsprofil_anlegen_und_freigeben_end_to_end` erweitert (prüft jetzt
+   auch `gueltig_ab`/`verzugsverantwortung_geprueft`/`versandkosten_
+   ersatzfaehig_geprueft` sowie die korrekte EUR->Cent-Umrechnung).
+
+2 neue/erweiterte Tests, 1001/1001 grün im Gesamtlauf. Nur synthetische
+Testdaten, kein Deployment, kein Serverzugriff, kein Liveversand.

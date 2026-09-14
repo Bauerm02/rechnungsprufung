@@ -2317,10 +2317,14 @@ def test_zinsprofil_anlegen_und_freigeben_end_to_end(backoffice_client):
     antwort = client.post(
         "/backoffice/vertrag/V-601-1/zinsprofil/erstellen",
         data={
-            "csrf_token": csrf, "ist_b2b": "1", "vertragsdatum": "2020-01-01",
+            "csrf_token": csrf, "ist_b2b": "1", "vertragsdatum": "2020-01-01", "gueltig_ab": "2020-01-01",
             "vereinbarter_zinssatz_prozent": "5,0", "vereinbarung_geprueft": "1",
-            "vereinbarung_beleg": "Vertrag §7", "mahngebuehr_kostenbasis_cent": "1500",
+            "vereinbarung_beleg": "Vertrag §7", "verzugsverantwortung_geprueft": "1",
+            # Geldbetrag im Formular in EUR (Auftrag Markus 14.09.2026) -
+            # "15,00" wird zu 1500 Cent, nicht wörtlich als Cent übernommen.
+            "mahngebuehr_kostenbasis_cent": "15,00",
             "mahngebuehr_kostenbasis_beleg": "Portokosten-Nachweis",
+            "versandkosten_ersatzfaehig_geprueft": "1",
         },
         follow_redirects=False,
     )
@@ -2337,6 +2341,10 @@ def test_zinsprofil_anlegen_und_freigeben_end_to_end(backoffice_client):
     profil = kosten_repo.neuestes_zinsprofil("V-601-1")
     assert profil is not None
     assert profil.status == "ENTWURF"
+    assert profil.mahngebuehr_kostenbasis_cent == 1500  # "15,00" EUR im Formular -> 1500 Cent, nicht 150000
+    assert profil.gueltig_ab == date(2020, 1, 1)
+    assert profil.verzugsverantwortung_geprueft is True
+    assert profil.versandkosten_ersatzfaehig_geprueft is True
 
     freigabe = client.post(f"/backoffice/zinsprofil/{profil.id}/freigeben", data={"csrf_token": csrf}, follow_redirects=False)
     assert freigabe.status_code == 303
@@ -2362,6 +2370,36 @@ def test_mahnvorschau_zeigt_mahnkosten_block_ohne_zu_buchen(backoffice_client):
     assert antwort.status_code == 200
     assert "Mahnkosten" in antwort.text
     assert "reine Vorschau, keine Buchung" in antwort.text
+
+
+def test_mahnvorschau_get_legt_nie_einen_mahnfall_an(backoffice_client):
+    """Auftrag Markus 14.09.2026: GET /vertrag/{id}/mahnvorschau darf
+    keine Mahnfälle schreiben - mehrere Aufrufe (auch mit
+    unterschiedlichem Simulationsdatum) dürfen die Anzahl der
+    `MahnFallTable`-Zeilen für diesen Vertrag NIE verändern. Das
+    tatsächliche Anlegen läuft ausschließlich über den separaten,
+    CSRF-geschützten POST `/vertrag/{id}/forderung/{op_id}/planen`."""
+
+    import mietinkasso.backoffice.app as backoffice_app
+
+    client, *_ = backoffice_client
+    _login(client)
+
+    vorher = len(backoffice_app._mahn_fall_repo.list_fuer_vertrag("V-601-1"))
+    for heute in (date.today().isoformat(), (date.today() + timedelta(days=200)).isoformat()):
+        antwort = client.get("/backoffice/vertrag/V-601-1/mahnvorschau", params={"heute": heute})
+        assert antwort.status_code == 200
+    nachher = len(backoffice_app._mahn_fall_repo.list_fuer_vertrag("V-601-1"))
+    assert nachher == vorher
+
+    # Ein POST ohne gültiges CSRF-Token wird abgelehnt (wie bei jedem
+    # anderen schreibenden Endpunkt) - auch das legt keinen Mahnfall an.
+    abgelehnt = client.post(
+        "/backoffice/vertrag/V-601-1/forderung/999999/planen",
+        data={"csrf_token": "ungueltig"},
+    )
+    assert abgelehnt.status_code in (400, 403)
+    assert len(backoffice_app._mahn_fall_repo.list_fuer_vertrag("V-601-1")) == vorher
 
 
 def test_basiszinssatz_erfassen_und_duplikat_wird_abgelehnt(backoffice_client):
