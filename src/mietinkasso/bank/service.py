@@ -86,10 +86,21 @@ def kategorisiere_bewegung(transaktion: BankTransaktionTable) -> tuple[str, str]
     Einordnung - ohne erkennbaren Rechnungsbezug im Banktext bleibt eine
     unklare negative Bewegung immer ein Klärfall."""
 
+    # Codex-Rückprüfung db3755a: eine Nullbewegung braucht eine EIGENE,
+    # ausdrückliche Kategorie - sie darf weder als Eingang/Mietzahlung
+    # noch als "harmlose" Umbuchung durchgehen, sondern bleibt (wie eine
+    # Rücklastschrift) ein Klärfall ohne normales Zahlungsformular.
+    if transaktion.betrag_cent == 0:
+        return (
+            KATEGORIE_RUECKLASTSCHRIFT_KLAERFALL,
+            "Nullbetrag ohne Zahlungsrichtung; Prüffall, keine automatische Kontierung, kein "
+            "Zahlungsformular.",
+        )
+
     text = " ".join(teil for teil in (transaktion.referenz, transaktion.gegenkonto_name) if teil)
     hat_schutzsignal = bool(_SCHUTZ_MUSTER.search(text))
 
-    if transaktion.betrag_cent >= 0:
+    if transaktion.betrag_cent > 0:
         if not hat_schutzsignal and _UMBUCHUNG_MUSTER.search(text):
             return KATEGORIE_UMBUCHUNG, "Banktext enthält 'Umbuchung' ohne Miet-/Rücklastschriftbezug."
         return (

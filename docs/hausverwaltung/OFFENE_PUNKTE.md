@@ -3710,3 +3710,32 @@ Hinweis.
   Restbetrag sichtbar, vollständige Zuordnung verschwindet,
   XSS-Escaping, unbekanntes Bankkonto ohne 500, seiteneffektfreies
   GET). 973/973 grün im `tests/mietinkasso`-Gesamtlauf.
+
+**Codex-Nachkorrektur db3755a (vor Freigabe):**
+1. Teil-Rücklastschriften zeigten im Klärfall-Bereich nur den
+   ursprünglichen Bankbetrag - jetzt zusätzlich der bereits über
+   `verwendeter_betrag_rueckbuchung` verarbeitete Betrag UND der
+   verbleibende Prüfrest, direkt in der Zeile (nicht nur implizit im
+   Repository). Ebenso zeigt eine teilzugeordnete positive Umbuchung
+   ihren Restbetrag jetzt direkt sichtbar, nicht nur im vorbefüllten
+   Formularfeld. Summen sind jetzt ausdrücklich als "Summe
+   (Bankbeträge)" gekennzeichnet, nicht als Summe der Restbeträge.
+2. Nullbewegungen (`betrag_cent == 0`) verschwanden bisher still aus
+   `list_unzugeordnet` - bleiben jetzt immer im Repository sichtbar und
+   werden von `kategorisiere_bewegung` einer EIGENEN, ausdrücklichen
+   Kategorie zugeordnet (Klärfall ohne normales Zahlungsformular, wie
+   eine Rücklastschrift).
+3. Sichtprüfungsfeedback (separat, gleicher Zug): Betrag-/Datumsspalten
+   brechen ab ~1265px nicht mehr mitten im Wort/in der Zahl um (neue
+   `.nowrap`-Klasse, nur Referenz bricht weiter um); die "Vorschlag"-
+   Spalte entfällt außerhalb der Demo-Umgebung vollständig (EBS-Hinweis
+   steht einmal oberhalb der Tabelle statt je Zeile); Hauptaktion heißt
+   jetzt kurz "Bestehende Zahlung verknüpfen", der
+   Doppelbuchungs-Hinweis steht einmal allgemein über der Tabelle statt
+   im Linktext; Kartenkopftexte deutlich gekürzt (Details bleiben in
+   `<details>` erhalten). Unbekanntes Bankkonto bleibt wie akzeptiert
+   eine ruhige 200-Hinweisseite.
+
+Zwei neue Tests (Teilrücklastschrift zeigt verarbeitet+Prüfrest im
+HTML, Nullbewegung bleibt sichtbar als Klärfall ohne Zahlungsformular).
+975/975 grün im `tests/mietinkasso`-Gesamtlauf.

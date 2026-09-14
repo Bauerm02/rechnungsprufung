@@ -131,8 +131,15 @@ class BankRepository:
         bereits verarbeitete Rückbuchungen stehen NICHT in
         `ZuordnungTable`, sondern als aktive
         `OPPositionTable.RUECKLASTSCHRIFT` mit `bank_transaktion_id` -
-        Rest = |Betrag| minus `verwendeter_betrag_rueckbuchung`. Reine
-        Leseabfrage, bucht/verändert nichts."""
+        Rest = |Betrag| minus `verwendeter_betrag_rueckbuchung`.
+
+        Codex-Rückprüfung db3755a: eine Nullbewegung (`betrag_cent == 0`)
+        darf NICHT still aus der Übersicht verschwinden, nur weil es für
+        sie keinen Zuordnungsmechanismus gibt - sie bleibt IMMER
+        sichtbar (der Aufrufer zeigt sie als ausdrücklichen Klärfall
+        ohne normales Zahlungsformular, siehe
+        `bank.service.kategorisiere_bewegung`). Reine Leseabfrage,
+        bucht/verändert nichts."""
 
         with self._session_factory() as session:
             transaktionen = session.execute(
@@ -148,7 +155,8 @@ class BankRepository:
                     verwendet = self.verwendeter_betrag_rueckbuchung(transaktion.id, session=session)
                     if verwendet < abs(transaktion.betrag_cent):
                         ergebnis.append(transaktion)
-                # betrag_cent == 0: nichts zu erklären - bewusst weggelassen.
+                else:
+                    ergebnis.append(transaktion)
             return ergebnis
 
     def get_transaktion(self, id: int) -> BankTransaktionTable | None:

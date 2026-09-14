@@ -324,6 +324,10 @@ def seite(
   .badge-ok {{ background: #e6f4ea; color: #1a7f37; }}
   .badge-muted {{ background: #eee; color: #555; }}
   .tabelle-scroll {{ overflow-x: auto; max-width: 100%; }}
+  /* Bankübersicht: Betrag/Datum dürfen nie mitten im Wort/in der Zahl
+     umbrechen ("Betr-ag", "600,-00 €") - nur die Referenzspalte bricht
+     um, die Tabelle selbst scrollt bei Bedarf horizontal (.tabelle-scroll). */
+  .tabelle-scroll th.nowrap, .tabelle-scroll td.nowrap {{ white-space: nowrap; }}
   /* Bankübersicht (Auftrag HV-20260914-BANKUEBERSICHT): "Mit bestehender
      Zahlung verknüpfen" bewusst optisch hervorgehoben (gefüllt statt nur
      Outline), um Doppelbuchungen zu vermeiden - sparsamer Golddunkel-

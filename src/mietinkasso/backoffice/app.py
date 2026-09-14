@@ -1630,31 +1630,32 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
             def _eingang_zeile(tx: object, begruendung: str) -> str:
                 zugeordnet = _bank_repo.zugeordneter_betrag(tx.id)
                 rest = tx.betrag_cent - zugeordnet
-                vorschlag_form = ""
+                vorschlag_td = ""
                 # Automatische Zuordnung ist nutzerseitig zurückgestellt (bis
                 # EBS/EBICS) - außerhalb bekannter Demo-Umgebungen weder
-                # Vorschlagstext noch Schaltfläche anzeigen. Die Anzeige
-                # allein wäre KEIN Schutz - die POST-Route selbst verweigert
-                # die Ausführung ebenfalls (siehe bank_automatisch_zuordnen).
+                # Vorschlagstext noch Schaltfläche anzeigen (Hinweis dazu
+                # steht EINMAL oberhalb der Tabelle, nicht je Zeile). Die
+                # Anzeige allein wäre KEIN Schutz - die POST-Route selbst
+                # verweigert die Ausführung ebenfalls (siehe
+                # bank_automatisch_zuordnen).
                 if _DEMO_UMGEBUNG:
                     vorschlag_konto, vorschlag_grund = _bank_service.schlage_konto_vor(tx)
-                    vorschlag_grund_html = h(vorschlag_grund)
+                    vorschlag_html = h(vorschlag_grund)
                     if vorschlag_konto is not None:
-                        vorschlag_form = f"""
+                        vorschlag_html += f"""
                         <form method="post" action="/backoffice/bank/{tx.id}/automatisch-zuordnen" class="inline">
                           {csrf_feld(session.csrf_token)}
                           <button type="submit">Vorschlag übernehmen ({h(vorschlag_konto.id)})</button>
                         </form>"""
-                else:
-                    vorschlag_grund_html = '<span class="muted">Automatische Zuordnung zurückgestellt (EBS/EBICS ausstehend).</span>'
+                    vorschlag_td = f"<td>{vorschlag_html}</td>"
                 return f"""
                 <tr>
-                  <td>{eur(tx.betrag_cent)}</td><td>{tx.buchungsdatum.isoformat()}</td>
-                  <td class="tx-referenz">{h(tx.referenz or '')}</td><td>{eur(rest)} offen</td>
+                  <td class="nowrap">{eur(tx.betrag_cent)}</td><td class="nowrap">{tx.buchungsdatum.isoformat()}</td>
+                  <td class="tx-referenz">{h(tx.referenz or '')}</td><td class="nowrap">{eur(rest)} offen</td>
                   <td>{h(begruendung)}</td>
-                  <td>{vorschlag_grund_html}{vorschlag_form}</td>
+                  {vorschlag_td}
                   <td>
-                    <a class="btn-verknuepfen" href="/backoffice/bank/{tx.id}/verknuepfen">Mit bestehender Zahlung verknüpfen (empfohlen gegen Doppelbuchung)</a>
+                    <a class="btn-verknuepfen" href="/backoffice/bank/{tx.id}/verknuepfen">Bestehende Zahlung verknüpfen</a>
                     <details class="tx-manuell"><summary>Manuell zuordnen</summary>
                       <form method="post" action="/backoffice/bank/{tx.id}/manuell-zuordnen">
                         {csrf_feld(session.csrf_token)}
@@ -1670,25 +1671,43 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
 
             def _klaerfall_zeile(tx: object, begruendung: str) -> str:
                 # Bewusst KEIN normales Zuordnungsformular/Vorschlag bei
-                # negativen Beträgen - nur ein Prüffall-Hinweis, keine neue
-                # Rücklastschrift-Buchung wird hier implementiert.
+                # negativen (oder Null-)Beträgen - nur ein Prüffall-Hinweis,
+                # keine neue Rücklastschrift-Buchung wird hier implementiert.
+                # Codex-Rückprüfung db3755a: der ursprüngliche Bankbetrag
+                # allein reichte nicht - bereits verarbeitete Teil-
+                # Rücklastschriften und der verbleibende Prüfrest müssen
+                # DIREKT sichtbar sein, nicht nur implizit im Repository.
+                urspruenglich = abs(tx.betrag_cent)
+                verarbeitet = _bank_repo.verwendeter_betrag_rueckbuchung(tx.id)
+                rest = urspruenglich - verarbeitet
+                status_html = '<span class="badge badge-warn">Prüffall</span>'
+                if verarbeitet > 0:
+                    status_html += (
+                        f'<p class="muted">verarbeitet {eur(verarbeitet)} &middot; Prüfrest {eur(rest)} '
+                        f'(von {eur(urspruenglich)})</p>'
+                    )
                 return f"""
                 <tr>
-                  <td>{eur(tx.betrag_cent)}</td><td>{tx.buchungsdatum.isoformat()}</td>
+                  <td class="nowrap">{eur(tx.betrag_cent)}</td><td class="nowrap">{tx.buchungsdatum.isoformat()}</td>
                   <td class="tx-referenz">{h(tx.referenz or '')}</td>
                   <td>{h(begruendung)}</td>
-                  <td><span class="badge badge-warn">Prüffall</span></td>
+                  <td>{status_html}</td>
                   <td>{_bank_tx_details_html(tx)}</td>
                 </tr>"""
 
             def _sonstige_zeile(tx: object, begruendung: str, *, manuelle_optionen: bool) -> str:
+                rest_html = ""
                 manuell_html = ""
                 if manuelle_optionen:
                     zugeordnet = _bank_repo.zugeordneter_betrag(tx.id)
                     rest = tx.betrag_cent - zugeordnet
+                    # Codex-Rückprüfung db3755a: der Teilzuordnungsrest muss
+                    # DIREKT in der Zeile sichtbar sein, nicht nur als
+                    # vorbefülltes Formularfeld im eingeklappten Bereich.
+                    rest_html = f'<p class="muted">offen {eur(rest)} (von {eur(tx.betrag_cent)})</p>'
                     manuell_html = f"""
                     <details class="tx-manuell"><summary>Manuelle Optionen</summary>
-                      <a class="btn-verknuepfen" href="/backoffice/bank/{tx.id}/verknuepfen">Mit bestehender Zahlung verknüpfen</a>
+                      <a class="btn-verknuepfen" href="/backoffice/bank/{tx.id}/verknuepfen">Bestehende Zahlung verknüpfen</a>
                       <form method="post" action="/backoffice/bank/{tx.id}/manuell-zuordnen">
                         {csrf_feld(session.csrf_token)}
                         <select name="konto_id" required><option value="">Konto wählen</option>{konten_select}</select>
@@ -1699,17 +1718,18 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
                     </details>"""
                 return f"""
                 <tr>
-                  <td>{eur(tx.betrag_cent)}</td><td>{tx.buchungsdatum.isoformat()}</td>
+                  <td class="nowrap">{eur(tx.betrag_cent)}</td><td class="nowrap">{tx.buchungsdatum.isoformat()}</td>
                   <td class="tx-referenz">{h(tx.referenz or '')}</td>
                   <td>{h(begruendung)}</td>
-                  <td>{manuell_html}{_bank_tx_details_html(tx)}</td>
+                  <td>{rest_html}{manuell_html}{_bank_tx_details_html(tx)}</td>
                 </tr>"""
 
             def _summe(zeilen: list[tuple[object, str]]) -> int:
                 return sum(tx.betrag_cent for tx, _ in zeilen)
 
+            eingaenge_colspan = 7 if _DEMO_UMGEBUNG else 6
             eingaenge_html = "".join(_eingang_zeile(tx, b) for tx, b in eingaenge) or (
-                '<tr><td colspan="7" class="muted">Keine offenen Eingänge.</td></tr>'
+                f'<tr><td colspan="{eingaenge_colspan}" class="muted">Keine offenen Eingänge.</td></tr>'
             )
             klaerfaelle_html = "".join(_klaerfall_zeile(tx, b) for tx, b in klaerfaelle) or (
                 '<tr><td colspan="6" class="muted">Keine Rücklastschriften/Klärfälle.</td></tr>'
@@ -1721,37 +1741,48 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
                 _sonstige_zeile(tx, b, manuelle_optionen=False) for tx, b in ausgaenge
             ) or '<tr><td colspan="5" class="muted">Keine Ausgänge.</td></tr>'
 
+            eingang_vorschlag_th = "<th>Vorschlag</th>" if _DEMO_UMGEBUNG else ""
+            eingang_ebs_hinweis = (
+                "" if _DEMO_UMGEBUNG
+                else '<p class="muted">Automatik zurückgestellt (EBS/EBICS ausstehend).</p>'
+            )
+
             bereiche = f"""
             <div class="card">
               <h2>Eingänge / Mietzahlungen prüfen ({len(eingaenge)})</h2>
-              <p class="muted">Summe {eur(_summe(eingaenge))} &mdash; reine Anzeigesumme, KEIN Mieter-Offener-Posten.</p>
+              <p class="muted">Summe (Bankbeträge): {eur(_summe(eingaenge))} &middot; kein Mieter-Offener-Posten &middot;
+                 "Bestehende Zahlung verknüpfen" vor manueller Neuzuordnung prüfen (vermeidet Doppelbuchung).</p>
+              {eingang_ebs_hinweis}
               <div class="tabelle-scroll"><table>
-                <tr><th>Betrag</th><th>Datum</th><th>Referenz</th><th>Offen</th><th>Hinweis</th><th>Vorschlag</th><th>Aktion</th></tr>
+                <tr><th class="nowrap">Betrag</th><th class="nowrap">Datum</th><th>Referenz</th>
+                    <th class="nowrap">Offen</th><th>Hinweis</th>{eingang_vorschlag_th}<th>Aktion</th></tr>
                 {eingaenge_html}
               </table></div>
             </div>
             <div class="card klaerfall-card">
               <h2>Rücklastschriften / Klärfälle ({len(klaerfaelle)})</h2>
-              <p class="muted">Summe {eur(_summe(klaerfaelle))} &mdash; Prüffälle, kein automatisches Zuordnungsformular;
-                 KEIN Mieter-Offener-Posten. Eine gültige Mahnsperre wird dadurch nicht pauschal aufgehoben.</p>
+              <p class="muted">Summe (Bankbeträge): {eur(_summe(klaerfaelle))} &middot; Prüffälle, kein
+                 Zuordnungsformular &middot; kein Mieter-Offener-Posten &middot; hebt keine gültige Mahnsperre auf.</p>
               <div class="tabelle-scroll"><table>
-                <tr><th>Betrag</th><th>Datum</th><th>Referenz</th><th>Hinweis</th><th>Status</th><th></th></tr>
+                <tr><th class="nowrap">Betrag</th><th class="nowrap">Datum</th><th>Referenz</th><th>Hinweis</th><th>Status</th><th></th></tr>
                 {klaerfaelle_html}
               </table></div>
             </div>
             <details class="card">
               <summary>Umbuchungen ({len(umbuchungen)}) &mdash; Hinweis aus Banktext</summary>
-              <p class="muted">Summe {eur(_summe(umbuchungen))} &mdash; reiner Anzeigehinweis, KEIN Mieter-Offener-Posten.</p>
+              <p class="muted">Summe (Bankbeträge): {eur(_summe(umbuchungen))} &middot; reiner Anzeigehinweis
+                 &middot; kein Mieter-Offener-Posten.</p>
               <div class="tabelle-scroll"><table>
-                <tr><th>Betrag</th><th>Datum</th><th>Referenz</th><th>Hinweis</th><th></th></tr>
+                <tr><th class="nowrap">Betrag</th><th class="nowrap">Datum</th><th>Referenz</th><th>Hinweis</th><th></th></tr>
                 {umbuchungen_html}
               </table></div>
             </details>
             <details class="card">
               <summary>Ausgänge / Betriebsausgaben ({len(ausgaenge)}) &mdash; Hinweis aus Banktext</summary>
-              <p class="muted">Summe {eur(_summe(ausgaenge))} &mdash; reiner Anzeigehinweis, KEIN Mieter-Offener-Posten.</p>
+              <p class="muted">Summe (Bankbeträge): {eur(_summe(ausgaenge))} &middot; reiner Anzeigehinweis
+                 &middot; kein Mieter-Offener-Posten.</p>
               <div class="tabelle-scroll"><table>
-                <tr><th>Betrag</th><th>Datum</th><th>Referenz</th><th>Hinweis</th><th></th></tr>
+                <tr><th class="nowrap">Betrag</th><th class="nowrap">Datum</th><th>Referenz</th><th>Hinweis</th><th></th></tr>
                 {ausgaenge_html}
               </table></div>
             </details>"""

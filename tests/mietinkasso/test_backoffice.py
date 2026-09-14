@@ -1495,7 +1495,7 @@ def test_bankseite_zeigt_keine_automatik_schaltflaeche_ausserhalb_der_demo_umgeb
     seite_ohne_demo = client.get("/backoffice/bank/unzugeordnet", params={"bank_konto_id": "BK-TEST-GATING"})
     assert seite_ohne_demo.status_code == 200
     assert "automatisch-zuordnen" not in seite_ohne_demo.text
-    assert "Automatische Zuordnung zurückgestellt" in seite_ohne_demo.text
+    assert "Automatik zurückgestellt" in seite_ohne_demo.text
 
 
 # -- HV-20260914-BANKUEBERSICHT: Bankübersicht bereinigt (Anzeigekategorien) -------
@@ -1524,8 +1524,8 @@ def test_bankuebersicht_eingang_mit_vertragsreferenz_erscheint_in_eingangsbereic
     assert "Eingänge / Mietzahlungen prüfen" in seiten_text
     zeile = _bank_zeile_ausschnitt(seiten_text, "VERTRAG:V-601-1")
     assert "manuell-zuordnen" in zeile
-    assert "Mit bestehender Zahlung verknüpfen" in zeile
-    assert "KEIN Mieter-Offener-Posten" in seiten_text  # Sammelsummen-Hinweis
+    assert "Bestehende Zahlung verknüpfen" in zeile
+    assert "kein Mieter-Offener-Posten" in seiten_text  # Sammelsummen-Hinweis
 
 
 def test_bankuebersicht_positiver_unklarer_eingang_ohne_referenz(backoffice_client):
@@ -1710,6 +1710,105 @@ def test_bankuebersicht_get_ist_seiteneffektfrei(backoffice_client):
     assert erste.status_code == 200 and zweite.status_code == 200
     assert op_service.berechne_saldo(konto_id).saldo_cent == saldo_vorher  # reines Lesen bucht nichts
     assert "READONLY-CHECK-1" in erste.text and "READONLY-CHECK-1" in zweite.text
+
+
+def test_bankuebersicht_teilrueckbuchung_zeigt_verarbeitet_und_pruefrest(backoffice_client):
+    """Codex-Rückprüfung db3755a, Punkt 1: eine bereits TEILWEISE
+    verarbeitete Rücklastschrift (aktive OPPositionTable.RUECKLASTSCHRIFT
+    mit bank_transaktion_id, siehe verwendeter_betrag_rueckbuchung) muss
+    im Klärfall-Bereich den bereits verarbeiteten Betrag UND den
+    verbleibenden Prüfrest zeigen, nicht nur den ursprünglichen
+    Bankbetrag."""
+
+    import mietinkasso.backoffice.app as backoffice_app
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-PARTRL", objekt_id="601", bezeichnung="Top Teil-Rücklastschrift", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-PARTRL", einheit_id="601-TOP-PARTRL", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-PARTRL"))
+
+    zahlung = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=90_000,
+        belegdatum=date(2026, 5, 1), buchungsdatum=date(2026, 5, 1), faelligkeit=None,
+        beleg_referenz="Vorab erfasste Zahlung (Teil-Rücklastschrift-Test)",
+    )
+
+    # Ursprünglicher Eingang UND spätere Rücklastschrift müssen laut
+    # Fachregel auf demselben Bankkonto liegen - erst verknüpfen, dann
+    # die negative Gegenbuchung importieren.
+    bank_konto_id = "BK-BANKUEB-PARTRUECKLAST"
+    seiten_text = _bank_datei_importieren(client, csrf, bank_konto_id=bank_konto_id, betrag_text="900.00")
+    treffer_eingang = re.search(r"/backoffice/bank/(\d+)/verknuepfen", seiten_text)
+    assert treffer_eingang is not None
+    verknuepft = client.post(
+        f"/backoffice/bank/{treffer_eingang.group(1)}/verknuepfen",
+        data={
+            "op_position_id": str(zahlung.id), "konto_id": konto.id, "betrag": "900,00",
+            "vorgangs_id": "PARTRUECKLAST-VERKNUEPFUNG-1", "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert verknuepft.status_code == 303
+
+    seiten_text_ruecklast = _bank_datei_importieren(
+        client, csrf, bank_konto_id=bank_konto_id, betrag_text="-900.00", referenz="RUECKLASTSCHRIFT ZU ZAHLUNG",
+    )
+    treffer_id = re.search(r"Transaktions-ID #(\d+)", seiten_text_ruecklast)
+    assert treffer_id is not None
+    ruecklast_transaktion_id = int(treffer_id.group(1))
+
+    frische_transaktion = backoffice_app._bank_repo.get_transaktion(ruecklast_transaktion_id)
+    assert frische_transaktion is not None
+    backoffice_app._bank_service.verarbeite_ruecklastschrift(
+        ctx=_ctx_admin(), transaktion=frische_transaktion, original_op_position=zahlung, konto=konto,
+        betrag_cent=40_000,  # bewusst TEILWEISE - Rest muss offen bleiben (900 - 400 = 500)
+    )
+
+    seite_danach = client.get("/backoffice/bank/unzugeordnet", params={"bank_konto_id": bank_konto_id})
+    assert seite_danach.status_code == 200
+    zeile = _bank_zeile_ausschnitt(seite_danach.text, "RUECKLASTSCHRIFT ZU ZAHLUNG")
+    assert "Prüffall" in zeile
+    assert "400,00" in zeile  # bereits verarbeitet
+    assert "500,00" in zeile  # verbleibender Prüfrest
+    assert "manuell-zuordnen" not in zeile and "automatisch-zuordnen" not in zeile
+
+
+def test_bankuebersicht_nullbewegung_bleibt_sichtbar_als_klaerfall_ohne_formular(backoffice_client):
+    """Codex-Rückprüfung db3755a, Punkt 2: eine Nullbewegung darf nicht
+    still verschwinden (weder aus dem Repository noch aus der Anzeige) -
+    sie bleibt sichtbar, ausdrücklich als Klärfall, ohne normales
+    Zahlungsformular."""
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text = _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-BANKUEB-NULLBEWEGUNG", betrag_text="0.00", referenz="NULLBEWEGUNG-TEST-1",
+    )
+    assert "NULLBEWEGUNG-TEST-1" in seiten_text
+    zeile = _bank_zeile_ausschnitt(seiten_text, "NULLBEWEGUNG-TEST-1")
+    assert "Prüffall" in zeile
+    assert "manuell-zuordnen" not in zeile
+    assert "automatisch-zuordnen" not in zeile
+    assert 'name="betrag" placeholder="Betrag EUR"' not in zeile
+    assert "Rücklastschriften / Klärfälle" in seiten_text
+    referenz_pos = seiten_text.index("NULLBEWEGUNG-TEST-1")
+    klaerfall_pos = seiten_text.index("Rücklastschriften / Klärfälle")
+    ausgaenge_pos = seiten_text.index("Ausgänge / Betriebsausgaben")
+    assert klaerfall_pos < referenz_pos < ausgaenge_pos
 
 
 def test_mieweg_vorschau_beide_spuren_ergeben_massgeblichen_betrag(backoffice_client):
