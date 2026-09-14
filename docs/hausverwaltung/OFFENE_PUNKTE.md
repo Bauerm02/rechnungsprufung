@@ -3241,3 +3241,18 @@ im Gesamtlauf. Kein Deployment, kein Serverzugriff, kein Liveversand
 durch Claude; physischer EinfachBrief-Transport bleibt mangels
 bestätigter sFTP/API-Spezifikation deaktiviert (`brief_transport_
 verfuegbar=False`) - kein erfundener Adapter.
+
+5. **Separater Headline-Font** (Codex-Rückmeldung: JLB-Assets liegen
+   fertig vor - `jlb-logo.png`, `Forum-Regular.ttf`, `EBGaramond-
+   Regular.ttf`/`-Bold.ttf`, offizieller Google-Fonts-OFL-Bestand,
+   Deployment unter `/runtime/brief-assets/`): neue optionale Einstellung
+   `MIETINKASSO_BRIEF_FONT_HEADLINE_PFAD` - nur die Betreffzeile
+   ("Zahlungserinnerung"/"Zweite Mahnung") verwendet diesen Font (Forum),
+   der übrige Fließtext bleibt beim regulären Regular-/Bold-Font (EB
+   Garamond). Ohne konfigurierten Pfad unverändertes Verhalten (Betreff
+   im normalen Fett-Font). `DEPLOYMENT_HETZNER.md` um die vier
+   konkreten `MIETINKASSO_BRIEF_*_PFAD`-Variablen für das read-only
+   `/runtime/brief-assets`-Mount ergänzt. 2 neue Tests.
+
+9 neue Tests insgesamt in Runde 10, 1029/1029 grün im Gesamtlauf. Keine
+Assets von Codex' Rechner abgerufen, kein Liveversand.

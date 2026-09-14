@@ -140,6 +140,12 @@ class Settings(BaseSettings):
     brief_logo_pfad: str | None = None
     brief_font_regular_pfad: str | None = None
     brief_font_bold_pfad: str | None = None
+    # Optionaler, vom Fließtext GETRENNTER Headline-Font (z. B. "Forum")
+    # nur für die Betreffzeile - Fließtext bleibt regular/bold
+    # (z. B. "EB Garamond"). Ohne konfigurierten Pfad fällt die
+    # Betreffzeile auf den normalen Fett-Font zurück (unverändertes
+    # Verhalten).
+    brief_font_headline_pfad: str | None = None
     # DIN-5008-Standardposition für ein Fensterkuvert - Codex kann sie
     # bei Bedarf auf die tatsächliche EinfachBrief-Fensterspezifikation
     # nachjustieren, ohne Codeänderung.

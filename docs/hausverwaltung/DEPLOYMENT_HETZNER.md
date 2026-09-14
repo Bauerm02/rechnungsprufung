@@ -156,6 +156,25 @@ Image, die auf eine Demo-Datenbank zeigen könnten. Ein Neustart des
 Containers ersetzt keine Daten (die SQLite-Datei liegt im gemounteten
 Volume, nicht im Container-Dateisystem).
 
+**Mahnbrief-Assets** (`mahnwesen/brief_pdf.py`, Logo/Fonts): weiteres
+read-only Volume mounten, z. B. `-v /runtime/brief-assets:/runtime/brief-assets:ro`,
+und im `--env-file` auf die dort abgelegten, freigegebenen Dateien
+zeigen:
+
+```
+MIETINKASSO_BRIEF_LOGO_PFAD=/runtime/brief-assets/jlb-logo.png
+MIETINKASSO_BRIEF_FONT_REGULAR_PFAD=/runtime/brief-assets/EBGaramond-Regular.ttf
+MIETINKASSO_BRIEF_FONT_BOLD_PFAD=/runtime/brief-assets/EBGaramond-Bold.ttf
+MIETINKASSO_BRIEF_FONT_HEADLINE_PFAD=/runtime/brief-assets/Forum-Regular.ttf
+```
+
+`BRIEF_FONT_HEADLINE_PFAD` ist optional (nur für die Betreffzeile,
+z. B. "Forum" getrennt vom EB-Garamond-Fließtext) - ohne ihn bleibt die
+Betreffzeile im normalen Fett-Font. Fehlt einer der Pfade oder die
+Datei, fällt der jeweilige Font auf die im Image via `fonts-liberation`
+immer vorhandene Ersatzschrift zurück bzw. bleibt das Logo ungezeichnet
+(kein erfundenes Signet) - kein Startfehler.
+
 ## 6. Health-Check und Readiness (kein Auth, keine Kundendaten)
 
 - `GET /health` — Liveness: der Prozess läuft und antwortet, OHNE

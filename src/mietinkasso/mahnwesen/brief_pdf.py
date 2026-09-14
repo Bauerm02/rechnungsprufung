@@ -41,6 +41,10 @@ class Absender:
     logo_pfad: str | None = None
     font_regular_pfad: str | None = None
     font_bold_pfad: str | None = None
+    # Optionaler, vom Fließtext getrennter Font NUR für den Betreff
+    # (z. B. "Forum" als Headline, "EB Garamond" als Copy) - ohne
+    # konfigurierten Pfad bleibt der Betreff auf dem normalen Fett-Font.
+    font_headline_pfad: str | None = None
     fenster_links_mm: float = 20.0
     fenster_oben_mm: float = 45.0
 
@@ -92,6 +96,10 @@ def erzeuge_mahnbrief_pdf(
     bold = absender.font_bold_pfad if absender.font_bold_pfad and Path(absender.font_bold_pfad).is_file() else _FALLBACK_FONT_BOLD
     pdf.add_font("Brief", "", regular)
     pdf.add_font("Brief", "B", bold)
+    headline_familie, headline_stil = "Brief", "B"
+    if absender.font_headline_pfad and Path(absender.font_headline_pfad).is_file():
+        pdf.add_font("Headline", "", absender.font_headline_pfad)
+        headline_familie, headline_stil = "Headline", ""
 
     if absender.logo_pfad and Path(absender.logo_pfad).is_file():
         pdf.image(absender.logo_pfad, x=20, y=15, w=40)
@@ -111,7 +119,7 @@ def erzeuge_mahnbrief_pdf(
     pdf.cell(0, 5, f"Wien, {heute.strftime('%d.%m.%Y')}", align="R", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
-    pdf.set_font("Brief", "B", 13)
+    pdf.set_font(headline_familie, headline_stil, 13)
     pdf.cell(0, 8, betreff, new_x="LMARGIN", new_y="NEXT")
     pdf.set_font("Brief", "", 10)
     pdf.cell(0, 5, f"{objekt_bezeichnung}, {einheit_bezeichnung}", new_x="LMARGIN", new_y="NEXT")

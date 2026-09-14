@@ -1748,6 +1748,7 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
         uid=_settings.brief_absender_uid, telefon=_settings.brief_absender_telefon, website=_settings.brief_absender_website,
         email=_settings.brief_absender_email, farbe_anthrazit=_settings.brief_farbe_anthrazit, farbe_gold=_settings.brief_farbe_gold,
         logo_pfad=_settings.brief_logo_pfad, font_regular_pfad=_settings.brief_font_regular_pfad, font_bold_pfad=_settings.brief_font_bold_pfad,
+        font_headline_pfad=_settings.brief_font_headline_pfad,
         fenster_links_mm=_settings.brief_fenster_links_mm, fenster_oben_mm=_settings.brief_fenster_oben_mm,
     )
     pdf_bytes = _erzeuge_mahnbrief_pdf(

@@ -77,6 +77,26 @@ def test_absenderdaten_stehen_in_fusszeile():
     assert "hausverwaltung@jlb-immo.at" in text
 
 
+def test_separater_headline_font_wird_nur_fuer_betreff_verwendet_wenn_konfiguriert():
+    """Codex-Rückmeldung 14.09.2026: Forum als Headline-Font, EB Garamond
+    als Fließtext - optional, ohne konfigurierten Pfad unverändertes
+    Verhalten (Betreff im normalen Fett-Font)."""
+
+    pdf_bytes = _erzeugen(absender=_absender(
+        font_headline_pfad="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ))
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = reader.pages[0].extract_text()
+    assert "Zweite Mahnung" in text
+    assert "Gesamtbetrag" in text  # Fließtext bleibt unverändert lesbar
+
+
+def test_ohne_konfigurierten_headline_font_bleibt_verhalten_unveraendert():
+    pdf_bytes = _erzeugen(absender=_absender(font_headline_pfad="/pfad/existiert/nicht.ttf"))
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    assert "Zweite Mahnung" in reader.pages[0].extract_text()
+
+
 def test_fehlende_eingebettete_schrift_wird_von_pdfa_erzwingung_abgelehnt():
     """Rückprüfung Codex 14.09.2026: PDF/A-Konformität wird über fpdf2s
     `enforce_compliance="PDF/A-2B"` erzwungen, nicht selbst nachgebaut -
