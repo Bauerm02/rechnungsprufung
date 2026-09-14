@@ -4538,6 +4538,19 @@ def vertragsanlage_detail(
             f"Status {letzte_pruefung.fachstatus} (Beleg: {letzte_pruefung.quellenbeleg_referenz})"
         )
 
+    # Letzter tatsächlicher monatlicher Indexautomatik-Lauf (reiner Read,
+    # KEIN neuer Lauf/keine neue Berechnung) - Codex-Rückprüfung: eine
+    # Vertragsprüfung ist KEIN Monatsindexlauf, ein BLOCKIERT-Lauf blieb
+    # bisher im Akte-Rendering unsichtbar.
+    letzter_indexautomatik_lauf_hinweis = None
+    indexautomatik_laeufe = _indexautomatik.lauf_repository.liste_fuer_vertrag(vertrag_id)
+    if indexautomatik_laeufe:
+        letzter_lauf = indexautomatik_laeufe[0]
+        blockiergruende_text = (
+            f", Blockiergründe: {', '.join(letzter_lauf.blockiert_gruende)}" if letzter_lauf.blockiert_gruende else ""
+        )
+        letzter_indexautomatik_lauf_hinweis = f"Periode {letzter_lauf.periode}, Status {letzter_lauf.status}{blockiergruende_text}"
+
     # Tatsächlich persistierte Vorschreibungsdatensätze samt
     # Einzelpositionen (Auftrag HV-20260914-AUFGABEN-MIETERAKTE,
     # Ergänzung Codex-Bestandsprüfung) - NICHT nur die vereinbarten
@@ -4572,6 +4585,7 @@ def vertragsanlage_detail(
         rechtsprofil_freigegeben_hinweis=rechtsprofil_freigegeben_hinweis,
         rechtsprofil_entwurf_hinweis=rechtsprofil_entwurf_hinweis,
         index_klausel_hinweis=index_klausel_hinweis, index_pruefbedarf_hinweis=index_pruefbedarf_hinweis,
+        letzter_indexautomatik_lauf_hinweis=letzter_indexautomatik_lauf_hinweis,
         letzte_pruefung_hinweis=letzte_pruefung_hinweis,
         versionen=versionen, csrf=session.csrf_token,
         aktueller_monat=aktueller_monat, vorschreibungen=vorschreibungen,

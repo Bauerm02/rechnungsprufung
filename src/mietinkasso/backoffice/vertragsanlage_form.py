@@ -576,6 +576,7 @@ def detail_ansicht(
     *, vertrag, objekt, einheit, debitor, gesellschaft, profil, kaution, konto_id, komponenten,
     rechtsprofil_freigegeben_hinweis: str | None, rechtsprofil_entwurf_hinweis: str | None,
     index_klausel_hinweis: str | None, index_pruefbedarf_hinweis: str | None,
+    letzter_indexautomatik_lauf_hinweis: str | None,
     letzte_pruefung_hinweis: str | None, versionen: list, csrf: str,
     aktueller_monat: str,
     vorschreibungen: list,
@@ -686,9 +687,10 @@ def detail_ansicht(
     primaer_summe, primaer_tabelle = _je_vorschreibung[primaer.id] if primaer is not None else (None, None)
 
     if primaer is not None:
+        primaer_status_label = h(_VORSCHREIBUNG_STATUS_LABEL.get(primaer.status, primaer.status))
         titel = (
-            f"Aktuelle Vorschreibung ({h(primaer.monat)})" if ist_aktueller_monat
-            else f"Letzte hinterlegte Vorschreibung — historisch ({h(primaer.monat)})"
+            f"Aktuelle Vorschreibung ({h(primaer.monat)}) — {primaer_status_label}" if ist_aktueller_monat
+            else f"Letzte hinterlegte Vorschreibung — historisch ({h(primaer.monat)}) — {primaer_status_label}"
         )
         monat_hinweis = (
             "" if ist_aktueller_monat
@@ -723,7 +725,7 @@ def detail_ansicht(
       <h3>Einzelbestandteile dieser Vorschreibung</h3>
       {primaer_tabelle}
       {f'<details><summary>Weitere vergangene Monate ({len(weitere_vergangene)})</summary><table><tr><th>Monat</th><th>Betrag</th><th>Status</th></tr>{weitere_v_zeilen}</table></details>' if weitere_vergangene else ''}
-      {f'<details><summary>Zukünftig hinterlegte Entwürfe ({len(zukuenftige)}) — NICHT aktuell, keine Sollstellung</summary><table><tr><th>Monat</th><th>Status</th></tr>{zukunft_zeilen}</table></details>' if zukuenftige else ''}
+      {f'<details><summary>Zukünftig terminierte Vorschreibungen ({len(zukuenftige)}) — NICHT aktuell, Status siehe Spalte</summary><table><tr><th>Monat</th><th>Status</th></tr>{zukunft_zeilen}</table></details>' if zukuenftige else ''}
       <p><a href="/backoffice/vertrag/{h(vertrag.id)}/vorschreibung">Vorschreibungsentwurf öffnen</a></p>
     </div>"""
     else:
@@ -733,8 +735,9 @@ def detail_ansicht(
         )
         zukunft_hinweis = (
             f'<p class="warn">Keine aktuelle/vergangene Vorschreibung, aber {len(zukuenftige)} zukünftig '
-            "hinterlegte(r) Entwurf/Entwürfe (siehe unten) - NICHT als bereits wirksam behandeln.</p>"
-            f'<details open><summary>Zukünftig hinterlegte Entwürfe ({len(zukuenftige)})</summary>'
+            "terminierte(r) Vorschreibungsdatensatz/-sätze (Status siehe Tabelle unten) - NICHT als bereits "
+            "wirksam behandeln.</p>"
+            f'<details open><summary>Zukünftig terminierte Vorschreibungen ({len(zukuenftige)})</summary>'
             f"<table><tr><th>Monat</th><th>Status</th></tr>{zukunft_zeilen}</table></details>"
             if zukuenftige else
             '<p class="muted">Keine Vorschreibung im System hinterlegt - das sagt nichts darüber aus, ob vor '
@@ -917,10 +920,16 @@ def detail_ansicht(
         <tr><th>Freigegebenes Rechtsprofil</th>
             <td>{h(rechtsprofil_freigegeben_hinweis) if rechtsprofil_freigegeben_hinweis else 'Kein freigegebenes Rechtsprofil.'}</td></tr>
         {f'<tr><th>Neuerer Rechtsprofil-Entwurf (ungeprüft)</th><td>{h(rechtsprofil_entwurf_hinweis)}</td></tr>' if rechtsprofil_entwurf_hinweis else ''}
-        <tr><th>Wirksame Indexklausel</th><td>{h(index_klausel_hinweis) if index_klausel_hinweis else 'Keine Indexklausel erfasst.'}</td></tr>
+        <tr><th>Gespeicherte freigegebene Indexklausel</th>
+            <td>{h(index_klausel_hinweis) if index_klausel_hinweis else 'Keine Indexklausel erfasst.'}</td></tr>
         <tr><th>Offener Index-Prüfbedarf</th><td>{h(index_pruefbedarf_hinweis) if index_pruefbedarf_hinweis else 'Kein offener Prüfbedarf hinterlegt.'}</td></tr>
+        <tr><th>Letzter Indexautomatik-Lauf</th>
+            <td>{h(letzter_indexautomatik_lauf_hinweis) if letzter_indexautomatik_lauf_hinweis else 'Noch kein Indexautomatik-Lauf für diesen Vertrag hinterlegt.'}</td></tr>
         <tr><th>Letzte Vertragsprüfung</th><td>{h(letzte_pruefung_hinweis) if letzte_pruefung_hinweis else 'Keine Vertragsprüfung im System hinterlegt.'}</td></tr>
       </table>
+      <p class="muted">"Gespeicherte freigegebene Indexklausel" bedeutet: eine Klausel mit Status FREIGEGEBEN ist
+         hinterlegt - dies ist KEIN laufender Gültigkeitscheck (z. B. Mindestabstand/Schwelle zum heutigen Tag),
+         das prüft weiterhin gesondert die Indexregel-Verwaltung.</p>
       <p class="muted">Ein fehlendes/neues Mietvertragsprofil bedeutet NICHT, dass hier keinerlei Rechts-/
          Indexwissen vorliegt - ältere Rechtsprofile/Prüfungen/Klauseln (oben) können unabhängig davon bereits
          bestehen.</p>
@@ -947,13 +956,27 @@ def detail_ansicht(
         eur(kaution.betrag_cent) if kaution
         else ("nicht hinterlegt" if not (profil and profil.vertragliche_kaution_cent is not None) else "vereinbart, kein Eingang bestätigt")
     )
-    vorschreibung_ueberblick_label = (
-        f"{'Aktuelle' if ist_aktueller_monat else 'Letzte hinterlegte'} Vorschreibung ({h(primaer.monat)})"
-        if primaer is not None else "Aktuelle Vorschreibung"
-    )
-    vorschreibung_ueberblick_wert = (
-        (eur(primaer_summe) if primaer_summe is not None else "kein Beleg") if primaer is not None else "keine hinterlegt"
-    )
+    # Codex-Rückprüfung: die oberste Kachel muss den tatsächlichen Status
+    # (insbesondere ENTWURF) direkt nennen statt unkommentiert nur einen
+    # Betrag zu zeigen; ein Ledger-only-SOLL für den laufenden Monat
+    # (siehe `ledger_nur_gebucht` oben) darf hier NICHT als "keine
+    # hinterlegt" erscheinen, obwohl tatsächlich gebucht wurde.
+    if primaer is not None:
+        vorschreibung_ueberblick_label = (
+            f"{'Aktuelle' if ist_aktueller_monat else 'Letzte hinterlegte'} Vorschreibung ({h(primaer.monat)})"
+        )
+        vorschreibung_ueberblick_wert = (
+            f"{eur(primaer_summe)} — {primaer_status_label}" if primaer_summe is not None
+            else f"kein Beleg — {primaer_status_label}"
+        )
+    else:
+        ledger_aktuell_cent = ledger_nur_gebucht.get(aktueller_monat)
+        if ledger_aktuell_cent is not None:
+            vorschreibung_ueberblick_label = f"Aktuelle Vorschreibung ({h(aktueller_monat)})"
+            vorschreibung_ueberblick_wert = f"{eur(ledger_aktuell_cent)} — im Konto gebucht, kein eigener Datensatz"
+        else:
+            vorschreibung_ueberblick_label = "Aktuelle Vorschreibung"
+            vorschreibung_ueberblick_wert = "siehe Buchungen"
     rechtsprofil_ueberblick_wert = (
         "freigegeben" if rechtsprofil_freigegeben_hinweis
         else ("Entwurf, ungeprüft" if rechtsprofil_entwurf_hinweis else "kein Rechtsprofil")
@@ -965,7 +988,7 @@ def detail_ansicht(
             <span class="kpi-label">Kontostand (offen/Guthaben)</span></div>
         <div class="kpi"><span class="zahl">{vorschreibung_ueberblick_wert}</span>
             <span class="kpi-label">{vorschreibung_ueberblick_label}</span></div>
-        <div class="kpi"><span class="zahl">{kaution_ueberblick}</span><span class="kpi-label">Kaution</span></div>
+        <div class="kpi"><span class="zahl">{kaution_ueberblick}</span><span class="kpi-label">Kaution eingegangen</span></div>
         <div class="kpi"><span class="zahl">{rechtsprofil_ueberblick_wert}</span><span class="kpi-label">Rechtsprofil-Status</span></div>
       </div>
     </div>"""

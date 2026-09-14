@@ -3563,3 +3563,84 @@ Beschriftung jetzt neutral "Offener Betrag"; der tatsächlich fällige
 echter Zukunftsfälligkeit. 2 gezielte Regressionstests (unbekannte
 Fälligkeit + unstrittiger Rest 0; Positionen fällig bei Kontoberechnung
 0 durch FIFO-Divergenz) plus angepasster Zukunftstest, 1059/1059 grün.
+
+## Paket F — HV-20260914-AUFGABEN-MIETERAKTE (14.09.2026)
+
+**1) "Das ist zu erledigen" (Dashboard):** aus einer Sammelzähler-Liste
+zu konkreten Karten je Person umgebaut (Mietername, Objekt/Einheit,
+tatsächlicher Grund inkl. Betrag, direkter Aktionsbutton). Mehrere
+gleichzeitige Gründe derselben Person bleiben sichtbar (Gruppierung je
+`vertrag_id` statt einer priorisierenden Liste). Objektfilter gilt
+weiterhin, und der aktive Filter wird über `?von_objekt=` an jeden
+Aktionslink UND den "zurück"-Link der Mieterakte weitergereicht. Eine
+gültige Sperre/ein Ratenplan wird nie als Aufforderung zum Entsperren
+dargestellt, sondern als "vor einer Mahnung berücksichtigen/Status
+prüfen"; eine Sperre auf einem ausgeglichenen/Guthaben-Konto bleibt
+weiterhin KEINE Aufgabe. Eine leere Liste erklärt sachlich, welche
+Kriterien geprüft wurden - keine Behauptung eines vollständigen
+Bankabgleichs.
+
+**2) Neue gemeinsame Mieterakte** (bestehende Route
+`/backoffice/vertrag/{vertrag_id}`, erreichbar aus Dashboard UND
+Mieterliste, bestehende Bearbeitungs-/Prüfrouten bleiben unverändert
+verlinkt): EINE Seite mit Stammdaten, Vertrag/Laufzeit, tatsächlich
+persistierter Vorschreibung (Einzelbestandteile Netto/USt/Brutto,
+GETRENNT von den nur vereinbarten Vertragskomponenten), Kontostatus mit
+echtem Vergleich Kontoberechnung ⟷ Summe Einzelpositionen, offenen
+Positionen/Buchungen, Sperren, Mahnfällen/Schriftverkehr (inkl.
+Mahnläufe/Erhöhungsschreiben/Vertragsende-Erinnerungen mit getrenntem
+Gesendet-/Zugangsnachweis), Kaution, und einer konsolidierten
+"Index & Rechtsprofil"-Karte (Freigabe/Entwurf getrennt, offener
+Prüfbedarf, letzter Indexautomatik-Lauf). Eine kompakte
+"Auf einen Blick"-Kennzahlenzeile zeigt Kontostand/aktuelle
+Vorschreibung/Kaution/Rechtsprofil-Status ohne Klick; lange
+Historien/Rohfelder bleiben in `<details>` eingeklappt. Fehlende Daten
+werden ehrlich als "nicht hinterlegt"/"kein Nachweis im System"/"kein
+Beleg" ausgewiesen, nie als erfundener Wert.
+
+**Sicherheitsgrenze (Pilotausschluss-Objekte):** die Route blockt
+JETZT vollständig (400, `_objekt_fuer_vertrag_gesperrt`) VOR jedem
+weiteren Datenread, sobald das Objekt ausgeschlossen ist - keine
+selektive Kartenunterdrückung mehr (eine erste Fassung dieser Runde
+hatte das noch nicht vollständig getan; von Codex in der
+Zwischenprüfung von Commit cddbe08 gefunden und in Commit d218011
+korrigiert). Bewusst NICHT rückwirkend auf den bestehenden
+Kontoauszug (`/backoffice/konto/{id}`) angewendet - der zeigt aus
+historischen Gründen weiterhin die reine Saldoansicht für
+ausgeschlossene Objekte; das war nicht Teil dieses Auftrags.
+
+**Korrigierte Fachfehler dieser Runde** (beide von Codex in der
+Zwischenprüfung gefunden, in Commit d218011 behoben):
+- Vorschreibungsauswahl wählte per bloßer DESC-Sortierung den am
+  weitesten in der Zukunft liegenden Datensatz als "aktuell" statt des
+  tatsächlich laufenden Monats.
+- `rechtsprofil_hinweis` nahm `historie[-1]` einer nach Version
+  ABSTEIGEND sortierten Liste - das ist die ÄLTESTE, nicht die neueste
+  Zeile; ein neuerer Entwurf konnte dadurch fälschlich unter
+  "Freigegebenes Rechtsprofil" erscheinen. Freigegeben/Entwurf werden
+  jetzt über zwei getrennte Werte ausgewiesen.
+
+**Offene Punkte / bewusste Grenzen:**
+- Mehrere Konten je Vertrag sind vom Datenmodell NICHT unterstützt
+  (`KontoTable.vertrag_id` trägt einen DB-Unique-Constraint, "genau
+  ein Mietkonto je Vertrag") - dafür wurde bewusst keine neue Funktion
+  gebaut, siehe bestehenden Migrationstest.
+- "Letzter Indexautomatik-Lauf" und "Gespeicherte freigegebene
+  Indexklausel" in der neuen Index-Karte sind reine, ungefilterte
+  Reads (jeweils der zuletzt/nach Version höchste Datensatz) - KEIN
+  laufender Gültigkeitscheck (Mindestabstand/Schwelle/Datum); das
+  prüft weiterhin ausschließlich die bestehende Indexregel-Verwaltung.
+- Das Schriftverkehr-Feld zeigt ausschließlich in DIESEM System selbst
+  geplante/versendete Datensätze (Mahnfälle/-läufe,
+  Erhöhungsschreiben, Vertragsende-Erinnerungen) - eine eventuelle
+  externe Korrespondenz (Outlook/Papierpost außerhalb des Systems)
+  wird nicht erfasst; das Rendering weist ausdrücklich darauf hin.
+- Keine finanzielle Logik-, Migrations-, Env-, Versand- oder
+  Bankänderung in dieser Runde; kein produktiver Funktionstest (nur
+  synthetische Testdaten, siehe `tests/mietinkasso/test_backoffice.py`).
+
+108 neue/angepasste Tests in `test_backoffice.py` (8 davon neu: leere
+Akte, unbekannter/ausgeschlossener Vertrag, XSS-Escaping,
+Vorschreibung aktuell/vergangen/zukünftig, Objektfilter für Aufgaben,
+Einheit-Metadaten bei reiner unbekannter Fälligkeit, Guthaben trotz
+alter Sperre), 962/962 grün im `tests/mietinkasso`-Gesamtlauf.

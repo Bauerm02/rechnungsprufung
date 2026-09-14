@@ -2477,6 +2477,251 @@ def test_detail_ansicht_zeigt_korrekten_ust_satz_und_netto_brutto_getrennt(backo
     assert "550,00" in detail.text  # Brutto bleibt unverändert (tatsächlich vorgeschrieben)
 
 
+# -- Mieterakte (Auftrag HV-20260914-AUFGABEN-MIETERAKTE) -------------------
+
+
+def test_akte_ohne_profil_kaution_vorschreibung_zeigt_ehrliche_leerstaende(backoffice_client):
+    """Ein Vertrag OHNE aktive Komponenten/Profil/Kaution/Vorschreibung/
+    Vertragsprüfung darf NIE "0,00" als tatsächlich vorgeschrieben zeigen
+    und muss fehlende Nachweise ehrlich als "nicht hinterlegt"/"kein
+    Nachweis im System" ausweisen, nicht stillschweigend als bezahlt/
+    zugestellt/geprüft erfinden."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_ = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-LEER-AKTE", objekt_id="601", bezeichnung="Top Leer Akte", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-LEER-AKTE", einheit_id="601-TOP-LEER-AKTE", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    # Bewusst KEIN add_komponente/Profil/Kaution/Vorschreibung/Prüfung/Konto.
+
+    akte = client.get("/backoffice/vertrag/V-601-LEER-AKTE")
+    assert akte.status_code == 200
+    assert "Keine aktiven Mietbestandteile hinterlegt." in akte.text
+    assert "Summe brutto (vereinbart)" not in akte.text  # keine erfundene 0,00-Summe ohne Komponenten
+    assert "Keine Vorschreibung im System hinterlegt" in akte.text
+    assert "Keine aktiven Sperren." in akte.text
+    assert "Kein freigegebenes Rechtsprofil." in akte.text
+    assert "Keine Indexklausel erfasst." in akte.text
+    assert "Kein offener Prüfbedarf hinterlegt." in akte.text
+    assert "Keine Vertragsprüfung im System hinterlegt." in akte.text
+    assert "nicht hinterlegt" in akte.text  # Kontakt/Mietbeginn
+    assert "bezahlt" not in akte.text.lower()
+    assert "zugestellt</td>" not in akte.text  # kein erfundener Zustellstatus
+
+
+def test_akte_unbekannter_vertrag_zeigt_fehlerseite(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    antwort = client.get("/backoffice/vertrag/V-VOELLIG-UNBEKANNT")
+    assert antwort.status_code == 400
+
+
+def test_akte_ausgeschlossenes_objekt_blockt_finanzdaten_vollstaendig(backoffice_client):
+    """Auftrag-Ergänzung (Codex-Rückprüfung 14.09.2026): der neue
+    gemeinsame Akteneinstieg darf für ein Pilotausschluss-Objekt
+    UEBERHAUPT KEINE Finanz-/Mietdaten zeigen - keine selektive
+    Unterdrückung einzelner Karten, sondern ein vollständiger Block
+    (400) VOR jedem weiteren Datenread."""
+
+    client, *_ = backoffice_client
+    _login(client)
+    antwort = client.get("/backoffice/vertrag/V-107-1")
+    assert antwort.status_code == 400
+    assert "ausgeschlossen" in antwort.text
+    assert "Kontostatus" not in antwort.text
+    assert "Vorschreibung" not in antwort.text
+    assert "Mahnfäl" not in antwort.text
+
+
+def test_akte_kontakt_wird_escaped(backoffice_client):
+    """XSS-Schutz: eine bösartige Adresse/Kommentar in Stammdaten/Sperren
+    darf niemals als rohes HTML im Akte-Rendering landen."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_ = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    payload = '<script>alert(1)</script>'
+    stammdaten.upsert_debitor(id="DEB-XSS-AKTE", name="Test Mieter XSS", adresse=payload)
+    stammdaten.upsert_einheit(id="601-TOP-XSS-AKTE", objekt_id="601", bezeichnung="Top XSS Akte", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-XSS-AKTE", einheit_id="601-TOP-XSS-AKTE", debitor_id="DEB-XSS-AKTE", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    sperre_id = stammdaten.sperre_setzen(vertrag_id="V-601-XSS-AKTE", grund="MANUELL", kommentar=payload)
+    try:
+        akte = client.get("/backoffice/vertrag/V-601-XSS-AKTE")
+        assert akte.status_code == 200
+        assert payload not in akte.text
+        assert "&lt;script&gt;" in akte.text
+    finally:
+        stammdaten.sperre_aufheben(sperre_id)
+
+
+def test_akte_vorschreibung_aktuell_vs_vergangen_vs_zukunft(backoffice_client):
+    """Codex-Rückprüfung: eine DESC-Sortierung allein wählte vorher
+    fälschlich den am weitesten in der Zukunft liegenden Datensatz als
+    "aktuell". Mit einer vergangenen (2020-01), einer aktuellen und
+    einer weit zukünftigen (2099-01) Vorschreibung muss GENAU die
+    aktuelle als "Aktuelle Vorschreibung" erscheinen, die zukünftige
+    getrennt und NIE als aktuell/wirksam."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    from mietinkasso.vorschreibung.repository import VorschreibungRepository
+    from mietinkasso.indexautomatik.zeit import heute_wien
+
+    client, *_ = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-VS-ZEIT", objekt_id="601", bezeichnung="Top Vorschreibung Zeit", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-VS-ZEIT", einheit_id="601-TOP-VS-ZEIT", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2020, 1, 1),
+    )
+    heute = heute_wien()
+    aktueller_monat = f"{heute.year:04d}-{heute.month:02d}"
+
+    vr = VorschreibungRepository(build_session_factory(get_settings().database_url))
+    v_alt = vr.get_or_create_entwurf(vertrag_id="V-601-VS-ZEIT", monat="2020-01", faelligkeit=date(2020, 1, 5))
+    vr.add_position(vorschreibung_id=v_alt.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=40_000, ust_satz_promille=10_000)
+    v_aktuell = vr.get_or_create_entwurf(vertrag_id="V-601-VS-ZEIT", monat=aktueller_monat, faelligkeit=date(heute.year, heute.month, 5))
+    vr.add_position(vorschreibung_id=v_aktuell.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=55_000, ust_satz_promille=10_000)
+    v_zukunft = vr.get_or_create_entwurf(vertrag_id="V-601-VS-ZEIT", monat="2099-01", faelligkeit=date(2099, 1, 5))
+    vr.add_position(vorschreibung_id=v_zukunft.id, art="HMZ", bezeichnung="Hauptmietzins", betrag_cent=99_999, ust_satz_promille=10_000)
+
+    akte = client.get("/backoffice/vertrag/V-601-VS-ZEIT")
+    assert akte.status_code == 200
+    text = akte.text
+    assert f"Aktuelle Vorschreibung ({aktueller_monat})" in text
+    idx_zukunft = text.find("Zukünftig terminierte Vorschreibungen")
+    assert idx_zukunft > 0
+    assert "550,00" in text[:idx_zukunft]  # aktueller Betrag vor der Zukunfts-Sektion sichtbar
+    assert "2099-01" in text[idx_zukunft:]
+    assert "999,99" not in text  # Zukunftsbetrag wird nicht als aktueller Wert prominent gezeigt
+    assert "2020-01" in text  # vergangener Monat bleibt in "Weitere vergangene Monate" nachvollziehbar
+
+
+def test_erledigen_objektfilter_gilt_auch_fuer_aufgabenkarten(backoffice_client):
+    """Der Objektfilter des Dashboards muss auch für "Das ist zu
+    erledigen" gelten - eine Aufgabenkarte eines anderen Objekts darf
+    nicht in der gefilterten Ansicht auftauchen."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_, op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_objekt(id="616", gesellschaft_id="7DI", bezeichnung="Fockygasse (Test)")
+    stammdaten.upsert_einheit(id="616-TOP-FILTER", objekt_id="616", bezeichnung="Top Filter 616", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-616-FILTER", einheit_id="616-TOP-FILTER", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-616-FILTER"))
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=1_234,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=None,
+        beleg_referenz="Filtertest ohne erfasste Fälligkeit",
+    )
+
+    dashboard_601 = client.get("/backoffice/", params={"objekt_id": "601"})
+    assert dashboard_601.status_code == 200
+    abschnitt_601 = dashboard_601.text.split("<h2>Das ist zu erledigen</h2>")[1].split("<h2>")[0]
+    assert "Top Filter 616" not in abschnitt_601
+
+    dashboard_616 = client.get("/backoffice/", params={"objekt_id": "616"})
+    assert dashboard_616.status_code == 200
+    abschnitt_616 = dashboard_616.text.split("<h2>Das ist zu erledigen</h2>")[1].split("<h2>")[0]
+    assert "Top Filter 616" in abschnitt_616
+    assert "Fälligkeit klären" in abschnitt_616
+    assert "von_objekt=616" in abschnitt_616  # Objektfilter bleibt über den Aktionslink erhalten
+
+
+def test_erledigen_einheit_metadaten_auch_bei_reiner_unbekannter_faelligkeit(backoffice_client):
+    """Codex-Rückprüfung: `OffenePositionZeile` trägt selbst keine
+    Einheit - ein Vertrag mit AUSSCHLIESSLICH dem Grund "unbekannte
+    Fälligkeit" (keine Abweichung/Sperre) muss die Einheit trotzdem aus
+    der Mietkonten-Übersicht bekommen, nicht leer bleiben."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_, op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-NUR-UNBEKANNT", objekt_id="601", bezeichnung="Top Nur Unbekannte Fälligkeit", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-NUR-UNBEKANNT", einheit_id="601-TOP-NUR-UNBEKANNT", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-NUR-UNBEKANNT"))
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=4_321,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=None,
+        beleg_referenz="Nur unbekannte Fälligkeit, kein weiterer Grund",
+    )
+    dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+    assert dashboard.status_code == 200
+    abschnitt = dashboard.text.split("<h2>Das ist zu erledigen</h2>")[1].split("<h2>")[0]
+    assert "Am Corso (Test) / Top Nur Unbekannte Fälligkeit" in abschnitt
+
+
+def test_erledigen_keine_aufgabe_fuer_guthaben_trotz_alter_sperre(backoffice_client):
+    """Eine Mahnsperre auf einem bereits ausgeglichenen/Guthaben-Konto
+    ist KEINE Handlungsaufgabe - nichts zu mahnen gibt es nicht."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_, op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-GUTHABEN-SPERRE", objekt_id="601", bezeichnung="Top Guthaben trotz Sperre", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-GUTHABEN-SPERRE", einheit_id="601-TOP-GUTHABEN-SPERRE", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-GUTHABEN-SPERRE"))
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.GUTSCHRIFT, betrag_cent=5_000,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=None,
+        beleg_referenz="Guthaben trotz alter Sperre",
+    )
+    sperre_id = stammdaten.sperre_setzen(vertrag_id="V-601-GUTHABEN-SPERRE", grund="RATENPLAN", kommentar="Alter Ratenplan, längst beglichen")
+    try:
+        dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+        assert dashboard.status_code == 200
+        abschnitt = dashboard.text.split("<h2>Das ist zu erledigen</h2>")[1].split("<h2>")[0]
+        assert "Top Guthaben trotz Sperre" not in abschnitt
+    finally:
+        stammdaten.sperre_aufheben(sperre_id)
+
+
 def test_kaution_ueber_wizard_bucht_nie_in_op_saldo(backoffice_client):
     from mietinkasso.infrastructure.config import get_settings
     from mietinkasso.infrastructure.db.session import build_session_factory
