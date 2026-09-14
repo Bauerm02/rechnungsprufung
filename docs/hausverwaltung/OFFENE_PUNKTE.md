@@ -3256,3 +3256,58 @@ verfuegbar=False`) - kein erfundener Adapter.
 
 9 neue Tests insgesamt in Runde 10, 1029/1029 grün im Gesamtlauf. Keine
 Assets von Codex' Rechner abgerufen, kein Liveversand.
+
+## Korrekturpaket Runde 11: EinfachBrief-Fensterspezifikation + PDF-Positionsfehler + qualifizierte Nachvollziehbarkeit (14.09.2026)
+
+Nach veraPDF-Bestätigung von 775ab99 (echtes Logo/EB Garamond, PDF/A-2b
+konform) vier konkrete, unabhängig gemeldete Layout-/Inhaltsbefunde
+behoben:
+
+1. **EinfachBrief-Fensterspezifikation korrekt umgesetzt** (20/62 mm,
+   90x45 mm, 5 mm Schutzzone, Empfänger 11pt linksbündig, max. 6 Zeilen):
+   Fensterposition-Default auf 62 mm korrigiert (war 45, lag im
+   Betreffbereich), Breite/Höhe-Settings jetzt tatsächlich verwendet,
+   Empfänger zeilenweise linksbündig (`cell(align="L")` statt
+   `multi_cell`-Blocksatz, der kurze Firmennamen sichtbar sperrte),
+   Fließtext beginnt erst nach Fenster+Schutzzone. Logo/Absenderzeile
+   sauber getrennt (tatsächliche Logohöhe statt geschätzter Konstante),
+   Absenderzeile 8pt. Fehlende/zu lange Adresse wirft jetzt
+   `AdressfehlerError` statt eines "Postadresse fehlt"-Platzhalters im
+   druckfertigen Brief - der Aufrufer (Backoffice-Route) lehnt das
+   kontrolliert mit 422 ab.
+2. **Variable Zeilenhöhe für Kosten-/Forderungszeilen**: lange
+   Rechtsgrundlage-Texte liefen zuvor in die Betragsspalte - Bezeichnung
+   und Betrag sind jetzt getrennte Spalten mit Zeilenumbruch für die
+   Bezeichnung. Fußzeile zweizeilig, wiederholter knapper Kopf +
+   Seitenzahl auf Folgeseiten (eigene `FPDF`-Unterklasse mit
+   `header()`/`footer()`).
+3. **Echter Bug dabei gefunden und gefixt**: bricht eine Kosten-/
+   Forderungszeile selbst mitten in der Zeile um (langer Bezeichnungs-
+   text am Seitenende), landete der Betrag mit dem noch alten
+   Zeilen-Ycode ein zweites Mal umgebrochen als verwaiste Zahl ohne
+   Bezeichnung auf der übernächsten Seite. Fix: `_zeile` bricht jetzt
+   selbst VOR der Zeile um (`fpdf2.will_page_break`), Bezeichnung und
+   Betrag beginnen immer auf derselben Seite.
+4. **Qualifizierte Nachvollziehbarkeit ohne Portalzugang**: der Brief
+   zeigte bisher nur die aggregierte "Hauptforderung" und bei mehreren
+   Zinssätzen den Verweis "siehe Kostenvorschau" - für einen Mieter ohne
+   Portalzugang nicht nachvollziehbar. `erzeuge_mahnbrief_pdf` bekommt
+   jetzt itemisierte Forderungszeilen (Monat/Beleg/Fälligkeit/Betrag)
+   und die tatsächlichen Zinssegmente (Zeitraum+Satz) - aus GENAU
+   derselben `MahnkostenService.vorschau()`-Berechnung wie E-Mail-Text
+   und Buchung, keine zweite Kostenberechnung. Die itemisierten offenen
+   Forderungen werden dafür zusätzlich einmal separat gelesen (dasselbe
+   etablierte Muster wie in `mailversand_service.py`s `versand_fn`) und
+   über `vorschau.forderung_op_position_ids` gefiltert.
+5. **Routen-Robustheit**: `stufe` nur 1/2 (sonst 422), ein unparsebares
+   `heute` kontrolliert 422 statt 500. Dateiversion (Hash im
+   Dateinamen) berücksichtigt jetzt auch Empfängername/-adresse und die
+   volle Kostenkomposition (Forderungszeilen, Zinssegmente,
+   Rechtsgrundlage), nicht nur aggregierte Summen - ein geänderter
+   Empfänger oder eine unterschiedlich zusammengesetzte, aber
+   zufällig gleich hohe Summe erzeugt jetzt einen neuen Dateinamen.
+   Weiterhin authentifiziert, gesellschaftsbegrenzt, ohne DB-Schreibzugriff;
+   der Download bleibt ausdrücklich eine aktuelle Live-Vorschau, kein
+   eingefrorener Versandnachweis.
+
+18 neue/erweiterte Tests, 1042/1042 grün im Gesamtlauf. Keine Liveaktionen.

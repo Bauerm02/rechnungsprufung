@@ -1,17 +1,22 @@
 """Tests für den PDF/A-Mahnbrief-Generator (mahnwesen/brief_pdf.py) -
 reine Funktion, keine DB. Prüft PDF/A-2B-Konformitätserzwingung (fpdf2
-`enforce_compliance`), Fenster-Adressblock und dass exakt dieselben
-Beträge wie in Vorschau/E-Mail im Text erscheinen."""
+`enforce_compliance`), EinfachBrief-Fensterposition, Adressvalidierung,
+variable Zeilenhöhen und dass exakt dieselben Beträge wie in Vorschau/
+E-Mail im Text erscheinen."""
 
 from __future__ import annotations
 
 import io
 from datetime import date
+from decimal import Decimal
 
 import pytest
 from pypdf import PdfReader
 
-from mietinkasso.mahnwesen.brief_pdf import Absender, erzeuge_mahnbrief_pdf
+from mietinkasso.mahnwesen.brief_pdf import (
+    Absender, AdressfehlerError, Forderungszeile, Zinssegment, _MahnbriefPDF, _zeile,
+    erzeuge_mahnbrief_pdf, pruefe_empfaengeradresse,
+)
 
 
 def _absender(**overrides) -> Absender:
@@ -29,9 +34,12 @@ def _erzeugen(**overrides) -> bytes:
     werte = dict(
         absender=_absender(), empfaenger_name="Max Mustermieter", empfaenger_adresse="Musterstraße 1\n1010 Wien",
         objekt_bezeichnung="Am Corso", einheit_bezeichnung="Top 3", stufe=2, heute=date(2026, 9, 28),
-        zahlungsfrist_bis=date(2026, 10, 12), hauptforderung_cent=0, bereits_offene_mahnkosten_cent=2073,
-        neue_zinsen_delta_cent=54, neue_gebuehr_cent=0, gebuehr_rechtsgrundlage=None,
-        zins_hinweis="Verzugszinsen (4,0 % p.a.)", gesamtbetrag_cent=2127,
+        zahlungsfrist_bis=date(2026, 10, 12),
+        forderungszeilen=[Forderungszeile("HMZ August", date(2026, 8, 5), 83_000)],
+        bereits_offene_mahnkosten_cent=2073,
+        neue_zinsen_delta_cent=54, zins_segmente=[], zinssatz_einheitlich_text="4,0 % p.a.",
+        neue_gebuehr_cent=0, gebuehr_rechtsgrundlage=None,
+        gesamtbetrag_cent=83_000 + 2073 + 54,
     )
     werte.update(overrides)
     return erzeuge_mahnbrief_pdf(**werte)
@@ -46,13 +54,17 @@ def test_erzeugtes_pdf_ist_lesbar_und_zeigt_denselben_gesamtbetrag_wie_die_vorsc
     assert "Max Mustermieter" in text
     assert "Musterstraße 1" in text
     assert "Zweite Mahnung" in text
+    assert "830,00" in text  # itemisierte Forderungszeile
     assert "20,73" in text  # bereits offene Mahnkosten
     assert "0,54" in text  # neue Zinsen
-    assert "21,27" in text  # Gesamtbetrag - identisch zur Vorschau/E-Mail
+    assert "851,27" in text  # Gesamtbetrag - identisch zur Vorschau/E-Mail
 
 
 def test_erste_stufe_heisst_zahlungserinnerung_nicht_mahnung():
-    pdf_bytes = _erzeugen(stufe=1, hauptforderung_cent=83_000, bereits_offene_mahnkosten_cent=0, gesamtbetrag_cent=83_000)
+    pdf_bytes = _erzeugen(
+        stufe=1, forderungszeilen=[Forderungszeile("HMZ August", date(2026, 8, 5), 83_000)],
+        bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0, gesamtbetrag_cent=83_000,
+    )
     reader = PdfReader(io.BytesIO(pdf_bytes))
     text = reader.pages[0].extract_text()
     assert "Zahlungserinnerung" in text
@@ -68,13 +80,14 @@ def test_ohne_konfiguriertes_logo_wird_kein_signet_gezeichnet():
     assert len(reader.pages[0].images) == 0
 
 
-def test_absenderdaten_stehen_in_fusszeile():
+def test_absenderdaten_stehen_in_fusszeile_zweizeilig_mit_seitenzahl():
     pdf_bytes = _erzeugen()
     reader = PdfReader(io.BytesIO(pdf_bytes))
     text = reader.pages[0].extract_text()
     assert "ATU81269707" in text
     assert "FN 631126b" in text
     assert "hausverwaltung@jlb-immo.at" in text
+    assert "Seite 1/1" in text
 
 
 def test_separater_headline_font_wird_nur_fuer_betreff_verwendet_wenn_konfiguriert():
@@ -110,3 +123,168 @@ def test_fehlende_eingebettete_schrift_wird_von_pdfa_erzwingung_abgelehnt():
     pdf.add_page()
     with pytest.raises(PDFAComplianceError):
         pdf.set_font("Helvetica", "", 11)
+
+
+# -- EinfachBrief-Fensterspezifikation (Codex 14.09.2026: 20/62 mm, ------
+# -- 90x45 mm, 5 mm Schutzzone, Empfänger 11pt linksbündig, max 6 Zeilen)
+
+
+def test_fensterposition_entspricht_der_einfachbrief_spezifikation():
+    absender = _absender()
+    assert absender.fenster_links_mm == 20.0
+    assert absender.fenster_oben_mm == 62.0
+    assert absender.fenster_breite_mm == 90.0
+    assert absender.fenster_hoehe_mm == 45.0
+
+
+def test_pruefe_empfaengeradresse_lehnt_fehlende_adresse_ab():
+    with pytest.raises(AdressfehlerError):
+        pruefe_empfaengeradresse(None)
+    with pytest.raises(AdressfehlerError):
+        pruefe_empfaengeradresse("   ")
+
+
+def test_pruefe_empfaengeradresse_lehnt_zu_lange_adresse_ab():
+    with pytest.raises(AdressfehlerError):
+        pruefe_empfaengeradresse("Z1\nZ2\nZ3\nZ4\nZ5\nZ6\nZ7")
+
+
+def test_erzeuge_mahnbrief_pdf_lehnt_fehlende_adresse_ab_statt_platzhalter_zu_drucken():
+    """Ein druckfertiger Brief darf NIE "Postadresse fehlt" als
+    Empfänger zeigen - kontrolliertes Scheitern statt Überlauf/
+    Platzhalter."""
+
+    with pytest.raises(AdressfehlerError):
+        _erzeugen(empfaenger_adresse="")
+
+
+def test_erzeuge_mahnbrief_pdf_lehnt_zu_lange_empfaenger_plus_adresse_ab():
+    with pytest.raises(AdressfehlerError):
+        _erzeugen(empfaenger_name="Ein Sehr Langer Name GmbH & Co KG", empfaenger_adresse="Z1\nZ2\nZ3\nZ4\nZ5\nZ6")
+
+
+def test_empfaengeradresse_wird_linksbuendig_nicht_im_blocksatz_gesetzt():
+    """Rückprüfung Codex 14.09.2026: `multi_cell`s Standard-Blocksatz
+    hatte kurze Firmennamen sichtbar gesperrt/gestreckt - der Empfänger
+    wird jetzt zeilenweise über `cell(align="L")` gesetzt."""
+
+    import inspect
+    quelltext = inspect.getsource(erzeuge_mahnbrief_pdf)
+    fenster_abschnitt = quelltext.split("Empfänger AUSSCHLIESSLICH")[1].split("Fließtext beginnt")[0]
+    assert "multi_cell(" not in fenster_abschnitt
+
+
+# -- Variable Zeilenhöhe für lange Bezeichnungen (keine Überschneidung ---
+# -- mit der Betragsspalte) -----------------------------------------------
+
+
+def test_lange_gebuehrenbezeichnung_laeuft_nicht_in_betragsspalte():
+    lange_bezeichnung = (
+        "§458 UGB - eine sehr lange, ausführliche Rechtsgrundlage-Beschriftung, die eigentlich in die "
+        "Betragsspalte hineinlaufen würde, wenn sie nicht umgebrochen wird"
+    )
+    pdf_bytes = _erzeugen(neue_gebuehr_cent=4000, gebuehr_rechtsgrundlage=lange_bezeichnung, gesamtbetrag_cent=87_127)
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = reader.pages[0].extract_text()
+    assert "40,00" in text
+    assert "Rechtsgrundlage-Beschriftung" in text
+
+
+def test_zinssegmente_werden_mit_zeitraum_und_satz_aufgelistet():
+    """Für eine nachvollziehbare Mahnung müssen die tatsächlichen
+    Zinszeiträume/-sätze im PDF stehen, nicht nur ein pauschaler
+    Verweis auf "mehrere Sätze"."""
+
+    segmente = [
+        Zinssegment(date(2026, 6, 1), date(2026, 6, 30), Decimal("1.530"), 40),
+        Zinssegment(date(2026, 7, 1), date(2026, 9, 28), Decimal("2.000"), 14),
+    ]
+    pdf_bytes = _erzeugen(
+        neue_zinsen_delta_cent=54, zins_segmente=segmente, zinssatz_einheitlich_text=None,
+        gesamtbetrag_cent=83_000 + 2073 + 54,
+    )
+    text = PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text()
+    assert "01.06.2026" in text and "30.06.2026" in text
+    assert "1.530" in text
+    assert "01.07.2026" in text and "28.09.2026" in text
+    assert "2.000" in text
+
+
+def test_mehrere_forderungszeilen_werden_einzeln_und_als_summe_gezeigt():
+    zeilen = [
+        Forderungszeile("Hauptmietzins August", date(2026, 8, 5), 50_000),
+        Forderungszeile("Betriebskosten August", date(2026, 8, 5), 33_000),
+    ]
+    pdf_bytes = _erzeugen(
+        forderungszeilen=zeilen, bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0,
+        gesamtbetrag_cent=83_000,
+    )
+    text = PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text()
+    assert "Hauptmietzins August" in text
+    assert "500,00" in text
+    assert "Betriebskosten August" in text
+    assert "330,00" in text
+    assert "Hauptforderung gesamt" in text
+    assert "830,00" in text
+
+
+# -- Mehrseitige Briefe: wiederholter Kopf + zweizeilige Fußzeile + -------
+# -- Seitenzahl, kein Seitenumbruch mitten in einer Kosten-/Forderungszeile
+
+
+def test_viele_forderungszeilen_erzeugen_wiederholten_kompakten_kopf_auf_folgeseiten():
+    zeilen = [Forderungszeile(f"Hauptmietzins Monat {i}", date(2026, 1, i % 28 + 1), 5000 + i) for i in range(1, 30)]
+    pdf_bytes = _erzeugen(
+        forderungszeilen=zeilen, bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0,
+        gesamtbetrag_cent=sum(z.betrag_cent for z in zeilen),
+    )
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    assert len(reader.pages) >= 2
+    seite2_text = reader.pages[1].extract_text()
+    assert "JLB Projects GmbH" in seite2_text  # wiederholter knapper Kopf
+    assert "Zweite Mahnung" in seite2_text
+    assert "Seite 2/" in seite2_text
+
+
+def test_seitenumbruch_reisst_keine_betragsspalte_von_ihrer_bezeichnung_ab():
+    """Rückprüfung Codex 14.09.2026, echter Bug: `_zeile` verwendete für
+    Bezeichnung und Betrag denselben, vor dem Zeilenumbruch erfassten
+    `y0` - brach `multi_cell` selbst mitten in der Zeile um, landete der
+    Betrag verwaist auf der FOLGESEITE ohne seine Bezeichnung. `_zeile`
+    bricht jetzt selbst VOR der Zeile um (`will_page_break`), damit
+    Bezeichnung und Betrag immer auf derselben Seite beginnen."""
+
+    zeilen = [Forderungszeile(f"Hauptmietzins Monat {i}, fällig seit 05.08.2026", date(2026, 8, 5), 5000 + i) for i in range(1, 30)]
+    pdf_bytes = _erzeugen(
+        forderungszeilen=zeilen, bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0,
+        gesamtbetrag_cent=sum(z.betrag_cent for z in zeilen),
+    )
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    for seite in reader.pages:
+        for zeile in seite.extract_text().splitlines():
+            zeile = zeile.strip()
+            if zeile.endswith("EUR") and "gesamt" not in zeile.lower() and "Gesamtbetrag" not in zeile:
+                assert "Hauptmietzins" in zeile, f"verwaiste Betragszeile ohne Bezeichnung: {zeile!r}"
+
+
+def test_will_page_break_verhindert_verwaisten_betrag_direkt_am_seitenumbruch():
+    """Gezielter Grenzfalltest exakt am Seitenumbruch (unabhängig vom
+    restlichen Briefaufbau)."""
+
+    pdf = _MahnbriefPDF(format="A4", unit="mm", enforce_compliance="PDF/A-2B")
+    pdf.farbe_anthrazit, pdf.farbe_gold = (0, 0, 0), (0, 0, 0)
+    pdf.kopf_text, pdf.fuss_zeile1, pdf.fuss_zeile2 = "K", "F1", "F2"
+    pdf.set_margins(20, 20, 20)
+    pdf.set_auto_page_break(True, margin=24)
+    pdf.alias_nb_pages()
+    pdf.add_font("Brief", "", "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf")
+    pdf.add_font("Brief", "B", "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf")
+    pdf.add_page()
+    pdf.set_y(270)  # knapp unter dem Umbruch-Trigger (297-24=273)
+    _zeile(pdf, "Hauptmietzins Monat X, fällig seit 05.08.2026", 5000)
+    assert pdf.page_no() == 2  # Zeile als Ganzes auf Seite 2 umgebrochen
+
+    out = bytes(pdf.output())
+    text = PdfReader(io.BytesIO(out)).pages[1].extract_text()
+    assert "Hauptmietzins Monat X" in text
+    assert "50,00" in text

@@ -93,7 +93,10 @@ from mietinkasso.vertragsanlage.vorschlaege import (
     mehrdeutigkeiten_aus_extraktion as _vertragsanlage_mehrdeutigkeiten_aus_extraktion,
     vorschlaege_aus_extraktion as _vertragsanlage_vorschlaege_aus_extraktion,
 )
-from mietinkasso.mahnwesen.brief_pdf import Absender as _BriefAbsender, erzeuge_mahnbrief_pdf as _erzeuge_mahnbrief_pdf
+from mietinkasso.mahnwesen.brief_pdf import (
+    Absender as _BriefAbsender, AdressfehlerError as _BriefAdressfehlerError, Forderungszeile as _BriefForderungszeile,
+    Zinssegment as _BriefZinssegment, erzeuge_mahnbrief_pdf as _erzeuge_mahnbrief_pdf,
+)
 from mietinkasso.op.service import compute_content_hash as _compute_content_hash
 from mietinkasso.mahnwesen.repository import (
     BriefAnbieterProfilRepository, MahnFallRepository, MahnKanalregelRepository, MahnPolicyRepository,
@@ -1715,10 +1718,23 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
     """Bereitet EINEN druckfertigen PDF/A-Mahnbrief aus GENAU demselben
     Kosten-/Forderungsstand vor, den auch `_mahnkosten_vorschau_block`
     anzeigt - reiner Download, keine Buchung, kein Versand, kein
-    Zustellnachweis. Der Dateiname trägt einen Hash über den
-    zugrundeliegenden Kostenstand: derselbe Stand liefert denselben
-    Namen (versioniert), ein veränderter Stand (z. B. nach einer
-    Zahlung) einen neuen."""
+    Zustellnachweis, ausdrücklich eine AKTUELLE Vorschau (kein
+    eingefrorener Versandnachweis - jeder Aufruf liest live neu).
+    Forderungszeilen/Zinssegmente stammen aus derselben `vorschau()`-
+    Berechnung wie der E-Mail-Text (keine zweite Kostenberechnung); die
+    itemisierten offenen Forderungen werden zusätzlich EINMAL separat
+    gelesen (wie im etablierten Muster in `mailversand_service.py`s
+    `versand_fn`) und anhand `vorschau.forderung_op_position_ids`
+    gefiltert, nie unabhängig neu berechnet. Der Dateiname trägt einen
+    Hash über Kostenkomposition UND Empfängerdaten: nur ein in beidem
+    unveränderter Stand liefert denselben Namen."""
+
+    if stufe not in (1, 2):
+        raise HTTPException(status_code=422, detail="stufe muss 1 oder 2 sein.")
+    try:
+        heute_datum = date.fromisoformat(heute) if heute else date.today()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Ungültiges Datum für 'heute' (Format YYYY-MM-DD erwartet).")
 
     vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
     konto = _stammdaten_repo.get_konto_by_vertrag(vertrag_id) if vertrag else None
@@ -1726,7 +1742,6 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
         raise HTTPException(status_code=404, detail="Unbekannter Vertrag oder kein Konto.")
     require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
 
-    heute_datum = date.fromisoformat(heute) if heute else date.today()
     debitor = _stammdaten_repo.get_debitor(konto.debitor_id)
     objekt = _stammdaten_repo.objekt_fuer_vertrag(vertrag_id)
     einheit = _stammdaten_repo.get_einheit(vertrag.einheit_id)
@@ -1738,11 +1753,23 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
     if vorschau is None:
         raise HTTPException(status_code=404, detail="Keine Kostenvorschau für diesen Vertrag/diese Stufe verfügbar.")
 
+    offene_ids = set(vorschau.forderung_op_position_ids)
+    forderungszeilen = [
+        _BriefForderungszeile(
+            bezeichnung=f.leistungsperiode or f.art,
+            faelligkeit=f.faelligkeit if f.faelligkeit_bekannt else None,
+            betrag_cent=f.rest_cent,
+        )
+        for f in _op_service.offene_forderungen(konto.id, heute=heute_datum)
+        if f.op_position_id in offene_ids
+    ]
+    zins_segmente = [
+        _BriefZinssegment(von=s.von, bis=s.bis, satz_prozent=s.satz_prozent, zinsen_cent=s.zinsen_cent)
+        for s in vorschau.zins_segmente
+    ]
     gesamtbetrag_cent = vorschau.hauptforderung_cent + vorschau.bereits_offene_mahnkosten_cent + vorschau.zusaetzlicher_betrag_cent
-    zins_hinweis = (
-        f"Verzugszinsen ({vorschau.zinssatz_prozent} % p.a.)" if vorschau.zinssatz_prozent is not None
-        else "Verzugszinsen (mehrere Sätze, siehe Kostenvorschau)"
-    )
+    zinssatz_einheitlich_text = f"{vorschau.zinssatz_prozent} % p.a." if vorschau.zinssatz_prozent is not None else None
+
     absender = _BriefAbsender(
         name=_settings.brief_absender_name, adresse=_settings.brief_absender_adresse, fn=_settings.brief_absender_fn,
         uid=_settings.brief_absender_uid, telefon=_settings.brief_absender_telefon, website=_settings.brief_absender_website,
@@ -1750,19 +1777,27 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
         logo_pfad=_settings.brief_logo_pfad, font_regular_pfad=_settings.brief_font_regular_pfad, font_bold_pfad=_settings.brief_font_bold_pfad,
         font_headline_pfad=_settings.brief_font_headline_pfad,
         fenster_links_mm=_settings.brief_fenster_links_mm, fenster_oben_mm=_settings.brief_fenster_oben_mm,
+        fenster_breite_mm=_settings.brief_fenster_breite_mm, fenster_hoehe_mm=_settings.brief_fenster_hoehe_mm,
     )
-    pdf_bytes = _erzeuge_mahnbrief_pdf(
-        absender=absender, empfaenger_name=debitor.name, empfaenger_adresse=(debitor.adresse or "Postadresse fehlt").replace(", ", "\n"),
-        objekt_bezeichnung=objekt.bezeichnung, einheit_bezeichnung=einheit.bezeichnung, stufe=stufe, heute=heute_datum,
-        zahlungsfrist_bis=heute_datum + timedelta(days=vertrag.zahlungsfrist_tage),
-        hauptforderung_cent=vorschau.hauptforderung_cent, bereits_offene_mahnkosten_cent=vorschau.bereits_offene_mahnkosten_cent,
-        neue_zinsen_delta_cent=vorschau.neue_zinsen_delta_cent, neue_gebuehr_cent=(vorschau.gebuehr_cent or 0),
-        gebuehr_rechtsgrundlage=vorschau.gebuehr_rechtsgrundlage, zins_hinweis=zins_hinweis, gesamtbetrag_cent=gesamtbetrag_cent,
-    )
+    try:
+        pdf_bytes = _erzeuge_mahnbrief_pdf(
+            absender=absender, empfaenger_name=debitor.name, empfaenger_adresse=(debitor.adresse or "").replace(", ", "\n"),
+            objekt_bezeichnung=objekt.bezeichnung, einheit_bezeichnung=einheit.bezeichnung, stufe=stufe, heute=heute_datum,
+            zahlungsfrist_bis=heute_datum + timedelta(days=vertrag.zahlungsfrist_tage),
+            forderungszeilen=forderungszeilen, bereits_offene_mahnkosten_cent=vorschau.bereits_offene_mahnkosten_cent,
+            neue_zinsen_delta_cent=vorschau.neue_zinsen_delta_cent, zins_segmente=zins_segmente,
+            zinssatz_einheitlich_text=zinssatz_einheitlich_text, neue_gebuehr_cent=(vorschau.gebuehr_cent or 0),
+            gebuehr_rechtsgrundlage=vorschau.gebuehr_rechtsgrundlage, gesamtbetrag_cent=gesamtbetrag_cent,
+        )
+    except _BriefAdressfehlerError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
     version = _compute_content_hash({
-        "vertrag_id": vertrag_id, "stufe": stufe, "gesamtbetrag_cent": gesamtbetrag_cent,
+        "vertrag_id": vertrag_id, "stufe": stufe, "empfaenger_name": debitor.name, "empfaenger_adresse": debitor.adresse,
         "hauptforderung_cent": vorschau.hauptforderung_cent, "bereits_offene_mahnkosten_cent": vorschau.bereits_offene_mahnkosten_cent,
-        "zusaetzlicher_betrag_cent": vorschau.zusaetzlicher_betrag_cent,
+        "zusaetzlicher_betrag_cent": vorschau.zusaetzlicher_betrag_cent, "gebuehr_rechtsgrundlage": vorschau.gebuehr_rechtsgrundlage,
+        "forderungszeilen": [(f.bezeichnung, str(f.faelligkeit), f.betrag_cent) for f in forderungszeilen],
+        "zins_segmente": [(str(s.von), str(s.bis), str(s.satz_prozent), s.zinsen_cent) for s in zins_segmente],
     })[:12]
     dateiname = f"Mahnbrief_{vertrag_id}_Stufe{stufe}_{heute_datum.isoformat()}_{version}.pdf"
     return Response(

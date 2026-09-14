@@ -2675,9 +2675,10 @@ def test_mahnbrief_pdf_download_zeigt_denselben_gesamtbetrag_wie_die_vorschau(ba
     _login(client)
 
     stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_debitor(id="DEB-BRIEFPDF", name="Test Mieterin Briefpdf", email="briefpdf@example.at", adresse="Musterstraße 1, 1010 Wien")
     stammdaten.upsert_einheit(id="601-TOP-BRIEFPDF", objekt_id="601", bezeichnung="Top Briefpdf", nutzungsstatus="DAUERVERMIETUNG")
     stammdaten.upsert_vertrag(
-        id="V-601-BRIEFPDF", einheit_id="601-TOP-BRIEFPDF", debitor_id="DEB-1", gesellschaft_id="7DI",
+        id="V-601-BRIEFPDF", einheit_id="601-TOP-BRIEFPDF", debitor_id="DEB-BRIEFPDF", gesellschaft_id="7DI",
         rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
     )
     konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-BRIEFPDF"))
@@ -2696,6 +2697,41 @@ def test_mahnbrief_pdf_download_zeigt_denselben_gesamtbetrag_wie_die_vorschau(ba
     text = PdfReader(io.BytesIO(antwort.content)).pages[0].extract_text()
     assert "Test Mieterin" in text  # DEB-1
     assert "500,00" in text  # Hauptforderung 500 EUR
+
+
+def test_mahnbrief_pdf_lehnt_ungueltige_parameter_und_fehlende_adresse_kontrolliert_ab(backoffice_client):
+    """Rückprüfung Codex 14.09.2026: `stufe` nur 1/2, ein unparsebares
+    Datum und eine fehlende Postadresse dürfen NIE zu einem 500er oder
+    zu einem druckfertigen Platzhalter-Brief führen, sondern zu einem
+    kontrollierten 4xx."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_debitor(id="DEB-OHNE-ADRESSE", name="Test Mieterin Ohne Adresse", email="ohne-adresse@example.at")
+    stammdaten.upsert_einheit(id="601-TOP-OHNE-ADRESSE", objekt_id="601", bezeichnung="Top Ohne Adresse", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-OHNE-ADRESSE", einheit_id="601-TOP-OHNE-ADRESSE", debitor_id="DEB-OHNE-ADRESSE", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-OHNE-ADRESSE"))
+
+    ungueltige_stufe = client.get("/backoffice/vertrag/V-601-OHNE-ADRESSE/mahnbrief.pdf", params={"stufe": 3})
+    assert ungueltige_stufe.status_code == 422
+
+    ungueltiges_datum = client.get(
+        "/backoffice/vertrag/V-601-OHNE-ADRESSE/mahnbrief.pdf", params={"stufe": 1, "heute": "keine-datumsangabe"},
+    )
+    assert ungueltiges_datum.status_code == 422
+
+    fehlende_adresse = client.get("/backoffice/vertrag/V-601-OHNE-ADRESSE/mahnbrief.pdf", params={"stufe": 1, "heute": "2026-09-01"})
+    assert fehlende_adresse.status_code == 422
+    assert "Postadresse" in fehlende_adresse.text
 
 
 def test_mahnvorschau_zeigt_brief_wartet_auf_anbindung_und_pdf_link_bei_kanal_brief(backoffice_client):
