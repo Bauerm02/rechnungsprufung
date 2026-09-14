@@ -333,6 +333,11 @@ def seite(
      mitten im Wort - die Seite selbst wird NICHT breiter, nur diese
      Zelle scrollt bei Bedarf mit dem umgebenden .tabelle-scroll mit. */
   .tabelle-scroll td.bank-aktion {{ min-width: 180px; overflow-wrap: normal; word-break: normal; }}
+  /* Mobilbefund 390px: ohne Mindestbreite quetscht der Browser die
+     Referenzspalte auf 1 Zeichen zusammen statt die Tabelle horizontal
+     scrollen zu lassen - .bank-tabelle erzwingt eine lesbare
+     Mindestbreite, .tabelle-scroll übernimmt dafür das Scrollen. */
+  .bank-tabelle {{ min-width: 760px; }}
   /* Bankübersicht (Auftrag HV-20260914-BANKUEBERSICHT): "Mit bestehender
      Zahlung verknüpfen" bewusst optisch hervorgehoben (gefüllt statt nur
      Outline), um Doppelbuchungen zu vermeiden - sparsamer Golddunkel-

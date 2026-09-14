@@ -1753,7 +1753,7 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
               <p class="muted">Summe (Bankbeträge): {eur(_summe(eingaenge))} &middot; kein Mieter-Offener-Posten &middot;
                  "Bestehende Zahlung verknüpfen" vor manueller Neuzuordnung prüfen (vermeidet Doppelbuchung).</p>
               {eingang_ebs_hinweis}
-              <div class="tabelle-scroll"><table>
+              <div class="tabelle-scroll"><table class="bank-tabelle">
                 <tr><th class="nowrap">Betrag</th><th class="nowrap">Datum</th><th>Referenz</th>
                     <th class="nowrap">Offen</th><th>Hinweis</th>{eingang_vorschlag_th}<th>Aktion</th></tr>
                 {eingaenge_html}
@@ -1763,7 +1763,7 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
               <h2>Rücklastschriften / Klärfälle ({len(klaerfaelle)})</h2>
               <p class="muted">Summe (Bankbeträge): {eur(_summe(klaerfaelle))} &middot; Prüffälle, kein
                  Zuordnungsformular &middot; kein Mieter-Offener-Posten &middot; hebt keine gültige Mahnsperre auf.</p>
-              <div class="tabelle-scroll"><table>
+              <div class="tabelle-scroll"><table class="bank-tabelle">
                 <tr><th class="nowrap">Betrag</th><th class="nowrap">Datum</th><th>Referenz</th><th>Hinweis</th><th>Status</th><th></th></tr>
                 {klaerfaelle_html}
               </table></div>
@@ -1772,7 +1772,7 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
               <summary>Umbuchungen ({len(umbuchungen)}) &mdash; Hinweis aus Banktext</summary>
               <p class="muted">Summe (Bankbeträge): {eur(_summe(umbuchungen))} &middot; reiner Anzeigehinweis
                  &middot; kein Mieter-Offener-Posten.</p>
-              <div class="tabelle-scroll"><table>
+              <div class="tabelle-scroll"><table class="bank-tabelle">
                 <tr><th class="nowrap">Betrag</th><th class="nowrap">Datum</th><th>Referenz</th><th>Hinweis</th><th></th></tr>
                 {umbuchungen_html}
               </table></div>
@@ -1781,7 +1781,7 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
               <summary>Ausgänge / Betriebsausgaben ({len(ausgaenge)}) &mdash; Hinweis aus Banktext</summary>
               <p class="muted">Summe (Bankbeträge): {eur(_summe(ausgaenge))} &middot; reiner Anzeigehinweis
                  &middot; kein Mieter-Offener-Posten.</p>
-              <div class="tabelle-scroll"><table>
+              <div class="tabelle-scroll"><table class="bank-tabelle">
                 <tr><th class="nowrap">Betrag</th><th class="nowrap">Datum</th><th>Referenz</th><th>Hinweis</th><th></th></tr>
                 {ausgaenge_html}
               </table></div>
