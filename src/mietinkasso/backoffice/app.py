@@ -59,7 +59,9 @@ from mietinkasso.backoffice.vertragsanlage_form import (
     vertraege_liste_formular as _vertragsanlage_liste_formular,
     vorschau_ansicht as _vertragsanlage_vorschau_ansicht,
 )
-from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, ist_bekannte_demo_umgebung, option, parse_eur_betrag, seite
+from mietinkasso.backoffice.views import (
+    csrf_feld, eur, flash_error, flash_ok, ist_bekannte_demo_umgebung, nutzungsstatus_label, option, parse_eur_betrag, seite,
+)
 from mietinkasso.bank.importer import (
     CamtKontoMismatchError,
     CamtMehrteiligeBuchungError,
@@ -246,6 +248,7 @@ def _layout(request: Request, session, titel: str, inhalt: str) -> HTMLResponse:
         titel=titel, inhalt=inhalt, user_id=session.user_id if session else None,
         csrf_token=session.csrf_token if session else None,
         environment=_settings.environment, send_enabled=_settings.send_enabled,
+        aktueller_pfad=request.url.path,
     ))
 
 
@@ -349,17 +352,145 @@ def _rueckstaende_objekt_filter_form(uebersicht, *, action: str = "/backoffice/"
 
 
 def _rueckstaende_kpi_html(k) -> str:
+    """Vier verständliche Kennzahlen für den Alltag (Auftrag
+    HV-20260914-UI-EINFACH) statt fünf technisch benannter Summen -
+    dieselben bereits vorhandenen Zahlen aus `RueckstandsKennzahlen`,
+    NUR neu beschriftet/gruppiert. "Davon fällig" ist die Summe der
+    EINZELPOSITIONEN mit bekannter, verstrichener Fälligkeit (nicht
+    identisch mit der Kontosaldo-Rechnung - siehe Erklärung), eine
+    unbekannte Fälligkeit heißt "Fälligkeit prüfen" (NICHT "strittig"),
+    und ein Guthaben wird nie gegen einen Rückstand verrechnet. Die
+    bisherige fünfte Zahl ("Noch nicht fällig") bleibt unter "weitere
+    Kennzahlen" erreichbar, damit keine Information verloren geht."""
+
     def _kpi(label: str, cent: int) -> str:
         return f'<div class="kpi"><span class="zahl">{eur(cent)}</span><span class="kpi-label">{h(label)}</span></div>'
 
     return f"""
     <div class="kpi-grid">
-      {_kpi("Summe positiver Kontostände", k.summe_positiver_kontostaende_cent)}
-      {_kpi("Guthaben gesamt (nicht verrechnet)", k.summe_guthaben_cent)}
-      {_kpi("Fällig/überfällig (bekanntes Datum)", k.ueberfaellig_cent)}
-      {_kpi("Noch nicht fällig", k.nicht_faellig_cent)}
-      {_kpi("Fälligkeit unbekannt", k.faelligkeit_unbekannt_cent)}
+      {_kpi("Offene Beträge", k.summe_positiver_kontostaende_cent)}
+      {_kpi("Davon fällig", k.ueberfaellig_cent)}
+      {_kpi("Fälligkeit prüfen", k.faelligkeit_unbekannt_cent)}
+      {_kpi("Guthaben der Mieter", k.summe_guthaben_cent)}
+    </div>
+    <details class="card">
+      <summary>Was bedeutet das? / weitere Kennzahlen</summary>
+      <ul>
+        <li><strong>Offene Beträge</strong>: Summe aller positiven Mietkonten (Rückstände) - ein Guthaben
+            eines anderen Mieters wird NIE davon abgezogen.</li>
+        <li><strong>Davon fällig</strong>: der Teil der offenen Beträge, dessen Fälligkeit bereits verstrichen
+            ist (Summe der einzelnen offenen Posten, siehe "Details" je Zeile) - eine bekannte Fälligkeit ist
+            KEINE Mahnfreigabe, eine bestehende Sperre gilt unabhängig davon.</li>
+        <li><strong>Fälligkeit prüfen</strong>: offene Posten ohne erfasstes Fälligkeitsdatum - das heißt
+            NICHT automatisch "strittig", sondern nur: das Datum fehlt noch in den Stammdaten.</li>
+        <li><strong>Guthaben der Mieter</strong>: Summe aller negativen Mietkonten - eigenes Geld der Mieter,
+            wird nicht automatisch verrechnet.</li>
+        <li class="muted">Weitere Kennzahl: Noch nicht fällig {eur(k.nicht_faellig_cent)}.</li>
+      </ul>
+    </details>"""
+
+
+def _erledigen_html(uebersicht, *, send_enabled: bool) -> str:
+    """"Das ist zu erledigen" (Auftrag HV-20260914-UI-EINFACH) - reine
+    Aggregation/Filterung der bereits in `uebersicht` vorhandenen Zahlen/
+    Sperren, KEINE neue Berechnung und KEINE erfundenen Aufgaben. Die
+    Bankschnittstellen-Grenze (kein automatischer Abgleich vor EBS/EBICS)
+    ist eine bereits dokumentierte Betriebsgrenze (siehe AGENTS.md/
+    RAHMENPROGRAMM.md), kein "Nachweis aktueller Bankdaten" - wird darum
+    als neutraler Funktionsstatus formuliert, nicht als Warnung."""
+
+    punkte: list[str] = []
+    unbekannte_positionen = [p for p in uebersicht.offene_positionen if p.faelligkeitsklasse == "UNBEKANNT"]
+    if unbekannte_positionen:
+        summe = sum(p.rest_cent for p in unbekannte_positionen)
+        punkte.append(
+            f'<li><a href="#offene-positionen">{len(unbekannte_positionen)} offene Position(en) ohne erfasste '
+            f'Fälligkeit</a> ({eur(summe)}) - Fälligkeit klären.</li>'
+        )
+    abweichende_konten = [z for z in uebersicht.mietkonten if z.abweichung_saldo_zu_positionen_cent]
+    if abweichende_konten:
+        punkte.append(
+            f'<li><a href="#mietkonten-details">{len(abweichende_konten)} Mietkonto/-konten mit Abweichung</a> '
+            "zwischen Kontostand und Einzelpositionen - Kontoabweichung prüfen.</li>"
+        )
+    gesperrte_konten = [z for z in uebersicht.mietkonten if z.sperrgruende]
+    if gesperrte_konten:
+        punkte.append(
+            f'<li><a href="#mietkonten-uebersicht">{len(gesperrte_konten)} Mietkonto/-konten mit aktiver '
+            "Mahnsperre</a> - vorhandene Mahnsperren prüfen.</li>"
+        )
+    aufgaben_html = (
+        f'<ul class="todo-liste">{"".join(punkte)}</ul>' if punkte
+        else '<p class="muted">Keine offenen Klärpunkte aus den aktuellen Daten.</p>'
+    )
+    status_zeilen = [
+        f'E-Mail-Versand: {"aktiv" if send_enabled else "pausiert (SEND_ENABLED=false)"}',
+        "Bankdaten: manuell aktualisieren (automatischer Abgleich folgt erst mit EBS/EBICS)",
+        "Mahnbrief per Post: noch nicht angebunden",
+    ]
+    status_html = "".join(f"<span>{h(s)}</span>" for s in status_zeilen)
+    return f"""
+    <div class="card">
+      <h2>Das ist zu erledigen</h2>
+      {aufgaben_html}
+      <div class="status-zeile">{status_html}</div>
     </div>"""
+
+
+def _rueckstaende_kompakt_zeile_html(z, *, unbekannte_faelligkeit: bool) -> str:
+    """Kompakte Hauptzeile (Auftrag HV-20260914-UI-EINFACH): Mieter/
+    Einheit, offener Betrag/Guthaben, EIN verständlicher Status statt
+    vieler Einzel-Badges, "Akte öffnen". Konto-/Vertrags-ID und die
+    getrennten Kontoberechnung-/Positionen-Zahlen bleiben über "Details"
+    je Zeile erreichbar, verschwinden aber nicht - keine neue
+    Saldologik, nur andere Anzeige derselben bereits berechneten Werte."""
+
+    if z.sperrgruende:
+        status_html = f'<span class="badge badge-error">Mahnung gesperrt ({h(", ".join(z.sperrgruende))})</span>'
+    elif z.abweichung_saldo_zu_positionen_cent:
+        status_html = '<span class="badge badge-warn">Klärung nötig (Kontoabweichung)</span>'
+    elif unbekannte_faelligkeit:
+        status_html = '<span class="badge badge-warn">Klärung nötig (Fälligkeit prüfen)</span>'
+    elif z.saldo_cent is None:
+        status_html = '<span class="badge badge-muted">kein Mietkonto</span>'
+    elif z.saldo_cent > 0:
+        status_html = '<span class="badge badge-error">Rückstand offen</span>'
+    elif z.saldo_cent < 0:
+        status_html = '<span class="badge badge-ok">Guthaben</span>'
+    else:
+        status_html = '<span class="badge badge-ok">ausgeglichen</span>'
+    if z.historisch:
+        status_html += ' <span class="badge badge-muted">historisch</span>'
+    if z.mahnfaelle_anzahl:
+        status_html += f' <span class="badge badge-muted">{z.mahnfaelle_anzahl} Mahnfall(e)</span>'
+
+    betrag_html = eur(z.saldo_cent) if z.saldo_cent is not None else "-"
+    details_zeilen = []
+    if z.konto_id:
+        details_zeilen.append(f"Konto: <code>{h(z.konto_id)}</code>")
+    details_zeilen.append(f"Vertrag: <code>{h(z.vertrag_id)}</code>")
+    if z.faelliger_unstrittiger_rest_cent is not None:
+        details_zeilen.append(f"Fällig (Kontoberechnung): {eur(z.faelliger_unstrittiger_rest_cent)}")
+    if z.positionen_faelliger_rest_cent is not None:
+        details_zeilen.append(f"Fällig (Positionen): {eur(z.positionen_faelliger_rest_cent)}")
+    if z.positionen_rest_gesamt_cent is not None:
+        details_zeilen.append(f"Rest gesamt (Positionen): {eur(z.positionen_rest_gesamt_cent)}")
+    if z.abweichung_saldo_zu_positionen_cent:
+        details_zeilen.append(f"Abweichung Konto/Positionen: {eur(z.abweichung_saldo_zu_positionen_cent)}")
+    details_html = "<br>".join(details_zeilen)
+    mahnvorschau_html = (
+        f' · <a href="/backoffice/vertrag/{h(z.vertrag_id)}/mahnvorschau">Mahnvorschau</a>' if z.konto_id else ""
+    )
+    return (
+        f"<tr class='{'gesperrt-row' if z.sperrgruende else ''}'>"
+        f"<td>{h(z.debitor_name)}<br><span class='muted'>{h(z.objekt_bezeichnung)} / {h(z.einheit_bezeichnung)} "
+        f"({h(nutzungsstatus_label(z.nutzungsstatus))})</span></td>"
+        f"<td>{betrag_html}</td>"
+        f"<td>{status_html}</td>"
+        f'<td><a href="/backoffice/vertrag/{h(z.vertrag_id)}">Akte öffnen</a>{mahnvorschau_html}'
+        f"<details><summary>Details</summary>{details_html}</details></td>"
+        "</tr>"
+    )
 
 
 def _rueckstaende_mietkonto_zeile_html(z) -> str:
@@ -478,10 +609,34 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
             f"{h(gefiltertes_objekt.bezeichnung)} ({h(gefiltertes_objekt.id)})"
             if gefiltertes_objekt is not None else h(uebersicht.objekt_filter)
         )
+    erledigen_html = _erledigen_html(uebersicht, send_enabled=_settings.send_enabled)
+
+    # Für die kompakte Statusspalte: welche Verträge haben mindestens
+    # eine offene Position OHNE erfasste Fälligkeit - reine Gruppierung
+    # der bereits klassifizierten `offene_positionen`, keine neue
+    # Fälligkeitslogik.
+    vertraege_mit_unbekannter_faelligkeit = {
+        p.vertrag_id for p in uebersicht.offene_positionen if p.faelligkeitsklasse == "UNBEKANNT"
+    }
+    kompakt_html = "".join(
+        _rueckstaende_kompakt_zeile_html(z, unbekannte_faelligkeit=(z.vertrag_id in vertraege_mit_unbekannter_faelligkeit))
+        for z in uebersicht.mietkonten
+    )
+    kompakt_tabelle = f"""
+    <div class="card" id="mietkonten-uebersicht">
+      <h2>Mietkontenübersicht — {titel_zusatz}</h2>
+      <div class="tabelle-scroll">
+      <table>
+        <tr><th>Mieter / Einheit</th><th>Offener Betrag / Guthaben</th><th>Status</th><th></th></tr>
+        {kompakt_html or '<tr><td colspan=4 class="muted">Keine Verträge.</td></tr>'}
+      </table>
+      </div>
+    </div>"""
+
     mietkonten_html = "".join(_rueckstaende_mietkonto_zeile_html(z) for z in uebersicht.mietkonten)
     mietkonten_tabelle = f"""
-    <div class="card">
-      <h2>Mietkontenübersicht — {titel_zusatz}</h2>
+    <details class="card" id="mietkonten-details">
+      <summary>Alle Mietkonten im Detail (Konto-/Vertrags-IDs, Kontoberechnung vs. Positionen)</summary>
       <p class="muted">"Kontostand" = Eröffnung + Vorschreibungen − Zahlungen/Gutschriften (positiv: offener
          Betrag; negativ: Guthaben). Zwei getrennte Berechnungen desselben Kontos stehen nebeneinander:
          "Fällig (Kontoberechnung)" ist die bestehende Kontostand-Rechnung, "Fällig (Positionen)"/
@@ -499,12 +654,12 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
         {mietkonten_html or '<tr><td colspan=13 class="muted">Keine Verträge.</td></tr>'}
       </table>
       </div>
-    </div>"""
+    </details>"""
 
     positionen_html = "".join(_rueckstaende_position_zeile_html(p) for p in uebersicht.offene_positionen)
     positionen_tabelle = f"""
-    <div class="card">
-      <h2>Offene Einzelpositionen — {titel_zusatz}</h2>
+    <details class="card" id="offene-positionen">
+      <summary>Offene Einzelpositionen im Detail — {titel_zusatz}</summary>
       <p class="muted">Jede Zeile ist ein einzelner offener Posten (nicht der Kontosaldo) - eine Zahlung
          wird zuerst der ältesten offenen Position zugeordnet, gezeigt wird nur der danach verbleibende
          Rest. OP-Nr. und Beleg identifizieren die zugrunde liegende Buchung eindeutig, auch wenn mehrere
@@ -516,12 +671,12 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
         {positionen_html or '<tr><td colspan=12 class="muted">Keine offenen Positionen.</td></tr>'}
       </table>
       </div>
-    </div>"""
+    </details>"""
 
     mahnfaelle_html = "".join(_rueckstaende_mahnfall_zeile_html(m) for m in uebersicht.mahnfaelle)
     mahnfaelle_tabelle = f"""
-    <div class="card">
-      <h2>Mahnfälle — {titel_zusatz}</h2>
+    <details class="card">
+      <summary>Mahnfälle im Detail — {titel_zusatz}</summary>
       <p class="muted">Alle bereits geplanten Mahnfälle je Forderung, nicht nur der zuletzt angelegte - so
          bleiben auch ältere Stufen/Forderungen nachvollziehbar. Der Fallbetrag ist der ursprünglich
          festgehaltene Betrag zum Planungszeitpunkt und fließt in KEINE Summe oben ein. Diese Übersicht
@@ -532,16 +687,16 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
         {mahnfaelle_html or '<tr><td colspan=7 class="muted">Keine Mahnfälle.</td></tr>'}
       </table>
       </div>
-    </div>"""
+    </details>"""
 
     bestand_html = "".join(
         f"<tr><td>{h(e.objekt_bezeichnung)}</td><td>{h(e.einheit_id)}</td><td>{h(e.einheit_bezeichnung)}</td>"
-        f"<td>{h(e.nutzungsstatus)}</td></tr>"
+        f"<td>{h(nutzungsstatus_label(e.nutzungsstatus))} <span class='muted'>({h(e.nutzungsstatus)})</span></td></tr>"
         for e in uebersicht.einheiten_ohne_konto
     )
     bestand_tabelle = f"""
-    <div class="card">
-      <h2>Einheiten ohne Mietkonto — {titel_zusatz}</h2>
+    <details class="card">
+      <summary>Leerstände &amp; sonstige Einheiten ohne Mietkonto — {titel_zusatz}</summary>
       <p class="muted">Nutzungsstatus wird eingespielt/gepflegt, unabhängig davon, ob eine Mietforderung
          besteht (z. B. Leerstand, Kurzzeitvermietung, Selfstorage, Eigennutzung) - das ist BESTAND, kein
          erfundener Nullsaldo/Rückstand.</p>
@@ -551,16 +706,102 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
         {bestand_html or '<tr><td colspan=4 class="muted">Keine Einheiten ohne Mietkonto.</td></tr>'}
       </table>
       </div>
-    </div>"""
+    </details>"""
 
-    mietvertraege_karte = (
-        '<div class="card"><a href="/backoffice/vertraege"><button type="button">Mietverträge öffnen</button></a> '
-        '<span class="muted">Vertragsanlage/-anzeige, Mietvertragsprofile, Aufnahme aus PDF.</span></div>'
-    )
     return _layout(
-        request, session, "Rückstandsübersicht",
-        mietvertraege_karte + auswahl_form + kpi_html + mietkonten_tabelle + positionen_tabelle + mahnfaelle_tabelle + bestand_tabelle,
+        request, session, "Übersicht",
+        auswahl_form + erledigen_html + kpi_html + kompakt_tabelle
+        + mietkonten_tabelle + positionen_tabelle + mahnfaelle_tabelle + bestand_tabelle,
     )
+
+
+# -- Bereichs-Startseiten (Auftrag HV-20260914-UI-EINFACH) -------------------
+# Bündeln die bisher als 15 technische Einzellinks in der Hauptnavigation
+# aufgeführten Arbeitsabläufe zu genau drei fachlichen Sammelseiten - JEDE
+# Route bleibt exakt wie zuvor erreichbar, nur der Weg dorthin führt jetzt
+# über eine dieser drei Seiten statt über die Navigation direkt. Reine
+# Verlinkung bestehender Seiten, keine eigene Datenabfrage/Berechnung.
+
+
+def _bereich_karten_html(karten: list[tuple[str, str, str]]) -> str:
+    """`karten`: Liste von (href, Titel, Beschreibung)."""
+
+    return '<div class="bereich-karten">' + "".join(
+        f'<div class="card"><h3><a href="{h(href)}">{h(titel)}</a></h3><p class="muted">{h(beschreibung)}</p></div>'
+        for href, titel, beschreibung in karten
+    ) + "</div>"
+
+
+@router.get("/zahlungen", response_class=HTMLResponse)
+def zahlungen_hub(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    inhalt = f"""
+    <div class="card"><h1>Zahlungen &amp; Mahnungen</h1>
+      <p class="muted">Bankdatei einlesen, offene Zahlungen zuordnen und den Mahnstand samt Versandnachweisen
+         einsehen. Die Mahnvorschau selbst gehört zu einem konkreten Mietvertrag und wird aus dessen Akte
+         geöffnet (Mieter &amp; Objekte).</p>
+    </div>
+    {_bereich_karten_html([
+        ("/backoffice/bank", "Bankdatei einlesen", "CSV-/CAMT.053-Import mit Vorschau vor der Übernahme."),
+        ("/backoffice/bank/unzugeordnet", "Offene Zahlungen zuordnen", "Bankbuchungen, die noch keinem Mietkonto zugeordnet sind."),
+        ("/backoffice/bank/vollstaendigkeit", "Bankvollständigkeit", "Bestätigt je Bankkonto, dass ein Zeitraum lückenlos eingelesen ist."),
+        ("/backoffice/mailversand", "Mailversand und Nachweise", "Mahn-Mailversand, Status je Fall, Zustellnachweise."),
+    ])}
+    <p><a href="/backoffice/">&larr; zur Übersicht</a></p>"""
+    return _layout(request, session, "Zahlungen & Mahnungen", inhalt)
+
+
+@router.get("/abrechnungen", response_class=HTMLResponse)
+def abrechnungen_hub(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    inhalt = f"""
+    <div class="card"><h1>Abrechnungen</h1>
+      <p class="muted">Variable Kurzzeit-/Selfstorage-Abrechnungen und die daraus abgeleitete
+         Netto-Monatsübersicht sind hier zusammen erreichbar.</p>
+    </div>
+    {_bereich_karten_html([
+        (
+            "/backoffice/variable-abrechnung", "Kurzzeit-/Selfstorage-Abrechnung",
+            "Variable Monatsabrechnung erfassen/prüfen, CSV-Import, Versionen.",
+        ),
+        (
+            "/backoffice/dashboard/monatsuebersicht", "Netto-Monatsübersicht",
+            "Nettomieterlös je Monat aus bestätigten Abrechnungen, inkl. Datenlücken.",
+        ),
+    ])}
+    <div class="card">
+      <h3>Betriebskostenabrechnung (BK)</h3>
+      <p class="muted">Noch nicht im Backoffice freigeschaltet (siehe
+         <code>docs/hausverwaltung/OFFENE_PUNKTE.md</code>) - das Berechnungsmodul existiert bereits
+         (<code>src/mietinkasso/bk/</code>), hat aber noch keine bedienbare Oberfläche.</p>
+    </div>
+    <p><a href="/backoffice/">&larr; zur Übersicht</a></p>"""
+    return _layout(request, session, "Abrechnungen", inhalt)
+
+
+@router.get("/einstellungen", response_class=HTMLResponse)
+def einstellungen_hub(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+    inhalt = f"""
+    <div class="card"><h1>Einstellungen</h1>
+      <p class="muted">Technische Regeln und Konfiguration, die im Alltag selten gebraucht werden - vom
+         einmaligen Dateneinstieg bis zu Index-/Mahnregeln.</p>
+    </div>
+    {_bereich_karten_html([
+        ("/backoffice/eroeffnung", "Eröffnungsimport", "Eröffnungssalden-CSV: Vorschau, dann bestätigter atomarer Import."),
+        ("/backoffice/mahnwesen/policy", "Mahnstufen-Konfiguration", "Freigegebene Mahnpolicy, Kanalregel je Stufe."),
+        ("/backoffice/basiszinssatz", "OeNB-Basiszinssatz", "Erfasste Basiszinssätze für die Verzugszinsenberechnung."),
+        ("/backoffice/indexautomatik/laeufe", "Indexautomatik: Monatsläufe", "Protokoll der monatlichen Indexlauf-Durchgänge."),
+        ("/backoffice/indexautomatik/outbox", "Indexautomatik: Outbox", "Erhöhungsschreiben vor Versand/Zugangsbestätigung."),
+        (
+            "/backoffice/indexautomatik/soll-umsetzung", "Indexautomatik: Soll-Umsetzung",
+            "Freigegebene Erhöhungen in neue Mietkomponenten umsetzen.",
+        ),
+        ("/backoffice/indexautomatik/vpi", "VPI-Werte", "Veröffentlichte Monatswerte für die Indexberechnung erfassen."),
+        (
+            "/backoffice/indexautomatik/vertragsende", "Vertragsende-Erinnerungen",
+            "Verträge, deren befristete Laufzeit demnächst endet.",
+        ),
+    ])}
+    <p><a href="/backoffice/">&larr; zur Übersicht</a></p>"""
+    return _layout(request, session, "Einstellungen", inhalt)
 
 
 # -- Kontoauszug --------------------------------------------------------------
@@ -4014,6 +4255,7 @@ def _hat_gesellschaft_zugriff(ctx: AuthContext, gesellschaft_id: str) -> bool:
 def vertragsanlage_liste(request: Request, session=Depends(_current_session)) -> HTMLResponse:
     ctx = _ctx(session)
     zeilen = []
+    einheiten_mit_vertrag: set[str] = set()
     for vertrag in _stammdaten_repo.list_alle_vertraege():
         if not _hat_gesellschaft_zugriff(ctx, vertrag.gesellschaft_id):
             continue
@@ -4022,8 +4264,26 @@ def vertragsanlage_liste(request: Request, session=Depends(_current_session)) ->
         debitor = _stammdaten_repo.get_debitor(vertrag.debitor_id)
         if einheit is None or objekt is None or debitor is None:
             continue
+        einheiten_mit_vertrag.add(einheit.id)
         zeilen.append({"vertrag": vertrag, "objekt": objekt, "einheit": einheit, "debitor": debitor})
-    return _layout(request, session, "Mietverträge", _vertragsanlage_liste_formular(zeilen, session.csrf_token))
+
+    # Leerstände/sonstige Einheiten OHNE Vertrag bleiben sichtbar (Auftrag
+    # HV-20260914-UI-EINFACH) - Bestandsart kommt direkt aus dem
+    # gepflegten `Einheit.nutzungsstatus`, NIE aus einem erratenen
+    # Nullsaldo/Fehlen eines Kontos.
+    leerstand_zeilen = []
+    for objekt in _stammdaten_repo.list_objekte():
+        if objekt.ausgeschlossen or not _hat_gesellschaft_zugriff(ctx, objekt.gesellschaft_id):
+            continue
+        for einheit in _stammdaten_repo.list_einheiten_fuer_objekt(objekt.id):
+            if einheit.id in einheiten_mit_vertrag:
+                continue
+            leerstand_zeilen.append({"objekt": objekt, "einheit": einheit})
+
+    return _layout(
+        request, session, "Mieter & Objekte",
+        _vertragsanlage_liste_formular(zeilen, session.csrf_token, leerstand_zeilen=leerstand_zeilen),
+    )
 
 
 @router.get("/vertrag/weiterleiten")

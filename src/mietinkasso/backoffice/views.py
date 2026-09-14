@@ -70,28 +70,70 @@ def parse_eur_betrag(text: str | None) -> int:
     return cent
 
 
-#: Sichtbare Hauptnavigation für angemeldete Benutzer. Die Vorschreibungs-/
-#: Mahnvorschau-Wege brauchen einen konkreten Vertrag und werden deshalb
-#: kontextuell im Kontoauszug verlinkt (nicht hier) - alle anderen
-#: Arbeitsabläufe haben aber keinen Kontext und MÜSSEN hier auffindbar
-#: sein, sonst gibt es keinen sichtbaren Weg dorthin.
-_NAV_LINKS = [
-    ("/backoffice/", "Dashboard"),
-    ("/backoffice/vertraege", "Mietverträge"),
-    ("/backoffice/eroeffnung", "Eröffnungsimport"),
-    ("/backoffice/bank", "Bankimport"),
-    ("/backoffice/bank/unzugeordnet", "Offene Zuordnungen"),
-    ("/backoffice/bank/vollstaendigkeit", "Bankvollständigkeit"),
-    ("/backoffice/mahnwesen/policy", "Mahnstufen-Konfiguration"),
-    ("/backoffice/mailversand", "Mailversand und Nachweise"),
-    ("/backoffice/indexautomatik/laeufe", "Indexautomatik-Monatsläufe"),
-    ("/backoffice/indexautomatik/outbox", "Indexautomatik-Outbox"),
-    ("/backoffice/indexautomatik/soll-umsetzung", "Indexautomatik-Soll-Umsetzung"),
-    ("/backoffice/indexautomatik/vpi", "VPI-Werte"),
-    ("/backoffice/indexautomatik/vertragsende", "Vertragsende-Erinnerungen"),
-    ("/backoffice/variable-abrechnung", "Variable Monatsabrechnung"),
-    ("/backoffice/dashboard/monatsuebersicht", "Monatsübersicht (Nettomieterlös)"),
-]
+#: Sichtbare Hauptnavigation für angemeldete Benutzer - Auftrag
+#: HV-20260914-UI-EINFACH: GENAU vier fachliche Hauptbereiche statt einer
+#: flachen Liste technischer Einzellinks, plus ein fünfter Sammelbereich
+#: "Einstellungen" für Konfiguration/Regeln, die im Alltag nicht gebraucht
+#: werden. JEDE bisher über `_NAV_LINKS` erreichbare Route bleibt
+#: erreichbar - nur nicht mehr als Einzellink hier, sondern über die
+#: jeweilige Bereichs-Startseite (`/backoffice/zahlungen`,
+#: `/backoffice/abrechnungen`, `/backoffice/einstellungen`), die diese
+#: Routen ihrerseits verlinkt. Reihenfolge = Anzeigereihenfolge.
+_BEREICHE = (
+    ("uebersicht", "/backoffice/", "Übersicht"),
+    ("mieter", "/backoffice/vertraege", "Mieter & Objekte"),
+    ("zahlungen", "/backoffice/zahlungen", "Zahlungen & Mahnungen"),
+    ("abrechnungen", "/backoffice/abrechnungen", "Abrechnungen"),
+    ("einstellungen", "/backoffice/einstellungen", "Einstellungen"),
+)
+
+#: Pfadpräfixe je Bereich, NUR für die aktive Hervorhebung in der
+#: Navigation (rein optisch - ändert keine Berechtigung/Route). Eine
+#: konkrete Vertrags-/Kontoseite (z. B. `/vertrag/{id}/mahnvorschau`)
+#: bleibt dabei bewusst dem Bereich "Mieter & Objekte" zugeordnet, weil
+#: sie von dort (der Mieterakte) aus erreicht wird, nicht dem
+#: fachlichen Thema der Zielseite.
+_BEREICH_PFADPRAEFIXE = {
+    "mieter": ("/backoffice/vertraege", "/backoffice/vertrag/", "/backoffice/konto/", "/backoffice/op/"),
+    "zahlungen": (
+        "/backoffice/zahlungen", "/backoffice/bank", "/backoffice/mahnwesen", "/backoffice/mailversand",
+        "/backoffice/mahnfall",
+    ),
+    "abrechnungen": (
+        "/backoffice/abrechnungen", "/backoffice/variable-abrechnung", "/backoffice/dashboard/monatsuebersicht",
+    ),
+    "einstellungen": (
+        "/backoffice/einstellungen", "/backoffice/eroeffnung", "/backoffice/indexautomatik", "/backoffice/basiszinssatz",
+    ),
+}
+
+
+def _aktueller_bereich(pfad: str) -> str | None:
+    if pfad in ("/backoffice/", "/backoffice"):
+        return "uebersicht"
+    for bereich, praefixe in _BEREICH_PFADPRAEFIXE.items():
+        if any(pfad.startswith(p) for p in praefixe):
+            return bereich
+    return None
+
+
+#: Anzeigefreundliche Bestandsart statt des rohen Enum-Werts
+#: (`domain/enums.py::Nutzungsstatus`) - reine Beschriftung, LEITET
+#: NICHTS aus einem Saldo/Nullkonto ab, sondern zeigt exakt den
+#: eingespielten/gepflegten `Einheit.nutzungsstatus` an.
+_NUTZUNGSSTATUS_LABEL = {
+    "DAUERVERMIETUNG": "vermietet",
+    "KURZZEITVERMIETUNG": "Kurzzeitvermietung",
+    "SELFSTORAGE": "Selfstorage",
+    "EIGENNUTZUNG": "Eigennutzung",
+    "LEERSTAND": "Leerstand",
+}
+
+
+def nutzungsstatus_label(nutzungsstatus: str | None) -> str:
+    if not nutzungsstatus:
+        return "-"
+    return _NUTZUNGSSTATUS_LABEL.get(nutzungsstatus, nutzungsstatus)
 
 
 #: NUR diese Umgebungswerte gelten als "wir wissen sicher, dass hier
@@ -142,19 +184,24 @@ def seite(
     csrf_token: str | None = None,
     environment: str = "development",
     send_enabled: bool = False,
+    aktueller_pfad: str = "",
 ) -> str:
     banner_text = betriebsmodus_banner(environment=environment, send_enabled=send_enabled)
     titel_suffix = "PILOT" if ist_bekannte_demo_umgebung(environment) else "ECHTBETRIEB"
     logout_form = ""
     nav = ""
     if user_id is not None:
+        aktiver_bereich = _aktueller_bereich(aktueller_pfad)
+        nav_links = "".join(
+            f'<a href="{h(pfad)}" class="{"aktiv" if bereich == aktiver_bereich else ""}">{h(label)}</a>'
+            for bereich, pfad, label in _BEREICHE
+        )
         logout_form = f"""
         <span class="muted">angemeldet als {h(user_id)}</span>
         <form method="post" action="/backoffice/logout" style="display:inline">
           <input type="hidden" name="csrf_token" value="{h(csrf_token or '')}">
           <button type="submit">Abmelden</button>
         </form>"""
-        nav_links = "".join(f'<a href="{h(pfad)}">{h(label)}</a>' for pfad, label in _NAV_LINKS)
         nav = f'<nav class="hauptnav">{nav_links}</nav>'
     return f"""<!doctype html>
 <html lang="de">
@@ -163,20 +210,32 @@ def seite(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{h(titel)} — Hausverwaltung & Mietinkasso ({titel_suffix})</title>
 <style>
-  body {{ font-family: system-ui, -apple-system, sans-serif; margin: 0; background: #f5f6f8; color: #1a1a1a; }}
-  header {{ background: #14213d; color: #fff; padding: 0.6rem 1.25rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; }}
-  header a {{ color: #fff; text-decoration: none; font-weight: 600; }}
-  header form button {{ background: transparent; border: 1px solid #fff; color: #fff; border-radius: 4px; padding: 0.2rem 0.6rem; }}
-  .pilot-banner {{ background: #a15c00; color: #fff; text-align: center; padding: 0.3rem; font-size: 0.82rem; font-weight: 600; }}
-  nav.hauptnav {{ background: #1c2d54; padding: 0.5rem 1.25rem; display: flex; flex-wrap: wrap; gap: 1.1rem; }}
-  nav.hauptnav a {{ color: #e8ecf7; text-decoration: none; font-size: 0.88rem; font-weight: 600; }}
-  nav.hauptnav a:hover {{ text-decoration: underline; }}
+  :root {{
+    --anthrazit: #1F2125; --anthrazit-hell: #33363b; --gold: #C9A86A; --gold-dunkel: #a9824a; --creme: #F5F2EC;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: "Segoe UI", system-ui, -apple-system, sans-serif; margin: 0; background: var(--creme); color: var(--anthrazit); }}
+  header {{ background: var(--anthrazit); color: #fff; padding: 0.6rem 1.25rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; }}
+  header a {{ color: #fff; text-decoration: none; font-weight: 700; letter-spacing: 0.01em; }}
+  header .muted {{ color: #d8d3c8; }}
+  header form button {{ background: transparent; border: 1px solid var(--gold); color: var(--gold); border-radius: 4px; padding: 0.25rem 0.7rem; }}
+  header form button:hover {{ background: var(--gold); color: var(--anthrazit); }}
+  .pilot-banner {{ background: var(--gold-dunkel); color: #fff; text-align: center; padding: 0.35rem 0.75rem; font-size: 0.82rem; font-weight: 600; }}
+  nav.hauptnav {{ background: var(--anthrazit-hell); padding: 0 1.25rem; display: flex; flex-wrap: wrap; }}
+  nav.hauptnav a {{
+    color: #eee9df; text-decoration: none; font-size: 0.92rem; font-weight: 600; padding: 0.7rem 0.9rem;
+    border-bottom: 3px solid transparent; white-space: nowrap;
+  }}
+  nav.hauptnav a:hover {{ color: #fff; }}
+  nav.hauptnav a.aktiv {{ color: #fff; border-bottom-color: var(--gold); }}
   main {{ padding: 1.25rem; max-width: 1150px; margin: 0 auto; }}
+  h1, h2, h3 {{ color: var(--anthrazit); }}
+  a {{ color: var(--anthrazit); }}
   table {{ border-collapse: collapse; width: 100%; margin: 0.75rem 0; background: #fff; }}
   th, td {{ border: 1px solid #ddd; padding: 0.35rem 0.55rem; text-align: left; font-size: 0.88rem; vertical-align: top; }}
-  th {{ background: #eef0f4; }}
-  .card {{ background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }}
-  .warn {{ color: #a15c00; font-weight: 600; }}
+  th {{ background: #efeae0; }}
+  .card {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }}
+  .warn {{ color: var(--gold-dunkel); font-weight: 600; }}
   .error {{ color: #b00020; font-weight: 600; }}
   .ok {{ color: #1a7f37; font-weight: 600; }}
   .muted {{ color: #666; font-size: 0.85rem; }}
@@ -184,27 +243,47 @@ def seite(
   .flash-error {{ background: #fbeaea; border: 1px solid #b00020; padding: 0.55rem 0.9rem; border-radius: 4px; margin-bottom: 1rem; }}
   .gesperrt-row {{ background: #fbeaea; }}
   .kpi-grid {{ display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 0.75rem; }}
-  .kpi {{ background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 0.65rem 0.9rem; flex: 1 1 150px; min-width: 140px; }}
-  .kpi .zahl {{ font-size: 1.25rem; font-weight: 700; display: block; }}
+  .kpi {{ background: #fff; border: 1px solid #ddd; border-left: 4px solid var(--gold); border-radius: 6px; padding: 0.65rem 0.9rem; flex: 1 1 170px; min-width: 150px; }}
+  .kpi .zahl {{ font-size: 1.3rem; font-weight: 700; display: block; color: var(--anthrazit); }}
   .kpi .kpi-label {{ font-size: 0.76rem; color: #666; }}
   .badge {{ display: inline-block; padding: 0.05rem 0.4rem; border-radius: 3px; font-size: 0.78rem; font-weight: 600; }}
   .badge-error {{ background: #fbeaea; color: #b00020; }}
   .badge-warn {{ background: #fdf0dc; color: #a15c00; }}
+  .badge-ok {{ background: #e6f4ea; color: #1a7f37; }}
   .badge-muted {{ background: #eee; color: #555; }}
   .tabelle-scroll {{ overflow-x: auto; max-width: 100%; }}
   label {{ display: block; margin: 0.5rem 0 0.15rem; font-weight: 600; font-size: 0.85rem; }}
   input, select, textarea {{ width: 100%; box-sizing: border-box; padding: 0.35rem 0.5rem; font: inherit; border: 1px solid #ccc; border-radius: 4px; }}
-  button, input[type=submit] {{ font: inherit; padding: 0.4rem 0.9rem; cursor: pointer; border-radius: 4px; border: 1px solid #14213d; background: #14213d; color: #fff; width: auto; margin-top: 0.6rem; }}
-  button.secondary {{ background: #fff; color: #14213d; }}
+  button, input[type=submit] {{ font: inherit; padding: 0.45rem 0.95rem; cursor: pointer; border-radius: 4px; border: 1px solid var(--anthrazit); background: var(--anthrazit); color: #fff; width: auto; margin-top: 0.6rem; }}
+  button:hover, input[type=submit]:hover {{ background: var(--anthrazit-hell); }}
+  button.secondary {{ background: #fff; color: var(--anthrazit); }}
+  button.secondary:hover {{ background: #f0ede5; }}
+  button.gross {{ background: var(--gold); color: var(--anthrazit); border-color: var(--gold-dunkel); font-size: 1rem; padding: 0.6rem 1.3rem; font-weight: 700; }}
+  button.gross:hover {{ background: var(--gold-dunkel); color: #fff; }}
   fieldset {{ border: 1px solid #ddd; border-radius: 6px; margin-bottom: 1rem; padding: 0.75rem 1rem; }}
   nav.tabs a {{ margin-right: 1rem; font-size: 0.9rem; }}
   code {{ background: #f0f0f0; padding: 0.05rem 0.3rem; border-radius: 3px; }}
+  .bereich-karten {{ display: flex; flex-wrap: wrap; gap: 0.9rem; }}
+  .bereich-karten .card {{ flex: 1 1 260px; margin-bottom: 0; }}
+  .todo-liste {{ list-style: none; margin: 0; padding: 0; }}
+  .todo-liste li {{ padding: 0.4rem 0; border-bottom: 1px solid #eee; }}
+  .todo-liste li:last-child {{ border-bottom: none; }}
+  .status-zeile {{ display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; font-size: 0.85rem; color: #555; margin: 0.5rem 0; }}
+  details > summary {{ cursor: pointer; color: var(--anthrazit); font-weight: 600; }}
+  @media (max-width: 640px) {{
+    main {{ padding: 0.75rem; }}
+    header {{ padding: 0.5rem 0.75rem; }}
+    nav.hauptnav {{ padding: 0 0.5rem; }}
+    nav.hauptnav a {{ padding: 0.6rem 0.55rem; font-size: 0.82rem; }}
+    .kpi {{ flex: 1 1 100%; }}
+    .bereich-karten .card {{ flex: 1 1 100%; }}
+  }}
 </style>
 </head>
 <body>
 <div class="pilot-banner">{h(banner_text)}</div>
 <header>
-  <a href="/backoffice/">Hausverwaltung & Mietinkasso</a>
+  <a href="/backoffice/">JLB Hausverwaltung</a>
   <div>{logout_form}</div>
 </header>
 {nav}

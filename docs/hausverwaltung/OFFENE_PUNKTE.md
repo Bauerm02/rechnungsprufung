@@ -3349,3 +3349,120 @@ Rendererfehler behoben:
 5 neue Tests (davon 3 gezielt gegen den alten Code als tatsächliche
 Regressionstests bestätigt), 1046/1046 grün im Gesamtlauf. Keine
 Liveaktionen, keine neuen Funktionen.
+
+## Auftrag HV-20260914-UI-EINFACH: vereinfachte Backoffice-Oberfläche (14.09.2026)
+
+Nutzer-Feedback nach Live-Ansicht: die bisherige Oberfläche (15
+technische Einzellinks in der Hauptnavigation, viele Fachbegriffe/IDs
+gleichzeitig auf einer Seite) ist für einen Nichtbuchhalter im Alltag zu
+kompliziert. Rein additive UI-Überarbeitung - KEINE neue Saldologik,
+KEINE neue automatische Zuordnung/Gebührenfreigabe/Finanzberechnung,
+KEINE DB-Migration/Aktivierung, dieselbe Auth/CSRF/GET-Seiteneffektfreiheit
+wie zuvor. Jede bisherige Route bleibt unter derselben URL erreichbar.
+
+1. **Navigation**: `views.py::_NAV_LINKS` (15 Einzellinks) ersetzt durch
+   genau vier fachliche Hauptbereiche + "Einstellungen"
+   (`_BEREICHE`/`_aktueller_bereich`): Übersicht (`/backoffice/`),
+   Mieter & Objekte (`/backoffice/vertraege`), Zahlungen & Mahnungen
+   (neue Bündelseite `/backoffice/zahlungen`), Abrechnungen (neue
+   Bündelseite `/backoffice/abrechnungen`), Einstellungen (neue
+   Bündelseite `/backoffice/einstellungen`). Die drei neuen Bündelseiten
+   verlinken NUR bereits bestehende Routen (keine eigene Datenabfrage) -
+   jeder vormals flach verlinkte Arbeitsablauf (Eröffnungsimport,
+   Bankimport/-zuordnung/-vollständigkeit, Mahnstufen-Konfiguration,
+   Mailversand, OeNB-Basiszinssatz, Indexautomatik-Läufe/Outbox/
+   Soll-Umsetzung/VPI/Vertragsende) ist von dort aus in einem weiteren
+   Klick erreichbar. Aktiver Bereich wird optisch hervorgehoben
+   (Gold-Unterstrich) - reine Anzeige, keine Berechtigungsänderung.
+   `_fehlerseite()` (129 Aufrufstellen) bekommt aus Aufwandsgründen
+   KEINE aktive Hervorhebung - Navigation bleibt dort trotzdem vollständig
+   vorhanden und funktional, nur ohne Gold-Unterstrich auf Fehlerseiten.
+2. **Farben/Typografie**: JLB Anthrazit `#1F2125`/Gold `#C9A86A`/Creme
+   `#F5F2EC` statt des bisherigen technischen Blau/Grau - EIN
+   gemeinsames CSS in `views.py::seite()`, responsive (Flex-Wrap,
+   Media-Query ≤640px), kein horizontales Scrollen bei normaler
+   Desktop-Breite (mit Playwright/Chromium synthetisch nachgemessen,
+   `scrollWidth == clientWidth` bei 1280px UND 390px).
+3. **Übersicht (`/`)**: vier verständliche Kennzahlen statt fünf
+   technisch benannter Summen ("Offene Beträge"/"Davon fällig"/
+   "Fälligkeit prüfen"/"Guthaben der Mieter" statt "Summe positiver
+   Kontostände"/"Fällig/überfällig"/"Fälligkeit unbekannt"/"Guthaben
+   gesamt") - EXAKT dieselben bereits berechneten
+   `RueckstandsKennzahlen`-Werte, nur andere Beschriftung/Gruppierung,
+   mit aufklappbarer Erklärung ("Was bedeutet das?"). Keine "automatisch
+   mahnbar"-Aussage, kein Abzug fremder Guthaben, unbekannte Fälligkeit
+   heißt nirgends "strittig". Neuer Block "Das ist zu erledigen"
+   (`_erledigen_html`) leitet Hinweise NUR aus bereits vorhandenen Daten
+   ab (offene Positionen ohne Fälligkeit, Kontoabweichungen, aktive
+   Mahnsperren) plus statischem Funktionsstatus (E-Mail-Versand
+   aktiv/pausiert, Bankdaten manuell/EBS-EBICS ausstehend, Mahnbrief
+   noch nicht angebunden) - keine erfundenen Aufgaben. Neue kompakte
+   Haupttabelle (Mieter/Einheit, Betrag, EIN verständlicher Status wie
+   "Klärung nötig"/"Mahnung gesperrt", "Akte öffnen") - Konto-/
+   Vertrags-IDs und die bisherigen doppelten Vergleichsspalten
+   ("Fällig (Kontoberechnung)" vs. "Fällig (Positionen)") stehen
+   unverändert in einem `<details>` je Zeile bzw. in einer eigenen
+   aufklappbaren Detailtabelle, nicht mehr standardmäßig sichtbar. Die
+   bisherige Sortierung (alphabetisch nach Objekt/Einheit/Vertrag, NICHT
+   nach Saldo) ist unverändert - Nullkonten standen also weder vorher
+   noch jetzt vor Rückständen. Alle bisherigen Detailtabellen (Mietkonten
+   im Detail, Offene Einzelpositionen, Mahnfälle, Leerstände) bleiben
+   vollständig erhalten, nur standardmäßig eingeklappt statt offen.
+4. **Mieter & Objekte (`/vertraege`)**: großer goldener
+   "+ Mietvertrag hinzufügen"-Button statt des bisherigen unauffälligen
+   Sekundärlinks. Neue Spalte "Bestandsart" mit verständlichem Text
+   (vermietet/Kurzzeitvermietung/Selfstorage/Eigennutzung/Leerstand über
+   `views.py::nutzungsstatus_label`) - abgeleitet AUSSCHLIESSLICH aus dem
+   gepflegten `Einheit.nutzungsstatus`, nie aus einem Nullsaldo. Neuer,
+   aufklappbarer Abschnitt "Leerstände & sonstige Einheiten ohne
+   Mietvertrag" (Einheiten ohne Vertrag bleiben sichtbar). Die
+   Mieterakte (`/vertrag/{id}`) zeigt jetzt den Mieternamen als
+   Überschrift statt der rohen Vertrags-ID (die bleibt als kleiner
+   `<code>`-Tag direkt darunter sichtbar).
+5. **Zahlungen & Mahnungen / Abrechnungen**: neue Bündelseiten, reine
+   Verlinkung. Betriebskostenabrechnung (BK) ist auf der
+   Abrechnungen-Seite ehrlich als "noch nicht im Backoffice
+   freigeschaltet" ausgewiesen - das Berechnungsmodul
+   (`src/mietinkasso/bk/`) existiert bereits, hat aber noch KEINE
+   bedienbare Oberfläche; das war nicht Teil dieses Auftrags
+   ("nur generische Oberfläche") und wird hier bewusst nicht miterfunden.
+
+**Offene Punkte für Codex/Freigabe:**
+
+- BK-Abrechnung hat weiterhin keine Backoffice-Oberfläche (siehe Punkt 5).
+- `_fehlerseite()` zeigt die Navigation ohne aktive Hervorhebung (siehe
+  Punkt 1) - rein kosmetisch, keine fachliche Einschränkung.
+- Einige vertragskontextuelle Werkzeuge (Vorschreibung, Zinsprofil,
+  Vertragsprüfung, Rechtsprofil, Komponenten-Freigabe) sind weiterhin
+  NICHT direkt von der Mieterakte aus verlinkt, sondern nur über den
+  Kontoauszug bzw. mehrere bereits bestehende Zwischenschritte erreichbar
+  (unverändertes Altverhalten, nicht neu eingeführt) - eine vollständige
+  Konsolidierung aller Vertragswerkzeuge auf der Akte selbst war mit dem
+  Umfang dieses Auftrags nicht mehr abgedeckt.
+
+**Synthetische lokale Vorschau (für Codex):**
+
+```
+export MIETINKASSO_DATABASE_URL="sqlite:////tmp/mietinkasso_vorschau.db"
+export MIETINKASSO_BACKOFFICE_USER="vorschau"
+export MIETINKASSO_BACKOFFICE_PASSWORD_HASH="$(python -c 'from mietinkasso.backoffice.security import hash_passwort; print(hash_passwort("EIN-TESTPASSWORT"))')"
+export MIETINKASSO_BACKOFFICE_COOKIE_SECURE="false"
+export MIETINKASSO_ENVIRONMENT="development"
+python scripts/seed_synthetic_data.py
+python -m uvicorn mietinkasso.api.app:app --host 127.0.0.1 --port 8791
+# Browser: http://127.0.0.1:8791/backoffice/login (Benutzer "vorschau")
+```
+
+Mit genau diesem Rezept wurde die neue Oberfläche in dieser Runde per
+Playwright/Chromium bei 1280px (Desktop) und 390px (Mobil) für alle
+fünf Bereiche gerendert und auf horizontales Scrollen geprüft (keines
+festgestellt) - reine lokale Sichtprüfung, keine Liveaktionen, keine
+echten Daten.
+
+4 neue Tests (aktive Navigation, Mahnsperre in "Das ist zu erledigen",
+Abrechnungen-Bündelseite, lange/HTML-artige Mieternamen) + 3 angepasste
+Bestandstests (neue Labels/Struktur statt der alten flachen Navigation -
+die fachliche Erreichbarkeitsaussage selbst bleibt geprüft, nur über die
+neuen Bündelseiten statt Einzellinks), 1050/1050 grün im Gesamtlauf.
+Keine Liveaktionen, keine neuen fachlichen Funktionen - ausschließlich
+Oberfläche.

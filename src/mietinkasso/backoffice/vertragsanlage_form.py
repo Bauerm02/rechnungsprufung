@@ -57,33 +57,57 @@ def einheit_label(objekt, einheit) -> str:
 # ---------------------------------------------------------------------------
 
 
-def vertraege_liste_formular(zeilen: list[dict], csrf: str) -> str:
-    """`zeilen`: Liste von {vertrag, objekt, einheit, debitor}."""
+def vertraege_liste_formular(zeilen: list[dict], csrf: str, *, leerstand_zeilen: list[dict] | None = None) -> str:
+    """`zeilen`: Liste von {vertrag, objekt, einheit, debitor}.
+    `leerstand_zeilen`: Liste von {objekt, einheit} OHNE Vertrag (Auftrag
+    HV-20260914-UI-EINFACH: Leerstände bleiben sichtbar, statt nur
+    vermietete Einheiten zu zeigen)."""
+
+    from mietinkasso.backoffice.views import nutzungsstatus_label
 
     optionen = "".join(
         option(z["vertrag"].id, f"{einheit_label(z['objekt'], z['einheit'])} — {z['debitor'].name}")
         for z in zeilen
     )
     tabellenzeilen = "".join(
-        f"<tr><td>{h(z['vertrag'].id)}</td><td>{h(z['objekt'].bezeichnung)}</td>"
-        f"<td>{h(z['einheit'].bezeichnung)}</td><td>{h(z['debitor'].name)}</td>"
-        f"<td><a href='/backoffice/vertrag/{h(z['vertrag'].id)}'>Öffnen</a></td></tr>"
+        f"<tr><td>{h(z['debitor'].name)}<br><span class='muted'>{h(z['objekt'].bezeichnung)} / "
+        f"{h(z['einheit'].bezeichnung)}</span></td>"
+        f"<td>{h(nutzungsstatus_label(z['einheit'].nutzungsstatus))}</td>"
+        f"<td><a href='/backoffice/vertrag/{h(z['vertrag'].id)}'>Akte öffnen</a>"
+        f"<details><summary>Details</summary>Vertrag: <code>{h(z['vertrag'].id)}</code></details></td></tr>"
         for z in zeilen
-    ) or "<tr><td colspan=5>Noch keine Verträge vorhanden.</td></tr>"
+    ) or "<tr><td colspan=3>Noch keine Verträge vorhanden.</td></tr>"
+
+    leerstand_zeilen = leerstand_zeilen or []
+    leerstand_html = "".join(
+        f"<tr><td>{h(z['objekt'].bezeichnung)} / {h(z['einheit'].bezeichnung)}</td>"
+        f"<td>{h(nutzungsstatus_label(z['einheit'].nutzungsstatus))}</td></tr>"
+        for z in leerstand_zeilen
+    )
+    leerstand_karte = f"""
+    <details class="card">
+      <summary>Leerstände &amp; sonstige Einheiten ohne Mietvertrag ({len(leerstand_zeilen)})</summary>
+      <table><tr><th>Objekt / Einheit</th><th>Bestandsart</th></tr>
+      {leerstand_html or '<tr><td colspan=2 class="muted">Keine Einheiten ohne Mietvertrag.</td></tr>'}</table>
+    </details>"""
+
     return f"""
     <div class="card">
-      <h1>Mietverträge</h1>
+      <h1>Mieter &amp; Objekte</h1>
+      <p><a href="/backoffice/vertraege/neu"><button type="button" class="gross">+ Mietvertrag hinzufügen</button></a></p>
       <form method="get" action="/backoffice/vertrag/weiterleiten" style="max-width:520px;">
         <label>Mietvertrag auswählen (Objekt / Einheit — Mieter)</label>
         <select name="vertrag_id" required>{optionen}</select>
-        <button type="submit">Öffnen</button>
+        <button type="submit" class="secondary">Öffnen</button>
       </form>
-      <p><a href="/backoffice/vertraege/neu"><button type="button" class="secondary">Neuen Mietvertrag anlegen</button></a></p>
     </div>
-    <div class="card"><h2>Übersicht</h2>
-      <table><tr><th>Vertrag</th><th>Objekt</th><th>Einheit</th><th>Mieter</th><th></th></tr>
+    <div class="card"><h2>Mieter</h2>
+      <div class="tabelle-scroll">
+      <table><tr><th>Mieter / Objekt / Einheit</th><th>Bestandsart</th><th></th></tr>
       {tabellenzeilen}</table>
-    </div>"""
+      </div>
+    </div>
+    {leerstand_karte}"""
 
 
 # ---------------------------------------------------------------------------
@@ -585,7 +609,8 @@ def detail_ansicht(
     konto_link = f'<a href="/backoffice/konto/{h(konto_id)}">Mietkonto</a> · ' if konto_id else '<span class="muted">Mietkonto (noch keine Eröffnung)</span> · '
     return f"""
     <div class="card">
-      <h1>Mietvertrag {h(vertrag.id)}</h1>
+      <h1>{h(debitor.name)}</h1>
+      <p class="muted">{h(objekt.bezeichnung)} / {h(einheit.bezeichnung)} · Vertrag <code>{h(vertrag.id)}</code></p>
       <p>{konto_link}
          <a href="/backoffice/vertrag/{h(vertrag.id)}/mahnvorschau">Mahnvorschau</a> ·
          <a href="/backoffice/vertrag/{h(vertrag.id)}/indexklauseln">Indexregel</a> ·

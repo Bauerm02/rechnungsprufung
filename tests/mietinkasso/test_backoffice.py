@@ -180,7 +180,7 @@ def test_dashboard_ohne_objekt_zeigt_alle_objekte_nicht_leer(backoffice_client):
     dashboard = client.get("/backoffice/")
     assert dashboard.status_code == 200
     assert "Alle Objekte" in dashboard.text
-    assert "Summe positiver Kontostände" in dashboard.text
+    assert "Offene Beträge" in dashboard.text  # Auftrag HV-20260914-UI-EINFACH: verständliche Beschriftung
     assert "Mietkontenübersicht" in dashboard.text
     assert "Offene Einzelpositionen" in dashboard.text
     assert konto_id in dashboard.text  # Am Corso ist Teil der "Alle Objekte"-Summe
@@ -305,31 +305,32 @@ def test_hauptnavigation_verlinkt_alle_kontextlosen_arbeitsablaeufe(backoffice_c
     """Regression (Bedienungsfehler-Meldung): nach der Anmeldung zeigte
     das Dashboard nur die Objektwahl - Eröffnungsimport, Bankimport,
     offene Zuordnungen und Bankvollständigkeit hatten keinen sichtbaren
-    Weg dorthin. Diese vier (kontextlosen, d. h. ohne Vertrag/Konto in
-    der URL) Arbeitsabläufe müssen im gemeinsamen Layout für jeden
-    angemeldeten Benutzer gut lesbar verlinkt sein, auf JEDER Seite -
-    nicht nur auf dem Dashboard. Vor der Anmeldung darf die Navigation
-    nicht erscheinen (keine funktionslosen Links auf der Login-Seite)."""
+    Weg dorthin. Diese kontextlosen (d. h. ohne Vertrag/Konto in der URL)
+    Arbeitsabläufe müssen von JEDER Seite aus in höchstens einem Klick
+    erreichbar sein. Auftrag HV-20260914-UI-EINFACH ersetzt die frühere
+    flache 15-Link-Navigation durch genau vier fachliche Hauptbereiche
+    plus "Einstellungen" - die Erreichbarkeit bleibt bestehen, führt aber
+    über die jeweilige Bereichs-Startseite statt über einen Einzellink in
+    der Navigation selbst. Vor der Anmeldung darf die Navigation nicht
+    erscheinen (keine funktionslosen Links auf der Login-Seite)."""
 
     client, konto_id, _konto_gesperrt_id, _op_service = backoffice_client
 
     login_seite = client.get("/backoffice/login")
     assert login_seite.status_code == 200
     assert "/backoffice/eroeffnung" not in login_seite.text
+    assert "/backoffice/einstellungen" not in login_seite.text
 
     _login(client)
-    erwartete_links = [
-        "/backoffice/eroeffnung",
-        "/backoffice/bank",
-        "/backoffice/bank/unzugeordnet",
-        "/backoffice/bank/vollstaendigkeit",
-        "/backoffice/mahnwesen/policy",
+    haupt_bereiche = [
+        "/backoffice/", "/backoffice/vertraege", "/backoffice/zahlungen",
+        "/backoffice/abrechnungen", "/backoffice/einstellungen",
     ]
 
     dashboard = client.get("/backoffice/")
     assert dashboard.status_code == 200
     assert "Hausverwaltung &amp; Mietinkasso" in dashboard.text or "Hausverwaltung & Mietinkasso" in dashboard.text
-    for link in erwartete_links:
+    for link in haupt_bereiche:
         assert f'href="{link}"' in dashboard.text, f"Navigationslink {link} fehlt auf dem Dashboard"
 
     # Die Navigation ist Teil des GEMEINSAMEN Layouts, nicht nur einer
@@ -337,8 +338,109 @@ def test_hauptnavigation_verlinkt_alle_kontextlosen_arbeitsablaeufe(backoffice_c
     # sichtbar.
     kontoauszug = client.get(f"/backoffice/konto/{konto_id}")
     assert kontoauszug.status_code == 200
-    for link in erwartete_links:
+    for link in haupt_bereiche:
         assert f'href="{link}"' in kontoauszug.text, f"Navigationslink {link} fehlt im Kontoauszug"
+
+    # Die vormals flach verlinkten Arbeitsabläufe bleiben über die
+    # jeweilige Bereichs-Startseite in einem weiteren Klick erreichbar.
+    zahlungen = client.get("/backoffice/zahlungen")
+    assert zahlungen.status_code == 200
+    for link in ("/backoffice/bank", "/backoffice/bank/unzugeordnet", "/backoffice/bank/vollstaendigkeit"):
+        assert f'href="{link}"' in zahlungen.text, f"{link} fehlt auf der Zahlungen-&-Mahnungen-Startseite"
+
+    einstellungen = client.get("/backoffice/einstellungen")
+    assert einstellungen.status_code == 200
+    for link in ("/backoffice/eroeffnung", "/backoffice/mahnwesen/policy"):
+        assert f'href="{link}"' in einstellungen.text, f"{link} fehlt auf der Einstellungen-Startseite"
+
+
+def test_abrechnungen_hub_verlinkt_variable_abrechnung_und_monatsuebersicht(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    seite = client.get("/backoffice/abrechnungen")
+    assert seite.status_code == 200
+    assert 'href="/backoffice/variable-abrechnung"' in seite.text
+    assert 'href="/backoffice/dashboard/monatsuebersicht"' in seite.text
+
+
+def test_navigation_hebt_aktuellen_bereich_hervor(backoffice_client):
+    """Auftrag HV-20260914-UI-EINFACH: "einheitliche aktive Navigation" -
+    GENAU der zur aktuellen Seite passende Bereichslink trägt die
+    Hervorhebungsklasse, alle anderen nicht."""
+
+    client, *_ = backoffice_client
+    _login(client)
+
+    dashboard = client.get("/backoffice/")
+    assert '<a href="/backoffice/" class="aktiv">Übersicht</a>' in dashboard.text
+    assert 'class="aktiv">Mieter &amp; Objekte</a>' not in dashboard.text
+
+    vertraege = client.get("/backoffice/vertraege")
+    assert '<a href="/backoffice/vertraege" class="aktiv">Mieter &amp; Objekte</a>' in vertraege.text
+    assert '<a href="/backoffice/" class="aktiv">' not in vertraege.text
+
+    zahlungen = client.get("/backoffice/zahlungen")
+    assert '<a href="/backoffice/zahlungen" class="aktiv">Zahlungen &amp; Mahnungen</a>' in zahlungen.text
+
+    einstellungen = client.get("/backoffice/einstellungen")
+    assert '<a href="/backoffice/einstellungen" class="aktiv">Einstellungen</a>' in einstellungen.text
+
+
+def test_dashboard_zeigt_mahnsperre_als_zu_erledigen_und_im_kompakten_status(backoffice_client):
+    """"Das ist zu erledigen" (Auftrag HV-20260914-UI-EINFACH) muss eine
+    tatsächlich bestehende Mahnsperre nennen, und die kompakte
+    Mietkonto-Zeile muss dafür einen verständlichen Status statt eines
+    rohen technischen Badges zeigen - abgeleitet aus denselben, bereits
+    bestehenden `aktive_sperren`-Daten, keine neue Sperrlogik."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_ = backoffice_client
+    settings = get_settings()
+    stammdaten = StammdatenRepository(build_session_factory(settings.database_url))
+    sperre_id = stammdaten.sperre_setzen(vertrag_id="V-601-1", grund="RECHTSANWALT", kommentar="RA Dr. Muster beauftragt")
+    try:
+        _login(client)
+        dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+        assert dashboard.status_code == 200
+        assert "vorhandene Mahnsperren prüfen" in dashboard.text
+        assert "Mahnung gesperrt" in dashboard.text
+        assert "RECHTSANWALT" in dashboard.text
+    finally:
+        stammdaten.sperre_aufheben(sperre_id)
+
+
+def test_dashboard_kompakte_tabelle_zeigt_lange_mieternamen_ohne_absturz_und_escaped(backoffice_client):
+    """Akzeptanzkriterium (Auftrag HV-20260914-UI-EINFACH): reale
+    Leer-/Randfälle wie ein sehr langer Mietername dürfen die neue
+    kompakte Übersichtstabelle nicht zum Absturz bringen - und ein
+    versehentlich HTML-artiger Name darf nie ungeschützt gerendert
+    werden (`views.py`-Grundsatz: alles läuft über `h()`)."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_ = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    langer_name = "Dr. Maximiliane Alexandra <script>Sehr-Lange-Nachname-Kombination</script> von Musterberg-Grafenstein"
+    stammdaten.upsert_debitor(id="DEB-LANGERNAME", name=langer_name, email=None)
+    stammdaten.upsert_einheit(id="601-TOP-LANG", objekt_id="601", bezeichnung="Top Langer Name", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-LANGERNAME", einheit_id="601-TOP-LANG", debitor_id="DEB-LANGERNAME", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-LANGERNAME"))
+
+    dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+    assert dashboard.status_code == 200
+    assert "<script>" not in dashboard.text  # nie ungeschützt gerendert
+    assert "&lt;script&gt;" in dashboard.text
+    assert "Musterberg-Grafenstein" in dashboard.text
 
 
 def test_objekt_107_ist_im_dashboard_nur_lesend(backoffice_client):
@@ -1768,9 +1870,11 @@ def test_vertraege_liste_zeigt_nav_und_bestehende_vertraege(backoffice_client):
     _login(client)
     seite = client.get("/backoffice/vertraege")
     assert seite.status_code == 200
-    assert "Mietverträge" in seite.text
+    assert "Mieter &amp; Objekte" in seite.text or "Mieter & Objekte" in seite.text
     assert "V-601-1" in seite.text
-    assert "Neuen Mietvertrag anlegen" in seite.text
+    # Auftrag HV-20260914-UI-EINFACH: großer, prominenter CTA-Button statt
+    # eines unauffälligen sekundären Links.
+    assert "Mietvertrag hinzufügen" in seite.text
 
 
 def test_dashboard_zeigt_mietvertraege_link(backoffice_client):
