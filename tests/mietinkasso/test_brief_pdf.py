@@ -290,3 +290,117 @@ def test_will_page_break_verhindert_verwaisten_betrag_direkt_am_seitenumbruch():
     text = PdfReader(io.BytesIO(out)).pages[1].extract_text()
     assert "Hauptmietzins Monat X" in text
     assert "50,00" in text
+
+
+def test_will_page_break_prueft_echte_mehrzeilige_hoehe_nicht_nur_eine_zeile():
+    """Rückprüfung 14.09.2026, Befund A: `_zeile` prüfte den
+    Seitenumbruch bisher gegen eine feste Einzelzeilenhöhe (5.5mm), nicht
+    gegen die tatsächliche - hier ZWEIZEILIGE - Höhe des umgebrochenen
+    Labels. Bei y=265 passt noch eine einzelne Zeile (5.5mm) vor dem
+    Umbruch-Trigger (273), aber nicht das komplette zweizeilige Label
+    (11mm) - `multi_cell` brach dadurch mitten in der Zeile selbst um,
+    der Betrag landete mit dem alten `y0` verwaist auf Seite 2."""
+
+    pdf = _MahnbriefPDF(format="A4", unit="mm", enforce_compliance="PDF/A-2B")
+    pdf.farbe_anthrazit, pdf.farbe_gold = (0, 0, 0), (0, 0, 0)
+    pdf.kopf_text, pdf.fuss_zeile1, pdf.fuss_zeile2 = "K", "F1", "F2"
+    pdf.set_margins(20, 20, 20)
+    pdf.set_auto_page_break(True, margin=24)
+    pdf.alias_nb_pages()
+    pdf.add_font("Brief", "", "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf")
+    pdf.add_font("Brief", "B", "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf")
+    pdf.add_page()
+    pdf.set_y(265)  # eine Zeile (5.5mm) passt noch vor 273, zwei (11mm) nicht mehr
+    label = (
+        "SYNTHETIC Forderungsbeleg 11 – anteilige Miete einschließlich Küche, "
+        "Parkplatz und gesondert vereinbarter Betriebskosten, fällig seit 05.08.2026"
+    )
+    _zeile(pdf, label, 10_011)
+    assert pdf.page_no() == 2  # gesamte (zweizeilige) Zeile als Ganzes auf Seite 2
+
+    out = bytes(pdf.output())
+    seite1_text = PdfReader(io.BytesIO(out)).pages[0].extract_text()
+    seite2_text = PdfReader(io.BytesIO(out)).pages[1].extract_text()
+    assert "100,11" not in seite1_text  # kein verwaister Betrag auf der Vorseite
+    assert "SYNTHETIC Forderungsbeleg 11" in seite2_text
+    assert "100,11" in seite2_text
+
+
+def test_mehrzeilige_forderungszeilen_reissen_betrag_nicht_von_ihrem_label_ab():
+    """Exakte Rückprüfung 14.09.2026 (Befund A): 18 Forderungszeilen mit
+    je zweizeiligem Label (EB Garamond beim Prüfenden, hier mit der
+    Fallback-Schrift reproduziert - die Zeilenumbruch-Logik ist
+    fontunabhängig) und Beträgen 10000+N Cent. Vorher landete der Betrag
+    zur 11. Zeile (100,11 EUR) verwaist am Seitenende von Seite 2 vor der
+    Fußzeile, ohne sein Label."""
+
+    zeilen = [
+        Forderungszeile(
+            f"SYNTHETIC Forderungsbeleg {n} – anteilige Miete einschließlich Küche, "
+            "Parkplatz und gesondert vereinbarter Betriebskosten",
+            date(2026, 8, 5), 10_000 + n,
+        )
+        for n in range(1, 19)
+    ]
+    gesamt = sum(f.betrag_cent for f in zeilen)
+    pdf_bytes = _erzeugen(
+        forderungszeilen=zeilen, bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0,
+        gesamtbetrag_cent=gesamt,
+    )
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    assert len(reader.pages) >= 2
+
+    for n in range(1, 19):
+        betrag_text = f"{(10_000 + n) / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        seiten_texte = [seite.extract_text() for seite in reader.pages]
+        seiten_mit_betrag = [t for t in seiten_texte if betrag_text in t]
+        assert seiten_mit_betrag, f"Betrag {betrag_text} fehlt komplett im PDF"
+        for text in seiten_mit_betrag:
+            assert f"Forderungsbeleg {n} " in text, (
+                f"Betrag {betrag_text} steht ohne sein Label \"Forderungsbeleg {n}\" auf einer Seite"
+            )
+
+
+# -- Empfänger-Fensterbreite: einzelne, für sich genommen zu lange -------
+# -- Zeile darf NICHT still aus dem 90mm-Fenster laufen (Rückprüfung -----
+# -- 14.09.2026, Befund B) -------------------------------------------------
+
+
+def test_zu_lange_einzelne_empfaengerzeile_wird_kontrolliert_umgebrochen():
+    """Eine einzelne, für sich genommen zu breite Zeile (Name ODER
+    Adresse) wird jetzt anhand der tatsächlichen 11pt-Fontbreite im
+    90mm-Fenster umgebrochen statt mit `cell(90, 5)` unbeachtet ihrer
+    Breite rechts aus dem Fenster zu laufen. Bleibt die Summe der
+    umgebrochenen Zeilen bei höchstens 6, wird der Brief trotzdem
+    erzeugt."""
+
+    pdf_bytes = _erzeugen(
+        empfaenger_name="Max Mustermieter",
+        empfaenger_adresse="Sehr lange Musterstraße mit sehr vielen Wörtern die nicht in neunzig Millimeter passen 12-14/5\n1010 Wien",
+    )
+    assert pdf_bytes[:5] == b"%PDF-"
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = reader.pages[0].extract_text()
+    assert "Sehr lange Musterstraße" in text
+    assert "1010 Wien" in text
+
+
+def test_zu_lange_einzelne_empfaengerzeile_die_trotz_umbruch_nicht_passt_wird_abgelehnt():
+    """Vorher wurde nur die ROHE Zeilenanzahl (hier 3: Name + 2
+    Adresszeilen) gegen das Limit von 6 geprüft und bestanden - die
+    einzelnen Zeilen liefen dabei unbeachtet ihrer tatsächlichen Breite
+    aus dem 90mm-Fenster. Ergibt der Umbruch anhand der echten
+    11pt-Fontbreite in Summe mehr als 6 Zeilen, wird jetzt kontrolliert
+    mit `AdressfehlerError` (422) abgelehnt statt still zu überlaufen."""
+
+    with pytest.raises(AdressfehlerError):
+        _erzeugen(
+            empfaenger_name=(
+                "Max Mustermieter mit außergewöhnlich langem doppeltem Nachnamen-Bindestrich-Kombination "
+                "und noch einem Adelstitel obendrauf"
+            ),
+            empfaenger_adresse=(
+                "Sehr lange Musterstraße mit sehr vielen Wörtern die nicht in neunzig Millimeter "
+                "Fensterbreite passen 12-14/5/22\n1010 Wien"
+            ),
+        )

@@ -3319,3 +3319,33 @@ behoben:
    Ausgabestellen verwendet, jeweils mit Zusatz "(einschließlich)".
 
 18 neue/erweiterte Tests, 1042/1042 grün im Gesamtlauf. Keine Liveaktionen.
+
+## Korrekturpaket Runde 12: Zwei belegte Renderfehler in _zeile/Empfängerfenster (14.09.2026)
+
+Nach unabhängiger PDF-Abnahme von 253ef99 (Portal-GETs/Auth/422/
+Adressversion/DB-unverändert bestätigt PASS) zwei konkret belegte
+Rendererfehler behoben:
+
+1. **`_zeile` prüfte den Seitenumbruch nur gegen eine feste
+   Einzelzeilenhöhe (5.5mm), nicht die tatsächliche - ggf. mehrzeilige -
+   Höhe des umgebrochenen Labels.** Bei langen Bezeichnungen (z. B. EB
+   Garamond, 18 Forderungszeilen mit je zweizeiligem Text) passte zwar
+   eine einzelne Zeile noch vor den Seitenumbruch-Trigger, das komplette
+   Label aber nicht mehr - `multi_cell` brach dadurch selbst mitten in
+   der Zeile um, der Betrag landete mit dem alten `y0` verwaist am
+   Seitenende vor der Fußzeile. Fix: die tatsächliche Höhe wird jetzt per
+   `multi_cell(..., dry_run=True, output=MethodReturnValue.HEIGHT)`
+   vorab ermittelt und gegen `will_page_break` geprüft, statt eine
+   einzelne Zeile anzunehmen.
+2. **Empfänger wurde nur nach ZeilenANZAHL geprüft, nicht nach der
+   tatsächlichen Breite.** Eine einzelne, für sich genommen zu lange
+   Zeile bestand die Zeilenanzahl-Prüfung (≤6) unbeachtet ihrer Breite
+   und lief mit `cell(90, 5)` unbemerkt rechts aus dem 90mm-Fenster. Fix:
+   jede Empfängerzeile wird jetzt per Dry-Run mit der tatsächlichen
+   11pt-Fontbreite im Fenster umgebrochen; ergibt das in Summe mehr als
+   6 Zeilen, wird kontrolliert mit `AdressfehlerError` (422) abgelehnt
+   statt still zu überlaufen.
+
+5 neue Tests (davon 3 gezielt gegen den alten Code als tatsächliche
+Regressionstests bestätigt), 1046/1046 grün im Gesamtlauf. Keine
+Liveaktionen, keine neuen Funktionen.

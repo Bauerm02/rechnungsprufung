@@ -23,6 +23,7 @@ from datetime import date
 from pathlib import Path
 
 from fpdf import FPDF
+from fpdf.enums import MethodReturnValue
 
 from mietinkasso.mahnwesen.kosten import zins_bis_einschliesslich
 
@@ -147,11 +148,13 @@ def _zeile(pdf: FPDF, label: str, betrag_cent: int, *, einzug: float = 0.0, fett
     label_breite = (_INHALT_RECHTS - _RAND - einzug) - _BETRAG_SPALTE_BREITE
     pdf.set_font("Brief", "B" if fett else "", 10)
     # Manuell VOR der Zeile umbrechen, statt `y0` unter der Hand
-    # veralten zu lassen: bräche `multi_cell` selbst mitten in der
-    # Zeile um, würde der Betrag mit dem alten `y0` sonst erneut einen
-    # (zweiten) Seitenumbruch auslösen und als verwaiste Zahl ohne
-    # Bezeichnung auf einer eigenen Seite landen.
-    if pdf.will_page_break(5.5):
+    # veralten zu lassen: bräche `multi_cell` selbst mitten in einer
+    # MEHRZEILIGEN Bezeichnung um, würde der Betrag mit dem alten `y0`
+    # sonst als verwaiste Zahl auf der Folgeseite landen. Die tatsächliche
+    # (ggf. mehrzeilige) Höhe wird deshalb per Dry-Run ermittelt statt nur
+    # eine einzelne Zeile anzunehmen.
+    hoehe = pdf.multi_cell(label_breite, 5.5, label, align="L", dry_run=True, output=MethodReturnValue.HEIGHT)
+    if pdf.will_page_break(hoehe):
         pdf.add_page()
     x0, y0 = _RAND + einzug, pdf.get_y()
     pdf.set_xy(x0, y0)
@@ -214,6 +217,25 @@ def erzeuge_mahnbrief_pdf(
 
     pdf.add_page()
 
+    # Bisher wurde nur die ANZAHL der Empfängerzeilen geprüft - eine
+    # einzelne, für sich genommen zu lange Zeile lief mangels
+    # Breitenprüfung mit `cell(fenster_breite_mm, ...)` rechts aus dem
+    # Fenster. Jetzt mit der tatsächlichen Fontbreite (11pt) je Zeile per
+    # Dry-Run kontrolliert umbrechen; ergibt das in Summe mehr als die
+    # zulässigen Zeilen, wird kontrolliert abgelehnt statt still zu
+    # überlaufen.
+    pdf.set_font("Brief", "", 11)
+    empfaenger_render_zeilen: list[str] = []
+    for zeile in empfaenger_alle_zeilen:
+        empfaenger_render_zeilen.extend(
+            pdf.multi_cell(absender.fenster_breite_mm, 5, zeile, align="L", dry_run=True, output=MethodReturnValue.LINES)
+        )
+    if len(empfaenger_render_zeilen) > _MAX_EMPFAENGER_ZEILEN:
+        raise AdressfehlerError(
+            f"Empfänger+Adresse ergeben nach Zeilenumbruch im {absender.fenster_breite_mm:.0f}-mm-Fenster "
+            f"{len(empfaenger_render_zeilen)} Zeilen, das Fenster erlaubt höchstens {_MAX_EMPFAENGER_ZEILEN}."
+        )
+
     fenster_unten = absender.fenster_oben_mm + absender.fenster_hoehe_mm
     logo_unten = 12.0
     if absender.logo_pfad and Path(absender.logo_pfad).is_file():
@@ -235,7 +257,7 @@ def erzeuge_mahnbrief_pdf(
     pdf.set_text_color(0, 0, 0)
     pdf.set_font("Brief", "", 11)
     y = absender.fenster_oben_mm
-    for zeile in empfaenger_alle_zeilen:
+    for zeile in empfaenger_render_zeilen:
         pdf.set_xy(absender.fenster_links_mm, y)
         pdf.cell(absender.fenster_breite_mm, 5, zeile, align="L")
         y += 5
