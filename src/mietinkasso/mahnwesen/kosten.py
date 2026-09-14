@@ -747,10 +747,45 @@ def berechne_mahnkosten_vorschau(
     else:
         hinweise.append("Gesetzliche Verzugszinsen §1000 ABGB (keine geprüfte abweichende Vereinbarung/kein geprüftes B2B-Profil).")
 
+    # Rückprüfung 14.09.2026, echter Bug (nachgelaufene Zinsen bei
+    # vollständiger Zahlung): eine Forderung, die zwischen der letzten
+    # Zinsberechnung und heute VOLLSTÄNDIG bezahlt wird, verschwindet aus
+    # `offene_forderungen()` (rest_cent == 0) und damit aus
+    # `forderungen_kern` - die zwischen der letzten Buchung und ihrer
+    # tatsächlichen Zahlung TATSÄCHLICH ANGEFALLENEN, noch nicht
+    # gebuchten Zinsen dürfen dadurch nicht ersatzlos verschwinden (§1000
+    # ABGB läuft bis zur tatsächlichen Zahlung, nicht bis zum letzten
+    # Mahnlauf). Nur eine Forderung, für die BEREITS EINMAL Zinsen
+    # gebucht wurden (`bereits_gebuchte_zinsen_je_op_position`), wird
+    # dafür aus den Rohdaten (`alle_positionen`) reaktiviert -
+    # `balance_zeitreihe_fuer_forderung` berücksichtigt die Zahlung
+    # ohnehin taggenau und liefert dann automatisch nur die Periode BIS
+    # zur Zahlung (rest_cent erreicht danach 0, keine erfundene
+    # Nachverzinsung). Eine Forderung, die VOR jeder Berechnung bereits
+    # vollständig bezahlt war (nie Teil eines Mahnlaufs), wird NIE
+    # rückwirkend neu entdeckt. Nebenforderungen (`quelle_system ==
+    # "mahnkosten"`) werden hier nie reaktiviert - sie tauchen aus
+    # demselben Grund gar nicht erst in diesem Dictionary auf.
+    from mietinkasso.domain.enums import OPTyp as _OPTyp
+
+    _bekannte_op_ids = {f.op_position_id for f in forderungen_kern}
+    _positive_typen_werte = {_OPTyp.EROEFFNUNG.value, _OPTyp.SOLL.value, _OPTyp.RUECKLASTSCHRIFT.value}
+    forderungen_getilgt_reaktiviert = [
+        OffeneForderung(
+            op_position_id=p.id, art=p.typ, betrag_cent=p.betrag_cent, rest_cent=0,
+            belegdatum=p.belegdatum, faelligkeit=p.faelligkeit, faelligkeit_bekannt=p.faelligkeit_bekannt,
+            leistungsperiode=p.leistungsperiode, quelle_system=p.quelle_system,
+        )
+        for p in alle_positionen
+        if p.id in bereits_gebuchte_zinsen_je_op_position and p.id not in _bekannte_op_ids
+        and p.typ in _positive_typen_werte and p.betrag_cent > 0 and p.quelle_system != "mahnkosten"
+    ]
+    forderungen_fuer_verzinsung = forderungen_kern + forderungen_getilgt_reaktiviert
+
     ausgeschlossen: list[str] = []
     alle_segmente: list[ZinsSegment] = []
 
-    for forderung in forderungen_kern:
+    for forderung in forderungen_fuer_verzinsung:
         perioden = balance_zeitreihe_fuer_forderung(
             ziel_op_position_id=forderung.op_position_id, alle_positionen=alle_positionen, heute=heute,
         )
@@ -862,12 +897,30 @@ def berechne_mahnkosten_vorschau(
                 schluessel for schluessel in _faellige_entgeltforderungs_schluessel(forderungen_kern, heute)
                 if schluessel not in bereits_erhobene_gebuehr_schluessel
             ]
-            for schluessel in fuer_gebuehr_qualifiziert:
-                gebuehr_segmente.append(GebuehrSegment(schluessel, ersatzfaehiger_betrag_cent, rechtsgrundlage))
+            # Rückprüfung 14.09.2026, echter Bug: §1333 Abs 2 ABGB ersetzt
+            # die TATSÄCHLICHEN Kosten DIESES EINEN Briefs (Druck+Kuvert+
+            # Porto+Nachweis) - anders als die je-Entgeltforderung
+            # gedachte §458-UGB-Pauschale entsteht dieser Aufwand GENAU
+            # EINMAL je Versand, unabhängig davon, wie viele fällige
+            # Monatsforderungen in diesem einen Brief gebündelt sind. Bei
+            # mehreren qualifizierten Entgeltforderungen in DERSELBEN
+            # Vorschau (ein einziger Brief) wird der volle, gedeckelte
+            # Ersatzbetrag deshalb NUR EINMAL angesetzt - auf die (nach
+            # `_faellige_entgeltforderungs_schluessel`, also FIFO-)
+            # ERSTE qualifizierte Entgeltforderung als Trägerin der
+            # dauerhaften Ledger-Sperre; die übrigen Entgeltforderungen
+            # dieses Briefs bleiben für §1333 unberührt (bekommen KEIN
+            # eigenes Segment) und können bei einem SPÄTEREN, separaten
+            # Brief noch ihre eigene tatsächliche Versandkosten-Position
+            # auslösen. Nie derselbe Portoaufwand mehrfach angesetzt.
+            if fuer_gebuehr_qualifiziert:
+                gebuehr_segmente.append(
+                    GebuehrSegment(fuer_gebuehr_qualifiziert[0], ersatzfaehiger_betrag_cent, rechtsgrundlage)
+                )
             if gebuehr_segmente:
                 hinweise.append(
-                    f"§1333 Abs 2 ABGB: {len(gebuehr_segmente)} neue ersatzfähige Versandkosten-Position(en) "
-                    "für bislang noch nicht belastete Entgeltforderung(en)."
+                    f"§1333 Abs 2 ABGB: 1 neue ersatzfähige Versandkosten-Position ({ersatzfaehiger_betrag_cent / 100:.2f} EUR) "
+                    "für diesen einen Brief - unabhängig von der Anzahl gebündelter Entgeltforderungen."
                 )
             else:
                 hinweise.append(

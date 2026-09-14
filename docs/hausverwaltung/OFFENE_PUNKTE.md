@@ -3136,3 +3136,65 @@ verfuegbar=False`), genau wie beauftragt.
 
 10 neue/erweiterte Tests, 1017/1017 grün im Gesamtlauf. Nur synthetische
 Testdaten, kein Deployment, kein Serverzugriff, kein Liveversand.
+
+## Korrekturpaket Runde 9: Nachgelaufene Zinsen bei Vollzahlung + §1333-Mehrfachansatz (14.09.2026)
+
+1. **Nachgelaufene Zinsen bei vollständiger Zahlung verschwanden ersatzlos**
+   (unabhängige Rückprüfung nach a1abdc6, echter Bug, konkreter Repro:
+   830 EUR/4 %, Fälligkeit 05.09., erste Mahnung 14.09. verbucht 8 Tage
+   Zinsen (0,73 EUR); Zahlung 850 EUR am 20.09. tilgt die Hauptforderung
+   VOLLSTÄNDIG; eine Vorschau am 28.09. zeigte `neue_zinsen_delta_cent=0`,
+   obwohl bis zur tatsächlichen Zahlung 14 Tage (1,27 EUR) angefallen
+   waren - die fehlenden 0,54 EUR gingen verloren): eine vollständig
+   bezahlte Forderung verschwindet aus `offene_forderungen()`
+   (`rest_cent == 0`) und damit aus der Zinsberechnungsschleife, obwohl
+   §1000 ABGB bis zur TATSÄCHLICHEN Zahlung läuft, nicht nur bis zum
+   letzten Mahnlauf. Fix: `kosten.py::berechne_mahnkosten_vorschau`
+   reaktiviert für die reine Zinsberechnung (NICHT für die Hauptforderung
+   selbst) jede Forderung, für die bereits einmal Zinsen gebucht wurden
+   (`bereits_gebuchte_zinsen_je_op_position`) und die seither vollständig
+   getilgt wurde, aus den Rohdaten (`alle_positionen`) -
+   `balance_zeitreihe_fuer_forderung` berücksichtigt die Zahlung ohnehin
+   taggenau und liefert automatisch nur die Periode BIS zur Zahlung
+   (kein erfundener Nachlauf danach). Eine Forderung, die VOR jeder
+   Berechnung bereits bezahlt war (nie Teil eines Mahnlaufs), wird NIE
+   rückwirkend neu entdeckt. Nebenforderungen (Mahnkosten-Zeilen) werden
+   nie reaktiviert. Ein bestehender Test, der die alte, fehlerhafte
+   Nichtberücksichtigung noch als erwartetes Verhalten geprüft hatte,
+   wurde entsprechend korrigiert. 2 neue gezielte Tests (exakter
+   830/850-EUR-Vollzahlungs-Repro inkl. Bestätigung, dass die Vorschau
+   trotz Hauptforderung 0 nicht verschwindet; Teilzahlungs-Gegenprobe mit
+   50 EUR, bei der die Forderung offen bleibt und beide Zinsperioden
+   bereits korrekt getrennt berechnet wurden).
+2. **§1333-Abs-2-ABGB-Versandkosten wurden je gebündelter Entgeltforderung
+   vervielfacht** (unabhängige Rückprüfung nach a1abdc6, echter Bug,
+   konkreter Repro: Verbraucher-Vertrag, zwei offene Monatsforderungen
+   Juli/August in EINEM Brief, geprüfter Anbietertarif Druck 31 Cent +
+   Porto 100 Cent = 131 Cent tatsächlicher Aufwand; die Vorschau setzte
+   für JEDE der zwei Entgeltforderungen ein eigenes 131-Cent-Segment an,
+   macht 262 Cent statt höchstens 131 Cent): §1333 ersetzt die
+   TATSÄCHLICHEN Kosten EINES konkreten Versands (Druck+Kuvert+Porto+
+   Nachweis), die unabhängig von der Anzahl gebündelter Monate nur EINMAL
+   anfallen - anders als die bewusst je-Entgeltforderung gedachte §458-
+   UGB-Pauschale (bleibt unverändert). Fix: `kosten.py::
+   berechne_mahnkosten_vorschau` setzt den vollen, ggf. gedeckelten
+   Ersatzbetrag nur noch EINMAL an (auf die erste qualifizierte
+   Entgeltforderung als Trägerin der dauerhaften Ledger-Sperre), die
+   übrigen im selben Brief gebündelten Entgeltforderungen bekommen KEIN
+   eigenes Segment - können aber bei einem späteren, separaten Brief noch
+   ihre eigene tatsächliche Versandkosten-Position auslösen. 1 neuer
+   gezielter Test (exakter 131-vs-262-Cent-Repro).
+
+3 neue/erweiterte Tests, 1020/1020 grün im Gesamtlauf. Nur synthetische
+Testdaten, kein Deployment, kein Serverzugriff, kein Liveversand.
+
+**Weiterhin ehrlich offen**: PDF/A-Exporter mit EinfachBrief-Layout
+(inkl. JLB-Briefkopf/-Farben/-Fonts, konfigurierbarer Asset-Pfad für das
+freigegebene Logo-PNG, PDF/A-Fonts/ICC-Abhängigkeiten im Docker-Build),
+die explizite Sichtbarmachung einer wegen fehlender Briefanbindung
+BLOCKIERT_TRANSIENT wartenden Stufe-2-Briefmahnung samt druckfertigem
+PDF im Portal - EinfachBrief sFTP/API ist weiterhin nicht freigeschaltet
+(`brief_transport_verfuegbar=False`), Stufe 2 fällt bei fehlendem
+Brieftransport NICHT auf E-Mail zurück, sondern bleibt `BLOCKIERT_
+TRANSIENT`/GEPLANT (bestehendes, unverändertes Verhalten, unabhängig
+bestätigt).

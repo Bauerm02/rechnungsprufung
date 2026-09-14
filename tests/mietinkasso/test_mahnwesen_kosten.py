@@ -283,7 +283,16 @@ def test_zinsdelta_einer_neuen_forderung_wird_nicht_durch_eine_alte_abgeloeste_g
     das wäre mit einer vertragsweiten Blanko-Subtraktion der Fall
     gewesen (`max(neue_zinsen_cent - bereits_gebuchte_zinsen_cent, 0)`
     hätte 0 ergeben, obwohl die neue Forderung echte, noch nie gebuchte
-    Zinsen trägt)."""
+    Zinsen trägt).
+
+    Rückprüfung 14.09.2026, echter Bug (zweite, spätere Runde): zwischen
+    der Buchung bei Stufe 1 (01.02.) und der tatsächlichen Vollzahlung
+    (10.02.) sind auf die ALTE Forderung noch WEITERE, bislang nie
+    gebuchte Zinstage angefallen (§1000 ABGB läuft bis zur tatsächlichen
+    Zahlung, nicht nur bis zum letzten Mahnlauf) - diese nachgelaufenen
+    Zinstage dürfen NICHT ersatzlos verschwinden, nur weil die
+    Hauptforderung selbst durch die Vollzahlung aus `offene_forderungen()`
+    verschwindet."""
 
     vertrag, konto = basis_vertrag
     op_service.buchen(
@@ -333,18 +342,33 @@ def test_zinsdelta_einer_neuen_forderung_wird_nicht_durch_eine_alte_abgeloeste_g
     # Zeile zählt NIE erneut als Hauptforderung).
     assert vorschau.hauptforderung_cent == 3_000
     assert vorschau.bereits_offene_mahnkosten_cent == zinsen_alte_forderung
-    assert vorschau.neue_zinsen_cent == zinsen_neue_forderung
-    # Der Kern des Fixes: das Delta ist NICHT 0, obwohl vertragsweit
-    # bereits mehr Zinsen gebucht wurden, als die neue Forderung selbst
-    # an Zinsen trägt.
-    assert vorschau.neue_zinsen_delta_cent == zinsen_neue_forderung
+    # Die alte Forderung wird trotz Vollzahlung für die Zinsberechnung
+    # bis zu ihrem tatsächlichen Zahlungsdatum (10.02., nicht nur bis
+    # zum letzten Mahnlauf 01.02.) reaktiviert - ihr voller, bis dahin
+    # angefallener Zinsbetrag fließt (abzüglich des bereits Gebuchten)
+    # zusätzlich zur neuen Forderung ins Delta ein.
+    zinsen_alte_forderung_bis_zahlung = _segment_zinsen_cent(
+        50_000, Decimal("4.000"), (date(2026, 2, 10) - date(2026, 1, 6)).days,
+    )
+    assert zinsen_alte_forderung_bis_zahlung > zinsen_alte_forderung  # es sind tatsächlich neue Tage dazugekommen
+    assert vorschau.neue_zinsen_cent == zinsen_alte_forderung_bis_zahlung + zinsen_neue_forderung
+    # Der Kern des ursprünglichen Fixes bleibt erhalten: das Delta ist
+    # NICHT 0, obwohl vertragsweit bereits mehr Zinsen gebucht wurden,
+    # als die neue Forderung selbst an Zinsen trägt - UND es enthält
+    # zusätzlich die nachgelaufenen, bislang nie gebuchten Zinstage der
+    # alten, mittlerweile bezahlten Forderung.
+    assert vorschau.neue_zinsen_delta_cent == (
+        (zinsen_alte_forderung_bis_zahlung - zinsen_alte_forderung) + zinsen_neue_forderung
+    )
 
     gebucht = kosten_service.buche_bei_versand(
         ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1),
         versandnachweis_referenz="mahnung:neue-forderung", akteur="test",
     )
     assert gebucht is not None
-    assert gebucht.zinsen_cent == zinsen_neue_forderung
+    assert gebucht.zinsen_cent == (
+        (zinsen_alte_forderung_bis_zahlung - zinsen_alte_forderung) + zinsen_neue_forderung
+    )
 
 
 def test_zwei_disjunkte_gruppen_selbe_stufe_selber_stichtag_buchen_getrennte_ledger(
@@ -1252,6 +1276,155 @@ def test_gruppenscoping_verliert_zugehoerige_bereits_offene_mahnkosten_nicht(
     assert vorschau2 is not None
     assert vorschau2.hauptforderung_cent == 83_000
     assert vorschau2.bereits_offene_mahnkosten_cent == bereits_gebuchte_mahnkosten_gesamt_cent
+
+
+# -- §1333 Abs 2 ABGB Versandkosten: EINMAL je Brief, nicht je Forderung ---
+
+
+def test_briefversandkosten_werden_nur_einmal_pro_brief_angesetzt_nicht_je_forderung(
+    op_service, kosten_repo, admin_ctx, basis_vertrag, session_factory, stammdaten_repo,
+):
+    """Rückprüfung 14.09.2026, echter Bug (a1abdc6): §1333 Abs 2 ABGB
+    ersetzt die TATSÄCHLICHEN Kosten EINES konkreten Briefs - bei zwei in
+    genau einem Brief gebündelten fälligen Monatsforderungen (Juli und
+    August) wurde der volle Anbieteraufwand (Druck 31 Cent + Porto
+    100 Cent = 131 Cent) bislang je Entgeltforderung ein zweites Mal
+    angesetzt (262 Cent statt höchstens 131 Cent). Der tatsächliche
+    Porto-/Druckaufwand entsteht aber nur EINMAL für diesen einen
+    Versand, unabhängig von der Anzahl gebündelter Monate."""
+
+    from mietinkasso.mahnwesen.kosten_service import MahnkostenService
+    from mietinkasso.mahnwesen.repository import BriefAnbieterProfilRepository
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
+        versandkosten_ersatzfaehig_geprueft=True,
+    )
+    brief_repo = BriefAnbieterProfilRepository(session_factory)
+    profil = brief_repo.anlegen(
+        anbieter_name="Test-Anbieter", quelle_beleg="Testtarif",
+        preis_druck_cent=31, preis_kuvert_cent=0, preis_porto_cent=100, preis_nachweis_cent=0,
+        erstellt_von="test",
+    )
+    brief_repo.freigeben(profil.id, freigegeben_von="test")
+
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 7, 1), buchungsdatum=date(2026, 7, 1),
+        faelligkeit=date(2026, 7, 5), leistungsperiode="2026-07", beleg_referenz="HMZ Juli",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1),
+        faelligkeit=date(2026, 8, 5), leistungsperiode="2026-08", beleg_referenz="HMZ August",
+    )
+
+    kosten_service_brief = MahnkostenService(
+        kosten_repo, op_service, stammdaten_repo, brief_anbieterprofil_repository=brief_repo,
+    )
+    vorschau = kosten_service_brief.vorschau(
+        vertrag_id=vertrag.id, stufe=1, heute=date(2026, 9, 1), kanal="BRIEF",
+    )
+
+    assert vorschau is not None
+    assert vorschau.versandkosten_anbieteraufwand_cent == 131
+    assert len(vorschau.gebuehr_segmente) == 1
+    assert vorschau.gebuehr_cent == 131  # NICHT 262 (131 je Forderung x 2 Monate)
+
+
+def test_teilzahlung_nach_erster_mahnung_verzinst_ursprungs_und_restbetrag_getrennt(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Unabhängige Rückprüfung Codex 14.09.2026, konkreter Repro: 830 EUR
+    Forderung (Fälligkeit 05.09., Zinsbeginn 06.09.), erste Mahnung 14.09.
+    verbucht 8 Tage Zinsen (0,73 EUR) + 40-EUR-§458-Pauschale. Eine
+    Teilzahlung von 50 EUR am 20.09. lässt die Forderung mit 780 EUR
+    OFFEN (bleibt Teil von `offene_forderungen()`) - die Vorschau am
+    28.09. muss die ursprünglichen 14 Tage auf 830 EUR UND die
+    nachfolgenden 8 Tage auf die reduzierten 780 EUR getrennt verzinsen,
+    abzüglich der bereits gebuchten 0,73 EUR (1,27 + 0,68 - 0,73 =
+    1,22 EUR Delta)."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=4000, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=83_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1),
+        faelligkeit=date(2026, 9, 5), leistungsperiode="2026-09", beleg_referenz="HMZ September",
+    )
+    stufe1 = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 9, 14),
+        versandnachweis_referenz="mahnung:stufe1", akteur="test",
+    )
+    assert stufe1 is not None
+    assert stufe1.zinsen_cent == 73
+    assert stufe1.gebuehr_cent == 4000
+
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=5_000,
+        belegdatum=date(2026, 9, 20), buchungsdatum=date(2026, 9, 20),
+        faelligkeit=None, beleg_referenz="Teilzahlung HMZ September",
+    )
+
+    vorschau2 = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=2, heute=date(2026, 9, 28))
+
+    assert vorschau2 is not None
+    assert vorschau2.hauptforderung_cent == 78_000
+    assert vorschau2.neue_zinsen_delta_cent == 122
+
+
+def test_vollzahlung_nach_erster_mahnung_verzinst_nachgelaufene_tage_bis_zur_zahlung(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Unabhängige Rückprüfung Codex 14.09.2026, konkreter Repro: dieselbe
+    830-EUR-Forderung wie oben, aber eine VOLLSTÄNDIGE Zahlung von
+    850 EUR am 20.09. tilgt die Hauptforderung komplett - sie
+    verschwindet damit aus `offene_forderungen()`. Die Vorschau am 28.09.
+    darf die zwischen der Buchung (14.09.) und der tatsächlichen Zahlung
+    (20.09.) TATSÄCHLICH ANGEFALLENEN, noch nicht gebuchten 6 Zinstage
+    (0,54 EUR: 1,27 EUR bis zur Zahlung abzüglich 0,73 EUR bereits
+    gebucht) nicht verschwinden lassen. Der überschießende Zahlungsteil
+    (20 EUR) tilgt zuerst die bereits gebuchten 0,73 EUR Zinsen
+    vollständig, dann teilweise die 40-EUR-Pauschale (bleibt mit
+    20,73 EUR offen) - keine neue §458-Pauschale, keine Verzinsung dieser
+    Nebenforderungen. Die Vorschau selbst darf trotz Hauptforderung 0
+    nicht verschwinden (`vorschau is not None`)."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=4000, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=83_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1),
+        faelligkeit=date(2026, 9, 5), leistungsperiode="2026-09", beleg_referenz="HMZ September",
+    )
+    stufe1 = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 9, 14),
+        versandnachweis_referenz="mahnung:stufe1", akteur="test",
+    )
+    assert stufe1 is not None
+    assert stufe1.zinsen_cent == 73
+    assert stufe1.gebuehr_cent == 4000
+
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=85_000,
+        belegdatum=date(2026, 9, 20), buchungsdatum=date(2026, 9, 20),
+        faelligkeit=None, beleg_referenz="Vollzahlung + Überzahlung HMZ September",
+    )
+
+    vorschau2 = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=2, heute=date(2026, 9, 28))
+
+    assert vorschau2 is not None  # darf NICHT verschwinden, nur weil die Hauptforderung getilgt ist
+    assert vorschau2.hauptforderung_cent == 0
+    assert vorschau2.bereits_offene_mahnkosten_cent == 2073  # 20,73 EUR: Rest der §458-Pauschale
+    assert vorschau2.neue_zinsen_delta_cent == 54  # nachgelaufene Zinsen 14.09.-20.09.
+    assert not vorschau2.gebuehr_segmente  # keine neue Pauschale auf eine bereits bepauschalte Forderung
 
 
 def test_reserviere_und_kuerze_vorschau_entfernt_von_anderer_gruppe_bereits_reserviertes_segment(
