@@ -1654,7 +1654,7 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
                   <td class="tx-referenz">{h(tx.referenz or '')}</td><td class="nowrap">{eur(rest)} offen</td>
                   <td>{h(begruendung)}</td>
                   {vorschlag_td}
-                  <td>
+                  <td class="bank-aktion">
                     <a class="btn-verknuepfen" href="/backoffice/bank/{tx.id}/verknuepfen">Bestehende Zahlung verknüpfen</a>
                     <details class="tx-manuell"><summary>Manuell zuordnen</summary>
                       <form method="post" action="/backoffice/bank/{tx.id}/manuell-zuordnen">
@@ -1721,7 +1721,7 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
                   <td class="nowrap">{eur(tx.betrag_cent)}</td><td class="nowrap">{tx.buchungsdatum.isoformat()}</td>
                   <td class="tx-referenz">{h(tx.referenz or '')}</td>
                   <td>{h(begruendung)}</td>
-                  <td>{rest_html}{manuell_html}{_bank_tx_details_html(tx)}</td>
+                  <td class="bank-aktion">{rest_html}{manuell_html}{_bank_tx_details_html(tx)}</td>
                 </tr>"""
 
             def _summe(zeilen: list[tuple[object, str]]) -> int:

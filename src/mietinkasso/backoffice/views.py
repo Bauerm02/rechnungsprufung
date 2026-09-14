@@ -328,6 +328,11 @@ def seite(
      umbrechen ("Betr-ag", "600,-00 €") - nur die Referenzspalte bricht
      um, die Tabelle selbst scrollt bei Bedarf horizontal (.tabelle-scroll). */
   .tabelle-scroll th.nowrap, .tabelle-scroll td.nowrap {{ white-space: nowrap; }}
+  /* Bank-Aktionszelle (Verknüpfen-Button/Manuell-Details) braucht etwas
+     Mindestbreite, sonst bricht "Bestehende"/"verknüpfen" bei ~820px
+     mitten im Wort - die Seite selbst wird NICHT breiter, nur diese
+     Zelle scrollt bei Bedarf mit dem umgebenden .tabelle-scroll mit. */
+  .tabelle-scroll td.bank-aktion {{ min-width: 180px; overflow-wrap: normal; word-break: normal; }}
   /* Bankübersicht (Auftrag HV-20260914-BANKUEBERSICHT): "Mit bestehender
      Zahlung verknüpfen" bewusst optisch hervorgehoben (gefüllt statt nur
      Outline), um Doppelbuchungen zu vermeiden - sparsamer Golddunkel-
