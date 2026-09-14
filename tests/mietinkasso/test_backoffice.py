@@ -1498,6 +1498,220 @@ def test_bankseite_zeigt_keine_automatik_schaltflaeche_ausserhalb_der_demo_umgeb
     assert "Automatische Zuordnung zurückgestellt" in seite_ohne_demo.text
 
 
+# -- HV-20260914-BANKUEBERSICHT: Bankübersicht bereinigt (Anzeigekategorien) -------
+
+
+def _bank_zeile_ausschnitt(seiten_text: str, referenz_marker: str) -> str:
+    """Isoliert die Tabellenzeile (<tr>...</tr>), die den gegebenen
+    eindeutigen Referenztext enthält - für gezielte Assertions je Zeile
+    statt versehentlich über die ganze Seite zu matchen."""
+
+    start = seiten_text.index(referenz_marker)
+    zeile_start = seiten_text.rindex("<tr>", 0, start)
+    zeile_ende = seiten_text.index("</tr>", start) + len("</tr>")
+    return seiten_text[zeile_start:zeile_ende]
+
+
+def test_bankuebersicht_eingang_mit_vertragsreferenz_erscheint_in_eingangsbereich(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text = _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-BANKUEB-EINGANG-MIETE", betrag_text="600.00", referenz="VERTRAG:V-601-1",
+    )
+    assert "Bankbewegungen prüfen" in seiten_text
+    assert "Eingänge / Mietzahlungen prüfen" in seiten_text
+    zeile = _bank_zeile_ausschnitt(seiten_text, "VERTRAG:V-601-1")
+    assert "manuell-zuordnen" in zeile
+    assert "Mit bestehender Zahlung verknüpfen" in zeile
+    assert "KEIN Mieter-Offener-Posten" in seiten_text  # Sammelsummen-Hinweis
+
+
+def test_bankuebersicht_positiver_unklarer_eingang_ohne_referenz(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text = _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-BANKUEB-UNKLAR", betrag_text="123.45", referenz="ZAHLUNGSEINGANG-OHNE-HINWEIS",
+    )
+    zeile = _bank_zeile_ausschnitt(seiten_text, "ZAHLUNGSEINGANG-OHNE-HINWEIS")
+    assert "reichen für keine" in zeile or "reichen für keine automatische Kontierung" in seiten_text
+    # Unklarer positiver Eingang landet im Eingangsbereich, nicht bei den Klärfällen.
+    eingang_pos = seiten_text.index("Eingänge / Mietzahlungen prüfen")
+    klaerfall_pos = seiten_text.index("Rücklastschriften / Klärfälle")
+    referenz_pos = seiten_text.index("ZAHLUNGSEINGANG-OHNE-HINWEIS")
+    assert eingang_pos < referenz_pos < klaerfall_pos
+
+
+def test_bankuebersicht_positive_umbuchung_ohne_mietbezug(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text = _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-BANKUEB-UMBUCHUNG-POS", betrag_text="200.00",
+        referenz="UMBUCHUNG INTERNET RUECKZAHLUNG",
+    )
+    assert "Umbuchungen (1)" in seiten_text
+    zeile = _bank_zeile_ausschnitt(seiten_text, "UMBUCHUNG INTERNET RUECKZAHLUNG")
+    assert "Manuelle Optionen" in zeile  # positive Umbuchung: manuelle Optionen bleiben, nur eingeklappt
+    # Nicht bei den unklaren Eingängen/Mietzahlungen gelistet.
+    eingang_bereich = seiten_text[: seiten_text.index("Rücklastschriften / Klärfälle")]
+    assert "UMBUCHUNG INTERNET RUECKZAHLUNG" not in eingang_bereich
+
+
+def test_bankuebersicht_rechnungsausgang_negativ_getrennt_ohne_zahlungsformular(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text = _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-BANKUEB-RG-AUSGANG", betrag_text="-89.00",
+        referenz="Zahlung RG-NR. 4711 Bueromaterial",
+    )
+    zeile = _bank_zeile_ausschnitt(seiten_text, "RG-NR. 4711")
+    assert "manuell-zuordnen" not in zeile
+    assert "automatisch-zuordnen" not in zeile
+    assert 'name="betrag" placeholder="Betrag EUR"' not in zeile
+    assert "Ausgänge / Betriebsausgaben" in seiten_text
+
+
+def test_bankuebersicht_ruecklastschrift_negativ_ist_pruefall_ohne_zahlungsformular(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text = _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-BANKUEB-RUECKLAST", betrag_text="-450.00",
+        referenz="RUECKLASTSCHRIFT SEPA-LASTSCHRIFT MIETE 04/2026",
+    )
+    zeile = _bank_zeile_ausschnitt(seiten_text, "RUECKLASTSCHRIFT SEPA-LASTSCHRIFT")
+    assert "Prüffall" in zeile
+    assert "manuell-zuordnen" not in zeile
+    assert "automatisch-zuordnen" not in zeile
+    assert 'name="betrag" placeholder="Betrag EUR"' not in zeile
+    assert "Rücklastschriften / Klärfälle" in seiten_text
+
+
+def test_bankuebersicht_konkurrierende_signale_negativ_ergeben_klaerfall(backoffice_client):
+    """Umbuchungssignal UND Mietsignal gleichzeitig im Banktext - das
+    Mietsignal (Schutzsignal) hat Vorrang, das Ergebnis bleibt ein
+    konservativer Klärfall, NIE eine "harmlose" Umbuchung."""
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text = _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-BANKUEB-KONKURRENZ", betrag_text="-77.00",
+        referenz="UMBUCHUNG MIETE RUECKZAHLUNG",
+    )
+    zeile = _bank_zeile_ausschnitt(seiten_text, "UMBUCHUNG MIETE RUECKZAHLUNG")
+    assert "Prüffall" in zeile
+    ausgaenge_bereich_start = seiten_text.index("Ausgänge / Betriebsausgaben")
+    assert "UMBUCHUNG MIETE RUECKZAHLUNG" not in seiten_text[ausgaenge_bereich_start:]
+
+
+def test_bankuebersicht_teilzuordnung_bleibt_mit_restbetrag_sichtbar(backoffice_client):
+    """Konkreter gefundener Fehler (Codex-Hinweis): der frühere NOT-IN-
+    Filter über ZuordnungTable ließ eine Transaktion nach der ERSTEN
+    Teilzuordnung komplett verschwinden. Nach dem Fix bleibt sie mit dem
+    tatsächlichen Restbetrag sichtbar."""
+
+    client, konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text = _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-BANKUEB-TEILZUORDNUNG", betrag_text="1000.00", referenz="TEILZUORDNUNG-TEST-1",
+    )
+    treffer_tx = re.search(r"/backoffice/bank/(\d+)/manuell-zuordnen", seiten_text)
+    assert treffer_tx is not None
+    transaktion_id = treffer_tx.group(1)
+
+    saldo_vorher = op_service.berechne_saldo(konto_id).saldo_cent
+    teilzuordnung = client.post(
+        f"/backoffice/bank/{transaktion_id}/manuell-zuordnen",
+        data={"csrf_token": csrf, "konto_id": konto_id, "betrag": "400.00", "vorgangs_id": "TEILZUORDNUNG-VORGANG-1"},
+        follow_redirects=False,
+    )
+    assert teilzuordnung.status_code == 303
+    assert op_service.berechne_saldo(konto_id).saldo_cent == saldo_vorher - 40_000
+
+    seite_danach = client.get("/backoffice/bank/unzugeordnet", params={"bank_konto_id": "BK-BANKUEB-TEILZUORDNUNG"})
+    assert seite_danach.status_code == 200
+    assert "TEILZUORDNUNG-TEST-1" in seite_danach.text  # bleibt sichtbar, nicht verschwunden
+    zeile = _bank_zeile_ausschnitt(seite_danach.text, "TEILZUORDNUNG-TEST-1")
+    assert "600,00" in zeile.replace("&nbsp;", " ")  # Restbetrag korrekt (1000 - 400)
+
+
+def test_bankuebersicht_vollstaendige_zuordnung_verschwindet(backoffice_client):
+    client, konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text = _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-BANKUEB-VOLLZUORDNUNG", betrag_text="250.00", referenz="VOLLZUORDNUNG-TEST-1",
+    )
+    treffer_tx = re.search(r"/backoffice/bank/(\d+)/manuell-zuordnen", seiten_text)
+    assert treffer_tx is not None
+    transaktion_id = treffer_tx.group(1)
+
+    voll = client.post(
+        f"/backoffice/bank/{transaktion_id}/manuell-zuordnen",
+        data={"csrf_token": csrf, "konto_id": konto_id, "betrag": "250.00", "vorgangs_id": "VOLLZUORDNUNG-VORGANG-1"},
+        follow_redirects=False,
+    )
+    assert voll.status_code == 303
+
+    seite_danach = client.get("/backoffice/bank/unzugeordnet", params={"bank_konto_id": "BK-BANKUEB-VOLLZUORDNUNG"})
+    assert seite_danach.status_code == 200
+    assert "VOLLZUORDNUNG-TEST-1" not in seite_danach.text  # vollständig zugeordnet - verschwindet
+
+
+def test_bankuebersicht_xss_in_referenz_wird_escaped(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text = _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-BANKUEB-XSS", betrag_text="50.00",
+        referenz='<script>alert("xss")</script>',
+    )
+    assert "<script>alert" not in seiten_text
+    assert "&lt;script&gt;" in seiten_text
+
+
+def test_bankuebersicht_unbekanntes_bankkonto_erzeugt_keinen_serverfehler(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+
+    antwort = client.get("/backoffice/bank/unzugeordnet", params={"bank_konto_id": "UNBEKANNTES-KONTO-XYZ"})
+    assert antwort.status_code == 200
+    assert "Unbekanntes Bankkonto" in antwort.text
+
+    ohne_auswahl = client.get("/backoffice/bank/unzugeordnet")
+    assert ohne_auswahl.status_code == 200
+
+
+def test_bankuebersicht_get_ist_seiteneffektfrei(backoffice_client):
+    client, konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-BANKUEB-READONLY", betrag_text="333.00", referenz="READONLY-CHECK-1",
+    )
+    saldo_vorher = op_service.berechne_saldo(konto_id).saldo_cent
+    erste = client.get("/backoffice/bank/unzugeordnet", params={"bank_konto_id": "BK-BANKUEB-READONLY"})
+    zweite = client.get("/backoffice/bank/unzugeordnet", params={"bank_konto_id": "BK-BANKUEB-READONLY"})
+    assert erste.status_code == 200 and zweite.status_code == 200
+    assert op_service.berechne_saldo(konto_id).saldo_cent == saldo_vorher  # reines Lesen bucht nichts
+    assert "READONLY-CHECK-1" in erste.text and "READONLY-CHECK-1" in zweite.text
+
+
 def test_mieweg_vorschau_beide_spuren_ergeben_massgeblichen_betrag(backoffice_client):
     """Paket C: End-to-End über HTTP - Rechtsprofil, gesetzliche VPI-Spur
     und Vertragsspur erfassen, maßgeblicher Höchstbetrag ist das Minimum

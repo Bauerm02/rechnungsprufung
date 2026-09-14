@@ -72,7 +72,14 @@ from mietinkasso.bank.importer import (
     parse_csv,
 )
 from mietinkasso.bank.repository import BankRepository
-from mietinkasso.bank.service import BankImportService
+from mietinkasso.bank.service import (
+    KATEGORIE_AUSGANG_BETRIEBSAUSGABE,
+    KATEGORIE_EINGANG_PRUEFEN,
+    KATEGORIE_RUECKLASTSCHRIFT_KLAERFALL,
+    KATEGORIE_UMBUCHUNG,
+    BankImportService,
+    kategorisiere_bewegung,
+)
 from mietinkasso.domain.enums import OPTyp, Rolle
 from mietinkasso.domain.enums import ZUGANGSFORMEN_ALLE as _ZUGANGSFORMEN_ALLE
 from mietinkasso.domain.exceptions import MietinkassoError
@@ -1551,6 +1558,36 @@ def bank_importieren(
     return _layout(request, session, "Bankimport erfolgreich", inhalt)
 
 
+def _bank_tx_details_html(tx: object) -> str:
+    """Technische IDs/Vorgangsdetails eingeklappt - für die Fachprüfung
+    zählen Referenz/Datum/Betrag/Richtung, nicht die interne ID."""
+
+    return (
+        '<details class="tx-details"><summary>Details</summary>'
+        f'<p class="muted">Transaktions-ID #{tx.id} &middot; '
+        f'Gegenkonto {h(tx.gegenkonto_name or "-")} ({h(tx.gegenkonto_iban or "-")})</p></details>'
+    )
+
+
+def _bank_konten_select_optionen(gesellschaft_id: str) -> str:
+    """Lesbare Konto-Auswahl bevorzugt Objekt/Einheit statt der reinen
+    Konto-ID; dieselbe Ausschlussprüfung wie bisher (Pilotausschluss
+    bleibt unverändert erhalten)."""
+
+    optionen = []
+    for objekt in _stammdaten_repo.list_objekte(gesellschaft_id=gesellschaft_id):
+        if objekt.ausgeschlossen:
+            continue
+        for vertrag in _stammdaten_repo.list_vertraege_fuer_objekt(objekt.id):
+            konto = _stammdaten_repo.get_konto_by_vertrag(vertrag.id)
+            if konto is None:
+                continue
+            einheit = _stammdaten_repo.get_einheit(vertrag.einheit_id)
+            einheit_label = f" / {einheit.bezeichnung}" if einheit else ""
+            optionen.append(option(konto.id, f"{objekt.bezeichnung}{einheit_label} ({konto.id})"))
+    return "".join(optionen)
+
+
 @router.get("/bank/unzugeordnet", response_class=HTMLResponse)
 def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, session=Depends(_current_session)) -> HTMLResponse:
     bank_konten = _bank_repo.list_bank_konten()
@@ -1564,67 +1601,163 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
       <noscript><button type="submit">Anzeigen</button></noscript>
     </form>"""
 
-    tabelle = ""
+    bereiche = ""
     if bank_konto_id:
-        transaktionen = _bank_repo.list_unzugeordnet(bank_konto_id)
-        gesellschaft_id = _bank_repo.get_bank_konto(bank_konto_id).gesellschaft_id
-        objekte = _stammdaten_repo.list_objekte(gesellschaft_id=gesellschaft_id)
-        konten_optionen = []
-        for objekt in objekte:
-            if objekt.ausgeschlossen:
-                continue
-            for vertrag in _stammdaten_repo.list_vertraege_fuer_objekt(objekt.id):
-                konto = _stammdaten_repo.get_konto_by_vertrag(vertrag.id)
-                if konto:
-                    konten_optionen.append(option(konto.id, f"{konto.id} ({objekt.bezeichnung})"))
-        konten_select = "".join(konten_optionen)
+        bank_konto = _bank_repo.get_bank_konto(bank_konto_id)
+        if bank_konto is None:
+            # Unbekanntes/leeres Bankkonto darf nie einen 500 erzeugen -
+            # nur ein ruhiger Hinweis, die Auswahl bleibt bedienbar.
+            bereiche = '<div class="card"><p class="warn">Unbekanntes Bankkonto.</p></div>'
+        else:
+            transaktionen = _bank_repo.list_unzugeordnet(bank_konto_id)
+            konten_select = _bank_konten_select_optionen(bank_konto.gesellschaft_id)
 
-        zeilen = []
-        for tx in transaktionen:
-            zugeordnet = _bank_repo.zugeordneter_betrag(tx.id)
-            rest = tx.betrag_cent - zugeordnet
-            vorschlag_form = ""
-            # Automatische Zuordnung ist nutzerseitig zurückgestellt (bis
-            # EBS/EBICS) - außerhalb bekannter Demo-Umgebungen weder
-            # Vorschlagstext noch Schaltfläche anzeigen. Die Anzeige allein
-            # wäre KEIN Schutz - die POST-Route selbst verweigert die
-            # Ausführung ebenfalls (siehe bank_automatisch_zuordnen unten).
-            vorschlag_grund_html = ""
-            if _DEMO_UMGEBUNG:
-                vorschlag_konto, vorschlag_grund = _bank_service.schlage_konto_vor(tx)
-                vorschlag_grund_html = h(vorschlag_grund)
-                if vorschlag_konto is not None:
-                    vorschlag_form = f"""
-                    <form method="post" action="/backoffice/bank/{tx.id}/automatisch-zuordnen" class="inline">
-                      {csrf_feld(session.csrf_token)}
-                      <button type="submit">Vorschlag übernehmen ({h(vorschlag_konto.id)})</button>
-                    </form>"""
-            else:
-                vorschlag_grund_html = '<span class="muted">Automatische Zuordnung zurückgestellt (EBS/EBICS ausstehend).</span>'
-            zeilen.append(f"""
-            <tr>
-              <td>#{tx.id}</td><td>{eur(tx.betrag_cent)}</td><td>{tx.buchungsdatum.isoformat()}</td>
-              <td>{h(tx.referenz or '')}</td><td>{eur(rest)} offen</td>
-              <td>{vorschlag_grund_html}{vorschlag_form}</td>
-              <td>
-                <form method="post" action="/backoffice/bank/{tx.id}/manuell-zuordnen">
-                  {csrf_feld(session.csrf_token)}
-                  <select name="konto_id" required><option value="">Konto wählen</option>{konten_select}</select>
-                  <input type="text" name="betrag" placeholder="Betrag EUR" value="{eur(rest).split()[0]}" required>
-                  <input type="text" name="vorgangs_id" placeholder="Vorgangs-ID" value="MANUELL-{tx.id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}" required>
-                  <button type="submit">Manuell zuordnen</button>
-                </form>
-                <a href="/backoffice/bank/{tx.id}/verknuepfen">Mit bestehender Zahlung verknüpfen</a>
-              </td>
-            </tr>""")
-        tabelle = f"""
-        <table>
-          <tr><th>#</th><th>Betrag</th><th>Datum</th><th>Referenz</th><th>Offen</th><th>Vorschlag</th><th>Manuell</th></tr>
-          {''.join(zeilen) if zeilen else '<tr><td colspan=7 class="muted">Keine unzugeordneten Transaktionen.</td></tr>'}
-        </table>"""
+            eingaenge: list[tuple[object, str]] = []
+            klaerfaelle: list[tuple[object, str]] = []
+            umbuchungen: list[tuple[object, str]] = []
+            ausgaenge: list[tuple[object, str]] = []
+            for tx in transaktionen:
+                kategorie, begruendung = kategorisiere_bewegung(tx)
+                if kategorie == KATEGORIE_EINGANG_PRUEFEN:
+                    eingaenge.append((tx, begruendung))
+                elif kategorie == KATEGORIE_RUECKLASTSCHRIFT_KLAERFALL:
+                    klaerfaelle.append((tx, begruendung))
+                elif kategorie == KATEGORIE_UMBUCHUNG:
+                    umbuchungen.append((tx, begruendung))
+                else:
+                    ausgaenge.append((tx, begruendung))
 
-    inhalt = f'<div class="card"><h1>Offene Zuordnungen</h1>{auswahl}{tabelle}</div>'
-    return _layout(request, session, "Offene Zuordnungen", inhalt)
+            def _eingang_zeile(tx: object, begruendung: str) -> str:
+                zugeordnet = _bank_repo.zugeordneter_betrag(tx.id)
+                rest = tx.betrag_cent - zugeordnet
+                vorschlag_form = ""
+                # Automatische Zuordnung ist nutzerseitig zurückgestellt (bis
+                # EBS/EBICS) - außerhalb bekannter Demo-Umgebungen weder
+                # Vorschlagstext noch Schaltfläche anzeigen. Die Anzeige
+                # allein wäre KEIN Schutz - die POST-Route selbst verweigert
+                # die Ausführung ebenfalls (siehe bank_automatisch_zuordnen).
+                if _DEMO_UMGEBUNG:
+                    vorschlag_konto, vorschlag_grund = _bank_service.schlage_konto_vor(tx)
+                    vorschlag_grund_html = h(vorschlag_grund)
+                    if vorschlag_konto is not None:
+                        vorschlag_form = f"""
+                        <form method="post" action="/backoffice/bank/{tx.id}/automatisch-zuordnen" class="inline">
+                          {csrf_feld(session.csrf_token)}
+                          <button type="submit">Vorschlag übernehmen ({h(vorschlag_konto.id)})</button>
+                        </form>"""
+                else:
+                    vorschlag_grund_html = '<span class="muted">Automatische Zuordnung zurückgestellt (EBS/EBICS ausstehend).</span>'
+                return f"""
+                <tr>
+                  <td>{eur(tx.betrag_cent)}</td><td>{tx.buchungsdatum.isoformat()}</td>
+                  <td class="tx-referenz">{h(tx.referenz or '')}</td><td>{eur(rest)} offen</td>
+                  <td>{h(begruendung)}</td>
+                  <td>{vorschlag_grund_html}{vorschlag_form}</td>
+                  <td>
+                    <a class="btn-verknuepfen" href="/backoffice/bank/{tx.id}/verknuepfen">Mit bestehender Zahlung verknüpfen (empfohlen gegen Doppelbuchung)</a>
+                    <details class="tx-manuell"><summary>Manuell zuordnen</summary>
+                      <form method="post" action="/backoffice/bank/{tx.id}/manuell-zuordnen">
+                        {csrf_feld(session.csrf_token)}
+                        <select name="konto_id" required><option value="">Konto wählen</option>{konten_select}</select>
+                        <input type="text" name="betrag" placeholder="Betrag EUR" value="{eur(rest).split()[0]}" required>
+                        <input type="text" name="vorgangs_id" placeholder="Vorgangs-ID" value="MANUELL-{tx.id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}" required>
+                        <button type="submit">Manuell zuordnen</button>
+                      </form>
+                    </details>
+                    {_bank_tx_details_html(tx)}
+                  </td>
+                </tr>"""
+
+            def _klaerfall_zeile(tx: object, begruendung: str) -> str:
+                # Bewusst KEIN normales Zuordnungsformular/Vorschlag bei
+                # negativen Beträgen - nur ein Prüffall-Hinweis, keine neue
+                # Rücklastschrift-Buchung wird hier implementiert.
+                return f"""
+                <tr>
+                  <td>{eur(tx.betrag_cent)}</td><td>{tx.buchungsdatum.isoformat()}</td>
+                  <td class="tx-referenz">{h(tx.referenz or '')}</td>
+                  <td>{h(begruendung)}</td>
+                  <td><span class="badge badge-warn">Prüffall</span></td>
+                  <td>{_bank_tx_details_html(tx)}</td>
+                </tr>"""
+
+            def _sonstige_zeile(tx: object, begruendung: str, *, manuelle_optionen: bool) -> str:
+                manuell_html = ""
+                if manuelle_optionen:
+                    zugeordnet = _bank_repo.zugeordneter_betrag(tx.id)
+                    rest = tx.betrag_cent - zugeordnet
+                    manuell_html = f"""
+                    <details class="tx-manuell"><summary>Manuelle Optionen</summary>
+                      <a class="btn-verknuepfen" href="/backoffice/bank/{tx.id}/verknuepfen">Mit bestehender Zahlung verknüpfen</a>
+                      <form method="post" action="/backoffice/bank/{tx.id}/manuell-zuordnen">
+                        {csrf_feld(session.csrf_token)}
+                        <select name="konto_id" required><option value="">Konto wählen</option>{konten_select}</select>
+                        <input type="text" name="betrag" placeholder="Betrag EUR" value="{eur(rest).split()[0]}" required>
+                        <input type="text" name="vorgangs_id" placeholder="Vorgangs-ID" value="MANUELL-{tx.id}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}" required>
+                        <button type="submit">Manuell zuordnen</button>
+                      </form>
+                    </details>"""
+                return f"""
+                <tr>
+                  <td>{eur(tx.betrag_cent)}</td><td>{tx.buchungsdatum.isoformat()}</td>
+                  <td class="tx-referenz">{h(tx.referenz or '')}</td>
+                  <td>{h(begruendung)}</td>
+                  <td>{manuell_html}{_bank_tx_details_html(tx)}</td>
+                </tr>"""
+
+            def _summe(zeilen: list[tuple[object, str]]) -> int:
+                return sum(tx.betrag_cent for tx, _ in zeilen)
+
+            eingaenge_html = "".join(_eingang_zeile(tx, b) for tx, b in eingaenge) or (
+                '<tr><td colspan="7" class="muted">Keine offenen Eingänge.</td></tr>'
+            )
+            klaerfaelle_html = "".join(_klaerfall_zeile(tx, b) for tx, b in klaerfaelle) or (
+                '<tr><td colspan="6" class="muted">Keine Rücklastschriften/Klärfälle.</td></tr>'
+            )
+            umbuchungen_html = "".join(
+                _sonstige_zeile(tx, b, manuelle_optionen=(tx.betrag_cent > 0)) for tx, b in umbuchungen
+            ) or '<tr><td colspan="5" class="muted">Keine Umbuchungen.</td></tr>'
+            ausgaenge_html = "".join(
+                _sonstige_zeile(tx, b, manuelle_optionen=False) for tx, b in ausgaenge
+            ) or '<tr><td colspan="5" class="muted">Keine Ausgänge.</td></tr>'
+
+            bereiche = f"""
+            <div class="card">
+              <h2>Eingänge / Mietzahlungen prüfen ({len(eingaenge)})</h2>
+              <p class="muted">Summe {eur(_summe(eingaenge))} &mdash; reine Anzeigesumme, KEIN Mieter-Offener-Posten.</p>
+              <div class="tabelle-scroll"><table>
+                <tr><th>Betrag</th><th>Datum</th><th>Referenz</th><th>Offen</th><th>Hinweis</th><th>Vorschlag</th><th>Aktion</th></tr>
+                {eingaenge_html}
+              </table></div>
+            </div>
+            <div class="card klaerfall-card">
+              <h2>Rücklastschriften / Klärfälle ({len(klaerfaelle)})</h2>
+              <p class="muted">Summe {eur(_summe(klaerfaelle))} &mdash; Prüffälle, kein automatisches Zuordnungsformular;
+                 KEIN Mieter-Offener-Posten. Eine gültige Mahnsperre wird dadurch nicht pauschal aufgehoben.</p>
+              <div class="tabelle-scroll"><table>
+                <tr><th>Betrag</th><th>Datum</th><th>Referenz</th><th>Hinweis</th><th>Status</th><th></th></tr>
+                {klaerfaelle_html}
+              </table></div>
+            </div>
+            <details class="card">
+              <summary>Umbuchungen ({len(umbuchungen)}) &mdash; Hinweis aus Banktext</summary>
+              <p class="muted">Summe {eur(_summe(umbuchungen))} &mdash; reiner Anzeigehinweis, KEIN Mieter-Offener-Posten.</p>
+              <div class="tabelle-scroll"><table>
+                <tr><th>Betrag</th><th>Datum</th><th>Referenz</th><th>Hinweis</th><th></th></tr>
+                {umbuchungen_html}
+              </table></div>
+            </details>
+            <details class="card">
+              <summary>Ausgänge / Betriebsausgaben ({len(ausgaenge)}) &mdash; Hinweis aus Banktext</summary>
+              <p class="muted">Summe {eur(_summe(ausgaenge))} &mdash; reiner Anzeigehinweis, KEIN Mieter-Offener-Posten.</p>
+              <div class="tabelle-scroll"><table>
+                <tr><th>Betrag</th><th>Datum</th><th>Referenz</th><th>Hinweis</th><th></th></tr>
+                {ausgaenge_html}
+              </table></div>
+            </details>"""
+
+    inhalt = f'<div class="card"><h1>Bankbewegungen prüfen</h1>{auswahl}</div>{bereiche}'
+    return _layout(request, session, "Bankbewegungen prüfen", inhalt)
 
 
 @router.post("/bank/{transaktion_id}/automatisch-zuordnen")

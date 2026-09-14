@@ -324,6 +324,19 @@ def seite(
   .badge-ok {{ background: #e6f4ea; color: #1a7f37; }}
   .badge-muted {{ background: #eee; color: #555; }}
   .tabelle-scroll {{ overflow-x: auto; max-width: 100%; }}
+  /* Bankübersicht (Auftrag HV-20260914-BANKUEBERSICHT): "Mit bestehender
+     Zahlung verknüpfen" bewusst optisch hervorgehoben (gefüllt statt nur
+     Outline), um Doppelbuchungen zu vermeiden - sparsamer Golddunkel-
+     Rahmen statt einer dominanten goldenen Fläche. */
+  a.btn-verknuepfen {{
+    display: inline-block; margin: 0.3rem 0.4rem 0.3rem 0; padding: 0.35rem 0.7rem; border-radius: 4px;
+    border: 1px solid var(--gold-dunkel); background: var(--anthrazit); color: #fff; text-decoration: none;
+    font-size: 0.82rem; font-weight: 600;
+  }}
+  a.btn-verknuepfen:hover {{ background: var(--anthrazit-hell); }}
+  .klaerfall-card {{ border-left: 3px solid #b00020; }}
+  .tx-manuell, .tx-details {{ margin-top: 0.4rem; }}
+  .tx-manuell summary, .tx-details summary {{ font-size: 0.82rem; font-weight: 600; }}
   label {{ display: block; margin: 0.5rem 0 0.15rem; font-weight: 600; font-size: 0.85rem; }}
   input, select, textarea {{ width: 100%; max-width: 100%; box-sizing: border-box; padding: 0.35rem 0.5rem; font: inherit; border: 1px solid #ccc; border-radius: 4px; }}
   button, input[type=submit] {{ font: inherit; font-weight: 600; padding: 0.45rem 0.95rem; cursor: pointer; border-radius: 4px; border: 1px solid var(--anthrazit); background: var(--anthrazit); color: #fff; width: auto; max-width: 100%; margin-top: 0.6rem; }}

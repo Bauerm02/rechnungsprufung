@@ -51,6 +51,73 @@ from mietinkasso.stammdaten.repository import StammdatenRepository
 
 _VERTRAG_REFERENZ = re.compile(r"VERTRAG:([A-Za-z0-9\-]+)")
 
+# -- Auftrag HV-20260914-BANKUEBERSICHT: reine Anzeigekategorisierung -----------
+#
+# Fachregel 4 gilt auch hier: NIEMALS Lieferanten-/Personennamen
+# hartcodieren, NIEMALS allein über Namensgleichheit oder allein über
+# das Vorzeichen des Betrags entscheiden. Alle Muster sind generische,
+# aus dem Banktext (Referenz/Gegenkonto-Name) ablesbare Signalwörter.
+#
+# Schutzsignale haben IMMER Vorrang vor einer "harmlosen" Umbuchungs-
+# oder Betriebsausgaben-Einordnung - bei konkurrierenden Signalen (z. B.
+# gleichzeitig "Umbuchung" UND "Miete" im Text) ist das Ergebnis IMMER
+# der konservative Klärfall-Pfad.
+KATEGORIE_EINGANG_PRUEFEN = "EINGANG_PRUEFEN"
+KATEGORIE_RUECKLASTSCHRIFT_KLAERFALL = "RUECKLASTSCHRIFT_KLAERFALL"
+KATEGORIE_UMBUCHUNG = "UMBUCHUNG"
+KATEGORIE_AUSGANG_BETRIEBSAUSGABE = "AUSGANG_BETRIEBSAUSGABE"
+
+_SCHUTZ_MUSTER = re.compile(
+    r"R(Ü|UE)CKLASTSCHRIFT|RETOURE|STORNO|MIET|KAUTION|MANDAT|VERTRAG",
+    re.IGNORECASE,
+)
+_UMBUCHUNG_MUSTER = re.compile(r"UMBUCHUNG", re.IGNORECASE)
+_RECHNUNGSAUSGANG_MUSTER = re.compile(r"RG[-\s]?NR|RECHNUNG(SNUMMER)?", re.IGNORECASE)
+
+
+def kategorisiere_bewegung(transaktion: BankTransaktionTable) -> tuple[str, str]:
+    """Reine, seiteneffektfreie Anzeigekategorisierung für
+    `/backoffice/bank/unzugeordnet` - KEINE abschließende Kontierung/
+    Buchung, verändert/verschiebt/löscht keine Rohdaten. Liest
+    ausschließlich `betrag_cent`/`referenz`/`gegenkonto_name` der
+    übergebenen Transaktion und trifft keine DB-Zugriffe.
+
+    Ein bloß negativer Betrag genügt NIE für eine Betriebsausgaben-
+    Einordnung - ohne erkennbaren Rechnungsbezug im Banktext bleibt eine
+    unklare negative Bewegung immer ein Klärfall."""
+
+    text = " ".join(teil for teil in (transaktion.referenz, transaktion.gegenkonto_name) if teil)
+    hat_schutzsignal = bool(_SCHUTZ_MUSTER.search(text))
+
+    if transaktion.betrag_cent >= 0:
+        if not hat_schutzsignal and _UMBUCHUNG_MUSTER.search(text):
+            return KATEGORIE_UMBUCHUNG, "Banktext enthält 'Umbuchung' ohne Miet-/Rücklastschriftbezug."
+        return (
+            KATEGORIE_EINGANG_PRUEFEN,
+            "Zahlungseingang noch nicht zugeordnet; Referenz/Gegenkonto allein reichen für keine "
+            "automatische Kontierung.",
+        )
+
+    if hat_schutzsignal:
+        return (
+            KATEGORIE_RUECKLASTSCHRIFT_KLAERFALL,
+            "Banktext enthält ein Rücklastschrift-/Retoure-/Storno-/Miet-/Kautions-/Mandats-/"
+            "Vertragssignal; Prüffall, keine automatische Kontierung.",
+        )
+    if _UMBUCHUNG_MUSTER.search(text):
+        return KATEGORIE_UMBUCHUNG, "Banktext enthält 'Umbuchung' ohne Miet-/Rücklastschriftbezug."
+    if _RECHNUNGSAUSGANG_MUSTER.search(text):
+        return (
+            KATEGORIE_AUSGANG_BETRIEBSAUSGABE,
+            "Banktext verweist auf eine Rechnungsnummer ohne Miet-/Rücklastschriftbezug; vermutlich "
+            "Betriebsausgabe (reiner Anzeigehinweis, keine Buchung).",
+        )
+    return (
+        KATEGORIE_RUECKLASTSCHRIFT_KLAERFALL,
+        "Negativer Betrag ohne eindeutigen Banktext-Hinweis; ein negativer Betrag allein genügt nicht "
+        "für eine Betriebsausgaben-Einordnung - Prüffall.",
+    )
+
 
 def _hash(fields: dict) -> str:
     canonical = json.dumps(fields, sort_keys=True, default=str)

@@ -3644,3 +3644,69 @@ Akte, unbekannter/ausgeschlossener Vertrag, XSS-Escaping,
 Vorschreibung aktuell/vergangen/zukünftig, Objektfilter für Aufgaben,
 Einheit-Metadaten bei reiner unbekannter Fälligkeit, Guthaben trotz
 alter Sperre), 962/962 grün im `tests/mietinkasso`-Gesamtlauf.
+
+## HV-20260914-BANKUEBERSICHT: Bankübersicht bereinigt (Mietzahlungen von
+## Umbuchungen/Betriebsausgaben getrennt)
+
+**Korrigierter Fachfehler:** `BankRepository.list_unzugeordnet` filterte
+bisher über `WHERE id NOT IN (SELECT bank_transaktion_id FROM
+zuordnungen)` - dadurch verschwand eine Transaktion bereits nach der
+ERSTEN Teilzuordnung vollständig aus der Ansicht, auch wenn noch ein
+positiver Restbetrag offen war. Jetzt wird je Transaktion der
+tatsächliche Restbetrag berechnet: positiv über
+`BankRepository.zugeordneter_betrag` (bestehende `ZuordnungTable`-
+Summe), negativ (Rücklastschriften) über
+`BankRepository.verwendeter_betrag_rueckbuchung` (aktive
+`OPPositionTable.RUECKLASTSCHRIFT`-Zeilen mit `bank_transaktion_id`) -
+eine Transaktion verschwindet erst, wenn ihr Restbetrag auf beiden
+Wegen vollständig erklärt ist. Reine Leseänderung, keine neue
+Rückbuchungsfunktion, keine Buchung.
+
+**Neue reine Anzeigekategorisierung** (`bank.service.kategorisiere_bewegung`,
+KEINE Kontierung/Buchung, ändert/verschiebt/löscht keine Rohdaten):
+klassifiziert jede offene Transaktion anhand generischer Textmuster in
+Referenz/Gegenkonto-Name (niemals Lieferanten-/Personennamen, niemals
+allein über Vorzeichen/Betrag) in vier Anzeigebereiche auf
+`/backoffice/bank/unzugeordnet` ("Bankbewegungen prüfen"):
+Eingänge/Mietzahlungen prüfen, Rücklastschriften/Klärfälle (prominent,
+alle negativen Klärfälle inkl. konkurrierender Signale), sowie
+aufklappbar Umbuchungen und Ausgänge/Betriebsausgaben. Schutzsignale
+(Rücklastschrift/Retoure/Storno/Miet-/Kautions-/Mandats-/
+Vertragsbezug) haben IMMER Vorrang vor einer Umbuchungs-/
+Betriebsausgaben-Einordnung; ein bloß negativer Betrag ohne
+Banktext-Hinweis bleibt ein Klärfall, nie automatisch eine
+Betriebsausgabe. Bei negativen Beträgen wird KEIN normales
+Zuordnungsformular mehr angezeigt (nur ein "Prüffall"-Hinweis) - keine
+neue Rücklastschrift-Buchungsfunktion wurde gebaut. Die "Mit
+bestehender Zahlung verknüpfen"-Aktion bleibt für Eingänge erhalten
+und ist jetzt optisch hervorgehoben, um Doppelbuchungen zu vermeiden.
+Jede Bereichssumme trägt einen expliziten Hinweis, dass sie KEIN
+Mieter-Offener-Posten ist. Technische IDs/Gegenkonto stehen jetzt in
+einem eingeklappten Detailbereich; die Konto-Auswahl für die manuelle
+Zuordnung zeigt Objekt/Einheit statt der reinen Konto-ID. Unbekanntes/
+leeres `bank_konto_id` erzeugt keinen 500 mehr, sondern einen ruhigen
+Hinweis.
+
+**Offene Punkte / bewusste Grenzen:**
+- Die Kategorisierungsmuster (`_SCHUTZ_MUSTER`, `_UMBUCHUNG_MUSTER`,
+  `_RECHNUNGSAUSGANG_MUSTER` in `bank/service.py`) sind bewusst
+  generisch/konservativ und wurden NICHT gegen echte Bankexportformate
+  (George Business CSV/CAMT.053 aus dem Echtbetrieb) kalibriert -
+  fachliche Nachschärfung der Stichworte bleibt Markus/Codex
+  vorbehalten, ohne Repo-Änderung durch Claude.
+- `zuordnen_manuell`/`create_zuordnung` prüfen weiterhin nur
+  Mandanten-/Währungsübereinstimmung, nicht zusätzlich
+  `objekt.ausgeschlossen` auf Zielkonto-Ebene - der bestehende
+  Pilotausschluss-Schutz in der Konto-Dropdown-Befüllung bleibt
+  unverändert (unangetastet, wie beauftragt), eine serverseitige
+  Zweitprüfung direkt in der Buchungsschicht wäre eine Scopeerweiterung
+  und wurde bewusst nicht vorgenommen.
+- Keine automatische Bankabholung/-zuordnung, kein Mailversand, keine
+  Produktionsdaten, kein Deployment in dieser Runde; ausschließlich
+  synthetische Testdaten (`tests/mietinkasso/test_backoffice.py`, elf
+  neue Tests: Eingang mit Vertragsreferenz, positiver unklarer
+  Eingang, positive Umbuchung, negativer Rechnungsausgang, negative
+  Rücklastschrift, konkurrierende Signale, Teilzuordnung bleibt mit
+  Restbetrag sichtbar, vollständige Zuordnung verschwindet,
+  XSS-Escaping, unbekanntes Bankkonto ohne 500, seiteneffektfreies
+  GET). 973/973 grün im `tests/mietinkasso`-Gesamtlauf.

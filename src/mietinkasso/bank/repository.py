@@ -122,14 +122,34 @@ class BankRepository:
             return _query(owned_session)
 
     def list_unzugeordnet(self, bank_konto_id: str) -> list[BankTransaktionTable]:
+        """Alle Transaktionen dieses Bankkontos mit einem noch NICHT
+        erklärten Restbetrag - anders als der frühere NOT-IN-Filter über
+        `ZuordnungTable` verschwindet eine Transaktion hier erst, wenn sie
+        VOLLSTÄNDIG erklärt ist, nicht schon bei der ersten (Teil-)
+        Zuordnung. Positiv: Rest = Betrag minus bereits über
+        `ZuordnungTable` zugeordneten Betrag. Negativ (Rücklastschrift):
+        bereits verarbeitete Rückbuchungen stehen NICHT in
+        `ZuordnungTable`, sondern als aktive
+        `OPPositionTable.RUECKLASTSCHRIFT` mit `bank_transaktion_id` -
+        Rest = |Betrag| minus `verwendeter_betrag_rueckbuchung`. Reine
+        Leseabfrage, bucht/verändert nichts."""
+
         with self._session_factory() as session:
-            zugeordnete_ids = select(ZuordnungTable.bank_transaktion_id)
-            statement = (
-                select(BankTransaktionTable)
-                .where(BankTransaktionTable.bank_konto_id == bank_konto_id)
-                .where(BankTransaktionTable.id.not_in(zugeordnete_ids))
-            )
-            return list(session.execute(statement).scalars().all())
+            transaktionen = session.execute(
+                select(BankTransaktionTable).where(BankTransaktionTable.bank_konto_id == bank_konto_id)
+            ).scalars().all()
+            ergebnis = []
+            for transaktion in transaktionen:
+                if transaktion.betrag_cent > 0:
+                    zugeordnet = self.zugeordneter_betrag(transaktion.id, session=session)
+                    if zugeordnet < transaktion.betrag_cent:
+                        ergebnis.append(transaktion)
+                elif transaktion.betrag_cent < 0:
+                    verwendet = self.verwendeter_betrag_rueckbuchung(transaktion.id, session=session)
+                    if verwendet < abs(transaktion.betrag_cent):
+                        ergebnis.append(transaktion)
+                # betrag_cent == 0: nichts zu erklären - bewusst weggelassen.
+            return ergebnis
 
     def get_transaktion(self, id: int) -> BankTransaktionTable | None:
         with self._session_factory() as session:
