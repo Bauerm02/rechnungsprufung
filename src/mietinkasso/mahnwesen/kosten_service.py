@@ -73,18 +73,21 @@ class MahnkostenService:
             return None
         forderungen = self._op_service.offene_forderungen(konto.id, heute=heute)
         alle_positionen = self._op_service.berechne_saldo(konto.id, stichtag=heute).positionen
-        zinsprofil = self._repository.geprueftes_zinsprofil(vertrag_id)
+        zinsprofil_historie = self._repository.historie_geprueft(vertrag_id)
         # Vertragsweit (NICHT je Stufe) - Stufe 2 rechnet dieselben, bei
         # Stufe 1 bereits fakturierten Zinstage nie erneut ab; eine bereits
         # erhobene §458-Pauschale wird nie ein zweites Mal für dieselbe
-        # Entgeltforderung angesetzt (siehe `kosten_repository.py`).
-        bereits_gebuchte_zinsen = self._repository.bereits_gebuchte_zinsen_cent(vertrag_id=vertrag_id)
+        # Entgeltforderung angesetzt (siehe `kosten_repository.py`). Die
+        # bereits gebuchten Zinsen werden JE FORDERUNG nachgeschlagen
+        # (nicht als vertragsweite Blanko-Summe - Rückprüfung Codex
+        # 14.09.2026, siehe `kosten.py::berechne_mahnkosten_vorschau`).
+        bereits_gebuchte_zinsen_je_op = self._repository.bereits_gebuchte_zinsen_je_op_position(vertrag_id=vertrag_id)
         bereits_erhobene_gebuehren = self._repository.bereits_erhobene_gebuehr_schluessel(vertrag_id=vertrag_id)
         return berechne_mahnkosten_vorschau(
             vertrag_id=vertrag_id, stufe=stufe, forderungen=forderungen, alle_positionen=alle_positionen,
-            heute=heute, zinsprofil=zinsprofil, basiszinssatz_lookup=self._repository.basiszinssatz_fuer_datum,
+            heute=heute, zinsprofil_historie=zinsprofil_historie, basiszinssatz_lookup=self._repository.basiszinssatz_fuer_datum,
             naechster_basiszinssatz_lookup=self._repository.naechster_basiszinssatz_ab,
-            bereits_gebuchte_zinsen_cent=bereits_gebuchte_zinsen,
+            bereits_gebuchte_zinsen_je_op_position=bereits_gebuchte_zinsen_je_op,
             bereits_erhobene_gebuehr_schluessel=bereits_erhobene_gebuehren,
         )
 
@@ -131,11 +134,12 @@ class MahnkostenService:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
 
         # Primäre Idempotenz: NICHT über eine "existiert bereits für
-        # diesen Schlüssel"-Abfrage, sondern über das vertragsweite Delta
-        # aus `vorschau` - das ist bei einem Wiederholaufruf am selben
-        # Tag oder bei Stufe 2 (dieselben, bei Stufe 1 bereits
+        # diesen Schlüssel"-Abfrage, sondern über das JE FORDERUNG
+        # gebildete Delta aus `vorschau` (`neue_zinsen_delta_cent`, siehe
+        # `kosten.py`-Moduldoc) - das ist bei einem Wiederholaufruf am
+        # selben Tag oder bei Stufe 2 (dieselben, bei Stufe 1 bereits
         # fakturierten Zinstage) natürlich <= 0/leer.
-        neu_anzusetzende_zinsen = max(vorschau.neue_zinsen_cent - vorschau.bereits_gebuchte_zinsen_cent, 0)
+        neu_anzusetzende_zinsen = vorschau.neue_zinsen_delta_cent
         gebuehr_betrag_gesamt = sum(s.betrag_cent for s in vorschau.gebuehr_segmente)
         if neu_anzusetzende_zinsen <= 0 and gebuehr_betrag_gesamt <= 0:
             return None  # nichts Neues zu buchen (u.a. der Idempotenz-Fall)

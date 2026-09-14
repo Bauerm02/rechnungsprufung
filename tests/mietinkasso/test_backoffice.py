@@ -2405,26 +2405,42 @@ def test_mahnvorschau_zeigt_zinssegmente_bei_halbjahreswechsel(backoffice_client
     from mietinkasso.domain.enums import OPTyp
     from datetime import date as _date
     from decimal import Decimal as _Decimal
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
 
-    client, konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
     _login(client)
 
-    konto = backoffice_app._stammdaten_repo.get_konto(konto_id)
     from mietinkasso.auth.service import AuthContext
     from mietinkasso.domain.enums import Rolle
     admin = AuthContext(user_id="test", rolle=Rolle.ADMIN, gesellschaft_ids=None)
 
-    # Eigener, mit keinem anderen Test dieser (modulweiten) Fixture
-    # kollidierender Zeitraum (2027 statt 2026, siehe
-    # `test_basiszinssatz_erfassen_und_duplikat_wird_abgelehnt` weiter
-    # oben im selben Modul).
+    # Eigener, isolierter Vertrag statt des modulweit geteilten V-601-1
+    # (wie an mehreren anderen Stellen dieses Moduls, z.B. V-601-1500):
+    # das gemeinsam genutzte V-601-1 hat andernorts bereits ein geprüftes
+    # Zinsprofil MIT vereinbartem Zinssatz - ein zweites, hier lokal
+    # angelegtes Zinsprofil ohne `gueltig_ab` würde unter der neuen
+    # periodengerechten Historie (Rückprüfung 14.09.2026, Risiko 3) den
+    # GESAMTEN Zeitraum zu Recht als "unberechenbar" ausweisen, statt die
+    # hier eigentlich zu testende Halbjahres-Segmentierung des
+    # UGB-Basiszinssatzes (kein vereinbarter Satz) zu zeigen.
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-ZINSSEGMENT", objekt_id="601", bezeichnung="Top Zinssegment", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-ZINSSEGMENT", einheit_id="601-TOP-ZINSSEGMENT", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-ZINSSEGMENT"))
+
     op_service.buchen(
         ctx=admin, konto=konto, typ=OPTyp.SOLL, betrag_cent=55_000,
         belegdatum=_date(2027, 6, 1), buchungsdatum=_date(2027, 6, 1), faelligkeit=_date(2027, 6, 5),
         beleg_referenz="TEST HMZ Juni (Segmenttest)",
     )
     profil = backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_anlegen(
-        vertrag_id=konto.vertrag_id, ist_b2b=True, vertragsdatum=_date(2020, 1, 1), erstellt_von="test",
+        vertrag_id=konto.vertrag_id, ist_b2b=True, vertragsdatum=_date(2020, 1, 1),
+        verzugsverantwortung_geprueft=True, erstellt_von="test",
     )
     backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
     backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(

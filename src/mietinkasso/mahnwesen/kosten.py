@@ -70,16 +70,32 @@ _TAGE_IM_JAHR = Decimal(365)
 
 
 def ugb_anwendbar(zinsprofil: ZinsprofilTable | None) -> bool:
-    """Gemeinsames Anwendungstor für §456 (erhöhter Zinssatz) UND §458
-    (Mahnspesen-Pauschale) UGB: beiderseits unternehmensbezogenes
-    Geschäft, geprüftes Profil, Vertragsdatum ab 16.03.2013. Bewusst OHNE
-    Basiszinssatz-Abhängigkeit - §458 braucht keinen Basiszinssatz, und
-    §456 wird davon getrennt (segmentweise) geprüft."""
+    """Gemeinsames Anwendungstor für die §458-UGB-Mahnspesen-Pauschale:
+    beiderseits unternehmensbezogenes Geschäft, geprüftes Profil,
+    Vertragsdatum ab 16.03.2013. Laut Gesetzesmaterialien ist §458
+    VERSCHULDENSUNABHÄNGIG - dieses Tor prüft daher bewusst NICHT die
+    Verzugsverantwortung. Für den ERHÖHTEN §456-Zinssatz gilt das
+    ZUSÄTZLICHE, engere Tor `_ugb_zinssatz_anwendbar` (unabhängige
+    Rückprüfung Codex 14.09.2026: §456 braucht neben B2B/Datum eine
+    BELEGTE Verzugsverantwortung, sonst gesetzliche 4 % ABGB)."""
 
     return (
         zinsprofil is not None and zinsprofil.status == "GEPRUEFT" and zinsprofil.ist_b2b
         and zinsprofil.vertragsdatum is not None and zinsprofil.vertragsdatum >= _STICHTAG_UGB_456
     )
+
+
+def _ugb_zinssatz_anwendbar(zinsprofil: ZinsprofilTable | None) -> bool:
+    """Enger als `ugb_anwendbar`: gilt NUR für die Wahl des ERHÖHTEN
+    §456-Zinssatzes, NIE für die §458-Pauschale (siehe dortiger
+    Docstring). Ein bloß unterstellter, nicht belegt geprüfter
+    Zahlungsverzug (`verzugsverantwortung_geprueft=False`, der additive
+    Spalten-Default) reicht nicht - die Verzinsung fällt dann auf die
+    gesetzlichen 4 % ABGB zurück, statt automatisch den höheren
+    UGB-Satz zu unterstellen ("ungeklärt führt nicht automatisch zum
+    Höchstsatz")."""
+
+    return ugb_anwendbar(zinsprofil) and zinsprofil.verzugsverantwortung_geprueft
 
 
 @dataclass(frozen=True)
@@ -108,7 +124,7 @@ def bestimme_zinssatz(
             hinweis=f"Vereinbarter, geprüfter Zinssatz laut Profil ({zinsprofil.vereinbarung_beleg or 'ohne Belegangabe'}).",
         )
 
-    if ugb_anwendbar(zinsprofil):
+    if _ugb_zinssatz_anwendbar(zinsprofil):
         basiszins = basiszinssatz_lookup(heute)
         if basiszins is None:
             return Zinsentscheidung(
@@ -285,23 +301,105 @@ def _segmentiere_periode_ugb(
     return segmente
 
 
+def _basis_fuer_profil(profil: ZinsprofilTable | None) -> tuple[str, Decimal | None]:
+    """Bestimmt den Basistyp für EIN konkretes, zu einem Zeitsegment
+    gehörendes Zinsprofil (oder `None` - kein Profil wirksam, gesetzliche
+    Basis). `konstanter_satz` ist nur bei `VEREINBART_GEPRUEFT`/
+    `GESETZLICH_ABGB` gesetzt - bei `UGB_B2B_BASISZINSSATZ` wird der Satz
+    weiterhin separat je Halbjahr aufgelöst (`_segmentiere_periode_ugb`)."""
+
+    if profil is not None and profil.status == "GEPRUEFT" and profil.vereinbarung_geprueft and profil.vereinbarter_zinssatz_prozent is not None:
+        return "VEREINBART_GEPRUEFT", profil.vereinbarter_zinssatz_prozent
+    if _ugb_zinssatz_anwendbar(profil):
+        return "UGB_B2B_BASISZINSSATZ", None
+    return "GESETZLICH_ABGB", _GESETZLICHER_ZINSSATZ_PROZENT
+
+
+def _zinsprofil_segmente(
+    historie: list[ZinsprofilTable], von: date, bis: date,
+) -> list[tuple[date, date, ZinsprofilTable | None, bool]]:
+    """Zerlegt [von, bis) periodengerecht nach Zinsprofil-Versionswechseln
+    (Rückprüfung 14.09.2026, Risiko 3 - "niemals rückwirkend den aktuellen
+    Satz verwenden"). Rückgabe je Segment: (seg_von, seg_bis, profil,
+    unberechenbar).
+
+    - 0 oder 1 jemals GEPRÜFTE Version: unverändertes Verhalten, sie gilt
+      (falls vorhanden) für die GESAMTE Periode - keine Mehrdeutigkeit
+      möglich.
+    - Mehrere GEPRÜFTE Versionen, ALLE mit belegtem `gueltig_ab`:
+      periodengerechte Zerlegung an den `gueltig_ab`-Wechseln; VOR dem
+      frühesten `gueltig_ab` gilt mangels bekannter Vereinbarung die
+      gesetzliche Basis (kein Profil, NICHT "unberechenbar" - das ist der
+      sichere gesetzliche Normalfall).
+    - Mehrere GEPRÜFTE Versionen, aber MINDESTENS EINE ohne `gueltig_ab`:
+      die GESAMTE Periode bleibt explizit "unberechenbar" (`profil=None,
+      unberechenbar=True`) - wir wissen, dass sich die Vereinbarung
+      geändert hat, aber NICHT wann, und raten das nicht anhand der
+      zuletzt geprüften Version."""
+
+    if len(historie) <= 1:
+        return [(von, bis, historie[0] if historie else None, False)]
+    if any(p.gueltig_ab is None for p in historie):
+        return [(von, bis, None, True)]
+
+    sortiert = sorted(historie, key=lambda p: p.gueltig_ab)
+    segmente: list[tuple[date, date, ZinsprofilTable | None, bool]] = []
+    cursor = von
+    erste_gueltig_ab = sortiert[0].gueltig_ab
+    if cursor < min(erste_gueltig_ab, bis):
+        segmente.append((cursor, min(erste_gueltig_ab, bis), None, False))
+        cursor = min(erste_gueltig_ab, bis)
+    for index, profil in enumerate(sortiert):
+        if cursor >= bis:
+            break
+        naechster_wechsel = sortiert[index + 1].gueltig_ab if index + 1 < len(sortiert) else None
+        seg_von = max(cursor, profil.gueltig_ab)
+        seg_bis = min(naechster_wechsel, bis) if naechster_wechsel is not None else bis
+        if seg_von < seg_bis:
+            segmente.append((seg_von, seg_bis, profil, False))
+            cursor = seg_bis
+    return segmente
+
+
+def _profil_wirksam_am(historie: list[ZinsprofilTable], datum: date) -> tuple[ZinsprofilTable | None, bool]:
+    """Das für GENAU `datum` (typischerweise `heute`) wirksame Profil -
+    für die §458-Gebührenprüfung (Präsens: "sind wir GERADE JETZT B2B mit
+    belegter Kostenbasis"), NICHT rückwirkend für die Zinsperiode
+    verwendet (siehe `_zinsprofil_segmente`). `unberechenbar=True`
+    bedeutet: mehrere Versionen ohne durchgängiges `gueltig_ab`, auch die
+    AKTUELLE Einordnung ist damit nicht sicher bestimmbar."""
+
+    segmente = _zinsprofil_segmente(historie, datum, datum + timedelta(days=1))
+    _seg_von, _seg_bis, profil, unberechenbar = segmente[-1]
+    return profil, unberechenbar
+
+
 def _zinssegmente_fuer_periode(
-    *, op_position_id: int, periode: BalancePeriode, basis: str, konstanter_satz: Decimal | None,
+    *, op_position_id: int, periode: BalancePeriode, zinsprofil_historie: list[ZinsprofilTable],
     basiszinssatz_lookup, naechster_basiszinssatz_lookup,
 ) -> list[ZinsSegment]:
-    if basis == "UGB_B2B_BASISZINSSATZ":
-        rohsegmente = _segmentiere_periode_ugb(
-            periode, basiszinssatz_lookup=basiszinssatz_lookup, naechster_basiszinssatz_lookup=naechster_basiszinssatz_lookup,
-        )
-    else:
-        quelle = "Vereinbarter, geprüfter Zinssatz" if basis == "VEREINBART_GEPRUEFT" else "Gesetzliche Verzugszinsen §1000 ABGB"
-        rohsegmente = [(periode.von, periode.bis, konstanter_satz, quelle)]
-
-    ergebnis = []
-    for von, bis, satz, quelle in rohsegmente:
-        tage = (bis - von).days
-        zinsen = _zinsen_fuer_segment_cent(periode.rest_cent, satz, tage) if satz is not None else 0
-        ergebnis.append(ZinsSegment(op_position_id, von, bis, periode.rest_cent, satz, quelle, zinsen))
+    ergebnis: list[ZinsSegment] = []
+    for seg_von, seg_bis, profil, unberechenbar in _zinsprofil_segmente(zinsprofil_historie, periode.von, periode.bis):
+        if unberechenbar:
+            ergebnis.append(ZinsSegment(
+                op_position_id, seg_von, seg_bis, periode.rest_cent, None,
+                "Vertragszinswechsel ohne durchgängig belegtes Wirksamkeitsdatum (gueltig_ab) - Zinsen für "
+                "diesen Zeitraum sind unberechenbar, bis die Historie geklärt/belegt ist.", 0,
+            ))
+            continue
+        basis, konstanter_satz = _basis_fuer_profil(profil)
+        if basis == "UGB_B2B_BASISZINSSATZ":
+            rohsegmente = _segmentiere_periode_ugb(
+                BalancePeriode(seg_von, seg_bis, periode.rest_cent),
+                basiszinssatz_lookup=basiszinssatz_lookup, naechster_basiszinssatz_lookup=naechster_basiszinssatz_lookup,
+            )
+        else:
+            quelle = "Vereinbarter, geprüfter Zinssatz" if basis == "VEREINBART_GEPRUEFT" else "Gesetzliche Verzugszinsen §1000 ABGB"
+            rohsegmente = [(seg_von, seg_bis, konstanter_satz, quelle)]
+        for von, bis, satz, quelle in rohsegmente:
+            tage = (bis - von).days
+            zinsen = _zinsen_fuer_segment_cent(periode.rest_cent, satz, tage) if satz is not None else 0
+            ergebnis.append(ZinsSegment(op_position_id, von, bis, periode.rest_cent, satz, quelle, zinsen))
     return ergebnis
 
 
@@ -354,6 +452,7 @@ class MahnkostenVorschau:
     zins_bis: date | None
     neue_zinsen_cent: int
     bereits_gebuchte_zinsen_cent: int
+    neue_zinsen_delta_cent: int
     zins_segmente: tuple[ZinsSegment, ...]
     zins_teilweise_ungeklaert: bool  # mind. ein Segment hat satz_prozent=None
     gebuehr_segmente: tuple[GebuehrSegment, ...]
@@ -365,13 +464,12 @@ class MahnkostenVorschau:
 
     @property
     def zusaetzlicher_betrag_cent(self) -> int:
-        """Der NEU anzusetzende Betrag (Zinsen abzüglich bereits für
-        denselben Vertrag gebuchter Zinsen, plus alle neuen, noch nicht
-        erhobenen §458-Pauschalen) - siehe Moduldoc: bereits berechnete
-        Zinstage/bereits erhobene Pauschalen werden nie doppelt
-        angesetzt."""
+        """Der NEU anzusetzende Betrag (`neue_zinsen_delta_cent`, siehe
+        dortiger Docstring - bereits JE FORDERUNG um früher gebuchte
+        Zinsen bereinigt, plus alle neuen, noch nicht erhobenen
+        §458-Pauschalen)."""
 
-        zusatz = max(self.neue_zinsen_cent - self.bereits_gebuchte_zinsen_cent, 0)
+        zusatz = self.neue_zinsen_delta_cent
         if self.gebuehr_cent is not None:
             zusatz += self.gebuehr_cent
         return zusatz
@@ -384,10 +482,10 @@ def berechne_mahnkosten_vorschau(
     forderungen: list[OffeneForderung],
     alle_positionen: list[OPPositionTable],
     heute: date,
-    zinsprofil: ZinsprofilTable | None,
+    zinsprofil_historie: list[ZinsprofilTable],
     basiszinssatz_lookup,
     naechster_basiszinssatz_lookup,
-    bereits_gebuchte_zinsen_cent: int,
+    bereits_gebuchte_zinsen_je_op_position: dict[int, int],
     bereits_erhobene_gebuehr_schluessel: frozenset[str],
 ) -> MahnkostenVorschau:
     """Aggregiert ALLE offenen Forderungen dieses Vertrags zu EINER
@@ -398,37 +496,51 @@ def berechne_mahnkosten_vorschau(
     ein, werden aber NICHT verzinst - das wird als Hinweis ausgewiesen,
     blockiert aber nicht die Hauptforderung selbst.
 
+    `zinsprofil_historie`: ALLE jemals GEPRÜFTEN Versionen (aufsteigend),
+    siehe `MahnkostenRepository.historie_geprueft` - die Zinsen werden
+    PERIODENGERECHT je nach zum jeweiligen Zeitpunkt wirksamer Version
+    berechnet (`_zinsprofil_segmente`), NIE rückwirkend mit der zuletzt
+    geprüften Version (Rückprüfung 14.09.2026, Risiko 3).
     `naechster_basiszinssatz_lookup(datum) -> OenbBasiszinssatzTable |
     None` - siehe `_segmentiere_periode_ugb`.
     `bereits_erhobene_gebuehr_schluessel` - siehe
     `MahnkostenRepository.bereits_erhobene_gebuehr_schluessel`; PERMANENT
     über alle Mahnläufe/Stufen dieses Vertrags hinweg, nicht nur die
-    aktuelle Stufe."""
+    aktuelle Stufe.
+
+    `bereits_gebuchte_zinsen_je_op_position`: JE `op_position_id`
+    aufgeschlüsselt (siehe `MahnkostenRepository.
+    bereits_gebuchte_zinsen_je_op_position`) - unabhängige Rückprüfung
+    Codex 14.09.2026: das Delta wird JE FORDERUNG gebildet und bei 0
+    gekappt, BEVOR es summiert wird (`neue_zinsen_delta_cent`). Eine
+    vertragsweite Blanko-Subtraktion (die alte, fehlerhafte
+    Berechnungsweise) würde die Verzinsung einer genuin NEUEN Forderung
+    fälschlich schlucken, sobald für eine ANDERE, mittlerweile
+    abgelöste/geschlossene Forderung früher bereits Zinsen gebucht
+    wurden."""
 
     hauptforderung_cent = sum(f.rest_cent for f in forderungen)
 
-    zinsprofil_geprueft_vereinbart = (
-        zinsprofil is not None and zinsprofil.status == "GEPRUEFT" and zinsprofil.vereinbarung_geprueft
-        and zinsprofil.vereinbarter_zinssatz_prozent is not None
-    )
-    ugb_scope = ugb_anwendbar(zinsprofil)
-    if zinsprofil_geprueft_vereinbart:
-        basis = "VEREINBART_GEPRUEFT"
-        konstanter_satz = zinsprofil.vereinbarter_zinssatz_prozent
-        basis_hinweis = f"Vereinbarter, geprüfter Zinssatz laut Profil ({zinsprofil.vereinbarung_beleg or 'ohne Belegangabe'})."
-    elif ugb_scope:
-        basis = "UGB_B2B_BASISZINSSATZ"
-        konstanter_satz = None  # wird je Segment aufgelöst
-        basis_hinweis = (
+    aktuelles_profil, aktuell_unberechenbar = _profil_wirksam_am(zinsprofil_historie, heute)
+    ugb_scope = ugb_anwendbar(aktuelles_profil)
+    aktuelle_basis, _ = _basis_fuer_profil(aktuelles_profil) if not aktuell_unberechenbar else (None, None)
+
+    hinweise: list[str] = []
+    if aktuell_unberechenbar:
+        hinweise.append(
+            "Zinsprofil: mehrere geprüfte Versionen ohne durchgängig belegtes Wirksamkeitsdatum (gueltig_ab) - "
+            "die aktuell gültige Einordnung ist unberechenbar, bis die Historie geklärt ist."
+        )
+    elif aktuelle_basis == "VEREINBART_GEPRUEFT":
+        hinweise.append(f"Vereinbarter, geprüfter Zinssatz laut Profil ({aktuelles_profil.vereinbarung_beleg or 'ohne Belegangabe'}).")
+    elif aktuelle_basis == "UGB_B2B_BASISZINSSATZ":
+        hinweise.append(
             f"§456 UGB: {_UGB_AUFSCHLAG_PROZENTPUNKTE} Prozentpunkte über dem für jedes betroffene Halbjahr "
             "belegten Basiszinssatz - eine Periode über einen Halbjahreswechsel wird in Teilsegmente zerlegt."
         )
     else:
-        basis = "GESETZLICH_ABGB"
-        konstanter_satz = _GESETZLICHER_ZINSSATZ_PROZENT
-        basis_hinweis = "Gesetzliche Verzugszinsen §1000 ABGB (keine geprüfte abweichende Vereinbarung/kein geprüftes B2B-Profil)."
+        hinweise.append("Gesetzliche Verzugszinsen §1000 ABGB (keine geprüfte abweichende Vereinbarung/kein geprüftes B2B-Profil).")
 
-    hinweise: list[str] = [basis_hinweis]
     ausgeschlossen: list[str] = []
     alle_segmente: list[ZinsSegment] = []
 
@@ -444,17 +556,29 @@ def berechne_mahnkosten_vorschau(
             continue
         for periode in perioden:
             alle_segmente.extend(_zinssegmente_fuer_periode(
-                op_position_id=forderung.op_position_id, periode=periode, basis=basis, konstanter_satz=konstanter_satz,
+                op_position_id=forderung.op_position_id, periode=periode, zinsprofil_historie=zinsprofil_historie,
                 basiszinssatz_lookup=basiszinssatz_lookup, naechster_basiszinssatz_lookup=naechster_basiszinssatz_lookup,
             ))
 
     neue_zinsen_gesamt = sum(s.zinsen_cent for s in alle_segmente)
+
+    # Delta JE FORDERUNG (op_position_id), NICHT vertragsweit gesamt -
+    # siehe Funktions-Docstring/Rückprüfung Codex 14.09.2026.
+    betroffene_ops = {s.op_position_id for s in alle_segmente}
+    neue_zinsen_delta_gesamt = 0
+    bereits_gebuchte_relevant_cent = 0
+    for op_id in betroffene_ops:
+        zinsen_dieser_op = sum(s.zinsen_cent for s in alle_segmente if s.op_position_id == op_id)
+        bereits_op = bereits_gebuchte_zinsen_je_op_position.get(op_id, 0)
+        bereits_gebuchte_relevant_cent += min(zinsen_dieser_op, bereits_op)
+        neue_zinsen_delta_gesamt += max(zinsen_dieser_op - bereits_op, 0)
+
     zins_teilweise_ungeklaert = any(s.satz_prozent is None for s in alle_segmente)
     if zins_teilweise_ungeklaert:
         unresolved_count = sum(1 for s in alle_segmente if s.satz_prozent is None)
         hinweise.append(
-            f"Verzugszinsen: {unresolved_count} Zeitsegment(e) ohne belegten Basiszinssatz - dieser Anteil wird "
-            "NICHT mitverzinst und muss nachgetragen werden, sobald der Basiszinssatz erfasst ist."
+            f"Verzugszinsen: {unresolved_count} Zeitsegment(e) ohne belegte Zins-/Basiszinssatzgrundlage - "
+            "dieser Anteil wird NICHT mitverzinst und muss nachgetragen werden, sobald die Grundlage geklärt ist."
         )
     aufgeloeste_saetze = {s.satz_prozent for s in alle_segmente if s.satz_prozent is not None}
     zinssatz_prozent = next(iter(aufgeloeste_saetze)) if len(aufgeloeste_saetze) == 1 else None
@@ -463,18 +587,20 @@ def berechne_mahnkosten_vorschau(
     zins_bis = max((s.bis for s in alle_segmente), default=None)
 
     gebuehr_segmente: list[GebuehrSegment] = []
-    if not ugb_scope:
+    if aktuell_unberechenbar:
+        hinweise.append("§458 UGB: keine Mahngebühr, solange die Zinsprofil-Historie unberechenbar ist.")
+    elif not ugb_scope:
         hinweise.append("§458 UGB gilt nur bei beiderseits unternehmensbezogenem Geschäft mit Vertragsdatum ab 16.03.2013 - keine Mahngebühr angesetzt.")
-    elif zinsprofil is None or zinsprofil.status != "GEPRUEFT" or zinsprofil.mahngebuehr_kostenbasis_cent is None:
+    elif aktuelles_profil is None or aktuelles_profil.status != "GEPRUEFT" or aktuelles_profil.mahngebuehr_kostenbasis_cent is None:
         hinweise.append("Mahngebühr: Klärung erforderlich (kein geprüftes Zinsprofil mit belegter §458-Kostenbasis hinterlegt).")
     else:
-        rechtsgrundlage = f"§458 UGB - geprüfte Kostenbasis ({zinsprofil.mahngebuehr_kostenbasis_beleg or 'ohne Belegangabe'})"
+        rechtsgrundlage = f"§458 UGB - geprüfte Kostenbasis ({aktuelles_profil.mahngebuehr_kostenbasis_beleg or 'ohne Belegangabe'})"
         fuer_gebuehr_qualifiziert = [
             schluessel for schluessel in _faellige_entgeltforderungs_schluessel(forderungen, heute)
             if schluessel not in bereits_erhobene_gebuehr_schluessel
         ]
         for schluessel in fuer_gebuehr_qualifiziert:
-            gebuehr_segmente.append(GebuehrSegment(schluessel, zinsprofil.mahngebuehr_kostenbasis_cent, rechtsgrundlage))
+            gebuehr_segmente.append(GebuehrSegment(schluessel, aktuelles_profil.mahngebuehr_kostenbasis_cent, rechtsgrundlage))
         if gebuehr_segmente:
             hinweise.append(
                 f"§458 UGB: {len(gebuehr_segmente)} neue Pauschale(n) für bislang noch nicht bepauschalte "
@@ -486,11 +612,14 @@ def berechne_mahnkosten_vorschau(
     gebuehr_cent = sum(s.betrag_cent for s in gebuehr_segmente) or None
     gebuehr_rechtsgrundlage = gebuehr_segmente[0].rechtsgrundlage if gebuehr_segmente else None
 
+    zinsbasis_label = "UNBERECHENBAR" if aktuell_unberechenbar else aktuelle_basis
+
     return MahnkostenVorschau(
         vertrag_id=vertrag_id, stufe=stufe, hauptforderung_cent=hauptforderung_cent,
-        zinsbasis=basis, zinssatz_prozent=zinssatz_prozent,
+        zinsbasis=zinsbasis_label, zinssatz_prozent=zinssatz_prozent,
         zins_von=zins_von, zins_bis=zins_bis, neue_zinsen_cent=neue_zinsen_gesamt,
-        bereits_gebuchte_zinsen_cent=bereits_gebuchte_zinsen_cent,
+        bereits_gebuchte_zinsen_cent=bereits_gebuchte_relevant_cent,
+        neue_zinsen_delta_cent=neue_zinsen_delta_gesamt,
         zins_segmente=tuple(alle_segmente), zins_teilweise_ungeklaert=zins_teilweise_ungeklaert,
         gebuehr_segmente=tuple(gebuehr_segmente), gebuehr_cent=gebuehr_cent, gebuehr_rechtsgrundlage=gebuehr_rechtsgrundlage,
         forderung_op_position_ids=tuple(f.op_position_id for f in forderungen),

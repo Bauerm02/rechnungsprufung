@@ -170,6 +170,77 @@ def test_stufe_zwei_rechnet_nur_das_delta_seit_stufe_eins_ab(op_service, kosten_
     assert len(zinsen_zeilen) == 2
 
 
+def test_zinsdelta_einer_neuen_forderung_wird_nicht_durch_eine_alte_abgeloeste_geschluckt(
+    op_service, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Unabhängige Rückprüfung Codex 14.09.2026: das Delta darf NICHT
+    vertragsweit als eine einzige Blanko-Summe gebildet werden. Eine
+    ALTE Forderung (hier: HMZ Jänner) wird vollständig abgelöst, NACHDEM
+    für sie bereits Zinsen gebucht wurden; danach entsteht eine GENUIN
+    NEUE, andere Forderung (HMZ Februar). Die neuen Zinsen dieser neuen
+    Forderung dürfen NICHT durch die (deutlich höhere) historische
+    Zinssumme der längst abgelösten alten Forderung aufgezehrt werden -
+    das wäre mit einer vertragsweiten Blanko-Subtraktion der Fall
+    gewesen (`max(neue_zinsen_cent - bereits_gebuchte_zinsen_cent, 0)`
+    hätte 0 ergeben, obwohl die neue Forderung echte, noch nie gebuchte
+    Zinsen trägt)."""
+
+    vertrag, konto = basis_vertrag
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+    alte_forderung = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1),
+        versandnachweis_referenz="mahnung:alte-forderung", akteur="test",
+    )
+    assert alte_forderung is not None
+    zinsen_alte_forderung = alte_forderung.zinsen_cent
+    assert zinsen_alte_forderung > 0
+
+    # Die alte Forderung wird VOLLSTÄNDIG abgelöst - sie taucht ab jetzt
+    # in keiner `offene_forderungen`-Auswertung mehr auf.
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=50_000,
+        belegdatum=date(2026, 2, 10), buchungsdatum=date(2026, 2, 10),
+        faelligkeit=None, beleg_referenz="Vollzahlung HMZ Jänner",
+    )
+
+    # Eine GENUIN NEUE, deutlich kleinere Forderung entsteht - ihre
+    # eigenen, bisher nie gebuchten Zinsen sind viel kleiner als die
+    # historische Zinssumme der alten Forderung.
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=3_000,
+        belegdatum=date(2026, 2, 1), buchungsdatum=date(2026, 2, 1),
+        faelligkeit=date(2026, 2, 15), beleg_referenz="HMZ Februar",
+    )
+
+    zinsen_neue_forderung = _segment_zinsen_cent(3_000, Decimal("4.000"), (date(2026, 3, 1) - date(2026, 2, 15)).days)
+    assert zinsen_neue_forderung > 0
+    assert zinsen_alte_forderung > zinsen_neue_forderung  # das eigentliche Bug-Szenario
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1))
+    assert vorschau is not None
+    # Die alte HAUPTforderung selbst ist getilgt; die für sie schon
+    # gebuchte, noch offene Zinsposition (`faelligkeit=None`, daher NIE
+    # selbst mitverzinst) bleibt bis zu ihrer eigenen Zahlung ein
+    # separater offener Posten.
+    assert vorschau.hauptforderung_cent == 3_000 + zinsen_alte_forderung
+    assert vorschau.neue_zinsen_cent == zinsen_neue_forderung
+    # Der Kern des Fixes: das Delta ist NICHT 0, obwohl vertragsweit
+    # bereits mehr Zinsen gebucht wurden, als die neue Forderung selbst
+    # an Zinsen trägt.
+    assert vorschau.neue_zinsen_delta_cent == zinsen_neue_forderung
+
+    gebucht = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1),
+        versandnachweis_referenz="mahnung:neue-forderung", akteur="test",
+    )
+    assert gebucht is not None
+    assert gebucht.zinsen_cent == zinsen_neue_forderung
+
+
 # -- Teilzahlung reduziert die Zinsbasis ab ihrem tatsächlichen Datum ------
 
 
@@ -214,7 +285,10 @@ def test_b2b_ohne_erfassten_basiszinssatz_fuer_das_halbjahr_bleibt_blockiert(
     op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
 ):
     vertrag, konto = basis_vertrag
-    _profil_geprueft(kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1))
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        verzugsverantwortung_geprueft=True,
+    )
     op_service.buchen(
         ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
         belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
@@ -245,7 +319,10 @@ def test_b2b_mit_erfasstem_basiszinssatz_verwendet_ugb456(
     op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
 ):
     vertrag, konto = basis_vertrag
-    _profil_geprueft(kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1))
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        verzugsverantwortung_geprueft=True,
+    )
     kosten_repo.basiszinssatz_erfassen(
         id="2026-1", gueltig_von=date(2026, 1, 1), gueltig_bis=date(2026, 6, 30),
         basiszinssatz_prozent=Decimal("1.530"), erfasst_von="test", quelle_referenz="OeNB 01.01.2026",
@@ -264,11 +341,47 @@ def test_b2b_mit_erfasstem_basiszinssatz_verwendet_ugb456(
     assert vorschau.neue_zinsen_cent > 0
 
 
+def test_b2b_ohne_belegte_verzugsverantwortung_faellt_auf_gesetzliche_zinsen_zurueck(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Unabhängige Rückprüfung Codex 14.09.2026: B2B + Vertragsdatum ab
+    16.03.2013 + erfasster Basiszinssatz allein reichen NICHT für den
+    erhöhten §456-Zinssatz - die Verantwortlichkeit für den Verzug muss
+    ZUSÄTZLICH belegt geprüft sein. Ist sie das (noch) nicht (der
+    Default), gelten die gesetzlichen 4 % ABGB - NICHT automatisch der
+    UGB-Höchstsatz."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1))
+    kosten_repo.basiszinssatz_erfassen(
+        id="2026-1", gueltig_von=date(2026, 1, 1), gueltig_bis=date(2026, 6, 30),
+        basiszinssatz_prozent=Decimal("1.530"), erfasst_von="test", quelle_referenz="OeNB 01.01.2026",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1))
+
+    assert vorschau is not None
+    assert vorschau.zinsbasis == "GESETZLICH_ABGB"
+    assert vorschau.zinssatz_prozent == Decimal("4.000")
+    # §458-Pauschale bleibt DAVON UNBERÜHRT (verschuldensunabhängig) -
+    # eine geklärte Kostenbasis würde weiterhin eine Pauschale auslösen,
+    # nur die VERZINSUNG fällt auf das gesetzliche Niveau zurück.
+    assert any("gesetzliche" in h.lower() or "abgb" in h.lower() for h in vorschau.hinweise)
+
+
 def test_zukuenftiges_halbjahr_verwendet_nicht_stillschweigend_alten_basiszinssatz(
     op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
 ):
     vertrag, konto = basis_vertrag
-    _profil_geprueft(kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1))
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        verzugsverantwortung_geprueft=True,
+    )
     kosten_repo.basiszinssatz_erfassen(
         id="2026-1", gueltig_von=date(2026, 1, 1), gueltig_bis=date(2026, 6, 30),
         basiszinssatz_prozent=Decimal("1.530"), erfasst_von="test", quelle_referenz="OeNB 01.01.2026",
@@ -292,7 +405,7 @@ def test_zukuenftiges_halbjahr_verwendet_nicht_stillschweigend_alten_basiszinssa
     assert vorschau.neue_zinsen_cent > 0
     erwartete_zinsen_h1_anteil = _segment_zinsen_cent(50_000, Decimal("10.730"), (date(2026, 7, 1) - date(2026, 1, 5)).days)
     assert vorschau.neue_zinsen_cent == erwartete_zinsen_h1_anteil
-    assert any("ohne belegten Basiszinssatz" in h for h in vorschau.hinweise)
+    assert any("ohne belegte Zins-/Basiszinssatzgrundlage" in h for h in vorschau.hinweise)
 
 
 def test_halbjahreswechsel_mit_beiden_erfassten_halbjahren_rechnet_in_teilperioden(
@@ -304,7 +417,10 @@ def test_halbjahreswechsel_mit_beiden_erfassten_halbjahren_rechnet_in_teilperiod
     einzigen, für die ganze Periode geltenden Satz."""
 
     vertrag, konto = basis_vertrag
-    _profil_geprueft(kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1))
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        verzugsverantwortung_geprueft=True,
+    )
     kosten_repo.basiszinssatz_erfassen(
         id="2026-1", gueltig_von=date(2026, 1, 1), gueltig_bis=date(2026, 6, 30),
         basiszinssatz_prozent=Decimal("1.530"), erfasst_von="test", quelle_referenz="OeNB 01.01.2026",
@@ -336,6 +452,96 @@ def test_halbjahreswechsel_mit_beiden_erfassten_halbjahren_rechnet_in_teilperiod
         + _segment_zinsen_cent(50_000, Decimal("11.200"), (date(2026, 7, 20) - date(2026, 7, 1)).days)
     )
     assert vorschau.neue_zinsen_cent == erwartet
+
+
+# -- Vertragszinswechsel: periodengerecht ODER explizit unberechenbar ------
+
+
+def test_zinsprofil_wechsel_mit_belegtem_gueltig_ab_wird_periodengerecht_segmentiert(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Rückprüfung 14.09.2026, Risiko 3: ZWEI geprüfte Zinsprofil-
+    Versionen mit je EIGENEM, belegtem `gueltig_ab` müssen eine Periode,
+    die den Wechsel überspannt, in Teilperioden mit je EIGENEM Satz
+    zerlegen - niemals rückwirkend den aktuell/zuletzt geprüften Satz
+    für die GESAMTE Periode verwenden."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
+        vereinbarter_zinssatz_prozent=Decimal("5.000"), vereinbarung_geprueft=True,
+        vereinbarung_beleg="Mietvertrag 2020", gueltig_ab=date(2026, 1, 1),
+    )
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
+        vereinbarter_zinssatz_prozent=Decimal("6.000"), vereinbarung_geprueft=True,
+        vereinbarung_beleg="Nachtrag 2026", gueltig_ab=date(2026, 6, 1),
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 3, 1), buchungsdatum=date(2026, 3, 1),
+        faelligkeit=date(2026, 3, 1), beleg_referenz="HMZ März",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 8, 1))
+
+    assert vorschau is not None
+    assert vorschau.zins_teilweise_ungeklaert is False
+    assert len(vorschau.zins_segmente) == 2
+    segment_v1 = next(s for s in vorschau.zins_segmente if s.satz_prozent == Decimal("5.000"))
+    segment_v2 = next(s for s in vorschau.zins_segmente if s.satz_prozent == Decimal("6.000"))
+    assert segment_v1.von == date(2026, 3, 1) and segment_v1.bis == date(2026, 6, 1)
+    assert segment_v2.von == date(2026, 6, 1) and segment_v2.bis == date(2026, 8, 1)
+    erwartet = (
+        _segment_zinsen_cent(50_000, Decimal("5.000"), (date(2026, 6, 1) - date(2026, 3, 1)).days)
+        + _segment_zinsen_cent(50_000, Decimal("6.000"), (date(2026, 8, 1) - date(2026, 6, 1)).days)
+    )
+    assert vorschau.neue_zinsen_cent == erwartet
+
+
+def test_zinsprofil_wechsel_ohne_durchgaengiges_gueltig_ab_bleibt_unberechenbar(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Rückprüfung 14.09.2026, Risiko 3, Kehrseite: fehlt bei
+    MINDESTENS einer von mehreren geprüften Versionen das `gueltig_ab`,
+    wissen wir zwar, dass sich die Vereinbarung geändert hat, aber NICHT
+    wann - der GESAMTE Zeitraum bleibt dann explizit unberechenbar
+    (satz_prozent=None, keine Zinsen), statt zu raten, welche Version
+    wann galt. Die Hauptforderung selbst bleibt davon unberührt."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
+        vereinbarter_zinssatz_prozent=Decimal("5.000"), vereinbarung_geprueft=True,
+        vereinbarung_beleg="Mietvertrag 2020", gueltig_ab=date(2026, 1, 1),
+    )
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
+        vereinbarter_zinssatz_prozent=Decimal("6.000"), vereinbarung_geprueft=True,
+        vereinbarung_beleg="Nachtrag 2026 (Datum nicht belegt)",  # bewusst OHNE gueltig_ab
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 3, 1), buchungsdatum=date(2026, 3, 1),
+        faelligkeit=date(2026, 3, 1), beleg_referenz="HMZ März",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 8, 1))
+
+    assert vorschau is not None
+    assert vorschau.zinsbasis == "UNBERECHENBAR"
+    assert vorschau.zins_teilweise_ungeklaert is True
+    assert vorschau.neue_zinsen_cent == 0
+    assert all(s.satz_prozent is None for s in vorschau.zins_segmente)
+    assert vorschau.hauptforderung_cent == 50_000  # Hauptforderung bleibt unblockiert
+    assert any("unberechenbar" in h.lower() for h in vorschau.hinweise)
+    assert any("§458" in h and "unberechenbar" in h.lower() for h in vorschau.hinweise)
+
+    gebucht = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 8, 1),
+        versandnachweis_referenz="mahnung:unberechenbar", akteur="test",
+    )
+    assert gebucht is None  # nichts zu buchen, solange die Historie ungeklärt ist
 
 
 # -- Privat/B2B-Unterscheidung ----------------------------------------------

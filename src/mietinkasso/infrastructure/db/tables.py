@@ -676,6 +676,45 @@ class MahnFallTable(Base):
     letzter_versuch_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class MahnLaufTable(Base):
+    """Persistente, ATOMARE Gruppensperre für einen gebündelten
+    Mahnversand (Auftrag HV-20260914-MAHNUNG-BRIEF, löst die frühere
+    "kleinste-Id"-Leader-Heuristik ab - siehe Rückprüfung 14.09.2026,
+    Risiko 1+2). GENAU EIN `MahnLaufTable`-Eintrag je (`vertrag_id`,
+    `stufe`, exakte Mitgliedermenge) - `mitglieder_mahnfall_ids` ist ein
+    beim Bilden der Gruppe EINGEFRORENER Snapshot der zu diesem
+    Zeitpunkt tatsächlich sendeberechtigten (nicht bloß "irgendwie
+    geplanten") `MahnFallTable`-Ids, siehe
+    `mahnwesen/service.py::MahnwesenService.plane_mahnlauf`.
+
+    Der atomare Compare-and-Swap GEPLANT -> IN_VERSAND läuft über GENAU
+    DIESE Zeile (nicht mehr über einen einzelnen "führenden" MahnFall) -
+    solange ein Mahnlauf IN_VERSAND, UNSICHER oder GESENDET ist, darf
+    KEIN Kanal (E-Mail, künftig Brief - `kanal`-Spalte) für dieselben
+    Mitglieder einen weiteren Versand versuchen, siehe
+    `versende_mahnlauf`. Dasselbe Wiederanlauf-/Recovery-Prinzip wie bei
+    `MahnFallTable`: ein zwischen Claim und Ergebnis abgestürzter Lauf
+    bleibt IN_VERSAND und wird NUR über
+    `markiere_verwaiste_mahnlaeufe_als_unsicher` (nie automatisch
+    erneut versucht) auf UNSICHER aufgelöst."""
+
+    __tablename__ = "mahnlaeufe"
+    __table_args__ = (UniqueConstraint("outbox_key", name="uq_mahnlauf_outbox_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    outbox_key: Mapped[str] = mapped_column(String(256))
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    gesellschaft_id: Mapped[str] = mapped_column(ForeignKey("gesellschaften.id"), index=True)
+    stufe: Mapped[int] = mapped_column(Integer)
+    mitglieder_mahnfall_ids: Mapped[str] = mapped_column(Text)  # JSON-Liste, sortiert
+    kanal: Mapped[str] = mapped_column(String(16), default="EMAIL", server_default=text("'EMAIL'"))
+    status: Mapped[str] = mapped_column(String(16), default="GEPLANT", server_default=text("'GEPLANT'"))
+    geplant_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    versand_beansprucht_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    gesendet_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fehlergrund: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+
 class AuditEventTable(Base):
     __tablename__ = "audit_events"
 
@@ -1242,7 +1281,31 @@ class ZinsprofilTable(Base):
     Wirksamkeitsfreigabe, insbesondere bei einem Verbraucher-Mieter
     (`ist_b2b=False`). `mahngebuehr_kostenbasis_cent` ist die laut
     §1333 Abs 2 ABGB / §458 UGB geprüfte, tatsächliche/zweckmäßige
-    Kostenbasis - NIE eine erfundene Pauschale."""
+    Kostenbasis - NIE eine erfundene Pauschale.
+
+    `gueltig_ab` (Rückprüfung 14.09.2026, Risiko 3): das EXPLIZIT
+    belegte Datum, AB DEM diese konkrete Version tatsächlich gilt - NICHT
+    zu verwechseln mit `geprueft_am` (nur der interne Freigabezeitpunkt).
+    Existiert für einen Vertrag NUR EINE JE GEPRÜFTE Version, gilt sie
+    (wie bisher, unverändertes Verhalten) für die gesamte berechenbare
+    Periode. Existieren MEHRERE geprüfte Versionen, wird NUR
+    periodengerecht (je Tag die zu diesem Tag gültige Version) gerechnet,
+    wenn ALLE beteiligten Versionen ein `gueltig_ab` tragen - fehlt es
+    bei auch nur einer, bleibt der betroffene Zinsanteil explizit
+    "unberechenbar" statt rückwirkend die aktuell/zuletzt geprüfte
+    Version zu verwenden (siehe `mahnwesen/kosten.py::
+    _zinsprofil_segmente`).
+
+    `verzugsverantwortung_geprueft` (unabhängige Rückprüfung Codex
+    14.09.2026): §456 UGB (der ERHÖHTE Zinssatz) setzt neben B2B/Datum
+    voraus, dass der Zahlungsverzug dem Schuldner zuzurechnen/von ihm zu
+    verantworten ist und dies auch BELEGT geprüft wurde - ein bloß
+    unterstellter, nicht belegter Verzug reicht NICHT für den erhöhten
+    Satz. Ist dies (noch) nicht geprüft, fällt die VERZINSUNG (nicht die
+    §458-Pauschale, die laut Gesetzesmaterialien verschuldensunabhängig
+    ist und davon unberührt bleibt) konservativ auf die gesetzlichen 4 %
+    ABGB zurück, statt automatisch den höheren UGB-Satz anzusetzen
+    (siehe `mahnwesen/kosten.py::_ugb_zinssatz_anwendbar`)."""
 
     __tablename__ = "zinsprofile"
     __table_args__ = (UniqueConstraint("vertrag_id", "version", name="uq_zinsprofil_version"),)
@@ -1256,6 +1319,11 @@ class ZinsprofilTable(Base):
     # Nie-Ableiten-Regel wie überall in diesem Repository).
     ist_b2b: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
     vertragsdatum: Mapped[date | None] = mapped_column(Date, nullable=True)
+    gueltig_ab: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Siehe Klassendoc oben - separat von `ist_b2b`/`vertragsdatum`, weil
+    # B2B+Datum allein nur die §458-Pauschale rechtfertigt, NICHT den
+    # erhöhten §456-Zinssatz.
+    verzugsverantwortung_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
     vereinbarter_zinssatz_prozent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
     vereinbarung_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
     vereinbarung_beleg: Mapped[str | None] = mapped_column(String(256), nullable=True)

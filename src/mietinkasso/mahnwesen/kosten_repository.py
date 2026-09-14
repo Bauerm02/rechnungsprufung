@@ -56,11 +56,25 @@ class MahnkostenRepository:
                 .order_by(ZinsprofilTable.version.desc())
             ).scalars().all())
 
+    def historie_geprueft(self, vertrag_id: str) -> list[ZinsprofilTable]:
+        """ALLE jemals GEPRUEFTEN Versionen (aufsteigend nach Version) -
+        Grundlage für die periodengerechte Auflösung bei einem
+        Vertragszinswechsel (siehe `kosten.py::_zinsprofil_segmente`).
+        Ein zwischenzeitlicher ENTWURF, der nie freigegeben wurde, taucht
+        hier NICHT auf (er entfaltet ohnehin keine Wirkung)."""
+
+        with self._session_factory() as session:
+            return list(session.execute(
+                select(ZinsprofilTable).where(ZinsprofilTable.vertrag_id == vertrag_id)
+                .where(ZinsprofilTable.status == "GEPRUEFT")
+                .order_by(ZinsprofilTable.version.asc())
+            ).scalars().all())
+
     def zinsprofil_anlegen(
         self, *, vertrag_id: str, ist_b2b: bool, vertragsdatum: date | None,
         vereinbarter_zinssatz_prozent=None, vereinbarung_geprueft: bool = False, vereinbarung_beleg: str | None = None,
         mahngebuehr_kostenbasis_cent: int | None = None, mahngebuehr_kostenbasis_beleg: str | None = None,
-        erstellt_von: str,
+        gueltig_ab: date | None = None, verzugsverantwortung_geprueft: bool = False, erstellt_von: str,
     ) -> ZinsprofilTable:
         with self._session_factory() as session:
             bisherige_version = session.execute(
@@ -69,7 +83,8 @@ class MahnkostenRepository:
             ).scalar_one_or_none()
             row = ZinsprofilTable(
                 vertrag_id=vertrag_id, version=(bisherige_version or 0) + 1, status="ENTWURF",
-                ist_b2b=ist_b2b, vertragsdatum=vertragsdatum,
+                ist_b2b=ist_b2b, vertragsdatum=vertragsdatum, gueltig_ab=gueltig_ab,
+                verzugsverantwortung_geprueft=verzugsverantwortung_geprueft,
                 vereinbarter_zinssatz_prozent=vereinbarter_zinssatz_prozent,
                 vereinbarung_geprueft=vereinbarung_geprueft, vereinbarung_beleg=vereinbarung_beleg,
                 mahngebuehr_kostenbasis_cent=mahngebuehr_kostenbasis_cent,
@@ -177,6 +192,35 @@ class MahnkostenRepository:
                 select(MahnkostenBuchungTable.zinsen_cent).where(MahnkostenBuchungTable.vertrag_id == vertrag_id)
             ).all()
             return sum(z for (z,) in zeilen)
+
+    def bereits_gebuchte_zinsen_je_op_position(self, *, vertrag_id: str) -> dict[int, int]:
+        """Wie `bereits_gebuchte_zinsen_cent`, aber JE zugrunde liegender
+        `op_position_id` aufgeschlüsselt (aus `zins_segmente_json` aller
+        historischen Buchungen dieses Vertrags) - unabhängige
+        Rückprüfung Codex 14.09.2026: eine vertragsweite BLANKO-Summe
+        würde die Verzinsung einer genuin NEUEN, seither entstandenen
+        Forderung fälschlich reduzieren, sobald eine ANDERE, mittlerweile
+        abgelöste/geschlossene Forderung früher bereits verzinst wurde.
+        Der Abzug in `kosten.py::berechne_mahnkosten_vorschau` erfolgt
+        deshalb JE `op_position_id`, nicht vertragsweit gesamt."""
+
+        with self._session_factory() as session:
+            zeilen = session.execute(
+                select(MahnkostenBuchungTable.zins_segmente_json).where(MahnkostenBuchungTable.vertrag_id == vertrag_id)
+            ).all()
+        ergebnis: dict[int, int] = {}
+        for (roh,) in zeilen:
+            try:
+                segmente = json.loads(roh) if roh else []
+            except (TypeError, ValueError):
+                segmente = []
+            for segment in segmente:
+                op_id = segment.get("op_position_id")
+                zinsen = segment.get("zinsen_cent")
+                if op_id is None or zinsen is None:
+                    continue
+                ergebnis[op_id] = ergebnis.get(op_id, 0) + int(zinsen)
+        return ergebnis
 
     def bereits_erhobene_gebuehr_schluessel(self, *, vertrag_id: str) -> frozenset[str]:
         """Alle `entgeltforderung_schluessel`, für die für DIESEN Vertrag

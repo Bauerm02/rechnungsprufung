@@ -54,7 +54,7 @@ def _mahnkosten_text_baustein(vorschau) -> str:
     zeilen: list[str] = []
     if vorschau.bereits_gebuchte_zinsen_cent > 0:
         zeilen.append(f"Bereits verrechnete Verzugszinsen aus früheren Mahnläufen: {_eur_text(vorschau.bereits_gebuchte_zinsen_cent)} EUR.")
-    neu_zinsen = max(vorschau.neue_zinsen_cent - vorschau.bereits_gebuchte_zinsen_cent, 0)
+    neu_zinsen = vorschau.neue_zinsen_delta_cent
     if neu_zinsen > 0:
         satz_text = f"{vorschau.zinssatz_prozent} % p.a." if vorschau.zinssatz_prozent is not None else "mehreren Sätzen (siehe Zeiträume unten)"
         zeitraum_text = f"{vorschau.zins_von.strftime('%d.%m.%Y')} bis {vorschau.zins_bis.strftime('%d.%m.%Y')}" if vorschau.zins_von and vorschau.zins_bis else ""

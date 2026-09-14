@@ -1560,8 +1560,8 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
           <h3>Stufe {stufe}</h3>
           <table>
             <tr><th>Hauptforderung</th><td>{eur(vorschau.hauptforderung_cent)}</td></tr>
-            <tr><th>Bereits gebuchte Zinsen (vertragsweit, alle Stufen)</th><td>{eur(vorschau.bereits_gebuchte_zinsen_cent)}</td></tr>
-            <tr><th>Neu zu bebuchende Zinsen (Delta)</th><td>{eur(max(vorschau.neue_zinsen_cent - vorschau.bereits_gebuchte_zinsen_cent, 0))}</td></tr>
+            <tr><th>Bereits gebuchte Zinsen (je betroffener Forderung, alle Stufen)</th><td>{eur(vorschau.bereits_gebuchte_zinsen_cent)}</td></tr>
+            <tr><th>Neu zu bebuchende Zinsen (Delta)</th><td>{eur(vorschau.neue_zinsen_delta_cent)}</td></tr>
             <tr><th>Zinssatz / Basis</th><td>{h(satz_text)} ({h(vorschau.zinsbasis)})</td></tr>
             <tr><th>Zinszeitraum</th><td>{h(zeitraum_text)}</td></tr>
             <tr><th>Neue Mahngebühr</th><td>{h(gebuehr_text)}{f" ({h(vorschau.gebuehr_rechtsgrundlage)})" if vorschau.gebuehr_rechtsgrundlage else ""}</td></tr>
