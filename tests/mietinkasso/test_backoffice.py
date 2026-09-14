@@ -443,8 +443,12 @@ def test_dashboard_sperre_auf_offenem_konto_wird_als_zu_erledigen_gezaehlt(backo
         _login(client)
         dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
         assert dashboard.status_code == 200
-        assert "aktiver Mahnsperre</a> - vor einem Mahnlauf beachten" in dashboard.text
-        assert "aufheben" not in dashboard.text.lower().split("das ist zu erledigen")[1].split("</div>")[0]
+        abschnitt = dashboard.text.split("<h2>Das ist zu erledigen</h2>")[1].split("<h2>")[0]
+        assert "Aktive Mahnsperre" in abschnitt
+        assert "vor einer Mahnung berücksichtigen" in abschnitt
+        assert "Status prüfen" in abschnitt
+        assert "aufheben" not in abschnitt.lower()
+        assert "entsperren" not in abschnitt.lower()
     finally:
         stammdaten.sperre_aufheben(sperre_id)
 
@@ -659,9 +663,19 @@ def test_dashboard_sperre_und_abweichung_werden_gleichzeitig_angezeigt(backoffic
     try:
         dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
         assert dashboard.status_code == 200
-        zeile = dashboard.text.split("Top Sperre Abweichung")[1].split("</tr>")[0]
+        kompakt_abschnitt = dashboard.text.split('id="mietkonten-uebersicht"')[1]
+        zeile = kompakt_abschnitt.split("Top Sperre Abweichung")[1].split("</tr>")[0]
         assert "Mahnung gesperrt" in zeile
         assert "Klärung nötig (Kontoabweichung)" in zeile
+
+        # Auftrag HV-20260914-AUFGABEN-MIETERAKTE: dieselbe Person muss mit
+        # BEIDEN Gründen gleichzeitig in "Das ist zu erledigen" auftauchen
+        # (Gruppierung je Vertrag, keine sich gegenseitig verdeckenden
+        # Einzelzähler mehr).
+        aufgaben_abschnitt = dashboard.text.split("<h2>Das ist zu erledigen</h2>")[1].split("<h2>")[0]
+        assert "Top Sperre Abweichung" in aufgaben_abschnitt
+        assert "Abweichung Kontostand/Einzelpositionen" in aufgaben_abschnitt
+        assert "Aktive Mahnsperre" in aufgaben_abschnitt
     finally:
         stammdaten.sperre_aufheben(sperre_id)
 

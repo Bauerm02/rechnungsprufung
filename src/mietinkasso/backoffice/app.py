@@ -391,46 +391,102 @@ def _rueckstaende_kpi_html(k) -> str:
 
 
 def _erledigen_html(uebersicht) -> str:
-    """"Das ist zu erledigen" (Auftrag HV-20260914-UI-EINFACH, verschärft
-    Rückprüfung 14.09.2026) - reine Aggregation/Filterung der bereits in
-    `uebersicht` vorhandenen Zahlen/Sperren, KEINE neue Berechnung und
-    KEINE erfundenen Aufgaben. Der Funktionsstatus (E-Mail-Versand/
-    Bankdaten) steht jetzt sitzungsweit im kurzen Kopfzeilen-Banner
-    (`views.py::kurzstatus_text`) statt hier zusätzlich mit technischem
-    Jargon (SEND_ENABLED/EBS/EBICS) wiederholt zu werden. Eine
-    Mahnsperre auf einem bereits vollständig bezahlten/Guthaben-Konto
-    ist HIER KEINE Handlungsaufgabe (nichts zu mahnen gibt es nicht) -
-    sie bleibt trotzdem im Detail sichtbar (siehe "weitere Konten")."""
+    """"Das ist zu erledigen" (Auftrag HV-20260914-AUFGABEN-MIETERAKTE,
+    ersetzt die bisherigen Sammelzähler aus HV-20260914-UI-EINFACH) -
+    reine Umgruppierung/Filterung der bereits in `uebersicht` vorhandenen,
+    bereits berechneten Zeilen (offene Positionen, Mietkonten,
+    Sperrgründe) je Vertrag (= eine Person/ein Mietverhältnis), KEINE
+    neue Berechnung, KEINE neue persistente Aufgaben-Ablage und KEINE
+    Berechnung/Versand als Nebeneffekt dieses GET. Mehrere gleichzeitig
+    zutreffende Gründe derselben Person werden gesammelt statt sich
+    gegenseitig zu verdecken (vorher: eine gemeinsame Zähler-Liste ohne
+    Personenbezug, effektiv eine elif-artige Priorisierung). Jeder Grund
+    verlinkt direkt zur passenden Sektion der eigenen Mieterakte
+    (`/backoffice/vertrag/{vertrag_id}#...`, siehe
+    `vertragsanlage_form.py::detail_ansicht`) statt zu einer allgemeinen
+    Dashboard-Tabelle. Eine gültige Sperre/ein Ratenplan/Anwaltsfall wird
+    NIE als Aufforderung zum Entsperren dargestellt, sondern als
+    "vor einer Mahnung berücksichtigen/Status prüfen". Eine Mahnsperre
+    auf einem bereits ausgeglichenen/Guthaben-Konto ist HIER weiterhin
+    KEINE Handlungsaufgabe (nichts zu mahnen gibt es nicht)."""
 
-    punkte: list[str] = []
-    unbekannte_positionen = [p for p in uebersicht.offene_positionen if p.faelligkeitsklasse == "UNBEKANNT"]
-    if unbekannte_positionen:
-        summe = sum(p.rest_cent for p in unbekannte_positionen)
-        punkte.append(
-            f'<li><a href="#offene-positionen">{len(unbekannte_positionen)} offene Position(en) ohne erfasste '
-            f'Fälligkeit</a> ({eur(summe)}) - Fälligkeit klären.</li>'
+    eintraege: dict[str, dict] = {}
+
+    def _eintrag(quelle) -> dict:
+        e = eintraege.get(quelle.vertrag_id)
+        if e is None:
+            e = {
+                "debitor_name": quelle.debitor_name,
+                "objekt_bezeichnung": quelle.objekt_bezeichnung,
+                "einheit_bezeichnung": getattr(quelle, "einheit_bezeichnung", None),
+                "gruende": [],
+            }
+            eintraege[quelle.vertrag_id] = e
+        elif e["einheit_bezeichnung"] is None:
+            e["einheit_bezeichnung"] = getattr(quelle, "einheit_bezeichnung", None)
+        return e
+
+    unbekannte_je_vertrag: dict[str, list] = {}
+    for p in uebersicht.offene_positionen:
+        if p.faelligkeitsklasse == "UNBEKANNT":
+            unbekannte_je_vertrag.setdefault(p.vertrag_id, []).append(p)
+    for vertrag_id, positionen in unbekannte_je_vertrag.items():
+        e = _eintrag(positionen[0])
+        summe = sum(pos.rest_cent for pos in positionen)
+        e["gruende"].append((
+            "warn",
+            f"{len(positionen)} offene Position(en) ohne erfasste Fälligkeit ({eur(summe)})",
+            "Fälligkeit klären",
+            f"/backoffice/vertrag/{h(vertrag_id)}#zahlungen",
+        ))
+
+    for z in uebersicht.mietkonten:
+        if z.abweichung_saldo_zu_positionen_cent:
+            e = _eintrag(z)
+            e["gruende"].append((
+                "warn",
+                f"Abweichung Kontostand/Einzelpositionen ({eur(z.abweichung_saldo_zu_positionen_cent)})",
+                "Buchungen vergleichen",
+                f"/backoffice/vertrag/{h(z.vertrag_id)}#kontodetails",
+            ))
+        # NUR Sperren auf tatsächlich offenen (positiven) Konten sind ein
+        # handlungsbezogener Punkt - eine Sperre auf einem ausgeglichenen/
+        # Guthaben-Konto betrifft keinen anstehenden Mahnlauf.
+        if z.sperrgruende and z.saldo_cent is not None and z.saldo_cent > 0:
+            e = _eintrag(z)
+            e["gruende"].append((
+                "error",
+                f"Aktive Mahnsperre ({h(', '.join(z.sperrgruende))}) bei offenem Betrag {eur(z.saldo_cent)} - "
+                "vor einer Mahnung berücksichtigen",
+                "Status prüfen",
+                f"/backoffice/vertrag/{h(z.vertrag_id)}#sperren",
+            ))
+
+    if not eintraege:
+        aufgaben_html = (
+            '<p class="muted">Aus den aktuell geprüften Kriterien (offene Positionen ohne Fälligkeit, '
+            "Abweichungen Kontostand/Einzelpositionen, aktive Mahnsperren auf offenen Konten) ergeben sich "
+            "keine Klärpunkte. Das ist KEINE Aussage über einen vollständigen Bankabgleich und KEINE "
+            "Behauptung, dass alle Beträge bereits bezahlt sind - nur diese Kriterien liefern aktuell "
+            "keinen Treffer.</p>"
         )
-    abweichende_konten = [z for z in uebersicht.mietkonten if z.abweichung_saldo_zu_positionen_cent]
-    if abweichende_konten:
-        punkte.append(
-            f'<li><a href="#mietkonten-details">{len(abweichende_konten)} Mietkonto/-konten mit Abweichung</a> '
-            "zwischen Kontostand und Einzelpositionen - Kontoabweichung prüfen.</li>"
-        )
-    # NUR Sperren auf tatsächlich offenen (positiven) Konten sind ein
-    # handlungsbezogener Punkt - eine Sperre auf einem ausgeglichenen/
-    # Guthaben-Konto betrifft keinen anstehenden Mahnlauf.
-    gesperrte_offene_konten = [
-        z for z in uebersicht.mietkonten if z.sperrgruende and z.saldo_cent is not None and z.saldo_cent > 0
-    ]
-    if gesperrte_offene_konten:
-        punkte.append(
-            f'<li><a href="#mietkonten-uebersicht">{len(gesperrte_offene_konten)} offene Mietkonto/-konten mit '
-            "aktiver Mahnsperre</a> - vor einem Mahnlauf beachten (z. B. Ratenplan läuft bereits).</li>"
-        )
-    aufgaben_html = (
-        f'<ul class="todo-liste">{"".join(punkte)}</ul>' if punkte
-        else '<p class="muted">Keine offenen Klärpunkte aus den aktuellen Daten.</p>'
-    )
+    else:
+        karten = []
+        for e in eintraege.values():
+            gruende_html = "".join(
+                f'<li><span class="badge badge-{stil}">{text}</span> <a href="{link}">{h(aktion)}</a></li>'
+                for stil, text, aktion, link in e["gruende"]
+            )
+            einheit_zusatz = f" / {h(e['einheit_bezeichnung'])}" if e["einheit_bezeichnung"] else ""
+            karten.append(
+                '<li class="aufgaben-karte">'
+                f'<div class="aufgaben-karte-kopf"><strong>{h(e["debitor_name"])}</strong> '
+                f'<span class="muted">{h(e["objekt_bezeichnung"])}{einheit_zusatz}</span></div>'
+                f'<ul class="aufgaben-gruende">{gruende_html}</ul>'
+                "</li>"
+            )
+        aufgaben_html = f'<ul class="aufgaben-liste">{"".join(karten)}</ul>'
+
     return f"""
     <div class="card">
       <h2>Das ist zu erledigen</h2>
@@ -4388,7 +4444,8 @@ def vertragsanlage_detail(request: Request, vertrag_id: str, session=Depends(_cu
     vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
     if vertrag is None:
         return _fehlerseite(session, "Mietvertrag", f"Unbekannter Vertrag {vertrag_id}.", "/backoffice/vertraege")
-    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    ctx = _ctx(session)
+    require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
     einheit = _stammdaten_repo.get_einheit(vertrag.einheit_id)
     objekt = _stammdaten_repo.get_objekt(einheit.objekt_id) if einheit else None
     debitor = _stammdaten_repo.get_debitor(vertrag.debitor_id)
@@ -4417,13 +4474,57 @@ def vertragsanlage_detail(request: Request, vertrag_id: str, session=Depends(_cu
             f"(Bezugsmonat {freigegebene_klausel.basis_monat})"
         )
 
+    letzte_pruefung_hinweis = None
+    letzte_pruefung = _vertragspruefung_repo.aktuelle(vertrag_id)
+    if letzte_pruefung is not None:
+        letzte_pruefung_hinweis = (
+            f"Version {letzte_pruefung.version}, Rechtsordnung {letzte_pruefung.rechtsordnung}, "
+            f"Status {letzte_pruefung.fachstatus} (Beleg: {letzte_pruefung.quellenbeleg_referenz})"
+        )
+
+    # Tatsächlich persistierte Vorschreibungsdatensätze (Auftrag
+    # HV-20260914-AUFGABEN-MIETERAKTE, Ergänzung Codex-Bestandsprüfung) -
+    # NICHT nur die vereinbarten Komponenten.
+    vorschreibungen = _vorschreibung_repo.list_fuer_vertrag(vertrag_id)
+    vorschreibung_summen = {
+        v.id: sum(p.betrag_cent for p in _vorschreibung_repo.list_positionen(v.id)) for v in vorschreibungen
+    }
+
+    # Ausgeschlossenes Objekt: Stammdaten bleiben sichtbar (wie beim
+    # bestehenden Kontoauszug), aber KEINE live berechnete Finanzzahl wird
+    # über diesen neuen, gemeinsamen Einstieg "eingeschleust" - dieselbe,
+    # bereits gehärtete Prüfung wie im Dashboard
+    # (`rueckstaende.service.berechne_rueckstandsuebersicht`), kein
+    # separater/laxerer Prüfpfad.
+    gesperrt = objekt.ausgeschlossen
+    kontostatus = None
+    unbekannte_faelligkeit_positionen: list = []
+    mahnfaelle: list = []
+    if not gesperrt:
+        uebersicht = berechne_rueckstandsuebersicht(
+            ctx=ctx, objekt_id=objekt.id, stammdaten_repository=_stammdaten_repo, op_service=_op_service,
+            mahn_fall_repository=_mahn_fall_repo,
+        )
+        kontostatus = next((z for z in uebersicht.mietkonten if z.vertrag_id == vertrag_id), None)
+        unbekannte_faelligkeit_positionen = [
+            p for p in uebersicht.offene_positionen if p.vertrag_id == vertrag_id and p.faelligkeitsklasse == "UNBEKANNT"
+        ]
+        mahnfaelle = [m for m in uebersicht.mahnfaelle if m.vertrag_id == vertrag_id]
+
+    zahlungen_positionen = _op_service.berechne_saldo(konto.id).positionen if (konto and not gesperrt) else []
+    sperren = _stammdaten_repo.aktive_sperren(vertrag_id)
+
     inhalt = _vertragsanlage_detail_ansicht(
         vertrag=vertrag, objekt=objekt, einheit=einheit, debitor=debitor, gesellschaft=gesellschaft,
         profil=profil, kaution=kaution, konto_id=konto.id if konto else None, komponenten=komponenten,
         rechtsprofil_hinweis=rechtsprofil_hinweis, index_klausel_hinweis=index_klausel_hinweis,
         versionen=versionen, csrf=session.csrf_token,
+        gesperrt=gesperrt, vorschreibungen=vorschreibungen, vorschreibung_summen=vorschreibung_summen,
+        kontostatus=kontostatus, unbekannte_faelligkeit_positionen=unbekannte_faelligkeit_positionen,
+        zahlungen_positionen=zahlungen_positionen, sperren=sperren, mahnfaelle=mahnfaelle,
+        letzte_pruefung_hinweis=letzte_pruefung_hinweis,
     )
-    return _layout(request, session, f"Mietvertrag {vertrag_id}", inhalt)
+    return _layout(request, session, f"Mieterakte {debitor.name}", inhalt)
 
 
 @router.post("/vertragsanlage/pdf-hochladen", response_class=HTMLResponse)

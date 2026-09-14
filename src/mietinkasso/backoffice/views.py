@@ -291,6 +291,11 @@ def seite(
   .todo-liste {{ list-style: none; margin: 0; padding: 0; }}
   .todo-liste li {{ padding: 0.4rem 0; border-bottom: 1px solid #eee; }}
   .todo-liste li:last-child {{ border-bottom: none; }}
+  .aufgaben-liste {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; }}
+  .aufgaben-karte {{ border: 1px solid #ddd; border-left: 4px solid var(--gold); border-radius: 6px; padding: 0.6rem 0.8rem; background: #fcfbf8; }}
+  .aufgaben-karte-kopf {{ margin-bottom: 0.3rem; }}
+  .aufgaben-gruende {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }}
+  .aufgaben-gruende li {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }}
   .status-zeile {{ display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; font-size: 0.85rem; color: #555; margin: 0.5rem 0; }}
   details > summary {{ cursor: pointer; color: var(--anthrazit); font-weight: 600; }}
   @media (max-width: 640px) {{

@@ -68,6 +68,24 @@ class VorschreibungRepository:
             )
             return list(session.execute(statement).scalars().all())
 
+    def list_fuer_vertrag(self, vertrag_id: str, *, limit: int = 6) -> list[VorschreibungTable]:
+        """Reiner Read, jüngster Monat zuerst - für die Mieterakte
+        (Auftrag HV-20260914-AUFGABEN-MIETERAKTE): zeigt die tatsächlich
+        persistierten Vorschreibungsdatensätze (mit ihrem echten Status
+        ENTWURF/SOLLGESTELLT/ZUGESTELLT/EXPORTIERT), NICHT nur die
+        aktuell aktiven Vertragskomponenten - eine Komponente ist ein
+        vereinbarter Betrag, kein Nachweis einer tatsächlichen
+        Sollstellung."""
+
+        with self._session_factory() as session:
+            statement = (
+                select(VorschreibungTable)
+                .where(VorschreibungTable.vertrag_id == vertrag_id)
+                .order_by(VorschreibungTable.monat.desc())
+                .limit(limit)
+            )
+            return list(session.execute(statement).scalars().all())
+
     def update_status(self, vorschreibung_id: int, **fields) -> VorschreibungTable:
         with self._session_factory() as session:
             row = session.get(VorschreibungTable, vorschreibung_id)
