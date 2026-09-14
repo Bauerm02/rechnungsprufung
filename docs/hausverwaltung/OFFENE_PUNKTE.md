@@ -3466,3 +3466,85 @@ die fachliche Erreichbarkeitsaussage selbst bleibt geprüft, nur über die
 neuen Bündelseiten statt Einzellinks), 1050/1050 grün im Gesamtlauf.
 Keine Liveaktionen, keine neuen fachlichen Funktionen - ausschließlich
 Oberfläche.
+
+## Korrekturpaket zu HV-20260914-UI-EINFACH: fünf Anzeigekorrekturen (14.09.2026)
+
+Unabhängige Abnahme von 3e682fe (945 Tests, synthetische GET/DB-
+unverändert-/Filter-/XSS-Prüfung) bestätigt grün; vor Deployment fünf
+begrenzte Anzeigekorrekturen - ausdrücklich KEINE Buchhaltungslogik,
+alle Beträge/Berechnungen unverändert:
+
+1. **Fälschlicher "Rückstand offen" bei künftig fälligem Soll.** Die
+   kompakte Statuszeile leitete "Rückstand offen" bisher aus dem rohen
+   positiven `saldo_cent` ab - ein Soll mit einziger bekannter
+   Fälligkeit 2099-01-05 (weit in der Zukunft) zeigte fälschlich Rot.
+   Fix: der Status verwendet jetzt die bereits vorhandene
+   Kontoberechnung `faelliger_unstrittiger_rest_cent` (prüft die
+   tatsächliche Fälligkeit korrekt) - nur wirklich fällige Rückstände
+   heißen "Rückstand offen", rein künftiges Soll heißt "Noch nicht
+   fällig". Keine Änderung der Zinsen-/Saldenberechnung, nur der
+   Statusableitung.
+2. **Nullsalden zwischen Rückständen + verdeckte Hinweise.** Die
+   Haupttabelle zeigte weiterhin alle Konten unsortiert; eine
+   `elif`-Kette blendete die Kontoabweichung aus, sobald zusätzlich
+   eine Sperre vorhanden war. Fix: positive offene Konten stehen jetzt
+   ZUERST, absteigend nach Betrag; ausgeglichene/Guthaben-/Konten ohne
+   Mietkonto stehen gesammelt in einem aufklappbaren "Weitere Konten"-
+   Block direkt unter der Haupttabelle. Sperre, Kontoabweichung und
+   unbekannte Fälligkeit werden jetzt als unabhängige, gleichzeitig
+   sichtbare Hinweis-Badges gezeigt statt sich gegenseitig zu
+   verdecken. Die Guthaben-KPI bleibt unverändert separat. Alle
+   bisherigen Detailinformationen (Konto-/Vertrags-ID, Kontoberechnung
+   vs. Positionen) bleiben über "Details" je Zeile erhalten.
+3. **Mahnsperren auf bereits bezahlten Konten als Aufgabe gezählt.**
+   "Das ist zu erledigen" zählt jetzt NUR Sperren auf Konten mit
+   tatsächlich offenem (positivem) Saldo als Handlungspunkt - eine
+   Sperre auf einem ausgeglichenen/Guthaben-Konto ist keine
+   Mahnlauf-Aufgabe, bleibt aber im kompakten Status ("Weitere Konten")
+   weiterhin als Badge sichtbar. Der Wortlaut heißt jetzt "vor einem
+   Mahnlauf beachten" statt eine Aufhebung nahezulegen - ein
+   vereinbarter Ratenplan erscheint damit nicht als "zu erledigende"
+   Aufhebungsaufgabe.
+4. **Zu großer/technischer Banner, Jargon in den Aufgaben.** Der
+   bisherige vollständige Banner (Umgebung/Flags im Klartext,
+   `SEND_ENABLED=false`, "EBS/EBICS") stand groß und prominent oben,
+   zusätzlich noch einmal (mit denselben Fachbegriffen) in "Das ist zu
+   erledigen". Fix: neue Funktion `views.py::kurzstatus_text()` zeigt
+   oben nur einen kurzen Satz ("Pilotbetrieb"/"Echtbetrieb (env)" ·
+   E-Mail-Versand aktiv/pausiert · Bankdaten manuell aktualisieren");
+   der vollständige bisherige Banner bleibt UNVERÄNDERT (keine
+   geschwächte Aussage, keine entfernte Kennzahl) in aufklappbaren
+   "Systemdetails" erhalten - bestehende Banner-Tests
+   (`test_backoffice_betriebsmodus.py`) bestehen unverändert, da der
+   Text weiterhin im HTML steht. Die redundante Status-Zeile in "Das
+   ist zu erledigen" wurde entfernt (der Kurzstatus deckt das jetzt
+   sitzungsweit ab). Auf der Abrechnungen-Seite zeigt der BK-Hinweis
+   jetzt nur noch "noch nicht bedienbar" ohne sichtbare `src/...`-/
+   `docs/...`-Pfade.
+5. **Kompakte Haupttabelle scrollte mobil seitlich.** Ursache: die
+   Kopfzeile war nur eine nackte `<tr><th>`-Zeile ohne `<thead>` -
+   die CSS-Kartenansicht (`.tabelle-kompakt thead { display:none }`)
+   griff deshalb nicht, und lange Namen ließen die Tabelle über die
+   Elternbreite hinauswachsen. Fix: `<thead>`/`<tbody>` korrekt
+   gesetzt, dazu `word-break`/`overflow-wrap` auf allen Zellen und eine
+   Media-Query (≤640px), die die kompakte Tabelle in lesbare
+   Karten/Zeilen mit `data-label`-Beschriftung umfließen lässt.
+   Technische Detailtabellen (`tabelle-scroll`) sind davon bewusst
+   NICHT betroffen und dürfen weiterhin horizontal scrollen. Verifiziert
+   per direktem HTML-Vergleich (`<thead>`/`<tbody>` vorhanden) und
+   Playwright-Messung (kompakte Tabelle exakt auf Elternbreite, kein
+   Overflow, 375px-Viewport mit langem Namen).
+
+**Zusätzlich (Nutzeranfrage während der Korrektur, dieselbe begrenzte
+Abnahme):** JLB-CI-Typografie in den CSS-Schriftfamilien berücksichtigt
+- Forum für Überschriften, EB Garamond für Fließtext, jeweils mit
+lokalem Serif-Fallback (Constantia/Cambria/Georgia). Reine
+`font-family`-Angabe ohne `@font-face`/Web-Font-Request - fehlen die
+Schriften lokal, greift der Browser lautlos auf den Fallback zurück;
+keine neue Abhängigkeit, keine neue Asset-Schnittstelle.
+
+12 neue Tests (davon mehrere gezielt als Regressionstests: künftig
+fälliges Soll, Sortierung ohne Nullsalden, gleichzeitige Sperre+
+Abweichung, Sperre auf ausgeglichenem vs. offenem Konto, Kurzstatus-
+Text, mobile Kartenansicht), 1057/1057 grün im Gesamtlauf. Keine
+Liveaktionen, keine neue Buchhaltungslogik - ausschließlich Anzeige.

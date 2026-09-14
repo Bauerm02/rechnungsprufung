@@ -28,7 +28,7 @@ Demo-Zweig zusätzlich End-to-End in `test_backoffice.py`."""
 
 from __future__ import annotations
 
-from mietinkasso.backoffice.views import betriebsmodus_banner, ist_bekannte_demo_umgebung, seite
+from mietinkasso.backoffice.views import betriebsmodus_banner, ist_bekannte_demo_umgebung, kurzstatus_text, seite
 
 
 def test_ist_bekannte_demo_umgebung_erkennt_nur_die_zugelassenen_werte():
@@ -89,3 +89,33 @@ def test_seite_zeigt_echtbetrieb_banner_und_titel_bei_production():
     assert "ECHTBETRIEB" in html
     assert "(ECHTBETRIEB)" in html
     assert "PILOT-BETRIEB" not in html
+
+
+def test_kurzstatus_text_ist_kurz_und_alltagstauglich():
+    """Rückprüfung 14.09.2026, Befund 4: statt eines "großen technischen
+    Produktionsbanners" mit sichtbarem `SEND_ENABLED=false` steht oben
+    ein kurzer, alltagstauglicher Satz - der vollständige technische
+    Banner bleibt unverändert (nur aufklappbar) erhalten."""
+
+    pilot = kurzstatus_text(environment="development", send_enabled=False)
+    assert pilot == "Pilotbetrieb · E-Mail-Versand pausiert · Bankdaten manuell aktualisieren"
+
+    echtbetrieb_pausiert = kurzstatus_text(environment="production", send_enabled=False)
+    assert echtbetrieb_pausiert == "Echtbetrieb (production) · E-Mail-Versand pausiert · Bankdaten manuell aktualisieren"
+    assert "SEND_ENABLED" not in echtbetrieb_pausiert
+    assert "EBS" not in echtbetrieb_pausiert
+
+    echtbetrieb_aktiv = kurzstatus_text(environment="production", send_enabled=True)
+    assert echtbetrieb_aktiv == "Echtbetrieb (production) · E-Mail-Versand aktiv · Bankdaten manuell aktualisieren"
+
+
+def test_seite_zeigt_kurzstatus_sichtbar_und_vollstaendigen_banner_aufklappbar():
+    """Der vollständige, bisherige Banner (Umgebung/Flags im Klartext)
+    bleibt vollständig im HTML vorhanden - nur in `<details>`
+    "Systemdetails" verschoben statt prominent an erster Stelle."""
+
+    html = seite(titel="Test", inhalt="<p>x</p>", environment="production", send_enabled=False)
+    assert "Echtbetrieb (production) · E-Mail-Versand pausiert · Bankdaten manuell aktualisieren" in html
+    assert "<summary>Systemdetails</summary>" in html
+    assert "SEND_ENABLED=false" in html  # vollständiger Banner weiterhin vorhanden, nur aufklappbar
+    assert "EBS/EBICS" in html

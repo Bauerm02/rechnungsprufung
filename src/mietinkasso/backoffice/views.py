@@ -176,6 +176,20 @@ def betriebsmodus_banner(*, environment: str, send_enabled: bool) -> str:
     )
 
 
+def kurzstatus_text(*, environment: str, send_enabled: bool) -> str:
+    """Kurzer, alltagstauglicher Betriebszustand OHNE technischen Jargon
+    (Auftrag HV-20260914-UI-EINFACH, Rückprüfung 14.09.2026: der bisherige
+    Banner war "groß und technisch", `SEND_ENABLED=false`/"EBS/EBICS"
+    tauchte zusätzlich in "Das ist zu erledigen" auf). Liest dieselbe
+    `environment`/`send_enabled`-Konfiguration wie `betriebsmodus_banner`,
+    NUR knapper formuliert - der vollständige Banner bleibt unverändert
+    in aufklappbaren Systemdetails erhalten."""
+
+    betrieb = "Pilotbetrieb" if ist_bekannte_demo_umgebung(environment) else f"Echtbetrieb ({environment})"
+    versand = "aktiv" if send_enabled else "pausiert"
+    return f"{betrieb} · E-Mail-Versand {versand} · Bankdaten manuell aktualisieren"
+
+
 def seite(
     *,
     titel: str,
@@ -187,6 +201,7 @@ def seite(
     aktueller_pfad: str = "",
 ) -> str:
     banner_text = betriebsmodus_banner(environment=environment, send_enabled=send_enabled)
+    kurzstatus = kurzstatus_text(environment=environment, send_enabled=send_enabled)
     titel_suffix = "PILOT" if ist_bekannte_demo_umgebung(environment) else "ECHTBETRIEB"
     logout_form = ""
     nav = ""
@@ -214,13 +229,21 @@ def seite(
     --anthrazit: #1F2125; --anthrazit-hell: #33363b; --gold: #C9A86A; --gold-dunkel: #a9824a; --creme: #F5F2EC;
   }}
   * {{ box-sizing: border-box; }}
-  body {{ font-family: "Segoe UI", system-ui, -apple-system, sans-serif; margin: 0; background: var(--creme); color: var(--anthrazit); }}
+  /* JLB-CI: Forum für Überschriften, EB Garamond für Fließtext - reine
+     Font-Family-Angabe mit lokalem Fallback (Constantia/Cambria/Georgia),
+     KEIN @font-face/Web-Font-Request, keine neue Abhängigkeit. Fehlen
+     Forum/EB Garamond lokal, greift der Browser lautlos auf den
+     Serif-Fallback zurück. */
+  body {{ font-family: "EB Garamond", Constantia, Cambria, Georgia, serif; font-size: 16px; margin: 0; background: var(--creme); color: var(--anthrazit); }}
+  h1, h2, h3, .schriftzug {{ font-family: Forum, Cambria, Georgia, serif; }}
   header {{ background: var(--anthrazit); color: #fff; padding: 0.6rem 1.25rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; }}
   header a {{ color: #fff; text-decoration: none; font-weight: 700; letter-spacing: 0.01em; }}
   header .muted {{ color: #d8d3c8; }}
   header form button {{ background: transparent; border: 1px solid var(--gold); color: var(--gold); border-radius: 4px; padding: 0.25rem 0.7rem; }}
   header form button:hover {{ background: var(--gold); color: var(--anthrazit); }}
   .pilot-banner {{ background: var(--gold-dunkel); color: #fff; text-align: center; padding: 0.35rem 0.75rem; font-size: 0.82rem; font-weight: 600; }}
+  .pilot-banner .banner-details {{ margin-top: 0.15rem; font-size: 0.72rem; font-weight: 400; }}
+  .pilot-banner .banner-details summary {{ cursor: pointer; color: #fff; text-decoration: underline; }}
   nav.hauptnav {{ background: var(--anthrazit-hell); padding: 0 1.25rem; display: flex; flex-wrap: wrap; }}
   nav.hauptnav a {{
     color: #eee9df; text-decoration: none; font-size: 0.92rem; font-weight: 600; padding: 0.7rem 0.9rem;
@@ -232,7 +255,7 @@ def seite(
   h1, h2, h3 {{ color: var(--anthrazit); }}
   a {{ color: var(--anthrazit); }}
   table {{ border-collapse: collapse; width: 100%; margin: 0.75rem 0; background: #fff; }}
-  th, td {{ border: 1px solid #ddd; padding: 0.35rem 0.55rem; text-align: left; font-size: 0.88rem; vertical-align: top; }}
+  th, td {{ border: 1px solid #ddd; padding: 0.35rem 0.55rem; text-align: left; font-size: 0.88rem; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; }}
   th {{ background: #efeae0; }}
   .card {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }}
   .warn {{ color: var(--gold-dunkel); font-weight: 600; }}
@@ -277,13 +300,28 @@ def seite(
     nav.hauptnav a {{ padding: 0.6rem 0.55rem; font-size: 0.82rem; }}
     .kpi {{ flex: 1 1 100%; }}
     .bereich-karten .card {{ flex: 1 1 100%; }}
+    /* Kompakte Kontentabelle wird zu lesbaren Karten/Zeilen statt seitlich
+       zu scrollen (Rückprüfung 14.09.2026) - technische Detailtabellen in
+       `.tabelle-scroll` behalten ihr normales Scrollverhalten, das ist
+       hier bewusst NICHT betroffen. */
+    .tabelle-kompakt table, .tabelle-kompakt thead, .tabelle-kompakt tbody,
+    .tabelle-kompakt tr, .tabelle-kompakt td {{ display: block; width: 100%; }}
+    .tabelle-kompakt thead {{ display: none; }}
+    .tabelle-kompakt tr {{ border: 1px solid #ddd; border-radius: 6px; margin-bottom: 0.6rem; padding: 0.4rem 0.6rem; }}
+    .tabelle-kompakt td {{ border: none; padding: 0.25rem 0; }}
+    .tabelle-kompakt td[data-label]::before {{
+      content: attr(data-label); display: block; font-size: 0.72rem; color: #666; font-weight: 600;
+    }}
   }}
 </style>
 </head>
 <body>
-<div class="pilot-banner">{h(banner_text)}</div>
+<div class="pilot-banner">
+  {h(kurzstatus)}
+  <details class="banner-details"><summary>Systemdetails</summary>{h(banner_text)}</details>
+</div>
 <header>
-  <a href="/backoffice/">JLB Hausverwaltung</a>
+  <a href="/backoffice/" class="schriftzug">JLB Hausverwaltung</a>
   <div>{logout_form}</div>
 </header>
 {nav}

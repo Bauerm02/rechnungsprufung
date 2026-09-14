@@ -386,12 +386,12 @@ def test_navigation_hebt_aktuellen_bereich_hervor(backoffice_client):
     assert '<a href="/backoffice/einstellungen" class="aktiv">Einstellungen</a>' in einstellungen.text
 
 
-def test_dashboard_zeigt_mahnsperre_als_zu_erledigen_und_im_kompakten_status(backoffice_client):
-    """"Das ist zu erledigen" (Auftrag HV-20260914-UI-EINFACH) muss eine
-    tatsächlich bestehende Mahnsperre nennen, und die kompakte
-    Mietkonto-Zeile muss dafür einen verständlichen Status statt eines
-    rohen technischen Badges zeigen - abgeleitet aus denselben, bereits
-    bestehenden `aktive_sperren`-Daten, keine neue Sperrlogik."""
+def test_dashboard_sperre_auf_ausgeglichenem_konto_ist_keine_erledigen_aufgabe(backoffice_client):
+    """Rückprüfung 14.09.2026, Befund 3: eine Mahnsperre auf einem
+    Konto OHNE offenen Betrag (hier V-601-1, Saldo 0 - keine SOLL-Buchung
+    in dieser Fixture) ist KEINE Handlungsaufgabe (nichts zu mahnen gibt
+    es nicht) und darf NICHT in "Das ist zu erledigen" gezählt werden -
+    bleibt aber im kompakten Status ("weitere Konten") sichtbar."""
 
     from mietinkasso.infrastructure.config import get_settings
     from mietinkasso.infrastructure.db.session import build_session_factory
@@ -405,11 +405,182 @@ def test_dashboard_zeigt_mahnsperre_als_zu_erledigen_und_im_kompakten_status(bac
         _login(client)
         dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
         assert dashboard.status_code == 200
-        assert "vorhandene Mahnsperren prüfen" in dashboard.text
+        assert "aktiver Mahnsperre</a> - vor einem Mahnlauf beachten" not in dashboard.text
         assert "Mahnung gesperrt" in dashboard.text
         assert "RECHTSANWALT" in dashboard.text
     finally:
         stammdaten.sperre_aufheben(sperre_id)
+
+
+def test_dashboard_sperre_auf_offenem_konto_wird_als_zu_erledigen_gezaehlt(backoffice_client):
+    """Gegenprobe zu Befund 3: eine Mahnsperre auf einem Konto MIT
+    tatsächlich offenem (fälligem) Betrag ist weiterhin ein
+    handlungsbezogener Punkt in "Das ist zu erledigen" - Wortlaut nennt
+    das Beachten vor einem Mahnlauf, nicht ein "Aufheben" (ein
+    Ratenplan etwa soll gerade NICHT als aufzuhebende Aufgabe erscheinen)."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_, op_service = backoffice_client
+    settings = get_settings()
+    stammdaten = StammdatenRepository(build_session_factory(settings.database_url))
+    stammdaten.upsert_einheit(id="601-TOP-SPERRE-OFFEN", objekt_id="601", bezeichnung="Top Sperre Offen", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-SPERRE-OFFEN", einheit_id="601-TOP-SPERRE-OFFEN", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-SPERRE-OFFEN"))
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=7_500,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
+        beleg_referenz="Synthetischer Rückstand für Sperr-Test",
+    )
+    sperre_id = stammdaten.sperre_setzen(vertrag_id="V-601-SPERRE-OFFEN", grund="RATENPLAN", kommentar="Ratenplan vereinbart")
+    try:
+        _login(client)
+        dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+        assert dashboard.status_code == 200
+        assert "aktiver Mahnsperre</a> - vor einem Mahnlauf beachten" in dashboard.text
+        assert "aufheben" not in dashboard.text.lower().split("das ist zu erledigen")[1].split("</div>")[0]
+    finally:
+        stammdaten.sperre_aufheben(sperre_id)
+
+
+def test_dashboard_kuenftig_faelliges_soll_heisst_nicht_faellig_nicht_rueckstand(backoffice_client):
+    """Rückprüfung 14.09.2026, Befund 1: ein synthetisches Konto mit
+    SOLL 75 EUR, einziger bekannter Fälligkeit 2099-01-05 (weit in der
+    Zukunft), ohne Sperre/Abweichung wurde fälschlich als "Rückstand
+    offen" (rot) angezeigt. Der Status muss aus dem tatsächlich FÄLLIGEN
+    Rest (bestehende Kontoberechnung `faelliger_unstrittiger_rest_cent`)
+    abgeleitet werden, nicht aus dem rohen positiven Saldo - korrekt ist
+    "Noch nicht fällig". Der Betrag selbst bleibt unverändert 75,00 €."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_, op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-KUENFTIG", objekt_id="601", bezeichnung="Top Künftig Fällig", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-KUENFTIG", einheit_id="601-TOP-KUENFTIG", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-KUENFTIG"))
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=7_500,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2099, 1, 5),
+        beleg_referenz="Synthetisch weit in der Zukunft fällig",
+    )
+    dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+    assert dashboard.status_code == 200
+    assert "75,00" in dashboard.text  # Betrag unverändert
+    zeile = dashboard.text.split("Top Künftig Fällig")[1].split("</tr>")[0]
+    assert "Noch nicht fällig" in zeile
+    assert "Rückstand offen" not in zeile
+
+
+def test_dashboard_haupttabelle_sortiert_positive_konten_absteigend_ohne_nullsalden(backoffice_client):
+    """Rückprüfung 14.09.2026, Befund 2: die sichtbare Haupttabelle darf
+    Nullsalden nicht mehr zwischen Rückständen zeigen - positive offene
+    Konten stehen zuerst, absteigend nach Betrag; ausgeglichene/Guthaben-
+    Konten wandern in die aufklappbaren "weiteren Konten"."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_, op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    for suffix, betrag_cent in (("KLEIN", 2_000), ("GROSS", 40_000)):
+        stammdaten.upsert_einheit(id=f"601-TOP-SORT-{suffix}", objekt_id="601", bezeichnung=f"Top Sortierung {suffix}", nutzungsstatus="DAUERVERMIETUNG")
+        stammdaten.upsert_vertrag(
+            id=f"V-601-SORT-{suffix}", einheit_id=f"601-TOP-SORT-{suffix}", debitor_id="DEB-1", gesellschaft_id="7DI",
+            rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+        )
+        konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag(f"V-601-SORT-{suffix}"))
+        op_service.buchen(
+            ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=betrag_cent,
+            belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
+            beleg_referenz=f"Sortiertest {suffix}",
+        )
+
+    dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+    assert dashboard.status_code == 200
+    haupttabelle = dashboard.text.split('id="mietkonten-uebersicht"')[1].split("Weitere Konten")[0]
+    assert haupttabelle.index("Top Sortierung GROSS") < haupttabelle.index("Top Sortierung KLEIN")
+    # Das gemeinsam genutzte, zu diesem Zeitpunkt noch unbebuchte
+    # V-601-1 (Saldo 0) steht NICHT in der sichtbaren Haupttabelle
+    # zwischen den Rückständen.
+    assert "Am Corso (Test) / Top 1 (vermietet)" not in haupttabelle
+
+
+def test_dashboard_sperre_und_abweichung_werden_gleichzeitig_angezeigt(backoffice_client):
+    """Rückprüfung 14.09.2026, Befund 2: eine `elif`-Kette blendete die
+    Kontoabweichung aus, sobald zusätzlich eine Sperre vorhanden war.
+    Beide Hinweise (Sperre UND Abweichung) müssen unabhängig voneinander
+    UND gleichzeitig sichtbar sein, wenn beide zutreffen."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_, op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-SPERRE-ABW", objekt_id="601", bezeichnung="Top Sperre Abweichung", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-SPERRE-ABW", einheit_id="601-TOP-SPERRE-ABW", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-SPERRE-ABW"))
+    # KORREKTUR-Buchung ohne eigene offene Einzelposition erzeugt eine
+    # echte Abweichung (siehe test_rueckstaende_service.py, exakt
+    # dasselbe etablierte Muster).
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.KORREKTUR, betrag_cent=777,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=None,
+        beleg_referenz="Manuelle Korrektur ohne Forderung",
+    )
+    sperre_id = stammdaten.sperre_setzen(vertrag_id="V-601-SPERRE-ABW", grund="RECHTSANWALT", kommentar="RA beauftragt")
+    try:
+        dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+        assert dashboard.status_code == 200
+        zeile = dashboard.text.split("Top Sperre Abweichung")[1].split("</tr>")[0]
+        assert "Mahnung gesperrt" in zeile
+        assert "Klärung nötig (Kontoabweichung)" in zeile
+    finally:
+        stammdaten.sperre_aufheben(sperre_id)
+
+
+def test_dashboard_kompakte_tabelle_traegt_mobile_kartenansicht_und_datalabels(backoffice_client):
+    """Rückprüfung 14.09.2026, Befund 5: die sichtbare kompakte
+    Haupttabelle bekommt die eigene CSS-Klasse `tabelle-kompakt` (nicht
+    `tabelle-scroll`), damit sie unter 640px per Media-Query zu
+    lesbaren Zeilen/Karten umfließt statt seitlich zu scrollen; jede
+    Zelle trägt ein `data-label` für die mobile Beschriftung. Technische
+    Detailtabellen (`tabelle-scroll`) sind davon bewusst nicht betroffen
+    und dürfen weiterhin horizontal scrollen."""
+
+    client, *_ = backoffice_client
+    _login(client)
+    dashboard = client.get("/backoffice/")
+    assert dashboard.status_code == 200
+    assert 'class="tabelle-kompakt"' in dashboard.text
+    assert 'data-label="Mieter / Einheit"' in dashboard.text
+    assert 'data-label="Offener Betrag / Guthaben"' in dashboard.text
+    assert 'data-label="Status"' in dashboard.text
 
 
 def test_dashboard_kompakte_tabelle_zeigt_lange_mieternamen_ohne_absturz_und_escaped(backoffice_client):
