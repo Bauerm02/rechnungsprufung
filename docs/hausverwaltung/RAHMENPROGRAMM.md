@@ -1015,3 +1015,61 @@ offene Grenzen (Leader-Wahl als Heuristik, "genau ein Schreiben" als
 Erfolgspfad- statt absolute Garantie, kein rückwirkender Split bei
 einem Wechsel der vereinbarten Zinsvereinbarung selbst) in
 `OFFENE_PUNKTE.md`, Abschnitt "Rückprüfung 14.09.2026".
+
+### Auftrag HV-20260914-MAHNUNG-BRIEF (wortgetreu, 14.09.2026)
+
+Behebt die vier oben genannten, damals bewusst offen gelassenen
+Grenzen der Rückprüfung 14.09.2026 endgültig, PLUS vier unabhängig von
+Codex gemeldete zusätzliche Prüfpunkte:
+
+1. **Persistente Gruppensperre statt Leader-Heuristik**: neue Tabelle
+   `MahnLaufTable` (`mahnwesen/repository.py::MahnLaufRepository`) hält
+   je (Vertrag, Stufe, exakter eingefrorener Mitgliedermenge) GENAU
+   EINE Zeile mit demselben Claim/Recovery-Zustandsautomaten wie
+   `MahnFallTable`. `MahnwesenService.plane_mahnlauf` bildet die Gruppe
+   über die bestehende, reine Prüfung `_pruefe_frisch_versandbereit`
+   für JEDES Mitglied einzeln (keine kleinste-Id-Auswahl mehr);
+   `versende_mahnlauf` claimt/versendet ausschließlich über die
+   `MahnLaufTable`-Zeile selbst - ein zweiter, gleichzeitiger Versuch
+   (auch über einen künftigen anderen Kanal, `outbox_key` ist bewusst
+   kanalunabhängig) sieht `status != GEPLANT` oder verliert den CAS.
+   Weicht auch nur EIN eingefrorenes Mitglied bei der Neuprüfung
+   unmittelbar vor dem Versand ab, wird die GESAMTE Gruppe blockiert
+   statt eine Teilmenge zu senden.
+2. **Periodengerechte Zinsprofil-Historie**: neue Spalte
+   `ZinsprofilTable.gueltig_ab`. Mehrere geprüfte Versionen mit
+   durchgängig belegtem `gueltig_ab` werden periodengerecht segmentiert
+   (`kosten.py::_zinsprofil_segmente`); fehlt es bei auch nur einer,
+   bleibt der GESAMTE Zeitraum explizit "unberechenbar" statt
+   rückwirkend die zuletzt geprüfte Version zu verwenden.
+3. **§456 UGB verlangt zusätzlich eine belegte Verzugsverantwortung**
+   (neue Spalte `verzugsverantwortung_geprueft`, unabhängiger
+   Codex-Fund) - ungeklärt fällt NUR die Verzinsung auf die
+   gesetzlichen 4 % ABGB zurück, §458 (verschuldensunabhängig) bleibt
+   unberührt.
+4. **Zinsdelta wird JE Forderung, nicht mehr vertragsweit pauschal
+   gebildet** (`neue_zinsen_delta_cent`, unabhängiger Codex-Fund) -
+   eine alte, längst abgelöste Forderung kann die Verzinsung einer
+   genuin neuen Forderung nicht mehr schlucken.
+5. **Mahnkosten-Vorschau kann exakt an eine eingefrorene Gruppe
+   gebunden werden** (`MahnkostenService.vorschau(...,
+   nur_op_position_ids=...)`, unabhängiger Codex-Fund) - der gebündelte
+   Mahnlauf-Versand bucht/schreibt NUR Kosten für seine eigenen,
+   tatsächlich versandten Mitglieder.
+6. Die alte `MahnPolicyRepository`-Gebühren-/Zins-Blockade im
+   Mahntext-Generator wurde entfernt (`MahnkostenService` ist jetzt die
+   EINZIGE Quelle).
+
+9 neue Tests (5x Gruppensperre/Konkurrenz/Recovery in
+`test_mahnwesen.py`, 4x §456/Zinsdelta/Zinsprofil-Historie in
+`test_mahnwesen_kosten.py`) plus ein angepasster Bestandstest
+(`test_backoffice.py`, isolierter Testvertrag statt geteilter
+Zinsprofil-Historie) über drei Testdateien, 872/872 grün im
+Gesamtlauf (863 vor dieser Runde). Der providerneutrale
+Brief-Outbox-Teil des Auftrags (Kanal BRIEF, PDF-Erzeugung,
+SEPA-Mahnaussetzung) wurde in dieser Runde BEWUSST NICHT begonnen
+(Umfang-Entscheidung, siehe `OFFENE_PUNKTE.md`, Abschnitt
+"HV-20260914-MAHNUNG-BRIEF"). Dort auch ein vom Nutzer ausdrücklich als
+BACKLOG (nicht Teil dieses Auftrags) markiertes vereinfachtes
+Bedienkonzept (ein Operator, tägliche Sammelmail nur bei
+Handlungsbedarf, Akte je Mietverhältnis) für eine spätere Runde.

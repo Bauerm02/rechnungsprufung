@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import select, update
@@ -7,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.domain.enums import MahnStatus
-from mietinkasso.infrastructure.db.tables import MahnFallTable, MahnPolicyTable
+from mietinkasso.infrastructure.db.tables import MahnFallTable, MahnLaufTable, MahnPolicyTable
 
 
 class MahnPolicyRepository:
@@ -165,3 +166,92 @@ class MahnFallRepository:
             session.commit()
             session.refresh(row)
             return row
+
+
+class MahnLaufRepository:
+    """Persistente, atomare Gruppensperre für einen gebündelten
+    Mahnversand (siehe `MahnLaufTable`-Docstring in `tables.py`) - ein
+    fast wörtliches Pendant zu `MahnFallRepository`, aber auf der
+    GRUPPENEBENE statt je einzelnem Fall. `outbox_key` enthält
+    ABSICHTLICH KEINEN Kanal: dieselbe eingefrorene Mitgliedermenge
+    desselben (Vertrag, Stufe) MUSS über Kanäle hinweg (E-Mail, künftig
+    Brief) auf DIESELBE Zeile treffen, damit ein zweiter Kanal niemals
+    unabhängig um dieselben Forderungen konkurrieren kann (Rückprüfung
+    14.09.2026, Risiko 1: kein bloßer Leader-CAS)."""
+
+    def __init__(self, session_factory: sessionmaker[Session]):
+        self._session_factory = session_factory
+
+    def get_or_create(self, *, outbox_key: str, **kwargs) -> MahnLaufTable:
+        with self._session_factory() as session:
+            existing = session.execute(
+                select(MahnLaufTable).where(MahnLaufTable.outbox_key == outbox_key)
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing
+            row = MahnLaufTable(outbox_key=outbox_key, **kwargs)
+            session.add(row)
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                return session.execute(
+                    select(MahnLaufTable).where(MahnLaufTable.outbox_key == outbox_key)
+                ).scalar_one()
+            session.refresh(row)
+            return row
+
+    def get(self, mahnlauf_id: int) -> MahnLaufTable | None:
+        with self._session_factory() as session:
+            return session.get(MahnLaufTable, mahnlauf_id)
+
+    def list_fuer_vertrag(self, vertrag_id: str) -> list[MahnLaufTable]:
+        with self._session_factory() as session:
+            statement = (
+                select(MahnLaufTable)
+                .where(MahnLaufTable.vertrag_id == vertrag_id)
+                .order_by(MahnLaufTable.id.desc())
+            )
+            return list(session.execute(statement).scalars().all())
+
+    def claim_fuer_versand(self, mahnlauf_id: int, *, jetzt: datetime | None = None) -> bool:
+        """Atomarer Compare-and-Swap GEPLANT -> IN_VERSAND auf der
+        GRUPPENZEILE selbst - das ist der eigentliche Unterschied zur
+        alten "kleinste-Id"-Heuristik: die Exklusivität hängt an keinem
+        einzelnen Mitglied mehr, sondern an dieser einen, für die exakte
+        Mitgliedermenge eindeutigen Zeile."""
+
+        with self._session_factory() as session:
+            result = session.execute(
+                update(MahnLaufTable)
+                .where(MahnLaufTable.id == mahnlauf_id)
+                .where(MahnLaufTable.status == "GEPLANT")
+                .values(status="IN_VERSAND", versand_beansprucht_am=jetzt or datetime.now(timezone.utc))
+            )
+            session.commit()
+            return result.rowcount > 0
+
+    def verwaiste_in_versand(self, *, aelter_als: datetime) -> list[MahnLaufTable]:
+        with self._session_factory() as session:
+            statement = (
+                select(MahnLaufTable)
+                .where(MahnLaufTable.status == "IN_VERSAND")
+                .where(MahnLaufTable.versand_beansprucht_am < aelter_als)
+            )
+            return list(session.execute(statement).scalars().all())
+
+    def set_status(self, mahnlauf_id: int, status: str, **zusatz) -> MahnLaufTable:
+        with self._session_factory() as session:
+            row = session.get(MahnLaufTable, mahnlauf_id)
+            if row is None:
+                raise ValueError(f"Unbekannter MahnLauf {mahnlauf_id}")
+            row.status = status
+            for key, value in zusatz.items():
+                setattr(row, key, value)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    @staticmethod
+    def mitglieder_ids(mahnlauf: MahnLaufTable) -> list[int]:
+        return list(json.loads(mahnlauf.mitglieder_mahnfall_ids))

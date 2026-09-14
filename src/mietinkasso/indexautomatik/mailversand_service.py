@@ -10,13 +10,15 @@ from mietinkasso.domain.exceptions import ObjektAusgeschlossenError, TransportFe
 from mietinkasso.indexautomatik.mailnachweis import nachweis_daten, versand_belegen
 from mietinkasso.indexautomatik.mailops_client import MailOpsAuftrag, MailOpsClient
 from mietinkasso.indexautomatik.mailops_transport import MailOpsTransportadapter
-from mietinkasso.infrastructure.db.tables import AuditEventTable, ErhoehungsschreibenTable, MahnFallTable, VertragsendeErinnerungTable
+from mietinkasso.infrastructure.db.tables import (
+    AuditEventTable, ErhoehungsschreibenTable, MahnFallTable, VertragsendeErinnerungTable,
+)
 from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
 from mietinkasso.mahnwesen.kosten_service import MahnkostenService
-from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
-from mietinkasso.mahnwesen.service import MahnwesenService
+from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnLaufRepository, MahnPolicyRepository
+from mietinkasso.mahnwesen.service import MahnwesenService, VersandErgebnis
 from mietinkasso.op.repository import OPRepository
-from mietinkasso.op.service import OPService, compute_content_hash
+from mietinkasso.op.service import OPService
 
 
 def mail_client_fuer(settings):
@@ -92,12 +94,13 @@ class HVMailversandService:
         self.op_service = OPService(OPRepository(session_factory), bundle.stammdaten_repository)
         self.bank_service = BankImportService(self.bank_repo, bundle.stammdaten_repository, self.op_service)
         self.mahn_repo = MahnFallRepository(session_factory)
+        self.mahnlauf_repo = MahnLaufRepository(session_factory)
         self.policy_repo = MahnPolicyRepository(session_factory)
         self.mahnkosten_repo = MahnkostenRepository(session_factory)
         self.mahnkosten_service = MahnkostenService(self.mahnkosten_repo, self.op_service, bundle.stammdaten_repository)
         self.mahn_service = MahnwesenService(self.mahn_repo, bundle.stammdaten_repository,
             self.op_service, self.policy_repo, bank_stand_max_age_days=settings.bank_stand_max_age_days,
-            mahnkosten_service=self.mahnkosten_service)
+            mahnkosten_service=self.mahnkosten_service, mahnlauf_repository=self.mahnlauf_repo)
 
     def owner_senden(self, auftrag):
         if self.client is None or not self.settings.hv_mail_allowlist_bestaetigt:
@@ -115,78 +118,32 @@ class HVMailversandService:
             mailops_allowlist_bestaetigt=self.settings.hv_mail_allowlist_bestaetigt,
             transport=MailOpsTransportadapter(self.client))
 
-    def mahnung_senden(self, *, ctx, row_id, heute):
-        """Sendet GENAU EIN Schreiben je Vertrag+Mahnstufe (Rückprüfung
-        14.09.2026), unabhängig davon, für welchen einzelnen `row_id`
-        (eine von möglicherweise mehreren GEPLANTEN Forderungen desselben
-        Vertrags/derselben Stufe - z. B. HMZ+BK derselben Vorschreibung)
-        diese Methode aufgerufen wird: alle GEPLANTEN MahnFälle desselben
-        (`vertrag_id`, `stufe`) werden zu EINER "Gruppe" gebündelt, die
-        Forderung mit der KLEINSTEN Id wird deterministisch zum
-        "führenden" Fall (in aller Regel die am längsten überfällige,
-        siehe Modul-Hinweis unten). Nur für den führenden Fall wird
-        tatsächlich einmal der externe Mailversand aufgerufen; alle
-        anderen Gruppenmitglieder übernehmen DENSELBEN bereits erhaltenen
-        Versandnachweis (kein zweiter externer Aufruf) und werden über
-        den bestehenden, unverändert genutzten
-        `MahnwesenService.versenden()`-Zustandsautomaten (Claim/Idempotenz/
-        Bank-/Sperr-/Empfänger-Frischprüfung je Fall) individuell auf
-        GESENDET gesetzt - dieselbe Prüfschärfe wie bisher, nur EIN
-        tatsächlich verschickter Brief.
+    def _dispatch_mahnlauf(self, *, ctx, mahnlauf, heute, confirmed, unclear) -> VersandErgebnis:
+        """Versendet EINEN bereits über `MahnwesenService.plane_mahnlauf`
+        gebildeten, eingefrorenen Mahnlauf - GENAU EIN tatsächlicher
+        externer Mailversand für die vollständige Mitgliedergruppe
+        (Rückprüfung 14.09.2026, Risiko 1+2: keine kleinste-Id-Leader-
+        Heuristik mehr, die atomare Exklusivität hängt an der
+        `MahnLaufTable`-Zeile selbst, siehe `MahnwesenService.
+        versende_mahnlauf`). Die alte Prüfung auf feste
+        MahnPolicy-Pauschalen (`snapshot["gebuehr_cent"]`/
+        `snapshot["zinsen_prozent"]`) entfällt bewusst: `MahnkostenService`
+        ist die EINZIGE Quelle für Zinsen/Gebühren, eine daneben laufende
+        Pauschale aus der Policy würde diese Vereinheitlichung wieder
+        aufheben."""
 
-        Zwei GLEICHZEITIGE Aufrufe für zwei VERSCHIEDENE Mitglieder
-        derselben Gruppe lösen NIE zwei E-Mails aus: beide berechnen
-        dieselbe Gruppe/denselben führenden Fall und konkurrieren um
-        DESSEN atomaren `claim_fuer_versand`-Compare-and-Swap (siehe
-        `mahnwesen/repository.py`) - nur einer gewinnt und ruft den
-        externen Versand auf, der andere sieht `BEREITS_VERARBEITET`.
-
-        Der Mahnkosten-/Zinsnachweis im Brieftext stammt aus GENAU EINER
-        `MahnkostenService.vorschau()`-Berechnung (unmittelbar vor dem
-        tatsächlichen Versand, berücksichtigt also auch kurz zuvor
-        eingegangene Zahlungen) und wird über `mahnkosten_vorschau_slot`
-        1:1 an die anschließende Buchung weitergereicht - Text und
-        Buchung können dadurch nie auseinanderlaufen (siehe
-        `kosten_service.py`-Moduldoc)."""
-
-        row = self.mahn_repo.get(row_id)
-        if row is None:
-            raise ValueError("Mahnfall fehlt.")
-        require_gesellschaft_access(ctx, row.gesellschaft_id)
-        require_schreibrecht(ctx)
-        confirmed, unclear = bank_freigabe_ableiten(
-            self.bank_repo, self.bank_service, row.gesellschaft_id, row.vertrag_id)
         send_enabled = bool(self.client and self.settings.send_enabled and self.settings.hv_mail_allowlist_bestaetigt)
-
-        gruppe = sorted(
-            (f for f in self.mahn_repo.list_fuer_vertrag(row.vertrag_id) if f.stufe == row.stufe and f.status == "GEPLANT"),
-            key=lambda f: f.id,
-        )
-        if not any(f.id == row_id for f in gruppe):
-            # `row` selbst ist nicht (mehr) GEPLANT (z. B. bereits verarbeitet
-            # oder blockiert) - unverändertes Einzelverhalten für eine
-            # konsistente Fehlermeldung/Statusabfrage, keine Gruppierung.
-            gruppe = [row]
-        leader = gruppe[0]
-        mitglieder = gruppe
-
-        beleg_holder: dict = {}
         vorschau_slot: dict = {}
 
-        def leader_versand_fn(_leader_snapshot):
+        def versand_fn(mitglieder):
             if self.client is None:
                 raise ValueError("Privater Mailweg ist nicht eingerichtet.")
-            # Existing policies have zero charges/interest. Other policies need
-            # an explicitly implemented calculation before any tenant mail.
-            for mitglied in mitglieder:
-                if mitglied.snapshot["gebuehr_cent"] or float(mitglied.snapshot["zinsen_prozent"]) != 0:
-                    raise ValueError("Mahngebühren/Zinsen benötigen eine eigene belegte Berechnung.")
 
             st = self.bundle.stammdaten_repository
-            contract = st.get_vertrag(row.vertrag_id)
-            obj = st.objekt_fuer_vertrag(row.vertrag_id)
+            contract = st.get_vertrag(mahnlauf.vertrag_id)
+            obj = st.objekt_fuer_vertrag(mahnlauf.vertrag_id)
             unit = st.get_einheit(contract.einheit_id)
-            account = st.get_konto_by_vertrag(row.vertrag_id)
+            account = st.get_konto_by_vertrag(mahnlauf.vertrag_id)
             offene = {f.op_position_id: f for f in self.op_service.offene_forderungen(account.id, heute=heute)}
 
             posten_zeilen = []
@@ -200,13 +157,21 @@ class HVMailversandService:
 
             vorschau = None
             if self.mahnkosten_service is not None:
-                vorschau = self.mahnkosten_service.vorschau(vertrag_id=row.vertrag_id, stufe=leader.stufe, heute=heute)
+                # An die eingefrorene Gruppe gebunden (Rückprüfung Codex
+                # 14.09.2026) - keine Kosten auf andere, nicht Teil
+                # dieses Mahnlaufs seiende offene Forderungen desselben
+                # Vertrags (siehe `kosten_service.py::vorschau`-Docstring).
+                vorschau = self.mahnkosten_service.vorschau(
+                    vertrag_id=mahnlauf.vertrag_id, stufe=mahnlauf.stufe, heute=heute,
+                    nur_op_position_ids=frozenset(m.forderung_op_position_id for m in mitglieder),
+                )
             vorschau_slot["vorschau"] = vorschau
             kosten_text = _mahnkosten_text_baustein(vorschau)
 
             deadline = heute + timedelta(days=contract.zahlungsfrist_tage)
-            subject = "Zahlungserinnerung" if leader.stufe == 1 else "Zweite Mahnung"
-            empfaenger_name = leader.snapshot["empfaenger_name"]
+            subject = "Zahlungserinnerung" if mahnlauf.stufe == 1 else "Zweite Mahnung"
+            anker = mitglieder[0]
+            empfaenger_name = anker.snapshot["empfaenger_name"]
             text = (
                 f"Guten Tag {empfaenger_name},\n\n"
                 f"für {obj.bezeichnung}, {unit.bezeichnung}, ist folgende Forderung offen:\n\n"
@@ -219,45 +184,93 @@ class HVMailversandService:
                 "Bei Fragen zur Forderung antworten Sie bitte auf diese Nachricht."
             )
             op_ids = sorted(m.forderung_op_position_id for m in mitglieder)
-            gruppen_schluessel = compute_content_hash({"op_ids": op_ids, "stufe": leader.stufe})
-            beleg = self.client.senden(MailOpsAuftrag(
-                "mahnungslauf:" + gruppen_schluessel, "MAHNUNG",
-                leader.snapshot["empfaenger_email"], empfaenger_name, subject, text,
-                f"MAHNPOLICY:{leader.policy_version}:VERTRAG:{row.vertrag_id}:STUFE:{leader.stufe}:FORDERUNGEN:{','.join(str(i) for i in op_ids)}",
+            return self.client.senden(MailOpsAuftrag(
+                "mahnungslauf:" + mahnlauf.outbox_key, "MAHNUNG",
+                anker.snapshot["empfaenger_email"], empfaenger_name, subject, text,
+                f"MAHNPOLICY:{anker.policy_version}:VERTRAG:{mahnlauf.vertrag_id}:STUFE:{mahnlauf.stufe}:"
+                f"FORDERUNGEN:{','.join(str(i) for i in op_ids)}",
             ))
-            beleg_holder["beleg"] = beleg
-            return beleg
 
-        leader_ergebnis = self.mahn_service.versenden(
-            ctx=ctx, mahnfall_id=leader.id, heute=heute, bank_bestaetigt_bis=confirmed,
+        return self.mahn_service.versende_mahnlauf(
+            ctx=ctx, mahnlauf_id=mahnlauf.id, heute=heute, bank_bestaetigt_bis=confirmed,
             ungeklaerte_eingaenge_vorhanden=unclear, send_enabled=send_enabled,
-            versand_fn=leader_versand_fn, mahnkosten_vorschau_slot=vorschau_slot,
+            versand_fn=versand_fn, mahnkosten_vorschau_slot=vorschau_slot,
         )
 
-        if leader.id == row_id:
-            ergebnis_fuer_aufrufer = leader_ergebnis
-        else:
-            ergebnis_fuer_aufrufer = None
+    def mahnung_senden(self, *, ctx, row_id, heute):
+        """Sendet GENAU EIN Schreiben je Vertrag+Mahnstufe (Rückprüfung
+        14.09.2026), unabhängig davon, für welchen einzelnen `row_id`
+        (eine von möglicherweise mehreren GEPLANTEN Forderungen desselben
+        Vertrags/derselben Stufe - z. B. HMZ+BK derselben Vorschreibung)
+        diese Methode aufgerufen wird: `MahnwesenService.plane_mahnlauf`
+        bildet die GENAU EINE, deterministische Gruppe ALLER aktuell
+        tatsächlich versandbereiten Mitglieder (KEINE kleinste-Id-Leader-
+        Heuristik - Rückprüfung 14.09.2026, Risiko 2) und friert sie in
+        einer persistenten `MahnLaufTable`-Zeile ein; `versende_mahnlauf`
+        claimt/versendet GENAU DIESE Gruppe atomar (Risiko 1).
 
-        if leader_ergebnis.status == "GESENDET":
-            beleg = beleg_holder["beleg"]
-            for mitglied in mitglieder:
-                if mitglied.id == leader.id:
-                    continue
-                einzel = self.mahn_service.versenden(
-                    ctx=ctx, mahnfall_id=mitglied.id, heute=heute, bank_bestaetigt_bis=confirmed,
-                    ungeklaerte_eingaenge_vorhanden=unclear, send_enabled=send_enabled,
-                    versand_fn=lambda _snapshot, _beleg=beleg: _beleg, mahnkosten_vorschau_slot=vorschau_slot,
-                )
-                if mitglied.id == row_id:
-                    ergebnis_fuer_aufrufer = einzel
+        Zwei GLEICHZEITIGE Aufrufe für zwei VERSCHIEDENE Mitglieder
+        derselben Gruppe lösen NIE zwei E-Mails aus: beide bilden
+        dieselbe Gruppe und konkurrieren um DEREN atomaren
+        `claim_fuer_versand`-Compare-and-Swap - nur einer gewinnt und
+        ruft den externen Versand auf, der andere sieht bereits
+        `mahnlauf.status != GEPLANT` (`BEREITS_VERARBEITET`).
 
-        return ergebnis_fuer_aufrufer if ergebnis_fuer_aufrufer is not None else leader_ergebnis
+        Der Mahnkosten-/Zinsnachweis im Brieftext stammt aus GENAU EINER
+        `MahnkostenService.vorschau()`-Berechnung (unmittelbar vor dem
+        tatsächlichen Versand, berücksichtigt also auch kurz zuvor
+        eingegangene Zahlungen, UND an exakt die Gruppenmitglieder
+        gebunden) und wird über `mahnkosten_vorschau_slot` 1:1 an die
+        anschließende Buchung weitergereicht - Text und Buchung können
+        dadurch nie auseinanderlaufen (siehe `kosten_service.py`-
+        Moduldoc)."""
+
+        row = self.mahn_repo.get(row_id)
+        if row is None:
+            raise ValueError("Mahnfall fehlt.")
+        require_gesellschaft_access(ctx, row.gesellschaft_id)
+        require_schreibrecht(ctx)
+        if row.status != "GEPLANT":
+            return VersandErgebnis("BEREITS_VERARBEITET", f"Status ist bereits {row.status}; kein Doppelversand.")
+
+        st = self.bundle.stammdaten_repository
+        contract = st.get_vertrag(row.vertrag_id)
+        account = st.get_konto_by_vertrag(row.vertrag_id)
+        if contract is None or account is None:
+            raise ValueError("Vertrag/Konto zum Mahnfall fehlt.")
+        confirmed, unclear = bank_freigabe_ableiten(
+            self.bank_repo, self.bank_service, row.gesellschaft_id, row.vertrag_id)
+
+        mahnlauf = self.mahn_service.plane_mahnlauf(
+            ctx=ctx, vertrag=contract, konto=account, stufe=row.stufe, heute=heute,
+            bank_bestaetigt_bis=confirmed, ungeklaerte_eingaenge_vorhanden=unclear,
+        )
+        if mahnlauf is not None and row_id in MahnLaufRepository.mitglieder_ids(mahnlauf):
+            return self._dispatch_mahnlauf(ctx=ctx, mahnlauf=mahnlauf, heute=heute, confirmed=confirmed, unclear=unclear)
+
+        # `row_id` selbst ist NICHT (mehr) Teil der aktuell gebildeten
+        # Gruppe (z. B. Frist noch nicht abgelaufen, oder bei der
+        # Planung final aus der Bündelung ausgeschieden) - ANDERE
+        # Mitglieder desselben Vertrags/derselben Stufe können trotzdem
+        # bereits versandbereit sein und wurden oben bereits verarbeitet;
+        # das Ergebnis für DIESEN Aufrufer richtet sich nach SEINEM
+        # eigenen, tatsächlich persistierten Stand.
+        if mahnlauf is not None:
+            self._dispatch_mahnlauf(ctx=ctx, mahnlauf=mahnlauf, heute=heute, confirmed=confirmed, unclear=unclear)
+        aktuell = self.mahn_repo.get(row_id)
+        if aktuell is None:
+            raise ValueError("Mahnfall fehlt.")
+        if aktuell.status == "GEPLANT":
+            return VersandErgebnis("BLOCKIERT", "Mahnfrist ist noch nicht abgelaufen oder derzeit kein Mitglied der Gruppe versandbereit.")
+        if aktuell.status in ("BLOCKIERT", "UEBERSPRUNGEN"):
+            return VersandErgebnis(aktuell.status, "Bei der Gruppenplanung dauerhaft aus der Bündelung ausgeschieden.")
+        return VersandErgebnis("BEREITS_VERARBEITET", f"Status ist bereits {aktuell.status}.")
 
     def mahnlauf(self, *, ctx, heute):
         if not (self.client and self.settings.send_enabled and self.settings.hv_mail_allowlist_bestaetigt):
             return {"geplant": 0, "gesendet": 0, "blockiert": 0}
         self.mahn_service.markiere_verwaiste_als_unsicher()
+        self.mahn_service.markiere_verwaiste_mahnlaeufe_als_unsicher()
         policy = self.policy_repo.aktuelle_freigegebene()
         counts = {"geplant": 0, "gesendet": 0, "blockiert": 0}
         if policy is None:
@@ -275,22 +288,25 @@ class HVMailversandService:
                 planned = self.mahn_service.plane_alle_offenen_forderungen(ctx=ctx, vertrag=contract,
                     konto=account, policy=policy, heute=heute, bank_bestaetigt_bis=confirmed,
                     ungeklaerte_eingaenge_vorhanden=unclear)
-                for p in planned:
-                    if p.status == "GEPLANT":
-                        counts["geplant"] += 1
-                        # `mahnung_senden` bündelt automatisch ALLE zu diesem
-                        # Zeitpunkt GEPLANTEN Fälle desselben Vertrags/derselben
-                        # Stufe zu EINEM Schreiben (siehe dort) - ein bereits
-                        # über eine FRÜHERE Gruppen-Zustellung in DIESEM Lauf
-                        # miterledigtes Mitglied ist hier nicht mehr GEPLANT
-                        # und wird nicht nochmal einzeln gezählt/angestoßen.
-                        aktueller_stand = self.mahn_repo.get(p.mahnfall_id)
-                        if aktueller_stand is None or aktueller_stand.status != "GEPLANT":
-                            continue
-                        result = self.mahnung_senden(ctx=ctx, row_id=p.mahnfall_id, heute=heute)
-                        counts["gesendet" if result.status == "GESENDET" else "blockiert"] += 1
-                    elif p.status == "BLOCKIERT":
-                        counts["blockiert"] += 1
+                counts["geplant"] += sum(1 for p in planned if p.status == "GEPLANT")
+                counts["blockiert"] += sum(1 for p in planned if p.status == "BLOCKIERT")
+                # EIN `plane_mahnlauf`/Dispatch je BETROFFENER Stufe - bündelt
+                # automatisch ALLE zu diesem Zeitpunkt GEPLANTEN Fälle
+                # desselben Vertrags/derselben Stufe zu EINEM Schreiben
+                # (siehe `_dispatch_mahnlauf`), kein Aufruf mehr je
+                # einzelner Forderung.
+                geplante_stufen = sorted({p.stufe for p in planned if p.status == "GEPLANT"})
+                for stufe in geplante_stufen:
+                    mahnlauf = self.mahn_service.plane_mahnlauf(
+                        ctx=ctx, vertrag=contract, konto=account, stufe=stufe, heute=heute,
+                        bank_bestaetigt_bis=confirmed, ungeklaerte_eingaenge_vorhanden=unclear,
+                    )
+                    if mahnlauf is None:
+                        continue
+                    ergebnis = self._dispatch_mahnlauf(
+                        ctx=ctx, mahnlauf=mahnlauf, heute=heute, confirmed=confirmed, unclear=unclear,
+                    )
+                    counts["gesendet" if ergebnis.status == "GESENDET" else "blockiert"] += 1
             except ObjektAusgeschlossenError:
                 continue
         return counts

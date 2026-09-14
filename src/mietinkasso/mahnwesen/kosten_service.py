@@ -67,11 +67,28 @@ class MahnkostenService:
         self._op_service = op_service
         self._stammdaten_repository = stammdaten_repository
 
-    def vorschau(self, *, vertrag_id: str, stufe: int, heute: date) -> MahnkostenVorschau | None:
+    def vorschau(
+        self, *, vertrag_id: str, stufe: int, heute: date,
+        nur_op_position_ids: frozenset[int] | None = None,
+    ) -> MahnkostenVorschau | None:
+        """`nur_op_position_ids`: unabhängige Rückprüfung Codex
+        14.09.2026 - die Kostenbasis (Hauptforderung/Zinsen/§458-Gebühr)
+        MUSS an exakt dieselben, tatsächlich freigegebenen/versandbereiten
+        Forderungs-Ids gebunden werden können, wenn ein Aufrufer (der
+        gebündelte Mahnlauf-Versand, siehe `mahnwesen/service.py::
+        MahnwesenService.versende_mahnlauf`) über eine EXAKTE,
+        eingefrorene Gruppe verfügt - KEINE Gebühren/Zinsen auf
+        zurückgestellte, strittige, SEPA-gebundene oder aktuell nicht
+        gemahnte offene Posten desselben Vertrags. `None` (Default)
+        erhält das bisherige Verhalten (alle offenen Forderungen des
+        Vertrags) für einfache, nicht gebündelte Aufrufer bei."""
+
         konto = self._stammdaten_repository.get_konto_by_vertrag(vertrag_id)
         if konto is None:
             return None
         forderungen = self._op_service.offene_forderungen(konto.id, heute=heute)
+        if nur_op_position_ids is not None:
+            forderungen = [f for f in forderungen if f.op_position_id in nur_op_position_ids]
         alle_positionen = self._op_service.berechne_saldo(konto.id, stichtag=heute).positionen
         zinsprofil_historie = self._repository.historie_geprueft(vertrag_id)
         # Vertragsweit (NICHT je Stufe) - Stufe 2 rechnet dieselben, bei

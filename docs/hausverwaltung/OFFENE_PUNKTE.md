@@ -2375,3 +2375,154 @@ etwaige Altdaten. Getestet:
   Umsetzung basiert ausschließlich auf dem Stand dieses Branches
   (`claude/bold-volta-7xovjq`) vor diesem Commit plus den in dieser
   Rückprüfung genannten Anforderungen.
+
+## HV-20260914-MAHNUNG-BRIEF
+
+Behebt die vier oben genannten offenen Risiken der Rückprüfung
+14.09.2026 endgültig und zusätzlich vier von Codex unabhängig
+gemeldete Prüfpunkte. Details/Rechtsgrundlagen in den jeweiligen
+Docstrings (`mahnwesen/service.py::MahnwesenService.plane_mahnlauf`/
+`versende_mahnlauf`, `mahnwesen/kosten.py`, `mahnwesen/repository.py::
+MahnLaufRepository`).
+
+**Was jetzt zusätzlich funktioniert (mit Test):**
+
+1. **Persistente, kanalunabhängige Gruppensperre statt Leader-Heuristik**
+   (Risiko 1+2 der letzten Rückprüfung): `MahnLaufTable` friert die
+   exakte Menge der GENAU JETZT tatsächlich versandbereiten
+   `MahnFallTable`-Ids ein (jedes Mitglied wird EINZELN mit der
+   bestehenden `_pruefe_frisch_versandbereit`-Prüfung bewertet, keine
+   kleinste-Id-Auswahl mehr). Die atomare Exklusivität (Compare-and-
+   Swap GEPLANT->IN_VERSAND) hängt an DIESER Zeile, nicht an einem
+   einzelnen Mitglied - `outbox_key` enthält bewusst KEINEN Kanal, ein
+   künftiger zweiter Kanal (z. B. Brief) für dieselbe Mitgliedermenge
+   träfe auf dieselbe Sperre. Weicht bei der Neuprüfung unmittelbar vor
+   dem Versand auch nur EIN eingefrorenes Mitglied ab (z. B. eine
+   inzwischen eingegangene Zahlung), wird die GESAMTE Gruppe blockiert,
+   NIE eine Teilmenge versendet. Getestet:
+   `test_plane_mahnlauf_buendelt_alle_versandbereiten_mitglieder_
+   deterministisch`,
+   `test_versende_mahnlauf_sendet_genau_einmal_mit_allen_mitgliedern`,
+   `test_versende_mahnlauf_zwei_gleichzeitige_aufrufe_senden_nicht_
+   doppelt`,
+   `test_versende_mahnlauf_recovery_nach_absturz_zwischen_claim_und_
+   ergebnis`,
+   `test_versende_mahnlauf_blockiert_gesamte_gruppe_bei_einem_
+   abweichenden_mitglied` (der Kernfall), plus die bestehenden
+   `test_hv_mailversand.py`-Bündelungs-/Konkurrenztests, die jetzt
+   gegen den neuen Mechanismus laufen und unverändert grün sind.
+2. **Periodengerechte Zinsprofil-Historie statt rückwirkender
+   Verwendung der zuletzt geprüften Version** (löst den in der letzten
+   Rückprüfung noch offenen Punkt): neue Spalte `ZinsprofilTable.
+   gueltig_ab`. Bei 0-1 jemals geprüfter Version unverändertes
+   Verhalten. Bei mehreren geprüften Versionen MIT durchgängig
+   belegtem `gueltig_ab` wird taggenau an den Wechseldaten segmentiert;
+   VOR dem frühesten `gueltig_ab` gilt mangels bekannter Vereinbarung
+   die gesetzliche Basis. Fehlt `gueltig_ab` bei auch nur EINER
+   Version, bleibt der GESAMTE Zeitraum explizit "unberechenbar"
+   (`zinsbasis="UNBERECHENBAR"`, keine Zinsen, keine §458-Pauschale) -
+   niemals wird geraten, welche historische Version wann galt. Getestet:
+   `test_zinsprofil_wechsel_mit_belegtem_gueltig_ab_wird_
+   periodengerecht_segmentiert`,
+   `test_zinsprofil_wechsel_ohne_durchgaengiges_gueltig_ab_bleibt_
+   unberechenbar`.
+3. **§456 UGB verlangt zusätzlich eine belegte Verzugsverantwortung**
+   (unabhängiger Codex-Fund): neue Spalte `verzugsverantwortung_
+   geprueft` (Default `False`). B2B + Vertragsdatum ab 16.03.2013
+   allein reichen nicht mehr für den ERHÖHTEN Zinssatz - ist die
+   Verantwortlichkeit für den Verzug (noch) nicht belegt geprüft, fällt
+   NUR die Verzinsung auf die gesetzlichen 4 % ABGB zurück. Die
+   §458-Pauschale (laut Gesetzesmaterialien verschuldensunabhängig)
+   bleibt davon bewusst UNBERÜHRT und weiterhin allein an B2B/Datum
+   geknüpft (`ugb_anwendbar`, unverändert). Getestet:
+   `test_b2b_ohne_belegte_verzugsverantwortung_faellt_auf_gesetzliche_
+   zinsen_zurueck`.
+4. **Bereits gebuchte Zinsen werden JE Forderung, nicht mehr
+   vertragsweit als eine Blanko-Summe abgezogen** (unabhängiger
+   Codex-Fund, echter Bug): eine ALTE, längst vollständig abgelöste
+   Forderung, für die schon (höhere) Zinsen gebucht wurden, hätte unter
+   der alten `max(neue_zinsen_cent - bereits_gebuchte_zinsen_cent, 0)`-
+   Formel die Verzinsung einer GENUIN NEUEN, seither entstandenen
+   Forderung vollständig schlucken können. Fix:
+   `MahnkostenRepository.bereits_gebuchte_zinsen_je_op_position`
+   (aufgeschlüsselt aus den historischen `zins_segmente_json`), Delta
+   wird PRO Forderung gebildet und bei 0 gekappt, dann summiert
+   (`MahnkostenVorschau.neue_zinsen_delta_cent`). Brieftext
+   (`mailversand_service.py::_mahnkosten_text_baustein`) und Buchung
+   (`kosten_service.py::buche_vorschau`) verwenden jetzt garantiert
+   denselben Wert. Getestet:
+   `test_zinsdelta_einer_neuen_forderung_wird_nicht_durch_eine_alte_
+   abgeloeste_geschluckt`.
+5. **Mahnkosten-Vorschau kann exakt an eine eingefrorene Gruppe
+   gebunden werden** (unabhängiger Codex-Fund): `MahnkostenService.
+   vorschau(..., nur_op_position_ids=...)` (optional, Default `None` =
+   unverändertes Verhalten für einfache, nicht gebündelte Aufrufer).
+   Der gebündelte Mahnlauf-Versand (`versende_mahnlauf`,
+   `mailversand_service.py::_dispatch_mahnlauf`) bindet die Kostenbasis
+   IMMER an genau die tatsächlich versandten Gruppenmitglieder - keine
+   Gebühren/Zinsen auf andere, nicht Teil dieses Mahnlaufs seiende
+   offene Forderungen desselben Vertrags (z. B. eine zurückgestellte,
+   strittige oder aktuell nicht gemahnte OP).
+6. Die alte `MahnPolicyRepository`-Gebühren-/Zins-Blockade
+   (`if mitglied.snapshot["gebuehr_cent"] or ...: raise ValueError(...)`)
+   im Mahntext-Generator wurde entfernt - `MahnkostenService` ist jetzt
+   die EINZIGE Quelle für Zinsen/Gebühren, keine daneben laufende
+   Pauschale mehr.
+
+**Weiterhin ehrlich offen (auch nach dieser Runde):**
+
+- **Providerneutraler Brief-Outbox-Teil des Auftrags wurde in dieser
+  Runde BEWUSST NICHT begonnen** (Kanal BRIEF, Briefart STANDARD/
+  EINSCHREIBEN/ÜBERNAHMENACHWEIS, PDF-Erzeugung mit Mietperioden/
+  Hauptforderung/alten+neuen Kosten/Zinstagen/Frist/Zahlungsziel,
+  generische SEPA-Mahnaussetzung, Postzugangslaufzeit für Stufe 2).
+  Scope-Entscheidung angesichts des Umfangs der vier oben genannten,
+  vom Auftraggeber selbst priorisierten Kernrisiken plus der vier
+  zusätzlichen Codex-Punkte - das architekturseitige `kanal`-Feld auf
+  `MahnLaufTable` existiert bereits (Default `"EMAIL"`), aber es gibt
+  noch KEIN `BriefAuftragTable`, KEIN Transportinterface und KEINEN
+  PDF-Writer. Muss in einer eigenen, fokussierten Folgerunde
+  nachgereicht werden.
+- **`MahnLaufTable`-Recovery über `status_abgleichen` fehlt**: eine
+  Gruppe, die auf UNSICHER läuft, wird über `markiere_verwaiste_
+  mahnlaeufe_als_unsicher` erkannt, aber `status_abgleichen()` löst
+  bisher NUR die einzelnen `MahnFallTable`-Mitglieder auf (unverändert
+  wie zuvor) - die `MahnLaufTable`-Zeile selbst bleibt nach einer
+  erfolgreichen Nachweis-Klärung dauerhaft auf `UNSICHER` stehen (rein
+  interner/Audit-Zustand, blockiert aber KEINE künftige, andere
+  Mitgliedermenge, da `outbox_key` deren exakte Mitgliedermenge
+  enthält). Eine explizite `manuell_abklaeren`-Variante für
+  `MahnLaufTable` gibt es noch nicht.
+- **Leader-Wahl/"genau ein Schreiben"-Einschränkungen der letzten
+  Rückprüfung sind durch die neue Gruppensperre GELÖST**, nicht nur
+  abgeschwächt: es gibt keine kleinste-Id-Heuristik mehr, und ein
+  UNSICHERer Versand blockiert jetzt die GESAMTE eingefrorene Gruppe
+  (kein Auseinanderfallen in mehrere kleinere Schreiben über mehrere
+  Tage mehr).
+- **§458-Qualifikation je Entgeltforderung** (unverändert, siehe
+  Rückprüfung 14.09.2026 oben): Annäherung bei uneinheitlichen
+  Fälligkeiten innerhalb derselben `leistungsperiode`.
+- Kein lokales "Codex-Experiment" aus einem anderen Branch wurde als
+  Grundlage verwendet - ausschließlich der Stand dieses Branches vor
+  diesem Commit plus die in diesem Auftrag genannten Anforderungen.
+
+**BACKLOG (vom Nutzer ausdrücklich als NICHT Teil dieses Auftrags
+markiert, nur festgehalten für eine spätere Runde):**
+
+- Anfangs GENAU EIN Operator im Portal; Mitarbeiter liefern Unterlagen
+  weiterhin per E-Mail, keine weiteren Benutzerkonten anlegen.
+- Täglich EINE Sammelmail NUR bei tatsächlichem Handlungsbedarf
+  (dringende Fristen sofort, unveränderte Ereignisse nicht mehrfach
+  melden) - im BESTEHENDEN deterministischen Programm/Erzeuger, KEINE
+  neue KI- oder Parallelautomation.
+- Standardregel "erste Mahnung E-Mail / zweite Brief" versus "beide
+  E-Mail" ist NOCH NICHT beantwortet - keine Annahme treffen, bis der
+  Nutzer sich festlegt.
+- Geplante vereinfachte Oberfläche: Übersicht mit Objektfilter und
+  konkreten Aufgaben; EINE Akte je Mietverhältnis (Zahlungen/Mahnungen/
+  Abrechnungen zusammengefasst); technische Details bleiben
+  aufklappbar, nicht das Standardbild. Bestehende Daten/Bestätigungen
+  nicht nochmals erheben.
+- Keine neue UI-/Versandimplementierung aus dieser Backlog-Ergänzung
+  wurde in dieser Runde begonnen - Korrektur/Abnahme der Mahn- und
+  Briefbasis bleibt Priorität.

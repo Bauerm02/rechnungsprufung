@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 
 from mietinkasso.domain.enums import MahnStatus, OPTyp, Rolle, Sperrgrund
-from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
+from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnLaufRepository, MahnPolicyRepository
 from mietinkasso.mahnwesen.service import MahnwesenService, PolicyNichtFreigegebenError, VersandUngewissError
 from mietinkasso.indexautomatik.mailops_client import MailOpsErgebnis
 
@@ -39,8 +39,16 @@ def freigegebene_policy(mahn_policy_repo):
 
 
 @pytest.fixture
-def mahn_service(mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo) -> MahnwesenService:
-    return MahnwesenService(mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, bank_stand_max_age_days=2)
+def mahnlauf_repo(session_factory) -> MahnLaufRepository:
+    return MahnLaufRepository(session_factory)
+
+
+@pytest.fixture
+def mahn_service(mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo) -> MahnwesenService:
+    return MahnwesenService(
+        mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, bank_stand_max_age_days=2,
+        mahnlauf_repository=mahnlauf_repo,
+    )
 
 
 def _mit_faelligem_soll(op_service, konto, ctx, betrag_cent=60_000, faelligkeit=date(2026, 4, 5)):
@@ -596,3 +604,221 @@ def test_objekt_107_wird_auch_im_mahnwesen_ausgeschlossen(mahn_service, stammdat
             mahn_service, ctx=ctx, vertrag=vertrag, konto=konto,
             forderung=synthetische_forderung, policy=freigegebene_policy, heute=date(2026, 4, 20),
         )
+
+
+# -- Mahnlauf-Gruppensperre (Rückprüfung 14.09.2026, Risiko 1+2): -----------
+# persistente, atomare Gruppensperre über `MahnLaufTable` statt einer
+# "kleinste-Id"-Leader-Heuristik. `plane_mahnlauf` bildet die Gruppe rein
+# lesend/nach individueller Prüfung JEDES Mitglieds; `versende_mahnlauf`
+# claimt/versendet die eingefrorene Gruppe atomar.
+
+
+def _zwei_faellige_forderungen(op_service, konto, ctx, heute):
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1),
+        faelligkeit=date(2026, 4, 5), beleg_referenz="HMZ April",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=15_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1),
+        faelligkeit=date(2026, 4, 5), beleg_referenz="Betriebskosten April",
+    )
+    return op_service.offene_forderungen(konto.id, heute=heute)
+
+
+def _plane_gruppe_stufe1(mahn_service, op_service, *, ctx, vertrag, konto, heute, freigegebene_policy):
+    forderungen = _zwei_faellige_forderungen(op_service, konto, ctx, heute)
+    assert len(forderungen) == 2
+    geplante_ids = []
+    for forderung in forderungen:
+        ergebnis = _planen(
+            mahn_service, ctx=ctx, vertrag=vertrag, konto=konto,
+            forderung=forderung, policy=freigegebene_policy, heute=heute,
+        )
+        assert ergebnis.status == "GEPLANT"
+        geplante_ids.append(ergebnis.mahnfall_id)
+    return sorted(geplante_ids)
+
+
+def test_plane_mahnlauf_buendelt_alle_versandbereiten_mitglieder_deterministisch(
+    mahn_service, mahnlauf_repo, op_service, basis_vertrag, ctx_factory, freigegebene_policy,
+):
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    geplante_ids = _plane_gruppe_stufe1(
+        mahn_service, op_service, ctx=ctx, vertrag=vertrag, konto=konto, heute=date(2026, 4, 20),
+        freigegebene_policy=freigegebene_policy,
+    )
+
+    mahnlauf = mahn_service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=1, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20),
+    )
+    assert mahnlauf is not None
+    assert mahnlauf.status == "GEPLANT"
+    assert MahnLaufRepository.mitglieder_ids(mahnlauf) == geplante_ids
+
+    # Wiederholter Aufruf mit UNVERÄNDERTER Mitgliedermenge liefert
+    # dieselbe Zeile (idempotent, kein zweiter Mahnlauf für dieselbe Gruppe).
+    nochmal = mahn_service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=1, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20),
+    )
+    assert nochmal.id == mahnlauf.id
+
+
+def test_versende_mahnlauf_sendet_genau_einmal_mit_allen_mitgliedern(
+    mahn_service, mahn_fall_repo, mahnlauf_repo, op_service, basis_vertrag, ctx_factory, freigegebene_policy,
+):
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    geplante_ids = _plane_gruppe_stufe1(
+        mahn_service, op_service, ctx=ctx, vertrag=vertrag, konto=konto, heute=date(2026, 4, 20),
+        freigegebene_policy=freigegebene_policy,
+    )
+    mahnlauf = mahn_service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=1, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20),
+    )
+    assert mahnlauf is not None
+
+    empfangene_mitglieder = {}
+
+    def versand_fn(mitglieder):
+        empfangene_mitglieder["ids"] = sorted(m.id for m in mitglieder)
+        return _test_receipt(date(2026, 4, 20))
+
+    ergebnis = mahn_service.versende_mahnlauf(
+        ctx=ctx, mahnlauf_id=mahnlauf.id, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20), ungeklaerte_eingaenge_vorhanden=False,
+        send_enabled=True, versand_fn=versand_fn,
+    )
+    assert ergebnis.status == "GESENDET"
+    assert empfangene_mitglieder["ids"] == geplante_ids
+    assert mahnlauf_repo.get(mahnlauf.id).status == "GESENDET"
+    for mahnfall_id in geplante_ids:
+        assert mahn_fall_repo.get(mahnfall_id).status == MahnStatus.GESENDET.value
+
+
+def test_versende_mahnlauf_zwei_gleichzeitige_aufrufe_senden_nicht_doppelt(
+    mahn_service, mahnlauf_repo, op_service, basis_vertrag, ctx_factory, freigegebene_policy,
+):
+    """Konkurrenz aus zwei Workern (bzw. künftig zwei Kanälen) auf
+    DIESELBE eingefrorene Gruppe: die atomare Exklusivität hängt an der
+    `MahnLaufTable`-Zeile selbst, nicht an einem einzelnen Mitglied."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    _plane_gruppe_stufe1(
+        mahn_service, op_service, ctx=ctx, vertrag=vertrag, konto=konto, heute=date(2026, 4, 20),
+        freigegebene_policy=freigegebene_policy,
+    )
+    mahnlauf = mahn_service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=1, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20),
+    )
+    assert mahnlauf is not None
+
+    versand_zaehler = {"count": 0}
+
+    def zaehlender_versand(mitglieder):
+        versand_zaehler["count"] += 1
+        return _test_receipt(date(2026, 4, 20))
+
+    def _versuch():
+        return mahn_service.versende_mahnlauf(
+            ctx=ctx, mahnlauf_id=mahnlauf.id, heute=date(2026, 4, 20),
+            bank_bestaetigt_bis=date(2026, 4, 20), ungeklaerte_eingaenge_vorhanden=False,
+            send_enabled=True, versand_fn=zaehlender_versand,
+        )
+
+    ergebnis_a = _versuch()
+    ergebnis_b = _versuch()  # simuliert einen zweiten, gleichzeitigen Worker/Kanal
+    assert ergebnis_a.status == "GESENDET"
+    assert ergebnis_b.status == "BEREITS_VERARBEITET"
+    assert versand_zaehler["count"] == 1
+
+
+def test_versende_mahnlauf_recovery_nach_absturz_zwischen_claim_und_ergebnis(
+    mahn_service, mahnlauf_repo, op_service, basis_vertrag, ctx_factory, freigegebene_policy,
+):
+    """Absturz-Recovery auf Gruppenebene: eine seit dem Claim zu lange
+    IN_VERSAND feststeckende Gruppe wird NIE automatisch erneut
+    versucht, sondern auf UNSICHER gesetzt - das blockiert weiterhin
+    JEDEN weiteren Versandversuch für dieselbe Gruppe."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    _plane_gruppe_stufe1(
+        mahn_service, op_service, ctx=ctx, vertrag=vertrag, konto=konto, heute=date(2026, 4, 20),
+        freigegebene_policy=freigegebene_policy,
+    )
+    mahnlauf = mahn_service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=1, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20),
+    )
+    assert mahnlauf is not None
+
+    lange_her = datetime.now(timezone.utc) - timedelta(hours=1)
+    assert mahnlauf_repo.claim_fuer_versand(mahnlauf.id, jetzt=lange_her) is True
+
+    verwaiste = mahn_service.markiere_verwaiste_mahnlaeufe_als_unsicher(max_alter=timedelta(minutes=15))
+    assert len(verwaiste) == 1
+    assert mahnlauf_repo.get(mahnlauf.id).status == "UNSICHER"
+
+    kein_retry = mahn_service.versende_mahnlauf(
+        ctx=ctx, mahnlauf_id=mahnlauf.id, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20), ungeklaerte_eingaenge_vorhanden=False,
+        send_enabled=True,
+        versand_fn=lambda mitglieder: (_ for _ in ()).throw(AssertionError("darf nicht aufgerufen werden")),
+    )
+    assert kein_retry.status == "BEREITS_VERARBEITET"
+
+
+def test_versende_mahnlauf_blockiert_gesamte_gruppe_bei_einem_abweichenden_mitglied(
+    mahn_service, mahn_fall_repo, mahnlauf_repo, op_service, basis_vertrag, ctx_factory, freigegebene_policy,
+):
+    """Kernfall von Risiko 1: zwischen Planung und Versand geht für EIN
+    Gruppenmitglied eine Zahlung ein. Es darf NIEMALS nur die Restgruppe
+    (Teilmenge) versendet werden - die GESAMTE eingefrorene Gruppe wird
+    blockiert, eine neue `plane_mahnlauf`-Bildung ist erforderlich."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    geplante_ids = _plane_gruppe_stufe1(
+        mahn_service, op_service, ctx=ctx, vertrag=vertrag, konto=konto, heute=date(2026, 4, 20),
+        freigegebene_policy=freigegebene_policy,
+    )
+    mahnlauf = mahn_service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=1, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20),
+    )
+    assert mahnlauf is not None
+
+    # Die BK-Forderung (15.000 Cent) wird zwischen Planung und Versand
+    # vollständig beglichen.
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=15_000,
+        belegdatum=date(2026, 4, 21), buchungsdatum=date(2026, 4, 21),
+        faelligkeit=None, beleg_referenz="Zahlung Betriebskosten",
+    )
+
+    versand_aufgerufen = {"called": False}
+
+    def darf_nicht_aufgerufen_werden(mitglieder):
+        versand_aufgerufen["called"] = True
+        return _test_receipt(date(2026, 4, 22))
+
+    ergebnis = mahn_service.versende_mahnlauf(
+        ctx=ctx, mahnlauf_id=mahnlauf.id, heute=date(2026, 4, 22),
+        bank_bestaetigt_bis=date(2026, 4, 22), ungeklaerte_eingaenge_vorhanden=False,
+        send_enabled=True, versand_fn=darf_nicht_aufgerufen_werden,
+    )
+    assert ergebnis.status == "BLOCKIERT"
+    assert versand_aufgerufen["called"] is False
+    assert mahnlauf_repo.get(mahnlauf.id).status == "BLOCKIERT"
+    # KEIN Mitglied wurde versendet - auch nicht das weiterhin
+    # tatsächlich offene HMZ.
+    for mahnfall_id in geplante_ids:
+        assert mahn_fall_repo.get(mahnfall_id).status != MahnStatus.GESENDET.value

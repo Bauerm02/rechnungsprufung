@@ -30,6 +30,7 @@ nie automatisch erneut angestoßen.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
@@ -37,8 +38,8 @@ from typing import Callable
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import MahnStatus, MahnStufe, rechtsordnung_geklaert
 from mietinkasso.domain.exceptions import BindungInkonsistentError, MahnstufeReihenfolgeError
-from mietinkasso.infrastructure.db.tables import KontoTable, MahnFallTable, MahnPolicyTable, VertragTable
-from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
+from mietinkasso.infrastructure.db.tables import KontoTable, MahnFallTable, MahnLaufTable, MahnPolicyTable, VertragTable
+from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnLaufRepository, MahnPolicyRepository
 from mietinkasso.op.service import OffeneForderung, OPService, compute_content_hash
 from mietinkasso.stammdaten.repository import StammdatenRepository
 from mietinkasso.indexautomatik.mailnachweis import nachweis_daten, versand_belegen
@@ -97,6 +98,7 @@ class MahnwesenService:
         *,
         bank_stand_max_age_days: int = 2,
         mahnkosten_service=None,
+        mahnlauf_repository: MahnLaufRepository | None = None,
     ):
         self._repository = repository
         self._stammdaten_repository = stammdaten_repository
@@ -108,6 +110,11 @@ class MahnwesenService:
         # HV-20260913-MAHNKOSTEN (keine Kostenbuchung beim Versand), damit
         # bestehende Aufrufer/Tests ohne Anpassung weiterlaufen.
         self._mahnkosten_service = mahnkosten_service
+        # Optional (siehe `plane_mahnlauf`/`versende_mahnlauf`) - ohne
+        # konfiguriertes Repository bleiben nur die bestehenden
+        # Einzelfall-Methoden (`plane_forderung`/`versenden`) nutzbar,
+        # bestehende Aufrufer/Tests laufen unverändert weiter.
+        self._mahnlauf_repository = mahnlauf_repository
 
     def _naechste_stufe_fuer_forderung(self, forderung_op_position_id: int) -> MahnStufe | None:
         letzter = self._repository.letzter_mahnfall_fuer_forderung(forderung_op_position_id)
@@ -463,6 +470,235 @@ class MahnwesenService:
                     versandnachweis_referenz="mahnung:" + mahnfall.outbox_key, akteur=ctx.user_id,
                 )
         return VersandErgebnis("GESENDET", "Tatsächlicher Versand im Maildienst nachgewiesen.")
+
+    def plane_mahnlauf(
+        self,
+        *,
+        ctx: AuthContext,
+        vertrag: VertragTable,
+        konto: KontoTable,
+        stufe: int,
+        heute: date,
+        bank_bestaetigt_bis: date | None,
+        ungeklaerte_eingaenge_vorhanden: bool = False,
+    ) -> MahnLaufTable | None:
+        """Bildet die GENAU EINE, deterministische, tatsächlich
+        sendeberechtigte Gruppe aller GEPLANTEN MahnFälle desselben
+        (`vertrag`, `stufe`) - über dieselbe, bereits für den
+        Einzelversand genutzte reine Prüfung `_pruefe_frisch_
+        versandbereit` (KEINE kleinste-Id-Heuristik: JEDES Mitglied wird
+        einzeln geprüft, NICHT nur eines stellvertretend - Rückprüfung
+        14.09.2026, Risiko 2) und friert deren exakte Mitgliedermenge in
+        einer persistenten `MahnLaufTable`-Zeile ein (`outbox_key`
+        deterministisch aus Vertrag/Stufe/Mitgliedermenge - ein
+        wiederholter Aufruf mit UNVERÄNDERTER Menge liefert dieselbe
+        Zeile, idempotent). Mitglieder, die bereits jetzt dauerhaft
+        nicht mehr versandfähig sind (Sperre, veraltete Forderung, ...),
+        werden HIER bereits final auf BLOCKIERT/UEBERSPRUNGEN gesetzt -
+        exakt wie es die bisherige Einzelfall-Prüfung in `versenden()`
+        auch getan hätte. Gibt `None` zurück, wenn AKTUELL kein
+        Mitglied sendebereit ist (nichts zu bündeln)."""
+
+        require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
+        require_schreibrecht(ctx)
+        if self._mahnlauf_repository is None:
+            raise ValueError("plane_mahnlauf benötigt ein konfiguriertes MahnLaufRepository.")
+
+        aktuelle_policy = self._mahn_policy_repository.aktuelle_freigegebene()
+        kandidaten = [
+            f for f in self._repository.list_fuer_vertrag(vertrag.id)
+            if f.stufe == stufe and f.status == MahnStatus.GEPLANT.value
+        ]
+        bereit_ids: list[int] = []
+        for mahnfall in kandidaten:
+            status_code, _grund, _forderung = self._pruefe_frisch_versandbereit(
+                mahnfall=mahnfall, vertrag=vertrag, konto=konto, aktuelle_policy=aktuelle_policy, heute=heute,
+                bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
+            )
+            if status_code is None:
+                bereit_ids.append(mahnfall.id)
+            elif status_code == "BLOCKIERT_PERSIST":
+                self._repository.set_status(mahnfall.id, MahnStatus.BLOCKIERT.value)
+            elif status_code == "UEBERSPRUNGEN_PERSIST":
+                self._repository.set_status(mahnfall.id, MahnStatus.UEBERSPRUNGEN.value)
+            # BLOCKIERT_TRANSIENT (Frist noch nicht abgelaufen): bleibt
+            # GEPLANT, ist nur (noch) nicht Teil DIESER Gruppe.
+
+        if not bereit_ids:
+            return None
+
+        bereit_ids_sortiert = sorted(bereit_ids)
+        mitglieder_hash = compute_content_hash({"mitglieder": bereit_ids_sortiert})
+        # Der Kanal ist BEWUSST NICHT Teil des Schlüssels (siehe
+        # `MahnLaufRepository`-Docstring): dieselbe Mitgliedermenge muss
+        # kanalübergreifend auf dieselbe Sperre treffen.
+        outbox_key = f"{vertrag.gesellschaft_id}:{vertrag.id}:{stufe}:{mitglieder_hash}"
+        return self._mahnlauf_repository.get_or_create(
+            outbox_key=outbox_key, vertrag_id=vertrag.id, gesellschaft_id=vertrag.gesellschaft_id,
+            stufe=stufe, mitglieder_mahnfall_ids=json.dumps(bereit_ids_sortiert),
+        )
+
+    def versende_mahnlauf(
+        self,
+        *,
+        ctx: AuthContext,
+        mahnlauf_id: int,
+        heute: date,
+        bank_bestaetigt_bis: date | None,
+        ungeklaerte_eingaenge_vorhanden: bool,
+        send_enabled: bool,
+        versand_fn: Callable[[list[MahnFallTable]], object],
+        mahnkosten_vorschau_slot: dict | None = None,
+    ) -> VersandErgebnis:
+        """Versendet EINEN bereits über `plane_mahnlauf` gebildeten,
+        eingefrorenen Mahnlauf GENAU EINMAL - `versand_fn` wird mit der
+        vollständigen Mitgliederliste (nicht nur einem "führenden"
+        Fall) aufgerufen. Die atomare Exklusivität hängt an der
+        `MahnLaufTable`-Zeile SELBST (`claim_fuer_versand`), NICHT an
+        einem einzelnen Mitglied - ein zweiter, gleichzeitiger Aufruf
+        (auch über einen künftigen anderen Kanal) für DIESELBE Gruppe
+        sieht entweder `mahnlauf.status != GEPLANT` (bereits
+        IN_VERSAND/UNSICHER/GESENDET) oder verliert den CAS.
+
+        JEDES eingefrorene Mitglied wird UNMITTELBAR vor dem Versand
+        NOCHMAL einzeln mit `_pruefe_frisch_versandbereit` geprüft; ist
+        auch nur eines nicht mehr bereit (z. B. eine inzwischen
+        eingegangene Zahlung), wird die GESAMTE Gruppe blockiert statt
+        eine Teilmenge zu versenden - ein neuer `plane_mahnlauf`-Aufruf
+        bildet dann die aktuell tatsächlich passende, neue Gruppe."""
+
+        mahnlauf = self._mahnlauf_repository.get(mahnlauf_id)
+        if mahnlauf is None:
+            raise ValueError(f"Unbekannter MahnLauf {mahnlauf_id}")
+
+        vertrag = self._stammdaten_repository.get_vertrag(mahnlauf.vertrag_id)
+        konto = self._stammdaten_repository.get_konto_by_vertrag(mahnlauf.vertrag_id)
+        if vertrag is None or konto is None or vertrag.gesellschaft_id != mahnlauf.gesellschaft_id:
+            raise BindungInkonsistentError(f"MahnLauf {mahnlauf.id}: Vertrag/Konto/Gesellschaft inkonsistent.")
+
+        require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
+        require_schreibrecht(ctx)
+
+        if mahnlauf.status != "GEPLANT":
+            return VersandErgebnis(
+                "BEREITS_VERARBEITET",
+                f"Mahnlauf-Status ist bereits {mahnlauf.status}; kein zweiter/kanalübergreifender Versand für dieselbe Gruppe.",
+            )
+
+        self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
+
+        mitglieder_ids = MahnLaufRepository.mitglieder_ids(mahnlauf)
+        mitglieder = [self._repository.get(i) for i in mitglieder_ids]
+        if not mitglieder_ids or any(m is None for m in mitglieder):
+            self._mahnlauf_repository.set_status(
+                mahnlauf_id, "BLOCKIERT", fehlergrund="Mindestens ein eingefrorenes Gruppenmitglied existiert nicht mehr."
+            )
+            return VersandErgebnis("BLOCKIERT", "Mahnlauf-Gruppe inkonsistent (Mitglied fehlt) - neue Planung erforderlich.")
+
+        aktuelle_policy = self._mahn_policy_repository.aktuelle_freigegebene()
+        for mahnfall in mitglieder:
+            if mahnfall.status != MahnStatus.GEPLANT.value:
+                self._mahnlauf_repository.set_status(
+                    mahnlauf_id, "BLOCKIERT",
+                    fehlergrund=f"Mitglied {mahnfall.id} ist nicht mehr GEPLANT (Status {mahnfall.status}).",
+                )
+                return VersandErgebnis("BLOCKIERT", "Ein Gruppenmitglied hat seinen Status seit der Planung verändert - neue Planung erforderlich.")
+            status_code, grund, _forderung = self._pruefe_frisch_versandbereit(
+                mahnfall=mahnfall, vertrag=vertrag, konto=konto, aktuelle_policy=aktuelle_policy, heute=heute,
+                bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
+            )
+            if status_code is not None:
+                if status_code == "BLOCKIERT_PERSIST":
+                    self._repository.set_status(mahnfall.id, MahnStatus.BLOCKIERT.value)
+                elif status_code == "UEBERSPRUNGEN_PERSIST":
+                    self._repository.set_status(mahnfall.id, MahnStatus.UEBERSPRUNGEN.value)
+                self._mahnlauf_repository.set_status(
+                    mahnlauf_id, "BLOCKIERT", fehlergrund=f"Mitglied {mahnfall.id}: {grund}"
+                )
+                return VersandErgebnis(
+                    "BLOCKIERT",
+                    f"Gruppe ist seit der Planung nicht mehr vollständig versandbereit (Mitglied {mahnfall.id}: {grund}); "
+                    "neue Planung erforderlich.",
+                )
+
+        if not send_enabled:
+            return VersandErgebnis("BEREITS_VERARBEITET", "SEND_ENABLED=false: nur Preview/Outbox, kein realer Versand.")
+
+        if not self._mahnlauf_repository.claim_fuer_versand(mahnlauf_id):
+            return VersandErgebnis("BEREITS_VERARBEITET", "Ein anderer Worker/Kanal verarbeitet diese Gruppe bereits.")
+
+        try:
+            beleg = versand_fn(mitglieder)
+        except (VersandUngewissError, TransportFehlerUngewissError):
+            self._mahnlauf_repository.set_status(mahnlauf_id, "UNSICHER")
+            for mahnfall in mitglieder:
+                self._repository.set_status(mahnfall.id, MahnStatus.UNSICHER.value)
+            return VersandErgebnis("UNSICHER", "Provider-Timeout nach möglicher Annahme; kein automatischer Retry.")
+        except ValueError as exc:
+            self._mahnlauf_repository.set_status(mahnlauf_id, "BLOCKIERT", fehlergrund=str(exc))
+            for mahnfall in mitglieder:
+                self._repository.set_status(mahnfall.id, MahnStatus.BLOCKIERT.value)
+            return VersandErgebnis("BLOCKIERT", "Mailauftrag oder private Mailkonfiguration unvollständig.")
+        if nachweis_daten(beleg) is None:
+            self._mahnlauf_repository.set_status(mahnlauf_id, "UNSICHER")
+            for mahnfall in mitglieder:
+                self._repository.set_status(mahnfall.id, MahnStatus.UNSICHER.value)
+            return VersandErgebnis("UNSICHER", "Noch kein tatsächlicher Versandnachweis; Status wird abgefragt, nicht erneut gesendet.")
+
+        versand_belegen(
+            self._mahnlauf_repository._session_factory, MahnLaufTable, mahnlauf_id,
+            ergebnis=beleg, erlaubt={"IN_VERSAND", "UNSICHER"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
+            referenz="mahnungslauf:" + mahnlauf.outbox_key,
+        )
+        # Jedes Mitglied war UNTER DIESEM Design nie selbst geclaimt (die
+        # Gruppenzeile allein stellt die Exklusivität her) - der Übergang
+        # GEPLANT -> GESENDET erfolgt hier direkt, je Mitglied einzeln
+        # protokolliert (eigener Audit-Eintrag, eigenes `gesendet_am`).
+        for mahnfall in mitglieder:
+            versand_belegen(
+                self._repository._session_factory, MahnFallTable, mahnfall.id,
+                ergebnis=beleg, erlaubt={"GEPLANT"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
+                referenz="mahnungslauf:" + mahnlauf.outbox_key,
+            )
+
+        if self._mahnkosten_service is not None:
+            vorschau = None
+            if mahnkosten_vorschau_slot is not None and "vorschau" in mahnkosten_vorschau_slot:
+                vorschau = mahnkosten_vorschau_slot["vorschau"]
+            else:
+                # An die eingefrorene Gruppe gebunden (siehe
+                # `kosten_service.py::vorschau`-Docstring, Rückprüfung
+                # Codex 14.09.2026) - keine Kosten auf andere, nicht Teil
+                # dieses Mahnlaufs seiende offene Forderungen desselben
+                # Vertrags.
+                vorschau = self._mahnkosten_service.vorschau(
+                    vertrag_id=vertrag.id, stufe=mahnlauf.stufe, heute=heute,
+                    nur_op_position_ids=frozenset(m.forderung_op_position_id for m in mitglieder),
+                )
+            if vorschau is not None:
+                self._mahnkosten_service.buche_vorschau(
+                    ctx=ctx, vorschau=vorschau, heute=heute,
+                    versandnachweis_referenz="mahnungslauf:" + mahnlauf.outbox_key, akteur=ctx.user_id,
+                )
+        return VersandErgebnis("GESENDET", "Tatsächlicher Versand im Maildienst nachgewiesen (gebündelter Mahnlauf).")
+
+    def markiere_verwaiste_mahnlaeufe_als_unsicher(
+        self, *, jetzt: datetime | None = None, max_alter: timedelta = timedelta(minutes=15),
+    ) -> list[MahnLaufTable]:
+        """Recovery-Pendant zu `markiere_verwaiste_als_unsicher` für
+        gebündelte Mahnläufe: eine seit `max_alter` in IN_VERSAND
+        feststeckende Gruppe (Absturz zwischen Claim und Ergebnis) wird
+        NIE automatisch erneut versucht, sondern auf UNSICHER gesetzt -
+        das blockiert (siehe `versende_mahnlauf`) weiterhin JEDEN Kanal
+        für dieselbe Mitgliedermenge, bis sie manuell geklärt ist."""
+
+        if self._mahnlauf_repository is None:
+            return []
+        grenze = (jetzt or datetime.now(timezone.utc)) - max_alter
+        verwaiste = self._mahnlauf_repository.verwaiste_in_versand(aelter_als=grenze)
+        for lauf in verwaiste:
+            self._mahnlauf_repository.set_status(lauf.id, "UNSICHER")
+        return verwaiste
 
     def markiere_verwaiste_als_unsicher(self, *, jetzt: datetime | None = None, max_alter: timedelta = timedelta(minutes=15)) -> list[MahnFallTable]:
         """Recovery für einen Absturz zwischen `claim_fuer_versand` und dem
