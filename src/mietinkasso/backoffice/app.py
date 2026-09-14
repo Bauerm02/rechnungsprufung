@@ -93,7 +93,9 @@ from mietinkasso.vertragsanlage.vorschlaege import (
     mehrdeutigkeiten_aus_extraktion as _vertragsanlage_mehrdeutigkeiten_aus_extraktion,
     vorschlaege_aus_extraktion as _vertragsanlage_vorschlaege_aus_extraktion,
 )
-from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnPolicyRepository
+from mietinkasso.mahnwesen.repository import (
+    BriefAnbieterProfilRepository, MahnFallRepository, MahnKanalregelRepository, MahnPolicyRepository,
+)
 from mietinkasso.mahnwesen.service import MahnwesenService
 from mietinkasso.op.eroeffnung_import import importiere_eroeffnung_csv_atomar, parse_eroeffnung_csv
 from mietinkasso.op.repository import OPRepository
@@ -141,7 +143,18 @@ _vorschreibung_repo = VorschreibungRepository(_session_factory)
 _vorschreibung_service = VorschreibungService(_vorschreibung_repo, _stammdaten_repo, _op_service)
 _mahn_fall_repo = MahnFallRepository(_session_factory)
 _mahn_policy_repo = MahnPolicyRepository(_session_factory)
-_mahn_service = MahnwesenService(_mahn_fall_repo, _stammdaten_repo, _op_service, _mahn_policy_repo, bank_stand_max_age_days=_settings.bank_stand_max_age_days)
+# Dieselben Repositories/Default-Werte wie in `HVMailversandService`
+# (siehe dortiger Kommentar) - EINE gemeinsame Datenbank, daher überall
+# konsistent: Kanal bleibt EMAIL für beide Stufen ohne freigegebene
+# Kanalregel, Briefkanal bleibt ohne echten Transport vollständig
+# blockiert.
+_mahn_kanalregel_repo = MahnKanalregelRepository(_session_factory)
+_brief_anbieterprofil_repo = BriefAnbieterProfilRepository(_session_factory)
+_mahn_service = MahnwesenService(
+    _mahn_fall_repo, _stammdaten_repo, _op_service, _mahn_policy_repo, bank_stand_max_age_days=_settings.bank_stand_max_age_days,
+    kanalregel_repository=_mahn_kanalregel_repo, brief_anbieterprofil_repository=_brief_anbieterprofil_repo,
+    brief_transport_verfuegbar=False,
+)
 _index_repo = IndexRepository(_session_factory)
 _index_service = IndexService(_index_repo, _stammdaten_repo)
 _vertragspruefung_repo = VertragPruefungRepository(_session_factory)
@@ -1596,7 +1609,8 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
 
     zeilen = []
     for stufe in (1, 2):
-        vorschau = _hv_mail.mahnkosten_service.vorschau(vertrag_id=vertrag_id, stufe=stufe, heute=heute_datum)
+        kanal = _hv_mail.mahn_service._resolve_kanal(stufe)
+        vorschau = _hv_mail.mahnkosten_service.vorschau(vertrag_id=vertrag_id, stufe=stufe, heute=heute_datum, kanal=kanal)
         if vorschau is None:
             continue
         satz_text = f"{vorschau.zinssatz_prozent} % p.a." if vorschau.zinssatz_prozent is not None else "ungeklärt"
@@ -1631,18 +1645,40 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
             gebuehr_segmente_html = f"""<details><summary>Neue Pauschalen je Entgeltforderung ({len(vorschau.gebuehr_segmente)})</summary>
               <table><tr><th>Entgeltforderung</th><th>Betrag</th></tr>{zeilen_gebuehr}</table>
             </details>"""
-        gesamtbetrag_cent = vorschau.hauptforderung_cent + vorschau.zusaetzlicher_betrag_cent
+        # Rückprüfung 14.09.2026, echter Bug: `hauptforderung_cent`
+        # enthält seit dem Doppelzählungs-Fix NIE mehr bereits gebuchte,
+        # noch offene Mahnkosten (siehe `kosten.py::
+        # berechne_mahnkosten_vorschau`) - der tatsächlich verlangte
+        # Gesamtbetrag muss sie deshalb HIER separat dazuzählen, sonst
+        # würde eine bereits fakturierte, noch unbezahlte Pauschale aus
+        # dem Gesamtbetrag verschwinden.
+        gesamtbetrag_cent = vorschau.hauptforderung_cent + vorschau.bereits_offene_mahnkosten_cent + vorschau.zusaetzlicher_betrag_cent
+        bereits_offene_mahnkosten_zeile = ""
+        if vorschau.bereits_offene_mahnkosten_cent:
+            bereits_offene_mahnkosten_zeile = f"""
+            <tr><th>Bereits gebuchte, noch offene Mahnkosten (frühere Mahnläufe)</th>
+                <td>{eur(vorschau.bereits_offene_mahnkosten_cent)}</td></tr>"""
+        versandkosten_zeile = ""
+        if vorschau.versandkosten_anbieteraufwand_cent is not None:
+            ersetzt_cent = vorschau.gebuehr_cent if (vorschau.gebuehr_rechtsgrundlage or "").startswith("§1333") else None
+            versandkosten_zeile = f"""
+            <tr><th>Versandkosten Anbieteraufwand (Druck/Kuvert/Porto/Nachweis)</th>
+                <td>{eur(vorschau.versandkosten_anbieteraufwand_cent)}</td></tr>
+            <tr><th>Davon ersatzfähig angesetzt (§1333 Abs 2 ABGB)</th>
+                <td>{eur(ersetzt_cent) if ersetzt_cent is not None else "0,00 €"}</td></tr>"""
         zeilen.append(f"""
         <div class="card">
-          <h3>Stufe {stufe}</h3>
+          <h3>Stufe {stufe} (Kanal: {h(kanal)})</h3>
           <table>
             <tr><th>Hauptforderung</th><td>{eur(vorschau.hauptforderung_cent)}</td></tr>
+            {bereits_offene_mahnkosten_zeile}
             <tr><th>Bereits gebuchte Zinsen (je betroffener Forderung, alle Stufen)</th><td>{eur(vorschau.bereits_gebuchte_zinsen_cent)}</td></tr>
             <tr><th>Neu zu bebuchende Zinsen (Delta)</th><td>{eur(vorschau.neue_zinsen_delta_cent)}</td></tr>
             <tr><th>Zinssatz / Basis</th><td>{h(satz_text)} ({h(vorschau.zinsbasis)})</td></tr>
             <tr><th>Zinszeitraum</th><td>{h(zeitraum_text)}</td></tr>
             <tr><th>Neue Mahngebühr</th><td>{h(gebuehr_text)}{f" ({h(vorschau.gebuehr_rechtsgrundlage)})" if vorschau.gebuehr_rechtsgrundlage else ""}</td></tr>
-            <tr><th><strong>Gesamtbetrag (Hauptforderung + neue Zinsen + neue Gebühr)</strong></th>
+            {versandkosten_zeile}
+            <tr><th><strong>Gesamtbetrag (Hauptforderung + bereits offene Mahnkosten + neue Zinsen + neue Gebühr)</strong></th>
                 <td><strong>{eur(gesamtbetrag_cent)}</strong></td></tr>
           </table>
           {segmente_html}

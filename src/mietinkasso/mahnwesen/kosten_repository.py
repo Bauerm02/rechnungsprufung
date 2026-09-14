@@ -17,6 +17,7 @@ from mietinkasso.infrastructure.db.tables import (
     OenbBasiszinssatzTable,
     ZinsprofilTable,
 )
+from mietinkasso.mahnwesen.kosten import S458_UGB_HOECHSTBETRAG_CENT
 
 
 class ZinsledgerInkonsistentError(Exception):
@@ -99,6 +100,18 @@ class MahnkostenRepository:
         gueltig_ab: date | None = None, verzugsverantwortung_geprueft: bool = False,
         versandkosten_ersatzfaehig_geprueft: bool = False, erstellt_von: str,
     ) -> ZinsprofilTable:
+        # §458 UGB deckelt die Mahnspesen-Pauschale gesetzlich auf 40 EUR
+        # (unabhängige Rückprüfung Codex 14.09.2026, echter Bug: das
+        # Formular akzeptierte z. B. 100 EUR ohne jede Prüfung) - ein
+        # bereits belegter, REDUZIERTER Altwert (0 < Wert <= 4000) bleibt
+        # uneingeschränkt gültig, nur ein Wert AUSSERHALB [0, 4000] wird
+        # abgelehnt, nicht stillschweigend gekappt (ein Formularfehler
+        # soll sichtbar auffallen, nicht auf 40 EUR "korrigiert" werden).
+        if mahngebuehr_kostenbasis_cent is not None and not (0 <= mahngebuehr_kostenbasis_cent <= S458_UGB_HOECHSTBETRAG_CENT):
+            raise ValueError(
+                f"Mahngebühr-Kostenbasis {mahngebuehr_kostenbasis_cent} Cent liegt außerhalb des gesetzlichen "
+                f"§458-UGB-Rahmens (0 bis {S458_UGB_HOECHSTBETRAG_CENT} Cent = 40,00 EUR)."
+            )
         with self._session_factory() as session:
             bisherige_version = session.execute(
                 select(ZinsprofilTable.version).where(ZinsprofilTable.vertrag_id == vertrag_id)

@@ -2601,6 +2601,64 @@ def test_ueberlappende_basiszinssaetze_werden_beim_erfassen_abgelehnt(backoffice
         )
 
 
+def test_mahnvorschau_zaehlt_bereits_gebuchte_mahnkosten_nicht_doppelt_zur_hauptforderung(backoffice_client):
+    """Rückprüfung 14.09.2026, echter Bug, konkreter Repro (synthetisch):
+    830 EUR Hauptforderung, geprüfte 40-EUR-§458-Pauschale. Erste
+    Kostenvorschau/-buchung am 14.09., zweite Portal-Ansicht am 28.09.
+    darf die bereits gebuchte, noch offene Pauschale/Zinsen NICHT ein
+    zweites Mal als Hauptforderung ausweisen (alte, fehlerhafte
+    Berechnung: 870,82 € statt 830,00 €) - sie erscheinen stattdessen in
+    einer eigenen, sichtbaren Zeile."""
+
+    import mietinkasso.backoffice.app as backoffice_app
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+
+    from mietinkasso.mahnwesen.repository import MahnPolicyRepository
+    mahn_policy_repo = MahnPolicyRepository(build_session_factory(get_settings().database_url))
+    if mahn_policy_repo.aktuelle_freigegebene() is None:
+        policy = mahn_policy_repo.anlegen(
+            stufe1_tage_nach_faelligkeit=7, stufe2_mindesttage_nach_stufe1_versand=14, status="ENTWURF",
+        )
+        mahn_policy_repo.freigeben(policy.id)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-DOPPELZAEHLUNG", objekt_id="601", bezeichnung="Top Doppelzählung", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-DOPPELZAEHLUNG", einheit_id="601-TOP-DOPPELZAEHLUNG", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-DOPPELZAEHLUNG"))
+
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=83_000,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
+        leistungsperiode="2026-08", beleg_referenz="HMZ August (Doppelzählung-Test)",
+    )
+    profil = backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_anlegen(
+        vertrag_id=konto.vertrag_id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=4000, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis", erstellt_von="test",
+    )
+    backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
+
+    gebucht = backoffice_app._hv_mail.mahnkosten_service.buche_bei_versand(
+        ctx=_ctx_admin(), vertrag_id=konto.vertrag_id, stufe=1, heute=date(2026, 9, 14),
+        versandnachweis_referenz="mahnung:test-doppelzaehlung", akteur="test",
+    )
+    assert gebucht is not None
+    assert gebucht.gebuehr_cent == 4000
+
+    antwort = client.get(f"/backoffice/vertrag/{konto.vertrag_id}/mahnvorschau", params={"heute": "2026-09-28"})
+    assert antwort.status_code == 200
+    assert "830,00 €" in antwort.text  # Hauptforderung bleibt korrekt, NICHT 870,82 €
+    assert "Bereits gebuchte, noch offene Mahnkosten" in antwort.text
+
+
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
     unten) - der Login-Ratelimiter ist ein globaler, prozessweiter

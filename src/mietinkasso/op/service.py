@@ -84,6 +84,14 @@ class OffeneForderung:
     faelligkeit: date | None
     faelligkeit_bekannt: bool
     leistungsperiode: str | None
+    # Rückprüfung 14.09.2026, echter Bug: unterscheidet eine echte Miet-/
+    # BK-Forderung von einer bereits vom Mahnwesen selbst gebuchten
+    # Zinsen-/Gebühr-SOLL-Zeile (`quelle_system == "mahnkosten"`, siehe
+    # `mahnwesen/kosten_service.py::buche_vorschau`) - ohne diese
+    # Unterscheidung zählt `berechne_mahnkosten_vorschau` bereits
+    # verbuchte, noch offene Mahnkosten fälschlich nochmals als
+    # "Hauptforderung" mit.
+    quelle_system: str | None = None
 
 
 class OPService:
@@ -539,6 +547,7 @@ class OPService:
                         faelligkeit=p.faelligkeit,
                         faelligkeit_bekannt=p.faelligkeit_bekannt,
                         leistungsperiode=p.leistungsperiode,
+                        quelle_system=p.quelle_system,
                     )
                 )
         return ergebnisse

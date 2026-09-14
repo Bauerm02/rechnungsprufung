@@ -61,13 +61,23 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
-from mietinkasso.infrastructure.db.tables import OPPositionTable, OenbBasiszinssatzTable, ZinsprofilTable
+from mietinkasso.infrastructure.db.tables import BriefAnbieterProfilTable, OPPositionTable, OenbBasiszinssatzTable, ZinsprofilTable
 from mietinkasso.op.service import OffeneForderung
 
 _STICHTAG_UGB_456 = date(2013, 3, 16)
 _GESETZLICHER_ZINSSATZ_PROZENT = Decimal("4.000")
 _UGB_AUFSCHLAG_PROZENTPUNKTE = Decimal("9.200")
 _TAGE_IM_JAHR = Decimal(365)
+# §458 UGB (https://www.ris.bka.gv.at/eli/drgbl/1897/219/P458/NOR40148646):
+# gesetzlicher HÖCHSTBETRAG der Mahnspesen-Pauschale 40 EUR - unabhängige
+# Rückprüfung Codex 14.09.2026, echter Bug: das Formular/Backend nahm
+# jeden Wert an (u. a. 100 EUR), obwohl §458 UGB diesen Betrag DECKELT.
+# Öffentlich (kein führender Unterstrich), damit `kosten_repository.py`
+# beim Anlegen eines Zinsprofils dieselbe Konstante prüft, statt eine
+# zweite, potenziell abweichende Kopie zu pflegen. Ein bereits belegter,
+# REDUZIERTER Altwert (0 < Wert <= 4000) bleibt uneingeschränkt gültig -
+# NUR Werte AUSSERHALB [0, 4000] sind unzulässig.
+S458_UGB_HOECHSTBETRAG_CENT = 4000
 
 
 def ugb_anwendbar(zinsprofil: ZinsprofilTable | None) -> bool:
@@ -481,6 +491,29 @@ class MahnkostenVorschau:
     forderung_op_position_ids: tuple[int, ...]
     ausgeschlossene_forderungen_hinweis: tuple[str, ...] = field(default_factory=tuple)
     hinweise: tuple[str, ...] = field(default_factory=tuple)
+    # Reiner Transparenzwert (Auftrag Markus 14.09.2026, Brief-Kostenpaket):
+    # der TATSÄCHLICHE Anbieteraufwand (Druck+Kuvert+Porto+Nachweis) laut
+    # freigegebenem `BriefAnbieterProfilTable`, NUR gesetzt wenn Kanal
+    # BRIEF und ein freigegebenes Profil vorliegt - unabhängig davon, ob
+    # (und in welcher Höhe) davon überhaupt etwas als `gebuehr_segmente`
+    # ersatzfähig angesetzt wird (siehe dortige §1333/§458-Weiche). Zeigt
+    # dem Portal ehrlich den Unterschied zwischen "was der Versand
+    # tatsächlich kostet" und "was davon dem Mieter verrechnet wird".
+    versandkosten_anbieteraufwand_cent: int | None = None
+    # Rückprüfung 14.09.2026, echter Bug: `hauptforderung_cent` enthält
+    # NIE mehr die vom Mahnwesen selbst gebuchten, noch offenen Zinsen-/
+    # Gebühr-SOLL-Zeilen (`OPPositionTable.quelle_system == "mahnkosten"`,
+    # siehe `kosten_service.py::buche_vorschau`) - diese würden sonst bei
+    # einer SPÄTEREN Vorschau nochmals aus `offene_forderungen()`
+    # hereinkommen und die Hauptforderung künstlich aufblähen (konkreter
+    # Repro: 830 EUR Hauptforderung + bereits gebuchte 40-EUR-Pauschale
+    # ergäbe sonst fälschlich 870 EUR "Hauptforderung"). Dieses Feld zeigt
+    # stattdessen TRANSPARENT, wie viel aus FRÜHEREN Mahnläufen bereits
+    # angesetzte Zinsen/Gebühren noch offen (unbezahlt) sind - separat von
+    # `hauptforderung_cent` (echte Miet-/BK-Forderungen) UND von
+    # `bereits_gebuchte_zinsen_cent` (das reine Ledger-Delta für die
+    # laufende Neuberechnung), damit nichts doppelt gezählt wird.
+    bereits_offene_mahnkosten_cent: int = 0
 
     @property
     def zusaetzlicher_betrag_cent(self) -> int:
@@ -528,6 +561,8 @@ def _vorschau_zu_dict(vorschau: MahnkostenVorschau) -> dict:
         "forderung_op_position_ids": list(vorschau.forderung_op_position_ids),
         "ausgeschlossene_forderungen_hinweis": list(vorschau.ausgeschlossene_forderungen_hinweis),
         "hinweise": list(vorschau.hinweise),
+        "versandkosten_anbieteraufwand_cent": vorschau.versandkosten_anbieteraufwand_cent,
+        "bereits_offene_mahnkosten_cent": vorschau.bereits_offene_mahnkosten_cent,
     }
 
 
@@ -557,6 +592,10 @@ def _vorschau_aus_dict(data: dict) -> MahnkostenVorschau:
         forderung_op_position_ids=tuple(data["forderung_op_position_ids"]),
         ausgeschlossene_forderungen_hinweis=tuple(data["ausgeschlossene_forderungen_hinweis"]),
         hinweise=tuple(data["hinweise"]),
+        # `.get(...)`: ein VOR diesem Auftrag persistierter Snapshot kennt
+        # dieses Feld noch nicht - additiv-sicher statt eines KeyError.
+        versandkosten_anbieteraufwand_cent=data.get("versandkosten_anbieteraufwand_cent"),
+        bereits_offene_mahnkosten_cent=data.get("bereits_offene_mahnkosten_cent", 0),
     )
 
 
@@ -593,15 +632,22 @@ def vorschau_bei_ledger_inkonsistenz(
     selbst widersprüchlich ist, aber die Hauptforderung bleibt
     unblockiert."""
 
-    hauptforderung_cent = sum(f.rest_cent for f in forderungen)
+    # Wie in `berechne_mahnkosten_vorschau`: bereits vom Mahnwesen selbst
+    # gebuchte, noch offene Zinsen-/Gebühr-Zeilen zählen NIE als
+    # Hauptforderung (Rückprüfung 14.09.2026, echter Bug).
+    forderungen_kern = [f for f in forderungen if f.quelle_system != "mahnkosten"]
+    forderungen_mahnkosten = [f for f in forderungen if f.quelle_system == "mahnkosten"]
+    hauptforderung_cent = sum(f.rest_cent for f in forderungen_kern)
+    bereits_offene_mahnkosten_cent = sum(f.rest_cent for f in forderungen_mahnkosten)
     return MahnkostenVorschau(
         vertrag_id=vertrag_id, stufe=stufe, hauptforderung_cent=hauptforderung_cent,
         zinsbasis="UNBERECHENBAR", zinssatz_prozent=None, zins_von=None, zins_bis=None,
         neue_zinsen_cent=0, bereits_gebuchte_zinsen_cent=0, neue_zinsen_delta_cent=0,
         neue_zinsen_delta_je_op_position={}, zins_segmente=(), zins_teilweise_ungeklaert=True,
         gebuehr_segmente=(), gebuehr_cent=None, gebuehr_rechtsgrundlage=None,
-        forderung_op_position_ids=tuple(f.op_position_id for f in forderungen),
+        forderung_op_position_ids=tuple(f.op_position_id for f in forderungen_kern),
         hinweise=(f"Zinsledger widersprüchlich, Zinsen/Gebühr bleiben blockiert: {grund}",),
+        bereits_offene_mahnkosten_cent=bereits_offene_mahnkosten_cent,
     )
 
 
@@ -617,6 +663,8 @@ def berechne_mahnkosten_vorschau(
     naechster_basiszinssatz_lookup,
     bereits_gebuchte_zinsen_je_op_position: dict[int, int],
     bereits_erhobene_gebuehr_schluessel: frozenset[str],
+    kanal: str = "EMAIL",
+    brief_anbieterprofil: BriefAnbieterProfilTable | None = None,
 ) -> MahnkostenVorschau:
     """Aggregiert ALLE offenen Forderungen dieses Vertrags zu EINER
     Mahnlauf-Kostenvorschau (Hauptforderung, Zinsen, Gebühr) - NIE eine
@@ -647,9 +695,37 @@ def berechne_mahnkosten_vorschau(
     Berechnungsweise) würde die Verzinsung einer genuin NEUEN Forderung
     fälschlich schlucken, sobald für eine ANDERE, mittlerweile
     abgelöste/geschlossene Forderung früher bereits Zinsen gebucht
-    wurden."""
+    wurden.
 
-    hauptforderung_cent = sum(f.rest_cent for f in forderungen)
+    `kanal`/`brief_anbieterprofil` (Auftrag Markus 14.09.2026, Brief-
+    Kostenpaket): §458 UGB (B2B, `ugb_scope`) und die §1333-Abs-2-ABGB-
+    Versandkosten-Ersatzfähigkeit (Nicht-B2B/Verbraucher, NUR Kanal
+    BRIEF) sind EINANDER AUSSCHLIESSEND für dieselbe Entgeltforderung -
+    ist B2B einschlägig, gilt AUSSCHLIESSLICH §458 (verschuldensunabhängig,
+    unabhängig vom tatsächlichen Porto), NIE zusätzlich die tatsächlichen
+    Versandkosten (keine doppelte Entschädigung). Beide teilen sich
+    DIESELBE `MahnkostenGebuehrTable`-Ledger-Exklusivität je
+    `entgeltforderung_schluessel` (siehe `GebuehrSegment`) - welche der
+    beiden Rechtsgrundlagen für eine Forderung zuerst reserviert wird,
+    besetzt sie dauerhaft; es gibt NIE einen nachträglichen Aufschlag auf
+    eine bereits einmal (ggf. reduziert) erhobene Position."""
+
+    # Rückprüfung 14.09.2026, echter Bug: eine vom Mahnwesen SELBST bereits
+    # gebuchte, noch offene Zinsen-/Gebühr-SOLL-Zeile
+    # (`OPPositionTable.quelle_system == "mahnkosten"`, siehe
+    # `kosten_service.py::buche_vorschau`) kommt über `offene_forderungen()`
+    # bei einer SPÄTEREN Vorschau erneut herein - sie ist aber keine echte
+    # Miet-/BK-Forderung und darf NIE nochmals in die Hauptforderung
+    # einfließen (das würde bereits gebuchte, noch unbezahlte Mahnkosten
+    # doppelt zählen: einmal hier, einmal implizit über die künftige
+    # Zahlung). Aus demselben Grund wird eine solche Zeile auch NIE selbst
+    # als neu zu bepauschalende "Entgeltforderung" behandelt (kein §458/
+    # §1333-Segment auf eine bereits gebuchte Mahnspesen-Zeile) und NIE ein
+    # zweites Mal verzinst.
+    forderungen_kern = [f for f in forderungen if f.quelle_system != "mahnkosten"]
+    forderungen_mahnkosten = [f for f in forderungen if f.quelle_system == "mahnkosten"]
+    hauptforderung_cent = sum(f.rest_cent for f in forderungen_kern)
+    bereits_offene_mahnkosten_cent = sum(f.rest_cent for f in forderungen_mahnkosten)
 
     aktuelles_profil, aktuell_unberechenbar = _profil_wirksam_am(zinsprofil_historie, heute)
     ugb_scope = ugb_anwendbar(aktuelles_profil)
@@ -674,7 +750,7 @@ def berechne_mahnkosten_vorschau(
     ausgeschlossen: list[str] = []
     alle_segmente: list[ZinsSegment] = []
 
-    for forderung in forderungen:
+    for forderung in forderungen_kern:
         perioden = balance_zeitreihe_fuer_forderung(
             ziel_op_position_id=forderung.op_position_id, alle_positionen=alle_positionen, heute=heute,
         )
@@ -721,27 +797,85 @@ def berechne_mahnkosten_vorschau(
     zins_bis = max((s.bis for s in alle_segmente), default=None)
 
     gebuehr_segmente: list[GebuehrSegment] = []
+    versandkosten_anbieteraufwand_cent: int | None = None
     if aktuell_unberechenbar:
         hinweise.append("§458 UGB: keine Mahngebühr, solange die Zinsprofil-Historie unberechenbar ist.")
-    elif not ugb_scope:
-        hinweise.append("§458 UGB gilt nur bei beiderseits unternehmensbezogenem Geschäft mit Vertragsdatum ab 16.03.2013 - keine Mahngebühr angesetzt.")
-    elif aktuelles_profil is None or aktuelles_profil.status != "GEPRUEFT" or aktuelles_profil.mahngebuehr_kostenbasis_cent is None:
-        hinweise.append("Mahngebühr: Klärung erforderlich (kein geprüftes Zinsprofil mit belegter §458-Kostenbasis hinterlegt).")
-    else:
-        rechtsgrundlage = f"§458 UGB - geprüfte Kostenbasis ({aktuelles_profil.mahngebuehr_kostenbasis_beleg or 'ohne Belegangabe'})"
-        fuer_gebuehr_qualifiziert = [
-            schluessel for schluessel in _faellige_entgeltforderungs_schluessel(forderungen, heute)
-            if schluessel not in bereits_erhobene_gebuehr_schluessel
-        ]
-        for schluessel in fuer_gebuehr_qualifiziert:
-            gebuehr_segmente.append(GebuehrSegment(schluessel, aktuelles_profil.mahngebuehr_kostenbasis_cent, rechtsgrundlage))
-        if gebuehr_segmente:
+    elif ugb_scope:
+        # §458 UGB (B2B) gilt EXKLUSIV für diese Entgeltforderung - selbst
+        # im Briefkanal NIE zusätzlich die tatsächlichen Versandkosten
+        # (keine doppelte Entschädigung, siehe Funktions-Docstring).
+        if aktuelles_profil is None or aktuelles_profil.status != "GEPRUEFT" or aktuelles_profil.mahngebuehr_kostenbasis_cent is None:
+            hinweise.append("Mahngebühr: Klärung erforderlich (kein geprüftes Zinsprofil mit belegter §458-Kostenbasis hinterlegt).")
+        elif not (0 <= aktuelles_profil.mahngebuehr_kostenbasis_cent <= S458_UGB_HOECHSTBETRAG_CENT):
+            # Defensiv (unabhängige Rückprüfung Codex 14.09.2026, echter
+            # Bug): `zinsprofil_anlegen` weist einen solchen Wert seit
+            # diesem Fix bereits beim Anlegen ab - ein BEREITS
+            # bestehendes, davor angelegtes ungültiges Profil (z. B. aus
+            # der Zeit vor der Formularumstellung von Cent auf EUR) wird
+            # hier trotzdem NIE stillschweigend verwendet, sondern die
+            # Pauschale bleibt sichtbar blockiert, bis das Profil
+            # korrigiert ist - niemals automatisch auf 40 EUR gekappt.
             hinweise.append(
-                f"§458 UGB: {len(gebuehr_segmente)} neue Pauschale(n) für bislang noch nicht bepauschalte "
-                "Entgeltforderung(en) - eine bereits erhobene Pauschale wird nie wiederholt."
+                f"Mahngebühr: geprüfte Kostenbasis ({aktuelles_profil.mahngebuehr_kostenbasis_cent / 100:.2f} EUR) "
+                f"überschreitet den gesetzlichen §458-UGB-Höchstbetrag von 40,00 EUR - Pauschale bleibt blockiert, "
+                "bis das Zinsprofil korrigiert ist."
             )
         else:
-            hinweise.append("§458 UGB: keine neue Pauschale - alle fälligen Entgeltforderungen wurden bereits einmalig bepauschalt.")
+            rechtsgrundlage = f"§458 UGB - geprüfte Kostenbasis ({aktuelles_profil.mahngebuehr_kostenbasis_beleg or 'ohne Belegangabe'})"
+            fuer_gebuehr_qualifiziert = [
+                schluessel for schluessel in _faellige_entgeltforderungs_schluessel(forderungen_kern, heute)
+                if schluessel not in bereits_erhobene_gebuehr_schluessel
+            ]
+            for schluessel in fuer_gebuehr_qualifiziert:
+                gebuehr_segmente.append(GebuehrSegment(schluessel, aktuelles_profil.mahngebuehr_kostenbasis_cent, rechtsgrundlage))
+            if gebuehr_segmente:
+                hinweise.append(
+                    f"§458 UGB: {len(gebuehr_segmente)} neue Pauschale(n) für bislang noch nicht bepauschalte "
+                    "Entgeltforderung(en) - eine bereits erhobene Pauschale wird nie wiederholt."
+                )
+            else:
+                hinweise.append("§458 UGB: keine neue Pauschale - alle fälligen Entgeltforderungen wurden bereits einmalig bepauschalt.")
+    elif kanal == "BRIEF":
+        # §1333 Abs 2 ABGB - Versandkosten-Ersatz gilt NUR für den
+        # Briefkanal bei einem NICHT-B2B-Vertrag (Verbraucher-Mieter
+        # eingeschlossen, anders als §458), NUR mit gebündelt geprüfter
+        # Ersatzfähigkeit UND einem tatsächlich freigegebenen Brief-
+        # Anbieterprofil - ein bloß vorhandenes Profil reicht NICHT
+        # (Auftrag Markus 14.09.2026).
+        if aktuelles_profil is None or aktuelles_profil.status != "GEPRUEFT" or not aktuelles_profil.versandkosten_ersatzfaehig_geprueft:
+            hinweise.append(
+                "§1333 Abs 2 ABGB: Versandkosten-Ersatzfähigkeit für diesen Vertrag nicht geprüft - "
+                "keine Versandkosten-Position angesetzt."
+            )
+        elif brief_anbieterprofil is None:
+            hinweise.append("§1333 Abs 2 ABGB: kein freigegebenes Brief-Anbieterprofil hinterlegt - keine Versandkosten-Position angesetzt.")
+        else:
+            versandkosten_anbieteraufwand_cent = (
+                brief_anbieterprofil.preis_druck_cent + brief_anbieterprofil.preis_kuvert_cent
+                + brief_anbieterprofil.preis_porto_cent + (brief_anbieterprofil.preis_nachweis_cent or 0)
+            )
+            ersatzfaehiger_betrag_cent = versandkosten_anbieteraufwand_cent
+            if brief_anbieterprofil.ersatzfaehiger_hoechstbetrag_cent is not None:
+                ersatzfaehiger_betrag_cent = min(ersatzfaehiger_betrag_cent, brief_anbieterprofil.ersatzfaehiger_hoechstbetrag_cent)
+            rechtsgrundlage = "§1333 Abs 2 ABGB - ersatzfähige Versandkosten (geprüft)"
+            fuer_gebuehr_qualifiziert = [
+                schluessel for schluessel in _faellige_entgeltforderungs_schluessel(forderungen_kern, heute)
+                if schluessel not in bereits_erhobene_gebuehr_schluessel
+            ]
+            for schluessel in fuer_gebuehr_qualifiziert:
+                gebuehr_segmente.append(GebuehrSegment(schluessel, ersatzfaehiger_betrag_cent, rechtsgrundlage))
+            if gebuehr_segmente:
+                hinweise.append(
+                    f"§1333 Abs 2 ABGB: {len(gebuehr_segmente)} neue ersatzfähige Versandkosten-Position(en) "
+                    "für bislang noch nicht belastete Entgeltforderung(en)."
+                )
+            else:
+                hinweise.append(
+                    "§1333 Abs 2 ABGB: keine neue Versandkosten-Position - alle fälligen Entgeltforderungen "
+                    "wurden bereits einmalig belastet."
+                )
+    else:
+        hinweise.append("§458 UGB gilt nur bei beiderseits unternehmensbezogenem Geschäft mit Vertragsdatum ab 16.03.2013 - keine Mahngebühr angesetzt.")
 
     gebuehr_cent = sum(s.betrag_cent for s in gebuehr_segmente) or None
     gebuehr_rechtsgrundlage = gebuehr_segmente[0].rechtsgrundlage if gebuehr_segmente else None
@@ -757,6 +891,15 @@ def berechne_mahnkosten_vorschau(
         neue_zinsen_delta_je_op_position=neue_zinsen_delta_je_op,
         zins_segmente=tuple(alle_segmente), zins_teilweise_ungeklaert=zins_teilweise_ungeklaert,
         gebuehr_segmente=tuple(gebuehr_segmente), gebuehr_cent=gebuehr_cent, gebuehr_rechtsgrundlage=gebuehr_rechtsgrundlage,
-        forderung_op_position_ids=tuple(f.op_position_id for f in forderungen),
+        # NUR die echten Miet-/BK-Forderungen (siehe Funktions-Docstring/
+        # `forderungen_kern` oben) - eine bereits gebuchte, noch offene
+        # Mahnkosten-Zeile ist keine vom Mahnlauf verfolgte "Forderung"
+        # und würde den daraus abgeleiteten `mahnlauf_schluessel`
+        # (`kosten_service.py::_mahnlauf_schluessel`) instabil machen,
+        # sobald diese Zeile später bezahlt wird und aus
+        # `offene_forderungen()` verschwindet.
+        forderung_op_position_ids=tuple(f.op_position_id for f in forderungen_kern),
         ausgeschlossene_forderungen_hinweis=tuple(ausgeschlossen), hinweise=tuple(hinweise),
+        versandkosten_anbieteraufwand_cent=versandkosten_anbieteraufwand_cent,
+        bereits_offene_mahnkosten_cent=bereits_offene_mahnkosten_cent,
     )

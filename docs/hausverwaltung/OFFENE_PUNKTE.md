@@ -3060,3 +3060,79 @@ sFTP/API ist noch nicht freigeschaltet (Stundungsvereinbarung mit der
 Post ausständig), daher bleibt der Briefkanal für einen echten Versand
 auch nach dieser Runde vollständig blockiert (`brief_transport_
 verfuegbar=False`), genau wie beauftragt.
+
+## Korrekturpaket Runde 8: §458-UGB-Höchstbetrag + Versandkosten-Berechnung + Hauptforderungs-Doppelzählung (14.09.2026)
+
+1. **Versandkosten-Berechnung (§1333 Abs 2 ABGB) für den Briefkanal fertig
+   verdrahtet** (Fortsetzung von Runde 7, Datenmodell/Gate waren bereits
+   vorhanden): `kosten.py::berechne_mahnkosten_vorschau` bekommt die
+   Parameter `kanal`/`brief_anbieterprofil` und weicht bei Kanal BRIEF +
+   Nicht-B2B + geprüfter `versandkosten_ersatzfaehig_geprueft` + einem
+   tatsächlich freigegebenen `BriefAnbieterProfilTable` auf den (ggf.
+   durch `ersatzfaehiger_hoechstbetrag_cent` gedeckelten) tatsächlichen
+   Anbieteraufwand (Druck+Kuvert+Porto+Nachweis) aus - §458 UGB (B2B) und
+   §1333 (Verbraucher/Brief) bleiben über dieselbe
+   `MahnkostenGebuehrTable`-Ledger-Exklusivität einander ausschließend,
+   keine doppelte Entschädigung. Neues Transparenzfeld
+   `versandkosten_anbieteraufwand_cent` (round-trip-fähig im
+   Kosten-/Inhaltssnapshot). `MahnkostenService.vorschau()`,
+   `MahnwesenService.versenden()`/`versende_mahnlauf()`,
+   `HVMailversandService` und das Backoffice (`_mahnkosten_vorschau_
+   block`, zeigt Kanal je Stufe und die Versandkosten-Zeilen) bis zu den
+   tatsächlichen Konstruktionsstellen durchverdrahtet - vorher war das
+   Feature nur in der reinen Berechnungsfunktion vorhanden, aber im
+   laufenden System inert.
+2. **§458 UGB Mahnspesen-Pauschale ohne gesetzliche Obergrenze akzeptiert**
+   (unabhängige Rückprüfung, echter Bug, konkreter Repro): `zinsprofil_
+   anlegen` nahm z. B. `mahngebuehr_kostenbasis_cent=10000` (100 EUR)
+   klaglos an - §458 UGB deckelt die Pauschale gesetzlich auf 40 EUR
+   (4000 Cent), unabhängig vom tatsächlichen Porto (Quelle:
+   https://www.ris.bka.gv.at/eli/drgbl/1897/219/P458/NOR40148646).
+   Gerade nach der Umstellung des Formulars von Cent auf EUR (Runde 7)
+   hätte ein alter, nicht mehr passender Formularwert hundertfach als
+   gesetzliche Pauschale weiterlaufen können. Fix zweischichtig: (a)
+   `kosten_repository.py::zinsprofil_anlegen` lehnt jeden Wert außerhalb
+   `[0, 4000]` Cent beim Anlegen mit `ValueError` ab; (b) defensiv in
+   `kosten.py::berechne_mahnkosten_vorschau` wird ein BEREITS
+   bestehendes, ungültiges Profil (Altdaten von vor diesem Fix) bei der
+   Berechnung sichtbar blockiert (Hinweis statt stiller Verwendung oder
+   automatischer Kappung auf 40 EUR) - eine reduzierte, tatsächlich
+   belegte Pauschale bleibt uneingeschränkt gültig. Keine bestehenden
+   Buchungen rückwirkend verändert. 4 neue gezielte Tests (Ablehnung bei
+   100 EUR, Ablehnung bei negativem Wert, Grenzwert 40 EUR bleibt
+   gültig, Berechnung blockiert ein simuliertes Altprofil mit 100 EUR).
+3. **Bereits gebuchte, noch offene Mahnkosten zählten bei einer späteren
+   Vorschau doppelt zur Hauptforderung** (unabhängige Rückprüfung, echter
+   Bug, konkreter Repro: 830 EUR Hauptforderung + geprüfte 40-EUR-§458-
+   Pauschale, gebucht am 14.09.; eine zweite Kostenvorschau am 28.09.
+   ergab fälschlich `hauptforderung_cent=87082` statt `83000`, weil die
+   von `kosten_service.py::buche_vorschau` selbst gebuchten Zinsen-/
+   Gebühr-SOLL-Zeilen (`OPPositionTable.quelle_system="mahnkosten"`,
+   `faelligkeit=None`) über `offene_forderungen()` bei der nächsten
+   Vorschau erneut als gewöhnliche Forderungszeile hereinkamen). Fix:
+   `op/service.py::OffeneForderung` bekommt das additive Feld
+   `quelle_system`; `kosten.py::berechne_mahnkosten_vorschau` (und
+   `vorschau_bei_ledger_inkonsistenz`) trennen die eingehenden
+   Forderungen strikt in echte Miet-/BK-Forderungen (`hauptforderung_
+   cent`) und bereits gebuchte, noch offene Mahnkosten (neues
+   Transparenzfeld `bereits_offene_mahnkosten_cent`, round-trip-fähig im
+   Snapshot) - eine Mahnkosten-Zeile wird dadurch auch nie selbst als
+   neu zu bepauschalende Entgeltforderung behandelt oder ein zweites Mal
+   verzinst (zusätzliche explizite Filterung, nicht mehr nur implizit
+   über `faelligkeit=None`). Im auf eine eingefrorene Gruppe begrenzten
+   Versandpfad (`MahnkostenService.vorschau(nur_op_position_ids=...)`,
+   gebündelter Mahnlauf-Versand) bleiben zugehörige, bereits offene
+   Mahnkosten-Zeilen jetzt ausdrücklich sichtbar, statt beim Scoping auf
+   die ursprüngliche Mitgliedermenge zu verschwinden. Backoffice-Vorschau
+   zeigt die noch offenen Mahnkosten als eigene Zeile und bezieht sie in
+   den "Gesamtbetrag" korrekt mit ein (vorher hätte deren Ausschluss aus
+   der Hauptforderung sie sonst aus dem Gesamtbetrag verschwinden
+   lassen). Ein bestehender Test (`test_zinsdelta_einer_neuen_forderung_
+   wird_nicht_durch_eine_alte_abgeloeste_geschluckt`), der die alte,
+   fehlerhafte Zusammenzählung noch als erwartetes Verhalten geprüft
+   hatte, wurde korrigiert. 3 neue gezielte Tests (exakter 830/87082-vs-
+   83000-Repro, derselbe Repro über den gruppenbegrenzten Pfad,
+   Portal-Rendering-Smoke-Test).
+
+10 neue/erweiterte Tests, 1017/1017 grün im Gesamtlauf. Nur synthetische
+Testdaten, kein Deployment, kein Serverzugriff, kein Liveversand.

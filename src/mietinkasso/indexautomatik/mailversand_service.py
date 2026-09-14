@@ -15,7 +15,10 @@ from mietinkasso.infrastructure.db.tables import (
 )
 from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
 from mietinkasso.mahnwesen.kosten_service import MahnkostenService
-from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnLaufRepository, MahnPolicyRepository
+from mietinkasso.mahnwesen.repository import (
+    BriefAnbieterProfilRepository, MahnFallRepository, MahnKanalregelRepository, MahnLaufRepository,
+    MahnPolicyRepository,
+)
 from mietinkasso.mahnwesen.service import MahnwesenService, VersandErgebnis
 from mietinkasso.op.repository import OPRepository
 from mietinkasso.op.service import OPService
@@ -97,10 +100,25 @@ class HVMailversandService:
         self.mahnlauf_repo = MahnLaufRepository(session_factory)
         self.policy_repo = MahnPolicyRepository(session_factory)
         self.mahnkosten_repo = MahnkostenRepository(session_factory)
-        self.mahnkosten_service = MahnkostenService(self.mahnkosten_repo, self.op_service, bundle.stammdaten_repository)
+        # Kanalregel/Brief-Anbieterprofil (Auftrag HV-20260914-MAHNUNG-
+        # BRIEF): Repositories bewusst IMMER verdrahtet - der Default-
+        # Kanal bleibt trotzdem EMAIL für beide Stufen, solange Codex
+        # keine Kanalregel freigibt (siehe `MahnwesenService._resolve_
+        # kanal`-Docstring), und `brief_transport_verfuegbar=False` hält
+        # den Briefkanal unabhängig davon vollständig blockiert - kein
+        # erfundener Live-Provider, EinfachBrief sFTP/API ist noch nicht
+        # freigeschaltet.
+        self.kanalregel_repo = MahnKanalregelRepository(session_factory)
+        self.brief_anbieterprofil_repo = BriefAnbieterProfilRepository(session_factory)
+        self.mahnkosten_service = MahnkostenService(
+            self.mahnkosten_repo, self.op_service, bundle.stammdaten_repository,
+            brief_anbieterprofil_repository=self.brief_anbieterprofil_repo,
+        )
         self.mahn_service = MahnwesenService(self.mahn_repo, bundle.stammdaten_repository,
             self.op_service, self.policy_repo, bank_stand_max_age_days=settings.bank_stand_max_age_days,
-            mahnkosten_service=self.mahnkosten_service, mahnlauf_repository=self.mahnlauf_repo)
+            mahnkosten_service=self.mahnkosten_service, mahnlauf_repository=self.mahnlauf_repo,
+            kanalregel_repository=self.kanalregel_repo, brief_anbieterprofil_repository=self.brief_anbieterprofil_repo,
+            brief_transport_verfuegbar=False)
 
     def owner_senden(self, auftrag):
         if self.client is None or not self.settings.hv_mail_allowlist_bestaetigt:
@@ -170,6 +188,7 @@ class HVMailversandService:
                 vorschau = self.mahnkosten_service.vorschau(
                     vertrag_id=mahnlauf.vertrag_id, stufe=mahnlauf.stufe, heute=heute,
                     nur_op_position_ids=frozenset(m.forderung_op_position_id for m in mitglieder),
+                    kanal=mahnlauf.kanal,
                 )
                 vorschau_slot["vorschau"] = vorschau
             else:

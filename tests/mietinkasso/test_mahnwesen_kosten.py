@@ -327,8 +327,12 @@ def test_zinsdelta_einer_neuen_forderung_wird_nicht_durch_eine_alte_abgeloeste_g
     # Die alte HAUPTforderung selbst ist getilgt; die für sie schon
     # gebuchte, noch offene Zinsposition (`faelligkeit=None`, daher NIE
     # selbst mitverzinst) bleibt bis zu ihrer eigenen Zahlung ein
-    # separater offener Posten.
-    assert vorschau.hauptforderung_cent == 3_000 + zinsen_alte_forderung
+    # separater offener Posten - GETRENNT von der Hauptforderung
+    # ausgewiesen (`bereits_offene_mahnkosten_cent`, Rückprüfung
+    # 14.09.2026, echter Bug: eine bereits vom Mahnwesen selbst gebuchte
+    # Zeile zählt NIE erneut als Hauptforderung).
+    assert vorschau.hauptforderung_cent == 3_000
+    assert vorschau.bereits_offene_mahnkosten_cent == zinsen_alte_forderung
     assert vorschau.neue_zinsen_cent == zinsen_neue_forderung
     # Der Kern des Fixes: das Delta ist NICHT 0, obwohl vertragsweit
     # bereits mehr Zinsen gebucht wurden, als die neue Forderung selbst
@@ -1090,6 +1094,164 @@ def test_mahngebuehr_zwei_genuin_unterschiedliche_monate_ergeben_zwei_pauschalen
     )
     assert stufe2 is not None
     assert stufe2.gebuehr_cent == 1500  # nur der DRITTE, bisher unbepauschalte Monat
+
+
+def test_zinsprofil_anlegen_lehnt_kostenbasis_ueber_40_euro_ab(kosten_repo, basis_vertrag):
+    """Rückprüfung 14.09.2026, echter Bug: `zinsprofil_anlegen` akzeptierte
+    mahngebuehr_kostenbasis_cent=10000 (100 EUR) klaglos - §458 UGB deckelt
+    die Pauschale gesetzlich auf 40 EUR, unabhängig vom tatsächlichen Porto.
+    Quelle: https://www.ris.bka.gv.at/eli/drgbl/1897/219/P458/NOR40148646"""
+
+    vertrag, _konto = basis_vertrag
+    with pytest.raises(ValueError, match="§458"):
+        kosten_repo.zinsprofil_anlegen(
+            vertrag_id=vertrag.id, erstellt_von="test", ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+            mahngebuehr_kostenbasis_cent=10_000, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+        )
+
+
+def test_zinsprofil_anlegen_lehnt_negative_kostenbasis_ab(kosten_repo, basis_vertrag):
+    vertrag, _konto = basis_vertrag
+    with pytest.raises(ValueError, match="§458"):
+        kosten_repo.zinsprofil_anlegen(
+            vertrag_id=vertrag.id, erstellt_von="test", ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+            mahngebuehr_kostenbasis_cent=-1, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+        )
+
+
+def test_zinsprofil_anlegen_akzeptiert_genau_40_euro_als_gueltige_obergrenze(kosten_repo, basis_vertrag):
+    """Der gesetzliche Höchstbetrag selbst (4000 Cent = 40 EUR) bleibt
+    ein gültiger, reduzierter Wert - nur AUSSERHALB [0, 4000] wird
+    abgelehnt."""
+
+    vertrag, _konto = basis_vertrag
+    profil = kosten_repo.zinsprofil_anlegen(
+        vertrag_id=vertrag.id, erstellt_von="test", ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=4000, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+    )
+    assert profil.mahngebuehr_kostenbasis_cent == 4000
+
+
+def test_mahngebuehr_blockiert_bereits_vorhandenes_ungueltiges_profil_bei_berechnung(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag, session_factory,
+):
+    """Rückprüfung 14.09.2026, echter Bug: ein VOR diesem Fix bereits
+    angelegtes/freigegebenes Profil mit ungültiger Kostenbasis (z. B. aus
+    der Zeit vor Umstellung des Formulars von Cent auf EUR) darf NICHT
+    stillschweigend als gesetzliche Pauschale weiterverwendet werden -
+    die Berechnung muss ein solches Altprofil sichtbar blockieren, statt
+    es entweder zu ignorieren oder auf 40 EUR zu kappen."""
+
+    from datetime import datetime, timezone
+
+    from mietinkasso.infrastructure.db.tables import ZinsprofilTable
+
+    vertrag, konto = basis_vertrag
+    # Simuliert ein bereits vorhandenes, ungültiges Profil, das die
+    # Validierung in `zinsprofil_anlegen` NICHT durchlaufen hat (Altdaten
+    # von vor diesem Fix) - direkter Rohzugriff statt Repository-Methode.
+    with session_factory() as session:
+        session.add(ZinsprofilTable(
+            vertrag_id=vertrag.id, version=1, status="GEPRUEFT",
+            ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+            mahngebuehr_kostenbasis_cent=10_000, mahngebuehr_kostenbasis_beleg="Alt-Beleg",
+            erstellt_von="test", geprueft_von="test", geprueft_am=datetime.now(timezone.utc),
+        ))
+        session.commit()
+
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), leistungsperiode="2026-01", beleg_referenz="HMZ Jänner",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1))
+
+    assert vorschau is not None
+    assert vorschau.gebuehr_cent is None
+    assert not vorschau.gebuehr_segmente
+    assert any("überschreitet den gesetzlichen §458-UGB-Höchstbetrag" in h for h in vorschau.hinweise)
+
+
+# -- Bereits gebuchte Mahnkosten zählen NIE erneut zur Hauptforderung ------
+
+
+def test_bereits_gebuchte_mahnkosten_zaehlen_bei_spaeterer_vorschau_nicht_erneut_zur_hauptforderung(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Rückprüfung 14.09.2026, echter Bug (konkreter Repro): 830 EUR
+    Hauptforderung, geprüfte zulässige 40-EUR-§458-Pauschale. Erste
+    Kostenvorschau am 14.09. bucht Zinsen+Gebühr als eigene, weiterhin
+    offene SOLL-Zeilen (`quelle_system="mahnkosten"`). Eine ZWEITE
+    Kostenvorschau am 28.09. darf diese bereits gebuchten, noch offenen
+    Zeilen NICHT ein zweites Mal aus `offene_forderungen()` als
+    Hauptforderung mitzählen (die alte, fehlerhafte Berechnung ergab
+    fälschlich 87082 statt 83000 Cent) - sie erscheinen stattdessen
+    GETRENNT über `bereits_offene_mahnkosten_cent`."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=4000, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=83_000,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1),
+        faelligkeit=date(2026, 8, 5), leistungsperiode="2026-08", beleg_referenz="HMZ August",
+    )
+
+    stufe1 = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 9, 14),
+        versandnachweis_referenz="mahnung:stufe1", akteur="test",
+    )
+    assert stufe1 is not None
+    assert stufe1.gebuehr_cent == 4000
+    bereits_gebuchte_mahnkosten_gesamt_cent = stufe1.zinsen_cent + stufe1.gebuehr_cent
+    assert bereits_gebuchte_mahnkosten_gesamt_cent > 4000  # es sind auch tatsächlich Zinsen angefallen
+
+    vorschau2 = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=2, heute=date(2026, 9, 28))
+
+    assert vorschau2 is not None
+    assert vorschau2.hauptforderung_cent == 83_000
+    assert vorschau2.bereits_offene_mahnkosten_cent == bereits_gebuchte_mahnkosten_gesamt_cent
+
+
+def test_gruppenscoping_verliert_zugehoerige_bereits_offene_mahnkosten_nicht(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Derselbe Repro wie oben, aber über den auf eine eingefrorene Gruppe
+    begrenzten `nur_op_position_ids`-Pfad (gebündelter Mahnlauf-Versand,
+    siehe `mahnwesen/service.py::versende_mahnlauf`): die zugehörige,
+    bereits gebuchte, noch offene Mahnspesen-/Zinsen-Zeile darf NICHT
+    verschwinden, nur weil ihre eigene `op_position_id` nicht Teil der
+    ursprünglichen Mitgliedermenge (der HMZ-Forderung) ist."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=4000, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+    )
+    hmz = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=83_000,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1),
+        faelligkeit=date(2026, 8, 5), leistungsperiode="2026-08", beleg_referenz="HMZ August",
+    )
+
+    stufe1 = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 9, 14),
+        versandnachweis_referenz="mahnung:stufe1", akteur="test",
+    )
+    assert stufe1 is not None
+    bereits_gebuchte_mahnkosten_gesamt_cent = stufe1.zinsen_cent + stufe1.gebuehr_cent
+
+    vorschau2 = kosten_service.vorschau(
+        vertrag_id=vertrag.id, stufe=2, heute=date(2026, 9, 28),
+        nur_op_position_ids=frozenset({hmz.id}),
+    )
+
+    assert vorschau2 is not None
+    assert vorschau2.hauptforderung_cent == 83_000
+    assert vorschau2.bereits_offene_mahnkosten_cent == bereits_gebuchte_mahnkosten_gesamt_cent
 
 
 def test_reserviere_und_kuerze_vorschau_entfernt_von_anderer_gruppe_bereits_reserviertes_segment(

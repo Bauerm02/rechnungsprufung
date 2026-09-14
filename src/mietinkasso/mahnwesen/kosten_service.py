@@ -64,14 +64,21 @@ def _segmente_als_json(vorschau: MahnkostenVorschau) -> str:
 class MahnkostenService:
     def __init__(
         self, repository: MahnkostenRepository, op_service: OPService, stammdaten_repository: StammdatenRepository,
+        *, brief_anbieterprofil_repository=None,
     ):
         self._repository = repository
         self._op_service = op_service
         self._stammdaten_repository = stammdaten_repository
+        # Optional (Auftrag Markus 14.09.2026, Brief-Kostenpaket) - ohne
+        # konfiguriertes Repository bleibt `kanal="BRIEF"` OHNE
+        # Versandkosten-Position (siehe `kosten.py::berechne_mahnkosten_
+        # vorschau`), damit ein Aufrufer ohne dieses Repository unverändert
+        # weiterläuft.
+        self._brief_anbieterprofil_repository = brief_anbieterprofil_repository
 
     def vorschau(
         self, *, vertrag_id: str, stufe: int, heute: date,
-        nur_op_position_ids: frozenset[int] | None = None,
+        nur_op_position_ids: frozenset[int] | None = None, kanal: str = "EMAIL",
     ) -> MahnkostenVorschau | None:
         """`nur_op_position_ids`: unabhängige Rückprüfung Codex
         14.09.2026 - die Kostenbasis (Hauptforderung/Zinsen/§458-Gebühr)
@@ -90,7 +97,18 @@ class MahnkostenService:
             return None
         forderungen = self._op_service.offene_forderungen(konto.id, heute=heute)
         if nur_op_position_ids is not None:
-            forderungen = [f for f in forderungen if f.op_position_id in nur_op_position_ids]
+            # Rückprüfung 14.09.2026, echter Bug: eine bereits vom
+            # Mahnwesen selbst gebuchte, noch offene Zinsen-/Gebühr-Zeile
+            # (`quelle_system == "mahnkosten"`) gehört zu KEINER
+            # einzelnen Gruppe von Mitglieds-OP-Ids - sie bleibt vertrags-
+            # weit sichtbar (für `bereits_offene_mahnkosten_cent`, siehe
+            # `kosten.py::berechne_mahnkosten_vorschau`), statt beim
+            # Scoping auf eine bestimmte, eingefrorene Mahnlauf-Gruppe
+            # (`nur_op_position_ids`) fälschlich zu verschwinden.
+            forderungen = [
+                f for f in forderungen
+                if f.op_position_id in nur_op_position_ids or f.quelle_system == "mahnkosten"
+            ]
         alle_positionen = self._op_service.berechne_saldo(konto.id, stichtag=heute).positionen
         zinsprofil_historie = self._repository.historie_geprueft(vertrag_id)
         # Vertragsweit (NICHT je Stufe) - Stufe 2 rechnet dieselben, bei
@@ -105,12 +123,16 @@ class MahnkostenService:
         except ZinsledgerInkonsistentError as exc:
             return vorschau_bei_ledger_inkonsistenz(vertrag_id=vertrag_id, stufe=stufe, forderungen=forderungen, grund=str(exc))
         bereits_erhobene_gebuehren = self._repository.bereits_erhobene_gebuehr_schluessel(vertrag_id=vertrag_id)
+        brief_anbieterprofil = None
+        if kanal == "BRIEF" and self._brief_anbieterprofil_repository is not None:
+            brief_anbieterprofil = self._brief_anbieterprofil_repository.aktuelle_freigegebene()
         return berechne_mahnkosten_vorschau(
             vertrag_id=vertrag_id, stufe=stufe, forderungen=forderungen, alle_positionen=alle_positionen,
             heute=heute, zinsprofil_historie=zinsprofil_historie, basiszinssatz_lookup=self._repository.basiszinssatz_fuer_datum,
             naechster_basiszinssatz_lookup=self._repository.naechster_basiszinssatz_ab,
             bereits_gebuchte_zinsen_je_op_position=bereits_gebuchte_zinsen_je_op,
             bereits_erhobene_gebuehr_schluessel=bereits_erhobene_gebuehren,
+            kanal=kanal, brief_anbieterprofil=brief_anbieterprofil,
         )
 
     def buche_bei_versand(

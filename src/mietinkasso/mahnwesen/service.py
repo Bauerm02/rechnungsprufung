@@ -650,7 +650,10 @@ class MahnwesenService:
             if mahnkosten_vorschau_slot is not None and "vorschau" in mahnkosten_vorschau_slot:
                 vorschau = mahnkosten_vorschau_slot["vorschau"]
             else:
-                vorschau = self._mahnkosten_service.vorschau(vertrag_id=vertrag.id, stufe=mahnfall.stufe, heute=heute)
+                vorschau = self._mahnkosten_service.vorschau(
+                    vertrag_id=vertrag.id, stufe=mahnfall.stufe, heute=heute,
+                    kanal=mahnfall.snapshot.get("kanal", "EMAIL"),
+                )
             if vorschau is not None:
                 self._mahnkosten_service.buche_vorschau(
                     ctx=ctx, vorschau=vorschau, heute=heute,
@@ -903,6 +906,7 @@ class MahnwesenService:
                 vorschau = self._mahnkosten_service.vorschau(
                     vertrag_id=vertrag.id, stufe=mahnlauf.stufe, heute=heute,
                     nur_op_position_ids=frozenset(m.forderung_op_position_id for m in mitglieder),
+                    kanal=mahnlauf.kanal,
                 )
 
         if not self._mahnlauf_repository.claim_fuer_versand(
