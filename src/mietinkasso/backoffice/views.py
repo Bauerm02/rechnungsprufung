@@ -195,7 +195,7 @@ _SPERRGRUND_LABEL = {
     "MIETMINDERUNG": "Mietminderung geltend gemacht",
     "RATENPLAN": "Ratenplan vereinbart",
     "INSOLVENZ": "Insolvenzverfahren",
-    "RECHTSANWALT": "Anwaltlich vertreten",
+    "RECHTSANWALT": "Beim Rechtsanwalt",
     "UNGEKLAERTER_EINGANG": "Ungeklärter Zahlungseingang",
     "UNKLARER_EROEFFNUNGSSALDO": "Unklarer Eröffnungssaldo",
     "BOUNCE": "E-Mail unzustellbar",
@@ -267,7 +267,7 @@ def seite(
   body {{
     font-family: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
     font-size: 15px; line-height: 1.5; font-weight: 400; margin: 0;
-    background: var(--creme); color: var(--anthrazit); overflow-x: hidden;
+    background: var(--creme); color: var(--anthrazit);
   }}
   h1, h2, h3, .schriftzug {{ font-family: inherit; font-weight: 600; line-height: 1.3; }}
   h1 {{ font-size: 1.35rem; }}
@@ -340,34 +340,49 @@ def seite(
   .todo-liste {{ list-style: none; margin: 0; padding: 0; }}
   .todo-liste li {{ padding: 0.4rem 0; border-bottom: 1px solid #eee; }}
   .todo-liste li:last-child {{ border-bottom: none; }}
-  /* Aufgabenliste (Dashboard "Das ist zu erledigen"): Name in eigener
-     Zeile, Objekt/Top sekundär (kleiner/gedämpft) darunter, je Grund
-     Text links und Aktionsbutton rechts ausgerichtet - siehe
-     Media-Query unten fürs geordnete Stapeln ab 820px. */
+  /* Aufgabenliste (Dashboard "Das ist zu erledigen") - Rückprüfung
+     Codex 14.09.2026: KEINE farbig gefüllten "Pillen"/Balken mehr für
+     ganze Satzstrecken (das erzeugte die "langen roten/gelben
+     Fettstreifen") und KEINE vollbreiten schwarzen Buttons bei 820px.
+     Name in eigener Zeile, Objekt/Top sekundär darunter. Je Grund: ein
+     Grid aus Text (links, schrumpft nie unter 0, bricht per
+     `overflow-wrap`) und einem ruhigen, schmalen Outline-Button
+     (rechts, fixe Breite) - erst bei sehr schmalem Viewport (≤520px)
+     wird untereinander gestapelt, NIE dazwischen. */
   .aufgaben-liste {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; }}
   .aufgaben-karte {{ border: 1px solid #ddd; border-left: 3px solid var(--gold); border-radius: 6px; padding: 0.6rem 0.8rem; background: #fff; }}
   .aufgaben-karte-kopf {{ margin-bottom: 0.4rem; display: flex; flex-direction: column; gap: 0.1rem; }}
   .aufgaben-name {{ font-weight: 600; }}
-  .aufgaben-gruende {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }}
+  .aufgaben-gruende {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }}
   .aufgaben-gruende li {{
-    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.4rem 0.75rem;
+    display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px;
   }}
-  .aufgaben-grund-text {{ flex: 1 1 auto; min-width: 0; }}
+  .aufgaben-grund-text {{
+    min-width: 0; font-size: 14px; font-weight: 400; line-height: 1.5; color: var(--anthrazit);
+    background: transparent; overflow-wrap: anywhere;
+  }}
+  .grund-punkt {{
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px;
+    vertical-align: middle; flex: 0 0 auto;
+  }}
+  .grund-punkt-warn {{ background: #c9820f; }}
+  .grund-punkt-error {{ background: #b00020; }}
   a.aufgabe-aktion {{
-    display: inline-block; flex: 0 0 auto; padding: 0.3rem 0.75rem; border-radius: 4px;
-    border: 1px solid var(--anthrazit); background: var(--anthrazit); color: #fff; text-decoration: none;
-    font-size: 0.82rem; font-weight: 600; white-space: nowrap;
+    display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box;
+    min-height: 36px; width: 150px; padding: 0 0.9rem; border-radius: 4px;
+    border: 1px solid var(--anthrazit); background: #fff; color: var(--anthrazit); text-decoration: none;
+    font-size: 0.82rem; font-weight: 600; white-space: nowrap; justify-self: end;
   }}
-  a.aufgabe-aktion:hover {{ background: var(--anthrazit-hell); }}
+  a.aufgabe-aktion:hover {{ background: #f2f0ea; }}
   .status-zeile {{ display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; font-size: 0.85rem; color: #555; margin: 0.5rem 0; }}
   details > summary {{ cursor: pointer; color: var(--anthrazit); font-weight: 600; }}
   img {{ max-width: 100%; }}
-  @media (max-width: 820px) {{
-    /* Auftrag HV-20260914-UI-LESBAR: Button/Grund-Zeilen wrappten hier
-       bisher chaotisch - ab dieser Breite wird geordnet gestapelt statt
-       nebeneinander gequetscht. */
-    .aufgaben-gruende li {{ flex-direction: column; align-items: stretch; }}
-    a.aufgabe-aktion {{ text-align: center; }}
+  code, pre {{ overflow-wrap: anywhere; }}
+  @media (max-width: 520px) {{
+    /* Erst hier untereinander stapeln - bei 820px bleibt die Zeile
+       zweispaltig (Text/Button nebeneinander), niemals vollbreit. */
+    .aufgaben-gruende li {{ grid-template-columns: 1fr; }}
+    a.aufgabe-aktion {{ width: auto; justify-self: start; }}
   }}
   @media (max-width: 640px) {{
     main {{ padding: 0.75rem; }}

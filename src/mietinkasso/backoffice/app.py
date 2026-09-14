@@ -473,13 +473,20 @@ def _erledigen_html(uebersicht) -> str:
             # Verständliche Labels statt Rohcodes (Auftrag HV-20260914-UI-
             # LESBAR: "MANUELL/RECHTSANWALT/RATENPLAN übersetzen") - der
             # Rohcode bleibt zusätzlich als title-Tooltip erhalten, keine
-            # Information geht verloren.
+            # Information geht verloren. Kurzer lesbarer Titel + Grund(e)
+            # primär sichtbar, der erklärende Satz ("keine Aufforderung
+            # zum Entsperren") steht aufklappbar darunter - Betrag und
+            # ALLE Gründe bleiben immer sichtbar (Rückprüfung Codex
+            # 14.09.2026: kein langer, farbig gefüllter Fließtextbalken
+            # mehr für diesen Grund).
             gruende_labels = ", ".join(sperrgrund_label(g) for g in z.sperrgruende)
             gruende_codes = ", ".join(z.sperrgruende)
             e["gruende"].append((
                 "error",
-                f'<span title="{h(gruende_codes)}">Aktive Mahnsperre ({h(gruende_labels)})</span> bei offenem '
-                f"Betrag {eur(z.saldo_cent)} - vor einer Mahnung berücksichtigen",
+                f'<span title="{h(gruende_codes)}"><strong>Mahnsperre aktiv:</strong> {h(gruende_labels)}</span> '
+                f"· {eur(z.saldo_cent)} offen "
+                '<details><summary>Was bedeutet das?</summary><p class="muted">Eine aktive Sperre ist vor '
+                "einer Mahnung zu berücksichtigen - sie ist KEINE Aufforderung, sie aufzuheben.</p></details>",
                 "Status prüfen",
                 f"/backoffice/vertrag/{h(z.vertrag_id)}{von_objekt_param}#sperren",
             ))
@@ -496,7 +503,8 @@ def _erledigen_html(uebersicht) -> str:
         karten = []
         for e in eintraege.values():
             gruende_html = "".join(
-                f'<li><span class="aufgaben-grund-text"><span class="badge badge-{stil}">{text}</span></span> '
+                f'<li><span class="aufgaben-grund-text"><span class="grund-punkt grund-punkt-{stil}"></span>'
+                f'{text}</span>'
                 f'<a class="aufgabe-aktion" href="{link}">{h(aktion)}</a></li>'
                 for stil, text, aktion, link in e["gruende"]
             )
@@ -844,7 +852,11 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
 
     return _layout(
         request, session, "Übersicht",
-        auswahl_form + erledigen_html + kpi_html + kompakt_tabelle
+        # Auftrag HV-20260914-UI-LESBAR: die vier Kennzahlen stehen VOR
+        # "Das ist zu erledigen" (Reihenfolge aus dem Auftrag), unmittelbar
+        # nach dem kompakten Objektfilter - reine Reihenfolgeänderung,
+        # alle Werte/Berechnungen bleiben unverändert.
+        auswahl_form + kpi_html + erledigen_html + kompakt_tabelle
         + mietkonten_tabelle + positionen_tabelle + mahnfaelle_tabelle + bestand_tabelle,
     )
 

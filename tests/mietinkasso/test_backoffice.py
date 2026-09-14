@@ -444,8 +444,8 @@ def test_dashboard_sperre_auf_offenem_konto_wird_als_zu_erledigen_gezaehlt(backo
         dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
         assert dashboard.status_code == 200
         abschnitt = dashboard.text.split("<h2>Das ist zu erledigen</h2>")[1].split("<h2>")[0]
-        assert "Aktive Mahnsperre" in abschnitt
-        assert "vor einer Mahnung berücksichtigen" in abschnitt
+        assert "Mahnsperre aktiv" in abschnitt
+        assert "vor einer Mahnung zu berücksichtigen" in abschnitt
         assert "Status prüfen" in abschnitt
         assert "aufheben" not in abschnitt.lower()
         assert "entsperren" not in abschnitt.lower()
@@ -676,7 +676,7 @@ def test_dashboard_sperre_und_abweichung_werden_gleichzeitig_angezeigt(backoffic
         aufgaben_abschnitt = dashboard.text.split("<h2>Das ist zu erledigen</h2>")[1].split("<h2>")[0]
         assert "Top Sperre Abweichung" in aufgaben_abschnitt
         assert "Abweichung Kontostand/Einzelpositionen" in aufgaben_abschnitt
-        assert "Aktive Mahnsperre" in aufgaben_abschnitt
+        assert "Mahnsperre aktiv" in aufgaben_abschnitt
     finally:
         stammdaten.sperre_aufheben(sperre_id)
 
