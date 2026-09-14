@@ -453,6 +453,13 @@ class MahnkostenVorschau:
     neue_zinsen_cent: int
     bereits_gebuchte_zinsen_cent: int
     neue_zinsen_delta_cent: int
+    # JE `op_position_id` (nicht nur die Summe `neue_zinsen_delta_cent`) -
+    # wird 1:1 in `MahnkostenBuchungTable.zinsen_delta_je_op_json`
+    # persistiert (unabhängige Rückprüfung Codex 14.09.2026: NUR dieses
+    # Delta darf später als "bereits gebucht" gegengerechnet werden,
+    # NIEMALS die volle, ab der Fälligkeit neu berechnete
+    # `zins_segmente`-Periode - siehe `MahnkostenBuchungTable`-Docstring).
+    neue_zinsen_delta_je_op_position: dict[int, int]
     zins_segmente: tuple[ZinsSegment, ...]
     zins_teilweise_ungeklaert: bool  # mind. ein Segment hat satz_prozent=None
     gebuehr_segmente: tuple[GebuehrSegment, ...]
@@ -566,12 +573,16 @@ def berechne_mahnkosten_vorschau(
     # siehe Funktions-Docstring/Rückprüfung Codex 14.09.2026.
     betroffene_ops = {s.op_position_id for s in alle_segmente}
     neue_zinsen_delta_gesamt = 0
+    neue_zinsen_delta_je_op: dict[int, int] = {}
     bereits_gebuchte_relevant_cent = 0
     for op_id in betroffene_ops:
         zinsen_dieser_op = sum(s.zinsen_cent for s in alle_segmente if s.op_position_id == op_id)
         bereits_op = bereits_gebuchte_zinsen_je_op_position.get(op_id, 0)
         bereits_gebuchte_relevant_cent += min(zinsen_dieser_op, bereits_op)
-        neue_zinsen_delta_gesamt += max(zinsen_dieser_op - bereits_op, 0)
+        delta = max(zinsen_dieser_op - bereits_op, 0)
+        neue_zinsen_delta_gesamt += delta
+        if delta > 0:
+            neue_zinsen_delta_je_op[op_id] = delta
 
     zins_teilweise_ungeklaert = any(s.satz_prozent is None for s in alle_segmente)
     if zins_teilweise_ungeklaert:
@@ -620,6 +631,7 @@ def berechne_mahnkosten_vorschau(
         zins_von=zins_von, zins_bis=zins_bis, neue_zinsen_cent=neue_zinsen_gesamt,
         bereits_gebuchte_zinsen_cent=bereits_gebuchte_relevant_cent,
         neue_zinsen_delta_cent=neue_zinsen_delta_gesamt,
+        neue_zinsen_delta_je_op_position=neue_zinsen_delta_je_op,
         zins_segmente=tuple(alle_segmente), zins_teilweise_ungeklaert=zins_teilweise_ungeklaert,
         gebuehr_segmente=tuple(gebuehr_segmente), gebuehr_cent=gebuehr_cent, gebuehr_rechtsgrundlage=gebuehr_rechtsgrundlage,
         forderung_op_position_ids=tuple(f.op_position_id for f in forderungen),

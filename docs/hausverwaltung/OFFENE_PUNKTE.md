@@ -2516,8 +2516,8 @@ markiert, nur festgehalten für eine spätere Runde):**
   melden) - im BESTEHENDEN deterministischen Programm/Erzeuger, KEINE
   neue KI- oder Parallelautomation.
 - Standardregel "erste Mahnung E-Mail / zweite Brief" versus "beide
-  E-Mail" ist NOCH NICHT beantwortet - keine Annahme treffen, bis der
-  Nutzer sich festlegt.
+  E-Mail" wurde vom Nutzer INZWISCHEN entschieden (Stufe 1 EMAIL,
+  Stufe 2 BRIEF) - siehe eigener Abschnitt unten, sobald umgesetzt.
 - Geplante vereinfachte Oberfläche: Übersicht mit Objektfilter und
   konkreten Aufgaben; EINE Akte je Mietverhältnis (Zahlungen/Mahnungen/
   Abrechnungen zusammengefasst); technische Details bleiben
@@ -2526,3 +2526,62 @@ markiert, nur festgehalten für eine spätere Runde):**
 - Keine neue UI-/Versandimplementierung aus dieser Backlog-Ergänzung
   wurde in dieser Runde begonnen - Korrektur/Abnahme der Mahn- und
   Briefbasis bleibt Priorität.
+
+## Korrekturpaket: unabhängige Abnahme auf Commit b2d3b12 (14.09.2026)
+
+Zwei unabhängig gemeldete, ECHTE Bugs im gerade zuvor gebauten
+Gruppensperre-Mechanismus/Zinsledger wurden noch VOR dem geplanten
+Kanal-/Kostenpaket behoben (beide mit exaktem Reproduktionstest des
+gemeldeten Ablaufs):
+
+1. **Überlappende Mahnlauf-Gruppen konnten dieselbe Forderung zweimal
+   tatsächlich versenden**: der `MahnLaufTable.outbox_key` war nur aus
+   der eingefrorenen Mitgliedermenge gebildet - eine in einer ERSTEN,
+   noch ungelösten Gruppe {A} steckende Forderung A blieb selbst
+   weiterhin `GEPLANT` und konnte von einem ZWEITEN Planungsversuch
+   (sobald eine genuin neue Forderung B fällig wurde) erneut in eine
+   überlappende Gruppe {A, B} aufgenommen werden. Fix: neuer
+   `MahnStatus.GEBUENDELT` - `MahnwesenService.plane_mahnlauf` claimt
+   ALLE Kandidaten ATOMAR (`MahnFallRepository.claim_fuer_buendelung`,
+   alle oder keiner) von GEPLANT auf GEBUENDELT, BEVOR die
+   `MahnLaufTable`-Zeile angelegt wird; ein bereits GEBUENDELTES
+   Mitglied ist für JEDE künftige Gruppenbildung unsichtbar, bis seine
+   Gruppe terminal aufgelöst ist (GESENDET/BLOCKIERT/UNSICHER). Eine
+   bereits bestehende, noch nicht dispatchte GEPLANT-Gruppe wird bei
+   einem erneuten `plane_mahnlauf`-Aufruf unverändert zurückgegeben
+   (Wiederaufnahme statt Neubildung). Recovery
+   (`markiere_verwaiste_mahnlaeufe_als_unsicher`) setzt jetzt auch die
+   GEBUENDELTEN Mitglieder einer abgestürzten Gruppe auf UNSICHER -
+   sonst blieben sie für immer unsichtbar für künftige Planungen.
+   Getestet:
+   `test_ueberlappende_gruppenbildung_sendet_gestecktes_mitglied_nicht_
+   doppelt` (exakter, vom unabhängigen Prüfer beschriebener Ablauf).
+2. **`bereits_gebuchte_zinsen_je_op_position` zählte das Stufe-1-Delta
+   bei Stufe 2 doppelt**: die Methode summierte `zins_segmente_json`
+   (die VOLLE, ab der Fälligkeit für JEDE Buchung neu berechnete
+   Periode - bewusst rein deskriptiv/Audit, siehe dortiger Docstring),
+   nicht das an jedem einzelnen Buchungstag tatsächlich NEU gebuchte
+   Delta. Bei zwei Buchungen für dieselbe Forderung (Stufe 1 dann
+   Stufe 2) wurde der Stufe-1-Anteil dadurch ein zweites Mal mitgezählt.
+   Fix: neue Spalte `MahnkostenBuchungTable.zinsen_delta_je_op_json`
+   (ausschließlich das an DIESEM Tag neu gebuchte Delta je
+   `op_position_id`, aus `MahnkostenVorschau.
+   neue_zinsen_delta_je_op_position`); `bereits_gebuchte_zinsen_je_
+   op_position` liest AUSSCHLIESSLICH diese neue Spalte. Getestet mit
+   den exakten, vom unabhängigen Prüfer gemeldeten Zahlen (100.000 Cent,
+   fällig 01.01.2026, Stufe 1 am 20.01. -> 208 Cent, Stufe 2 am 10.02.
+   -> insgesamt 438 Cent, NICHT 646):
+   `test_bereits_gebuchte_zinsen_je_op_position_zaehlt_stufe1_delta_
+   nicht_doppelt`.
+
+Zusätzlich vom unabhängigen Prüfer vermerkt (noch NICHT umgesetzt,
+gehört zum kommenden Kanal-/Brief-Dokumentpaket): der tatsächlich
+versendete E-Mail-Text enthält bislang nur Betrag/Fälligkeit je
+Position, nicht Beleg/Leistungsperiode und keinen numerischen
+Endbetrag - beim Bau des neuen Brief-PDF/Dokumentpakets müssen diese
+bereits beauftragten Pflichtangaben (inkl. tatsächlich noch offener
+Altspesen/-zinsen, NICHT bereits bezahlter historischer Kosten)
+mitgenommen werden.
+
+2 neue Tests, 874/874 grün im Gesamtlauf (Mahnwesen-Testsuite; 872 vor
+diesem Korrekturpaket).

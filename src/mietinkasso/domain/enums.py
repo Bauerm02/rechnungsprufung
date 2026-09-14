@@ -46,6 +46,13 @@ class MahnStufe(int, enum.Enum):
 
 class MahnStatus(str, enum.Enum):
     GEPLANT = "GEPLANT"
+    # Dauerhaft exklusiv einer eingefrorenen MahnLauf-Gruppe zugeordnet
+    # (Rückprüfung Codex 14.09.2026: verhindert, dass derselbe MahnFall
+    # gleichzeitig Teil zweier überlappender Gruppen wird - siehe
+    # `mahnwesen/repository.py::MahnFallRepository.claim_fuer_buendelung`
+    # und `mahnwesen/service.py::MahnwesenService.plane_mahnlauf`). Ein
+    # GEBUENDELTER Fall ist NIE Kandidat einer neuen Gruppenbildung.
+    GEBUENDELT = "GEBUENDELT"
     IN_VERSAND = "IN_VERSAND"  # atomar beansprucht, Provider-Aufruf läuft/lief möglicherweise
     GESENDET = "GESENDET"
     UNSICHER = "UNSICHER"

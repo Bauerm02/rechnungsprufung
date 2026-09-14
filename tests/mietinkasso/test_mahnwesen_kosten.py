@@ -170,6 +170,52 @@ def test_stufe_zwei_rechnet_nur_das_delta_seit_stufe_eins_ab(op_service, kosten_
     assert len(zinsen_zeilen) == 2
 
 
+def test_bereits_gebuchte_zinsen_je_op_position_zaehlt_stufe1_delta_nicht_doppelt(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Unabhängige Rückprüfung Codex 14.09.2026, echter Bug: das an
+    Stufe 1 gebuchte Zinsdelta wurde bei Stufe 2 ein ZWEITES Mal in
+    `bereits_gebuchte_zinsen_je_op_position` gezählt, weil diese Methode
+    ursprünglich `zins_segmente_json` (die VOLLE, ab der Fälligkeit neu
+    berechnete Periode je Buchung) statt des tatsächlich an jedem Tag
+    NEU gebuchten Deltas summierte. Exakter, vom unabhängigen Prüfer
+    gemeldeter Ablauf: 100.000 Cent Hauptforderung, fällig 01.01.2026,
+    Stufe 1 am 20.01. (19 Tage, 4 % gesetzlich -> 208 Cent), Stufe 2 am
+    10.02. (40 Tage seit Fälligkeit -> 438 Cent gesamt, davon 230 Cent
+    neu). Insgesamt tatsächlich gebucht: 208 + 230 = 438 Cent - NICHT
+    646 (208 fälschlich doppelt gezählt)."""
+
+    vertrag, konto = basis_vertrag
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=100_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 1), beleg_referenz="HMZ Jänner",
+    )
+
+    stufe1 = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 1, 20),
+        versandnachweis_referenz="mahnung:stufe1", akteur="test",
+    )
+    assert stufe1 is not None
+    assert stufe1.zinsen_cent == 208
+
+    stufe2 = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=2, heute=date(2026, 2, 10),
+        versandnachweis_referenz="mahnung:stufe2", akteur="test",
+    )
+    assert stufe2 is not None
+    assert stufe2.zinsen_cent == 230
+
+    op_ids = [f.op_position_id for f in op_service.offene_forderungen(konto.id, heute=date(2026, 2, 10))]
+    hmz_op_id = min(op_ids)  # die Hauptforderung selbst (kleinste Id, vor den beiden Zinsbuchungen)
+
+    bereits_je_op = kosten_repo.bereits_gebuchte_zinsen_je_op_position(vertrag_id=vertrag.id)
+    assert bereits_je_op[hmz_op_id] == 438  # NICHT 646 (208 nicht doppelt gezählt)
+
+    tatsaechlich_gebucht_gesamt = stufe1.zinsen_cent + stufe2.zinsen_cent
+    assert bereits_je_op[hmz_op_id] == tatsaechlich_gebucht_gesamt
+
+
 def test_zinsdelta_einer_neuen_forderung_wird_nicht_durch_eine_alte_abgeloeste_geschluckt(
     op_service, kosten_service, admin_ctx, basis_vertrag,
 ):

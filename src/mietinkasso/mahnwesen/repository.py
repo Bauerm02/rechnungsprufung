@@ -155,6 +155,42 @@ class MahnFallRepository:
             )
             return list(session.execute(statement).scalars().all())
 
+    def claim_fuer_buendelung(self, mahnfall_ids: list[int]) -> bool:
+        """Atomarer MEHRZEILEN-Compare-and-Swap GEPLANT -> GEBUENDELT für
+        ALLE übergebenen Ids GEMEINSAM: entweder ALLE oder KEINE (echte
+        Rückprüfung Codex 14.09.2026 - reproduzierter Doppelversand: der
+        alte `MahnLaufTable.outbox_key` war NUR aus der Mitgliedermenge
+        gebildet und schützte deshalb NICHT vor ÜBERLAPPENDEN Gruppen -
+        eine in einem stecken gebliebenen ersten Mahnlauf {A} weiterhin
+        GEPLANTE Forderung A konnte in einem zweiten Planungsversuch
+        erneut in eine ANDERE Gruppe {A, B} aufgenommen und dadurch
+        zweimal tatsächlich versendet werden.
+
+        Dieser Claim macht jedes GENUIN gebündelte Mitglied SOFORT für
+        JEDE andere Gruppenbildung unsichtbar (Kandidatenfilter in
+        `MahnwesenService.plane_mahnlauf` ist `status == GEPLANT`) - ein
+        Mitglied kann dadurch zu keinem Zeitpunkt Teil zweier
+        gleichzeitig nicht-abgeschlossener Gruppen sein. Schlägt der
+        Claim fehl (ein anderer, gleichzeitiger Planungsversuch war
+        schneller und hat mindestens eine der Ids bereits verändert),
+        wird GAR NICHTS committet - der Aufrufer bildet in diesem Lauf
+        keine Gruppe, ein späterer Lauf versucht es erneut."""
+
+        if not mahnfall_ids:
+            return True
+        with self._session_factory() as session:
+            result = session.execute(
+                update(MahnFallTable)
+                .where(MahnFallTable.id.in_(mahnfall_ids))
+                .where(MahnFallTable.status == MahnStatus.GEPLANT.value)
+                .values(status=MahnStatus.GEBUENDELT.value)
+            )
+            if result.rowcount != len(mahnfall_ids):
+                session.rollback()
+                return False
+            session.commit()
+            return True
+
     def set_status(self, mahnfall_id: int, status: str, **zusatz) -> MahnFallTable:
         with self._session_factory() as session:
             row = session.get(MahnFallTable, mahnfall_id)

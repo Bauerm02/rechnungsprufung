@@ -822,3 +822,103 @@ def test_versende_mahnlauf_blockiert_gesamte_gruppe_bei_einem_abweichenden_mitgl
     # tatsächlich offene HMZ.
     for mahnfall_id in geplante_ids:
         assert mahn_fall_repo.get(mahnfall_id).status != MahnStatus.GESENDET.value
+
+
+def test_ueberlappende_gruppenbildung_sendet_gestecktes_mitglied_nicht_doppelt(
+    mahn_service, mahnlauf_repo, mahn_fall_repo, op_service, basis_vertrag, ctx_factory, freigegebene_policy,
+):
+    """Exakt reproduzierter Ablauf der unabhängigen Abnahme auf Commit
+    b2d3b12 (echter Bug): Forderung A wird zu einer Gruppe {A}
+    gebündelt; ein Worker beansprucht diese Gruppe (`claim_fuer_versand`)
+    und "verschwindet" danach (simulierter Absturz nach möglicher
+    Provider-Annahme, das Ergebnis wird nie aufgelöst - Mahnfall A
+    selbst bleibt dabei technisch unverändert). Eine GENUIN neue,
+    andere Forderung B wird fällig und geplant. Der alte `outbox_key`
+    (nur aus der Mitgliedermenge gebildet) schützte NICHT davor, dass
+    ein zweiter `plane_mahnlauf`-Aufruf A erneut in eine (überlappende)
+    Gruppe {A, B} aufnimmt und A dadurch ein zweites Mal tatsächlich
+    versendet - A muss stattdessen exklusiv an die erste, noch
+    ungelöste Gruppe gebunden bleiben, bis diese aufgelöst ist."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1),
+        faelligkeit=date(2026, 4, 5), beleg_referenz="HMZ April (A)",
+    )
+    forderung_a = _einzige_forderung(op_service, konto, date(2026, 4, 20))
+    geplant_a = _planen(
+        mahn_service, ctx=ctx, vertrag=vertrag, konto=konto,
+        forderung=forderung_a, policy=freigegebene_policy, heute=date(2026, 4, 20),
+    )
+    assert geplant_a.status == "GEPLANT"
+
+    mahnlauf_a = mahn_service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=1, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20),
+    )
+    assert mahnlauf_a is not None
+    assert MahnLaufRepository.mitglieder_ids(mahnlauf_a) == [geplant_a.mahnfall_id]
+    assert mahn_fall_repo.get(geplant_a.mahnfall_id).status == "GEBUENDELT"
+
+    # Worker beansprucht die Gruppe (mögliche Provider-Annahme) und
+    # "stürzt" danach ab, ohne das Ergebnis aufzulösen - GENAU dieser
+    # Zwischenzustand hat den ursprünglich gemeldeten Bug ausgelöst.
+    lange_her = datetime.now(timezone.utc) - timedelta(hours=1)
+    assert mahnlauf_repo.claim_fuer_versand(mahnlauf_a.id, jetzt=lange_her) is True
+
+    # Eine GENUIN neue, andere Forderung B wird fällig und geplant.
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=15_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1),
+        faelligkeit=date(2026, 4, 6), beleg_referenz="Betriebskosten April (B)",
+    )
+    forderung_b = next(
+        f for f in op_service.offene_forderungen(konto.id, heute=date(2026, 4, 21))
+        if f.op_position_id != forderung_a.op_position_id
+    )
+    geplant_b = _planen(
+        mahn_service, ctx=ctx, vertrag=vertrag, konto=konto,
+        forderung=forderung_b, policy=freigegebene_policy, heute=date(2026, 4, 21),
+    )
+    assert geplant_b.status == "GEPLANT"
+
+    # Zweiter Planungsversuch: A ist bereits GEBUENDELT (Teil der ersten,
+    # noch ungelösten Gruppe) und darf NICHT erneut Kandidat sein - KEINE
+    # Überlappung mit der neuen Gruppe für B.
+    mahnlauf_b = mahn_service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=1, heute=date(2026, 4, 21),
+        bank_bestaetigt_bis=date(2026, 4, 21),
+    )
+    assert mahnlauf_b is not None
+    assert mahnlauf_b.id != mahnlauf_a.id
+    mitglieder_b = MahnLaufRepository.mitglieder_ids(mahnlauf_b)
+    assert geplant_a.mahnfall_id not in mitglieder_b
+    assert mitglieder_b == [geplant_b.mahnfall_id]
+
+    versand_aufrufe: list[list[int]] = []
+
+    def versand_fn(mitglieder):
+        versand_aufrufe.append(sorted(m.id for m in mitglieder))
+        return _test_receipt(date(2026, 4, 21))
+
+    ergebnis_b = mahn_service.versende_mahnlauf(
+        ctx=ctx, mahnlauf_id=mahnlauf_b.id, heute=date(2026, 4, 21),
+        bank_bestaetigt_bis=date(2026, 4, 21), ungeklaerte_eingaenge_vorhanden=False,
+        send_enabled=True, versand_fn=versand_fn,
+    )
+    assert ergebnis_b.status == "GESENDET"
+    # Der eigentliche, ursprünglich gemeldete Bug: A darf in KEINEM
+    # tatsächlichen Versandaufruf der zweiten Gruppe auftauchen.
+    assert all(geplant_a.mahnfall_id not in aufruf for aufruf in versand_aufrufe)
+    assert mahn_fall_repo.get(geplant_a.mahnfall_id).status == "GEBUENDELT"  # unverändert, noch ungelöst
+    assert mahn_fall_repo.get(geplant_b.mahnfall_id).status == "GESENDET"
+
+    # Recovery löst die erste, abgestürzte Gruppe (samt ihrem weiterhin
+    # GEBUENDELTEN Mitglied A) auf UNSICHER auf - sonst bliebe A für
+    # immer unsichtbar für jede künftige Planung.
+    verwaiste = mahn_service.markiere_verwaiste_mahnlaeufe_als_unsicher(max_alter=timedelta(minutes=15))
+    assert len(verwaiste) == 1 and verwaiste[0].id == mahnlauf_a.id
+    assert mahn_fall_repo.get(geplant_a.mahnfall_id).status == MahnStatus.UNSICHER.value

@@ -203,6 +203,7 @@ class MahnkostenService:
                     gebuehr_cent=(gebuehr_betrag_gesamt or None), rechtsgrundlage_gebuehr=vorschau.gebuehr_rechtsgrundlage,
                     versandnachweis_referenz=versandnachweis_referenz, zinsen_op_position_id=zinsen_position_id,
                     gebuehr_op_position_id=gebuehr_position_id, zins_segmente_json=_segmente_als_json(vorschau),
+                    zinsen_delta_je_op_json=json.dumps(vorschau.neue_zinsen_delta_je_op_position),
                     erstellt_von=akteur, session=session,
                 )
 

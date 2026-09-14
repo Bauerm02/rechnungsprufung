@@ -195,31 +195,40 @@ class MahnkostenRepository:
 
     def bereits_gebuchte_zinsen_je_op_position(self, *, vertrag_id: str) -> dict[int, int]:
         """Wie `bereits_gebuchte_zinsen_cent`, aber JE zugrunde liegender
-        `op_position_id` aufgeschlüsselt (aus `zins_segmente_json` aller
-        historischen Buchungen dieses Vertrags) - unabhängige
-        Rückprüfung Codex 14.09.2026: eine vertragsweite BLANKO-Summe
-        würde die Verzinsung einer genuin NEUEN, seither entstandenen
-        Forderung fälschlich reduzieren, sobald eine ANDERE, mittlerweile
-        abgelöste/geschlossene Forderung früher bereits verzinst wurde.
-        Der Abzug in `kosten.py::berechne_mahnkosten_vorschau` erfolgt
-        deshalb JE `op_position_id`, nicht vertragsweit gesamt."""
+        `op_position_id` aufgeschlüsselt - unabhängige Rückprüfung Codex
+        14.09.2026: eine vertragsweite BLANKO-Summe würde die Verzinsung
+        einer genuin NEUEN, seither entstandenen Forderung fälschlich
+        reduzieren, sobald eine ANDERE, mittlerweile abgelöste/
+        geschlossene Forderung früher bereits verzinst wurde. Der Abzug
+        in `kosten.py::berechne_mahnkosten_vorschau` erfolgt deshalb JE
+        `op_position_id`, nicht vertragsweit gesamt.
+
+        Liest AUSSCHLIESSLICH `zinsen_delta_je_op_json` (das an JEDEM
+        einzelnen Buchungstag tatsächlich NEU gebuchte Delta) - NIEMALS
+        `zins_segmente_json` (zweiter, unabhängig gemeldeter Bug der
+        Rückprüfung Codex 14.09.2026: `zins_segmente_json` bildet die
+        VOLLE, ab der Fälligkeit neu berechnete Periode ab, nicht nur das
+        an diesem Tag zusätzlich gebuchte Delta - eine Summe über mehrere
+        Buchungen hinweg würde denselben Zeitraum mehrfach zählen, siehe
+        `MahnkostenBuchungTable.zinsen_delta_je_op_json`-Docstring)."""
 
         with self._session_factory() as session:
             zeilen = session.execute(
-                select(MahnkostenBuchungTable.zins_segmente_json).where(MahnkostenBuchungTable.vertrag_id == vertrag_id)
+                select(MahnkostenBuchungTable.zinsen_delta_je_op_json).where(MahnkostenBuchungTable.vertrag_id == vertrag_id)
             ).all()
         ergebnis: dict[int, int] = {}
         for (roh,) in zeilen:
             try:
-                segmente = json.loads(roh) if roh else []
+                eintraege = json.loads(roh) if roh else {}
             except (TypeError, ValueError):
-                segmente = []
-            for segment in segmente:
-                op_id = segment.get("op_position_id")
-                zinsen = segment.get("zinsen_cent")
-                if op_id is None or zinsen is None:
+                eintraege = {}
+            for op_id_str, delta in eintraege.items():
+                try:
+                    op_id = int(op_id_str)
+                    delta_cent = int(delta)
+                except (TypeError, ValueError):
                     continue
-                ergebnis[op_id] = ergebnis.get(op_id, 0) + int(zinsen)
+                ergebnis[op_id] = ergebnis.get(op_id, 0) + delta_cent
         return ergebnis
 
     def bereits_erhobene_gebuehr_schluessel(self, *, vertrag_id: str) -> frozenset[str]:
@@ -283,7 +292,8 @@ class MahnkostenRepository:
         hauptforderung_cent: int, zinsbasis: str, zinssatz_prozent, zins_von: date, zins_bis: date,
         zinsen_cent: int, gebuehr_cent: int | None, rechtsgrundlage_gebuehr: str | None,
         versandnachweis_referenz: str, zinsen_op_position_id: int | None, gebuehr_op_position_id: int | None,
-        erstellt_von: str, zins_segmente_json: str = "[]", session: Session | None = None,
+        erstellt_von: str, zins_segmente_json: str = "[]", zinsen_delta_je_op_json: str = "{}",
+        session: Session | None = None,
     ) -> MahnkostenBuchungTable:
         """`session`: siehe `stammdaten/repository.py::upsert_gesellschaft` -
         übergeben, um diese Buchung Teil derselben atomaren Transaktion
@@ -304,7 +314,8 @@ class MahnkostenRepository:
                 zins_von=zins_von, zins_bis=zins_bis, zinsen_cent=zinsen_cent, gebuehr_cent=gebuehr_cent,
                 rechtsgrundlage_gebuehr=rechtsgrundlage_gebuehr, versandnachweis_referenz=versandnachweis_referenz,
                 zinsen_op_position_id=zinsen_op_position_id, gebuehr_op_position_id=gebuehr_op_position_id,
-                zins_segmente_json=zins_segmente_json, erstellt_von=erstellt_von,
+                zins_segmente_json=zins_segmente_json, zinsen_delta_je_op_json=zinsen_delta_je_op_json,
+                erstellt_von=erstellt_von,
             )
             active_session.add(row)
             return row

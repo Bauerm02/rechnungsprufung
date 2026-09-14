@@ -1405,6 +1405,16 @@ class MahnkostenBuchungTable(Base):
     # isoliert (das wäre bei mehreren Segmenten nicht eindeutig zuordenbar).
     # JSON-Liste von {von, bis, rest_cent, satz_prozent, quelle, zinsen_cent}.
     zins_segmente_json: Mapped[str] = mapped_column(Text, default="[]", server_default=text("'[]'"))
+    # Das GENAU an diesem Tag NEU gebuchte Zinsdelta, JE `op_position_id`
+    # (unabhängige Rückprüfung Codex 14.09.2026, echter Bug): NIEMALS aus
+    # `zins_segmente_json` ableiten (siehe dortiger Docstring) - das wäre
+    # die volle, ab der Fälligkeit neu berechnete Periode, nicht das an
+    # DIESEM Tag zusätzlich gebuchte Delta, und würde bei einer späteren
+    # Stufe/einem Retry zu doppelt gezählten Zinsen führen
+    # (`MahnkostenRepository.bereits_gebuchte_zinsen_je_op_position`
+    # summiert ausschließlich DIESES Feld über alle Buchungen). JSON-Objekt
+    # {op_position_id (als String): delta_cent}.
+    zinsen_delta_je_op_json: Mapped[str] = mapped_column(Text, default="{}", server_default=text("'{}'"))
     gebucht_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     erstellt_von: Mapped[str] = mapped_column(String(128))
 

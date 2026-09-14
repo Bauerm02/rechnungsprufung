@@ -504,6 +504,22 @@ class MahnwesenService:
         if self._mahnlauf_repository is None:
             raise ValueError("plane_mahnlauf benötigt ein konfiguriertes MahnLaufRepository.")
 
+        # Gibt es bereits eine NICHT-abgeschlossene (GEPLANT, also noch
+        # nicht dispatchte) Gruppe für (Vertrag, Stufe)? Diese wird
+        # UNVERÄNDERT zurückgegeben (Wiederaufnahme nach z. B. einem
+        # Absturz zwischen `plane_mahnlauf` und `versende_mahnlauf") -
+        # es wird NIE eine zweite, potenziell überlappende Gruppe für
+        # denselben (Vertrag, Stufe) gebildet, solange eine bereits
+        # offene existiert (echte Rückprüfung Codex 14.09.2026:
+        # reproduzierter Doppelversand, siehe `MahnFallRepository.
+        # claim_fuer_buendelung`-Docstring).
+        bestehende_offene_gruppe = next(
+            (m for m in self._mahnlauf_repository.list_fuer_vertrag(vertrag.id) if m.stufe == stufe and m.status == "GEPLANT"),
+            None,
+        )
+        if bestehende_offene_gruppe is not None:
+            return bestehende_offene_gruppe
+
         aktuelle_policy = self._mahn_policy_repository.aktuelle_freigegebene()
         kandidaten = [
             f for f in self._repository.list_fuer_vertrag(vertrag.id)
@@ -528,6 +544,17 @@ class MahnwesenService:
             return None
 
         bereit_ids_sortiert = sorted(bereit_ids)
+
+        # ATOMARER Mehrzeilen-Claim ALLER Mitglieder GEPLANT->GEBUENDELT,
+        # BEVOR die MahnLaufTable-Zeile angelegt wird - das ist der
+        # eigentliche Schutz gegen überlappende Gruppen (der reine
+        # Mitglieder-Hash im `outbox_key` allein reicht NICHT, siehe
+        # `claim_fuer_buendelung`-Docstring). Schlägt der Claim fehl
+        # (ein gleichzeitiger anderer Planungsversuch war schneller),
+        # wird in DIESEM Lauf keine Gruppe gebildet.
+        if not self._repository.claim_fuer_buendelung(bereit_ids_sortiert):
+            return None
+
         mitglieder_hash = compute_content_hash({"mitglieder": bereit_ids_sortiert})
         # Der Kanal ist BEWUSST NICHT Teil des Schlüssels (siehe
         # `MahnLaufRepository`-Docstring): dieselbe Mitgliedermenge muss
@@ -597,10 +624,10 @@ class MahnwesenService:
 
         aktuelle_policy = self._mahn_policy_repository.aktuelle_freigegebene()
         for mahnfall in mitglieder:
-            if mahnfall.status != MahnStatus.GEPLANT.value:
+            if mahnfall.status != MahnStatus.GEBUENDELT.value:
                 self._mahnlauf_repository.set_status(
                     mahnlauf_id, "BLOCKIERT",
-                    fehlergrund=f"Mitglied {mahnfall.id} ist nicht mehr GEPLANT (Status {mahnfall.status}).",
+                    fehlergrund=f"Mitglied {mahnfall.id} ist nicht mehr GEBUENDELT (Status {mahnfall.status}).",
                 )
                 return VersandErgebnis("BLOCKIERT", "Ein Gruppenmitglied hat seinen Status seit der Planung verändert - neue Planung erforderlich.")
             status_code, grund, _forderung = self._pruefe_frisch_versandbereit(
@@ -650,14 +677,15 @@ class MahnwesenService:
             ergebnis=beleg, erlaubt={"IN_VERSAND", "UNSICHER"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
             referenz="mahnungslauf:" + mahnlauf.outbox_key,
         )
-        # Jedes Mitglied war UNTER DIESEM Design nie selbst geclaimt (die
-        # Gruppenzeile allein stellt die Exklusivität her) - der Übergang
-        # GEPLANT -> GESENDET erfolgt hier direkt, je Mitglied einzeln
-        # protokolliert (eigener Audit-Eintrag, eigenes `gesendet_am`).
+        # Jedes Mitglied wurde bereits bei `plane_mahnlauf` atomar auf
+        # GEBUENDELT geclaimt (siehe `MahnFallRepository.
+        # claim_fuer_buendelung`) - der Übergang GEBUENDELT -> GESENDET
+        # erfolgt hier direkt, je Mitglied einzeln protokolliert (eigener
+        # Audit-Eintrag, eigenes `gesendet_am`).
         for mahnfall in mitglieder:
             versand_belegen(
                 self._repository._session_factory, MahnFallTable, mahnfall.id,
-                ergebnis=beleg, erlaubt={"GEPLANT"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
+                ergebnis=beleg, erlaubt={"GEBUENDELT"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
                 referenz="mahnungslauf:" + mahnlauf.outbox_key,
             )
 
@@ -690,7 +718,14 @@ class MahnwesenService:
         feststeckende Gruppe (Absturz zwischen Claim und Ergebnis) wird
         NIE automatisch erneut versucht, sondern auf UNSICHER gesetzt -
         das blockiert (siehe `versende_mahnlauf`) weiterhin JEDEN Kanal
-        für dieselbe Mitgliedermenge, bis sie manuell geklärt ist."""
+        für dieselbe Mitgliedermenge, bis sie manuell geklärt ist.
+
+        Setzt ZUSÄTZLICH jedes noch GEBUENDELTE Mitglied dieser Gruppe
+        ebenfalls auf UNSICHER (Rückprüfung Codex 14.09.2026): sonst
+        blieben diese Forderungen für IMMER GEBUENDELT und damit für
+        JEDE künftige `plane_mahnlauf`-Kandidatenauswahl unsichtbar -
+        eine abgestürzte Gruppe würde ihre Mitglieder sonst dauerhaft
+        "verschlucken", ohne sie gleichzeitig tatsächlich zu versenden."""
 
         if self._mahnlauf_repository is None:
             return []
@@ -698,6 +733,10 @@ class MahnwesenService:
         verwaiste = self._mahnlauf_repository.verwaiste_in_versand(aelter_als=grenze)
         for lauf in verwaiste:
             self._mahnlauf_repository.set_status(lauf.id, "UNSICHER")
+            for mahnfall_id in MahnLaufRepository.mitglieder_ids(lauf):
+                mahnfall = self._repository.get(mahnfall_id)
+                if mahnfall is not None and mahnfall.status == MahnStatus.GEBUENDELT.value:
+                    self._repository.set_status(mahnfall_id, MahnStatus.UNSICHER.value)
         return verwaiste
 
     def markiere_verwaiste_als_unsicher(self, *, jetzt: datetime | None = None, max_alter: timedelta = timedelta(minutes=15)) -> list[MahnFallTable]:
