@@ -2893,3 +2893,59 @@ Vier weitere, unabhängig gemeldete echte Bugs behoben:
 
 6 neue/erweiterte Tests, 892/892 grün im Gesamtlauf. Nur synthetische
 Testdaten, kein Deployment, kein Serverzugriff, kein Liveversand.
+
+## Korrekturpaket Runde 6: unabhängige Abnahme auf Commit 7376ab8 (14.09.2026)
+
+Zwei unabhängig gemeldete, an einem echten vollständigen Alt-ORM-Upgrade
+mit befüllter `mahnkosten_gebuehren`-Kindzeile reproduzierte Bugs in der
+Runde-5-Migration:
+
+1. **Migration-Rebuild schrieb Fremdschlüssel der Kindtabelle auf die
+   dann gedroppte Zwischentabelle um**: die vorige Fassung von
+   `ensure_mahnkosten_lauf_unique_key` benannte zuerst die ORIGINAL-
+   Tabelle um (`ALTER TABLE mahnkosten_buchungen RENAME TO ..._vor_
+   migration`) und legte danach die neue Tabelle unter dem ORIGINAL-
+   Namen an. SQLite schreibt bei `ALTER TABLE ... RENAME` jedoch
+   automatisch JEDE Fremdschlüsseldefinition ANDERER Tabellen, die auf
+   die umbenannte Tabelle verweisen, auf deren neuen (temporären) Namen
+   um - `mahnkosten_gebuehren.mahnkosten_buchung_id` zeigte danach
+   fälschlich auf `mahnkosten_buchungen__vor_migration`, die
+   anschließend gedroppt wurde (`pragma foreign_key_check =>
+   [(mahnkosten_gebuehren,1,mahnkosten_buchungen__vor_migration,0)]`).
+   Fix: offizielle SQLite-Reihenfolge (https://www.sqlite.org/
+   lang_altertable.html, Abschnitt 7): neue Tabelle unter einem
+   TEMPORÄREN Namen anlegen, Daten kopieren, die ORIGINAL-Tabelle
+   DROPPEN (nicht umbenennen), dann die neue Tabelle auf den Original-
+   Namen umbenennen - die Original-Tabelle wird dabei nie umbenannt,
+   also schreibt SQLite auch nie eine Kindtabellen-Referenz um.
+   Zusätzlich VOR dem Commit ein gezieltes `PRAGMA foreign_key_check`
+   auf jeder tatsächlichen Kindtabelle von `mahnkosten_buchungen`
+   (dynamisch ermittelt, nicht hartkodiert) - ein Fund rollt die gesamte
+   Transaktion zurück statt eine inkonsistente Datenbank zu committen.
+   Getestet:
+   `test_ensure_mahnkosten_lauf_unique_key_erhaelt_fremdschluessel_der_
+   gebuehren_kindtabelle` (voller Alt-ORM-Upgrade-Repro mit befüllter
+   Kindzeile, vor dem Fix nachweislich mit `RuntimeError`/`foreign_key_
+   check`-Fund rot).
+2. **`mahnkosten_gebuehren.status`-Backfill setzte bereits abgeschlossen
+   gebuchte Altzeilen fälschlich auf RESERVIERT**: `ensure_additive_
+   columns` zieht die neue Spalte `status` für eine bereits VOR dem
+   zweistufigen RESERVIERT/GEBUCHT-Lebenszyklus über die alte,
+   einstufige `gebuehr_erheben()` tatsächlich abgeschlossen gebuchte
+   Zeile ausschließlich mit ihrem `server_default('RESERVIERT')` nach -
+   unabhängig davon, dass diese Zeile bereits `mahnkosten_buchung_id`
+   UND `gebuehr_op_position_id` gesetzt hat. Fix: neue Migration
+   `ensure_mahnkosten_gebuehr_status_backfill` (läuft nach `ensure_
+   additive_columns`, vor `ensure_mahnkosten_lauf_unique_key`) setzt
+   GENAU die Zeilen mit beiden bereits gesetzten Buchungsreferenzen auf
+   `GEBUCHT` zurück; eine echte neue, noch offene Reservierung (ohne
+   Buchungsreferenzen) bleibt unberührt. Getestet:
+   `test_ensure_mahnkosten_gebuehr_status_backfill_korrigiert_bereits_
+   gebuchte_altzeilen` (inkl. Gegenprobe mit einer echten offenen
+   Reservierung und Idempotenz-Check).
+
+Produktionsvorfahr `b70a20c` enthält `mahnkosten_buchungen`/
+`mahnkosten_gebuehren` noch nicht - kein aktueller Datenverlust, beide
+Fixes sind reine Vorsorge vor dem finalen Paket. 2 neue Tests, 999/999
+grün im Gesamtlauf. Nur synthetische Testdaten, kein Deployment, kein
+Serverzugriff, kein Liveversand.

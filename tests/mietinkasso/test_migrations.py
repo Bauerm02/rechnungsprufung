@@ -26,7 +26,11 @@ import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.infrastructure.db import tables as _tables  # noqa: F401 - registriert ORM-Tabellen
-from mietinkasso.infrastructure.db.migrations import ensure_additive_columns, ensure_mahnkosten_lauf_unique_key
+from mietinkasso.infrastructure.db.migrations import (
+    ensure_additive_columns,
+    ensure_mahnkosten_gebuehr_status_backfill,
+    ensure_mahnkosten_lauf_unique_key,
+)
 from mietinkasso.infrastructure.db.tables import ErhoehungsschreibenTable, RechtsprofilTable
 
 
@@ -472,6 +476,161 @@ def test_ensure_mahnkosten_lauf_unique_key_ohne_tabelle_no_op():
             assert ensure_mahnkosten_lauf_unique_key(engine) is False
         finally:
             engine.dispose()
+
+
+def _altschema_mahnkosten_gebuehren_metadata(meta: sa.MetaData) -> sa.Table:
+    """`mahnkosten_gebuehren` WIE VOR der Rückprüfung 14.09.2026 (echter
+    Bug) - noch OHNE die Spalten `status`/`reserviert_fuer_mahnlauf_id`
+    des zweistufigen RESERVIERT/GEBUCHT-Lebenszyklus (siehe
+    `MahnkostenGebuehrTable`-Moduldoc), aber bereits mit dem echten
+    Fremdschlüssel auf `mahnkosten_buchungen.id` - Grundlage für BEIDE
+    unabhängig gemeldeten Bugs: den FK-Rebuild-Fehler UND das falsche
+    Status-Backfill einer bereits abgeschlossenen Altzeile."""
+
+    return sa.Table(
+        "mahnkosten_gebuehren",
+        meta,
+        sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+        sa.Column("vertrag_id", sa.String(64), nullable=False, index=True),
+        sa.Column("entgeltforderung_schluessel", sa.String(200), nullable=False),
+        sa.Column("betrag_cent", sa.Integer, nullable=False),
+        sa.Column("rechtsgrundlage", sa.String(256), nullable=False),
+        sa.Column("mahnkosten_buchung_id", sa.Integer, sa.ForeignKey("mahnkosten_buchungen.id"), nullable=True),
+        sa.Column("gebuehr_op_position_id", sa.Integer, nullable=True),
+        sa.Column("erhoben_am", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("erstellt_von", sa.String(128), nullable=False),
+        sa.UniqueConstraint("vertrag_id", "entgeltforderung_schluessel", name="uq_mahnkosten_gebuehr_forderung"),
+    )
+
+
+@pytest.fixture
+def mahnkosten_voller_altschema_upgrade_engine(tmp_path: Path):
+    """Echter vollständiger Alt-ORM-Upgrade (unabhängige Abnahme Codex
+    14.09.2026, Commit 7376ab8): `mahnkosten_buchungen` im ALTEN Schema
+    (grobe Eindeutigkeit `vertrag_id, stufe, zins_bis`, siehe
+    `_altschema_mahnkosten_metadata`) UND `mahnkosten_gebuehren` im
+    ALTEN Schema (ohne `status`/`reserviert_fuer_mahnlauf_id`), mit
+    einer bereits über die alte, einstufige `gebuehr_erheben()`
+    tatsächlich abgeschlossenen Gebühren-Kindzeile (`mahnkosten_
+    buchung_id`+`gebuehr_op_position_id` beide gesetzt) - genau der vom
+    Nutzer unabhängig reproduzierte Fall."""
+
+    db_pfad = tmp_path / "altschema_mahnkosten_voll.db"
+    engine = sa.create_engine(f"sqlite:///{db_pfad}", future=True)
+    meta, buchungen = _altschema_mahnkosten_metadata()
+    gebuehren = _altschema_mahnkosten_gebuehren_metadata(meta)
+    meta.create_all(engine)
+
+    jetzt = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    with engine.begin() as conn:
+        conn.execute(
+            buchungen.insert().values(
+                vertrag_id="V-ALT-MAHNKOSTEN", stufe=1, mahnlauf_schluessel="ALT-GRUPPE-A",
+                forderung_op_position_ids="[1]", hauptforderung_cent=50_000, zinsbasis="GESETZLICH_ABGB",
+                zinssatz_prozent="4.000", zins_von=date(2026, 1, 5), zins_bis=date(2026, 3, 1),
+                zinsen_cent=208, gebuehr_cent=4000, rechtsgrundlage_gebuehr="§458 UGB",
+                versandnachweis_referenz="mahnung:produktiv-alt", zinsen_op_position_id=None,
+                gebuehr_op_position_id=1, erstellt_von="markus",
+            )
+        )
+        conn.execute(
+            gebuehren.insert().values(
+                vertrag_id="V-ALT-MAHNKOSTEN", entgeltforderung_schluessel="V-ALT-MAHNKOSTEN:2026-01",
+                betrag_cent=4000, rechtsgrundlage="§458 UGB",
+                mahnkosten_buchung_id=1, gebuehr_op_position_id=1,
+                erhoben_am=jetzt, erstellt_von="markus",
+            )
+        )
+    yield engine
+    engine.dispose()
+
+
+def test_ensure_mahnkosten_lauf_unique_key_erhaelt_fremdschluessel_der_gebuehren_kindtabelle(
+    mahnkosten_voller_altschema_upgrade_engine,
+):
+    """Unabhängige Abnahme Codex auf Commit 7376ab8, echter Bug: der
+    frühere Rebuild benannte die ORIGINAL-Tabelle zuerst um (`RENAME TO
+    ..._vor_migration`); SQLite schreibt dabei automatisch JEDE
+    Fremdschlüsseldefinition ANDERER Tabellen, die auf sie verweisen
+    (hier `mahnkosten_gebuehren.mahnkosten_buchung_id`), auf den neuen
+    (temporären) Namen um - nach dem `DROP TABLE ..._vor_migration` war
+    die Kindzeile mit einer Referenz auf eine nicht mehr existierende
+    Tabelle verwaist (`pragma foreign_key_check =>
+    [(mahnkosten_gebuehren,1,mahnkosten_buchungen__vor_migration,0)]`).
+    Nach dem Fix (neue Tabelle unter Temp-Namen, Original DROPPEN statt
+    umbenennen, dann neue Tabelle auf den Original-Namen umbenennen)
+    bleibt die Fremdschlüssel-Referenz durchgängig intakt."""
+
+    engine = mahnkosten_voller_altschema_upgrade_engine
+    geaendert = ensure_mahnkosten_lauf_unique_key(engine)
+    assert geaendert is True
+
+    with engine.begin() as conn:
+        # Bewusst NUR die Kindtabelle dieses Rebuilds geprüft, nicht die
+        # gesamte (in dieser Fixture bewusst minimalen, ohne `vertraege`
+        # aufgebauten) synthetischen Test-DB - siehe Migrations-Docstring.
+        verletzungen = conn.execute(sa.text("PRAGMA foreign_key_check(mahnkosten_gebuehren)")).fetchall()
+        assert verletzungen == []
+
+        gebuehr_zeile = conn.execute(sa.text(
+            "SELECT g.mahnkosten_buchung_id, b.vertrag_id, b.mahnlauf_schluessel "
+            "FROM mahnkosten_gebuehren g JOIN mahnkosten_buchungen b "
+            "ON g.mahnkosten_buchung_id = b.id WHERE g.id = 1"
+        )).mappings().one()
+    assert gebuehr_zeile["vertrag_id"] == "V-ALT-MAHNKOSTEN"
+    assert gebuehr_zeile["mahnlauf_schluessel"] == "ALT-GRUPPE-A"
+
+    inspector = sa.inspect(engine)
+    constraints = inspector.get_unique_constraints("mahnkosten_buchungen")
+    assert any(set(c["column_names"]) == {"vertrag_id", "stufe", "mahnlauf_schluessel"} for c in constraints)
+
+
+def test_ensure_mahnkosten_gebuehr_status_backfill_korrigiert_bereits_gebuchte_altzeilen(
+    mahnkosten_voller_altschema_upgrade_engine,
+):
+    """Unabhängige Abnahme Codex auf Commit 7376ab8, echter Bug:
+    `ensure_additive_columns` zieht `status`/`reserviert_fuer_mahnlauf_
+    id` additiv nach; die bereits VOR dem zweistufigen Lebenszyklus über
+    die alte `gebuehr_erheben()` abgeschlossen gebuchte Zeile (mit
+    gesetztem `mahnkosten_buchung_id`+`gebuehr_op_position_id`) bekäme
+    dabei ausschließlich den `server_default('RESERVIERT')` - obwohl sie
+    tatsächlich längst GEBUCHT ist. Das Backfill korrigiert GENAU diese
+    Zeilen; eine (hier zusätzlich angelegte) echte NEUE, noch offene
+    Reservierung ohne Buchungsreferenzen bleibt unverändert RESERVIERT."""
+
+    engine = mahnkosten_voller_altschema_upgrade_engine
+    ausgefuehrt = ensure_additive_columns(engine)
+    assert any("mahnkosten_gebuehren" in a and "status" in a for a in ausgefuehrt)
+
+    with engine.begin() as conn:
+        vor_backfill = conn.execute(sa.text("SELECT status FROM mahnkosten_gebuehren WHERE id = 1")).scalar_one()
+    assert vor_backfill == "RESERVIERT"  # der Bug: server_default trifft auch die bereits gebuchte Altzeile
+
+    # Eine echte neue, noch offene Reservierung (kein Bug-Kandidat) zum
+    # Gegenprobe-Vergleich anlegen.
+    with engine.begin() as conn:
+        conn.execute(sa.text(
+            "INSERT INTO mahnkosten_gebuehren "
+            "(vertrag_id, entgeltforderung_schluessel, betrag_cent, rechtsgrundlage, "
+            " mahnkosten_buchung_id, gebuehr_op_position_id, status, reserviert_fuer_mahnlauf_id, "
+            " erhoben_am, erstellt_von) "
+            "VALUES ('V-ALT-MAHNKOSTEN', 'V-ALT-MAHNKOSTEN:2026-02', 4000, '§458 UGB', "
+            " NULL, NULL, 'RESERVIERT', 99, '2026-09-01 12:00:00', 'markus')"
+        ))
+
+    geaendert = ensure_mahnkosten_gebuehr_status_backfill(engine)
+    assert geaendert is True
+
+    with engine.begin() as conn:
+        zeilen = {
+            row["id"]: row["status"]
+            for row in conn.execute(sa.text("SELECT id, status FROM mahnkosten_gebuehren")).mappings()
+        }
+    assert zeilen[1] == "GEBUCHT"  # bereits gebuchte Altzeile korrigiert
+    assert zeilen[2] == "RESERVIERT"  # echte offene Reservierung bleibt unberührt
+
+    # Idempotent: ein zweiter Lauf ändert nichts mehr.
+    assert ensure_mahnkosten_gebuehr_status_backfill(engine) is False
 
 
 def test_ensure_additive_columns_bei_frischer_db_no_op():

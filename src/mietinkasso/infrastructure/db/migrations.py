@@ -143,57 +143,119 @@ def ensure_mahnkosten_lauf_unique_key(engine: Engine) -> bool:
         return False  # bereits korrekt migriert
 
     zieltabelle = Base.metadata.tables["mahnkosten_buchungen"]
+    # Tabellen, die EINEN Fremdschlüssel auf "mahnkosten_buchungen"
+    # halten (aktuell nur `mahnkosten_gebuehren.mahnkosten_buchung_id`,
+    # aber bewusst dynamisch ermittelt statt hartkodiert, falls künftig
+    # weitere Kindtabellen hinzukommen) - GENAU diese Referenzen dürfen
+    # der Rebuild niemals verwaisen lassen (siehe unten).
+    kind_tabellen = [
+        t for t in inspector.get_table_names()
+        if any(fk.get("referred_table") == "mahnkosten_buchungen" for fk in inspector.get_foreign_keys(t))
+    ]
 
     if engine.dialect.name == "sqlite":
-        # Echte, per `CREATE INDEX` realisierte Indizes (z. B. aus
-        # `index=True`, wie `vertrag_id`) VOR dem Rebuild einsammeln -
-        # unabhängige Abnahme 2cd09ca, echter Bug: SQLite benennt einen
-        # Index global (nicht je Tabelle) und `ALTER TABLE ... RENAME`
-        # lässt den Index unter seinem ALTEN Namen an der umbenannten
-        # Tabelle hängen. Ohne explizites Löschen kollidiert
-        # `zieltabelle.create()` gleich beim Anlegen der frischen Tabelle
-        # mit `OperationalError: index ... already exists`, weil
-        # SQLAlchemy für die (unveränderte) `vertrag_id`-Spalte denselben
-        # Indexnamen neu vergeben will. `get_indexes()` liefert bewusst
-        # NUR echte benannte Indizes, keine impliziten
-        # `sqlite_autoindex_*` einer UNIQUE-Constraint (die werden separat
-        # über `get_unique_constraints()` behandelt und beim Rebuild der
-        # Tabelle ohnehin automatisch durch die NEUE Constraint ersetzt).
-        alte_indexe = [i["name"] for i in inspector.get_indexes("mahnkosten_buchungen") if i.get("name")]
+        # Reihenfolge unabhängige Abnahme Codex 14.09.2026, echter Bug
+        # (reproduziert mit befüllter `mahnkosten_gebuehren`-Kindzeile,
+        # `mahnkosten_gebuehren.mahnkosten_buchung_id -> mahnkosten_
+        # buchungen.id`): die FRÜHERE Fassung dieser Migration benannte
+        # zuerst die ORIGINAL-Tabelle um (`RENAME TO ..._vor_migration`)
+        # und legte danach die neue Tabelle unter dem ORIGINAL-Namen an.
+        # SQLite schreibt bei `ALTER TABLE ... RENAME` jedoch automatisch
+        # JEDE Fremdschlüsseldefinition ANDERER Tabellen, die auf die
+        # umbenannte Tabelle verweisen, auf deren NEUEN (temporären) Namen
+        # um (Standardverhalten seit SQLite 3.25, `legacy_alter_table`
+        # ist hier nicht gesetzt) - die Kindzeile in `mahnkosten_
+        # gebuehren` zeigte danach fälschlich auf `mahnkosten_buchungen__
+        # vor_migration`, die anschließend gedroppt wurde:
+        # `PRAGMA foreign_key_check` meldete genau diese verwaiste
+        # Referenz. Offizielle sichere Reihenfolge (https://www.sqlite.
+        # org/lang_altertable.html, Abschnitt 7 "Making Other Kinds Of
+        # Table Schema Changes", Schritte 4-7): NEUE Tabelle unter einem
+        # TEMPORÄREN Namen anlegen, Daten kopieren, die ALTE (Original-
+        # benannte) Tabelle DROPPEN (nicht umbenennen), dann die neue
+        # Tabelle AUF den Original-Namen umbenennen. Die ORIGINAL-Tabelle
+        # wird dabei NIE umbenannt, also schreibt SQLite auch NIE eine
+        # Kindtabellen-Fremdschlüsseldefinition um - sie verweist die
+        # ganze Zeit unverändert auf den Namen "mahnkosten_buchungen".
         spaltennamen = ", ".join(c.name for c in zieltabelle.columns)
+        temp_name = "mahnkosten_buchungen__migriert_neu"
+        # `to_metadata` MUSS auf `Base.metadata` selbst zielen (nicht auf
+        # eine leere `MetaData()`) - `zieltabelle` trägt einen echten
+        # Fremdschlüssel auf `vertraege.id`, dessen Auflösung beim
+        # Kopieren die referenzierte Tabelle im ZIEL-Metadata-Objekt
+        # verlangt. Der temporäre Tabellen-Klon wird deshalb im
+        # `finally` wieder aus `Base.metadata` entfernt - er soll die
+        # gemeinsame, langlebige Registry nie dauerhaft verunreinigen
+        # (u. a. damit ein zweiter Aufruf, z. B. in Tests, nicht an
+        # einer bereits registrierten gleichnamigen Tabelle scheitert).
+        temp_table = zieltabelle.to_metadata(Base.metadata, name=temp_name)
         # KEIN `engine.begin()` auf der übergebenen Engine - unabhängige
         # Abnahme, echter Bug: pysqlite committet unter dem Standard-
-        # `isolation_level` jede DDL-Anweisung (RENAME/CREATE/DROP TABLE)
+        # `isolation_level` jede DDL-Anweisung (CREATE/DROP/RENAME TABLE)
         # implizit VOR ihrer Ausführung, eine gewöhnliche `engine.begin()`-
         # Transaktion rollt so etwas NICHT zurück - ein fehlgeschlagenes
-        # `INSERT` danach ließ RENAME+CREATE bereits committet zurück
-        # (leere neue Tabelle + verwaiste `..._vor_migration`-Alttabelle).
+        # `INSERT` danach ließ CREATE bereits committet zurück (leere neue
+        # Tabelle neben einer dann fehlenden/verwaisten Alttabelle).
         # `_sqlite_engine_mit_echter_ddl_transaktion` erzwingt ECHTES
         # transaktionales DDL für GENAU diesen Rebuild.
         ddl_engine = _sqlite_engine_mit_echter_ddl_transaktion(engine.url)
         try:
             with ddl_engine.begin() as connection:
-                connection.execute(text("ALTER TABLE mahnkosten_buchungen RENAME TO mahnkosten_buchungen__vor_migration"))
-                for index_name in alte_indexe:
-                    connection.execute(text(f"DROP INDEX IF EXISTS {index_name}"))
-                zieltabelle.create(connection)
+                temp_table.create(connection)
                 connection.execute(text(
-                    f"INSERT INTO mahnkosten_buchungen ({spaltennamen}) "
-                    f"SELECT {spaltennamen} FROM mahnkosten_buchungen__vor_migration"
+                    f"INSERT INTO {temp_name} ({spaltennamen}) "
+                    f"SELECT {spaltennamen} FROM mahnkosten_buchungen"
                 ))
-                connection.execute(text("DROP TABLE mahnkosten_buchungen__vor_migration"))
-                # Alles bisher Ausgeführte (RENAME/DROP INDEX/CREATE/INSERT/
-                # DROP TABLE) läuft in DIESER EINEN, echten DDL-Transaktion
-                # auf DERSELBEN Connection - ein Fehler IRGENDWO in diesem
-                # Block (z. B. ein abweichendes Spaltenschema, das das
-                # INSERT...SELECT scheitern lässt) rollt jetzt TATSÄCHLICH
-                # alles gemeinsam zurück. Es bleibt dadurch NIE eine leere
-                # neue Tabelle neben einer verwaisten `..._vor_migration`-
-                # Alttabelle zurück - entweder gelingt der gesamte Rebuild,
-                # oder die Original-Tabelle ist unverändert unter ihrem
-                # ursprünglichen Namen vorhanden.
+                connection.execute(text("DROP TABLE mahnkosten_buchungen"))
+                connection.execute(text(f"ALTER TABLE {temp_name} RENAME TO mahnkosten_buchungen"))
+                # Schritt 8 der offiziellen Reihenfolge: Indizes unter dem
+                # TEMPORÄREN Namen (von `temp_table.create()` automatisch
+                # mit eigenem, vom temporären Tabellennamen abgeleiteten
+                # Namen mitangelegt) entfernen und mit dem ursprünglichen,
+                # kanonischen Namen auf der jetzt umbenannten Tabelle neu
+                # anlegen - rein kosmetisch für die Namensgleichheit mit
+                # dem ORM-Modell, funktional bereits durch die Umbenennung
+                # korrekt zugeordnet.
+                for idx in temp_table.indexes:
+                    connection.execute(text(f"DROP INDEX IF EXISTS {idx.name}"))
+                for idx in zieltabelle.indexes:
+                    idx.create(connection)
+                # Schritt 10 der offiziellen Reihenfolge: VOR dem Commit
+                # verifizieren, dass der Rebuild KEINE Fremdschlüssel-
+                # Referenz EINER KINDTABELLE auf "mahnkosten_buchungen"
+                # verwaist zurücklässt - schlägt fehl, rollt die gesamte
+                # Transaktion (inkl. DROP TABLE) zurück, statt eine
+                # inkonsistente Datenbank zu committen. Bewusst NUR auf
+                # die tatsächlichen Kindtabellen DIESES Rebuilds
+                # beschränkt (nicht ein pauschaler `PRAGMA foreign_key_
+                # check` über die GESAMTE Datenbank) - ein von diesem
+                # Rebuild unabhängiger, bereits VORHER bestehender
+                # Fremdschlüssel-Defekt anderswo (z. B. eine unvollständig
+                # aufgebaute synthetische Testdatenbank ohne `vertraege`-
+                # Tabelle) ist NICHT das, was diese Migration verifizieren
+                # soll oder darf blockieren.
+                for kind in kind_tabellen:
+                    verletzungen = connection.execute(text(f"PRAGMA foreign_key_check({kind})")).fetchall()
+                    if verletzungen:
+                        raise RuntimeError(
+                            f"ensure_mahnkosten_lauf_unique_key: Rebuild hinterlässt verwaiste "
+                            f"Fremdschlüssel-Referenzen von {kind!r}: {verletzungen!r}"
+                        )
+                # Alles bisher Ausgeführte (CREATE/INSERT/DROP/RENAME/
+                # Index-Rekonstruktion/foreign_key_check) läuft in DIESER
+                # EINEN, echten DDL-Transaktion auf DERSELBEN Connection -
+                # ein Fehler IRGENDWO in diesem Block (z. B. ein
+                # abweichendes Spaltenschema, das das INSERT...SELECT
+                # scheitern lässt, oder eine verwaiste Fremdschlüssel-
+                # Referenz) rollt jetzt TATSÄCHLICH alles gemeinsam zurück.
+                # Es bleibt dadurch NIE eine leere neue Tabelle neben einer
+                # fehlenden/inkonsistenten Alttabelle zurück - entweder
+                # gelingt der gesamte Rebuild, oder die Original-Tabelle
+                # ist unverändert unter ihrem ursprünglichen Namen mit
+                # intakten Fremdschlüsseln vorhanden.
         finally:
             ddl_engine.dispose()
+            Base.metadata.remove(temp_table)
         return True
 
     alte_namen = [uc["name"] for uc in bestehende if set(uc["column_names"]) == alte_spalten and uc["name"]]
@@ -205,3 +267,44 @@ def ensure_mahnkosten_lauf_unique_key(engine: Engine) -> bool:
             "UNIQUE (vertrag_id, stufe, mahnlauf_schluessel)"
         ))
     return True
+
+
+def ensure_mahnkosten_gebuehr_status_backfill(engine: Engine) -> bool:
+    """Backfill für `mahnkosten_gebuehren.status` (unabhängige Rückprüfung
+    Codex 14.09.2026, echter Bug, reproduziert an einem vollständigen
+    Alt-ORM-Upgrade mit einer bereits befüllten Gebühren-Kindzeile):
+    `ensure_additive_columns` zieht die neue Spalte `status` für eine
+    bereits VOR dem zweistufigen RESERVIERT/GEBUCHT-Lebenszyklus (siehe
+    `MahnkostenGebuehrTable`-Moduldoc) über die ALTE, einstufige
+    `gebuehr_erheben()` tatsächlich abgeschlossen gebuchte Zeile
+    ausschließlich mit ihrem `server_default('RESERVIERT')` nach - eine
+    solche Altzeile bliebe damit fälschlich für immer im Zustand "noch
+    nicht bestätigt", obwohl sie bereits mit gesetztem `mahnkosten_
+    buchung_id`/`gebuehr_op_position_id` vollständig gebucht ist.
+
+    Setzt GENAU die Zeilen, die BEIDE Buchungsreferenzen bereits gesetzt
+    haben, von `RESERVIERT` auf `GEBUCHT` zurück. Eine ECHTE neue
+    Reservierung (angelegt über `MahnkostenRepository.reserviere_
+    gebuehr`, IMMER mit `reserviert_fuer_mahnlauf_id` gesetzt und OHNE
+    Buchungsreferenzen, bis `finalisiere_reservierte_gebuehr` sie nach
+    bestätigtem Versand abschließt) erfüllt diese Bedingung nie und
+    bleibt unberührt.
+
+    Idempotent: ein bereits korrekter Stand (keine solche Zeile mehr)
+    ändert nichts; eine (noch) fehlende Tabelle/Spalte ist ein No-Op.
+    Muss NACH `ensure_additive_columns` laufen (die Spalte muss bereits
+    existieren)."""
+
+    inspector = inspect(engine)
+    if "mahnkosten_gebuehren" not in inspector.get_table_names():
+        return False
+    vorhandene_spalten = {s["name"] for s in inspector.get_columns("mahnkosten_gebuehren")}
+    if "status" not in vorhandene_spalten:
+        return False
+    with engine.begin() as connection:
+        ergebnis = connection.execute(text(
+            "UPDATE mahnkosten_gebuehren SET status = 'GEBUCHT' "
+            "WHERE status = 'RESERVIERT' AND mahnkosten_buchung_id IS NOT NULL "
+            "AND gebuehr_op_position_id IS NOT NULL"
+        ))
+    return (ergebnis.rowcount or 0) > 0

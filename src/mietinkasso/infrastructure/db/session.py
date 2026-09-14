@@ -7,7 +7,11 @@ from sqlalchemy.pool import StaticPool
 from mietinkasso.infrastructure.config import Settings
 from mietinkasso.infrastructure.db.base import Base
 from mietinkasso.infrastructure.db import tables as _tables  # noqa: F401
-from mietinkasso.infrastructure.db.migrations import ensure_additive_columns, ensure_mahnkosten_lauf_unique_key
+from mietinkasso.infrastructure.db.migrations import (
+    ensure_additive_columns,
+    ensure_mahnkosten_gebuehr_status_backfill,
+    ensure_mahnkosten_lauf_unique_key,
+)
 
 
 def build_engine(database_url: str):
@@ -32,4 +36,5 @@ def create_all_tables(settings: Settings) -> None:
     engine = build_engine(settings.database_url)
     Base.metadata.create_all(engine)
     ensure_additive_columns(engine)
+    ensure_mahnkosten_gebuehr_status_backfill(engine)
     ensure_mahnkosten_lauf_unique_key(engine)
