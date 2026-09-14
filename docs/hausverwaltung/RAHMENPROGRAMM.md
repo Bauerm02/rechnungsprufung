@@ -1073,3 +1073,57 @@ SEPA-Mahnaussetzung) wurde in dieser Runde BEWUSST NICHT begonnen
 BACKLOG (nicht Teil dieses Auftrags) markiertes vereinfachtes
 Bedienkonzept (ein Operator, tägliche Sammelmail nur bei
 Handlungsbedarf, Akte je Mietverhältnis) für eine spätere Runde.
+
+#### Ergänzung 14.09.2026: EinfachBrief-Formatvorgaben + Tarif-/§458-Klarstellung (noch NICHT implementiert)
+
+Vom Nutzer als verbindliche Ergänzung zum bereits beauftragten, noch
+ausstehenden Brief-/Kostenumfang übermittelt (Quelle:
+https://www.einfach-brief.at/fe/vorlagen) - festgehalten, damit es beim
+tatsächlichen Bau des PDF/A-Exporters/der Kostenpositionen nicht
+verloren geht. Zum Zeitpunkt dieses Eintrags noch KEIN Code dafür
+vorhanden (siehe offene Punkte unten und `OFFENE_PUNKTE.md`):
+
+- **PDF/A-Pflicht + Layout (C5-Fensterkuvert)**: Adressfeld bei x=20mm/
+  y=62mm ab linker/oberer Blattkante, Breite 90mm/Höhe 45mm, umlaufend
+  5mm und links 18mm frei; Empfängeradresse maschinenlesbar, 11pt, max.
+  6 Zeilen, KEINE Bilder/IBAN/Kundennummer im Adressfeld; optionaler
+  Rücksendeabsender 8pt darüber im selben Feld.
+- **Formatprüfungs-Nachweis ist Pflicht, kein Metadatenlabel**: die
+  Brief-Stufe braucht einen tatsächlichen PDF/A-Export UND einen
+  Nachweis der Formatprüfung - ein bloß gesetztes Metadaten-/Label-Flag
+  ("ist PDF/A") ist KEIN Nachweis. Fehlt der Konverter/die Validierung,
+  bleibt das ein EXPLIZIT benannter offener Integrationspunkt - niemals
+  "versandbereit" behaupten, wenn die Formatprüfung tatsächlich nicht
+  stattgefunden hat.
+- **Kein Live-Test**: kein realer Upload, kein Testbrief gegen den
+  echten Provider - synthetisch bleibt synthetisch, auch für diesen
+  Teil.
+- **E-Brief vom Nutzer deaktiviert**: Stufe 2 MUSS physisch (Kanal
+  BRIEF) bleiben, keine elektronische Ersatzzustellung, auch wenn ein
+  E-Brief-Weg technisch verfügbar würde.
+- **Aktuelle Netto-Preise (nur versionierte Tarif-Vorschau, KEINE
+  automatische Weiterbelastung ohne geprüfte Anspruchsvoraussetzung)**:
+  1 SW-Blatt Inland 1,31 EUR; Einschreiben-Zuschlag 3,50 EUR (Summe
+  4,81 EUR). Diese Zahlen sind Anbieteraufwand-Tarifdaten für das
+  `BriefAnbieterProfilTable`-Profil, nicht automatisch der dem Mieter
+  ersatzfähige Betrag (siehe §1333-Gate unten).
+- **§458 UGB (Original:
+  https://www.ris.bka.gv.at/eli/drgbl/1897/219/P458/NOR40148646)**: die
+  40-EUR-Pauschale gilt bei anwendbarem B2B UNABHÄNGIG vom konkreten
+  Porto (kein Abgleich gegen den tatsächlichen Anbieterpreis nötig).
+  Ein §1333-Nachweis (siehe unten) ist NUR für tatsächliche, darüber
+  hinausgehende weitere Kosten heranzuziehen - keine doppelte
+  Entschädigung (Netting bleibt wie geplant: `MahnkostenGebuehrTable`
+  als gemeinsamer Ledger je Entgeltforderung). Zulässige, bereits
+  bestehende REDUZIERTE Altprofile (eine niedrigere als die 40-EUR-
+  Pauschale, falls fachlich so freigegeben) bleiben ERHALTEN und werden
+  NIE stillschweigend auf 40 EUR angehoben.
+- **§1333 Abs 2 ABGB**: Nachweis ausschließlich für tatsächlich
+  erwachsene ZUSÄTZLICHE Kosten über die §458-Pauschale hinaus (nicht
+  als Ersatz für sie).
+- **Ganzheitliche Umsetzung erforderlich, nicht nur isolierte
+  Klassen**: die finale Umsetzung muss auch die Portalvorschau, den
+  erklärten Endbetrag, den Kanal, die vollständige Druckdatei und den
+  Versand-/Kostenstatus im Backoffice sichtbar/abrufbar machen - eine
+  reine Backend-Serviceklasse ohne Anbindung an Vorschau/Anzeige gilt
+  NICHT als erledigt.
