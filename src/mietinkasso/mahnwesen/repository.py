@@ -155,42 +155,6 @@ class MahnFallRepository:
             )
             return list(session.execute(statement).scalars().all())
 
-    def claim_fuer_buendelung(self, mahnfall_ids: list[int]) -> bool:
-        """Atomarer MEHRZEILEN-Compare-and-Swap GEPLANT -> GEBUENDELT für
-        ALLE übergebenen Ids GEMEINSAM: entweder ALLE oder KEINE (echte
-        Rückprüfung Codex 14.09.2026 - reproduzierter Doppelversand: der
-        alte `MahnLaufTable.outbox_key` war NUR aus der Mitgliedermenge
-        gebildet und schützte deshalb NICHT vor ÜBERLAPPENDEN Gruppen -
-        eine in einem stecken gebliebenen ersten Mahnlauf {A} weiterhin
-        GEPLANTE Forderung A konnte in einem zweiten Planungsversuch
-        erneut in eine ANDERE Gruppe {A, B} aufgenommen und dadurch
-        zweimal tatsächlich versendet werden.
-
-        Dieser Claim macht jedes GENUIN gebündelte Mitglied SOFORT für
-        JEDE andere Gruppenbildung unsichtbar (Kandidatenfilter in
-        `MahnwesenService.plane_mahnlauf` ist `status == GEPLANT`) - ein
-        Mitglied kann dadurch zu keinem Zeitpunkt Teil zweier
-        gleichzeitig nicht-abgeschlossener Gruppen sein. Schlägt der
-        Claim fehl (ein anderer, gleichzeitiger Planungsversuch war
-        schneller und hat mindestens eine der Ids bereits verändert),
-        wird GAR NICHTS committet - der Aufrufer bildet in diesem Lauf
-        keine Gruppe, ein späterer Lauf versucht es erneut."""
-
-        if not mahnfall_ids:
-            return True
-        with self._session_factory() as session:
-            result = session.execute(
-                update(MahnFallTable)
-                .where(MahnFallTable.id.in_(mahnfall_ids))
-                .where(MahnFallTable.status == MahnStatus.GEPLANT.value)
-                .values(status=MahnStatus.GEBUENDELT.value)
-            )
-            if result.rowcount != len(mahnfall_ids):
-                session.rollback()
-                return False
-            session.commit()
-            return True
-
     def set_status(self, mahnfall_id: int, status: str, **zusatz) -> MahnFallTable:
         with self._session_factory() as session:
             row = session.get(MahnFallTable, mahnfall_id)
@@ -230,6 +194,69 @@ class MahnLaufRepository:
             try:
                 session.commit()
             except IntegrityError:
+                session.rollback()
+                return session.execute(
+                    select(MahnLaufTable).where(MahnLaufTable.outbox_key == outbox_key)
+                ).scalar_one()
+            session.refresh(row)
+            return row
+
+    def claim_mitglieder_und_erstelle_gruppe(
+        self, *, mahnfall_ids: list[int], outbox_key: str, vertrag_id: str, gesellschaft_id: str,
+        stufe: int, kanal: str = "EMAIL",
+    ) -> MahnLaufTable | None:
+        """Bindet den Mitglieder-Claim (GEPLANT -> GEBUENDELT auf
+        `MahnFallTable`) UND die Anlage der `MahnLaufTable`-Zeile in
+        GENAU EINER Datenbanktransaktion zusammen (unabhängige
+        Rückprüfung Codex 14.09.2026, echter Bug: die vorherige Version
+        führte beides in ZWEI separaten, jeweils für sich committeten
+        Schritten aus - ein Absturz/Prozesskill genau dazwischen ließ
+        die Mitglieder für immer GEBUENDELT OHNE zugehörige Gruppenzeile
+        zurück: weder durch eine künftige Planung erreichbar (GEBUENDELT
+        ist kein Planungskandidat mehr) noch durch die MahnLauf-Recovery
+        auflösbar (es existiert ja gar keine Zeile). Ein reines
+        try/except auf Python-Ebene hätte das NICHT verhindert - die
+        Sicherheit kommt hier ausschließlich aus der EINEN gemeinsamen
+        Transaktionsgrenze: entweder committen BEIDE Änderungen
+        zusammen, oder KEINE von beiden.
+
+        Gibt `None` zurück, wenn der Mitglieder-Claim fehlschlägt (ein
+        anderer, gleichzeitiger Planungsversuch war schneller) - dann
+        wird auch KEINE Gruppenzeile angelegt. Bereits existierende
+        Zeile für denselben `outbox_key` wird unverändert zurückgegeben
+        (Idempotenz wie `get_or_create`), OHNE die Mitglieder erneut zu
+        claimen (sie sind es unter diesem `outbox_key` bereits)."""
+
+        if not mahnfall_ids:
+            return None
+        with self._session_factory() as session:
+            existing = session.execute(
+                select(MahnLaufTable).where(MahnLaufTable.outbox_key == outbox_key)
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing
+            result = session.execute(
+                update(MahnFallTable)
+                .where(MahnFallTable.id.in_(mahnfall_ids))
+                .where(MahnFallTable.status == MahnStatus.GEPLANT.value)
+                .values(status=MahnStatus.GEBUENDELT.value)
+            )
+            if result.rowcount != len(mahnfall_ids):
+                session.rollback()
+                return None
+            row = MahnLaufTable(
+                outbox_key=outbox_key, vertrag_id=vertrag_id, gesellschaft_id=gesellschaft_id,
+                stufe=stufe, kanal=kanal, mitglieder_mahnfall_ids=json.dumps(sorted(mahnfall_ids)),
+            )
+            session.add(row)
+            try:
+                session.commit()
+            except IntegrityError:
+                # Ein gleichzeitiger anderer Versuch hat exakt diesen
+                # outbox_key zwischenzeitlich bereits angelegt - die
+                # MITGLIEDER-Claim-Änderung dieser Transaktion wird
+                # dabei ATOMAR mit zurückgerollt (keine verwaisten
+                # GEBUENDELT-Mitglieder ohne Gruppe).
                 session.rollback()
                 return session.execute(
                     select(MahnLaufTable).where(MahnLaufTable.outbox_key == outbox_key)

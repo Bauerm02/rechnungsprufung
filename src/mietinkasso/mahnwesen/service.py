@@ -471,6 +471,27 @@ class MahnwesenService:
                 )
         return VersandErgebnis("GESENDET", "Tatsächlicher Versand im Maildienst nachgewiesen.")
 
+    def _freigebe_gebuendelte_mitglieder(self, mitglieder: list[MahnFallTable | None], *, ausser: int | None = None) -> None:
+        """Setzt jedes noch GEBUENDELTE Mitglied (außer `ausser`, das
+        bereits selbst einen konkreten Status erhalten hat) zurück auf
+        GEPLANT - unabhängige Rückprüfung Codex 14.09.2026: scheitert
+        die Vorprüfung EINES Gruppenmitglieds, bevor überhaupt ein
+        tatsächlicher/unklarer Provideraufruf stattgefunden hat, dürfen
+        die ÜBRIGEN, für sich genommen weiterhin versandfähigen
+        Mitglieder NICHT für immer GEBUENDELT (und damit für jede
+        künftige Planung unsichtbar) bleiben - eine neue
+        `plane_mahnlauf`-Bildung mit dem dann aktuellen Stand holt sie
+        wieder ab. Diese Freigabe ist NUR vor einem tatsächlichen
+        Provideraufruf zulässig: sobald `versand_fn` aufgerufen wurde,
+        werden Mitglieder NIE wieder auf GEPLANT zurückgesetzt (siehe
+        die UNSICHER/BLOCKIERT-Zweige weiter unten in `versende_
+        mahnlauf`), da zu diesem Zeitpunkt ein echter Versand bereits
+        stattgefunden haben könnte."""
+
+        for mahnfall in mitglieder:
+            if mahnfall is not None and mahnfall.id != ausser and mahnfall.status == MahnStatus.GEBUENDELT.value:
+                self._repository.set_status(mahnfall.id, MahnStatus.GEPLANT.value)
+
     def plane_mahnlauf(
         self,
         *,
@@ -544,25 +565,20 @@ class MahnwesenService:
             return None
 
         bereit_ids_sortiert = sorted(bereit_ids)
-
-        # ATOMARER Mehrzeilen-Claim ALLER Mitglieder GEPLANT->GEBUENDELT,
-        # BEVOR die MahnLaufTable-Zeile angelegt wird - das ist der
-        # eigentliche Schutz gegen überlappende Gruppen (der reine
-        # Mitglieder-Hash im `outbox_key` allein reicht NICHT, siehe
-        # `claim_fuer_buendelung`-Docstring). Schlägt der Claim fehl
-        # (ein gleichzeitiger anderer Planungsversuch war schneller),
-        # wird in DIESEM Lauf keine Gruppe gebildet.
-        if not self._repository.claim_fuer_buendelung(bereit_ids_sortiert):
-            return None
-
         mitglieder_hash = compute_content_hash({"mitglieder": bereit_ids_sortiert})
         # Der Kanal ist BEWUSST NICHT Teil des Schlüssels (siehe
         # `MahnLaufRepository`-Docstring): dieselbe Mitgliedermenge muss
         # kanalübergreifend auf dieselbe Sperre treffen.
         outbox_key = f"{vertrag.gesellschaft_id}:{vertrag.id}:{stufe}:{mitglieder_hash}"
-        return self._mahnlauf_repository.get_or_create(
-            outbox_key=outbox_key, vertrag_id=vertrag.id, gesellschaft_id=vertrag.gesellschaft_id,
-            stufe=stufe, mitglieder_mahnfall_ids=json.dumps(bereit_ids_sortiert),
+
+        # Mitglieder-Claim (GEPLANT->GEBUENDELT) UND Gruppenzeilenanlage
+        # in EINER Transaktion (Rückprüfung Codex 14.09.2026, siehe
+        # `MahnLaufRepository.claim_mitglieder_und_erstelle_gruppe`-
+        # Docstring) - ein Absturz zwischen beiden Schritten darf NIE
+        # Mitglieder ohne zugehörige Gruppe zurücklassen.
+        return self._mahnlauf_repository.claim_mitglieder_und_erstelle_gruppe(
+            mahnfall_ids=bereit_ids_sortiert, outbox_key=outbox_key, vertrag_id=vertrag.id,
+            gesellschaft_id=vertrag.gesellschaft_id, stufe=stufe,
         )
 
     def versende_mahnlauf(
@@ -620,6 +636,7 @@ class MahnwesenService:
             self._mahnlauf_repository.set_status(
                 mahnlauf_id, "BLOCKIERT", fehlergrund="Mindestens ein eingefrorenes Gruppenmitglied existiert nicht mehr."
             )
+            self._freigebe_gebuendelte_mitglieder(mitglieder)
             return VersandErgebnis("BLOCKIERT", "Mahnlauf-Gruppe inkonsistent (Mitglied fehlt) - neue Planung erforderlich.")
 
         aktuelle_policy = self._mahn_policy_repository.aktuelle_freigegebene()
@@ -629,6 +646,7 @@ class MahnwesenService:
                     mahnlauf_id, "BLOCKIERT",
                     fehlergrund=f"Mitglied {mahnfall.id} ist nicht mehr GEBUENDELT (Status {mahnfall.status}).",
                 )
+                self._freigebe_gebuendelte_mitglieder(mitglieder, ausser=mahnfall.id)
                 return VersandErgebnis("BLOCKIERT", "Ein Gruppenmitglied hat seinen Status seit der Planung verändert - neue Planung erforderlich.")
             status_code, grund, _forderung = self._pruefe_frisch_versandbereit(
                 mahnfall=mahnfall, vertrag=vertrag, konto=konto, aktuelle_policy=aktuelle_policy, heute=heute,
@@ -639,9 +657,22 @@ class MahnwesenService:
                     self._repository.set_status(mahnfall.id, MahnStatus.BLOCKIERT.value)
                 elif status_code == "UEBERSPRUNGEN_PERSIST":
                     self._repository.set_status(mahnfall.id, MahnStatus.UEBERSPRUNGEN.value)
+                else:
+                    # BLOCKIERT_TRANSIENT ("Frist noch nicht abgelaufen"):
+                    # dieses Mitglied bekommt KEINEN dauerhaften Status -
+                    # es wird stattdessen selbst auf GEPLANT zurückgesetzt,
+                    # damit eine spätere Planung es erneut berücksichtigt,
+                    # sobald es tatsächlich fällig ist.
+                    self._repository.set_status(mahnfall.id, MahnStatus.GEPLANT.value)
                 self._mahnlauf_repository.set_status(
                     mahnlauf_id, "BLOCKIERT", fehlergrund=f"Mitglied {mahnfall.id}: {grund}"
                 )
+                # Die ÜBRIGEN, unauffälligen Mitglieder werden ebenfalls
+                # freigegeben (Rückprüfung Codex 14.09.2026: sonst
+                # blieben sie für immer GEBUENDELT/unsichtbar, obwohl
+                # noch KEIN Provideraufruf stattgefunden hat und sie für
+                # sich genommen weiterhin versandfähig sein könnten).
+                self._freigebe_gebuendelte_mitglieder(mitglieder, ausser=mahnfall.id)
                 return VersandErgebnis(
                     "BLOCKIERT",
                     f"Gruppe ist seit der Planung nicht mehr vollständig versandbereit (Mitglied {mahnfall.id}: {grund}); "

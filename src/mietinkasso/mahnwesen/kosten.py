@@ -482,6 +482,30 @@ class MahnkostenVorschau:
         return zusatz
 
 
+def vorschau_bei_ledger_inkonsistenz(
+    *, vertrag_id: str, stufe: int, forderungen: list[OffeneForderung], grund: str,
+) -> MahnkostenVorschau:
+    """Sicherer Rückfall für `kosten_service.py::vorschau()`, wenn
+    `MahnkostenRepository.bereits_gebuchte_zinsen_je_op_position`
+    `ZinsledgerInkonsistentError` auslöst (unabhängige Rückprüfung
+    Codex 14.09.2026) - dieselbe "niemals raten"-Haltung wie bei einer
+    unberechenbaren Zinsprofil-Historie (siehe `_zinsprofil_segmente`):
+    KEINE Zinsen/Gebühr für den GESAMTEN Vertrag, solange der Ledger
+    selbst widersprüchlich ist, aber die Hauptforderung bleibt
+    unblockiert."""
+
+    hauptforderung_cent = sum(f.rest_cent for f in forderungen)
+    return MahnkostenVorschau(
+        vertrag_id=vertrag_id, stufe=stufe, hauptforderung_cent=hauptforderung_cent,
+        zinsbasis="UNBERECHENBAR", zinssatz_prozent=None, zins_von=None, zins_bis=None,
+        neue_zinsen_cent=0, bereits_gebuchte_zinsen_cent=0, neue_zinsen_delta_cent=0,
+        neue_zinsen_delta_je_op_position={}, zins_segmente=(), zins_teilweise_ungeklaert=True,
+        gebuehr_segmente=(), gebuehr_cent=None, gebuehr_rechtsgrundlage=None,
+        forderung_op_position_ids=tuple(f.op_position_id for f in forderungen),
+        hinweise=(f"Zinsledger widersprüchlich, Zinsen/Gebühr bleiben blockiert: {grund}",),
+    )
+
+
 def berechne_mahnkosten_vorschau(
     *,
     vertrag_id: str,

@@ -2585,3 +2585,74 @@ mitgenommen werden.
 
 2 neue Tests, 874/874 grün im Gesamtlauf (Mahnwesen-Testsuite; 872 vor
 diesem Korrekturpaket).
+
+## Korrekturpaket Runde 2: unabhängige Abnahme auf Commit f8c8801 (14.09.2026)
+
+Drei weitere, unabhängig gemeldete Punkte im selben Gruppensperre-
+Mechanismus behoben:
+
+3. **Mitglieder-Claim und Gruppenzeilenanlage liefen in ZWEI separaten
+   committeten Schritten**: ein Absturz genau dazwischen ließ Mitglieder
+   für immer GEBUENDELT OHNE zugehörige `MahnLaufTable`-Zeile zurück -
+   weder durch eine erneute Planung (GEBUENDELT ist kein Kandidat mehr)
+   noch durch die MahnLauf-Recovery erreichbar (es existierte ja gar
+   keine Zeile). Fix: `MahnLaufRepository.
+   claim_mitglieder_und_erstelle_gruppe` führt BEIDE Änderungen in
+   GENAU EINER Transaktion aus - ein reines try/except auf Python-Ebene
+   hätte das NICHT verhindert (kein Schutz gegen einen echten
+   Prozesskill), die Sicherheit kommt ausschließlich aus der
+   gemeinsamen Transaktionsgrenze. Getestet:
+   `test_plane_mahnlauf_absturz_zwischen_mitgliederclaim_und_
+   gruppenanlage_ist_atomar` (simulierter Absturz per Monkeypatch,
+   danach Wiederherstellung und erfolgreicher erneuter Planungsversuch).
+4. **Eine Vorprüfungs-Blockade (VOR jedem Provideraufruf) ließ die
+   ÜBRIGEN, unauffälligen GEBUENDELTEN Gruppenmitglieder für immer
+   GEBUENDELT/unsichtbar zurück** - nur das konkret abweichende
+   Mitglied bekam einen realen Status, die anderen wurden nie berührt.
+   Fix: `MahnwesenService._freigebe_gebuendelte_mitglieder` setzt jedes
+   noch GEBUENDELTE (nicht selbst betroffene) Mitglied zurück auf
+   GEPLANT, solange NOCH KEIN tatsächlicher/unklarer Provideraufruf
+   stattgefunden hat - danach (UNSICHER/ValueError-Pfade) wird NIE
+   wieder freigegeben, das war bereits korrekt. Getestet: verschärfte
+   Assertion in
+   `test_versende_mahnlauf_blockiert_gesamte_gruppe_bei_einem_
+   abweichenden_mitglied` (das unauffällige Mitglied landet jetzt
+   nachweislich wieder bei GEPLANT, nicht bei GEBUENDELT).
+5. **Legacy-/inkonsistenter Zinsledger könnte stillschweigend als "0
+   bereits gebucht" gewertet werden** (Doppelzinsen-Risiko, z. B. bei
+   einer Buchung von vor Einführung von `zinsen_delta_je_op_json`):
+   `bereits_gebuchte_zinsen_je_op_position` löst jetzt
+   `ZinsledgerInkonsistentError` aus, sobald eine Buchung tatsächlich
+   gebuchte Zinsen (`zinsen_cent > 0`) hat, deren Delta-JSON sich aber
+   nicht auf denselben Betrag summiert; `kosten_service.py::vorschau()`
+   fängt das ab und liefert eine explizit "unberechenbar"e Vorschau
+   (keine Zinsen/Gebühr) für den betroffenen Vertrag, OHNE die
+   Hauptforderung zu blockieren. Getestet:
+   `test_inkonsistenter_zinsledger_wird_nicht_als_null_bereits_
+   gebucht_gewertet`.
+
+**Weiterhin ehrlich offen (auch nach dieser Runde), vom unabhängigen
+Prüfer selbst benannt:**
+
+- **Kosten-/Mitgliedsnachweis-Recovery bei einem Absturz ZWISCHEN
+  bestätigtem Versand und Kostenbuchung fehlt noch**: `versende_
+  mahnlauf` setzt Gruppe/Mitglieder auf GESENDET und bucht die
+  Mahnkosten (`MahnkostenService.buche_vorschau`) DANACH, aber NICHT
+  in derselben Transaktion. Stürzt der Prozess GENAU dazwischen ab,
+  bleibt der Versand korrekt als GESENDET erfasst, aber die
+  Kostenbuchung fehlt dauerhaft (keine automatische Nachholung, da
+  `versende_mahnlauf` für eine bereits GESENDETE Gruppe nie wieder
+  aufgerufen wird). Eine vollständige Lösung erfordert entweder eine
+  gemeinsame Transaktion (größerer Umbau von `buche_vorschau`, das
+  aktuell keinen externen `session`-Parameter annimmt) oder einen
+  separaten Recovery-Abgleich (GESENDETE Mahnläufe ohne zugehörige
+  `MahnkostenBuchungTable`-Zeile finden und nachbuchen). NICHT Teil
+  dieser Runde - bewusst offen benannt statt stillschweigend
+  übergangen.
+- Der im tatsächlich versendeten E-Mail-Text ausgewiesene Kosten-/
+  Zinsnachweis enthält weiterhin nur Betrag/Fälligkeit je Position
+  (siehe Korrekturpaket Runde 1 oben) - unverändert offen, gehört zum
+  kommenden Kanal-/Brief-Dokumentpaket.
+
+2 weitere neue Tests plus eine verschärfte Bestandstest-Assertion,
+876/876 grün im Gesamtlauf.

@@ -19,6 +19,28 @@ from mietinkasso.infrastructure.db.tables import (
 )
 
 
+class ZinsledgerInkonsistentError(Exception):
+    """Eine `MahnkostenBuchungTable`-Zeile hat tatsächlich gebuchte
+    Zinsen (`zinsen_cent > 0`), aber ihr `zinsen_delta_je_op_json`
+    (das JE `op_position_id` tatsächlich neu gebuchte Delta) fehlt oder
+    summiert sich nicht auf denselben Betrag - z. B. eine Buchung aus
+    der Zeit vor Einführung dieser Spalte, oder eine manuell/fehlerhaft
+    veränderte Zeile. Unabhängige Rückprüfung Codex 14.09.2026: eine
+    solche Zeile NIE stillschweigend als "0 bereits gebucht" werten
+    (das würde bei einer künftigen Stufe zu doppelt gebuchten Zinsen
+    führen) - stattdessen wird die weitere automatische Berechnung für
+    die betroffenen Forderungen explizit blockiert, bis die Historie
+    nachvollziehbar migriert/belegt ist."""
+
+    def __init__(self, *, vertrag_id: str, betroffene_op_ids: list[int], zinsen_cent: int, summe_delta_cent: int):
+        self.vertrag_id = vertrag_id
+        self.betroffene_op_ids = betroffene_op_ids
+        super().__init__(
+            f"Vertrag {vertrag_id}: Buchung mit zinsen_cent={zinsen_cent} hat ein fehlendes/inkonsistentes "
+            f"zinsen_delta_je_op_json (Summe={summe_delta_cent}) - betroffene Forderungen: {betroffene_op_ids}."
+        )
+
+
 class MahnkostenRepository:
     def __init__(self, session_factory: sessionmaker[Session]):
         self._session_factory = session_factory
@@ -210,18 +232,33 @@ class MahnkostenRepository:
         VOLLE, ab der Fälligkeit neu berechnete Periode ab, nicht nur das
         an diesem Tag zusätzlich gebuchte Delta - eine Summe über mehrere
         Buchungen hinweg würde denselben Zeitraum mehrfach zählen, siehe
-        `MahnkostenBuchungTable.zinsen_delta_je_op_json`-Docstring)."""
+        `MahnkostenBuchungTable.zinsen_delta_je_op_json`-Docstring).
+
+        Hat eine Buchung tatsächlich gebuchte Zinsen (`zinsen_cent > 0`),
+        aber ihr `zinsen_delta_je_op_json` fehlt oder summiert sich NICHT
+        auf denselben Betrag (z. B. eine Alt-Buchung von vor Einführung
+        dieser Spalte), wird das NIEMALS still als "0 bereits gebucht"
+        gewertet (dritter unabhängig gemeldeter Bug derselben Rückprüfung
+        - das würde bei einer künftigen Stufe zu doppelt gebuchten Zinsen
+        führen) - stattdessen wird `ZinsledgerInkonsistentError`
+        ausgelöst, die `kosten_service.py::vorschau()` abfängt und in
+        eine explizit "unberechenbar"e Vorschau für den betroffenen
+        Vertrag umwandelt."""
 
         with self._session_factory() as session:
             zeilen = session.execute(
-                select(MahnkostenBuchungTable.zinsen_delta_je_op_json).where(MahnkostenBuchungTable.vertrag_id == vertrag_id)
+                select(
+                    MahnkostenBuchungTable.zinsen_delta_je_op_json, MahnkostenBuchungTable.zinsen_cent,
+                    MahnkostenBuchungTable.forderung_op_position_ids,
+                ).where(MahnkostenBuchungTable.vertrag_id == vertrag_id)
             ).all()
         ergebnis: dict[int, int] = {}
-        for (roh,) in zeilen:
+        for roh, zinsen_cent, op_ids_json in zeilen:
             try:
                 eintraege = json.loads(roh) if roh else {}
             except (TypeError, ValueError):
                 eintraege = {}
+            summe_delta = 0
             for op_id_str, delta in eintraege.items():
                 try:
                     op_id = int(op_id_str)
@@ -229,6 +266,16 @@ class MahnkostenRepository:
                 except (TypeError, ValueError):
                     continue
                 ergebnis[op_id] = ergebnis.get(op_id, 0) + delta_cent
+                summe_delta += delta_cent
+            if zinsen_cent and zinsen_cent > 0 and summe_delta != zinsen_cent:
+                try:
+                    betroffene_ops = json.loads(op_ids_json) if op_ids_json else []
+                except (TypeError, ValueError):
+                    betroffene_ops = []
+                raise ZinsledgerInkonsistentError(
+                    vertrag_id=vertrag_id, betroffene_op_ids=betroffene_ops,
+                    zinsen_cent=zinsen_cent, summe_delta_cent=summe_delta,
+                )
         return ergebnis
 
     def bereits_erhobene_gebuehr_schluessel(self, *, vertrag_id: str) -> frozenset[str]:

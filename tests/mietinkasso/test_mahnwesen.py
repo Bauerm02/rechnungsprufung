@@ -823,6 +823,16 @@ def test_versende_mahnlauf_blockiert_gesamte_gruppe_bei_einem_abweichenden_mitgl
     for mahnfall_id in geplante_ids:
         assert mahn_fall_repo.get(mahnfall_id).status != MahnStatus.GESENDET.value
 
+    # Unabhängige Rückprüfung Codex 14.09.2026: GENAU EIN Mitglied bekommt
+    # den konkreten Abweichungs-Status (UEBERSPRUNGEN - welches Mitglied
+    # das FIFO-Zahlungsausgleich tatsächlich trifft, ist hier nicht die
+    # Kernaussage); das ANDERE, weiterhin versandfähige Mitglied darf
+    # NICHT für immer GEBUENDELT/unsichtbar bleiben, sondern wird auf
+    # GEPLANT zurückgesetzt - noch KEIN Provideraufruf hat stattgefunden.
+    faelle_nach_status = {mahn_fall_repo.get(mid).status for mid in geplante_ids}
+    assert faelle_nach_status == {"UEBERSPRUNGEN", "GEPLANT"}
+    assert not any(mahn_fall_repo.get(mid).status == "GEBUENDELT" for mid in geplante_ids)
+
 
 def test_ueberlappende_gruppenbildung_sendet_gestecktes_mitglied_nicht_doppelt(
     mahn_service, mahnlauf_repo, mahn_fall_repo, op_service, basis_vertrag, ctx_factory, freigegebene_policy,
@@ -922,3 +932,62 @@ def test_ueberlappende_gruppenbildung_sendet_gestecktes_mitglied_nicht_doppelt(
     verwaiste = mahn_service.markiere_verwaiste_mahnlaeufe_als_unsicher(max_alter=timedelta(minutes=15))
     assert len(verwaiste) == 1 and verwaiste[0].id == mahnlauf_a.id
     assert mahn_fall_repo.get(geplant_a.mahnfall_id).status == MahnStatus.UNSICHER.value
+
+
+def test_plane_mahnlauf_absturz_zwischen_mitgliederclaim_und_gruppenanlage_ist_atomar(
+    mahn_service, mahnlauf_repo, mahn_fall_repo, op_service, basis_vertrag, ctx_factory, freigegebene_policy, monkeypatch,
+):
+    """Unabhängige Rückprüfung Codex 14.09.2026, echter Bug: die
+    Mitglieder-Claim (GEPLANT -> GEBUENDELT) und die Anlage der
+    `MahnLaufTable`-Zeile liefen ursprünglich in ZWEI getrennten,
+    jeweils FÜR SICH committeten Schritten - ein Absturz GENAU
+    dazwischen ließ die einzige Forderung für immer GEBUENDELT OHNE
+    zugehörige Gruppenzeile zurück: weder durch eine erneute Planung
+    (GEBUENDELT ist kein Kandidat mehr) noch durch die MahnLauf-
+    Recovery erreichbar (es existierte ja gar keine Zeile). Simuliert
+    den Absturz durch einen fehlschlagenden zweiten Schritt und
+    beweist die Atomarität: nach dem simulierten Absturz ist die
+    Forderung UNVERÄNDERT GEPLANT (nicht verwaist GEBUENDELT), und ein
+    erneuter Planungsversuch nach Wiederherstellung bildet erfolgreich
+    eine neue Gruppe."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    _mit_faelligem_soll(op_service, konto, ctx)
+    forderung = _einzige_forderung(op_service, konto, date(2026, 4, 20))
+    geplant = _planen(
+        mahn_service, ctx=ctx, vertrag=vertrag, konto=konto,
+        forderung=forderung, policy=freigegebene_policy, heute=date(2026, 4, 20),
+    )
+    assert geplant.status == "GEPLANT"
+
+    import mietinkasso.mahnwesen.repository as mahn_repo_module
+
+    def _kaputte_gruppenanlage(*_args, **_kwargs):
+        raise RuntimeError("Simulierter Absturz NACH dem Mitglieder-Claim, VOR dem Commit der Gruppenzeile.")
+
+    # Patcht die Konstruktion der Gruppenzeile selbst - die Mitglieder-
+    # Claim-UPDATE innerhalb derselben Methode/Transaktion hat zu diesem
+    # Zeitpunkt bereits (unkommittet) stattgefunden.
+    monkeypatch.setattr(mahn_repo_module, "MahnLaufTable", _kaputte_gruppenanlage)
+    with pytest.raises(RuntimeError):
+        mahn_service.plane_mahnlauf(
+            ctx=ctx, vertrag=vertrag, konto=konto, stufe=1, heute=date(2026, 4, 20),
+            bank_bestaetigt_bis=date(2026, 4, 20),
+        )
+    monkeypatch.undo()  # Originalmethode/-klasse wiederherstellen
+
+    # Der simulierte Absturz darf die Forderung NICHT dauerhaft als
+    # GEBUENDELT ohne zugehörige Gruppe zurücklassen - dank der
+    # gemeinsamen Transaktion ist sie UNVERÄNDERT GEPLANT.
+    assert mahn_fall_repo.get(geplant.mahnfall_id).status == "GEPLANT"
+
+    # Ein erneuter Planungsversuch funktioniert normal und bildet
+    # erfolgreich eine neue Gruppe für dieselbe Forderung.
+    mahnlauf = mahn_service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=1, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20),
+    )
+    assert mahnlauf is not None
+    assert MahnLaufRepository.mitglieder_ids(mahnlauf) == [geplant.mahnfall_id]
+    assert mahn_fall_repo.get(geplant.mahnfall_id).status == "GEBUENDELT"

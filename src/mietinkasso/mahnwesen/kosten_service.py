@@ -38,8 +38,8 @@ from sqlalchemy.exc import IntegrityError
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access
 from mietinkasso.domain.enums import OPTyp
-from mietinkasso.mahnwesen.kosten import MahnkostenVorschau, berechne_mahnkosten_vorschau
-from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
+from mietinkasso.mahnwesen.kosten import MahnkostenVorschau, berechne_mahnkosten_vorschau, vorschau_bei_ledger_inkonsistenz
+from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository, ZinsledgerInkonsistentError
 from mietinkasso.op.service import OPService, compute_content_hash
 from mietinkasso.stammdaten.repository import StammdatenRepository
 
@@ -98,7 +98,10 @@ class MahnkostenService:
         # bereits gebuchten Zinsen werden JE FORDERUNG nachgeschlagen
         # (nicht als vertragsweite Blanko-Summe - Rückprüfung Codex
         # 14.09.2026, siehe `kosten.py::berechne_mahnkosten_vorschau`).
-        bereits_gebuchte_zinsen_je_op = self._repository.bereits_gebuchte_zinsen_je_op_position(vertrag_id=vertrag_id)
+        try:
+            bereits_gebuchte_zinsen_je_op = self._repository.bereits_gebuchte_zinsen_je_op_position(vertrag_id=vertrag_id)
+        except ZinsledgerInkonsistentError as exc:
+            return vorschau_bei_ledger_inkonsistenz(vertrag_id=vertrag_id, stufe=stufe, forderungen=forderungen, grund=str(exc))
         bereits_erhobene_gebuehren = self._repository.bereits_erhobene_gebuehr_schluessel(vertrag_id=vertrag_id)
         return berechne_mahnkosten_vorschau(
             vertrag_id=vertrag_id, stufe=stufe, forderungen=forderungen, alle_positionen=alle_positionen,

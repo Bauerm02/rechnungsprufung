@@ -216,6 +216,55 @@ def test_bereits_gebuchte_zinsen_je_op_position_zaehlt_stufe1_delta_nicht_doppel
     assert bereits_je_op[hmz_op_id] == tatsaechlich_gebucht_gesamt
 
 
+def test_inkonsistenter_zinsledger_wird_nicht_als_null_bereits_gebucht_gewertet(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Unabhängige Rückprüfung Codex 14.09.2026: eine (z. B. aus der Zeit
+    vor Einführung von `zinsen_delta_je_op_json` stammende) Buchung mit
+    tatsächlich gebuchten Zinsen, aber fehlendem/inkonsistentem Delta-
+    JSON, darf NIEMALS still als "0 bereits gebucht" behandelt werden -
+    das würde bei einer künftigen Stufe zu doppelt gebuchten Zinsen
+    führen. Stattdessen bleibt die Vorschau für den GESAMTEN Vertrag
+    explizit "unberechenbar" (keine Zinsen/Gebühr), die Hauptforderung
+    selbst bleibt unblockiert."""
+
+    vertrag, konto = basis_vertrag
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+    forderung = op_service.offene_forderungen(konto.id, heute=date(2026, 2, 1))[0]
+
+    # Simuliert eine Alt-Buchung: zinsen_cent > 0, aber KEIN (bzw. leeres)
+    # zinsen_delta_je_op_json - genau der vom unabhängigen Prüfer
+    # beschriebene inkonsistente Zustand.
+    kosten_repo.buchung_anlegen(
+        vertrag_id=vertrag.id, stufe=1, mahnlauf_schluessel="ALT-BUCHUNG",
+        forderung_op_position_ids=[forderung.op_position_id], hauptforderung_cent=50_000,
+        zinsbasis="GESETZLICH_ABGB", zinssatz_prozent=Decimal("4.000"),
+        zins_von=date(2026, 1, 5), zins_bis=date(2026, 1, 20), zinsen_cent=208,
+        gebuehr_cent=None, rechtsgrundlage_gebuehr=None, versandnachweis_referenz="mahnung:alt",
+        zinsen_op_position_id=None, gebuehr_op_position_id=None, erstellt_von="test",
+        # zinsen_delta_je_op_json bewusst NICHT gesetzt -> Default "{}".
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=2, heute=date(2026, 3, 1))
+
+    assert vorschau is not None
+    assert vorschau.zinsbasis == "UNBERECHENBAR"
+    assert vorschau.neue_zinsen_cent == 0
+    assert vorschau.gebuehr_cent is None
+    assert vorschau.hauptforderung_cent == 50_000  # Hauptforderung bleibt unblockiert
+    assert any("Zinsledger widersprüchlich" in h for h in vorschau.hinweise)
+
+    # Direkt am Repository nachgewiesen: die Methode wirft, statt 0 zu
+    # unterstellen.
+    from mietinkasso.mahnwesen.kosten_repository import ZinsledgerInkonsistentError
+    with pytest.raises(ZinsledgerInkonsistentError):
+        kosten_repo.bereits_gebuchte_zinsen_je_op_position(vertrag_id=vertrag.id)
+
+
 def test_zinsdelta_einer_neuen_forderung_wird_nicht_durch_eine_alte_abgeloeste_geschluckt(
     op_service, kosten_service, admin_ctx, basis_vertrag,
 ):
