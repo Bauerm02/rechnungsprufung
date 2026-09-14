@@ -9,6 +9,54 @@ from mietinkasso.domain.enums import Nutzungsstatus, OPTyp
 from mietinkasso.stammdaten.service import ObjektAusgeschlossenError, StammdatenService
 
 
+def test_upsert_debitor_setzt_postadresse_geprueft_bei_echter_adressaenderung_zurueck(stammdaten_repo):
+    """Unabhängige Rückprüfung 14.09.2026, echter Bug: `postadresse_
+    geprueft=True` blieb auch dann bestehen, wenn sich `adresse` selbst
+    tatsächlich geändert hat, ohne dass eine neue Prüfung explizit
+    übergeben wurde - eine frühere Prüfung gilt aber nicht für eine
+    GENUIN ANDERE, seither nie geprüfte Adresse."""
+
+    stammdaten_repo.upsert_debitor(
+        id="DEB-ADR-1", name="Erika Mieterin", email="erika@example.at",
+        adresse="Alte Gasse 1, 1010 Wien", postadresse_geprueft=True,
+    )
+    assert stammdaten_repo.get_debitor("DEB-ADR-1").postadresse_geprueft is True
+
+    # Tatsächliche Adressänderung OHNE erneute explizite Prüfung.
+    stammdaten_repo.upsert_debitor(
+        id="DEB-ADR-1", name="Erika Mieterin", email="erika@example.at",
+        adresse="Neue Gasse 2, 1020 Wien",
+    )
+    aktualisiert = stammdaten_repo.get_debitor("DEB-ADR-1")
+    assert aktualisiert.adresse == "Neue Gasse 2, 1020 Wien"
+    assert aktualisiert.postadresse_geprueft is False
+
+
+def test_upsert_debitor_erhaelt_postadresse_geprueft_bei_reinem_email_update(stammdaten_repo):
+    """Gegenprobe: ein routinemäßiges Update anderer Felder (E-Mail) bei
+    UNVERÄNDERTER Adresse darf die einmal erteilte Prüfung weiterhin
+    NICHT stillschweigend zurücksetzen."""
+
+    stammdaten_repo.upsert_debitor(
+        id="DEB-ADR-2", name="Max Mieter", email="max-alt@example.at",
+        adresse="Immergleiche Gasse 3, 1030 Wien", postadresse_geprueft=True,
+    )
+    stammdaten_repo.upsert_debitor(
+        id="DEB-ADR-2", name="Max Mieter", email="max-neu@example.at",
+        adresse="Immergleiche Gasse 3, 1030 Wien",
+    )
+    aktualisiert = stammdaten_repo.get_debitor("DEB-ADR-2")
+    assert aktualisiert.email == "max-neu@example.at"
+    assert aktualisiert.postadresse_geprueft is True
+
+    # Explizites Zurücksetzen bleibt weiterhin über den Parameter möglich.
+    stammdaten_repo.upsert_debitor(
+        id="DEB-ADR-2", name="Max Mieter", email="max-neu@example.at",
+        adresse="Immergleiche Gasse 3, 1030 Wien", postadresse_geprueft=False,
+    )
+    assert stammdaten_repo.get_debitor("DEB-ADR-2").postadresse_geprueft is False
+
+
 def test_kaution_ist_strukturell_von_op_getrennt(stammdaten_repo, op_service, basis_vertrag, ctx_factory):
     vertrag, konto = basis_vertrag
     ctx = ctx_factory("7DI")

@@ -3,8 +3,9 @@
 Shared by the three existing business outboxes. No new business ledger,
 no resend, no recipient content in the audit record.
 """
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from mietinkasso.infrastructure.db.tables import AuditEventTable
 
@@ -50,3 +51,49 @@ def versand_belegen(session_factory, table, row_id, *, ergebnis, erlaubt,
             aktion="MAILVERSAND_BESTAETIGT", akteur="hv-mailversand",
             payload={"vorgangsreferenz": referenz, **proof}))
     return True
+
+
+@dataclass(frozen=True)
+class RekonstruierterBeleg:
+    """Baut aus dem bereits persistierten `AuditEventTable`-Payload (das
+    `versand_belegen` beim ursprünglichen tatsächlichen Versand
+    geschrieben hat) ein Objekt, das `nachweis_daten`/`versand_belegen`
+    exakt wie das ursprüngliche Versandergebnis akzeptieren - für eine
+    Recovery, die NICHT erneut sendet, sondern eine bereits TATSÄCHLICH
+    bestätigte Quittung übernimmt (Mitgliedsnachweise/Kostenbuchung
+    nachziehen, siehe `mahnwesen/service.py::MahnwesenService.
+    _vervollstaendige_bestaetigten_mahnlauf`). `status` wird NICHT aus
+    dem Payload gelesen (er wurde dort nie mitgespeichert) - die reine
+    EXISTENZ eines Audit-Eintrags mit `aktion ==
+    "MAILVERSAND_BESTAETIGT"` belegt bereits, dass `status == "GESENDET"`
+    beim ursprünglichen Versand zutraf, sonst wäre dieser Eintrag nie
+    geschrieben worden."""
+
+    status: str
+    versendet_am: datetime
+    externe_referenz: str
+    provider_referenz: str
+
+
+def beleg_aus_bestaetigtem_audit(session_factory, table, row_id) -> "RekonstruierterBeleg | None":
+    """Lädt den JÜNGSTEN `MAILVERSAND_BESTAETIGT`-Audit-Eintrag für
+    `(table.__tablename__, row_id)` und rekonstruiert daraus den
+    ursprünglichen Beleg - `None`, wenn (noch) keiner existiert."""
+
+    with session_factory() as session:
+        event = session.execute(
+            select(AuditEventTable)
+            .where(AuditEventTable.entity_typ == table.__tablename__)
+            .where(AuditEventTable.entity_id == str(row_id))
+            .where(AuditEventTable.aktion == "MAILVERSAND_BESTAETIGT")
+            .order_by(AuditEventTable.id.desc())
+        ).scalars().first()
+    if event is None:
+        return None
+    payload = event.payload
+    return RekonstruierterBeleg(
+        status="GESENDET",
+        versendet_am=datetime.fromisoformat(payload["versendet_am"]),
+        externe_referenz=payload["externe_referenz"],
+        provider_referenz=payload["provider_referenz"],
+    )

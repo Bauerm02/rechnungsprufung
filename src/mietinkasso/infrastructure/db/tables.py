@@ -1561,7 +1561,26 @@ class MahnkostenGebuehrTable(Base):
     `mahnwesen/kosten.py::_entgeltforderung_schluessel`). Die
     Unique-Constraint ist hier - anders als bei `MahnkostenBuchungTable` -
     das FACHLICHE Gate selbst, nicht nur ein Race-Sicherheitsnetz: ein
-    zweiter Versuch für dieselbe Forderung MUSS scheitern."""
+    zweiter Versuch für dieselbe Forderung MUSS scheitern.
+
+    `status`/`reserviert_fuer_mahnlauf_id` (Auftrag Markus 14.09.2026,
+    unabhängige Rückprüfung, echter Bug): eine Zeile entsteht ZWEISTUFIG
+    - `RESERVIERT` (angelegt SOFORT nach gewonnenem Gruppen-Claim, VOR
+    Text-/Kostenfreeze und jedem Providerkontakt, siehe
+    `MahnkostenService.reserviere_und_kuerze_vorschau`) und erst NACH
+    bestätigtem Versand auf `GEBUCHT` umgeschrieben (`MahnkostenRepository.
+    finalisiere_reservierte_gebuehr`, NIE ein zweiter `INSERT`). Ohne
+    diese frühe Reservierung konnten zwei DISJUNKTE, gleichzeitig in
+    Arbeit befindliche Mahnlauf-Gruppen (z. B. zwei Komponenten
+    derselben Vorschreibungsperiode in unterschiedlichen Gruppen) BEIDE
+    unabhängig voneinander dieselbe, noch unbestätigte Pauschale in
+    ihrem jeweiligen Brief-/Mailtext ankündigen - die Unique-Constraint
+    hätte erst bei der ZWEITEN tatsächlichen Buchung gegriffen, als der
+    fälschlich doppelt angekündigte Brief längst versendet war. Die
+    Reservierung bleibt über einen UNSICHER-Zustand hinweg bestehen
+    (der Provider könnte bereits angenommen haben); bei einer sauberen
+    Blockade VOR jedem Providerkontakt wird sie wieder freigegeben
+    (`MahnkostenRepository.gib_reservierung_frei`)."""
 
     __tablename__ = "mahnkosten_gebuehren"
     __table_args__ = (UniqueConstraint("vertrag_id", "entgeltforderung_schluessel", name="uq_mahnkosten_gebuehr_forderung"),)
@@ -1573,5 +1592,13 @@ class MahnkostenGebuehrTable(Base):
     rechtsgrundlage: Mapped[str] = mapped_column(String(256))
     mahnkosten_buchung_id: Mapped[int | None] = mapped_column(ForeignKey("mahnkosten_buchungen.id"), nullable=True)
     gebuehr_op_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # RESERVIERT (noch nicht bestätigt gesendet/gebucht) | GEBUCHT
+    # (tatsächlicher Versand bestätigt, Buchungsreferenzen oben gesetzt).
+    status: Mapped[str] = mapped_column(String(16), default="RESERVIERT", server_default=text("'RESERVIERT'"))
+    # Bewusst PLAIN Integer ohne echten `ForeignKey` (Präzedenzfall in
+    # dieser Tabelle selbst: `gebuehr_op_position_id` ist ebenfalls eine
+    # lose Referenz ohne FK) - hält `ensure_additive_columns`s
+    # FK-Spalten-Sonderfall aus dieser rein additiven Erweiterung heraus.
+    reserviert_fuer_mahnlauf_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     erhoben_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     erstellt_von: Mapped[str] = mapped_column(String(128))

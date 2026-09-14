@@ -244,19 +244,33 @@ def test_ensure_additive_columns_ist_idempotent(altschema_engine):
     assert zweiter_lauf == []
 
 
-def _altschema_mahnkosten_metadata() -> tuple[sa.MetaData, sa.Table]:
+def _altschema_mahnkosten_metadata(*, mit_erstellt_von: bool = True) -> tuple[sa.MetaData, sa.Table]:
     """`mahnkosten_buchungen` WIE VOR der Rückprüfung 14.09.2026 (echter
     Bug, siehe `MahnkostenBuchungTable`-Moduldoc): die Unique-Constraint
     lag auf (`vertrag_id, stufe, zins_bis`) statt auf (`vertrag_id,
     stufe, mahnlauf_schluessel`) - GENAU dieselben Spalten wie das
-    aktuelle Modell, nur der Constraint unterscheidet sich."""
+    aktuelle Modell, nur der Constraint unterscheidet sich.
+
+    `vertrag_id` trägt bewusst `index=True` - unabhängige Abnahme
+    2cd09ca, echter Bug: das reale ORM-Modell (`tables.py::
+    MahnkostenBuchungTable.vertrag_id`) hat diesen Index tatsächlich
+    (`ForeignKey(...), index=True`); ein Rebuild, der diesen Index nicht
+    vor dem Anlegen der frischen Tabelle entfernt, scheitert an SQLite
+    mit `OperationalError: index ix_mahnkosten_buchungen_vertrag_id
+    already exists` - ein früherer Testlauf ohne diesen Index hat genau
+    diese reale Kollision NICHT abgebildet.
+
+    `mit_erstellt_von=False` bildet zusätzlich ein (rein synthetisches)
+    NOCH älteres Altschema nach, dem eine vom aktuellen Modell als
+    NOT NULL erwartete Spalte komplett fehlt - Grundlage für den
+    Atomaritäts-Test: das `INSERT INTO ... SELECT ...` schlägt dabei
+    zwangsläufig fehl, und genau dieser Fall muss den GESAMTEN Rebuild
+    (samt `ALTER TABLE ... RENAME`) rückstandsfrei zurückrollen."""
 
     meta = sa.MetaData()
-    tabelle = sa.Table(
-        "mahnkosten_buchungen",
-        meta,
+    spalten = [
         sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
-        sa.Column("vertrag_id", sa.String(64), nullable=False),
+        sa.Column("vertrag_id", sa.String(64), nullable=False, index=True),
         sa.Column("stufe", sa.Integer, nullable=False),
         sa.Column("mahnlauf_schluessel", sa.String(128), nullable=False),
         sa.Column("forderung_op_position_ids", sa.Text, nullable=False),
@@ -274,9 +288,11 @@ def _altschema_mahnkosten_metadata() -> tuple[sa.MetaData, sa.Table]:
         sa.Column("zins_segmente_json", sa.Text, nullable=False, server_default="[]"),
         sa.Column("zinsen_delta_je_op_json", sa.Text, nullable=False, server_default="{}"),
         sa.Column("gebucht_am", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
-        sa.Column("erstellt_von", sa.String(128), nullable=False),
-        sa.UniqueConstraint("vertrag_id", "stufe", "zins_bis", name="uq_mahnkosten_lauf"),
-    )
+    ]
+    if mit_erstellt_von:
+        spalten.append(sa.Column("erstellt_von", sa.String(128), nullable=False))
+    spalten.append(sa.UniqueConstraint("vertrag_id", "stufe", "zins_bis", name="uq_mahnkosten_lauf"))
+    tabelle = sa.Table("mahnkosten_buchungen", meta, *spalten)
     return meta, tabelle
 
 
@@ -310,6 +326,67 @@ def mahnkosten_altschema_engine(tmp_path: Path):
         )
     yield engine
     engine.dispose()
+
+
+@pytest.fixture
+def mahnkosten_altschema_engine_inkompatibel(tmp_path: Path):
+    """Fehlt eine vom aktuellen Modell als NOT NULL erwartete Spalte
+    (`erstellt_von`) komplett - das `INSERT INTO ... SELECT ...` des
+    Rebuilds MUSS daran scheitern. Grundlage für den Atomaritäts-Test:
+    dieser Fehlerfall darf NIE eine leere neue Tabelle neben einer
+    verwaisten `..._vor_migration`-Alttabelle zurücklassen."""
+
+    db_pfad = tmp_path / "altschema_mahnkosten_inkompatibel.db"
+    engine = sa.create_engine(f"sqlite:///{db_pfad}", future=True)
+    meta, tabelle = _altschema_mahnkosten_metadata(mit_erstellt_von=False)
+    meta.create_all(engine)
+
+    with engine.begin() as conn:
+        conn.execute(
+            tabelle.insert().values(
+                vertrag_id="V-ALT-MAHNKOSTEN", stufe=1, mahnlauf_schluessel="ALT-GRUPPE-A",
+                forderung_op_position_ids="[1]", hauptforderung_cent=50_000, zinsbasis="GESETZLICH_ABGB",
+                zinssatz_prozent="4.000", zins_von=date(2026, 1, 5), zins_bis=date(2026, 3, 1),
+                zinsen_cent=208, gebuehr_cent=None, rechtsgrundlage_gebuehr=None,
+                versandnachweis_referenz="mahnung:produktiv-alt", zinsen_op_position_id=None,
+                gebuehr_op_position_id=None,
+            )
+        )
+    yield engine
+    engine.dispose()
+
+
+def test_ensure_mahnkosten_lauf_unique_key_rebuild_ist_atomar_bei_fehler(mahnkosten_altschema_engine_inkompatibel):
+    """Unabhängige Abnahme 2cd09ca: ein fehlschlagender Rebuild (hier
+    provoziert durch eine fehlende, vom neuen Modell als NOT NULL
+    erwartete Spalte) darf NIE eine leere neue Tabelle neben einer
+    verwaisten `mahnkosten_buchungen__vor_migration`-Alttabelle
+    zurücklassen - der GESAMTE Rebuild (RENAME/DROP INDEX/CREATE/INSERT)
+    läuft in EINER Transaktion und rollt bei einem Fehler vollständig
+    zurück; die Originaltabelle bleibt unter ihrem ursprünglichen Namen
+    mit ihrer ursprünglichen Zeile unverändert erhalten."""
+
+    engine = mahnkosten_altschema_engine_inkompatibel
+    with pytest.raises(sa.exc.OperationalError):
+        ensure_mahnkosten_lauf_unique_key(engine)
+
+    inspector = sa.inspect(engine)
+    tabellen = set(inspector.get_table_names())
+    assert "mahnkosten_buchungen" in tabellen
+    assert "mahnkosten_buchungen__vor_migration" not in tabellen  # kein verwaister Rest
+
+    with engine.begin() as conn:
+        zeile = conn.execute(sa.text(
+            "SELECT vertrag_id, mahnlauf_schluessel, zinsen_cent FROM mahnkosten_buchungen WHERE id = 1"
+        )).mappings().one()
+    assert zeile["vertrag_id"] == "V-ALT-MAHNKOSTEN"
+    assert zeile["mahnlauf_schluessel"] == "ALT-GRUPPE-A"
+    assert zeile["zinsen_cent"] == 208  # unveränderte Originalzeile, nicht verloren
+
+    # Die alte Eindeutigkeit ist unverändert noch da - der Fehler hat
+    # NICHTS am ursprünglichen Zustand verändert.
+    constraints = inspector.get_unique_constraints("mahnkosten_buchungen")
+    assert any(set(c["column_names"]) == {"vertrag_id", "stufe", "zins_bis"} for c in constraints)
 
 
 def test_ensure_mahnkosten_lauf_unique_key_migriert_altes_schema(mahnkosten_altschema_engine):

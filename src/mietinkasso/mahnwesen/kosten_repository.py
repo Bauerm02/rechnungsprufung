@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -280,12 +280,19 @@ class MahnkostenRepository:
 
     def bereits_erhobene_gebuehr_schluessel(self, *, vertrag_id: str) -> frozenset[str]:
         """Alle `entgeltforderung_schluessel`, für die für DIESEN Vertrag
-        bereits PERMANENT eine §458-UGB-Pauschale erhoben wurde - über
-        ALLE Mahnläufe/Stufen hinweg (siehe
-        `kosten.py::MahnkostenGebuehrTable`-Moduldoc). Eine hier
-        enthaltene Entgeltforderung löst NIE wieder eine zweite Pauschale
-        aus; eine GENUIN andere (nicht enthaltene) Entgeltforderung kann
-        weiterhin ihre eigene, separate Pauschale auslösen."""
+        bereits eine §458/§1333-Pauschale ERHOBEN ODER RESERVIERT ist -
+        über ALLE Mahnläufe/Stufen hinweg (siehe
+        `kosten.py::MahnkostenGebuehrTable`-Moduldoc). BEWUSST ohne
+        Status-Filter (`RESERVIERT` zählt genauso wie `GEBUCHT`) -
+        unabhängige Rückprüfung Codex 14.09.2026, echter Bug: eine noch
+        nicht final gebuchte, aber bereits von einer ANDEREN, gerade in
+        Arbeit befindlichen Gruppe reservierte Entgeltforderung darf
+        einer zweiten Gruppe NIE erneut als "noch offen" erscheinen -
+        sonst würden beide Gruppen unabhängig voneinander dieselbe
+        Pauschale ankündigen. Eine hier enthaltene Entgeltforderung löst
+        NIE wieder eine zweite Pauschale aus; eine GENUIN andere (nicht
+        enthaltene) Entgeltforderung kann weiterhin ihre eigene,
+        separate Pauschale auslösen."""
 
         with self._session_factory() as session:
             zeilen = session.execute(
@@ -303,12 +310,21 @@ class MahnkostenRepository:
         `uq_mahnkosten_gebuehr_forderung` ist hier das FACHLICHE Gate
         selbst (siehe Tabellen-Docstring), kein bloßes Race-Netz: ein
         zweiter Versuch für dieselbe Entgeltforderung MUSS mit
-        `IntegrityError` scheitern."""
+        `IntegrityError` scheitern.
+
+        NUR für den einzelfallbasierten, in Produktion nicht mehr
+        verdrahteten `MahnwesenService.versenden()`-Pfad (kein
+        gebündelter Mahnlauf, daher KEIN Reservierungsschritt vor dem
+        Versand nötig/möglich) - legt die Zeile direkt als `GEBUCHT` an.
+        Der gebündelte Mahnlauf-Pfad (`versende_mahnlauf`) verwendet
+        stattdessen `reserviere_gebuehr` (vor Text-/Kostenfreeze) plus
+        `finalisiere_reservierte_gebuehr` (nach bestätigtem Versand) -
+        siehe `MahnkostenGebuehrTable`-Docstring."""
 
         def _schreiben(active_session: Session) -> MahnkostenGebuehrTable:
             row = MahnkostenGebuehrTable(
                 vertrag_id=vertrag_id, entgeltforderung_schluessel=entgeltforderung_schluessel,
-                betrag_cent=betrag_cent, rechtsgrundlage=rechtsgrundlage,
+                betrag_cent=betrag_cent, rechtsgrundlage=rechtsgrundlage, status="GEBUCHT",
                 mahnkosten_buchung_id=mahnkosten_buchung_id, gebuehr_op_position_id=gebuehr_op_position_id,
                 erstellt_von=erstellt_von,
             )
@@ -324,6 +340,99 @@ class MahnkostenRepository:
             owned_session.commit()
             owned_session.refresh(row)
             return row
+
+    def reserviere_gebuehr(
+        self, *, vertrag_id: str, entgeltforderung_schluessel: str, betrag_cent: int, rechtsgrundlage: str,
+        mahnlauf_id: int, erstellt_von: str,
+    ) -> MahnkostenGebuehrTable | None:
+        """Reserviert EXKLUSIV eine Entgeltforderung für GENAU DIESEN
+        Mahnlauf - unabhängige Rückprüfung Codex 14.09.2026, echter Bug:
+        ohne diese frühe Reservierung (VOR Text-/Kostenfreeze und jedem
+        Providerkontakt) konnten zwei DISJUNKTE, gleichzeitig in Arbeit
+        befindliche Mahnlauf-Gruppen für dieselbe Entgeltforderung BEIDE
+        unabhängig voneinander eine noch unbestätigte Pauschale in ihrem
+        jeweiligen Brief-/Mailtext ankündigen (die Unique-Constraint
+        hätte erst bei der ZWEITEN tatsächlichen Buchung gegriffen, als
+        der fälschlich doppelt angekündigte Brief längst versendet war).
+        Gibt bei einer erfolgreichen Reservierung die neue Zeile
+        (`status="RESERVIERT"`) zurück, bei `IntegrityError` (eine
+        ANDERE Gruppe hat diese Entgeltforderung bereits reserviert oder
+        gebucht) `None` - der Aufrufer MUSS das betroffene Segment dann
+        aus seiner eigenen Vorschau entfernen, NIEMALS eine zweite
+        Zusage für dieselbe Forderung versenden (siehe
+        `MahnkostenService.reserviere_und_kuerze_vorschau`)."""
+
+        with self._session_factory() as session:
+            row = MahnkostenGebuehrTable(
+                vertrag_id=vertrag_id, entgeltforderung_schluessel=entgeltforderung_schluessel,
+                betrag_cent=betrag_cent, rechtsgrundlage=rechtsgrundlage, status="RESERVIERT",
+                reserviert_fuer_mahnlauf_id=mahnlauf_id, erstellt_von=erstellt_von,
+            )
+            session.add(row)
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                return None
+            session.refresh(row)
+            return row
+
+    def gib_reservierung_frei(self, *, vertrag_id: str, entgeltforderung_schluessel: str, mahnlauf_id: int) -> None:
+        """Gibt eine VOM AUFRUFER selbst gehaltene, noch nicht gebuchte
+        Reservierung wieder frei (löscht die Zeile) - NUR zulässig,
+        solange noch KEIN tatsächlicher/unklarer Providerkontakt
+        stattgefunden hat (siehe `MahnwesenService.versende_mahnlauf`,
+        ValueError-Zweig VOR dem Providerkontakt). Löscht GEZIELT nur
+        die EIGENE Zeile (`reserviert_fuer_mahnlauf_id == mahnlauf_id`
+        UND `status == "RESERVIERT"`) - eine bereits `GEBUCHT`e oder
+        einer ANDEREN Gruppe gehörende Zeile bleibt unberührt. Kein
+        Fehler, wenn keine passende Zeile (mehr) existiert (idempotent)."""
+
+        with self._session_factory() as session:
+            session.execute(
+                delete(MahnkostenGebuehrTable)
+                .where(MahnkostenGebuehrTable.vertrag_id == vertrag_id)
+                .where(MahnkostenGebuehrTable.entgeltforderung_schluessel == entgeltforderung_schluessel)
+                .where(MahnkostenGebuehrTable.reserviert_fuer_mahnlauf_id == mahnlauf_id)
+                .where(MahnkostenGebuehrTable.status == "RESERVIERT")
+            )
+            session.commit()
+
+    def finalisiere_reservierte_gebuehr(
+        self, *, vertrag_id: str, entgeltforderung_schluessel: str, mahnlauf_id: int,
+        mahnkosten_buchung_id: int, gebuehr_op_position_id: int | None, session: Session,
+    ) -> MahnkostenGebuehrTable:
+        """Wandelt die EIGENE, bei `reserviere_gebuehr` angelegte Zeile
+        (`status == "RESERVIERT"`, `reserviert_fuer_mahnlauf_id ==
+        mahnlauf_id`) nach bestätigtem Versand in die endgültige Buchung
+        um (`status = "GEBUCHT"`, Buchungsreferenzen ergänzt) - KEIN
+        neuer `INSERT` (der würde an der eigenen, bereits bestehenden
+        Zeile scheitern). Läuft in DERSELBEN, vom Aufrufer übergebenen
+        Transaktion wie die eigentliche OP-Buchung (Alles-oder-nichts,
+        wie `buchung_anlegen`). Findet sich KEINE eigene Reservierung
+        mehr (z. B. versehentlich manuell entfernt), wird das LAUT
+        gemeldet (`ValueError`) statt stillschweigend eine neue Zeile
+        anzulegen oder nichts zu tun - eine finanzielle Buchung ohne
+        nachvollziehbare Grundlage wird NIE stillschweigend
+        hingenommen."""
+
+        row = session.execute(
+            select(MahnkostenGebuehrTable)
+            .where(MahnkostenGebuehrTable.vertrag_id == vertrag_id)
+            .where(MahnkostenGebuehrTable.entgeltforderung_schluessel == entgeltforderung_schluessel)
+            .where(MahnkostenGebuehrTable.reserviert_fuer_mahnlauf_id == mahnlauf_id)
+        ).scalar_one_or_none()
+        if row is None:
+            raise ValueError(
+                f"Keine eigene Reservierung für Entgeltforderung {entgeltforderung_schluessel!r} "
+                f"(Mahnlauf {mahnlauf_id}, Vertrag {vertrag_id}) gefunden - Buchung kann nicht ohne "
+                "nachvollziehbare Grundlage finalisiert werden."
+            )
+        row.status = "GEBUCHT"
+        row.mahnkosten_buchung_id = mahnkosten_buchung_id
+        row.gebuehr_op_position_id = gebuehr_op_position_id
+        session.flush()
+        return row
 
     def buchung_fuer_mahnlauf(self, *, vertrag_id: str, stufe: int, mahnlauf_schluessel: str) -> MahnkostenBuchungTable | None:
         """Lookup nach dem tatsächlichen Eindeutigkeitsschlüssel

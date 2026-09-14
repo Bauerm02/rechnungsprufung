@@ -8,7 +8,116 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.domain.enums import MahnStatus
-from mietinkasso.infrastructure.db.tables import MahnFallTable, MahnLaufTable, MahnPolicyTable
+from mietinkasso.infrastructure.db.tables import (
+    BriefAnbieterProfilTable, MahnFallTable, MahnKanalregelTable, MahnLaufTable, MahnPolicyTable,
+)
+
+
+class MahnKanalregelRepository:
+    """Versionierte Kanalregel (ENTWURF -> FREIGEGEBEN), fast wörtliches
+    Pendant zu `MahnPolicyRepository` - siehe `MahnKanalregelTable`-
+    Docstring. `MahnwesenService._resolve_kanal` verwendet AUSSCHLIESSLICH
+    die aktuell freigegebene Regel; fehlt jede, bleibt der bisherige
+    Code-Default (EMAIL für beide Stufen, siehe dortige Docstring)
+    unverändert wirksam - eine neue Kanalzuordnung braucht KEINEN Deploy,
+    nur eine neue freigegebene Version, entfaltet aber auch erst DANN
+    tatsächlich Wirkung."""
+
+    def __init__(self, session_factory: sessionmaker[Session]):
+        self._session_factory = session_factory
+
+    def naechste_version(self) -> int:
+        with self._session_factory() as session:
+            versionen = [v for (v,) in session.execute(select(MahnKanalregelTable.version)).all()]
+            return (max(versionen) + 1) if versionen else 1
+
+    def anlegen(self, **kwargs) -> MahnKanalregelTable:
+        with self._session_factory() as session:
+            row = MahnKanalregelTable(version=self.naechste_version(), **kwargs)
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def freigeben(self, regel_id: int, *, freigegeben_von: str) -> MahnKanalregelTable:
+        with self._session_factory() as session:
+            row = session.get(MahnKanalregelTable, regel_id)
+            if row is None:
+                raise ValueError(f"Unbekannte MahnKanalregel {regel_id}")
+            if row.status != "ENTWURF":
+                raise ValueError(f"MahnKanalregel {regel_id} ist bereits {row.status}, keine erneute Freigabe.")
+            row.status = "FREIGEGEBEN"
+            row.geprueft_von = freigegeben_von
+            row.geprueft_am = datetime.now(timezone.utc)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def aktuelle_freigegebene(self) -> MahnKanalregelTable | None:
+        with self._session_factory() as session:
+            return session.execute(
+                select(MahnKanalregelTable).where(MahnKanalregelTable.status == "FREIGEGEBEN")
+                .order_by(MahnKanalregelTable.version.desc()).limit(1)
+            ).scalar_one_or_none()
+
+    def alle(self) -> list[MahnKanalregelTable]:
+        with self._session_factory() as session:
+            return list(session.execute(select(MahnKanalregelTable).order_by(MahnKanalregelTable.version.desc())).scalars())
+
+
+class BriefAnbieterProfilRepository:
+    """Versioniertes, geprüftes Preis-/Tarifprofil je Briefart (ENTWURF ->
+    FREIGEGEBEN), fast wörtliches Pendant zu `MahnPolicyRepository` -
+    siehe `BriefAnbieterProfilTable`-Docstring. Fehlt jede freigegebene
+    Version für die gewünschte `briefart`, bleibt der Briefkanal explizit
+    blockiert (`mahnwesen/service.py::_pruefe_frisch_versandbereit`)."""
+
+    def __init__(self, session_factory: sessionmaker[Session]):
+        self._session_factory = session_factory
+
+    def naechste_version(self, *, briefart: str) -> int:
+        with self._session_factory() as session:
+            versionen = [v for (v,) in session.execute(
+                select(BriefAnbieterProfilTable.version).where(BriefAnbieterProfilTable.briefart == briefart)
+            ).all()]
+            return (max(versionen) + 1) if versionen else 1
+
+    def anlegen(self, *, briefart: str = "STANDARD", **kwargs) -> BriefAnbieterProfilTable:
+        with self._session_factory() as session:
+            row = BriefAnbieterProfilTable(briefart=briefart, version=self.naechste_version(briefart=briefart), **kwargs)
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def freigeben(self, profil_id: int, *, freigegeben_von: str) -> BriefAnbieterProfilTable:
+        with self._session_factory() as session:
+            row = session.get(BriefAnbieterProfilTable, profil_id)
+            if row is None:
+                raise ValueError(f"Unbekanntes BriefAnbieterProfil {profil_id}")
+            if row.status != "ENTWURF":
+                raise ValueError(f"BriefAnbieterProfil {profil_id} ist bereits {row.status}, keine erneute Freigabe.")
+            row.status = "FREIGEGEBEN"
+            row.geprueft_von = freigegeben_von
+            row.geprueft_am = datetime.now(timezone.utc)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def aktuelle_freigegebene(self, *, briefart: str = "STANDARD") -> BriefAnbieterProfilTable | None:
+        with self._session_factory() as session:
+            return session.execute(
+                select(BriefAnbieterProfilTable)
+                .where(BriefAnbieterProfilTable.briefart == briefart, BriefAnbieterProfilTable.status == "FREIGEGEBEN")
+                .order_by(BriefAnbieterProfilTable.version.desc()).limit(1)
+            ).scalar_one_or_none()
+
+    def alle(self, *, briefart: str | None = None) -> list[BriefAnbieterProfilTable]:
+        with self._session_factory() as session:
+            statement = select(BriefAnbieterProfilTable).order_by(BriefAnbieterProfilTable.version.desc())
+            if briefart is not None:
+                statement = statement.where(BriefAnbieterProfilTable.briefart == briefart)
+            return list(session.execute(statement).scalars())
 
 
 class MahnPolicyRepository:
@@ -327,19 +436,33 @@ class MahnLaufRepository:
             )
             return list(session.execute(statement).scalars().all())
 
-    def claim_fuer_versand(self, mahnlauf_id: int, *, jetzt: datetime | None = None) -> bool:
+    def claim_fuer_versand(self, mahnlauf_id: int, *, jetzt: datetime | None = None, zusatz: dict | None = None) -> bool:
         """Atomarer Compare-and-Swap GEPLANT -> IN_VERSAND auf der
         GRUPPENZEILE selbst - das ist der eigentliche Unterschied zur
         alten "kleinste-Id"-Heuristik: die Exklusivität hängt an keinem
         einzelnen Mitglied mehr, sondern an dieser einen, für die exakte
-        Mitgliedermenge eindeutigen Zeile."""
+        Mitgliedermenge eindeutigen Zeile.
+
+        `zusatz`: optionale zusätzliche Spaltenwerte, ATOMAR in DERSELBEN
+        UPDATE-Anweisung wie der Claim selbst geschrieben (Auftrag Markus
+        14.09.2026, unabhängige Rückprüfung: der eingefrorene Kosten-/
+        Inhaltssnapshot MUSS bereits VOR jedem tatsächlichen
+        Providerkontakt persistiert sein - sonst geht er verloren, falls
+        der Provider das Schreiben annimmt, der lokale Prozess aber VOR
+        der Bestätigung des Ergebnisses abstürzt; eine spätere Status-
+        Abfrage für eine dann UNSICHERE Gruppe hätte sonst keine
+        verlässliche Grundlage mehr für Mitgliedsnachweis/Kostenbuchung,
+        außer einer potenziell abweichenden Neuberechnung)."""
 
         with self._session_factory() as session:
+            values = {"status": "IN_VERSAND", "versand_beansprucht_am": jetzt or datetime.now(timezone.utc)}
+            if zusatz:
+                values.update(zusatz)
             result = session.execute(
                 update(MahnLaufTable)
                 .where(MahnLaufTable.id == mahnlauf_id)
                 .where(MahnLaufTable.status == "GEPLANT")
-                .values(status="IN_VERSAND", versand_beansprucht_am=jetzt or datetime.now(timezone.utc))
+                .values(**values)
             )
             session.commit()
             return result.rowcount > 0
@@ -361,8 +484,7 @@ class MahnLaufRepository:
         Kostenbuchung wurde noch nicht als abgeschlossen markiert - ein
         Absturz zwischen bestätigtem Versand und Buchung, oder zwischen
         Buchung und dem Markieren als abgeschlossen. Siehe
-        `MahnwesenService.vervollstaendige_gesendete_mahnlaeufe_ohne_
-        kostenabschluss`."""
+        `MahnwesenService.vervollstaendige_gesendete_mahnlaeufe`."""
 
         with self._session_factory() as session:
             statement = (
@@ -373,11 +495,51 @@ class MahnLaufRepository:
             )
             return list(session.execute(statement).scalars().all())
 
+    def list_fuer_status(self, status: str) -> list[MahnLaufTable]:
+        with self._session_factory() as session:
+            return list(session.execute(select(MahnLaufTable).where(MahnLaufTable.status == status)).scalars().all())
+
+    def list_gesendet_mit_offenen_mitgliedern(self, *, mitglieder_repo) -> list[MahnLaufTable]:
+        """GESENDETE Mahnläufe, bei denen mindestens ein eingefrorenes
+        Mitglied NOCH NICHT auf GESENDET nachgezogen wurde - unabhängige
+        Rückprüfung Codex 14.09.2026, echter Bug: ein Absturz MITTEN in
+        der Mitgliederschleife (nach dem bestätigten Gruppenübergang,
+        vor/während einzelner Mitgliedsnachweise) durfte die Gruppe
+        NICHT mit einem für immer GEBUENDELT bleibenden Mitglied
+        zurücklassen (das blockiert insbesondere Stufe 2/den
+        Zugangsbeleg für dieses Mitglied). Siehe
+        `MahnwesenService.vervollstaendige_gesendete_mahnlaeufe`."""
+
+        offene: list[MahnLaufTable] = []
+        for lauf in self.list_fuer_status("GESENDET"):
+            mitglieder_ids = self.mitglieder_ids(lauf)
+            if any(
+                (mitglied := mitglieder_repo.get(mitglied_id)) is None or mitglied.status != MahnStatus.GESENDET.value
+                for mitglied_id in mitglieder_ids
+            ):
+                offene.append(lauf)
+        return offene
+
     def markiere_mahnkosten_verarbeitet(self, mahnlauf_id: int, *, zeitpunkt: datetime | None = None) -> None:
         with self._session_factory() as session:
             session.execute(
                 update(MahnLaufTable).where(MahnLaufTable.id == mahnlauf_id)
                 .values(mahnkosten_verarbeitet_am=zeitpunkt or datetime.now(timezone.utc))
+            )
+            session.commit()
+
+    def aktualisiere_kosten_snapshot(self, mahnlauf_id: int, kosten_snapshot_json: str) -> None:
+        """Schreibt einen bereits VOR dem Providerkontakt eingefrorenen
+        Snapshot NACHTRÄGLICH um (z. B. weil `MahnkostenService.
+        reserviere_und_kuerze_vorschau` ein Gebührensegment entfernen
+        musste, das eine andere, schnellere Gruppe soeben reserviert
+        hat) - IMMER NOCH VOR dem eigentlichen Providerkontakt
+        aufgerufen, siehe `MahnwesenService.versende_mahnlauf`."""
+
+        with self._session_factory() as session:
+            session.execute(
+                update(MahnLaufTable).where(MahnLaufTable.id == mahnlauf_id)
+                .values(mahnkosten_snapshot_json=kosten_snapshot_json)
             )
             session.commit()
 

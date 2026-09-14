@@ -36,6 +36,8 @@ from decimal import Decimal
 
 from sqlalchemy.exc import IntegrityError
 
+import dataclasses
+
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access
 from mietinkasso.domain.enums import OPTyp
 from mietinkasso.mahnwesen.kosten import MahnkostenVorschau, berechne_mahnkosten_vorschau, vorschau_bei_ledger_inkonsistenz
@@ -134,9 +136,67 @@ class MahnkostenService:
             return None
         return self.buche_vorschau(ctx=ctx, vorschau=vorschau, heute=heute, versandnachweis_referenz=versandnachweis_referenz, akteur=akteur)
 
+    def reserviere_und_kuerze_vorschau(
+        self, *, vorschau: MahnkostenVorschau, mahnlauf_id: int, akteur: str,
+    ) -> MahnkostenVorschau:
+        """Reserviert JEDES in `vorschau.gebuehr_segmente` enthaltene
+        Segment EXKLUSIV für `mahnlauf_id`, BEVOR der Brief-/Mailtext
+        eingefroren und der Provider kontaktiert wird (Auftrag Markus
+        14.09.2026, unabhängige Rückprüfung, echter Bug: zwei DISJUNKTE,
+        gleichzeitig in Arbeit befindliche Mahnlauf-Gruppen für dieselbe
+        Entgeltforderung - z. B. zwei Komponenten derselben
+        Vorschreibungsperiode in unterschiedlichen Gruppen - konnten
+        sonst BEIDE unabhängig voneinander dieselbe, noch unbestätigte
+        Pauschale ankündigen, weil die Unique-Constraint erst bei der
+        ZWEITEN tatsächlichen Buchung gegriffen hätte, als der doppelt
+        angekündigte Brief längst versendet war).
+
+        Ein Segment, das eine ANDERE, gerade schnellere Gruppe soeben
+        reserviert hat, wird aus der zurückgegebenen Vorschau ENTFERNT
+        (nie stillschweigend behalten) - `gebuehr_cent`/
+        `gebuehr_rechtsgrundlage` werden entsprechend neu gebildet. Gibt
+        `vorschau` UNVERÄNDERT (dasselbe Objekt) zurück, wenn nichts zu
+        kürzen war - der Aufrufer kann das per Identitätsvergleich
+        erkennen, um einen unnötigen erneuten Snapshot-Schreibvorgang zu
+        vermeiden."""
+
+        if not vorschau.gebuehr_segmente:
+            return vorschau
+        behaltene = [
+            segment for segment in vorschau.gebuehr_segmente
+            if self._repository.reserviere_gebuehr(
+                vertrag_id=vorschau.vertrag_id, entgeltforderung_schluessel=segment.entgeltforderung_schluessel,
+                betrag_cent=segment.betrag_cent, rechtsgrundlage=segment.rechtsgrundlage,
+                mahnlauf_id=mahnlauf_id, erstellt_von=akteur,
+            ) is not None
+        ]
+        if len(behaltene) == len(vorschau.gebuehr_segmente):
+            return vorschau
+        return dataclasses.replace(
+            vorschau, gebuehr_segmente=tuple(behaltene),
+            gebuehr_cent=(sum(s.betrag_cent for s in behaltene) or None),
+            gebuehr_rechtsgrundlage=(behaltene[0].rechtsgrundlage if behaltene else None),
+        )
+
+    def gib_reservierungen_frei(self, *, vorschau: MahnkostenVorschau, mahnlauf_id: int) -> None:
+        """Gegenstück zu `reserviere_und_kuerze_vorschau` - gibt ALLE in
+        `vorschau.gebuehr_segmente` enthaltenen, von DIESEM Mahnlauf
+        gehaltenen Reservierungen wieder frei. NUR aufzurufen, solange
+        noch KEIN tatsächlicher/unklarer Providerkontakt stattgefunden
+        hat (siehe `MahnwesenService.versende_mahnlauf`, ValueError-Zweig
+        VOR dem Providerkontakt) - danach (UNSICHER) bleibt die
+        Reservierung bestehen, der Provider könnte bereits angenommen
+        haben."""
+
+        for segment in vorschau.gebuehr_segmente:
+            self._repository.gib_reservierung_frei(
+                vertrag_id=vorschau.vertrag_id, entgeltforderung_schluessel=segment.entgeltforderung_schluessel,
+                mahnlauf_id=mahnlauf_id,
+            )
+
     def buche_vorschau(
         self, *, ctx: AuthContext, vorschau: MahnkostenVorschau, heute: date,
-        versandnachweis_referenz: str, akteur: str,
+        versandnachweis_referenz: str, akteur: str, mahnlauf_id: int | None = None,
     ):
         """Bucht EXAKT die in `vorschau` berechneten Werte - ruft NIE
         selbst erneut `berechne_mahnkosten_vorschau` auf. Bucht NUR das
@@ -144,7 +204,18 @@ class MahnkostenService:
         alle Stufen hinweg - gebuchten Zinssumme, plus alle in `vorschau.
         gebuehr_segmente` enthaltenen, noch nicht erhobenen §458-
         Pauschalen) - NIE die volle `neue_zinsen_cent`-Summe erneut.
-        Gibt `None` zurück, wenn nichts zu buchen ist."""
+        Gibt `None` zurück, wenn nichts zu buchen ist.
+
+        `mahnlauf_id`: NUR vom gebündelten Mahnlauf-Pfad
+        (`MahnwesenService.versende_mahnlauf`) gesetzt - jedes Segment in
+        `vorschau.gebuehr_segmente` wurde dann bereits VOR dem
+        Providerkontakt über `reserviere_und_kuerze_vorschau` exklusiv
+        reserviert; die Finalisierung schreibt hier NUR noch die
+        bestehende Reservierung um (`finalisiere_reservierte_gebuehr`),
+        statt einen neuen, mit der eigenen Reservierung kollidierenden
+        `INSERT` zu versuchen. `None` (Default) erhält das alte
+        Verhalten (`gebuehr_erheben`, frischer `INSERT`) für den
+        einzelfallbasierten, nicht gebündelten Pfad."""
 
         vertrag_id = vorschau.vertrag_id
         vertrag = self._stammdaten_repository.get_vertrag(vertrag_id)
@@ -211,33 +282,66 @@ class MahnkostenService:
                 )
 
                 # Jede §458-Pauschale wird EINZELN, dauerhaft je zugrunde
-                # liegender Entgeltforderung erhoben - die Unique-
-                # Constraint ist hier das fachliche Gate: wenn ein
-                # gleichzeitiger anderer Vorgang dieselbe Entgeltforderung
-                # bereits bepauschalt hat, scheitert dieser INSERT und die
-                # gesamte Buchung wird zurückgerollt (Alles-oder-nichts).
+                # liegender Entgeltforderung erhoben. Im gebündelten
+                # Mahnlauf-Pfad (`mahnlauf_id` gesetzt) wurde die Zeile
+                # bereits VOR dem Providerkontakt als Reservierung
+                # angelegt (siehe `reserviere_und_kuerze_vorschau`) - hier
+                # wird sie NUR noch finalisiert (`UPDATE`, kein
+                # zweiter `INSERT`, der an der eigenen Reservierung
+                # scheitern würde). Im einzelfallbasierten Pfad (`None`)
+                # bleibt der alte frische `INSERT` (`gebuehr_erheben`) -
+                # die Unique-Constraint ist dort weiterhin das fachliche
+                # Gate: ein gleichzeitiger anderer Vorgang, der dieselbe
+                # Entgeltforderung bereits bepauschalt hat, lässt diesen
+                # INSERT scheitern und rollt die GESAMTE Buchung zurück
+                # (Alles-oder-nichts).
                 for segment in vorschau.gebuehr_segmente:
-                    self._repository.gebuehr_erheben(
-                        vertrag_id=vertrag_id, entgeltforderung_schluessel=segment.entgeltforderung_schluessel,
-                        betrag_cent=segment.betrag_cent, rechtsgrundlage=segment.rechtsgrundlage,
-                        mahnkosten_buchung_id=ledger.id, gebuehr_op_position_id=gebuehr_position_id,
-                        erstellt_von=akteur, session=session,
-                    )
+                    if mahnlauf_id is not None:
+                        self._repository.finalisiere_reservierte_gebuehr(
+                            vertrag_id=vertrag_id, entgeltforderung_schluessel=segment.entgeltforderung_schluessel,
+                            mahnlauf_id=mahnlauf_id, mahnkosten_buchung_id=ledger.id,
+                            gebuehr_op_position_id=gebuehr_position_id, session=session,
+                        )
+                    else:
+                        self._repository.gebuehr_erheben(
+                            vertrag_id=vertrag_id, entgeltforderung_schluessel=segment.entgeltforderung_schluessel,
+                            betrag_cent=segment.betrag_cent, rechtsgrundlage=segment.rechtsgrundlage,
+                            mahnkosten_buchung_id=ledger.id, gebuehr_op_position_id=gebuehr_position_id,
+                            erstellt_von=akteur, session=session,
+                        )
 
                 session.commit()
                 return ledger
         except IntegrityError:
-            # Ein anderer, gleichzeitiger Aufruf hat entweder exakt DIESEN
+            # Ein anderer, gleichzeitiger Aufruf hat exakt DIESEN
             # (vertrag_id, stufe, mahnlauf_schluessel)-Mahnlauf (Race-
-            # Sicherheitsnetz) oder dieselbe Entgeltforderungs-Pauschale
-            # (fachliches Gate, siehe oben) zwischenzeitlich bereits
-            # gebucht - kein Fehler, sondern ein Idempotenz-/
-            # Konsistenzfall. Lookup BEWUSST über `mahnlauf_schluessel`
-            # (die exakte, eingefrorene Forderungsmenge DIESER Gruppe),
-            # NICHT über `zins_bis` - unabhängige Rückprüfung Codex
-            # 14.09.2026, echter Bug: eine ANDERE, disjunkte Gruppe
-            # desselben Vertrags/derselben Stufe kann denselben
-            # `zins_bis`-Stichtag haben; eine Suche über `zins_bis` hätte
-            # deren FREMDEN Ledger als vermeintlich eigenen Kostenbeleg
+            # Sicherheitsnetz) zwischenzeitlich bereits gebucht - kein
+            # Fehler, sondern ein Idempotenz-/Konsistenzfall. Lookup
+            # BEWUSST über `mahnlauf_schluessel` (die exakte,
+            # eingefrorene Forderungsmenge DIESER Gruppe), NICHT über
+            # `zins_bis` - unabhängige Rückprüfung Codex 14.09.2026,
+            # echter Bug: eine ANDERE, disjunkte Gruppe desselben
+            # Vertrags/derselben Stufe kann denselben `zins_bis`-
+            # Stichtag haben; eine Suche über `zins_bis` hätte deren
+            # FREMDEN Ledger als vermeintlich eigenen Kostenbeleg
             # zurückgegeben (siehe `MahnkostenBuchungTable`-Moduldoc).
-            return self._repository.buchung_fuer_mahnlauf(vertrag_id=vertrag_id, stufe=stufe, mahnlauf_schluessel=mahnlauf_schluessel)
+            #
+            # Findet sich dabei KEIN eigener Ledger-Eintrag für DIESEN
+            # `mahnlauf_schluessel`, war die IntegrityError NICHT unsere
+            # eigene, bereits erfolgreiche Buchung, sondern ein echter,
+            # ungeklärter Konflikt (z. B. eine Reservierung, die
+            # zwischenzeitlich verschwunden ist) - das wird LAUT
+            # gemeldet, NIEMALS als stilles `None` (= "nichts zu tun,
+            # alles gut") interpretiert, denn genau das würde einen
+            # Kostenabschluss vortäuschen, der nie stattgefunden hat
+            # (unabhängige Rückprüfung Codex 14.09.2026, echter Bug).
+            bestehender = self._repository.buchung_fuer_mahnlauf(vertrag_id=vertrag_id, stufe=stufe, mahnlauf_schluessel=mahnlauf_schluessel)
+            if bestehender is None:
+                raise RuntimeError(
+                    f"Mahnkosten-Buchung für Vertrag {vertrag_id} Stufe {stufe} "
+                    f"(Mahnlauf-Schlüssel {mahnlauf_schluessel}) ist an einer IntegrityError gescheitert, "
+                    "aber es existiert KEIN eigener Ledger-Eintrag für diesen Mahnlauf - ein stilles None "
+                    "würde einen tatsächlichen Kostenabschluss vortäuschen, wo keiner stattgefunden hat. "
+                    "Manuelle Klärung erforderlich."
+                ) from None
+            return bestehender

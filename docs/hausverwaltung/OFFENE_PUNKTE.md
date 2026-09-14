@@ -2782,4 +2782,114 @@ erfolgreicher Recovery UND Idempotenz-Gegenprobe eines zweiten
 Recovery-Durchlaufs in `test_hv_mailversand.py`), 885/885 grün im
 Gesamtlauf.
 
-7 weitere neue Tests, 883/883 grün im Gesamtlauf.
+## Korrekturpaket Runde 5: unabhängige Abnahme auf Commit eb7b8a7 (14.09.2026)
+
+Vier weitere, unabhängig gemeldete echte Bugs behoben:
+
+8. **Migration-Rebuild kollidierte mit echtem Index**: `ensure_
+   mahnkosten_lauf_unique_key` scheiterte beim SQLite-Rebuild mit
+   `OperationalError: index ix_mahnkosten_buchungen_vertrag_id already
+   exists`, weil der reale `index=True`-Index von `vertrag_id` nach
+   `ALTER TABLE ... RENAME` unter seinem alten Namen an der umbenannten
+   Tabelle hängen blieb und mit dem gleichnamigen Index der frisch
+   angelegten Tabelle kollidierte - die bisherige Testfixture bildete
+   diesen Index nicht ab. ZWEITER, unabhängig davon gefundener Bug beim
+   Nachtesten: pysqlite committet DDL-Anweisungen unter dem Standard-
+   `isolation_level` implizit VOR ihrer Ausführung - ein fehlgeschlagenes
+   `INSERT` nach `RENAME`+`CREATE TABLE` ließ beide DDL-Änderungen
+   bereits committet zurück (leere neue Tabelle + verwaiste
+   `..._vor_migration`-Alttabelle), obwohl beides in einer `engine.
+   begin()`-Transaktion lag. Fix: alte Indizes vor dem `CREATE` explizit
+   entfernen; der gesamte Rebuild läuft jetzt über eine eigene,
+   kurzlebige Engine mit abgeschaltetem implizitem Commit und explizitem
+   `BEGIN IMMEDIATE` (mirrors `sqlite_write_lock.py`), sodass ein Fehler
+   den GESAMTEN Rebuild tatsächlich zurückrollt. Getestet:
+   `_altschema_mahnkosten_metadata` jetzt mit realem Index,
+   `test_ensure_mahnkosten_lauf_unique_key_rebuild_ist_atomar_bei_fehler`
+   (absichtlich inkompatibles Altschema, beweist rückstandsfreien
+   Rollback).
+9. **`upsert_debitor` setzte `postadresse_geprueft` bei echter
+   Adressänderung nicht zurück**: blieb `True`, obwohl sich `adresse`
+   selbst geändert hat, solange `postadresse_geprueft` nicht explizit
+   neu übergeben wurde - eine frühere Prüfung galt fälschlich weiter für
+   eine GENUIN andere, nie geprüfte Adresse. Fix: bei tatsächlicher
+   Adressänderung ohne explizite Neuprüfung wird das Flag automatisch
+   zurückgesetzt; ein reines Update anderer Felder (z. B. E-Mail) bei
+   UNVERÄNDERTER Adresse bleibt weiterhin unberührt. Getestet in
+   `test_stammdaten.py`.
+10. **Mitgliedsnachweis+Kostenabschluss nicht konsistent bei Absturz
+    MITTEN in der Mitgliederschleife**: der GESENDET-Übergang der
+    GRUPPE selbst wird atomar committet, aber ein Absturz UNMITTELBAR
+    DANACH (vor dem ersten Mitgliedsnachweis) ließ das Mitglied
+    dauerhaft `GEBUENDELT` statt `GESENDET` zurück - blockierte Stufe 2
+    und den Zugangsbeleg, obwohl der Versand längst bestätigt war.
+    Zusätzlich: der Kosten-/Inhaltssnapshot wurde bisher erst NACH dem
+    `claim_fuer_versand`-CAS berechnet, nicht schon BEIM Claim selbst -
+    ein Absturz zwischen Claim und Providerkontakt hätte den Snapshot
+    verloren, falls der Provider das Schreiben trotzdem angenommen
+    hätte. Fix: `versende_mahnlauf` berechnet die Kostenvorschau jetzt
+    VOR dem `claim_fuer_versand`-Aufruf und übergibt sie direkt als
+    `zusatz` (siehe Runde 4) - der Snapshot liegt dadurch bereits VOR
+    jedem Providerkontakt durabel vor. Ein neuer gemeinsamer Helfer
+    `_vervollstaendige_bestaetigten_mahnlauf` vervollständigt Gruppe,
+    JEDES noch offene Mitglied UND die Kostenbuchung konsistent aus
+    EINEM `beleg` - aufgerufen vom Normalfall, von der (jetzt
+    umbenannten und erweiterten) `vervollstaendige_gesendete_
+    mahnlaeufe` (findet jetzt auch GESENDETE Gruppen mit offenen
+    Mitgliedern, nicht nur offene Kostenbuchungen) UND von der NEUEN
+    `vervollstaendige_unsichere_mahnlaeufe` (fragt für jede UNSICHERE
+    Gruppe den tatsächlichen Providerstatus ab und übernimmt eine
+    bestätigte Quittung OHNE erneut zu senden - rekonstruiert dafür den
+    Beleg aus dem bereits persistierten Audit-Eintrag, `mailnachweis.py::
+    beleg_aus_bestaetigtem_audit`). In `HVMailversandService.
+    status_abgleichen` verdrahtet (ersetzt den dafür ungeeigneten
+    generischen `MahnFallTable`-Eintrag, der die falsche - die eigene,
+    nicht die Gruppen- - Referenz abgefragt hätte). Getestet:
+    `test_absturz_mitten_in_mitgliederschleife_wird_ueber_
+    gruppenquittung_nachgezogen` (voller Repro inkl. anschließend
+    tatsächlich erreichbarer Stufe 2).
+11. **Disjunkte Gruppen konnten dieselbe Entgeltforderungs-Pauschale
+    doppelt ankündigen**: zwei GENUIN unterschiedliche OP-Komponenten
+    derselben Vorschreibungsperiode landen in zwei verschiedenen
+    Mahnlauf-Gruppen; ohne frühe Reservierung konnten BEIDE Gruppen
+    unabhängig voneinander (jede auf Basis ihrer eigenen, noch nicht
+    committeten Sicht) dieselbe §458-Pauschale in ihrem jeweiligen,
+    TATSÄCHLICH versendeten Brief-/Mailtext ankündigen - die Unique-
+    Constraint hätte erst bei der zweiten tatsächlichen Buchung
+    gegriffen, als beide Briefe längst versendet waren. Fix:
+    `MahnkostenGebuehrTable` bekommt `status` (RESERVIERT/GEBUCHT) und
+    `reserviert_fuer_mahnlauf_id`; `versende_mahnlauf` reserviert JEDES
+    Gebührensegment exklusiv für die eigene Gruppe SOFORT NACH
+    gewonnenem Claim, VOR Text-/Kostenfreeze und Providerkontakt
+    (`MahnkostenService.reserviere_und_kuerze_vorschau`) - ein Segment,
+    das eine andere Gruppe soeben reserviert hat, wird aus der eigenen
+    Vorschau entfernt, nie stillschweigend behalten. Reservierung bleibt
+    über UNSICHER hinweg bestehen; bei sauberer Blockade VOR jedem
+    Providerkontakt wird sie wieder freigegeben (`gib_reservierungen_
+    frei`), damit eine spätere Planung dieselbe Forderung erneut
+    versuchen kann. Zusätzlich: `buche_vorschau`s IntegrityError-Handler
+    wertet ein `None` vom Ledger-Lookup NIE mehr stillschweigend als
+    erfolgreichen Kostenabschluss (löst stattdessen laut aus) - ein
+    stilles `None` hätte einen tatsächlichen Kostenabschluss vortäuschen
+    können, wo keiner stattgefunden hat. Getestet: zwei gezielte
+    Reservierungs-Unit-Tests in `test_mahnwesen_kosten.py`
+    (Kürzung bei fremder Reservierung, Freigabe erlaubt späteren
+    Versuch) sowie ein voller, ohne Threads durch verschachtelte Aufrufe
+    reproduzierter End-zu-Ende-Test
+    `test_codex_interleaved_disjoint_groups_do_not_announce_same_
+    period_fee_twice` in `test_hv_mailversand.py` (vor dem Fix
+    nachweislich rot - manuell durch temporäres Deaktivieren der
+    Reservierung verifiziert).
+
+**Weiterhin ehrlich offen:**
+
+- Der einzelfallbasierte, in Produktion nicht mehr verwendete
+  `MahnwesenService.versenden()`-Pfad hat dieselbe theoretische
+  Doppelankündigungs-Lücke (Punkt 11) wie der Gruppen-Pfad, wurde aber
+  bewusst nicht mitbehandelt, da kein produktiver Aufrufer ihn erreicht.
+- Der im tatsächlich versendeten E-Mail-Text ausgewiesene Kosten-/
+  Zinsnachweis enthält weiterhin nur Betrag/Fälligkeit je Position -
+  unverändert offen, gehört zum kommenden Kanal-/Brief-Dokumentpaket.
+
+6 neue/erweiterte Tests, 892/892 grün im Gesamtlauf. Nur synthetische
+Testdaten, kein Deployment, kein Serverzugriff, kein Liveversand.

@@ -184,7 +184,16 @@ class StammdatenRepository:
         (Default) lässt ein bereits gesetztes Flag unverändert, damit ein
         routinemäßiges Update (z. B. eine korrigierte E-Mail) eine einmal
         erteilte Prüfung nicht stillschweigend zurücksetzt (siehe
-        `DebitorTable.postadresse_geprueft`-Docstring)."""
+        `DebitorTable.postadresse_geprueft`-Docstring).
+
+        AUSNAHME (unabhängige Rückprüfung 14.09.2026, echter Bug): ändert
+        sich `adresse` selbst TATSÄCHLICH gegenüber dem bestehenden Wert,
+        OHNE dass `postadresse_geprueft` bei diesem Aufruf explizit neu
+        übergeben wird, wird das Flag automatisch auf `False`
+        zurückgesetzt - eine bereits geprüfte Adresse gilt nicht mehr für
+        eine GENUIN ANDERE, seither nie geprüfte Adresse. Ein reines
+        Update anderer Felder (z. B. E-Mail) bei UNVERÄNDERTER `adresse`
+        bleibt davon unberührt (Flag erhalten, wie oben beschrieben)."""
 
         def _schreiben(active_session: Session) -> None:
             row = active_session.get(DebitorTable, id)
@@ -194,11 +203,14 @@ class StammdatenRepository:
                     postadresse_geprueft=bool(postadresse_geprueft) if postadresse_geprueft is not None else False,
                 ))
             else:
+                adresse_geaendert = adresse != row.adresse
                 row.name = name
                 row.email = email
                 row.adresse = adresse
                 if postadresse_geprueft is not None:
                     row.postadresse_geprueft = postadresse_geprueft
+                elif adresse_geaendert:
+                    row.postadresse_geprueft = False
 
         if session is not None:
             _schreiben(session)

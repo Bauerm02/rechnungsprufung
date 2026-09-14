@@ -13,7 +13,9 @@ from mietinkasso.indexautomatik.bootstrap import bauen
 from mietinkasso.indexautomatik.mailops_client import MailOpsClient, MailOpsErgebnis
 from mietinkasso.indexautomatik.mailversand_service import HVMailversandService
 from mietinkasso.infrastructure.config import Settings
-from mietinkasso.infrastructure.db.tables import AuditEventTable, MahnFallTable, MahnkostenBuchungTable, MahnLaufTable
+from mietinkasso.infrastructure.db.tables import (
+    AuditEventTable, MahnFallTable, MahnkostenBuchungTable, MahnkostenGebuehrTable, MahnLaufTable,
+)
 
 
 @pytest.fixture
@@ -68,10 +70,22 @@ def test_mahnung_acceptance_then_actual_sending_get_only_and_stage2_clock(hv, ba
     assert [r.method for r in state["calls"]] == ["POST", "GET"]
     sent = service.mahn_repo.get(row.id)
     assert sent.status == "GESENDET" and sent.gesendet_am.isoformat() == "2026-09-14T22:30:00"
+    # Der Status-Abgleich vervollständigt nicht nur das Mitglied, sondern
+    # konsistent AUCH die Gruppe selbst (unabhängige Rückprüfung Codex
+    # 14.09.2026: "Mitgliedsnachweis UND Kostenabschluss ... konsistent
+    # fertigstellen") - beide werden nachweislich GESENDET, kein
+    # erneuter Versand.
+    gruppe = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    assert gruppe.status == "GESENDET"
     assert service.status_abgleichen(ctx=admin_ctx) == 0
     with session_factory() as s:
         evidence = list(s.execute(select(AuditEventTable).where(AuditEventTable.aktion == "MAILVERSAND_BESTAETIGT")).scalars())
-    assert len(evidence) == 1 and evidence[0].payload["zugang_bestaetigt"] is False
+    # ZWEI Audit-Einträge - einer für die Gruppe (`mahnlaeufe`), einer für
+    # das Mitglied (`mahn_faelle`) - beide belegen denselben tatsächlichen
+    # Versand, keiner davon ein zweiter/erfundener.
+    assert len(evidence) == 2
+    assert {e.entity_typ for e in evidence} == {"mahnlaeufe", "mahn_faelle"}
+    assert all(e.payload["zugang_bestaetigt"] is False for e in evidence)
     shown = service.versanduebersicht(ctx=admin_ctx)
     assert len(shown) == 1 and shown[0]["status"] == "GESENDET"
     assert shown[0]["provider_referenz"] == "SYNTHETIC-SENT-1"
@@ -394,7 +408,7 @@ def test_absturz_zwischen_bestaetigtem_versand_und_kostenbuchung_wird_anhand_sna
     # Versand erneut anzustoßen (kein zweiter Mailversand, `state["calls"]`
     # bleibt bei genau einem Aufruf).
     aufrufe_vor_recovery = len(state["calls"])
-    nachgeholt = service.mahn_service.vervollstaendige_gesendete_mahnlaeufe_ohne_kostenabschluss(
+    nachgeholt = service.mahn_service.vervollstaendige_gesendete_mahnlaeufe(
         ctx=admin_ctx, akteur="recovery-test",
     )
     assert len(nachgeholt) == 1
@@ -410,7 +424,7 @@ def test_absturz_zwischen_bestaetigtem_versand_und_kostenbuchung_wird_anhand_sna
 
     # Ein zweiter Recovery-Durchlauf findet nichts mehr offen und bucht
     # NICHT ein zweites Mal (keine doppelte Kostenposition).
-    zweiter_durchlauf = service.mahn_service.vervollstaendige_gesendete_mahnlaeufe_ohne_kostenabschluss(
+    zweiter_durchlauf = service.mahn_service.vervollstaendige_gesendete_mahnlaeufe(
         ctx=admin_ctx, akteur="recovery-test",
     )
     assert zweiter_durchlauf == []
@@ -418,6 +432,180 @@ def test_absturz_zwischen_bestaetigtem_versand_und_kostenbuchung_wird_anhand_sna
         buchungen_gesamt = list(db.execute(select(MahnkostenBuchungTable).where(
             MahnkostenBuchungTable.vertrag_id == contract.id)).scalars())
     assert len(buchungen_gesamt) == 1
+
+
+def test_absturz_mitten_in_mitgliederschleife_wird_ueber_gruppenquittung_nachgezogen(
+    hv, basis_vertrag, admin_ctx, monkeypatch,
+):
+    """Unabhängige Abnahme eb7b8a7, echter Bug: der bestätigte GESENDET-
+    Übergang der GRUPPE selbst wird atomar committet, aber ein Absturz
+    UNMITTELBAR DANACH - mitten in der Mitgliederschleife, bevor auch
+    nur EIN Mitglied nachgezogen ist - ließ das Mitglied dauerhaft
+    GEBUENDELT statt GESENDET zurück. Das blockiert insbesondere Stufe 2
+    (die eine tatsächlich GESENDETE Stufe 1 voraussetzt) und den
+    Zugangsbeleg für dieses Mitglied, obwohl der Versand selbst längst
+    bestätigt war. Die Recovery MUSS Mitgliedsnachweis UND
+    Kostenabschluss konsistent anhand der TATSÄCHLICHEN, bereits
+    persistierten Gruppenquittung nachziehen - OHNE erneut zu senden."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    state["status"] = "GESENDET"
+    _seed_debt(hv, contract, account, admin_ctx)
+
+    import mietinkasso.mahnwesen.service as mahn_service_module
+    original_versand_belegen = mahn_service_module.versand_belegen
+
+    def kaputtes_versand_belegen(session_factory, table, row_id, **kwargs):
+        if table is MahnFallTable:
+            raise RuntimeError(
+                "Simulierter Absturz NACH bestätigtem Gruppen-GESENDET+Snapshot, "
+                "WÄHREND der Mitgliederschleife (vor jedem einzelnen Mitgliedsnachweis)."
+            )
+        return original_versand_belegen(session_factory, table, row_id, **kwargs)
+
+    monkeypatch.setattr(mahn_service_module, "versand_belegen", kaputtes_versand_belegen)
+    with pytest.raises(RuntimeError):
+        service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    monkeypatch.undo()
+
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    mahnfall = service.mahn_repo.list_fuer_vertrag(contract.id)[0]
+    assert mahnlauf.status == "GESENDET"  # Gruppe selbst bereits korrekt bestätigt
+    assert mahnfall.status == "GEBUENDELT"  # Mitglied hängt noch fest - genau die Lücke
+    assert len(state["calls"]) == 1
+
+    nachgeholt = service.mahn_service.vervollstaendige_gesendete_mahnlaeufe(ctx=admin_ctx, akteur="recovery-test")
+    assert len(nachgeholt) == 1
+
+    mahnfall_danach = service.mahn_repo.get(mahnfall.id)
+    assert mahnfall_danach.status == MahnStatus.GESENDET.value
+    assert mahnfall_danach.gesendet_am is not None
+    # KEIN zweiter Mailversand - die Recovery hat den bereits bestätigten
+    # Beleg übernommen, nicht erneut gesendet.
+    assert len(state["calls"]) == 1
+
+    with service.sf() as db:
+        evidence = list(db.execute(select(AuditEventTable).where(
+            AuditEventTable.aktion == "MAILVERSAND_BESTAETIGT",
+            AuditEventTable.entity_typ == "mahn_faelle",
+        )).scalars())
+    assert len(evidence) == 1
+
+    # Stufe 2 ist jetzt tatsächlich erreichbar - vorher wäre sie an der
+    # "Stufe 2 verlangt eine erfolgreich gesendete Stufe 1"-Prüfung
+    # gescheitert, weil das Mitglied nie als GESENDET erkannt worden wäre.
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="SYNTHETIC-BANK",
+        bestaetigt_bis=date(2026, 9, 29), bestaetigt_von="SYNTHETIC-TEST")
+    state["sent"] = "2026-09-29T08:00:00Z"
+    ergebnis_stufe2 = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 29))
+    assert ergebnis_stufe2["gesendet"] == 1
+    assert service.mahn_repo.list_fuer_vertrag(contract.id)[0].stufe == 2
+
+
+def test_codex_interleaved_disjoint_groups_do_not_announce_same_period_fee_twice(hv, basis_vertrag, admin_ctx):
+    """Unabhängige Abnahme eb7b8a7, echter Bug (ohne Threads
+    reproduziert, verschachtelte Aufrufe statt echter Nebenläufigkeit):
+    zwei disjunkte OP-Komponenten DERSELBEN Vorschreibungsperiode landen
+    in zwei VERSCHIEDENEN Mahnlauf-Gruppen. Gruppe A wird geplant/
+    gebündelt und claimt den Versand; WÄHREND A "in Versand" ist
+    (innerhalb ihres eigenen `versand_fn`), wird die GENUIN andere,
+    disjunkte Forderung B DERSELBEN Periode gebucht, geplant, gebündelt
+    und TATSÄCHLICH gesendet - verschachtelt, nicht threaded. Ohne die
+    frühe Reservierung (VOR Text-/Kostenfreeze und Providerkontakt)
+    hätten BEIDE Gruppen unabhängig voneinander dieselbe, noch
+    unbestätigte §458-Pauschale in ihrem jeweiligen Brief-/Mailtext
+    angekündigt, obwohl sie nur EINMAL gebucht werden darf."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    state["status"] = "GESENDET"
+    policy = service.policy_repo.anlegen(stufe1_tage_nach_faelligkeit=7,
+        stufe2_mindesttage_nach_stufe1_versand=14, zinsen_prozent=Decimal("0"), gebuehr_cent=0, status="ENTWURF")
+    policy = service.policy_repo.freigeben(policy.id)
+    profil = service.mahnkosten_repo.zinsprofil_anlegen(
+        vertrag_id=contract.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=4000, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis", erstellt_von="test",
+    )
+    service.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
+    service.bank_repo.upsert_bank_konto(id="SYNTHETIC-BANK", gesellschaft_id=contract.gesellschaft_id,
+        iban="SYNTHETIC-NOT-A-REAL-IBAN", bezeichnung="Testkonto")
+    heute = date(2026, 4, 20)
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="SYNTHETIC-BANK",
+        bestaetigt_bis=heute, bestaetigt_von="SYNTHETIC-TEST")
+
+    def _receipt(ref):
+        return MailOpsErgebnis("GESENDET", ref, "SYNTHETIC-SENT", datetime(2026, 4, 20, 10, 0, tzinfo=timezone.utc))
+
+    op_a = service.op_service.buchen(
+        ctx=admin_ctx, konto=account, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1),
+        faelligkeit=date(2026, 4, 5), leistungsperiode="2026-04", beleg_referenz="Komponente A",
+    )
+    forderung_a = next(f for f in service.op_service.offene_forderungen(account.id, heute=heute) if f.op_position_id == op_a.id)
+    geplant_a = service.mahn_service.plane_forderung(
+        ctx=admin_ctx, vertrag=contract, konto=account, forderung=forderung_a, policy=policy, heute=heute,
+        bank_bestaetigt_bis=heute, ungeklaerte_eingaenge_vorhanden=False,
+    )
+    assert geplant_a.status == "GEPLANT"
+    mahnlauf_a = service.mahn_service.plane_mahnlauf(
+        ctx=admin_ctx, vertrag=contract, konto=account, stufe=1, heute=heute, bank_bestaetigt_bis=heute,
+    )
+    assert mahnlauf_a is not None
+
+    ergebnis_b_slot: dict = {}
+
+    def versand_fn_a(_mitglieder):
+        # WÄHREND A "in Versand" ist: B wird gebucht, geplant, gebündelt
+        # und TATSÄCHLICH gesendet - verschachtelt, ohne Threads.
+        op_b = service.op_service.buchen(
+            ctx=admin_ctx, konto=account, typ=OPTyp.SOLL, betrag_cent=15_000,
+            belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1),
+            faelligkeit=date(2026, 4, 6), leistungsperiode="2026-04", beleg_referenz="Komponente B",
+        )
+        forderung_b = next(f for f in service.op_service.offene_forderungen(account.id, heute=heute) if f.op_position_id == op_b.id)
+        geplant_b = service.mahn_service.plane_forderung(
+            ctx=admin_ctx, vertrag=contract, konto=account, forderung=forderung_b, policy=policy, heute=heute,
+            bank_bestaetigt_bis=heute, ungeklaerte_eingaenge_vorhanden=False,
+        )
+        assert geplant_b.status == "GEPLANT"
+        mahnlauf_b = service.mahn_service.plane_mahnlauf(
+            ctx=admin_ctx, vertrag=contract, konto=account, stufe=1, heute=heute, bank_bestaetigt_bis=heute,
+        )
+        assert mahnlauf_b is not None
+        assert mahnlauf_b.id != mahnlauf_a.id  # genuin disjunkte, ANDERE Gruppe
+
+        ergebnis_b = service.mahn_service.versende_mahnlauf(
+            ctx=admin_ctx, mahnlauf_id=mahnlauf_b.id, heute=heute, bank_bestaetigt_bis=heute,
+            ungeklaerte_eingaenge_vorhanden=False, send_enabled=True,
+            versand_fn=lambda _m: _receipt("mahnungslauf:" + mahnlauf_b.outbox_key),
+            mahnkosten_vorschau_slot=ergebnis_b_slot,
+        )
+        assert ergebnis_b.status == "GESENDET"
+        return _receipt("mahnungslauf:" + mahnlauf_a.outbox_key)
+
+    ergebnis_a_slot: dict = {}
+    ergebnis_a = service.mahn_service.versende_mahnlauf(
+        ctx=admin_ctx, mahnlauf_id=mahnlauf_a.id, heute=heute, bank_bestaetigt_bis=heute,
+        ungeklaerte_eingaenge_vorhanden=False, send_enabled=True,
+        versand_fn=versand_fn_a, mahnkosten_vorschau_slot=ergebnis_a_slot,
+    )
+    assert ergebnis_a.status == "GESENDET"
+
+    vorschau_a = ergebnis_a_slot.get("vorschau")
+    vorschau_b = ergebnis_b_slot.get("vorschau")
+    angekuendigt = [(v.gebuehr_cent or 0) for v in (vorschau_a, vorschau_b) if v is not None]
+    # Der eigentliche Bug: BEIDE Vorschauen hätten unabhängig voneinander
+    # 4000 Cent angekündigt. Nach dem Fix darf die SUMME der tatsächlich
+    # in den (bereits versendeten) Texten angekündigten Pauschalen 4000
+    # (einmal) nicht übersteigen.
+    assert sum(angekuendigt) <= 4000
+
+    with service.sf() as db:
+        gebuehren = list(db.execute(select(MahnkostenGebuehrTable).where(
+            MahnkostenGebuehrTable.vertrag_id == contract.id)).scalars())
+    assert len(gebuehren) == 1  # GENAU eine Zeile für "PERIODE:2026-04"
+    assert sum(g.betrag_cent for g in gebuehren) <= 4000
 
 
 def test_index_real_mail_protocol_acceptance_is_not_sending_or_rent_change(hv, basis_vertrag, admin_ctx):

@@ -43,7 +43,7 @@ from mietinkasso.mahnwesen.kosten import snapshot_aus_json, snapshot_zu_json
 from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnLaufRepository, MahnPolicyRepository
 from mietinkasso.op.service import OffeneForderung, OPService, compute_content_hash
 from mietinkasso.stammdaten.repository import StammdatenRepository
-from mietinkasso.indexautomatik.mailnachweis import nachweis_daten, versand_belegen
+from mietinkasso.indexautomatik.mailnachweis import beleg_aus_bestaetigtem_audit, nachweis_daten, versand_belegen
 from mietinkasso.domain.exceptions import TransportFehlerUngewissError
 from mietinkasso.indexautomatik.zeit import heute_wien
 
@@ -683,39 +683,18 @@ class MahnwesenService:
         if not send_enabled:
             return VersandErgebnis("BEREITS_VERARBEITET", "SEND_ENABLED=false: nur Preview/Outbox, kein realer Versand.")
 
-        if not self._mahnlauf_repository.claim_fuer_versand(mahnlauf_id):
-            return VersandErgebnis("BEREITS_VERARBEITET", "Ein anderer Worker/Kanal verarbeitet diese Gruppe bereits.")
-
-        try:
-            beleg = versand_fn(mitglieder)
-        except (VersandUngewissError, TransportFehlerUngewissError):
-            self._mahnlauf_repository.set_status(mahnlauf_id, "UNSICHER")
-            for mahnfall in mitglieder:
-                self._repository.set_status(mahnfall.id, MahnStatus.UNSICHER.value)
-            return VersandErgebnis("UNSICHER", "Provider-Timeout nach möglicher Annahme; kein automatischer Retry.")
-        except ValueError as exc:
-            self._mahnlauf_repository.set_status(mahnlauf_id, "BLOCKIERT", fehlergrund=str(exc))
-            for mahnfall in mitglieder:
-                self._repository.set_status(mahnfall.id, MahnStatus.BLOCKIERT.value)
-            return VersandErgebnis("BLOCKIERT", "Mailauftrag oder private Mailkonfiguration unvollständig.")
-        if nachweis_daten(beleg) is None:
-            self._mahnlauf_repository.set_status(mahnlauf_id, "UNSICHER")
-            for mahnfall in mitglieder:
-                self._repository.set_status(mahnfall.id, MahnStatus.UNSICHER.value)
-            return VersandErgebnis("UNSICHER", "Noch kein tatsächlicher Versandnachweis; Status wird abgefragt, nicht erneut gesendet.")
-
-        # Kosten-/Inhaltssnapshot wird VOR dem GESENDET-Übergang bestimmt
-        # und ATOMAR IN DERSELBEN UPDATE-Anweisung eingefroren (Auftrag
-        # Markus 14.09.2026: "Recovery nach bestätigtem Versand mit
-        # eingefrorenem Kosten-/Inhaltssnapshot") - ein Absturz
-        # IRGENDWANN NACH diesem Punkt (mitten in der Mitgliederschleife,
-        # vor/während der eigentlichen Kostenbuchung) hinterlässt IMMER
-        # entweder GAR KEINEN GESENDET-Übergang (dann bleibt die Gruppe
-        # IN_VERSAND, siehe `markiere_verwaiste_mahnlaeufe_als_unsicher`)
-        # oder GESENDET+Snapshot GEMEINSAM - nie GESENDET ohne Snapshot.
-        # Die Buchung selbst verwendet danach IMMER GENAU dieses
-        # eingefrorene Objekt, NIE eine zweite, potenziell durch
-        # inzwischen eingegangene Zahlungen abweichende Neuberechnung.
+        # Kosten-/Inhaltssnapshot wird BEREITS HIER (VOR dem Claim, also
+        # VOR jedem Providerkontakt) bestimmt (Auftrag Markus 14.09.2026,
+        # unabhängige Rückprüfung: "der Kosten-/Inhaltssnapshot muss
+        # bereits VOR jedem Providerkontakt verfügbar sein, sonst
+        # Verlust bei Providerannahme vor lokalem Ergebniscommit") - ein
+        # Absturz NACH dem Claim, aber VOR/WÄHREND des Providerkontakts,
+        # lässt den Snapshot trotzdem bereits durabel auf der Zeile
+        # liegen; eine spätere Status-Abfrage für eine dann UNSICHERE
+        # Gruppe (`vervollstaendige_unsichere_mahnlaeufe`) kann damit
+        # Mitgliedsnachweise/Kostenbuchung IMMER anhand DIESES
+        # eingefrorenen Objekts nachziehen, nie anhand einer zweiten,
+        # potenziell abweichenden Neuberechnung.
         vorschau = None
         if self._mahnkosten_service is not None:
             if mahnkosten_vorschau_slot is not None and "vorschau" in mahnkosten_vorschau_slot:
@@ -730,53 +709,156 @@ class MahnwesenService:
                     vertrag_id=vertrag.id, stufe=mahnlauf.stufe, heute=heute,
                     nur_op_position_ids=frozenset(m.forderung_op_position_id for m in mitglieder),
                 )
-        kosten_snapshot_json = snapshot_zu_json(vorschau) if self._mahnkosten_service is not None else None
 
-        versand_belegen(
-            self._mahnlauf_repository._session_factory, MahnLaufTable, mahnlauf_id,
-            ergebnis=beleg, erlaubt={"IN_VERSAND", "UNSICHER"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
-            referenz="mahnungslauf:" + mahnlauf.outbox_key,
-            zusatz={"mahnkosten_snapshot_json": kosten_snapshot_json} if kosten_snapshot_json is not None else None,
-        )
-        # Jedes Mitglied wurde bereits bei `plane_mahnlauf` atomar auf
-        # GEBUENDELT geclaimt (siehe `MahnFallRepository.
-        # claim_fuer_buendelung`) - der Übergang GEBUENDELT -> GESENDET
-        # erfolgt hier direkt, je Mitglied einzeln protokolliert (eigener
-        # Audit-Eintrag, eigenes `gesendet_am`).
-        for mahnfall in mitglieder:
-            versand_belegen(
-                self._repository._session_factory, MahnFallTable, mahnfall.id,
-                ergebnis=beleg, erlaubt={"GEBUENDELT"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
-                referenz="mahnungslauf:" + mahnlauf.outbox_key,
+        if not self._mahnlauf_repository.claim_fuer_versand(
+            mahnlauf_id,
+            zusatz={"mahnkosten_snapshot_json": snapshot_zu_json(vorschau)} if self._mahnkosten_service is not None else None,
+        ):
+            return VersandErgebnis("BEREITS_VERARBEITET", "Ein anderer Worker/Kanal verarbeitet diese Gruppe bereits.")
+
+        # Reservierung ERST NACH gewonnenem Claim (Rückprüfung Codex
+        # 14.09.2026, echter Bug: zwei DISJUNKTE, gleichzeitig in Arbeit
+        # befindliche Gruppen konnten für dieselbe Entgeltforderung -
+        # z. B. zwei Komponenten derselben Vorschreibungsperiode in
+        # unterschiedlichen Gruppen - BEIDE unabhängig voneinander
+        # dieselbe, noch unbestätigte Pauschale ankündigen). Eine
+        # Reservierung VOR dem Claim würde bei zwei GLEICHZEITIGEN
+        # Versandversuchen FÜR DIESELBE Gruppe die eigene, noch nicht
+        # entschiedene Konkurrenzanfrage fälschlich als "fremde Gruppe"
+        # werten - der Claim selbst entscheidet zuerst, WER überhaupt
+        # weitermachen darf.
+        if self._mahnkosten_service is not None and vorschau is not None and vorschau.gebuehr_segmente:
+            gekuerzte_vorschau = self._mahnkosten_service.reserviere_und_kuerze_vorschau(
+                vorschau=vorschau, mahnlauf_id=mahnlauf_id, akteur=ctx.user_id,
             )
+            if gekuerzte_vorschau is not vorschau:
+                vorschau = gekuerzte_vorschau
+                # Der bereits (mit dem Claim) eingefrorene Snapshot
+                # muss die KÜRZUNG widerspiegeln - IMMER NOCH VOR dem
+                # eigentlichen Providerkontakt.
+                self._mahnlauf_repository.aktualisiere_kosten_snapshot(mahnlauf_id, snapshot_zu_json(vorschau))
+        if mahnkosten_vorschau_slot is not None and self._mahnkosten_service is not None:
+            # Der Inhalt (Brief-/Mailtext, siehe `versand_fn`-Aufrufer in
+            # `indexautomatik/mailversand_service.py`) verwendet GENAU
+            # DIESES - ggf. bereits gekürzte - Objekt, NIE eine eigene
+            # Neuberechnung.
+            mahnkosten_vorschau_slot["vorschau"] = vorschau
 
-        if self._mahnkosten_service is not None:
-            if vorschau is not None:
-                self._mahnkosten_service.buche_vorschau(
-                    ctx=ctx, vorschau=vorschau, heute=heute,
-                    versandnachweis_referenz="mahnungslauf:" + mahnlauf.outbox_key, akteur=ctx.user_id,
-                )
-            # Erst JETZT als abgeschlossen markiert - ein Absturz VOR
-            # diesem Punkt (Snapshot bereits persistiert, Buchung aber
-            # noch offen) wird durch `vervollstaendige_gesendete_
-            # mahnlaeufe_ohne_kostenabschluss` anhand DESSELBEN
-            # eingefrorenen Snapshots sicher nachgeholt.
-            self._mahnlauf_repository.markiere_mahnkosten_verarbeitet(mahnlauf_id)
+        try:
+            beleg = versand_fn(mitglieder)
+        except (VersandUngewissError, TransportFehlerUngewissError):
+            self._mahnlauf_repository.set_status(mahnlauf_id, "UNSICHER")
+            for mahnfall in mitglieder:
+                self._repository.set_status(mahnfall.id, MahnStatus.UNSICHER.value)
+            # Reservierungen BLEIBEN bestehen (Auftrag Markus: "Sperre
+            # über UNSICHER ... erhalten") - der Provider könnte das
+            # Schreiben bereits angenommen haben.
+            return VersandErgebnis("UNSICHER", "Provider-Timeout nach möglicher Annahme; kein automatischer Retry.")
+        except ValueError as exc:
+            self._mahnlauf_repository.set_status(mahnlauf_id, "BLOCKIERT", fehlergrund=str(exc))
+            for mahnfall in mitglieder:
+                self._repository.set_status(mahnfall.id, MahnStatus.BLOCKIERT.value)
+            # VOR jedem Providerkontakt blockiert - Reservierungen werden
+            # wieder freigegeben (analog zur Mitglieder-Freigabe), damit
+            # eine spätere Planung dieselbe Entgeltforderung erneut
+            # versuchen kann, statt sie dauerhaft zu verlieren.
+            if self._mahnkosten_service is not None and vorschau is not None:
+                self._mahnkosten_service.gib_reservierungen_frei(vorschau=vorschau, mahnlauf_id=mahnlauf_id)
+            return VersandErgebnis("BLOCKIERT", "Mailauftrag oder private Mailkonfiguration unvollständig.")
+        if nachweis_daten(beleg) is None:
+            self._mahnlauf_repository.set_status(mahnlauf_id, "UNSICHER")
+            for mahnfall in mitglieder:
+                self._repository.set_status(mahnfall.id, MahnStatus.UNSICHER.value)
+            return VersandErgebnis("UNSICHER", "Noch kein tatsächlicher Versandnachweis; Status wird abgefragt, nicht erneut gesendet.")
+
+        self._vervollstaendige_bestaetigten_mahnlauf(
+            mahnlauf=mahnlauf, mitglieder=mitglieder, beleg=beleg, ctx=ctx, akteur=ctx.user_id,
+        )
         return VersandErgebnis("GESENDET", "Tatsächlicher Versand im Maildienst nachgewiesen (gebündelter Mahnlauf).")
 
-    def vervollstaendige_gesendete_mahnlaeufe_ohne_kostenabschluss(
+    def _vervollstaendige_bestaetigten_mahnlauf(
+        self, *, mahnlauf: MahnLaufTable, mitglieder: list[MahnFallTable], beleg, ctx: AuthContext, akteur: str,
+    ) -> None:
+        """Vervollständigt EINEN bereits durch `beleg` tatsächlich
+        bestätigten Mahnlauf konsistent - Gruppenübergang, JEDES noch
+        nicht GESENDETE Mitglied, und die Kostenbuchung, in genau
+        DIESER Reihenfolge, idempotent wiederholbar. Wird von DREI
+        Stellen mit unterschiedlicher Herkunft desselben `beleg`
+        aufgerufen (frisch aus `versand_fn`, aus der persistierten
+        Gruppenquittung rekonstruiert, oder aus einer Status-Abfrage) -
+        Auftrag Markus 14.09.2026: "den vollständigen Zustandsweg
+        zusammen korrigieren". Jeder Schritt prüft selbst, ob er
+        überhaupt noch etwas zu tun hat (`versand_belegen` no-opt auf
+        einer bereits GESENDETEN Zeile, Mitglieder werden einzeln
+        geprüft, die Kostenbuchung nur bei fehlendem `mahnkosten_
+        verarbeitet_am`) - ein wiederholter Aufruf für denselben,
+        bereits vollständig abgeschlossenen Mahnlauf ändert nichts."""
+
+        versand_belegen(
+            self._mahnlauf_repository._session_factory, MahnLaufTable, mahnlauf.id,
+            ergebnis=beleg, erlaubt={"IN_VERSAND", "UNSICHER"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
+            referenz="mahnungslauf:" + mahnlauf.outbox_key,
+        )
+        # Jedes Mitglied wurde entweder bei `plane_mahnlauf` atomar auf
+        # GEBUENDELT geclaimt (Normalfall) oder - bei einem zwischenzeitlich
+        # UNSICHEREN Providerkontakt (siehe `versende_mahnlauf`) -
+        # zusätzlich auf UNSICHER gesetzt; der Übergang zu GESENDET
+        # erfolgt hier direkt, je Mitglied einzeln protokolliert (eigener
+        # Audit-Eintrag, eigenes `gesendet_am`). NUR Mitglieder, die noch
+        # NICHT GESENDET sind (unabhängige Rückprüfung Codex 14.09.2026,
+        # echter Bug: ein Absturz MITTEN in dieser Schleife durfte die
+        # bereits bestätigte Gruppe NICHT mit einem für immer GEBUENDELT
+        # bleibenden Mitglied zurücklassen - eine Wiederholung dieses
+        # Aufrufs muss GENAU die übrig gebliebenen Mitglieder nachziehen,
+        # nicht die bereits erledigten erneut anfassen).
+        for mahnfall in mitglieder:
+            if mahnfall.status != MahnStatus.GESENDET.value:
+                versand_belegen(
+                    self._repository._session_factory, MahnFallTable, mahnfall.id,
+                    ergebnis=beleg, erlaubt={"GEBUENDELT", "UNSICHER"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
+                    referenz="mahnungslauf:" + mahnlauf.outbox_key,
+                )
+
+        if self._mahnkosten_service is None:
+            return
+        aktuell = self._mahnlauf_repository.get(mahnlauf.id)
+        if aktuell is None or aktuell.mahnkosten_verarbeitet_am is not None:
+            return
+        # IMMER aus dem persistierten Snapshot lesen (nie aus einem
+        # potenziell veralteten In-Memory-Objekt) - das ist GENAU der
+        # Stand, der bereits VOR dem Providerkontakt eingefroren wurde.
+        vorschau = snapshot_aus_json(aktuell.mahnkosten_snapshot_json)
+        if vorschau is not None:
+            self._mahnkosten_service.buche_vorschau(
+                ctx=ctx, vorschau=vorschau, heute=_versandtag_wien(aktuell.gesendet_am or beleg.versendet_am),
+                versandnachweis_referenz="mahnungslauf:" + mahnlauf.outbox_key, akteur=akteur,
+                mahnlauf_id=mahnlauf.id,
+            )
+        # Erst JETZT als abgeschlossen markiert - ein Absturz VOR diesem
+        # Punkt (Snapshot bereits persistiert, Buchung aber noch offen)
+        # wird durch `vervollstaendige_gesendete_mahnlaeufe` anhand
+        # DESSELBEN eingefrorenen Snapshots sicher nachgeholt.
+        self._mahnlauf_repository.markiere_mahnkosten_verarbeitet(mahnlauf.id)
+
+    def vervollstaendige_gesendete_mahnlaeufe(
         self, *, ctx: AuthContext, akteur: str,
     ) -> list[MahnLaufTable]:
         """Recovery-Pendant zur Kosten-/Inhaltssnapshot-Bindung in
         `versende_mahnlauf` (Auftrag Markus 14.09.2026). Findet jeden
         GESENDETEN Mahnlauf, dessen Kostenbuchung NOCH NICHT als
         abgeschlossen markiert ist (Absturz zwischen bestätigtem Versand
-        und Buchung, oder zwischen Buchung und dem Markieren als
-        abgeschlossen), und bucht ihn anhand des ATOMAR mit GESENDET
-        eingefrorenen Snapshots nach - NIE anhand einer frisch
-        berechneten, ggf. durch eine inzwischen eingegangene Zahlung
-        abweichenden Vorschau (das würde den tatsächlich gesendeten,
-        angekündigten Betrag nachträglich stillschweigend verändern).
+        und Buchung, oder ZWISCHEN dem GESENDET-Übergang der Gruppe und
+        dem Nachziehen einzelner Mitglieder, unabhängige Rückprüfung
+        Codex 14.09.2026), und vervollständigt ihn über
+        `_vervollstaendige_bestaetigten_mahnlauf` - Mitgliedsnachweise
+        UND Kostenbuchung GEMEINSAM, anhand des ATOMAR mit dem
+        GESENDET-Übergang eingefrorenen Snapshots, NIE anhand einer
+        frisch berechneten, ggf. durch eine inzwischen eingegangene
+        Zahlung abweichenden Vorschau (das würde den tatsächlich
+        gesendeten, angekündigten Betrag nachträglich stillschweigend
+        verändern) und rekonstruiert dafür den ursprünglichen Beleg aus
+        dem bereits persistierten Audit-Eintrag der Gruppe (`versand_
+        fn` wird NICHT erneut aufgerufen - kein zweiter Versand).
 
         Sicher wiederholbar aufzurufen: `MahnkostenService.buche_vorschau`
         ist selbst idempotent (Ledger-Unique-Constraint auf
@@ -787,20 +869,76 @@ class MahnwesenService:
         Recovery-Durchlauf für alle anderen blockiert - er bleibt für
         einen späteren Durchlauf mit passendem `ctx` offen."""
 
-        if self._mahnlauf_repository is None or self._mahnkosten_service is None:
+        if self._mahnlauf_repository is None:
             return []
         abgeschlossen: list[MahnLaufTable] = []
-        for lauf in self._mahnlauf_repository.gesendet_ohne_kostenabschluss():
+        kandidaten = {lauf.id: lauf for lauf in self._mahnlauf_repository.gesendet_ohne_kostenabschluss()}
+        # Zusätzlich: Mahnläufe, die zwar GESENDET sind (Kosten bereits
+        # abgeschlossen ODER kein Kostenservice konfiguriert), aber
+        # mindestens ein Mitglied noch nicht auf GESENDET nachgezogen
+        # haben (Absturz zwischen Gruppen- und Mitgliederübergang).
+        for lauf in self._mahnlauf_repository.list_gesendet_mit_offenen_mitgliedern(mitglieder_repo=self._repository):
+            kandidaten.setdefault(lauf.id, lauf)
+        for lauf in kandidaten.values():
             if lauf.gesendet_am is None:
                 continue
+            if not ctx.has_zugriff(lauf.gesellschaft_id):
+                continue
+            beleg = beleg_aus_bestaetigtem_audit(self._mahnlauf_repository._session_factory, MahnLaufTable, lauf.id)
+            if beleg is None:
+                continue  # sollte bei status==GESENDET nie vorkommen, sicherheitshalber übersprungen statt abgebrochen
+            mitglieder_ids = MahnLaufRepository.mitglieder_ids(lauf)
+            mitglieder = [m for m in (self._repository.get(i) for i in mitglieder_ids) if m is not None]
             try:
-                vorschau = snapshot_aus_json(lauf.mahnkosten_snapshot_json)
-                if vorschau is not None:
-                    self._mahnkosten_service.buche_vorschau(
-                        ctx=ctx, vorschau=vorschau, heute=_versandtag_wien(lauf.gesendet_am),
-                        versandnachweis_referenz="mahnungslauf:" + lauf.outbox_key, akteur=akteur,
-                    )
-                self._mahnlauf_repository.markiere_mahnkosten_verarbeitet(lauf.id)
+                self._vervollstaendige_bestaetigten_mahnlauf(
+                    mahnlauf=lauf, mitglieder=mitglieder, beleg=beleg, ctx=ctx, akteur=akteur,
+                )
+                abgeschlossen.append(lauf)
+            except CrossTenantError:
+                continue
+        return abgeschlossen
+
+    def vervollstaendige_unsichere_mahnlaeufe(
+        self, *, ctx: AuthContext, akteur: str, status_abfragen_fn: Callable[[str], object],
+    ) -> list[MahnLaufTable]:
+        """Fragt für jeden UNSICHEREN Mahnlauf (Absturz zwischen Claim
+        und bestätigtem Ergebnis, siehe `markiere_verwaiste_mahnlaeufe_
+        als_unsicher`) den TATSÄCHLICHEN Providerstatus ab
+        (`status_abfragen_fn(referenz) -> Objekt mit status/
+        versendet_am/externe_referenz/provider_referenz`, z. B.
+        `MailOpsClient.status_abfragen`) und übernimmt eine bestätigte
+        Quittung OHNE erneut zu senden - Auftrag Markus 14.09.2026,
+        unabhängige Rückprüfung: "UNSICHER muss konkreten Gruppenauftrag
+        abfragen und bestätigte Quittung ohne Neusenden übernehmen
+        können". Der Kosten-/Inhaltssnapshot wurde bereits VOR dem
+        ursprünglichen Providerkontakt eingefroren (siehe `versende_
+        mahnlauf`) und steht deshalb unabhängig vom Ausgang dieser
+        Abfrage weiterhin zur Verfügung.
+
+        Liefert die Status-Abfrage (noch) keine Bestätigung oder scheitert
+        sie (`TransportFehlerUngewissError`/`ValueError`), bleibt der
+        Mahnlauf unverändert UNSICHER - kein Fehler, nur noch nicht
+        geklärt. Ein Vertrag, auf den `ctx` keinen Zugriff hat, wird
+        übersprungen (nicht abgebrochen)."""
+
+        if self._mahnlauf_repository is None:
+            return []
+        abgeschlossen: list[MahnLaufTable] = []
+        for lauf in self._mahnlauf_repository.list_fuer_status("UNSICHER"):
+            if not ctx.has_zugriff(lauf.gesellschaft_id):
+                continue  # KEINE Status-Abfrage für nicht zuständige Gesellschaften auslösen
+            try:
+                ergebnis = status_abfragen_fn("mahnungslauf:" + lauf.outbox_key)
+            except (TransportFehlerUngewissError, ValueError):
+                continue
+            if nachweis_daten(ergebnis) is None:
+                continue
+            mitglieder_ids = MahnLaufRepository.mitglieder_ids(lauf)
+            mitglieder = [m for m in (self._repository.get(i) for i in mitglieder_ids) if m is not None]
+            try:
+                self._vervollstaendige_bestaetigten_mahnlauf(
+                    mahnlauf=lauf, mitglieder=mitglieder, beleg=ergebnis, ctx=ctx, akteur=akteur,
+                )
                 abgeschlossen.append(lauf)
             except CrossTenantError:
                 continue

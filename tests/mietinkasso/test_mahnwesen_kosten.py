@@ -19,10 +19,12 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access
 from mietinkasso.domain.enums import OPTyp, Rolle
 from mietinkasso.domain.exceptions import CrossTenantError
+from mietinkasso.infrastructure.db.tables import MahnkostenGebuehrTable
 from mietinkasso.mahnwesen.kosten import bestimme_zinssatz, snapshot_aus_json, snapshot_zu_json
 from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
 from mietinkasso.mahnwesen.kosten_service import MahnkostenService
@@ -1003,6 +1005,100 @@ def test_mahngebuehr_zwei_genuin_unterschiedliche_monate_ergeben_zwei_pauschalen
     )
     assert stufe2 is not None
     assert stufe2.gebuehr_cent == 1500  # nur der DRITTE, bisher unbepauschalte Monat
+
+
+def test_reserviere_und_kuerze_vorschau_entfernt_von_anderer_gruppe_bereits_reserviertes_segment(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Unabhängige Abnahme eb7b8a7, echter Bug (reproduziert ohne
+    Threads): zwei disjunkte Mahnlauf-Gruppen für zwei GENUIN
+    unterschiedliche OP-Komponenten DERSELBEN Vorschreibungsperiode
+    können ihre jeweilige Kostenvorschau BEIDE berechnen, BEVOR eine von
+    beiden tatsächlich reserviert - beide sehen (noch) dieselbe offene
+    §458-Pauschale. `reserviere_und_kuerze_vorschau` MUSS sicherstellen,
+    dass NUR die zuerst reservierende Gruppe die Pauschale in ihrer
+    (danach eingefrorenen und versendeten) Vorschau behält - die zweite
+    Gruppe darf sie NIEMALS ebenfalls ankündigen."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=4000, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+    )
+    op_a = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1),
+        faelligkeit=date(2026, 4, 5), leistungsperiode="2026-04", beleg_referenz="Komponente A",
+    )
+    op_b = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=15_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1),
+        faelligkeit=date(2026, 4, 6), leistungsperiode="2026-04", beleg_referenz="Komponente B",
+    )
+    heute = date(2026, 4, 20)
+    # BEIDE Gruppen berechnen ihre eigene, an ihre Mitgliedermenge
+    # gebundene Vorschau, BEVOR auch nur eine von beiden reserviert -
+    # genau das Zeitfenster einer echten Nebenläufigkeit, hier ohne
+    # Threads durch getrennte, vorab berechnete Vorschauen simuliert.
+    vorschau_a = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=heute, nur_op_position_ids=frozenset({op_a.id}))
+    vorschau_b = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=heute, nur_op_position_ids=frozenset({op_b.id}))
+    assert vorschau_a.gebuehr_cent == 4000
+    assert vorschau_b.gebuehr_cent == 4000  # BEIDE sehen (noch) dieselbe offene Pauschale
+
+    gekuerzte_a = kosten_service.reserviere_und_kuerze_vorschau(vorschau=vorschau_a, mahnlauf_id=101, akteur="test")
+    assert gekuerzte_a is vorschau_a  # nichts zu kürzen - A war zuerst
+    assert gekuerzte_a.gebuehr_cent == 4000
+
+    gekuerzte_b = kosten_service.reserviere_und_kuerze_vorschau(vorschau=vorschau_b, mahnlauf_id=102, akteur="test")
+    assert gekuerzte_b is not vorschau_b
+    assert gekuerzte_b.gebuehr_cent is None  # B darf die Pauschale NICHT nochmal ankündigen
+    assert gekuerzte_b.gebuehr_segmente == ()
+    assert gekuerzte_b.hauptforderung_cent == vorschau_b.hauptforderung_cent  # Hauptforderung unberührt
+
+    with kosten_repo._session_factory() as db:
+        gebuehren = list(db.execute(select(MahnkostenGebuehrTable).where(
+            MahnkostenGebuehrTable.vertrag_id == vertrag.id)).scalars())
+    assert len(gebuehren) == 1  # GENAU eine Zeile für "PERIODE:2026-04"
+    assert gebuehren[0].reserviert_fuer_mahnlauf_id == 101
+    assert gebuehren[0].status == "RESERVIERT"
+
+
+def test_gib_reservierungen_frei_erlaubt_spaeteren_versuch_einer_anderen_gruppe(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Eine VOR jedem Providerkontakt blockierte Gruppe gibt ihre
+    Reservierung wieder frei - eine GENUIN andere (oder dieselbe, neu
+    geplante) Gruppe kann die Entgeltforderung danach erneut
+    versuchen."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=4000, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1),
+        faelligkeit=date(2026, 4, 5), leistungsperiode="2026-04", beleg_referenz="HMZ April",
+    )
+    heute = date(2026, 4, 20)
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=heute)
+    assert vorschau.gebuehr_cent == 4000
+
+    gekuerzt = kosten_service.reserviere_und_kuerze_vorschau(vorschau=vorschau, mahnlauf_id=201, akteur="test")
+    assert gekuerzt is vorschau  # erfolgreich reserviert
+
+    kosten_service.gib_reservierungen_frei(vorschau=vorschau, mahnlauf_id=201)
+    with kosten_repo._session_factory() as db:
+        gebuehren = list(db.execute(select(MahnkostenGebuehrTable).where(
+            MahnkostenGebuehrTable.vertrag_id == vertrag.id)).scalars())
+    assert gebuehren == []  # Reservierung tatsächlich entfernt
+
+    frische_vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=heute)
+    assert frische_vorschau.gebuehr_cent == 4000  # wieder offen für einen neuen Versuch
+    gekuerzt_neu = kosten_service.reserviere_und_kuerze_vorschau(vorschau=frische_vorschau, mahnlauf_id=202, akteur="test")
+    assert gekuerzt_neu is frische_vorschau
+    assert gekuerzt_neu.gebuehr_cent == 4000
 
 
 # -- Unbekannte/ungegliederte Eröffnungsstruktur: nie fiktiv verzinst ------

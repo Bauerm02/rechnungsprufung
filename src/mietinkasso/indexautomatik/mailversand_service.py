@@ -155,17 +155,25 @@ class HVMailversandService:
                 gesamt_cent += debt.rest_cent
                 posten_zeilen.append(f"- {_eur_text(debt.rest_cent)} EUR, fällig seit {debt.faelligkeit.strftime('%d.%m.%Y')}")
 
-            vorschau = None
-            if self.mahnkosten_service is not None:
-                # An die eingefrorene Gruppe gebunden (Rückprüfung Codex
-                # 14.09.2026) - keine Kosten auf andere, nicht Teil
-                # dieses Mahnlaufs seiende offene Forderungen desselben
-                # Vertrags (siehe `kosten_service.py::vorschau`-Docstring).
+            # `versende_mahnlauf` berechnet (und reserviert/kürzt, siehe
+            # Rückprüfung Codex 14.09.2026) die Vorschau bereits VOR dem
+            # Aufruf dieser Funktion und befüllt `vorschau_slot` damit -
+            # GENAU DIESES Objekt wird hier verwendet, NIE eine eigene
+            # Neuberechnung (die die zwischenzeitliche Kürzung um bereits
+            # anderweitig reservierte Gebührensegmente ignorieren würde).
+            if "vorschau" in vorschau_slot:
+                vorschau = vorschau_slot["vorschau"]
+            elif self.mahnkosten_service is not None:
+                # Rückfall für einen hypothetischen Aufrufer ohne
+                # vorbefüllten Slot - an die eingefrorene Gruppe gebunden
+                # (siehe `kosten_service.py::vorschau`-Docstring).
                 vorschau = self.mahnkosten_service.vorschau(
                     vertrag_id=mahnlauf.vertrag_id, stufe=mahnlauf.stufe, heute=heute,
                     nur_op_position_ids=frozenset(m.forderung_op_position_id for m in mitglieder),
                 )
-            vorschau_slot["vorschau"] = vorschau
+                vorschau_slot["vorschau"] = vorschau
+            else:
+                vorschau = None
             kosten_text = _mahnkosten_text_baustein(vorschau)
 
             deadline = heute + timedelta(days=contract.zahlungsfrist_tage)
@@ -272,14 +280,14 @@ class HVMailversandService:
         self.mahn_service.markiere_verwaiste_als_unsicher()
         self.mahn_service.markiere_verwaiste_mahnlaeufe_als_unsicher()
         # Recovery-Paket 14.09.2026: ein Absturz zwischen bestätigtem
-        # Versand und der eigentlichen Kostenbuchung wird HIER anhand
-        # des eingefrorenen Kosten-/Inhaltssnapshots nachgeholt, NIE
-        # anhand einer neu berechneten, potenziell abweichenden Vorschau
+        # Versand und der eigentlichen Kostenbuchung ODER zwischen dem
+        # Gruppen- und dem Mitgliederübergang wird HIER anhand des
+        # eingefrorenen Kosten-/Inhaltssnapshots bzw. der persistierten
+        # Gruppenquittung nachgeholt, NIE anhand einer neu berechneten,
+        # potenziell abweichenden Vorschau oder eines erneuten Versands
         # (siehe `MahnwesenService.vervollstaendige_gesendete_
-        # mahnlaeufe_ohne_kostenabschluss`-Docstring).
-        self.mahn_service.vervollstaendige_gesendete_mahnlaeufe_ohne_kostenabschluss(
-            ctx=ctx, akteur="hv-mailversand-recovery",
-        )
+        # mahnlaeufe`-Docstring).
+        self.mahn_service.vervollstaendige_gesendete_mahnlaeufe(ctx=ctx, akteur="hv-mailversand-recovery")
         policy = self.policy_repo.aktuelle_freigegebene()
         counts = {"geplant": 0, "gesendet": 0, "blockiert": 0}
         if policy is None:
@@ -326,9 +334,22 @@ class HVMailversandService:
         if self.client is None:
             return 0
         count = 0
+        # `MahnFallTable` ist HIER BEWUSST NICHT (mehr) enthalten: jeder
+        # produktive Versand läuft über den gebündelten Mahnlauf-Pfad
+        # (`plane_mahnlauf`/`versende_mahnlauf`), dessen Mitglieder unter
+        # der GRUPPEN-Referenz ("mahnungslauf:" + Gruppen-outbox_key)
+        # gesendet werden, NICHT unter ihrem eigenen `outbox_key`
+        # ("mahnung:" + eigener outbox_key) - eine generische Abfrage
+        # unter der EIGENEN Referenz würde beim tatsächlichen Provider
+        # ins Leere laufen. Gebündelte Mahnläufe werden stattdessen über
+        # `MahnwesenService.vervollstaendige_unsichere_mahnlaeufe` unten
+        # korrekt (Gruppen-Referenz, samt Mitgliedsnachweisen/
+        # Kostenbuchung) abgeglichen. Der einzelfallbasierte, in
+        # Produktion nicht mehr verdrahtete `versenden()`-Pfad hat noch
+        # keine eigene Status-Abfrage-Rekonziliation - siehe
+        # `docs/hausverwaltung/OFFENE_PUNKTE.md`.
         specs = [
             (ErhoehungsschreibenTable, {"UNKLAR"}, "GESENDET", "versendet_am", "externe_versandreferenz", lambda r: r.idempotenzschluessel),
-            (MahnFallTable, {"UNSICHER"}, "GESENDET", "gesendet_am", None, lambda r: "mahnung:" + r.outbox_key),
             (VertragsendeErinnerungTable, {"UNKLAR"}, "BENACHRICHTIGT", "benachrichtigt_am", None,
              lambda r: f"vertragsende:{r.vertrag_id}:{r.end_datum.isoformat()}"),
         ]
@@ -347,6 +368,16 @@ class HVMailversandService:
                 if nachweis_daten(result):
                     count += int(versand_belegen(self.sf, table, row.id, ergebnis=result, erlaubt=pending,
                         neuer_status=done, zeitfeld=field, referenz=ref, referenzfeld=ref_field))
+
+        # Gebündelte Mahnläufe (MahnLaufTable) brauchen mehr als den
+        # generischen Ein-Feld-Übergang oben: eine bestätigte Quittung
+        # muss zusätzlich JEDES noch offene Mitglied und die Kostenbuchung
+        # nachziehen (siehe `MahnwesenService.vervollstaendige_unsichere_
+        # mahnlaeufe`-Docstring, Auftrag Markus 14.09.2026) - deshalb ein
+        # eigener Aufruf statt eines weiteren generischen `specs`-Eintrags.
+        count += len(self.mahn_service.vervollstaendige_unsichere_mahnlaeufe(
+            ctx=ctx, akteur="hv-mailversand-status-abgleich", status_abfragen_fn=self.client.status_abfragen,
+        ))
         return count
 
     def versanduebersicht(self, *, ctx):
