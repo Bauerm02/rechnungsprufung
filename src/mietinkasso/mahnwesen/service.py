@@ -37,8 +37,9 @@ from typing import Callable
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import MahnStatus, MahnStufe, rechtsordnung_geklaert
-from mietinkasso.domain.exceptions import BindungInkonsistentError, MahnstufeReihenfolgeError
+from mietinkasso.domain.exceptions import BindungInkonsistentError, CrossTenantError, MahnstufeReihenfolgeError
 from mietinkasso.infrastructure.db.tables import KontoTable, MahnFallTable, MahnLaufTable, MahnPolicyTable, VertragTable
+from mietinkasso.mahnwesen.kosten import snapshot_aus_json, snapshot_zu_json
 from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnLaufRepository, MahnPolicyRepository
 from mietinkasso.op.service import OffeneForderung, OPService, compute_content_hash
 from mietinkasso.stammdaten.repository import StammdatenRepository
@@ -703,10 +704,39 @@ class MahnwesenService:
                 self._repository.set_status(mahnfall.id, MahnStatus.UNSICHER.value)
             return VersandErgebnis("UNSICHER", "Noch kein tatsächlicher Versandnachweis; Status wird abgefragt, nicht erneut gesendet.")
 
+        # Kosten-/Inhaltssnapshot wird VOR dem GESENDET-Übergang bestimmt
+        # und ATOMAR IN DERSELBEN UPDATE-Anweisung eingefroren (Auftrag
+        # Markus 14.09.2026: "Recovery nach bestätigtem Versand mit
+        # eingefrorenem Kosten-/Inhaltssnapshot") - ein Absturz
+        # IRGENDWANN NACH diesem Punkt (mitten in der Mitgliederschleife,
+        # vor/während der eigentlichen Kostenbuchung) hinterlässt IMMER
+        # entweder GAR KEINEN GESENDET-Übergang (dann bleibt die Gruppe
+        # IN_VERSAND, siehe `markiere_verwaiste_mahnlaeufe_als_unsicher`)
+        # oder GESENDET+Snapshot GEMEINSAM - nie GESENDET ohne Snapshot.
+        # Die Buchung selbst verwendet danach IMMER GENAU dieses
+        # eingefrorene Objekt, NIE eine zweite, potenziell durch
+        # inzwischen eingegangene Zahlungen abweichende Neuberechnung.
+        vorschau = None
+        if self._mahnkosten_service is not None:
+            if mahnkosten_vorschau_slot is not None and "vorschau" in mahnkosten_vorschau_slot:
+                vorschau = mahnkosten_vorschau_slot["vorschau"]
+            else:
+                # An die eingefrorene Gruppe gebunden (siehe
+                # `kosten_service.py::vorschau`-Docstring, Rückprüfung
+                # Codex 14.09.2026) - keine Kosten auf andere, nicht Teil
+                # dieses Mahnlaufs seiende offene Forderungen desselben
+                # Vertrags.
+                vorschau = self._mahnkosten_service.vorschau(
+                    vertrag_id=vertrag.id, stufe=mahnlauf.stufe, heute=heute,
+                    nur_op_position_ids=frozenset(m.forderung_op_position_id for m in mitglieder),
+                )
+        kosten_snapshot_json = snapshot_zu_json(vorschau) if self._mahnkosten_service is not None else None
+
         versand_belegen(
             self._mahnlauf_repository._session_factory, MahnLaufTable, mahnlauf_id,
             ergebnis=beleg, erlaubt={"IN_VERSAND", "UNSICHER"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
             referenz="mahnungslauf:" + mahnlauf.outbox_key,
+            zusatz={"mahnkosten_snapshot_json": kosten_snapshot_json} if kosten_snapshot_json is not None else None,
         )
         # Jedes Mitglied wurde bereits bei `plane_mahnlauf` atomar auf
         # GEBUENDELT geclaimt (siehe `MahnFallRepository.
@@ -721,25 +751,60 @@ class MahnwesenService:
             )
 
         if self._mahnkosten_service is not None:
-            vorschau = None
-            if mahnkosten_vorschau_slot is not None and "vorschau" in mahnkosten_vorschau_slot:
-                vorschau = mahnkosten_vorschau_slot["vorschau"]
-            else:
-                # An die eingefrorene Gruppe gebunden (siehe
-                # `kosten_service.py::vorschau`-Docstring, Rückprüfung
-                # Codex 14.09.2026) - keine Kosten auf andere, nicht Teil
-                # dieses Mahnlaufs seiende offene Forderungen desselben
-                # Vertrags.
-                vorschau = self._mahnkosten_service.vorschau(
-                    vertrag_id=vertrag.id, stufe=mahnlauf.stufe, heute=heute,
-                    nur_op_position_ids=frozenset(m.forderung_op_position_id for m in mitglieder),
-                )
             if vorschau is not None:
                 self._mahnkosten_service.buche_vorschau(
                     ctx=ctx, vorschau=vorschau, heute=heute,
                     versandnachweis_referenz="mahnungslauf:" + mahnlauf.outbox_key, akteur=ctx.user_id,
                 )
+            # Erst JETZT als abgeschlossen markiert - ein Absturz VOR
+            # diesem Punkt (Snapshot bereits persistiert, Buchung aber
+            # noch offen) wird durch `vervollstaendige_gesendete_
+            # mahnlaeufe_ohne_kostenabschluss` anhand DESSELBEN
+            # eingefrorenen Snapshots sicher nachgeholt.
+            self._mahnlauf_repository.markiere_mahnkosten_verarbeitet(mahnlauf_id)
         return VersandErgebnis("GESENDET", "Tatsächlicher Versand im Maildienst nachgewiesen (gebündelter Mahnlauf).")
+
+    def vervollstaendige_gesendete_mahnlaeufe_ohne_kostenabschluss(
+        self, *, ctx: AuthContext, akteur: str,
+    ) -> list[MahnLaufTable]:
+        """Recovery-Pendant zur Kosten-/Inhaltssnapshot-Bindung in
+        `versende_mahnlauf` (Auftrag Markus 14.09.2026). Findet jeden
+        GESENDETEN Mahnlauf, dessen Kostenbuchung NOCH NICHT als
+        abgeschlossen markiert ist (Absturz zwischen bestätigtem Versand
+        und Buchung, oder zwischen Buchung und dem Markieren als
+        abgeschlossen), und bucht ihn anhand des ATOMAR mit GESENDET
+        eingefrorenen Snapshots nach - NIE anhand einer frisch
+        berechneten, ggf. durch eine inzwischen eingegangene Zahlung
+        abweichenden Vorschau (das würde den tatsächlich gesendeten,
+        angekündigten Betrag nachträglich stillschweigend verändern).
+
+        Sicher wiederholbar aufzurufen: `MahnkostenService.buche_vorschau`
+        ist selbst idempotent (Ledger-Unique-Constraint auf
+        `mahnlauf_schluessel`, siehe `kosten_repository.py`), ein zweiter
+        Aufruf für dieselbe Gruppe bucht nie doppelt. Ein Vertrag, auf den
+        `ctx` keinen Zugriff hat, wird übersprungen (nicht abgebrochen),
+        damit EIN nicht zuständiger Mahnlauf nicht den gesamten
+        Recovery-Durchlauf für alle anderen blockiert - er bleibt für
+        einen späteren Durchlauf mit passendem `ctx` offen."""
+
+        if self._mahnlauf_repository is None or self._mahnkosten_service is None:
+            return []
+        abgeschlossen: list[MahnLaufTable] = []
+        for lauf in self._mahnlauf_repository.gesendet_ohne_kostenabschluss():
+            if lauf.gesendet_am is None:
+                continue
+            try:
+                vorschau = snapshot_aus_json(lauf.mahnkosten_snapshot_json)
+                if vorschau is not None:
+                    self._mahnkosten_service.buche_vorschau(
+                        ctx=ctx, vorschau=vorschau, heute=_versandtag_wien(lauf.gesendet_am),
+                        versandnachweis_referenz="mahnungslauf:" + lauf.outbox_key, akteur=akteur,
+                    )
+                self._mahnlauf_repository.markiere_mahnkosten_verarbeitet(lauf.id)
+                abgeschlossen.append(lauf)
+            except CrossTenantError:
+                continue
+        return abgeschlossen
 
     def markiere_verwaiste_mahnlaeufe_als_unsicher(
         self, *, jetzt: datetime | None = None, max_alter: timedelta = timedelta(minutes=15),

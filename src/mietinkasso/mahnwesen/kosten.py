@@ -56,6 +56,7 @@ Neuberechnung)."""
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
@@ -480,6 +481,92 @@ class MahnkostenVorschau:
         if self.gebuehr_cent is not None:
             zusatz += self.gebuehr_cent
         return zusatz
+
+
+def _vorschau_zu_dict(vorschau: MahnkostenVorschau) -> dict:
+    """Vollständige, verlustfreie Serialisierung EINER `MahnkostenVorschau`
+    - Grundlage des eingefrorenen Kosten-/Inhaltssnapshots (Auftrag
+    Markus 14.09.2026: "Recovery nach bestätigtem Versand mit
+    eingefrorenem Kosten-/Inhaltssnapshot"). Muss exakt zu
+    `_vorschau_aus_dict` passen (Round-Trip-Eigenschaft, siehe Tests)."""
+
+    return {
+        "vertrag_id": vorschau.vertrag_id, "stufe": vorschau.stufe,
+        "hauptforderung_cent": vorschau.hauptforderung_cent, "zinsbasis": vorschau.zinsbasis,
+        "zinssatz_prozent": str(vorschau.zinssatz_prozent) if vorschau.zinssatz_prozent is not None else None,
+        "zins_von": vorschau.zins_von.isoformat() if vorschau.zins_von else None,
+        "zins_bis": vorschau.zins_bis.isoformat() if vorschau.zins_bis else None,
+        "neue_zinsen_cent": vorschau.neue_zinsen_cent,
+        "bereits_gebuchte_zinsen_cent": vorschau.bereits_gebuchte_zinsen_cent,
+        "neue_zinsen_delta_cent": vorschau.neue_zinsen_delta_cent,
+        "neue_zinsen_delta_je_op_position": {str(k): v for k, v in vorschau.neue_zinsen_delta_je_op_position.items()},
+        "zins_segmente": [
+            {"op_position_id": s.op_position_id, "von": s.von.isoformat(), "bis": s.bis.isoformat(),
+             "rest_cent": s.rest_cent, "satz_prozent": str(s.satz_prozent) if s.satz_prozent is not None else None,
+             "quelle": s.quelle, "zinsen_cent": s.zinsen_cent}
+            for s in vorschau.zins_segmente
+        ],
+        "zins_teilweise_ungeklaert": vorschau.zins_teilweise_ungeklaert,
+        "gebuehr_segmente": [
+            {"entgeltforderung_schluessel": g.entgeltforderung_schluessel, "betrag_cent": g.betrag_cent,
+             "rechtsgrundlage": g.rechtsgrundlage}
+            for g in vorschau.gebuehr_segmente
+        ],
+        "gebuehr_cent": vorschau.gebuehr_cent, "gebuehr_rechtsgrundlage": vorschau.gebuehr_rechtsgrundlage,
+        "forderung_op_position_ids": list(vorschau.forderung_op_position_ids),
+        "ausgeschlossene_forderungen_hinweis": list(vorschau.ausgeschlossene_forderungen_hinweis),
+        "hinweise": list(vorschau.hinweise),
+    }
+
+
+def _vorschau_aus_dict(data: dict) -> MahnkostenVorschau:
+    return MahnkostenVorschau(
+        vertrag_id=data["vertrag_id"], stufe=data["stufe"], hauptforderung_cent=data["hauptforderung_cent"],
+        zinsbasis=data["zinsbasis"],
+        zinssatz_prozent=Decimal(data["zinssatz_prozent"]) if data["zinssatz_prozent"] is not None else None,
+        zins_von=date.fromisoformat(data["zins_von"]) if data["zins_von"] else None,
+        zins_bis=date.fromisoformat(data["zins_bis"]) if data["zins_bis"] else None,
+        neue_zinsen_cent=data["neue_zinsen_cent"], bereits_gebuchte_zinsen_cent=data["bereits_gebuchte_zinsen_cent"],
+        neue_zinsen_delta_cent=data["neue_zinsen_delta_cent"],
+        neue_zinsen_delta_je_op_position={int(k): v for k, v in data["neue_zinsen_delta_je_op_position"].items()},
+        zins_segmente=tuple(
+            ZinsSegment(
+                s["op_position_id"], date.fromisoformat(s["von"]), date.fromisoformat(s["bis"]), s["rest_cent"],
+                Decimal(s["satz_prozent"]) if s["satz_prozent"] is not None else None, s["quelle"], s["zinsen_cent"],
+            )
+            for s in data["zins_segmente"]
+        ),
+        zins_teilweise_ungeklaert=data["zins_teilweise_ungeklaert"],
+        gebuehr_segmente=tuple(
+            GebuehrSegment(g["entgeltforderung_schluessel"], g["betrag_cent"], g["rechtsgrundlage"])
+            for g in data["gebuehr_segmente"]
+        ),
+        gebuehr_cent=data["gebuehr_cent"], gebuehr_rechtsgrundlage=data["gebuehr_rechtsgrundlage"],
+        forderung_op_position_ids=tuple(data["forderung_op_position_ids"]),
+        ausgeschlossene_forderungen_hinweis=tuple(data["ausgeschlossene_forderungen_hinweis"]),
+        hinweise=tuple(data["hinweise"]),
+    )
+
+
+def snapshot_zu_json(vorschau: MahnkostenVorschau | None) -> str:
+    """Friert `vorschau` (oder explizit `None` - "kein Kostenservice
+    konfiguriert"/"nichts zu berechnen") als JSON-Text ein - wird ATOMAR
+    mit dem GESENDET-Übergang persistiert (`MahnLaufTable.
+    mahnkosten_snapshot_json`, siehe dortiger Docstring). NIE aus einer
+    späteren Neuberechnung ableiten."""
+
+    return json.dumps(_vorschau_zu_dict(vorschau) if vorschau is not None else None)
+
+
+def snapshot_aus_json(payload: str | None) -> MahnkostenVorschau | None:
+    """Kehrseite zu `snapshot_zu_json` - liefert `None`, wenn die Spalte
+    selbst `NULL` ist (noch nie bis zum Versand gekommen) ODER das JSON
+    explizit `null` ist (kein Kostenservice/nichts zu buchen)."""
+
+    if payload is None:
+        return None
+    data = json.loads(payload)
+    return _vorschau_aus_dict(data) if data is not None else None
 
 
 def vorschau_bei_ledger_inkonsistenz(

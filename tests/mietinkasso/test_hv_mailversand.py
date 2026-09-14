@@ -13,7 +13,7 @@ from mietinkasso.indexautomatik.bootstrap import bauen
 from mietinkasso.indexautomatik.mailops_client import MailOpsClient, MailOpsErgebnis
 from mietinkasso.indexautomatik.mailversand_service import HVMailversandService
 from mietinkasso.infrastructure.config import Settings
-from mietinkasso.infrastructure.db.tables import AuditEventTable, MahnFallTable
+from mietinkasso.infrastructure.db.tables import AuditEventTable, MahnFallTable, MahnkostenBuchungTable, MahnLaufTable
 
 
 @pytest.fixture
@@ -331,6 +331,93 @@ def test_mahnkosten_text_stimmt_exakt_mit_gebuchten_zusatzpositionen_ueberein(hv
     zinsen_text = f"{buchung.zinsen_cent/100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     assert buchung.zinsen_cent > 0
     assert f"{zinsen_text} EUR" in body["text"]
+
+
+def test_absturz_zwischen_bestaetigtem_versand_und_kostenbuchung_wird_anhand_snapshot_nachgeholt(
+    hv, basis_vertrag, admin_ctx, monkeypatch,
+):
+    """Auftrag Markus 14.09.2026: "Recovery nach bestätigtem Versand mit
+    eingefrorenem Kosten-/Inhaltssnapshot". Simuliert einen Absturz GENAU
+    zwischen dem bestätigten GESENDET-Übergang (Gruppe+Mitglieder, samt
+    dabei atomar eingefrorenem Kosten-/Inhaltssnapshot) und der
+    eigentlichen Kostenbuchung, indem `MahnkostenService.buche_vorschau`
+    beim ERSTEN Aufruf eine Exception wirft. Der Versand selbst bleibt
+    dabei UNVERÄNDERT korrekt bestätigt (kein Doppelversand-Risiko); die
+    fehlende Kostenbuchung wird über die tägliche Recovery-Routine
+    NACHTRÄGLICH exakt anhand des eingefrorenen Snapshots nachgeholt -
+    NIE anhand einer frisch neu berechneten, potenziell abweichenden
+    Vorschau."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    state["status"] = "GESENDET"
+    _seed_zwei_komponenten(hv, contract, account, admin_ctx, faelligkeit=date(2026, 1, 5))
+    _bank_bestaetigen(service, contract, date(2026, 3, 1))
+    profil = service.mahnkosten_repo.zinsprofil_anlegen(
+        vertrag_id=contract.id, ist_b2b=False, vertragsdatum=None, erstellt_von="test",
+    )
+    service.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
+
+    original_buche_vorschau = service.mahnkosten_service.buche_vorschau
+    aufrufe = {"anzahl": 0}
+
+    def kaputte_buchung(*args, **kwargs):
+        aufrufe["anzahl"] += 1
+        if aufrufe["anzahl"] == 1:
+            raise RuntimeError("Simulierter Absturz NACH bestätigtem Versand, VOR der Kostenbuchung.")
+        return original_buche_vorschau(*args, **kwargs)
+
+    monkeypatch.setattr(service.mahnkosten_service, "buche_vorschau", kaputte_buchung)
+    with pytest.raises(RuntimeError):
+        service.mahnlauf(ctx=admin_ctx, heute=date(2026, 3, 1))
+    monkeypatch.undo()
+
+    # Der Versand selbst ist trotz des simulierten Absturzes UNVERÄNDERT
+    # korrekt bestätigt - kein halb-gesendeter/unklarer Zustand.
+    with service.sf() as db:
+        mahnlauf = db.execute(select(MahnLaufTable).where(MahnLaufTable.vertrag_id == contract.id)).scalars().one()
+        mahnfaelle = list(db.execute(select(MahnFallTable).where(MahnFallTable.vertrag_id == contract.id)).scalars())
+    assert mahnlauf.status == "GESENDET"
+    assert all(f.status == MahnStatus.GESENDET.value for f in mahnfaelle)
+    # Der Kosten-/Inhaltssnapshot wurde bereits ATOMAR mit dem
+    # GESENDET-Übergang eingefroren - aber die Buchung selbst ist noch
+    # NICHT als abgeschlossen markiert (genau die Recovery-Lücke).
+    assert mahnlauf.mahnkosten_snapshot_json is not None
+    assert mahnlauf.mahnkosten_verarbeitet_am is None
+
+    with service.sf() as db:
+        keine_buchung = list(db.execute(select(MahnkostenBuchungTable).where(
+            MahnkostenBuchungTable.vertrag_id == contract.id)).scalars())
+    assert keine_buchung == []  # tatsächlich noch nichts gebucht
+
+    # Recovery: bucht anhand des eingefrorenen Snapshots nach, ohne den
+    # Versand erneut anzustoßen (kein zweiter Mailversand, `state["calls"]`
+    # bleibt bei genau einem Aufruf).
+    aufrufe_vor_recovery = len(state["calls"])
+    nachgeholt = service.mahn_service.vervollstaendige_gesendete_mahnlaeufe_ohne_kostenabschluss(
+        ctx=admin_ctx, akteur="recovery-test",
+    )
+    assert len(nachgeholt) == 1
+    assert len(state["calls"]) == aufrufe_vor_recovery  # kein erneuter Versand
+
+    with service.sf() as db:
+        buchung = db.execute(select(MahnkostenBuchungTable).where(
+            MahnkostenBuchungTable.vertrag_id == contract.id)).scalars().one()
+        mahnlauf_nach = db.get(MahnLaufTable, mahnlauf.id)
+    assert buchung.zinsen_cent > 0
+    assert buchung.versandnachweis_referenz == "mahnungslauf:" + mahnlauf.outbox_key
+    assert mahnlauf_nach.mahnkosten_verarbeitet_am is not None
+
+    # Ein zweiter Recovery-Durchlauf findet nichts mehr offen und bucht
+    # NICHT ein zweites Mal (keine doppelte Kostenposition).
+    zweiter_durchlauf = service.mahn_service.vervollstaendige_gesendete_mahnlaeufe_ohne_kostenabschluss(
+        ctx=admin_ctx, akteur="recovery-test",
+    )
+    assert zweiter_durchlauf == []
+    with service.sf() as db:
+        buchungen_gesamt = list(db.execute(select(MahnkostenBuchungTable).where(
+            MahnkostenBuchungTable.vertrag_id == contract.id)).scalars())
+    assert len(buchungen_gesamt) == 1
 
 
 def test_index_real_mail_protocol_acceptance_is_not_sending_or_rent_change(hv, basis_vertrag, admin_ctx):

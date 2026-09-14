@@ -23,7 +23,15 @@ def nachweis_daten(ergebnis):
 
 
 def versand_belegen(session_factory, table, row_id, *, ergebnis, erlaubt,
-                    neuer_status, zeitfeld, referenz, referenzfeld=None):
+                    neuer_status, zeitfeld, referenz, referenzfeld=None, zusatz=None):
+    """`zusatz`: optionale zusätzliche Spaltenwerte, die ATOMAR in
+    DERSELBEN UPDATE-Anweisung wie der Statusübergang geschrieben werden
+    (z. B. ein eingefrorener Kosten-/Inhaltssnapshot, siehe
+    `mahnwesen/service.py::MahnwesenService.versende_mahnlauf`) - niemals
+    in einem separaten, potenziell durch einen Absturz getrennten
+    zweiten Schritt. `None` (Default) ändert nichts am bestehenden
+    Verhalten der drei bereits vorhandenen Aufrufer."""
+
     proof = nachweis_daten(ergebnis)
     if proof is None:
         raise ValueError("Nachweislich gesendete Nachricht mit tatsächlichem Versandzeitpunkt erforderlich.")
@@ -33,6 +41,8 @@ def versand_belegen(session_factory, table, row_id, *, ergebnis, erlaubt,
             values[referenzfeld] = ergebnis.externe_referenz
         if hasattr(table, "fehlergrund"):
             values["fehlergrund"] = None
+        if zusatz:
+            values.update(zusatz)
         changed = session.execute(update(table).where(table.id == row_id, table.status.in_(erlaubt)).values(**values))
         if changed.rowcount != 1:
             return False

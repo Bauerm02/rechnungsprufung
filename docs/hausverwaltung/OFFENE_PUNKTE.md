@@ -2731,9 +2731,55 @@ selbst als NÄCHSTE Priorität benannt, noch NICHT Teil dieser Runde):**
   bestätigtem Versand und Kostenbuchung fehlt weiterhin**: siehe Runde 2
   oben - unverändert offen, wird als NÄCHSTER Schritt vor dem Kanal-/
   Kostenpaket (Stufe1=EMAIL/Stufe2=BRIEF, Versandkostenpositionen,
-  §1333/§458-Gates) bearbeitet.
+  §1333/§458-Gates) bearbeitet. **Behoben in Runde 4, siehe unten.**
 - Der im tatsächlich versendeten E-Mail-Text ausgewiesene Kosten-/
   Zinsnachweis enthält weiterhin nur Betrag/Fälligkeit je Position -
   unverändert offen, gehört zum kommenden Kanal-/Brief-Dokumentpaket.
+
+## Korrekturpaket Runde 4: Kosten-/Inhaltssnapshot-Recovery (Auftrag Markus 14.09.2026)
+
+Schließt die in Runde 2/3 ehrlich offen benannte Recovery-Lücke
+("Kosten-/Mitgliedsnachweis-Recovery bei einem Absturz ZWISCHEN
+bestätigtem Versand und Kostenbuchung fehlt noch") endgültig:
+
+- **`MahnLaufTable` bekommt zwei neue additive Spalten**:
+  `mahnkosten_snapshot_json` (die exakte, für den tatsächlich gesendeten
+  Brief-/Mailtext verwendete `MahnkostenVorschau`, verlustfrei
+  serialisiert über `kosten.py::snapshot_zu_json`/`snapshot_aus_json`,
+  oder JSON-`null` bei nicht konfiguriertem Kostenservice) und
+  `mahnkosten_verarbeitet_am` (gesetzt, sobald die Kostenbuchung für
+  diesen Mahnlauf abgeschlossen ist).
+- **`indexautomatik/mailnachweis.py::versand_belegen`** bekommt einen
+  optionalen `zusatz`-Parameter (zusätzliche Spaltenwerte, ATOMAR in
+  DERSELBEN UPDATE-Anweisung wie der Statusübergang geschrieben) -
+  additive Erweiterung, ändert nichts an den drei bestehenden Aufrufern.
+  `MahnwesenService.versende_mahnlauf` berechnet die Kostenvorschau VOR
+  dem GESENDET-Übergang und übergibt sie als `zusatz` - der
+  Kosten-/Inhaltssnapshot wird dadurch IMMER GEMEINSAM mit GESENDET
+  persistiert, nie erst danach in einem separaten, durch einen Absturz
+  trennbaren Schritt.
+- **Neue Recovery-Methode `MahnwesenService.vervollstaendige_
+  gesendete_mahnlaeufe_ohne_kostenabschluss`**: findet jeden GESENDETEN
+  Mahnlauf mit vorhandenem Snapshot, aber ohne abgeschlossene
+  Kostenbuchung, und bucht ihn NACH - IMMER anhand des eingefrorenen
+  Snapshots, NIE anhand einer frisch neu berechneten (und durch eine
+  inzwischen eingegangene Zahlung ggf. abweichenden) Vorschau. Sicher
+  wiederholbar (die zugrunde liegende `buche_vorschau` ist selbst über
+  die Ledger-Unique-Constraint idempotent). In den täglichen
+  `HVMailversandService.mahnlauf()`-Worker verdrahtet, direkt neben den
+  bestehenden `markiere_verwaiste_*_als_unsicher`-Aufrufen.
+- Der einzelfall-basierte, in Produktion nicht mehr verwendete
+  `MahnwesenService.versenden()`-Pfad (`MahnFallTable`, siehe
+  `indexautomatik/mailversand_service.py` - dort ausschließlich
+  `plane_mahnlauf`/`versende_mahnlauf` verdrahtet) hat DIESELBE
+  theoretische Lücke, wurde in dieser Runde aber bewusst NICHT
+  mitbehandelt, da er von keinem produktiven Aufrufer mehr erreicht
+  wird - sollte er reaktiviert werden, braucht er dieselbe Behandlung.
+
+3 neue Tests (Snapshot-JSON-Rundtrip verlustfrei inkl. Decimal-Präzision
+in `test_mahnwesen_kosten.py`; voller Absturz-Repro mit anschließender
+erfolgreicher Recovery UND Idempotenz-Gegenprobe eines zweiten
+Recovery-Durchlaufs in `test_hv_mailversand.py`), 885/885 grün im
+Gesamtlauf.
 
 7 weitere neue Tests, 883/883 grün im Gesamtlauf.

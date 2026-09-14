@@ -792,6 +792,29 @@ class MahnLaufTable(Base):
     versand_beansprucht_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     gesendet_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     fehlergrund: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Recovery-Paket 14.09.2026 (Nutzerauftrag: "Recovery nach bestätigtem
+    # Versand mit eingefrorenem Kosten-/Inhaltssnapshot"): wird ATOMAR IN
+    # DERSELBEN UPDATE-Anweisung wie der Übergang auf GESENDET geschrieben
+    # (siehe `mahnwesen/service.py::MahnwesenService.versende_mahnlauf` /
+    # `indexautomatik/mailnachweis.py::versand_belegen`-`zusatz`-Parameter) -
+    # NIEMALS erst danach in einem zweiten Schritt. Enthält die exakt
+    # gleiche `MahnkostenVorschau`, die auch den tatsächlich gesendeten
+    # Brief-/Mailtext gespeist hat (`kosten.py::snapshot_zu_json`), oder
+    # das JSON-Literal `null`, wenn kein Kostenservice konfiguriert ist/
+    # nichts zu berechnen war. Ein Absturz ZWISCHEN bestätigtem Versand
+    # und der eigentlichen Kostenbuchung kann dadurch die Buchung IMMER
+    # anhand DERSELBEN eingefrorenen Zahlen nachholen (nie eine neu
+    # berechnete, ggf. abweichende Vorschau) - siehe
+    # `MahnwesenService.vervollstaendige_gesendete_mahnlaeufe_ohne_
+    # kostenabschluss`. `NULL` (Spaltenwert, nicht JSON-`null`) bedeutet:
+    # noch gar nicht bis zum Versand gekommen.
+    mahnkosten_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Gesetzt, sobald die Kostenbuchung für diesen Mahnlauf ABGESCHLOSSEN
+    # ist (tatsächlich gebucht ODER bewusst als "nichts zu buchen"
+    # erkannt) - NIE vorher. `status == "GESENDET" AND mahnkosten_
+    # snapshot_json IS NOT NULL AND mahnkosten_verarbeitet_am IS NULL`
+    # markiert genau die Recovery-Lücke.
+    mahnkosten_verarbeitet_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AuditEventTable(Base):

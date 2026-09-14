@@ -271,6 +271,15 @@ class HVMailversandService:
             return {"geplant": 0, "gesendet": 0, "blockiert": 0}
         self.mahn_service.markiere_verwaiste_als_unsicher()
         self.mahn_service.markiere_verwaiste_mahnlaeufe_als_unsicher()
+        # Recovery-Paket 14.09.2026: ein Absturz zwischen bestätigtem
+        # Versand und der eigentlichen Kostenbuchung wird HIER anhand
+        # des eingefrorenen Kosten-/Inhaltssnapshots nachgeholt, NIE
+        # anhand einer neu berechneten, potenziell abweichenden Vorschau
+        # (siehe `MahnwesenService.vervollstaendige_gesendete_
+        # mahnlaeufe_ohne_kostenabschluss`-Docstring).
+        self.mahn_service.vervollstaendige_gesendete_mahnlaeufe_ohne_kostenabschluss(
+            ctx=ctx, akteur="hv-mailversand-recovery",
+        )
         policy = self.policy_repo.aktuelle_freigegebene()
         counts = {"geplant": 0, "gesendet": 0, "blockiert": 0}
         if policy is None:

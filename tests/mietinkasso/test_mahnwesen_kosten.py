@@ -23,7 +23,7 @@ import pytest
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access
 from mietinkasso.domain.enums import OPTyp, Rolle
 from mietinkasso.domain.exceptions import CrossTenantError
-from mietinkasso.mahnwesen.kosten import bestimme_zinssatz
+from mietinkasso.mahnwesen.kosten import bestimme_zinssatz, snapshot_aus_json, snapshot_zu_json
 from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
 from mietinkasso.mahnwesen.kosten_service import MahnkostenService
 
@@ -446,6 +446,47 @@ def test_wiederholung_derselben_gruppe_bucht_weiterhin_nicht_doppelt(
         vertrag_id=vertrag.id, stufe=1, heute=heute, nur_op_position_ids=frozenset({op_a.id}),
     )
     assert frische_vorschau.neue_zinsen_delta_cent <= 0
+
+
+def test_snapshot_json_rundtrip_erhaelt_alle_felder_verlustfrei(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Grundlage der Recovery (Auftrag Markus 14.09.2026, "eingefrorener
+    Kosten-/Inhaltssnapshot"): eine über `snapshot_zu_json` eingefrorene
+    Vorschau muss über `snapshot_aus_json` VERLUSTFREI (inkl. Segmenten,
+    Gebühren, Hinweisen, Decimal-Präzision) zurückgewonnen werden - eine
+    per Recovery nachgeholte Buchung darf sich in KEINEM Feld von einer
+    direkt gebuchten unterscheiden."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=1500, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+    )
+    kosten_repo.basiszinssatz_erfassen(
+        id="2026-1", gueltig_von=date(2026, 1, 1), gueltig_bis=date(2026, 6, 30),
+        basiszinssatz_prozent=Decimal("1.530"), erfasst_von="test", quelle_referenz="OeNB 01.01.2026",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), leistungsperiode="2026-01", beleg_referenz="HMZ Jänner",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1))
+    assert vorschau is not None
+    assert vorschau.zins_segmente and vorschau.gebuehr_segmente
+
+    payload = snapshot_zu_json(vorschau)
+    zurueckgewonnen = snapshot_aus_json(payload)
+
+    assert zurueckgewonnen == vorschau
+
+    # Der None-Fall (kein Kostenservice konfiguriert/nichts zu berechnen)
+    # muss ebenfalls verlustfrei rundlaufen - und bleibt unterscheidbar
+    # von "Spalte war NULL" (siehe `snapshot_aus_json`-Docstring).
+    assert snapshot_aus_json(snapshot_zu_json(None)) is None
+    assert snapshot_aus_json(None) is None
 
 
 # -- Teilzahlung reduziert die Zinsbasis ab ihrem tatsächlichen Datum ------

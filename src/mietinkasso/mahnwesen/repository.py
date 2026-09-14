@@ -353,6 +353,34 @@ class MahnLaufRepository:
             )
             return list(session.execute(statement).scalars().all())
 
+    def gesendet_ohne_kostenabschluss(self) -> list[MahnLaufTable]:
+        """Genau die Recovery-Lücke (Auftrag Markus 14.09.2026): der
+        Versand ist bestätigt (`GESENDET`) und ein eingefrorener Kosten-
+        /Inhaltssnapshot wurde atomar damit persistiert
+        (`mahnkosten_snapshot_json IS NOT NULL`), aber die eigentliche
+        Kostenbuchung wurde noch nicht als abgeschlossen markiert - ein
+        Absturz zwischen bestätigtem Versand und Buchung, oder zwischen
+        Buchung und dem Markieren als abgeschlossen. Siehe
+        `MahnwesenService.vervollstaendige_gesendete_mahnlaeufe_ohne_
+        kostenabschluss`."""
+
+        with self._session_factory() as session:
+            statement = (
+                select(MahnLaufTable)
+                .where(MahnLaufTable.status == "GESENDET")
+                .where(MahnLaufTable.mahnkosten_snapshot_json.is_not(None))
+                .where(MahnLaufTable.mahnkosten_verarbeitet_am.is_(None))
+            )
+            return list(session.execute(statement).scalars().all())
+
+    def markiere_mahnkosten_verarbeitet(self, mahnlauf_id: int, *, zeitpunkt: datetime | None = None) -> None:
+        with self._session_factory() as session:
+            session.execute(
+                update(MahnLaufTable).where(MahnLaufTable.id == mahnlauf_id)
+                .values(mahnkosten_verarbeitet_am=zeitpunkt or datetime.now(timezone.utc))
+            )
+            session.commit()
+
     def set_status(self, mahnlauf_id: int, status: str, **zusatz) -> MahnLaufTable:
         with self._session_factory() as session:
             row = session.get(MahnLaufTable, mahnlauf_id)
