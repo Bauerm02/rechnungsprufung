@@ -76,6 +76,18 @@ class DebitorTable(Base):
     name: Mapped[str] = mapped_column(String(256))
     email: Mapped[str | None] = mapped_column(String(256), nullable=True)
     adresse: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # Auftrag HV-20260914-MAHNUNG-BRIEF: eine vorhandene `adresse` allein
+    # ist KEINE "geprüfte Postadresse" (dieselbe Nie-Ableiten-Regel wie
+    # überall - ein bloß erfasster String könnte unvollständig/veraltet
+    # sein). Stufe 2 (Kanal BRIEF laut Kanalregel) verlangt explizit
+    # DIESES Flag, sonst bleibt der Briefkanal blockiert, OHNE einen
+    # E-Mail-Ersatz zu versenden (siehe `mahnwesen/service.py::
+    # _pruefe_frisch_versandbereit`). Wird über `stammdaten/repository.py::
+    # StammdatenRepository.upsert_debitor(postadresse_geprueft=...)`
+    # bewusst NUR bei explizitem Setzen verändert - ein routinemäßiges
+    # Update von Name/E-Mail darf eine einmal erteilte Prüfung nicht
+    # stillschweigend zurücksetzen.
+    postadresse_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
 
 
 class VertragTable(Base):
@@ -648,6 +660,73 @@ class MahnPolicyTable(Base):
     gebuehr_cent: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(16), default="ENTWURF")
     freigegeben_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MahnKanalregelTable(Base):
+    """Versionierte Kanalregel für den automatischen Mahnversand
+    (Auftrag HV-20260914-MAHNUNG-BRIEF, Nutzerentscheidung 14.09.2026:
+    "Stufe 1 EMAIL, Stufe 2 BRIEF"). Mirrors `MahnPolicyTable`s
+    Governance-Muster (ENTWURF -> FREIGEGEBEN); `mahnwesen/service.py::
+    MahnwesenService.plane_mahnlauf` verwendet AUSSCHLIESSLICH die
+    aktuell freigegebene Regel, NIE einen im Code hartkodierten
+    Kanal - eine künftige Änderung der Kanalzuordnung braucht dadurch
+    keinen Deploy, sondern nur eine neue freigegebene Version.
+
+    Fehlt jede freigegebene Regel, bleibt der automatische Mahnversand
+    komplett blockiert (dieselbe "kein GESENDET ohne geprüfte
+    Grundlage"-Regel wie bei `MahnPolicyTable`) - es wird NIE
+    stillschweigend ein Default-Kanal unterstellt."""
+
+    __tablename__ = "mahn_kanalregeln"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[int] = mapped_column(Integer, unique=True)
+    stufe1_kanal: Mapped[str] = mapped_column(String(16), default="EMAIL")
+    stufe2_kanal: Mapped[str] = mapped_column(String(16), default="BRIEF")
+    status: Mapped[str] = mapped_column(String(16), default="ENTWURF", server_default=text("'ENTWURF'"))
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    geprueft_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    geprueft_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class BriefAnbieterProfilTable(Base):
+    """Versioniertes, geprüftes Preis-/Tarifprofil eines Briefversand-
+    Anbieters (Auftrag HV-20260914-MAHNUNG-BRIEF) - mirrors
+    `ZinsprofilTable`s Governance-Muster. Fehlt jede geprüfte Version
+    für die gewünschte `briefart`, bleibt der Briefkanal EXPLIZIT
+    blockiert (siehe `mahnwesen/service.py::_pruefe_frisch_
+    versandbereit`) - es wird NIE ein erfundener Standardpreis
+    unterstellt. Die Preisfelder bilden den TATSÄCHLICHEN
+    Anbieteraufwand ab (was der Anbieter JLB/Markus in Rechnung
+    stellt); ob/wieviel davon gegenüber dem Mieter nach §1333 Abs 2
+    ABGB tatsächlich ERSATZFÄHIG ist, entscheidet ZUSÄTZLICH
+    `ZinsprofilTable.versandkosten_ersatzfaehig_geprueft` (getrennte
+    Prüfung, siehe dortiger Docstring) - `ersatzfaehiger_hoechstbetrag_
+    cent` deckelt den ersatzfähigen Anteil optional nach unten, falls
+    der volle Anbieterpreis nicht 1:1 weiterverrechnet werden darf."""
+
+    __tablename__ = "brief_anbieterprofile"
+    __table_args__ = (UniqueConstraint("briefart", "version", name="uq_brief_anbieterprofil_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version: Mapped[int] = mapped_column(Integer)
+    briefart: Mapped[str] = mapped_column(String(24), default="STANDARD", server_default=text("'STANDARD'"))
+    status: Mapped[str] = mapped_column(String(16), default="ENTWURF", server_default=text("'ENTWURF'"))
+    anbieter_name: Mapped[str] = mapped_column(String(256))
+    quelle_beleg: Mapped[str] = mapped_column(String(256))
+    preis_druck_cent: Mapped[int] = mapped_column(Integer, default=0)
+    preis_kuvert_cent: Mapped[int] = mapped_column(Integer, default=0)
+    preis_porto_cent: Mapped[int] = mapped_column(Integer, default=0)
+    preis_nachweis_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)  # z. B. Einschreiben-Zuschlag
+    # Optionale Deckelung des NACH §1333 Abs 2 ABGB ersatzfähigen Anteils
+    # (siehe Klassendoc) - `None` bedeutet: der volle Anbieteraufwand ist
+    # (vorbehaltlich `versandkosten_ersatzfaehig_geprueft`) der Ansatz.
+    ersatzfaehiger_hoechstbetrag_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    geprueft_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    geprueft_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class MahnFallTable(Base):
@@ -1324,6 +1403,16 @@ class ZinsprofilTable(Base):
     # B2B+Datum allein nur die §458-Pauschale rechtfertigt, NICHT den
     # erhöhten §456-Zinssatz.
     verzugsverantwortung_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
+    # §1333 Abs 2 ABGB (Auftrag HV-20260914-MAHNUNG-BRIEF, Nutzerentscheidung
+    # 14.09.2026): nur tatsächlich erwachsene, schuldhaft verursachte,
+    # notwendige/zweckmäßige/angemessene Betreibungskosten (z. B. echte
+    # Brief-Versandkosten) dürfen dem Mieter weiterverrechnet werden -
+    # gilt (anders als §456/§458 UGB) AUCH für einen Verbraucher-Mieter.
+    # Ein bloß vorhandenes Anbieterprofil reicht NICHT - diese
+    # Voraussetzungen müssen gebündelt menschlich geprüft/belegt sein,
+    # sonst bleibt die Versandkosten-Position bei 0 (siehe
+    # `mahnwesen/kosten.py::berechne_mahnkosten_vorschau`).
+    versandkosten_ersatzfaehig_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
     vereinbarter_zinssatz_prozent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
     vereinbarung_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
     vereinbarung_beleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
@@ -1373,11 +1462,24 @@ class MahnkostenBuchungTable(Base):
     Lauf am selben Tag ohne neu verstrichene Zeit) bucht nichts, ohne
     dass dafür ein eigener Sperrmechanismus nötig ist. `uq_mahnkosten_
     lauf` fängt nur eine ECHTE gleichzeitige Doppelausführung für
-    denselben Stichtag ab (Idempotenz-Sicherheitsnetz, kein fachliches
-    Gate)."""
+    DENSELBEN eingefrorenen Mahnlauf ab (Idempotenz-Sicherheitsnetz,
+    kein fachliches Gate).
+
+    Eindeutigkeit hängt BEWUSST an `mahnlauf_schluessel` (dem Hash der
+    exakten, eingefrorenen Forderungs-Mitgliedermenge), NICHT an
+    `zins_bis` - unabhängige Rückprüfung Codex 14.09.2026, echter Bug:
+    zwei DISJUNKTE Gruppen desselben Vertrags/derselben Stufe können am
+    selben Kalendertag denselben `zins_bis`-Stichtag haben, obwohl sie
+    völlig unterschiedliche Forderungen betreffen. Mit einer
+    Eindeutigkeit auf `zins_bis` würde der zweite `INSERT` fälschlich
+    als "derselbe Vorgang, bereits gebucht" abgelehnt und der
+    IntegrityError-Handler in `kosten_service.py::buche_vorschau` hätte
+    den FREMDEN Ledger der ANDEREN Gruppe als vermeintlich eigenen
+    Kostenbeleg zurückgegeben - der behauptete und der tatsächlich
+    gebuchte Betrag wären für die zweite Gruppe auseinandergelaufen."""
 
     __tablename__ = "mahnkosten_buchungen"
-    __table_args__ = (UniqueConstraint("vertrag_id", "stufe", "zins_bis", name="uq_mahnkosten_lauf"),)
+    __table_args__ = (UniqueConstraint("vertrag_id", "stufe", "mahnlauf_schluessel", name="uq_mahnkosten_lauf"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)

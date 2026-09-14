@@ -227,9 +227,17 @@ class MahnkostenService:
                 session.commit()
                 return ledger
         except IntegrityError:
-            # Ein anderer, gleichzeitiger Aufruf hat entweder exakt diesen
-            # (vertrag_id, stufe, zins_bis)-Mahnlauf (Race-Sicherheitsnetz)
-            # oder dieselbe Entgeltforderungs-Pauschale (fachliches Gate,
-            # siehe oben) zwischenzeitlich bereits gebucht - kein Fehler,
-            # sondern ein Idempotenz-/Konsistenzfall.
-            return self._repository.buchung_fuer_stichtag(vertrag_id=vertrag_id, stufe=stufe, zins_bis=zins_bis_fuer_stichtag)
+            # Ein anderer, gleichzeitiger Aufruf hat entweder exakt DIESEN
+            # (vertrag_id, stufe, mahnlauf_schluessel)-Mahnlauf (Race-
+            # Sicherheitsnetz) oder dieselbe Entgeltforderungs-Pauschale
+            # (fachliches Gate, siehe oben) zwischenzeitlich bereits
+            # gebucht - kein Fehler, sondern ein Idempotenz-/
+            # Konsistenzfall. Lookup BEWUSST über `mahnlauf_schluessel`
+            # (die exakte, eingefrorene Forderungsmenge DIESER Gruppe),
+            # NICHT über `zins_bis` - unabhängige Rückprüfung Codex
+            # 14.09.2026, echter Bug: eine ANDERE, disjunkte Gruppe
+            # desselben Vertrags/derselben Stufe kann denselben
+            # `zins_bis`-Stichtag haben; eine Suche über `zins_bis` hätte
+            # deren FREMDEN Ledger als vermeintlich eigenen Kostenbeleg
+            # zurückgegeben (siehe `MahnkostenBuchungTable`-Moduldoc).
+            return self._repository.buchung_fuer_mahnlauf(vertrag_id=vertrag_id, stufe=stufe, mahnlauf_schluessel=mahnlauf_schluessel)

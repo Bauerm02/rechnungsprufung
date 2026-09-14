@@ -68,3 +68,70 @@ def ensure_additive_columns(engine: Engine) -> list[str]:
         )
 
     return ausgefuehrt
+
+
+def ensure_mahnkosten_lauf_unique_key(engine: Engine) -> bool:
+    """Ersetzt eine zu grob geratene ältere Eindeutigkeit auf
+    `mahnkosten_buchungen` (`vertrag_id, stufe, zins_bis`) durch die
+    korrekte, an den tatsächlich eingefrorenen Mahnlauf gebundene
+    Eindeutigkeit (`vertrag_id, stufe, mahnlauf_schluessel`) -
+    unabhängige Rückprüfung Codex 14.09.2026, echter Bug: zwei
+    DISJUNKTE Gruppen desselben Vertrags/derselben Stufe am selben
+    Kalendertag (identisches `zins_bis`) wurden mit der alten
+    Eindeutigkeit fälschlich als derselbe Vorgang behandelt - der
+    `IntegrityError`-Pfad in `kosten_service.py::MahnkostenService.
+    buche_vorschau` gab dann den FREMDEN Ledger der jeweils ANDEREN
+    Gruppe als vermeintlich eigenen Kostenbeleg zurück.
+
+    Reine Struktur-/Constraint-Migration (keine fehlende Spalte) - liegt
+    deshalb bewusst NICHT in `ensure_additive_columns` (das ist
+    ausschließlich für fehlende SPALTEN gedacht, siehe dortige
+    Moduldoc, die NIE Constraints bestehender Spalten ändert).
+    Idempotent: eine bereits korrekt migrierte oder noch gar nicht
+    angelegte Tabelle bleibt unverändert (`create_all_tables` legt eine
+    fehlende Tabelle ohnehin gleich mit der korrekten Eindeutigkeit an).
+
+    `mahnkosten_buchungen` ist eine Tabelle DIESES Auftrags (Markus
+    13.09.2026), die im unveränderten Produktionsvorfahren `b70a20c`
+    noch gar nicht existiert - ein bereits echt produktiv befülltes
+    Vorkommen mit der alten Eindeutigkeit ist nach aktuellem
+    Kenntnisstand nicht zu erwarten. Die SQLite-Variante (Rebuild per
+    Tabellenkopie, da SQLite kein `ALTER TABLE ... DROP CONSTRAINT`
+    kennt) deckt eine synthetische Testfixture UND ein versehentlich
+    bereits einmal angelegtes Entwicklungsschema gleichermaßen ab; die
+    Postgres-Variante nutzt das dort verfügbare direkte
+    `DROP CONSTRAINT`/`ADD CONSTRAINT`."""
+
+    inspector = inspect(engine)
+    if "mahnkosten_buchungen" not in inspector.get_table_names():
+        return False
+
+    ziel_spalten = {"vertrag_id", "stufe", "mahnlauf_schluessel"}
+    alte_spalten = {"vertrag_id", "stufe", "zins_bis"}
+    bestehende = inspector.get_unique_constraints("mahnkosten_buchungen")
+    if any(set(uc["column_names"]) == ziel_spalten for uc in bestehende):
+        return False  # bereits korrekt migriert
+
+    zieltabelle = Base.metadata.tables["mahnkosten_buchungen"]
+
+    if engine.dialect.name == "sqlite":
+        spaltennamen = ", ".join(c.name for c in zieltabelle.columns)
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE mahnkosten_buchungen RENAME TO mahnkosten_buchungen__vor_migration"))
+            zieltabelle.create(connection)
+            connection.execute(text(
+                f"INSERT INTO mahnkosten_buchungen ({spaltennamen}) "
+                f"SELECT {spaltennamen} FROM mahnkosten_buchungen__vor_migration"
+            ))
+            connection.execute(text("DROP TABLE mahnkosten_buchungen__vor_migration"))
+        return True
+
+    alte_namen = [uc["name"] for uc in bestehende if set(uc["column_names"]) == alte_spalten and uc["name"]]
+    with engine.begin() as connection:
+        for name in alte_namen:
+            connection.execute(text(f"ALTER TABLE mahnkosten_buchungen DROP CONSTRAINT {name}"))
+        connection.execute(text(
+            "ALTER TABLE mahnkosten_buchungen ADD CONSTRAINT uq_mahnkosten_lauf "
+            "UNIQUE (vertrag_id, stufe, mahnlauf_schluessel)"
+        ))
+    return True

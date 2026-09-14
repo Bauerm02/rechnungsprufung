@@ -223,9 +223,24 @@ class MahnLaufRepository:
         Gibt `None` zurück, wenn der Mitglieder-Claim fehlschlägt (ein
         anderer, gleichzeitiger Planungsversuch war schneller) - dann
         wird auch KEINE Gruppenzeile angelegt. Bereits existierende
-        Zeile für denselben `outbox_key` wird unverändert zurückgegeben
-        (Idempotenz wie `get_or_create`), OHNE die Mitglieder erneut zu
-        claimen (sie sind es unter diesem `outbox_key` bereits)."""
+        Zeile für denselben `outbox_key` wird grundsätzlich unverändert
+        zurückgegeben (Idempotenz wie `get_or_create`), OHNE die
+        Mitglieder erneut zu claimen (sie sind es unter diesem
+        `outbox_key` bereits) - AUSSER sie ist eine tote, VOR jedem
+        Providerkontakt blockierte Zeile (`status == "BLOCKIERT"` UND
+        `versand_beansprucht_am is None`): unabhängige Rückprüfung Codex
+        14.09.2026, echter Bug - deren Mitglieder wurden beim Blockieren
+        bereits wieder auf GEPLANT freigegeben
+        (`MahnwesenService._freigebe_gebuendelte_mitglieder`), der
+        deterministische `outbox_key` (Hash der exakten Mitgliedermenge)
+        darf diese Menge dann NICHT dauerhaft unbenutzbar machen, falls
+        exakt dieselbe Menge später wieder versandbereit wird - eine
+        solche Zeile wird für den neuen Claim WIEDERVERWENDET statt eine
+        zweite Zeile mit identischem, unique-constraint-geschütztem
+        Schlüssel anzulegen. Jeder andere Zustand (insbesondere
+        IN_VERSAND/UNSICHER/GESENDET - tatsächlicher oder unklarer
+        Providerkontakt) bleibt für IMMER geschützt und wird nie
+        wiederverwendet."""
 
         if not mahnfall_ids:
             return None
@@ -233,7 +248,42 @@ class MahnLaufRepository:
             existing = session.execute(
                 select(MahnLaufTable).where(MahnLaufTable.outbox_key == outbox_key)
             ).scalar_one_or_none()
+            if existing is not None and not (existing.status == "BLOCKIERT" and existing.versand_beansprucht_am is None):
+                # Entweder eine echte GEPLANT-Race (ein gleichzeitiger
+                # anderer Planungsversuch hat diese Zeile soeben
+                # angelegt) oder ein Zustand mit tatsächlichem/unklarem
+                # Providerkontakt (IN_VERSAND/UNSICHER/GESENDET) - in
+                # KEINEM dieser Fälle darf der Schlüssel erneut
+                # beansprucht werden.
+                return existing
             if existing is not None:
+                # Unabhängige Rückprüfung Codex 14.09.2026, echter Bug:
+                # eine Gruppe, die VOR jedem Providerkontakt blockiert
+                # wurde (`versand_beansprucht_am is None`), hat ihre
+                # Mitglieder bereits über `MahnwesenService.
+                # _freigebe_gebuendelte_mitglieder` wieder auf GEPLANT
+                # freigegeben - der `outbox_key` (deterministisch aus der
+                # exakten Mitgliedermenge) darf diese Menge dann NICHT
+                # dauerhaft unbenutzbar machen, falls exakt dieselbe
+                # Menge später wieder versandbereit wird. Diese tote
+                # Zeile wird für den neuen, frischen Claim
+                # WIEDERVERWENDET statt eine zweite Zeile mit
+                # identischem, unique-constraint-geschütztem Schlüssel zu
+                # versuchen.
+                ergebnis = session.execute(
+                    update(MahnFallTable)
+                    .where(MahnFallTable.id.in_(mahnfall_ids))
+                    .where(MahnFallTable.status == MahnStatus.GEPLANT.value)
+                    .values(status=MahnStatus.GEBUENDELT.value)
+                )
+                if ergebnis.rowcount != len(mahnfall_ids):
+                    session.rollback()
+                    return None
+                existing.status = "GEPLANT"
+                existing.fehlergrund = None
+                existing.mitglieder_mahnfall_ids = json.dumps(sorted(mahnfall_ids))
+                session.commit()
+                session.refresh(existing)
                 return existing
             result = session.execute(
                 update(MahnFallTable)

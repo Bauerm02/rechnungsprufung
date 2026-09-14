@@ -176,18 +176,29 @@ class StammdatenRepository:
 
     # -- Debitor ------------------------------------------------------------
     def upsert_debitor(
-        self, *, id: str, name: str, email: str | None = None, adresse: str | None = None, session: Session | None = None
+        self, *, id: str, name: str, email: str | None = None, adresse: str | None = None,
+        postadresse_geprueft: bool | None = None, session: Session | None = None,
     ) -> None:
-        """`session`: siehe `upsert_gesellschaft`."""
+        """`session`: siehe `upsert_gesellschaft`. `postadresse_geprueft`:
+        NUR bei explizitem Setzen (`True`/`False`) verändert - `None`
+        (Default) lässt ein bereits gesetztes Flag unverändert, damit ein
+        routinemäßiges Update (z. B. eine korrigierte E-Mail) eine einmal
+        erteilte Prüfung nicht stillschweigend zurücksetzt (siehe
+        `DebitorTable.postadresse_geprueft`-Docstring)."""
 
         def _schreiben(active_session: Session) -> None:
             row = active_session.get(DebitorTable, id)
             if row is None:
-                active_session.add(DebitorTable(id=id, name=name, email=email, adresse=adresse))
+                active_session.add(DebitorTable(
+                    id=id, name=name, email=email, adresse=adresse,
+                    postadresse_geprueft=bool(postadresse_geprueft) if postadresse_geprueft is not None else False,
+                ))
             else:
                 row.name = name
                 row.email = email
                 row.adresse = adresse
+                if postadresse_geprueft is not None:
+                    row.postadresse_geprueft = postadresse_geprueft
 
         if session is not None:
             _schreiben(session)

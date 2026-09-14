@@ -2656,3 +2656,84 @@ Prüfer selbst benannt:**
 
 2 weitere neue Tests plus eine verschärfte Bestandstest-Assertion,
 876/876 grün im Gesamtlauf.
+
+## Korrekturpaket Runde 3: unabhängige Abnahme auf Commit 1328f2d (14.09.2026)
+
+Zwei weitere, unabhängig gemeldete echte Bugs im selben Gruppensperre-/
+Kostenledger-Mechanismus behoben:
+
+6. **`uq_mahnkosten_lauf` (Unique-Constraint auf `mahnkosten_buchungen`)
+   war (`vertrag_id, stufe, zins_bis`) - zu grob**: zwei DISJUNKTE, an
+   unterschiedliche Mahnläufe gebundene Forderungen desselben Vertrags/
+   derselben Stufe können denselben `zins_bis`-Stichtag (`heute`)
+   treffen. Der zweite `buche_vorschau`-Aufruf wurde dann fälschlich als
+   Doppelversuch für die ERSTE Gruppe abgelehnt (`IntegrityError`) und
+   der `except`-Zweig lieferte deren FREMDEN Ledger zurück - die zweite
+   Forderung bekam nie eigene Zinsen gebucht, obwohl `buche_vorschau`
+   ein (fremdes) Ergebnis zurückmeldete. Fix: Eindeutigkeit jetzt auf
+   (`vertrag_id, stufe, mahnlauf_schluessel`) - dem Hash der exakten,
+   eingefrorenen Forderungs-Mitgliedermenge des jeweiligen Mahnlaufs;
+   der Lookup im `IntegrityError`-Handler (`MahnkostenRepository.
+   buchung_fuer_mahnlauf`, ersetzt das alte `buchung_fuer_stichtag`)
+   folgt konsequent demselben Schlüssel. Reine Struktur-/Constraint-
+   Migration (keine fehlende Spalte) liegt bewusst NICHT in
+   `ensure_additive_columns` (das ist ausschließlich für fehlende
+   SPALTEN gedacht) - neue, eigenständige, additiv-sichere
+   `ensure_mahnkosten_lauf_unique_key` in `migrations.py`, wird in
+   `create_all_tables` unmittelbar nach `ensure_additive_columns`
+   aufgerufen. `mahnkosten_buchungen` ist eine Tabelle DIESES Auftrags
+   (Markus 13.09.2026), die im unveränderten Produktionsvorfahren
+   `b70a20c` noch gar nicht existiert - ein bereits echt produktiv
+   befülltes Vorkommen mit der alten Eindeutigkeit ist nach aktuellem
+   Kenntnisstand nicht zu erwarten; die Migration deckt trotzdem sowohl
+   eine frische Tabelle (No-Op) als auch ein bereits einmal mit der
+   alten Constraint angelegtes Schema ab (SQLite: Tabellenkopie-Rebuild,
+   da SQLite kein `ALTER TABLE ... DROP CONSTRAINT` kennt; Postgres:
+   direktes `DROP`/`ADD CONSTRAINT`). Getestet:
+   `test_zwei_disjunkte_gruppen_selbe_stufe_selber_stichtag_buchen_
+   getrennte_ledger`, `test_wiederholung_derselben_gruppe_bucht_
+   weiterhin_nicht_doppelt` (Gegenprobe: eine ECHTE Wiederholung
+   derselben Gruppe bleibt weiterhin durch die Constraint verhindert -
+   liefert denselben, bereits gebuchten Ledger, keinen fremden),
+   `test_ensure_mahnkosten_lauf_unique_key_migriert_altes_schema` +
+   `..._ist_idempotent` + `..._bei_frischer_db_no_op` +
+   `..._ohne_tabelle_no_op` (Migrationsverhalten gegen eine Altschema-
+   Fixture, analog dem bestehenden `ensure_additive_columns`-Testmuster).
+7. **Ein VOR jedem Providerkontakt blockierter `outbox_key` machte die
+   exakte Mitgliedermenge dauerhaft unbenutzbar**: `claim_mitglieder_
+   und_erstelle_gruppe` gab eine bereits existierende `MahnLaufTable`-
+   Zeile für denselben `outbox_key` bisher IMMER unverändert zurück -
+   auch wenn sie VOR jedem Providerkontakt BLOCKIERT wurde
+   (`versand_beansprucht_am is None`) und ihr einziges/ihre Mitglieder
+   längst wieder über `_freigebe_gebuendelte_mitglieder` auf GEPLANT
+   freigegeben waren (z. B. ein reiner `BLOCKIERT_TRANSIENT`-Fall: die
+   Mahnfrist war beim tatsächlichen Versandversuch - mit einem früheren
+   `heute` als bei der Planung - noch nicht abgelaufen). Wurde später
+   exakt dieselbe Mitgliedermenge erneut versandbereit, blieb sie hinter
+   der toten BLOCKIERT-Zeile für immer unerreichbar. Fix: eine solche
+   tote Zeile (`status == "BLOCKIERT"` UND `versand_beansprucht_am is
+   None`) wird für den neuen Claim WIEDERVERWENDET (Mitglieder erneut
+   atomar GEPLANT→GEBUENDELT geclaimt, Zeile auf GEPLANT zurückgesetzt,
+   `fehlergrund` gelöscht, Mitgliederliste aktualisiert) statt
+   unverändert zurückgegeben zu werden. JEDER andere Zustand
+   (GEPLANT/IN_VERSAND/UNSICHER/GESENDET - tatsächlicher oder unklarer
+   Providerkontakt) bleibt UNVERÄNDERT für immer geschützt und wird NIE
+   wiederverwendet. Getestet:
+   `test_blockierte_gruppe_vor_providerkontakt_macht_outbox_key_nicht_
+   dauerhaft_unbenutzbar` (voller Ablauf: Planung → BLOCKIERT_TRANSIENT
+   vor Providerkontakt → erneute Planung mit identischem `outbox_key` →
+   erfolgreicher tatsächlicher Versand).
+
+**Weiterhin ehrlich offen (unverändert seit Runde 2, vom Auftraggeber
+selbst als NÄCHSTE Priorität benannt, noch NICHT Teil dieser Runde):**
+
+- **Kosten-/Mitgliedsnachweis-Recovery bei einem Absturz ZWISCHEN
+  bestätigtem Versand und Kostenbuchung fehlt weiterhin**: siehe Runde 2
+  oben - unverändert offen, wird als NÄCHSTER Schritt vor dem Kanal-/
+  Kostenpaket (Stufe1=EMAIL/Stufe2=BRIEF, Versandkostenpositionen,
+  §1333/§458-Gates) bearbeitet.
+- Der im tatsächlich versendeten E-Mail-Text ausgewiesene Kosten-/
+  Zinsnachweis enthält weiterhin nur Betrag/Fälligkeit je Position -
+  unverändert offen, gehört zum kommenden Kanal-/Brief-Dokumentpaket.
+
+7 weitere neue Tests, 883/883 grün im Gesamtlauf.

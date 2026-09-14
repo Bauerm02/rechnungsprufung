@@ -14,6 +14,7 @@ verzinst, aber Teil der Hauptforderung)."""
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from decimal import Decimal
 
@@ -334,6 +335,117 @@ def test_zinsdelta_einer_neuen_forderung_wird_nicht_durch_eine_alte_abgeloeste_g
     )
     assert gebucht is not None
     assert gebucht.zinsen_cent == zinsen_neue_forderung
+
+
+def test_zwei_disjunkte_gruppen_selbe_stufe_selber_stichtag_buchen_getrennte_ledger(
+    op_service, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Unabhängige Abnahme auf Commit 1328f2d, neuer echter Bug:
+    `uq_mahnkosten_lauf` war (vertrag_id, stufe, zins_bis) - zu grob.
+    Zwei DISJUNKTE, an unterschiedliche Mahnläufe gebundene Forderungen
+    desselben Vertrags/derselben Stufe können denselben `zins_bis`-
+    Stichtag (`heute`) treffen. Mit der alten Eindeutigkeit wurde der
+    zweite `buche_vorschau`-Aufruf als Doppelversuch für die ERSTE
+    Gruppe abgelehnt (`IntegrityError`) und lieferte deren FREMDEN
+    Ledger zurück - die zweite Forderung bekam nie eigene Zinsen
+    gebucht, obwohl `buche_vorschau` GESENDET zurückmeldete."""
+
+    vertrag, konto = basis_vertrag
+    op_a = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 5), buchungsdatum=date(2026, 1, 5),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+    op_b = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 2, 5), buchungsdatum=date(2026, 2, 5),
+        faelligkeit=date(2026, 2, 5), beleg_referenz="HMZ Februar",
+    )
+    heute = date(2026, 3, 1)
+
+    vorschau_a = kosten_service.vorschau(
+        vertrag_id=vertrag.id, stufe=1, heute=heute, nur_op_position_ids=frozenset({op_a.id}),
+    )
+    vorschau_b = kosten_service.vorschau(
+        vertrag_id=vertrag.id, stufe=1, heute=heute, nur_op_position_ids=frozenset({op_b.id}),
+    )
+    assert vorschau_a is not None and vorschau_b is not None
+    assert vorschau_a.neue_zinsen_cent > 0
+    assert vorschau_b.neue_zinsen_cent > 0
+    # Derselbe Stichtag für beide Gruppen - genau die Konstellation, die
+    # die alte, zu grobe Eindeutigkeit fälschlich als "derselbe Vorgang"
+    # behandelt hätte.
+    assert vorschau_a.zins_bis == vorschau_b.zins_bis == heute
+
+    gebucht_a = kosten_service.buche_vorschau(
+        ctx=admin_ctx, vorschau=vorschau_a, heute=heute,
+        versandnachweis_referenz="mahnungslauf:gruppe-a", akteur="test",
+    )
+    gebucht_b = kosten_service.buche_vorschau(
+        ctx=admin_ctx, vorschau=vorschau_b, heute=heute,
+        versandnachweis_referenz="mahnungslauf:gruppe-b", akteur="test",
+    )
+
+    assert gebucht_a is not None
+    assert gebucht_b is not None
+    assert gebucht_a.id != gebucht_b.id  # NIE derselbe fremde Ledger
+    assert gebucht_a.zinsen_cent == vorschau_a.neue_zinsen_cent
+    assert gebucht_b.zinsen_cent == vorschau_b.neue_zinsen_cent  # tatsächlich für B gebucht, nicht 0/fremd
+    assert json.loads(gebucht_a.forderung_op_position_ids) == [op_a.id]
+    assert json.loads(gebucht_b.forderung_op_position_ids) == [op_b.id]
+
+    saldo_positionen = op_service.berechne_saldo(konto.id, stichtag=heute).positionen
+    zinsen_zeilen = [p for p in saldo_positionen if p.aenderungsgrund == "Mahnkosten - Verzugszinsen"]
+    assert len(zinsen_zeilen) == 2  # je Gruppe EINE eigene Zinsposition, nicht nur eine
+
+
+def test_wiederholung_derselben_gruppe_bucht_weiterhin_nicht_doppelt(
+    op_service, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Gegenprobe zum vorigen Test: die neue, feinere Eindeutigkeit auf
+    `mahnlauf_schluessel` darf eine ECHTE Wiederholung DERSELBEN Gruppe
+    (identische Mitgliedermenge, DIESELBE bereits verwendete Vorschau -
+    z. B. ein Retry nach einem unklaren Versandergebnis) weiterhin nicht
+    doppelt buchen: der zweite Versuch kollidiert mit der Unique-
+    Constraint und liefert exakt denselben, bereits gebuchten Ledger
+    zurück, NIEMALS eine zweite Zeile."""
+
+    vertrag, konto = basis_vertrag
+    op_a = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 5), buchungsdatum=date(2026, 1, 5),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+    heute = date(2026, 3, 1)
+    vorschau = kosten_service.vorschau(
+        vertrag_id=vertrag.id, stufe=1, heute=heute, nur_op_position_ids=frozenset({op_a.id}),
+    )
+    assert vorschau is not None and vorschau.neue_zinsen_cent > 0
+
+    erster = kosten_service.buche_vorschau(
+        ctx=admin_ctx, vorschau=vorschau, heute=heute,
+        versandnachweis_referenz="mahnungslauf:erster-versuch", akteur="test",
+    )
+    assert erster is not None
+
+    zweiter = kosten_service.buche_vorschau(
+        ctx=admin_ctx, vorschau=vorschau, heute=heute,
+        versandnachweis_referenz="mahnungslauf:zweiter-versuch-selbe-gruppe", akteur="test",
+    )
+    assert zweiter is not None
+    assert zweiter.id == erster.id  # derselbe Ledger, kein zweiter/fremder
+
+    saldo_positionen = op_service.berechne_saldo(konto.id, stichtag=heute).positionen
+    zinsen_zeilen = [p for p in saldo_positionen if p.aenderungsgrund == "Mahnkosten - Verzugszinsen"]
+    assert len(zinsen_zeilen) == 1  # KEINE zweite OP-Position durch den Retry
+
+    # Eine frisch berechnete Vorschau (der normale Weg für einen
+    # echten zweiten Lauf, siehe `test_zwei_laeufe_am_selben_tag_
+    # buchen_nicht_doppelt`) sieht das Delta korrekt bereits als 0.
+    frische_vorschau = kosten_service.vorschau(
+        vertrag_id=vertrag.id, stufe=1, heute=heute, nur_op_position_ids=frozenset({op_a.id}),
+    )
+    assert frische_vorschau.neue_zinsen_delta_cent <= 0
 
 
 # -- Teilzahlung reduziert die Zinsbasis ab ihrem tatsächlichen Datum ------

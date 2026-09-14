@@ -26,7 +26,7 @@ import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.infrastructure.db import tables as _tables  # noqa: F401 - registriert ORM-Tabellen
-from mietinkasso.infrastructure.db.migrations import ensure_additive_columns
+from mietinkasso.infrastructure.db.migrations import ensure_additive_columns, ensure_mahnkosten_lauf_unique_key
 from mietinkasso.infrastructure.db.tables import ErhoehungsschreibenTable, RechtsprofilTable
 
 
@@ -242,6 +242,159 @@ def test_ensure_additive_columns_ist_idempotent(altschema_engine):
     assert erster_lauf  # beim ersten Lauf gibt es tatsächlich etwas zu tun
     zweiter_lauf = ensure_additive_columns(altschema_engine)
     assert zweiter_lauf == []
+
+
+def _altschema_mahnkosten_metadata() -> tuple[sa.MetaData, sa.Table]:
+    """`mahnkosten_buchungen` WIE VOR der Rückprüfung 14.09.2026 (echter
+    Bug, siehe `MahnkostenBuchungTable`-Moduldoc): die Unique-Constraint
+    lag auf (`vertrag_id, stufe, zins_bis`) statt auf (`vertrag_id,
+    stufe, mahnlauf_schluessel`) - GENAU dieselben Spalten wie das
+    aktuelle Modell, nur der Constraint unterscheidet sich."""
+
+    meta = sa.MetaData()
+    tabelle = sa.Table(
+        "mahnkosten_buchungen",
+        meta,
+        sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+        sa.Column("vertrag_id", sa.String(64), nullable=False),
+        sa.Column("stufe", sa.Integer, nullable=False),
+        sa.Column("mahnlauf_schluessel", sa.String(128), nullable=False),
+        sa.Column("forderung_op_position_ids", sa.Text, nullable=False),
+        sa.Column("hauptforderung_cent", sa.Integer, nullable=False),
+        sa.Column("zinsbasis", sa.String(32), nullable=False),
+        sa.Column("zinssatz_prozent", sa.Numeric(6, 3), nullable=False),
+        sa.Column("zins_von", sa.Date, nullable=False),
+        sa.Column("zins_bis", sa.Date, nullable=False),
+        sa.Column("zinsen_cent", sa.Integer, nullable=False),
+        sa.Column("gebuehr_cent", sa.Integer, nullable=True),
+        sa.Column("rechtsgrundlage_gebuehr", sa.String(256), nullable=True),
+        sa.Column("versandnachweis_referenz", sa.String(256), nullable=False),
+        sa.Column("zinsen_op_position_id", sa.Integer, nullable=True),
+        sa.Column("gebuehr_op_position_id", sa.Integer, nullable=True),
+        sa.Column("zins_segmente_json", sa.Text, nullable=False, server_default="[]"),
+        sa.Column("zinsen_delta_je_op_json", sa.Text, nullable=False, server_default="{}"),
+        sa.Column("gebucht_am", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("erstellt_von", sa.String(128), nullable=False),
+        sa.UniqueConstraint("vertrag_id", "stufe", "zins_bis", name="uq_mahnkosten_lauf"),
+    )
+    return meta, tabelle
+
+
+@pytest.fixture
+def mahnkosten_altschema_engine(tmp_path: Path):
+    db_pfad = tmp_path / "altschema_mahnkosten.db"
+    engine = sa.create_engine(f"sqlite:///{db_pfad}", future=True)
+    meta, tabelle = _altschema_mahnkosten_metadata()
+    meta.create_all(engine)
+
+    with engine.begin() as conn:
+        conn.execute(
+            tabelle.insert().values(
+                vertrag_id="V-ALT-MAHNKOSTEN",
+                stufe=1,
+                mahnlauf_schluessel="ALT-GRUPPE-A",
+                forderung_op_position_ids="[1]",
+                hauptforderung_cent=50_000,
+                zinsbasis="GESETZLICH_ABGB",
+                zinssatz_prozent="4.000",
+                zins_von=date(2026, 1, 5),
+                zins_bis=date(2026, 3, 1),
+                zinsen_cent=208,
+                gebuehr_cent=None,
+                rechtsgrundlage_gebuehr=None,
+                versandnachweis_referenz="mahnung:produktiv-alt",
+                zinsen_op_position_id=None,
+                gebuehr_op_position_id=None,
+                erstellt_von="markus",
+            )
+        )
+    yield engine
+    engine.dispose()
+
+
+def test_ensure_mahnkosten_lauf_unique_key_migriert_altes_schema(mahnkosten_altschema_engine):
+    """Unabhängige Abnahme auf Commit 1328f2d, echter Bug: die alte
+    Eindeutigkeit (`vertrag_id, stufe, zins_bis`) verhinderte zwei
+    disjunkte Gruppen desselben Vertrags/derselben Stufe am selben
+    Stichtag. Nach der Migration greift die korrekte Eindeutigkeit
+    (`vertrag_id, stufe, mahnlauf_schluessel`), die bestehende Zeile
+    bleibt dabei unverändert erhalten."""
+
+    geaendert = ensure_mahnkosten_lauf_unique_key(mahnkosten_altschema_engine)
+    assert geaendert is True
+
+    inspector = sa.inspect(mahnkosten_altschema_engine)
+    constraints = inspector.get_unique_constraints("mahnkosten_buchungen")
+    assert any(set(c["column_names"]) == {"vertrag_id", "stufe", "mahnlauf_schluessel"} for c in constraints)
+    assert not any(set(c["column_names"]) == {"vertrag_id", "stufe", "zins_bis"} for c in constraints)
+
+    with mahnkosten_altschema_engine.begin() as conn:
+        alte_zeile = conn.execute(
+            sa.text(
+                "SELECT vertrag_id, mahnlauf_schluessel, zinsen_cent, erstellt_von "
+                "FROM mahnkosten_buchungen WHERE id = 1"
+            )
+        ).mappings().one()
+    assert alte_zeile["vertrag_id"] == "V-ALT-MAHNKOSTEN"
+    assert alte_zeile["mahnlauf_schluessel"] == "ALT-GRUPPE-A"
+    assert alte_zeile["zinsen_cent"] == 208
+    assert alte_zeile["erstellt_von"] == "markus"
+
+    # Der eigentliche Beweis: eine ZWEITE, disjunkte Gruppe desselben
+    # Vertrags/derselben Stufe mit DEMSELBEN `zins_bis`-Stichtag darf
+    # jetzt erfolgreich eingefügt werden - mit der alten Eindeutigkeit
+    # hätte das mit `IntegrityError` fehlgeschlagen.
+    with mahnkosten_altschema_engine.begin() as conn:
+        conn.execute(sa.text(
+            "INSERT INTO mahnkosten_buchungen "
+            "(vertrag_id, stufe, mahnlauf_schluessel, forderung_op_position_ids, hauptforderung_cent, "
+            " zinsbasis, zinssatz_prozent, zins_von, zins_bis, zinsen_cent, versandnachweis_referenz, erstellt_von) "
+            "VALUES ('V-ALT-MAHNKOSTEN', 1, 'ALT-GRUPPE-B', '[2]', 30000, 'GESETZLICH_ABGB', 4.000, "
+            " '2026-02-05', '2026-03-01', 150, 'mahnung:produktiv-alt-b', 'markus')"
+        ))
+
+    # Gegenprobe: eine ECHTE Wiederholung derselben Gruppe (identischer
+    # `mahnlauf_schluessel`) bleibt weiterhin durch die Constraint verhindert.
+    with pytest.raises(sa.exc.IntegrityError):
+        with mahnkosten_altschema_engine.begin() as conn:
+            conn.execute(sa.text(
+                "INSERT INTO mahnkosten_buchungen "
+                "(vertrag_id, stufe, mahnlauf_schluessel, forderung_op_position_ids, hauptforderung_cent, "
+                " zinsbasis, zinssatz_prozent, zins_von, zins_bis, zinsen_cent, versandnachweis_referenz, erstellt_von) "
+                "VALUES ('V-ALT-MAHNKOSTEN', 1, 'ALT-GRUPPE-A', '[1]', 50000, 'GESETZLICH_ABGB', 4.000, "
+                " '2026-01-05', '2026-03-01', 999, 'mahnung:doppelt', 'markus')"
+            ))
+
+
+def test_ensure_mahnkosten_lauf_unique_key_ist_idempotent(mahnkosten_altschema_engine):
+    erster_lauf = ensure_mahnkosten_lauf_unique_key(mahnkosten_altschema_engine)
+    assert erster_lauf is True
+    zweiter_lauf = ensure_mahnkosten_lauf_unique_key(mahnkosten_altschema_engine)
+    assert zweiter_lauf is False
+
+
+def test_ensure_mahnkosten_lauf_unique_key_bei_frischer_db_no_op():
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = sa.create_engine(f"sqlite:///{tmp}/frisch_mahnkosten.db", future=True)
+        from mietinkasso.infrastructure.db.base import Base
+
+        try:
+            Base.metadata.create_all(engine)
+            assert ensure_mahnkosten_lauf_unique_key(engine) is False
+            inspector = sa.inspect(engine)
+            constraints = inspector.get_unique_constraints("mahnkosten_buchungen")
+            assert any(set(c["column_names"]) == {"vertrag_id", "stufe", "mahnlauf_schluessel"} for c in constraints)
+        finally:
+            engine.dispose()
+
+
+def test_ensure_mahnkosten_lauf_unique_key_ohne_tabelle_no_op():
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = sa.create_engine(f"sqlite:///{tmp}/leer.db", future=True)
+        try:
+            assert ensure_mahnkosten_lauf_unique_key(engine) is False
+        finally:
+            engine.dispose()
 
 
 def test_ensure_additive_columns_bei_frischer_db_no_op():

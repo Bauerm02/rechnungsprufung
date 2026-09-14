@@ -991,3 +991,75 @@ def test_plane_mahnlauf_absturz_zwischen_mitgliederclaim_und_gruppenanlage_ist_a
     assert mahnlauf is not None
     assert MahnLaufRepository.mitglieder_ids(mahnlauf) == [geplant.mahnfall_id]
     assert mahn_fall_repo.get(geplant.mahnfall_id).status == "GEBUENDELT"
+
+
+def test_blockierte_gruppe_vor_providerkontakt_macht_outbox_key_nicht_dauerhaft_unbenutzbar(
+    mahn_service, mahnlauf_repo, mahn_fall_repo, op_service, basis_vertrag, ctx_factory, freigegebene_policy,
+):
+    """Unabhängige Abnahme auf Commit 1328f2d, neuer echter Bug: eine
+    Gruppe, die VOR jedem Providerkontakt blockiert wird (hier: die
+    Mahnfrist ist beim tatsächlichen Versandversuch - mit einem früheren
+    `heute` als bei der Planung - noch nicht abgelaufen, ein reiner
+    BLOCKIERT_TRANSIENT-Fall), gibt ihr einziges Mitglied korrekt wieder
+    auf GEPLANT frei. Der deterministische `outbox_key` (Hash der exakten
+    Mitgliedermenge) blieb aber an der toten BLOCKIERT-Zeile hängen:
+    bildet eine spätere Planung exakt DIESELBE Mitgliedermenge erneut,
+    lieferte `claim_mitglieder_und_erstelle_gruppe` bisher einfach die
+    alte, tote BLOCKIERT-Zeile unverändert zurück, OHNE das Mitglied
+    erneut zu claimen - die Forderung blieb für immer unbenutzbar
+    versandblockiert, obwohl sie längst wieder GEPLANT und versandbereit
+    war."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    _mit_faelligem_soll(op_service, konto, ctx, faelligkeit=date(2026, 4, 5))
+    forderung = _einzige_forderung(op_service, konto, date(2026, 4, 20))
+    geplant = _planen(
+        mahn_service, ctx=ctx, vertrag=vertrag, konto=konto,
+        forderung=forderung, policy=freigegebene_policy, heute=date(2026, 4, 20),
+    )
+    assert geplant.status == "GEPLANT"
+
+    mahnlauf = mahn_service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=1, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20),
+    )
+    assert mahnlauf is not None
+    urspruenglicher_outbox_key = mahnlauf.outbox_key
+
+    # Der eigentliche Versandversuch verwendet ein FRÜHERES `heute` als
+    # die Planung (z. B. ein verzögerter/erneut angestoßener Lauf) - die
+    # Mahnfrist (Fälligkeit 5.4. + 7 Tage Policy = 12.4.) ist am 10.4.
+    # noch nicht abgelaufen: reiner BLOCKIERT_TRANSIENT-Fall, VOR jedem
+    # Providerkontakt.
+    ergebnis = mahn_service.versende_mahnlauf(
+        ctx=ctx, mahnlauf_id=mahnlauf.id, heute=date(2026, 4, 10),
+        bank_bestaetigt_bis=date(2026, 4, 10), ungeklaerte_eingaenge_vorhanden=False,
+        send_enabled=True,
+        versand_fn=lambda mitglieder: (_ for _ in ()).throw(AssertionError("darf nicht aufgerufen werden")),
+    )
+    assert ergebnis.status == "BLOCKIERT"
+    assert mahnlauf_repo.get(mahnlauf.id).status == "BLOCKIERT"
+    assert mahnlauf_repo.get(mahnlauf.id).versand_beansprucht_am is None  # KEIN Providerkontakt
+    assert mahn_fall_repo.get(geplant.mahnfall_id).status == "GEPLANT"  # wieder frei
+
+    # Eine spätere Planung (Mahnfrist jetzt abgelaufen) bildet erneut
+    # EXAKT dieselbe Mitgliedermenge - derselbe deterministische
+    # outbox_key wie zuvor.
+    neue_gruppe = mahn_service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=1, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20),
+    )
+    assert neue_gruppe is not None
+    assert neue_gruppe.outbox_key == urspruenglicher_outbox_key
+    assert neue_gruppe.status == "GEPLANT"  # NICHT die tote BLOCKIERT-Zeile unverändert
+    assert MahnLaufRepository.mitglieder_ids(neue_gruppe) == [geplant.mahnfall_id]
+    assert mahn_fall_repo.get(geplant.mahnfall_id).status == "GEBUENDELT"  # erneut tatsächlich geclaimt
+
+    ergebnis_zwei = mahn_service.versende_mahnlauf(
+        ctx=ctx, mahnlauf_id=neue_gruppe.id, heute=date(2026, 4, 20),
+        bank_bestaetigt_bis=date(2026, 4, 20), ungeklaerte_eingaenge_vorhanden=False,
+        send_enabled=True, versand_fn=lambda mitglieder: _test_receipt(date(2026, 4, 20)),
+    )
+    assert ergebnis_zwei.status == "GESENDET"
+    assert mahn_fall_repo.get(geplant.mahnfall_id).status == MahnStatus.GESENDET.value

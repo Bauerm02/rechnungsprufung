@@ -325,13 +325,22 @@ class MahnkostenRepository:
             owned_session.refresh(row)
             return row
 
-    def buchung_fuer_stichtag(self, *, vertrag_id: str, stufe: int, zins_bis: date) -> MahnkostenBuchungTable | None:
+    def buchung_fuer_mahnlauf(self, *, vertrag_id: str, stufe: int, mahnlauf_schluessel: str) -> MahnkostenBuchungTable | None:
+        """Lookup nach dem tatsächlichen Eindeutigkeitsschlüssel
+        `uq_mahnkosten_lauf` (`vertrag_id, stufe, mahnlauf_schluessel`) -
+        NICHT nach `zins_bis` (unabhängige Rückprüfung Codex 14.09.2026,
+        echter Bug: zwei disjunkte Gruppen desselben Vertrags/derselben
+        Stufe können denselben `zins_bis`-Stichtag haben; eine Suche
+        nach `zins_bis` hätte dann den Ledger der JEWEILS ANDEREN
+        Gruppe zurückgeliefert, siehe `MahnkostenBuchungTable`-
+        Moduldoc)."""
+
         with self._session_factory() as session:
             return session.execute(
                 select(MahnkostenBuchungTable)
                 .where(MahnkostenBuchungTable.vertrag_id == vertrag_id)
                 .where(MahnkostenBuchungTable.stufe == stufe)
-                .where(MahnkostenBuchungTable.zins_bis == zins_bis)
+                .where(MahnkostenBuchungTable.mahnlauf_schluessel == mahnlauf_schluessel)
             ).scalar_one_or_none()
 
     def buchung_anlegen(
@@ -347,11 +356,15 @@ class MahnkostenRepository:
         wie die tatsächlichen OP-Buchungen zu machen (Alles-oder-nichts,
         siehe `kosten_service.py::MahnkostenService.buche_bei_versand`).
         Die `uq_mahnkosten_lauf`-Unique-Constraint (`vertrag_id, stufe,
-        zins_bis`) lässt einen gleichzeitigen zweiten Versuch für
-        denselben Mahnlauf mit einem `IntegrityError` scheitern statt eine
-        zweite Zeile anzulegen - reines Race-Condition-Sicherheitsnetz,
-        die primäre Idempotenz ist das vertragsweite Delta in
-        `kosten_service.py::MahnkostenService.buche_bei_versand`."""
+        mahnlauf_schluessel`) lässt einen gleichzeitigen zweiten Versuch
+        für DENSELBEN eingefrorenen Mahnlauf mit einem `IntegrityError`
+        scheitern statt eine zweite Zeile anzulegen - reines
+        Race-Condition-Sicherheitsnetz, die primäre Idempotenz ist das
+        je-Forderung-Delta in `kosten_service.py::MahnkostenService.
+        buche_vorschau`. BEWUSST NICHT auf `zins_bis` (siehe
+        `MahnkostenBuchungTable`-Moduldoc: zwei disjunkte Gruppen
+        desselben Vertrags/derselben Stufe können denselben Stichtag
+        haben)."""
 
         def _schreiben(active_session: Session) -> MahnkostenBuchungTable:
             row = MahnkostenBuchungTable(
