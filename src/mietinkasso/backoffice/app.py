@@ -451,14 +451,22 @@ def _rueckstaende_kompakt_zeile_html(z, *, unbekannte_faelligkeit: bool) -> str:
     (`faelliger_unstrittiger_rest_cent`, bereits vorhandene
     Kontoberechnung mit korrekter Fälligkeitsprüfung) statt aus dem
     rohen positiven Saldo - ein rein künftig fälliges Soll (z. B.
-    Fälligkeit 2099) hieß vorher fälschlich "Rückstand offen"."""
+    Fälligkeit 2099) hieß vorher fälschlich "Rückstand offen". Ist
+    `faelliger_unstrittiger_rest_cent` 0, heißt das NICHT automatisch
+    "noch nicht fällig" - z. B. eine reine Eröffnung ohne bekanntes
+    Fälligkeitsdatum, oder eine bereits fällige, aber aus dem
+    unstrittigen Rest ausgeschlossene Position, wäre damit falsch
+    beschriftet. Ohne eine neue Berechnung echter Zukunftsfälligkeit
+    bleibt dieser Fall darum bewusst neutral "Offener Betrag" - die
+    unabhängigen Hinweise (u. a. "Fälligkeit prüfen") bleiben davon
+    unberührt."""
 
     if z.saldo_cent is None:
         status_html = '<span class="badge badge-muted">kein Mietkonto</span>'
     elif z.saldo_cent > 0 and z.faelliger_unstrittiger_rest_cent:
         status_html = '<span class="badge badge-error">Rückstand offen</span>'
     elif z.saldo_cent > 0:
-        status_html = '<span class="badge badge-muted">Noch nicht fällig</span>'
+        status_html = '<span class="badge badge-muted">Offener Betrag</span>'
     elif z.saldo_cent < 0:
         status_html = '<span class="badge badge-ok">Guthaben</span>'
     else:

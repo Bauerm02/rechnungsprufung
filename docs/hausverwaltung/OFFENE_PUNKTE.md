@@ -3548,3 +3548,18 @@ fälliges Soll, Sortierung ohne Nullsalden, gleichzeitige Sperre+
 Abweichung, Sperre auf ausgeglichenem vs. offenem Konto, Kurzstatus-
 Text, mobile Kartenansicht), 1057/1057 grün im Gesamtlauf. Keine
 Liveaktionen, keine neue Buchhaltungslogik - ausschließlich Anzeige.
+
+**Nachkorrektur (14.09.2026):** der positive Fallback in
+`_rueckstaende_kompakt_zeile_html` (`faelliger_unstrittiger_rest_cent
+== 0`) hieß pauschal "Noch nicht fällig" - falsch für eine reine
+Eröffnung ohne bekanntes Fälligkeitsdatum sowie für eine bereits
+fällige, aber aus dem unstrittigen Rest ausgeschlossene Position (z. B.
+wenn eine Gutschrift kontoweit genau die fälligen Beträge neutralisiert,
+aber die FIFO-Zuordnung der Einzelpositionen einer ANDEREN,
+früher gebuchten Position ohne bekannte Fälligkeit zugeordnet wird).
+Beschriftung jetzt neutral "Offener Betrag"; der tatsächlich fällige
+`>0`-Zweig ("Rückstand offen") und alle unabhängigen Hinweise
+(u. a. "Fälligkeit prüfen") bleiben unverändert. Keine neue Berechnung
+echter Zukunftsfälligkeit. 2 gezielte Regressionstests (unbekannte
+Fälligkeit + unstrittiger Rest 0; Positionen fällig bei Kontoberechnung
+0 durch FIFO-Divergenz) plus angepasster Zukunftstest, 1059/1059 grün.

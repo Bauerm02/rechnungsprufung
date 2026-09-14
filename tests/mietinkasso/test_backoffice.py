@@ -449,14 +449,19 @@ def test_dashboard_sperre_auf_offenem_konto_wird_als_zu_erledigen_gezaehlt(backo
         stammdaten.sperre_aufheben(sperre_id)
 
 
-def test_dashboard_kuenftig_faelliges_soll_heisst_nicht_faellig_nicht_rueckstand(backoffice_client):
+def test_dashboard_kuenftig_faelliges_soll_heisst_nicht_rueckstand(backoffice_client):
     """Rückprüfung 14.09.2026, Befund 1: ein synthetisches Konto mit
     SOLL 75 EUR, einziger bekannter Fälligkeit 2099-01-05 (weit in der
     Zukunft), ohne Sperre/Abweichung wurde fälschlich als "Rückstand
     offen" (rot) angezeigt. Der Status muss aus dem tatsächlich FÄLLIGEN
     Rest (bestehende Kontoberechnung `faelliger_unstrittiger_rest_cent`)
-    abgeleitet werden, nicht aus dem rohen positiven Saldo - korrekt ist
-    "Noch nicht fällig". Der Betrag selbst bleibt unverändert 75,00 €."""
+    abgeleitet werden, nicht aus dem rohen positiven Saldo. Zweite
+    Rückprüfung 14.09.2026: der positive Fallback (faelliger_
+    unstrittiger_rest_cent == 0) heißt NICHT pauschal "Noch nicht
+    fällig" (das wäre für eine reine Eröffnung ohne Fälligkeitsdatum
+    oder eine aus dem unstrittigen Rest ausgeschlossene, aber bereits
+    fällige Position falsch) - korrekt ist die neutrale Beschriftung
+    "Offener Betrag". Der Betrag selbst bleibt unverändert 75,00 €."""
 
     from mietinkasso.infrastructure.config import get_settings
     from mietinkasso.infrastructure.db.session import build_session_factory
@@ -482,8 +487,105 @@ def test_dashboard_kuenftig_faelliges_soll_heisst_nicht_faellig_nicht_rueckstand
     assert dashboard.status_code == 200
     assert "75,00" in dashboard.text  # Betrag unverändert
     zeile = dashboard.text.split("Top Künftig Fällig")[1].split("</tr>")[0]
-    assert "Noch nicht fällig" in zeile
+    assert "Offener Betrag" in zeile
     assert "Rückstand offen" not in zeile
+    assert "Noch nicht fällig" not in zeile
+
+
+def test_dashboard_unbekannte_faelligkeit_mit_unstrittigem_rest_null_heisst_nie_nicht_faellig(backoffice_client):
+    """Rückprüfung 14.09.2026, zweiter Befund: eine offene Position OHNE
+    erfasste Fälligkeit (unbekannt, nicht künftig) darf trotz
+    `faelliger_unstrittiger_rest_cent == 0` NIE "Noch nicht fällig"
+    heißen - das würde ein bekanntes künftiges Datum unterstellen, das
+    es hier gar nicht gibt. Der unabhängige Hinweis "Fälligkeit prüfen"
+    bleibt davon unberührt, der primäre Status ist neutral
+    "Offener Betrag"."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_, op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-UNBEKANNT-STATUS", objekt_id="601", bezeichnung="Top Unbekannte Fälligkeit Status", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-UNBEKANNT-STATUS", einheit_id="601-TOP-UNBEKANNT-STATUS", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-UNBEKANNT-STATUS"))
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=6_600,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=None,
+        beleg_referenz="Synthetisch ohne erfasste Fälligkeit",
+    )
+    dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+    assert dashboard.status_code == 200
+    zeile = dashboard.text.split("Top Unbekannte Fälligkeit Status")[1].split("</tr>")[0]
+    assert "Noch nicht fällig" not in zeile
+    assert "Offener Betrag" in zeile
+    assert "Klärung nötig (Fälligkeit prüfen)" in zeile
+
+
+def test_dashboard_positionen_faellig_aber_kontoberechnung_null_heisst_nie_nicht_faellig(backoffice_client):
+    """Rückprüfung 14.09.2026, zweiter Befund: `faelliger_unstrittiger_
+    rest_cent == 0` auf Kontoebene bedeutet NICHT, dass keine
+    Einzelposition fällig ist. Konstruktion: eine Position X ohne
+    bekannte Fälligkeit (belegdatum früher) und eine Position Y mit
+    bekannter, bereits verstrichener Fälligkeit (belegdatum später) -
+    eine GUTSCHRIFT in Höhe von X mindert die (nicht FIFO-geordnete)
+    Kontoberechnung insgesamt auf 0 (X selbst trägt dort nichts bei,
+    da ihre Fälligkeit unbekannt ist), wird aber in der FIFO-Zuordnung
+    der Einzelpositionen (`offene_forderungen`) zuerst mit X (früheres
+    Belegdatum) verrechnet - Y bleibt dort in voller Höhe als fällige
+    offene Position stehen (`positionen_faelliger_rest_cent` > 0). Der
+    Status darf für dieses Konto NIE "Noch nicht fällig" zeigen -
+    korrekt ist die neutrale Beschriftung "Offener Betrag"."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_, op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-KONTOZERO", objekt_id="601", bezeichnung="Top Kontoberechnung Null Status", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-KONTOZERO", einheit_id="601-TOP-KONTOZERO", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-KONTOZERO"))
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=5_000,
+        belegdatum=date(2020, 1, 1), buchungsdatum=date(2020, 1, 1), faelligkeit=None,
+        beleg_referenz="X: ohne bekannte Fälligkeit, frühestes Belegdatum",
+    )
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=4_000,
+        belegdatum=date(2020, 2, 1), buchungsdatum=date(2020, 2, 1), faelligkeit=date(2020, 6, 1),
+        beleg_referenz="Y: bekannte, bereits verstrichene Fälligkeit",
+    )
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.GUTSCHRIFT, betrag_cent=5_000,
+        belegdatum=date(2020, 3, 1), buchungsdatum=date(2020, 3, 1), faelligkeit=None,
+        beleg_referenz="Gutschrift in Höhe von X",
+    )
+    saldo = op_service.berechne_saldo(konto.id)
+    assert saldo.saldo_cent == 4_000  # 5000 + 4000 - 5000
+    assert saldo.faelliger_unstrittiger_rest_cent == 0  # Kontoebene: exakt der zu prüfende Fall
+    forderungen = op_service.offene_forderungen(konto.id)
+    assert len(forderungen) == 1 and forderungen[0].rest_cent == 4_000  # Y bleibt in voller Höhe fällig
+
+    dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
+    assert dashboard.status_code == 200
+    zeile = dashboard.text.split("Top Kontoberechnung Null Status")[1].split("</tr>")[0]
+    assert "Noch nicht fällig" not in zeile
+    assert "Offener Betrag" in zeile
+    assert "40,00" in zeile
 
 
 def test_dashboard_haupttabelle_sortiert_positive_konten_absteigend_ohne_nullsalden(backoffice_client):
