@@ -296,6 +296,8 @@ def seite(
   .aufgaben-karte-kopf {{ margin-bottom: 0.3rem; }}
   .aufgaben-gruende {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }}
   .aufgaben-gruende li {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }}
+  a.aufgabe-aktion {{ display: inline-block; padding: 0.3rem 0.75rem; border-radius: 4px; border: 1px solid var(--anthrazit); background: var(--anthrazit); color: #fff; text-decoration: none; font-size: 0.82rem; font-weight: 600; }}
+  a.aufgabe-aktion:hover {{ background: var(--anthrazit-hell); }}
   .status-zeile {{ display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; font-size: 0.85rem; color: #555; margin: 0.5rem 0; }}
   details > summary {{ cursor: pointer; color: var(--anthrazit); font-weight: 600; }}
   @media (max-width: 640px) {{

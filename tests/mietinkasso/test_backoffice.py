@@ -527,7 +527,8 @@ def test_dashboard_unbekannte_faelligkeit_mit_unstrittigem_rest_null_heisst_nie_
     )
     dashboard = client.get("/backoffice/", params={"objekt_id": "601"})
     assert dashboard.status_code == 200
-    zeile = dashboard.text.split("Top Unbekannte Fälligkeit Status")[1].split("</tr>")[0]
+    kompakt_abschnitt = dashboard.text.split('id="mietkonten-uebersicht"')[1]
+    zeile = kompakt_abschnitt.split("Top Unbekannte Fälligkeit Status")[1].split("</tr>")[0]
     assert "Noch nicht fällig" not in zeile
     assert "Offener Betrag" in zeile
     assert "Klärung nötig (Fälligkeit prüfen)" in zeile

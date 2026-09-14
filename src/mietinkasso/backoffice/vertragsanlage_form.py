@@ -564,30 +564,49 @@ def profil_werte_aus_form(form) -> dict:
 # ---------------------------------------------------------------------------
 
 
+_VORSCHREIBUNG_STATUS_LABEL = {
+    "ENTWURF": "Entwurf (noch nicht sollgestellt)",
+    "SOLLGESTELLT": "sollgestellt",
+    "ZUGESTELLT": "zugestellt",
+    "EXPORTIERT": "zugestellt, ins Hauptbuch exportiert",
+}
+
+
 def detail_ansicht(
     *, vertrag, objekt, einheit, debitor, gesellschaft, profil, kaution, konto_id, komponenten,
-    rechtsprofil_hinweis: str | None, index_klausel_hinweis: str | None, versionen: list, csrf: str,
-    gesperrt: bool = False,
-    vorschreibungen: list | None = None,
-    vorschreibung_summen: dict[int, int] | None = None,
-    kontostatus=None,
-    unbekannte_faelligkeit_positionen: list | None = None,
-    zahlungen_positionen: list | None = None,
-    sperren: list | None = None,
-    mahnfaelle: list | None = None,
-    letzte_pruefung_hinweis: str | None = None,
+    rechtsprofil_freigegeben_hinweis: str | None, rechtsprofil_entwurf_hinweis: str | None,
+    index_klausel_hinweis: str | None, index_pruefbedarf_hinweis: str | None,
+    letzte_pruefung_hinweis: str | None, versionen: list, csrf: str,
+    aktueller_monat: str,
+    vorschreibungen: list,
+    vorschreibung_positionen_je_id: dict,
+    kontostatus,
+    unbekannte_faelligkeit_positionen: list,
+    zahlungen_positionen: list,
+    sperren: list,
+    mahnfaelle: list,
+    mahnlaeufe: list,
+    erhoehungsschreiben: list,
+    vertragsende_erinnerungen: list,
+    von_objekt: str | None = None,
 ) -> str:
-    """Mieterakte (Auftrag HV-20260914-AUFGABEN-MIETERAKTE): EIN
-    gemeinsamer, gegliederter Einstieg. Alle neuen Abschnitte lesen
-    AUSSCHLIESSLICH bereits bestehende, andernorts geprüfte Quellen -
-    keine neue Berechnung, keine neue juristische/Index-Bewertung.
-    Fehlende Daten werden ehrlich als "nicht hinterlegt"/"kein Nachweis
-    im System" ausgewiesen, nie als erfundener Wert (bezahlt/zugestellt/
-    0,00). `gesperrt` (Objekt von der Pilotphase ausgeschlossen) blendet
-    NUR die live berechneten Abschnitte (Kontostatus/offene Positionen/
-    Mahnfälle) aus - Stammdaten bleiben wie beim bestehenden Kontoauszug
-    sichtbar, aber es wird für ein ausgeschlossenes Objekt NIE eine
-    Finanzzahl über diese neue, gemeinsame Akte "eingeschleust"."""
+    """Mieterakte (Auftrag HV-20260914-AUFGABEN-MIETERAKTE, Rückprüfung
+    Codex 14.09.2026): EIN gemeinsamer, gegliederter Einstieg für NICHT
+    ausgeschlossene Objekte - der Aufruf für ein Pilotausschluss-Objekt
+    wird bereits VOR diesem Renderer in der Route mit einer eigenen
+    Fehlerseite abgefangen (`app.py::vertragsanlage_detail`), daher gibt
+    es hier keinen `gesperrt`-Zweig mehr und NIE eine nur selektiv
+    unterdrückte Finanzzahl. Alle Abschnitte lesen AUSSCHLIESSLICH
+    bereits bestehende, andernorts geprüfte Quellen - keine neue
+    Berechnung, keine neue juristische/Index-Bewertung. Fehlende Daten
+    werden ehrlich als "nicht hinterlegt"/"kein Nachweis im System"/
+    "kein Beleg" ausgewiesen, nie als erfundener Wert (0,00/bezahlt/
+    zugestellt)."""
+
+    zurueck_html = (
+        f'<a href="/backoffice/?objekt_id={h(von_objekt)}">&larr; zurück zur gefilterten Übersicht</a>'
+        if von_objekt else '<a href="/backoffice/vertraege">&larr; zurück zur Mieterliste</a>'
+    )
 
     nutzungsart = profil.nutzungsart if profil else "UNGEKLAERT"
     nutzungsart_status = feld_status(nutzungsart, unklar_werte=("UNGEKLAERT",))
@@ -629,73 +648,155 @@ def detail_ansicht(
     ) or "<tr><td colspan=5>Noch keine Version gespeichert.</td></tr>"
 
     konto_link = f'<a href="/backoffice/konto/{h(konto_id)}">Mietkonto</a> · ' if konto_id else '<span class="muted">Mietkonto (noch keine Eröffnung)</span> · '
-    gesperrt_banner = (
-        '<div class="flash-error">Objekt ist von der Pilotphase ausgeschlossen - Kontostatus, offene Positionen '
-        'und Mahnfälle werden hier nicht angezeigt.</div>' if gesperrt else ""
-    )
 
-    # -- Aktuelle Vorschreibung (Auftrag HV-20260914-AUFGABEN-MIETERAKTE, --
-    # -- Ergänzung Codex-Bestandsprüfung): tatsächlich PERSISTIERTE --------
-    # -- Vorschreibungsdatensätze, NICHT die vereinbarten Komponenten. -----
+    # -- Vorschreibung: exakter aktueller Monat vorrangig; ohne Treffer ----
+    # -- wird der letzte VERGANGENE Monat ausdrücklich als "historisch" ----
+    # -- ausgewiesen, ein künftig hinterlegter Entwurf NIE als "aktuell" ---
+    # -- (Codex-Rückprüfung: bloße DESC-Sortierung wählte vorher den am ----
+    # -- weitesten in der Zukunft liegenden Datensatz als "aktuell", und ---
+    # -- eine leere Positionsliste wurde als belegte 0,00-Summe gezeigt). --
     vorschreibungen = vorschreibungen or []
-    vorschreibung_summen = vorschreibung_summen or {}
-    _VORSCHREIBUNG_STATUS_LABEL = {
-        "ENTWURF": "Entwurf (noch nicht sollgestellt)",
-        "SOLLGESTELLT": "sollgestellt",
-        "ZUGESTELLT": "zugestellt",
-        "EXPORTIERT": "zugestellt, ins Hauptbuch exportiert",
-    }
-    if vorschreibungen:
-        aktuelle_v = vorschreibungen[0]
-        weitere_v = vorschreibungen[1:]
+    vorschreibung_positionen_je_id = vorschreibung_positionen_je_id or {}
+
+    def _positionen_tabelle(v):
+        positionen = vorschreibung_positionen_je_id.get(v.id) or []
+        if not positionen:
+            return None, '<p class="muted">Keine Einzelpositionen zu diesem Datensatz hinterlegt - der Betrag ist NICHT belegt (kein "0,00" als Beleg).</p>'
+        zeilen = []
+        summe = 0
+        for p in positionen:
+            netto_cent, ust_cent = zerlege_brutto_cent(p.betrag_cent, p.ust_satz_promille)
+            summe += p.betrag_cent
+            zeilen.append(
+                f"<tr><td>{h(p.art)}</td><td>{h(p.bezeichnung)}</td><td>{eur(netto_cent)}</td>"
+                f"<td>{eur(ust_cent)}</td><td>{eur(p.betrag_cent)}</td></tr>"
+            )
+        tabelle = (
+            "<table><tr><th>Art</th><th>Bezeichnung</th><th>Netto</th><th>USt</th><th>Brutto</th></tr>"
+            f"{''.join(zeilen)}</table>"
+        )
+        return summe, tabelle
+
+    _je_vorschreibung = {v.id: _positionen_tabelle(v) for v in vorschreibungen}
+    vergangene_oder_aktuelle = [v for v in vorschreibungen if v.monat <= aktueller_monat]
+    zukuenftige = [v for v in vorschreibungen if v.monat > aktueller_monat]
+    primaer = vergangene_oder_aktuelle[0] if vergangene_oder_aktuelle else None
+    ist_aktueller_monat = primaer is not None and primaer.monat == aktueller_monat
+    weitere_vergangene = vergangene_oder_aktuelle[1:]
+    primaer_summe, primaer_tabelle = _je_vorschreibung[primaer.id] if primaer is not None else (None, None)
+
+    if primaer is not None:
+        titel = (
+            f"Aktuelle Vorschreibung ({h(primaer.monat)})" if ist_aktueller_monat
+            else f"Letzte hinterlegte Vorschreibung — historisch ({h(primaer.monat)})"
+        )
+        monat_hinweis = (
+            "" if ist_aktueller_monat
+            else f'<p class="warn">Kein Datensatz für den laufenden Monat ({h(aktueller_monat)}) hinterlegt - '
+                 f"dies ist der letzte vorhandene, bereits VERGANGENE Monat.</p>"
+        )
+        betrag_zeile = (
+            f"<tr><th>Betrag (belegte Positionen)</th><td>{eur(primaer_summe)}</td></tr>" if primaer_summe is not None
+            else '<tr><th>Betrag</th><td class="muted">kein Beleg - keine Einzelpositionen hinterlegt</td></tr>'
+        )
         weitere_v_zeilen = "".join(
-            f"<tr><td>{h(v.monat)}</td><td>{eur(vorschreibung_summen.get(v.id, 0))}</td>"
+            f"<tr><td>{h(v.monat)}</td>"
+            f"<td>{eur(_je_vorschreibung[v.id][0]) if _je_vorschreibung[v.id][0] is not None else 'kein Beleg'}</td>"
             f"<td>{h(_VORSCHREIBUNG_STATUS_LABEL.get(v.status, v.status))}</td></tr>"
-            for v in weitere_v
+            for v in weitere_vergangene
+        )
+        zukunft_zeilen = "".join(
+            f"<tr><td>{h(v.monat)}</td><td>{h(_VORSCHREIBUNG_STATUS_LABEL.get(v.status, v.status))}</td></tr>"
+            for v in zukuenftige
         )
         vorschreibung_karte = f"""
-    <div class="card"><h2>Aktuelle Vorschreibung</h2>
+    <div class="card"><h2>{titel}</h2>
+      {monat_hinweis}
       <table>
-        <tr><th>Monat</th><td>{h(aktuelle_v.monat)}</td></tr>
-        <tr><th>Betrag (belegte Positionen)</th><td>{eur(vorschreibung_summen.get(aktuelle_v.id, 0))}</td></tr>
-        <tr><th>Status</th><td>{h(_VORSCHREIBUNG_STATUS_LABEL.get(aktuelle_v.status, aktuelle_v.status))}</td></tr>
-        <tr><th>Fälligkeit</th><td>{aktuelle_v.faelligkeit.isoformat() if aktuelle_v.faelligkeit else '—'}</td></tr>
+        <tr><th>Monat</th><td>{h(primaer.monat)}</td></tr>
+        {betrag_zeile}
+        <tr><th>Status</th><td>{h(_VORSCHREIBUNG_STATUS_LABEL.get(primaer.status, primaer.status))}</td></tr>
+        <tr><th>Fälligkeit</th><td>{primaer.faelligkeit.isoformat() if primaer.faelligkeit else '—'}</td></tr>
         <tr><th>Dokument zugestellt am</th>
-            <td>{aktuelle_v.dokument_zugestellt_am.strftime('%Y-%m-%d') if aktuelle_v.dokument_zugestellt_am else 'kein Nachweis im System'}</td></tr>
+            <td>{primaer.dokument_zugestellt_am.strftime('%Y-%m-%d') if primaer.dokument_zugestellt_am else 'kein Nachweis im System'}</td></tr>
       </table>
-      {f'<details><summary>Weitere Monate ({len(weitere_v)})</summary><table><tr><th>Monat</th><th>Betrag</th><th>Status</th></tr>{weitere_v_zeilen}</table></details>' if weitere_v else ''}
+      <h3>Einzelbestandteile dieser Vorschreibung</h3>
+      {primaer_tabelle}
+      {f'<details><summary>Weitere vergangene Monate ({len(weitere_vergangene)})</summary><table><tr><th>Monat</th><th>Betrag</th><th>Status</th></tr>{weitere_v_zeilen}</table></details>' if weitere_vergangene else ''}
+      {f'<details><summary>Zukünftig hinterlegte Entwürfe ({len(zukuenftige)}) — NICHT aktuell, keine Sollstellung</summary><table><tr><th>Monat</th><th>Status</th></tr>{zukunft_zeilen}</table></details>' if zukuenftige else ''}
       <p><a href="/backoffice/vertrag/{h(vertrag.id)}/vorschreibung">Vorschreibungsentwurf öffnen</a></p>
     </div>"""
     else:
+        zukunft_zeilen = "".join(
+            f"<tr><td>{h(v.monat)}</td><td>{h(_VORSCHREIBUNG_STATUS_LABEL.get(v.status, v.status))}</td></tr>"
+            for v in zukuenftige
+        )
+        zukunft_hinweis = (
+            f'<p class="warn">Keine aktuelle/vergangene Vorschreibung, aber {len(zukuenftige)} zukünftig '
+            "hinterlegte(r) Entwurf/Entwürfe (siehe unten) - NICHT als bereits wirksam behandeln.</p>"
+            f'<details open><summary>Zukünftig hinterlegte Entwürfe ({len(zukuenftige)})</summary>'
+            f"<table><tr><th>Monat</th><th>Status</th></tr>{zukunft_zeilen}</table></details>"
+            if zukuenftige else
+            '<p class="muted">Keine Vorschreibung im System hinterlegt - das sagt nichts darüber aus, ob vor '
+            "Verwaltungsübernahme extern vorgeschrieben wurde, nur dass hier keine erfasst ist.</p>"
+        )
         vorschreibung_karte = f"""
     <div class="card"><h2>Aktuelle Vorschreibung</h2>
-      <p class="muted">Keine Vorschreibung im System hinterlegt - das sagt nichts darüber aus, ob vor Verwaltungs-
-         übernahme extern vorgeschrieben wurde, nur dass hier keine erfasst ist.</p>
+      {zukunft_hinweis}
       <p><a href="/backoffice/vertrag/{h(vertrag.id)}/vorschreibung">Vorschreibungsentwurf öffnen</a></p>
     </div>"""
 
-    # -- Kontostatus (id="kontodetails") - dieselbe, bereits geprüfte ------
-    # -- Berechnung wie Übersicht/Dashboard (rueckstaende/service.py), ------
-    # -- KEIN zweiter Rechenweg. -------------------------------------------
-    if gesperrt:
-        kontostatus_karte = ""
-    elif kontostatus is None:
+    # -- Ledger-only SOLL-Buchungen ohne eigenen Vorschreibungsdatensatz ---
+    # -- (z. B. Altimport/manuelle Nachbuchung) - eine solche Buchung ist --
+    # -- eine ECHTE gebuchte Vorschreibung, auch ohne VorschreibungTable. --
+    bekannte_monate = {v.monat for v in vorschreibungen}
+    ledger_nur_gebucht: dict[str, int] = {}
+    for p in zahlungen_positionen:
+        if p.typ == "SOLL" and p.leistungsperiode and p.leistungsperiode not in bekannte_monate:
+            ledger_nur_gebucht[p.leistungsperiode] = ledger_nur_gebucht.get(p.leistungsperiode, 0) + p.betrag_cent
+    if ledger_nur_gebucht:
+        ledger_zeilen = "".join(
+            f"<tr><td>{h(periode)}</td><td>{eur(betrag)}</td></tr>"
+            for periode, betrag in sorted(ledger_nur_gebucht.items(), reverse=True)
+        )
+        vorschreibung_karte += f"""
+    <div class="card"><h2>Zusätzlich im Konto gebuchte SOLL-Perioden</h2>
+      <p class="muted">Tatsächlich als SOLL gebucht (z. B. Altimport/manuelle Nachbuchung), aber OHNE eigenen
+         Vorschreibungsdatensatz oben - trotzdem eine echte, gebuchte Vorschreibung, kein bloßer Entwurf.</p>
+      <table><tr><th>Leistungsperiode</th><th>Betrag</th></tr>{ledger_zeilen}</table>
+    </div>"""
+
+    # -- Kontostatus & Buchungsvergleich (id="kontodetails") - dieselbe, ---
+    # -- bereits geprüfte Berechnung wie Übersicht/Dashboard, KEIN zweiter -
+    # -- Rechenweg; zeigt Kontoberechnung UND Summe Einzelpositionen -------
+    # -- NEBENEINANDER, damit "Buchungen vergleichen" tatsächlich einen ----
+    # -- Vergleich zeigt statt nur eine Summenkarte (Codex-Rückprüfung). ---
+    if kontostatus is None:
         kontostatus_karte = """
     <div class="card" id="kontodetails"><h2>Offener Betrag &amp; Kontostatus</h2>
       <p class="muted">Kein Mietkonto vorhanden.</p>
     </div>"""
     else:
         abweichung_zeile = (
-            f"<tr><th>Abweichung Kontostand/Einzelpositionen</th><td>{eur(kontostatus.abweichung_saldo_zu_positionen_cent)}"
+            f'<tr><th>Abweichung (Kontoberechnung minus Positionen)</th><td>{eur(kontostatus.abweichung_saldo_zu_positionen_cent)}'
             " <span class='muted'>(z. B. eine Korrekturbuchung ohne eigene offene Position)</span></td></tr>"
             if kontostatus.abweichung_saldo_zu_positionen_cent else ""
         )
         kontostatus_karte = f"""
     <div class="card" id="kontodetails"><h2>Offener Betrag &amp; Kontostatus</h2>
+      <h3>Vergleich: Kontoberechnung ⟷ Summe Einzelpositionen</h3>
       <table>
-        <tr><th>Kontostand (offen/Guthaben)</th><td>{eur(kontostatus.saldo_cent) if kontostatus.saldo_cent is not None else '—'}</td></tr>
-        <tr><th>Davon fällig (Kontoberechnung)</th><td>{eur(kontostatus.faelliger_unstrittiger_rest_cent) if kontostatus.faelliger_unstrittiger_rest_cent is not None else '—'}</td></tr>
-        {abweichung_zeile}
+        <tr><th></th><th>Kontoberechnung</th><th>Summe Einzelpositionen</th></tr>
+        <tr><th>Offen gesamt</th>
+            <td>{eur(max(kontostatus.saldo_cent, 0)) if kontostatus.saldo_cent is not None else '—'}</td>
+            <td>{eur(kontostatus.positionen_rest_gesamt_cent) if kontostatus.positionen_rest_gesamt_cent is not None else '—'}</td></tr>
+        <tr><th>Davon fällig</th>
+            <td>{eur(kontostatus.faelliger_unstrittiger_rest_cent) if kontostatus.faelliger_unstrittiger_rest_cent is not None else '—'}</td>
+            <td>{eur(kontostatus.positionen_faelliger_rest_cent) if kontostatus.positionen_faelliger_rest_cent is not None else '—'}</td></tr>
+      </table>
+      {f'<table>{abweichung_zeile}</table>' if abweichung_zeile else ''}
+      <table>
+        <tr><th>Kontostand (offen/Guthaben) — Kontoberechnung</th><td>{eur(kontostatus.saldo_cent) if kontostatus.saldo_cent is not None else '—'}</td></tr>
       </table>
       <p class="muted">Eine bekannte Fälligkeit ist KEINE Mahnfreigabe - eine aktive Sperre (unten) blockiert
          unabhängig davon.</p>
@@ -704,31 +805,28 @@ def detail_ansicht(
     # -- Offene Positionen & Zahlungen (id="zahlungen") ---------------------
     unbekannte_faelligkeit_positionen = unbekannte_faelligkeit_positionen or []
     zahlungen_positionen = zahlungen_positionen or []
-    if gesperrt:
-        zahlungen_karte = ""
-    else:
-        unbekannt_html = ""
-        if unbekannte_faelligkeit_positionen:
-            unbekannt_zeilen = "".join(
-                f"<tr><td>{h(p.beleg_referenz)}</td><td>{h(p.art)}</td><td>{eur(p.rest_cent)}</td>"
-                f"<td>{p.belegdatum.isoformat()}</td></tr>"
-                for p in unbekannte_faelligkeit_positionen
-            )
-            unbekannt_html = f"""
+    unbekannt_html = ""
+    if unbekannte_faelligkeit_positionen:
+        unbekannt_zeilen = "".join(
+            f"<tr><td>{h(p.beleg_referenz)}</td><td>{h(p.art)}</td><td>{eur(p.rest_cent)}</td>"
+            f"<td>{p.belegdatum.isoformat()}</td></tr>"
+            for p in unbekannte_faelligkeit_positionen
+        )
+        unbekannt_html = f"""
       <p class="warn">Offene Position(en) ohne erfasste Fälligkeit:</p>
       <table><tr><th>Beleg</th><th>Art</th><th>Rest</th><th>Belegdatum</th></tr>{unbekannt_zeilen}</table>"""
-        zahlungen_zeilen = "".join(
-            f"<tr><td>{p.belegdatum.isoformat()}</td><td>{h(p.typ)}</td><td>{eur(p.betrag_cent)}</td>"
-            f"<td>{h(p.beleg_referenz or '')}</td></tr>"
-            for p in zahlungen_positionen
-        )
-        zahlungen_karte = f"""
+    zahlungen_zeilen = "".join(
+        f"<tr><td>{p.belegdatum.isoformat()}</td><td>{h(p.typ)}</td><td>{eur(p.betrag_cent)}</td>"
+        f"<td>{h(p.leistungsperiode or '')}</td><td>{h(p.beleg_referenz or '')}</td></tr>"
+        for p in zahlungen_positionen
+    )
+    zahlungen_karte = f"""
     <div class="card" id="zahlungen"><h2>Offene Positionen &amp; Zahlungen/Buchungen</h2>
       {unbekannt_html}
       <details {"open" if not unbekannte_faelligkeit_positionen else ""}>
         <summary>Alle Buchungen ({len(zahlungen_positionen)})</summary>
-        <table><tr><th>Datum</th><th>Typ</th><th>Betrag</th><th>Beleg/Quelle</th></tr>
-        {zahlungen_zeilen or '<tr><td colspan=4 class="muted">Keine Buchungen.</td></tr>'}</table>
+        <table><tr><th>Datum</th><th>Typ</th><th>Betrag</th><th>Periode</th><th>Beleg/Quelle</th></tr>
+        {zahlungen_zeilen or '<tr><td colspan=5 class="muted">Keine Buchungen.</td></tr>'}</table>
       </details>
       {f'<p><a href="/backoffice/konto/{h(konto_id)}">Vollständigen Kontoauszug öffnen</a></p>' if konto_id else ''}
     </div>"""
@@ -746,21 +844,134 @@ def detail_ansicht(
       {f'<table><tr><th>Grund</th><th>Gesetzt am</th><th>Kommentar</th></tr>{sperren_zeilen}</table><p class="muted">Aktive Sperre(n) - vor einem Mahnlauf beachten, keine Aufforderung zum Entsperren.</p>' if sperren else '<p class="muted">Keine aktiven Sperren.</p>'}
     </div>"""
 
-    # -- Mahnfälle (id="mahnfaelle") -----------------------------------------
+    # -- Mahnfälle & Schriftverkehr (id="mahnfaelle") - fasst ALLE in ------
+    # -- diesem System tatsächlich existierenden verknüpften Nachweise -----
+    # -- zusammen (Mahnfälle/Mahnläufe/Erhöhungsschreiben/Vertragsende-Er- -
+    # -- innerungen), Gesendet/Zugang jeweils getrennt ausgewiesen. Externe-
+    # -- Korrespondenz außerhalb dieses Systems wird NICHT geführt --------
+    # -- (Codex-Rückprüfung: bisher nur Mahnfälle, keine tatsächlichen -----
+    # -- Versand-/Zustellnachweise). ----------------------------------------
     mahnfaelle = mahnfaelle or []
     mahnfaelle_zeilen = "".join(
         f"<tr><td>#{m.forderung_op_position_id}</td><td>{m.stufe}</td><td>{h(m.status)}</td>"
         f"<td>{eur(m.betrag_cent)}</td><td>{m.geplant_am.date().isoformat()}</td></tr>"
         for m in mahnfaelle
     )
-    mahnfaelle_karte = "" if gesperrt else f"""
+    mahnlaeufe = mahnlaeufe or []
+    mahnlauf_zeilen = "".join(
+        f"<tr><td>Stufe {m.stufe}</td><td>{h(m.kanal)}</td><td>{h(m.status)}</td>"
+        f"<td>{m.geplant_am.strftime('%Y-%m-%d') if m.geplant_am else '—'}</td>"
+        f"<td>{m.gesendet_am.strftime('%Y-%m-%d') if m.gesendet_am else 'kein Nachweis im System'}</td></tr>"
+        for m in mahnlaeufe
+    )
+    erhoehungsschreiben = erhoehungsschreiben or []
+    erhoehung_zeilen = "".join(
+        f"<tr><td>{h(e.status)}</td><td>{e.massgeblicher_termin.isoformat()}</td><td>{eur(e.erhoehung_cent)}</td>"
+        f"<td>{e.versendet_am.strftime('%Y-%m-%d') if e.versendet_am else 'kein Nachweis im System'}</td>"
+        f"<td>{e.zugang_bestaetigt_am.isoformat() if e.zugang_bestaetigt_am else 'kein Nachweis im System'}</td></tr>"
+        for e in erhoehungsschreiben
+    )
+    vertragsende_erinnerungen = vertragsende_erinnerungen or []
+    vertragsende_zeilen = "".join(
+        f"<tr><td>{h(v.status)}</td><td>{v.end_datum.isoformat()}</td><td>{v.faellig_am.isoformat()}</td>"
+        f"<td>{v.benachrichtigt_am.strftime('%Y-%m-%d') if v.benachrichtigt_am else 'kein Nachweis im System'}</td></tr>"
+        for v in vertragsende_erinnerungen
+    )
+    schriftverkehr_teile = []
+    if mahnfaelle:
+        schriftverkehr_teile.append(
+            "<h3>Mahnfälle</h3><table><tr><th>OP-Nr.</th><th>Stufe</th><th>Status</th><th>Fallbetrag</th>"
+            f"<th>Geplant am</th></tr>{mahnfaelle_zeilen}</table>"
+        )
+    if mahnlaeufe:
+        schriftverkehr_teile.append(
+            "<h3>Mahnläufe (Versand)</h3><table><tr><th>Stufe</th><th>Kanal</th><th>Status</th>"
+            f"<th>Geplant am</th><th>Gesendet/bestätigt am</th></tr>{mahnlauf_zeilen}</table>"
+        )
+    if erhoehungsschreiben:
+        schriftverkehr_teile.append(
+            "<h3>Erhöhungsschreiben (Index)</h3><table><tr><th>Status</th><th>Maßgeblicher Termin</th>"
+            f"<th>Erhöhung</th><th>Versendet am</th><th>Zugang bestätigt am</th></tr>{erhoehung_zeilen}</table>"
+        )
+    if vertragsende_erinnerungen:
+        schriftverkehr_teile.append(
+            "<h3>Vertragsende-Erinnerungen</h3><table><tr><th>Status</th><th>Enddatum</th><th>Fällig am</th>"
+            f"<th>Benachrichtigt am</th></tr>{vertragsende_zeilen}</table>"
+        )
+    mahnfaelle_karte = f"""
     <div class="card" id="mahnfaelle"><h2>Mahnfälle &amp; Schriftverkehr</h2>
-      {f'<table><tr><th>OP-Nr.</th><th>Stufe</th><th>Status</th><th>Fallbetrag</th><th>Geplant am</th></tr>{mahnfaelle_zeilen}</table>' if mahnfaelle else '<p class="muted">Keine Mahnfälle im System hinterlegt.</p>'}
+      {"".join(schriftverkehr_teile) or '<p class="muted">Keine Mahnfälle, Mahnläufe, Erhöhungsschreiben oder Vertragsende-Erinnerungen im System hinterlegt.</p>'}
+      <p class="muted">Diese Übersicht zeigt nur in DIESEM System selbst geplante/versendete Schreiben - eine
+         etwaige externe Korrespondenz (z. B. Outlook/Papierpost außerhalb dieses Systems) wird hier NICHT
+         geführt und ist separat zu prüfen.</p>
       <p><a href="/backoffice/vertrag/{h(vertrag.id)}/mahnvorschau">Mahnvorschau öffnen</a></p>
     </div>"""
 
+    # -- Index & Rechtsprofil - konsolidiert und OHNE Klick sichtbar -------
+    # -- (vorher großteils in "Quellen und Historie" versteckt); Entwurf ---
+    # -- und Freigabe bleiben GETRENNT, ein fehlendes Profil wird NICHT ----
+    # -- mit fehlendem Rechts-/Indexwissen insgesamt gleichgesetzt. --------
+    index_karte = f"""
+    <div class="card"><h2>Index &amp; Rechtsprofil</h2>
+      <table>
+        <tr><th>Freigegebenes Rechtsprofil</th>
+            <td>{h(rechtsprofil_freigegeben_hinweis) if rechtsprofil_freigegeben_hinweis else 'Kein freigegebenes Rechtsprofil.'}</td></tr>
+        {f'<tr><th>Neuerer Rechtsprofil-Entwurf (ungeprüft)</th><td>{h(rechtsprofil_entwurf_hinweis)}</td></tr>' if rechtsprofil_entwurf_hinweis else ''}
+        <tr><th>Wirksame Indexklausel</th><td>{h(index_klausel_hinweis) if index_klausel_hinweis else 'Keine Indexklausel erfasst.'}</td></tr>
+        <tr><th>Offener Index-Prüfbedarf</th><td>{h(index_pruefbedarf_hinweis) if index_pruefbedarf_hinweis else 'Kein offener Prüfbedarf hinterlegt.'}</td></tr>
+        <tr><th>Letzte Vertragsprüfung</th><td>{h(letzte_pruefung_hinweis) if letzte_pruefung_hinweis else 'Keine Vertragsprüfung im System hinterlegt.'}</td></tr>
+      </table>
+      <p class="muted">Ein fehlendes/neues Mietvertragsprofil bedeutet NICHT, dass hier keinerlei Rechts-/
+         Indexwissen vorliegt - ältere Rechtsprofile/Prüfungen/Klauseln (oben) können unabhängig davon bereits
+         bestehen.</p>
+      <details><summary>Index-Quellfelder aus dem Profil (unverbindlich, erzeugt keine Klausel)</summary>
+        <table>
+          <tr><th>Reihe</th><td>{h(profil.index_reihe) if profil and profil.index_reihe else '—'}</td></tr>
+          <tr><th>Basismonat</th><td>{h(profil.index_urspruenglicher_basismonat) if profil and profil.index_urspruenglicher_basismonat else '—'}</td></tr>
+          <tr><th>Basiswert</th><td>{profil.index_urspruenglicher_basiswert if profil and profil.index_urspruenglicher_basiswert is not None else '—'}</td></tr>
+          <tr><th>Schwelle</th><td>{f"{profil.index_schwelle_prozent} % ({'ab' if profil.index_schwelle_inklusive else 'über'})" if profil and profil.index_schwelle_prozent is not None else '—'}</td></tr>
+          <tr><th>Anpassungsmonat</th><td>{profil.index_anpassungsmonat if profil and profil.index_anpassungsmonat else '—'}</td></tr>
+          <tr><th>Mindestabstand (Monate)</th><td>{profil.index_mindestintervall_monate if profil and profil.index_mindestintervall_monate else '—'}</td></tr>
+        </table>
+      </details>
+      <p><a href="/backoffice/vertrag/{h(vertrag.id)}/rechtsprofil">Rechtsprofil verwalten</a> ·
+         <a href="/backoffice/vertrag/{h(vertrag.id)}/indexklauseln">Indexregel verwalten</a> ·
+         <a href="/backoffice/vertrag/{h(vertrag.id)}/pruefung">Vertragsprüfung</a></p>
+    </div>"""
+
+    # -- Auf einen Blick - zentrale Werte OHNE Klick sichtbar, lange -------
+    # -- Historie/Detailtabellen bleiben in den Karten/Details darunter ----
+    # -- eingeklappt (Codex-Rückprüfung: "zentralen Kontobetrag/aktuelle ---
+    # -- Vorschreibung/Kaution/Index oben sichtbar halten"). ---------------
+    kaution_ueberblick = (
+        eur(kaution.betrag_cent) if kaution
+        else ("nicht hinterlegt" if not (profil and profil.vertragliche_kaution_cent is not None) else "vereinbart, kein Eingang bestätigt")
+    )
+    vorschreibung_ueberblick_label = (
+        f"{'Aktuelle' if ist_aktueller_monat else 'Letzte hinterlegte'} Vorschreibung ({h(primaer.monat)})"
+        if primaer is not None else "Aktuelle Vorschreibung"
+    )
+    vorschreibung_ueberblick_wert = (
+        (eur(primaer_summe) if primaer_summe is not None else "kein Beleg") if primaer is not None else "keine hinterlegt"
+    )
+    rechtsprofil_ueberblick_wert = (
+        "freigegeben" if rechtsprofil_freigegeben_hinweis
+        else ("Entwurf, ungeprüft" if rechtsprofil_entwurf_hinweis else "kein Rechtsprofil")
+    )
+    ueberblick_html = f"""
+    <div class="card">
+      <div class="kpi-grid">
+        <div class="kpi"><span class="zahl">{eur(kontostatus.saldo_cent) if (kontostatus and kontostatus.saldo_cent is not None) else '—'}</span>
+            <span class="kpi-label">Kontostand (offen/Guthaben)</span></div>
+        <div class="kpi"><span class="zahl">{vorschreibung_ueberblick_wert}</span>
+            <span class="kpi-label">{vorschreibung_ueberblick_label}</span></div>
+        <div class="kpi"><span class="zahl">{kaution_ueberblick}</span><span class="kpi-label">Kaution</span></div>
+        <div class="kpi"><span class="zahl">{rechtsprofil_ueberblick_wert}</span><span class="kpi-label">Rechtsprofil-Status</span></div>
+      </div>
+    </div>"""
+
     return f"""
-    {gesperrt_banner}
+    <p>{zurueck_html}</p>
     <div class="card">
       <h1>{h(debitor.name)}</h1>
       <p class="muted">{h(objekt.bezeichnung)} / {h(einheit.bezeichnung)} · Vertrag <code>{h(vertrag.id)}</code></p>
@@ -770,6 +981,7 @@ def detail_ansicht(
          <a href="/backoffice/vertrag/{h(vertrag.id)}/mieweg-vorschau">Rekonstruktionsmodell (Mietzinsobergrenze)</a></p>
       <a href="/backoffice/vertrag/{h(vertrag.id)}/mietvertragsprofil/bearbeiten"><button type="button">Profil aktualisieren</button></a>
     </div>
+    {ueberblick_html}
     <div class="card"><h2>Mieter und Objekt</h2>
       <table>
         <tr><th>Mieter</th><td>{h(debitor.name)}{' — ' + h(debitor.email) if debitor.email else ''}</td></tr>
@@ -785,13 +997,13 @@ def detail_ansicht(
     </div>
     <div class="card"><h2>Laufzeit</h2>
       <table>
-        <tr><th>Vertragsbeginn</th><td>{vertrag.gueltig_von.isoformat()}</td></tr>
+        <tr><th>Vertragsbeginn (technisch, für Sollstellung/Buchung)</th><td>{vertrag.gueltig_von.isoformat()}</td></tr>
         <tr><th>Vertragsende</th><td>{vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else 'unbefristet'}</td></tr>
         <tr><th>Ursprünglicher tatsächlicher Mietbeginn</th>
-            <td>{profil.urspruenglicher_mietbeginn.isoformat() if profil and profil.urspruenglicher_mietbeginn else '—'}
+            <td>{profil.urspruenglicher_mietbeginn.isoformat() if profil and profil.urspruenglicher_mietbeginn else 'nicht hinterlegt'}
             {_status_badge('bereit' if (profil and profil.urspruenglicher_mietbeginn) else 'Angabe fehlt')}</td></tr>
         <tr><th>Verwaltungsübernahme</th>
-            <td>{profil.verwaltungsuebernahme_am.isoformat() if profil and profil.verwaltungsuebernahme_am else '—'}
+            <td>{profil.verwaltungsuebernahme_am.isoformat() if profil and profil.verwaltungsuebernahme_am else 'nicht hinterlegt'}
             {_status_badge('bereit' if (profil and profil.verwaltungsuebernahme_am) else 'Angabe fehlt')}</td></tr>
       </table>
     </div>
@@ -820,26 +1032,9 @@ def detail_ansicht(
             {' <span class="muted">(0 = ausdrücklich keine Gebühr vereinbart)</span>' if profil and profil.mahngebuehr_cent == 0 else ''}</td></tr>
       </table>
     </div>
-    <div class="card"><h2>Index-Quellfelder (unverbindlich)</h2>
-      <p class="muted">Reine Gedächtnisstütze - erzeugt keine aktive Klausel. Die tatsächlich wirksame Indexklausel
-         steht getrennt unter "Indexregel" oben.</p>
-      <table>
-        <tr><th>Reihe</th><td>{h(profil.index_reihe) if profil and profil.index_reihe else '—'}</td></tr>
-        <tr><th>Basismonat</th><td>{h(profil.index_urspruenglicher_basismonat) if profil and profil.index_urspruenglicher_basismonat else '—'}</td></tr>
-        <tr><th>Basiswert</th><td>{profil.index_urspruenglicher_basiswert if profil and profil.index_urspruenglicher_basiswert is not None else '—'}</td></tr>
-        <tr><th>Schwelle</th><td>{f"{profil.index_schwelle_prozent} % ({'ab' if profil.index_schwelle_inklusive else 'über'})" if profil and profil.index_schwelle_prozent is not None else '—'}</td></tr>
-        <tr><th>Anpassungsmonat</th><td>{profil.index_anpassungsmonat if profil and profil.index_anpassungsmonat else '—'}</td></tr>
-        <tr><th>Mindestabstand (Monate)</th><td>{profil.index_mindestintervall_monate if profil and profil.index_mindestintervall_monate else '—'}</td></tr>
-      </table>
-    </div>
-    <details class="card"><summary>Quellen und Historie</summary>
-      <p class="muted">Technischer Vertragsbeginn = für Sollstellung/Buchung maßgebliches Feld
-         (<code>{h(vertrag.id)}</code>, Gesellschaft <code>{h(vertrag.gesellschaft_id)}</code>) - kann bei
-         Altobjekten von der Verwaltungsübernahme abweichen (siehe oben, "Ursprünglicher tatsächlicher Mietbeginn").
-         "Quelle" (PDF-Extraktion/manuell/Importformat) ist ein Herkunftsvermerk, KEINE fachliche Freigabe.</p>
-      <h3>Freigegebenes Rechtsprofil</h3><p>{h(rechtsprofil_hinweis) if rechtsprofil_hinweis else 'Kein Rechtsprofil freigegeben.'}</p>
-      <h3>Indexklausel</h3><p>{h(index_klausel_hinweis) if index_klausel_hinweis else 'Keine Indexklausel erfasst.'}</p>
-      <h3>Letzte Vertragsprüfung</h3><p>{h(letzte_pruefung_hinweis) if letzte_pruefung_hinweis else 'Keine Vertragsprüfung im System hinterlegt.'}</p>
-      <h3>Mietvertragsprofil-Versionen</h3>
+    {index_karte}
+    <details class="card"><summary>Quellen und Historie (Mietvertragsprofil-Versionen)</summary>
+      <p class="muted">"Quelle" (PDF-Extraktion/manuell/Importformat) ist ein Herkunftsvermerk, KEINE fachliche
+         Freigabe.</p>
       <table><tr><th>Version</th><th>Quelle</th><th>Referenz</th><th>Erfasst von</th><th>Am</th></tr>{versionen_zeilen}</table>
     </details>"""

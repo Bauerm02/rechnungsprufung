@@ -612,6 +612,20 @@ class VertragsendeErinnerungRepository:
             )
             return session.execute(statement).scalars().first()
 
+    def list_fuer_vertrag(self, vertrag_id: str) -> list[VertragsendeErinnerungTable]:
+        """Reiner Read, jüngstes Enddatum zuerst - für die Mieterakte
+        (HV-20260914-AUFGABEN-MIETERAKTE, Codex-Rückprüfung): zeigt auch
+        eine bereits `UNGUELTIG` markierte Zeile (Audit-Historie), keine
+        neue Berechnung."""
+
+        with self._session_factory() as session:
+            statement = (
+                select(VertragsendeErinnerungTable)
+                .where(VertragsendeErinnerungTable.vertrag_id == vertrag_id)
+                .order_by(VertragsendeErinnerungTable.end_datum.desc())
+            )
+            return list(session.execute(statement).scalars().all())
+
     def anlegen(self, row: VertragsendeErinnerungTable) -> VertragsendeErinnerungTable:
         with self._session_factory() as session:
             session.add(row)

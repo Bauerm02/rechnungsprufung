@@ -511,6 +511,21 @@ class MahnLaufRepository:
         with self._session_factory() as session:
             return list(session.execute(select(MahnLaufTable).where(MahnLaufTable.status == status)).scalars().all())
 
+    def list_fuer_vertrag(self, vertrag_id: str) -> list[MahnLaufTable]:
+        """Reiner Read, jüngste Zeile zuerst - für die Mieterakte
+        (HV-20260914-AUFGABEN-MIETERAKTE, Codex-Rückprüfung): tatsächlich
+        geplante/gesendete Mahnläufe als Schriftverkehrsnachweis, getrennt
+        nach `versand_beansprucht_am` (Transport angenommen) und
+        `gesendet_am` (bestätigter Abschluss) - keine neue Berechnung."""
+
+        with self._session_factory() as session:
+            statement = (
+                select(MahnLaufTable)
+                .where(MahnLaufTable.vertrag_id == vertrag_id)
+                .order_by(MahnLaufTable.geplant_am.desc())
+            )
+            return list(session.execute(statement).scalars().all())
+
     def list_gesendet_mit_offenen_mitgliedern(self, *, mitglieder_repo) -> list[MahnLaufTable]:
         """GESENDETE Mahnläufe, bei denen mindestens ein eingefrorenes
         Mitglied NOCH NICHT auf GESENDET nachgezogen wurde - unabhängige

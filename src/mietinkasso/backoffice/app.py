@@ -410,20 +410,35 @@ def _erledigen_html(uebersicht) -> str:
     auf einem bereits ausgeglichenen/Guthaben-Konto ist HIER weiterhin
     KEINE Handlungsaufgabe (nichts zu mahnen gibt es nicht)."""
 
+    # Vollständige Metadaten (Objekt/Einheit/Mieter) kommen bevorzugt aus
+    # `uebersicht.mietkonten` - DIE Zeile deckt JEDEN Vertrag im
+    # Objekt-Scope ab, auch ohne eigenes Mietkonto (siehe
+    # `rueckstaende/service.py::berechne_rueckstandsuebersicht`).
+    # `OffenePositionZeile` (unbekannte Fälligkeit) trägt selbst KEINE
+    # Einheit - ohne diese Vor-Befüllung blieb die Einheit für einen
+    # Vertrag leer, der NUR diesen einen Grund hatte (Codex-Rückprüfung
+    # 14.09.2026).
+    mietkonten_by_vertrag = {z.vertrag_id: z for z in uebersicht.mietkonten}
+    # Der aktive Objektfilter wird an jeden Aktionslink angehängt, damit
+    # die Mieterakte per "zurück"-Link zur GEFILTERTEN Übersicht
+    # zurückführt statt stillschweigend auf "Alle Objekte" zu wechseln.
+    von_objekt_param = f"?von_objekt={h(uebersicht.objekt_filter)}" if uebersicht.objekt_filter else ""
+
     eintraege: dict[str, dict] = {}
 
-    def _eintrag(quelle) -> dict:
-        e = eintraege.get(quelle.vertrag_id)
-        if e is None:
-            e = {
-                "debitor_name": quelle.debitor_name,
-                "objekt_bezeichnung": quelle.objekt_bezeichnung,
-                "einheit_bezeichnung": getattr(quelle, "einheit_bezeichnung", None),
-                "gruende": [],
-            }
-            eintraege[quelle.vertrag_id] = e
-        elif e["einheit_bezeichnung"] is None:
-            e["einheit_bezeichnung"] = getattr(quelle, "einheit_bezeichnung", None)
+    def _eintrag(vertrag_id: str, fallback_quelle=None) -> dict:
+        e = eintraege.get(vertrag_id)
+        if e is not None:
+            return e
+        z = mietkonten_by_vertrag.get(vertrag_id)
+        quelle = z or fallback_quelle
+        e = {
+            "debitor_name": quelle.debitor_name,
+            "objekt_bezeichnung": quelle.objekt_bezeichnung,
+            "einheit_bezeichnung": getattr(z, "einheit_bezeichnung", None),
+            "gruende": [],
+        }
+        eintraege[vertrag_id] = e
         return e
 
     unbekannte_je_vertrag: dict[str, list] = {}
@@ -431,35 +446,35 @@ def _erledigen_html(uebersicht) -> str:
         if p.faelligkeitsklasse == "UNBEKANNT":
             unbekannte_je_vertrag.setdefault(p.vertrag_id, []).append(p)
     for vertrag_id, positionen in unbekannte_je_vertrag.items():
-        e = _eintrag(positionen[0])
+        e = _eintrag(vertrag_id, fallback_quelle=positionen[0])
         summe = sum(pos.rest_cent for pos in positionen)
         e["gruende"].append((
             "warn",
             f"{len(positionen)} offene Position(en) ohne erfasste Fälligkeit ({eur(summe)})",
             "Fälligkeit klären",
-            f"/backoffice/vertrag/{h(vertrag_id)}#zahlungen",
+            f"/backoffice/vertrag/{h(vertrag_id)}{von_objekt_param}#zahlungen",
         ))
 
     for z in uebersicht.mietkonten:
         if z.abweichung_saldo_zu_positionen_cent:
-            e = _eintrag(z)
+            e = _eintrag(z.vertrag_id, fallback_quelle=z)
             e["gruende"].append((
                 "warn",
                 f"Abweichung Kontostand/Einzelpositionen ({eur(z.abweichung_saldo_zu_positionen_cent)})",
                 "Buchungen vergleichen",
-                f"/backoffice/vertrag/{h(z.vertrag_id)}#kontodetails",
+                f"/backoffice/vertrag/{h(z.vertrag_id)}{von_objekt_param}#kontodetails",
             ))
         # NUR Sperren auf tatsächlich offenen (positiven) Konten sind ein
         # handlungsbezogener Punkt - eine Sperre auf einem ausgeglichenen/
         # Guthaben-Konto betrifft keinen anstehenden Mahnlauf.
         if z.sperrgruende and z.saldo_cent is not None and z.saldo_cent > 0:
-            e = _eintrag(z)
+            e = _eintrag(z.vertrag_id, fallback_quelle=z)
             e["gruende"].append((
                 "error",
                 f"Aktive Mahnsperre ({h(', '.join(z.sperrgruende))}) bei offenem Betrag {eur(z.saldo_cent)} - "
                 "vor einer Mahnung berücksichtigen",
                 "Status prüfen",
-                f"/backoffice/vertrag/{h(z.vertrag_id)}#sperren",
+                f"/backoffice/vertrag/{h(z.vertrag_id)}{von_objekt_param}#sperren",
             ))
 
     if not eintraege:
@@ -474,7 +489,8 @@ def _erledigen_html(uebersicht) -> str:
         karten = []
         for e in eintraege.values():
             gruende_html = "".join(
-                f'<li><span class="badge badge-{stil}">{text}</span> <a href="{link}">{h(aktion)}</a></li>'
+                f'<li><span class="badge badge-{stil}">{text}</span> '
+                f'<a class="aufgabe-aktion" href="{link}">{h(aktion)}</a></li>'
                 for stil, text, aktion, link in e["gruende"]
             )
             einheit_zusatz = f" / {h(e['einheit_bezeichnung'])}" if e["einheit_bezeichnung"] else ""
@@ -4440,12 +4456,30 @@ def vertragsanlage_bearbeiten_formular(request: Request, vertrag_id: str, sessio
 
 
 @router.get("/vertrag/{vertrag_id}", response_class=HTMLResponse)
-def vertragsanlage_detail(request: Request, vertrag_id: str, session=Depends(_current_session)) -> HTMLResponse:
+def vertragsanlage_detail(
+    request: Request, vertrag_id: str, von_objekt: str | None = None, session=Depends(_current_session),
+) -> HTMLResponse:
     vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
     if vertrag is None:
         return _fehlerseite(session, "Mietvertrag", f"Unbekannter Vertrag {vertrag_id}.", "/backoffice/vertraege")
     ctx = _ctx(session)
     require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
+    # Pilotausschluss-Objekt: die gemeinsame Mieterakte zeigt für ein
+    # ausgeschlossenes Objekt UEBERHAUPT KEINE Finanz-/Mietdaten -
+    # Codex-Rückprüfung 14.09.2026: eine nur SELEKTIVE Unterdrückung
+    # einzelner Kartenabschnitte (vorherige Fassung) ließ z. B. die
+    # Vorschreibung trotzdem durchrutschen. Blockt hier VOR jedem
+    # weiteren Datenread, konsistent mit dem etablierten Muster an
+    # dutzenden anderen Stellen dieser Datei (`_objekt_fuer_vertrag_
+    # gesperrt`) - bewusst NICHT das laxere Kontoauszug-Verhalten
+    # (dort bleibt aus historischen Gründen die reine Saldoansicht
+    # sichtbar; das ändert dieser Auftrag nicht).
+    if _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(
+            session, "Mieterakte",
+            "Objekt ist von der Pilotphase ausgeschlossen; die gemeinsame Mieterakte zeigt hierfür keine Finanz-/Mietdaten.",
+            "/backoffice/vertraege",
+        )
     einheit = _stammdaten_repo.get_einheit(vertrag.einheit_id)
     objekt = _stammdaten_repo.get_objekt(einheit.objekt_id) if einheit else None
     debitor = _stammdaten_repo.get_debitor(vertrag.debitor_id)
@@ -4459,12 +4493,24 @@ def vertragsanlage_detail(request: Request, vertrag_id: str, session=Depends(_cu
     komponenten = _stammdaten_repo.list_aktive_komponenten(vertrag_id, heute_wien())
     versionen = _stammdaten_repo.liste_mietvertragsprofil_versionen(vertrag_id)
 
-    rechtsprofil_hinweis = None
+    # Freigegebenes Rechtsprofil und ein ggf. NEUERER Entwurf werden
+    # GETRENNT ausgewiesen - ein Entwurf darf nie die Kennzeichnung
+    # "freigegeben" überschreiben (Codex-Rückprüfung 14.09.2026; die
+    # Liste ist nach Version absteigend sortiert, `historie[-1]` traf
+    # vorher fälschlich die ÄLTESTE statt die neueste Zeile).
     historie = _indexautomatik.rechtsprofil_service.liste_fuer_vertrag(vertrag_id)
-    if historie:
-        neuestes = historie[-1]
-        status_label = " (ENTWURF, noch nicht freigegeben)" if neuestes.status == "ENTWURF" else " (freigegeben)"
-        rechtsprofil_hinweis = f"Version {neuestes.version}, Rechtsordnung {neuestes.rechtsordnung}{status_label}"
+    freigegebenes_profil = next((p for p in historie if p.status == "FREIGEGEBEN"), None)
+    rechtsprofil_freigegeben_hinweis = (
+        f"Version {freigegebenes_profil.version}, Rechtsordnung {freigegebenes_profil.rechtsordnung}"
+        if freigegebenes_profil else None
+    )
+    neuester_entwurf = historie[0] if historie and historie[0].status == "ENTWURF" else None
+    rechtsprofil_entwurf_hinweis = None
+    if neuester_entwurf is not None and (freigegebenes_profil is None or neuester_entwurf.version > freigegebenes_profil.version):
+        rechtsprofil_entwurf_hinweis = (
+            f"Version {neuester_entwurf.version}, Rechtsordnung {neuester_entwurf.rechtsordnung} "
+            "(ENTWURF, noch nicht freigegeben)"
+        )
 
     index_klausel_hinweis = None
     freigegebene_klausel = _indexautomatik.index_repository.freigegebene_klausel(vertrag_id)
@@ -4472,6 +4518,16 @@ def vertragsanlage_detail(request: Request, vertrag_id: str, session=Depends(_cu
         index_klausel_hinweis = (
             f"Freigegeben: {freigegebene_klausel.basis_reihe} Basis {freigegebene_klausel.basis_wert} "
             f"(Bezugsmonat {freigegebene_klausel.basis_monat})"
+        )
+
+    index_pruefbedarf_hinweis = None
+    pruefbedarf_liste = _vertragspruefung_service.liste_index_pruefbedarf(vertrag_id)
+    if pruefbedarf_liste:
+        neuester_bedarf = pruefbedarf_liste[0]
+        index_pruefbedarf_hinweis = (
+            f"{len(pruefbedarf_liste)} Eintrag/Einträge, zuletzt {neuester_bedarf.basis_reihe or '—'} "
+            f"{neuester_bedarf.basis_wert if neuester_bedarf.basis_wert is not None else ''} "
+            f"({neuester_bedarf.basis_monat or 'kein Monat angegeben'}) - {neuester_bedarf.kommentar or 'ohne Kommentar'}"
         )
 
     letzte_pruefung_hinweis = None
@@ -4482,47 +4538,48 @@ def vertragsanlage_detail(request: Request, vertrag_id: str, session=Depends(_cu
             f"Status {letzte_pruefung.fachstatus} (Beleg: {letzte_pruefung.quellenbeleg_referenz})"
         )
 
-    # Tatsächlich persistierte Vorschreibungsdatensätze (Auftrag
-    # HV-20260914-AUFGABEN-MIETERAKTE, Ergänzung Codex-Bestandsprüfung) -
-    # NICHT nur die vereinbarten Komponenten.
-    vorschreibungen = _vorschreibung_repo.list_fuer_vertrag(vertrag_id)
-    vorschreibung_summen = {
-        v.id: sum(p.betrag_cent for p in _vorschreibung_repo.list_positionen(v.id)) for v in vorschreibungen
-    }
+    # Tatsächlich persistierte Vorschreibungsdatensätze samt
+    # Einzelpositionen (Auftrag HV-20260914-AUFGABEN-MIETERAKTE,
+    # Ergänzung Codex-Bestandsprüfung) - NICHT nur die vereinbarten
+    # Komponenten. Auswahl des "aktuellen" Monats erfolgt im Renderer
+    # anhand von `aktueller_monat`, NICHT durch bloße DESC-Sortierung
+    # (ein weit in der Zukunft hinterlegter Entwurf wäre sonst
+    # fälschlich "aktuell").
+    heute = heute_wien()
+    aktueller_monat = f"{heute.year:04d}-{heute.month:02d}"
+    vorschreibungen = _vorschreibung_repo.list_fuer_vertrag(vertrag_id, limit=24)
+    vorschreibung_positionen_je_id = {v.id: _vorschreibung_repo.list_positionen(v.id) for v in vorschreibungen}
 
-    # Ausgeschlossenes Objekt: Stammdaten bleiben sichtbar (wie beim
-    # bestehenden Kontoauszug), aber KEINE live berechnete Finanzzahl wird
-    # über diesen neuen, gemeinsamen Einstieg "eingeschleust" - dieselbe,
-    # bereits gehärtete Prüfung wie im Dashboard
-    # (`rueckstaende.service.berechne_rueckstandsuebersicht`), kein
-    # separater/laxerer Prüfpfad.
-    gesperrt = objekt.ausgeschlossen
-    kontostatus = None
-    unbekannte_faelligkeit_positionen: list = []
-    mahnfaelle: list = []
-    if not gesperrt:
-        uebersicht = berechne_rueckstandsuebersicht(
-            ctx=ctx, objekt_id=objekt.id, stammdaten_repository=_stammdaten_repo, op_service=_op_service,
-            mahn_fall_repository=_mahn_fall_repo,
-        )
-        kontostatus = next((z for z in uebersicht.mietkonten if z.vertrag_id == vertrag_id), None)
-        unbekannte_faelligkeit_positionen = [
-            p for p in uebersicht.offene_positionen if p.vertrag_id == vertrag_id and p.faelligkeitsklasse == "UNBEKANNT"
-        ]
-        mahnfaelle = [m for m in uebersicht.mahnfaelle if m.vertrag_id == vertrag_id]
+    uebersicht = berechne_rueckstandsuebersicht(
+        ctx=ctx, objekt_id=objekt.id, stammdaten_repository=_stammdaten_repo, op_service=_op_service,
+        mahn_fall_repository=_mahn_fall_repo,
+    )
+    kontostatus = next((z for z in uebersicht.mietkonten if z.vertrag_id == vertrag_id), None)
+    unbekannte_faelligkeit_positionen = [
+        p for p in uebersicht.offene_positionen if p.vertrag_id == vertrag_id and p.faelligkeitsklasse == "UNBEKANNT"
+    ]
+    mahnfaelle = [m for m in uebersicht.mahnfaelle if m.vertrag_id == vertrag_id]
 
-    zahlungen_positionen = _op_service.berechne_saldo(konto.id).positionen if (konto and not gesperrt) else []
+    zahlungen_positionen = _op_service.berechne_saldo(konto.id).positionen if konto else []
     sperren = _stammdaten_repo.aktive_sperren(vertrag_id)
+    mahnlaeufe = _hv_mail.mahnlauf_repo.list_fuer_vertrag(vertrag_id)
+    erhoehungsschreiben = _indexautomatik.outbox_repository.liste_fuer_vertrag(vertrag_id)
+    vertragsende_erinnerungen = _indexautomatik.vertragsende_repository.list_fuer_vertrag(vertrag_id)
 
     inhalt = _vertragsanlage_detail_ansicht(
         vertrag=vertrag, objekt=objekt, einheit=einheit, debitor=debitor, gesellschaft=gesellschaft,
         profil=profil, kaution=kaution, konto_id=konto.id if konto else None, komponenten=komponenten,
-        rechtsprofil_hinweis=rechtsprofil_hinweis, index_klausel_hinweis=index_klausel_hinweis,
+        rechtsprofil_freigegeben_hinweis=rechtsprofil_freigegeben_hinweis,
+        rechtsprofil_entwurf_hinweis=rechtsprofil_entwurf_hinweis,
+        index_klausel_hinweis=index_klausel_hinweis, index_pruefbedarf_hinweis=index_pruefbedarf_hinweis,
+        letzte_pruefung_hinweis=letzte_pruefung_hinweis,
         versionen=versionen, csrf=session.csrf_token,
-        gesperrt=gesperrt, vorschreibungen=vorschreibungen, vorschreibung_summen=vorschreibung_summen,
+        aktueller_monat=aktueller_monat, vorschreibungen=vorschreibungen,
+        vorschreibung_positionen_je_id=vorschreibung_positionen_je_id,
         kontostatus=kontostatus, unbekannte_faelligkeit_positionen=unbekannte_faelligkeit_positionen,
         zahlungen_positionen=zahlungen_positionen, sperren=sperren, mahnfaelle=mahnfaelle,
-        letzte_pruefung_hinweis=letzte_pruefung_hinweis,
+        mahnlaeufe=mahnlaeufe, erhoehungsschreiben=erhoehungsschreiben,
+        vertragsende_erinnerungen=vertragsende_erinnerungen, von_objekt=von_objekt,
     )
     return _layout(request, session, f"Mieterakte {debitor.name}", inhalt)
 
