@@ -11,7 +11,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from html import escape as h
 
-from mietinkasso.backoffice.views import csrf_feld, eur, option, parse_eur_betrag
+from mietinkasso.backoffice.views import csrf_feld, eur, option, parse_eur_betrag, sperrgrund_label
 from mietinkasso.domain.money import cents_to_decimal, zerlege_brutto_cent
 
 NUTZUNGSARTEN = ["UNGEKLAERT", "WOHNUNG", "BUERO", "GESCHAEFTSLOKAL", "SONSTIGE"]
@@ -838,7 +838,8 @@ def detail_ansicht(
     # -- Aufforderung zum Entsperren (Rückprüfung 14.09.2026). --------------
     sperren = sperren or []
     sperren_zeilen = "".join(
-        f"<tr><td>{h(s.grund)}</td><td>{s.gesetzt_am.strftime('%Y-%m-%d') if s.gesetzt_am else ''}</td>"
+        f"<tr><td>{h(sperrgrund_label(s.grund))} <span class='muted'>({h(s.grund)})</span></td>"
+        f"<td>{s.gesetzt_am.strftime('%Y-%m-%d') if s.gesetzt_am else ''}</td>"
         f"<td>{h(s.kommentar or '')}</td></tr>"
         for s in sperren
     )

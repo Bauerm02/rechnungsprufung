@@ -60,7 +60,8 @@ from mietinkasso.backoffice.vertragsanlage_form import (
     vorschau_ansicht as _vertragsanlage_vorschau_ansicht,
 )
 from mietinkasso.backoffice.views import (
-    csrf_feld, eur, flash_error, flash_ok, ist_bekannte_demo_umgebung, nutzungsstatus_label, option, parse_eur_betrag, seite,
+    csrf_feld, eur, flash_error, flash_ok, ist_bekannte_demo_umgebung, nutzungsstatus_label, option, parse_eur_betrag,
+    seite, sperrgrund_label,
 )
 from mietinkasso.bank.importer import (
     CamtKontoMismatchError,
@@ -469,10 +470,16 @@ def _erledigen_html(uebersicht) -> str:
         # Guthaben-Konto betrifft keinen anstehenden Mahnlauf.
         if z.sperrgruende and z.saldo_cent is not None and z.saldo_cent > 0:
             e = _eintrag(z.vertrag_id, fallback_quelle=z)
+            # Verständliche Labels statt Rohcodes (Auftrag HV-20260914-UI-
+            # LESBAR: "MANUELL/RECHTSANWALT/RATENPLAN übersetzen") - der
+            # Rohcode bleibt zusätzlich als title-Tooltip erhalten, keine
+            # Information geht verloren.
+            gruende_labels = ", ".join(sperrgrund_label(g) for g in z.sperrgruende)
+            gruende_codes = ", ".join(z.sperrgruende)
             e["gruende"].append((
                 "error",
-                f"Aktive Mahnsperre ({h(', '.join(z.sperrgruende))}) bei offenem Betrag {eur(z.saldo_cent)} - "
-                "vor einer Mahnung berücksichtigen",
+                f'<span title="{h(gruende_codes)}">Aktive Mahnsperre ({h(gruende_labels)})</span> bei offenem '
+                f"Betrag {eur(z.saldo_cent)} - vor einer Mahnung berücksichtigen",
                 "Status prüfen",
                 f"/backoffice/vertrag/{h(z.vertrag_id)}{von_objekt_param}#sperren",
             ))
@@ -489,15 +496,15 @@ def _erledigen_html(uebersicht) -> str:
         karten = []
         for e in eintraege.values():
             gruende_html = "".join(
-                f'<li><span class="badge badge-{stil}">{text}</span> '
+                f'<li><span class="aufgaben-grund-text"><span class="badge badge-{stil}">{text}</span></span> '
                 f'<a class="aufgabe-aktion" href="{link}">{h(aktion)}</a></li>'
                 for stil, text, aktion, link in e["gruende"]
             )
             einheit_zusatz = f" / {h(e['einheit_bezeichnung'])}" if e["einheit_bezeichnung"] else ""
             karten.append(
                 '<li class="aufgaben-karte">'
-                f'<div class="aufgaben-karte-kopf"><strong>{h(e["debitor_name"])}</strong> '
-                f'<span class="muted">{h(e["objekt_bezeichnung"])}{einheit_zusatz}</span></div>'
+                f'<div class="aufgaben-karte-kopf"><div class="aufgaben-name">{h(e["debitor_name"])}</div>'
+                f'<div class="muted">{h(e["objekt_bezeichnung"])}{einheit_zusatz}</div></div>'
                 f'<ul class="aufgaben-gruende">{gruende_html}</ul>'
                 "</li>"
             )
@@ -546,7 +553,11 @@ def _rueckstaende_kompakt_zeile_html(z, *, unbekannte_faelligkeit: bool) -> str:
 
     hinweise = []
     if z.sperrgruende:
-        hinweise.append(f'<span class="badge badge-error">Mahnung gesperrt ({h(", ".join(z.sperrgruende))})</span>')
+        sperrgrund_labels = ", ".join(sperrgrund_label(g) for g in z.sperrgruende)
+        sperrgrund_codes = ", ".join(z.sperrgruende)
+        hinweise.append(
+            f'<span class="badge badge-error" title="{h(sperrgrund_codes)}">Mahnung gesperrt ({h(sperrgrund_labels)})</span>'
+        )
     if z.abweichung_saldo_zu_positionen_cent:
         hinweise.append('<span class="badge badge-warn">Klärung nötig (Kontoabweichung)</span>')
     if unbekannte_faelligkeit:
@@ -595,7 +606,8 @@ def _rueckstaende_mietkonto_zeile_html(z) -> str:
     if z.nutzungsstatus == "LEERSTAND":
         status_tags.append('<span class="badge badge-warn">Leerstand</span>')
     if z.sperrgruende:
-        status_tags.append(f'<span class="badge badge-error">Sperre: {h(", ".join(z.sperrgruende))}</span>')
+        sperrgrund_labels = ", ".join(sperrgrund_label(g) for g in z.sperrgruende)
+        status_tags.append(f'<span class="badge badge-error">Sperre: {h(sperrgrund_labels)}</span>')
     if z.mahnfaelle_anzahl:
         status_tags.append(f'<span class="badge badge-muted">{z.mahnfaelle_anzahl} Mahnfall(e), siehe Tabelle unten</span>')
     konto_link = f'<a href="/backoffice/konto/{h(z.konto_id)}">{h(z.konto_id)}</a>' if z.konto_id else "-"
@@ -999,7 +1011,8 @@ def kontoauszug(request: Request, konto_id: str, session=Depends(_current_sessio
     </div>"""
 
     sperren_zeilen = "".join(
-        f"<tr><td>{h(s.grund)}</td><td>{s.gesetzt_am.isoformat() if s.gesetzt_am else ''}</td>"
+        f"<tr><td>{h(sperrgrund_label(s.grund))} <span class='muted'>({h(s.grund)})</span></td>"
+        f"<td>{s.gesetzt_am.isoformat() if s.gesetzt_am else ''}</td>"
         f"<td>{h(s.kommentar or '')}</td></tr>"
         for s in aktive_sperren
     )
@@ -2534,7 +2547,8 @@ def _pruefung_zeile_html(p) -> str:
 def _sperre_zeile_html(s, *, vertrag_id: str, csrf_token: str) -> str:
     return f"""
     <tr>
-      <td>{h(s.grund)}</td><td>{s.gesetzt_am.isoformat() if s.gesetzt_am else ''}</td><td>{h(s.kommentar or '')}</td>
+      <td>{h(sperrgrund_label(s.grund))} <span class="muted">({h(s.grund)})</span></td>
+      <td>{s.gesetzt_am.isoformat() if s.gesetzt_am else ''}</td><td>{h(s.kommentar or '')}</td>
       <td>
         <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/sperre/{s.id}/aufheben">
           {csrf_feld(csrf_token)}

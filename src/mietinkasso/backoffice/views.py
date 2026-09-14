@@ -190,6 +190,32 @@ def kurzstatus_text(*, environment: str, send_enabled: bool) -> str:
     return f"{betrieb} · E-Mail-Versand {versand} · Bankdaten manuell aktualisieren"
 
 
+_SPERRGRUND_LABEL = {
+    "STREIT": "Streitfall",
+    "MIETMINDERUNG": "Mietminderung geltend gemacht",
+    "RATENPLAN": "Ratenplan vereinbart",
+    "INSOLVENZ": "Insolvenzverfahren",
+    "RECHTSANWALT": "Anwaltlich vertreten",
+    "UNGEKLAERTER_EINGANG": "Ungeklärter Zahlungseingang",
+    "UNKLARER_EROEFFNUNGSSALDO": "Unklarer Eröffnungssaldo",
+    "BOUNCE": "E-Mail unzustellbar",
+    "MANUELL": "Manuell gesetzt",
+}
+
+
+def sperrgrund_label(code: str) -> str:
+    """Verständliche Übersetzung eines technischen Sperrgrund-Codes fürs
+    UI (Auftrag HV-20260914-UI-LESBAR: "MANUELL/RECHTSANWALT/RATENPLAN
+    verständlich übersetzen"). Der Rohcode bleibt an jeder Anzeigestelle
+    zusätzlich im HTML erhalten (Tooltip oder Klammerzusatz je nach
+    Platz) - nur die primäre Anzeige wird lesbar, Umfang/Block der
+    Sperre ändert sich nicht. Ein unbekannter/künftiger Code fällt
+    unverändert auf den Rohcode zurück (kein stiller
+    Informationsverlust)."""
+
+    return _SPERRGRUND_LABEL.get(code, code)
+
+
 def seite(
     *,
     titel: str,
@@ -229,24 +255,43 @@ def seite(
     --anthrazit: #1F2125; --anthrazit-hell: #33363b; --gold: #C9A86A; --gold-dunkel: #a9824a; --creme: #F5F2EC;
   }}
   * {{ box-sizing: border-box; }}
-  /* JLB-CI: Forum für Überschriften, EB Garamond für Fließtext - reine
-     Font-Family-Angabe mit lokalem Fallback (Constantia/Cambria/Georgia),
-     KEIN @font-face/Web-Font-Request, keine neue Abhängigkeit. Fehlen
-     Forum/EB Garamond lokal, greift der Browser lautlos auf den
-     Serif-Fallback zurück. */
-  body {{ font-family: "EB Garamond", Constantia, Cambria, Georgia, serif; font-size: 16px; margin: 0; background: var(--creme); color: var(--anthrazit); }}
-  h1, h2, h3, .schriftzug {{ font-family: Forum, Cambria, Georgia, serif; }}
-  header {{ background: var(--anthrazit); color: #fff; padding: 0.6rem 1.25rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; }}
-  header a {{ color: #fff; text-decoration: none; font-weight: 700; letter-spacing: 0.01em; }}
+  /* Auftrag HV-20260914-UI-LESBAR (Userkorrektur, hat für die
+     funktionale Weboberfläche Vorrang vor der JLB-Garamond-CI - PDFs/
+     Mails/Brandassets sind davon NICHT betroffen): System-UI-Sans-Serif
+     für alle Bedienelemente/Tabellen/Zahlen/Texte statt der bisherigen
+     Serifenschrift, die auf manchen Systemen winzig/fett wirkte. Reine
+     Font-Family-Angabe ohne @font-face/Web-Font-Request - kein neues
+     Framework, keine neue Abhängigkeit. Anthrazit/Gold bleiben die
+     Akzentfarben, aber sparsam (kleine Marker/Ränder statt große
+     einfarbige Flächen) auf hellem, neutralem Grund. */
+  body {{
+    font-family: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    font-size: 15px; line-height: 1.5; font-weight: 400; margin: 0;
+    background: var(--creme); color: var(--anthrazit); overflow-x: hidden;
+  }}
+  h1, h2, h3, .schriftzug {{ font-family: inherit; font-weight: 600; line-height: 1.3; }}
+  h1 {{ font-size: 1.35rem; }}
+  h2 {{ font-size: 1.1rem; }}
+  h3 {{ font-size: 0.98rem; }}
+  header {{ background: var(--anthrazit); color: #fff; padding: 0.55rem 1.25rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem 1rem; }}
+  header a {{ color: #fff; text-decoration: none; font-weight: 600; letter-spacing: 0.01em; }}
   header .muted {{ color: #d8d3c8; }}
-  header form button {{ background: transparent; border: 1px solid var(--gold); color: var(--gold); border-radius: 4px; padding: 0.25rem 0.7rem; }}
+  header form {{ display: inline-flex; align-items: center; gap: 0.5rem; }}
+  header form button {{ background: transparent; border: 1px solid var(--gold); color: var(--gold); border-radius: 4px; padding: 0.25rem 0.7rem; margin-top: 0; }}
   header form button:hover {{ background: var(--gold); color: var(--anthrazit); }}
-  .pilot-banner {{ background: var(--gold-dunkel); color: #fff; text-align: center; padding: 0.35rem 0.75rem; font-size: 0.82rem; font-weight: 600; }}
-  .pilot-banner .banner-details {{ margin-top: 0.15rem; font-size: 0.72rem; font-weight: 400; }}
-  .pilot-banner .banner-details summary {{ cursor: pointer; color: #fff; text-decoration: underline; }}
+  /* Kein "dominanter goldener Warnstreifen" mehr - der Betriebsstatus
+     bleibt lesbar/erkennbar (kleiner Gold-Punkt als sparsamer Akzent),
+     aber als schmale, helle Zeile statt einer vollflächigen Farbleiste. */
+  .pilot-banner {{
+    background: #fff; color: #4a4d52; border-bottom: 1px solid #e3ded3;
+    text-align: left; padding: 0.3rem 1.25rem; font-size: 0.78rem; font-weight: 400;
+  }}
+  .pilot-banner::before {{ content: "●"; color: var(--gold-dunkel); margin-right: 0.4rem; font-size: 0.7em; }}
+  .pilot-banner .banner-details {{ margin-top: 0.1rem; font-size: 0.74rem; font-weight: 400; }}
+  .pilot-banner .banner-details summary {{ cursor: pointer; color: var(--anthrazit); text-decoration: underline; font-weight: 400; }}
   nav.hauptnav {{ background: var(--anthrazit-hell); padding: 0 1.25rem; display: flex; flex-wrap: wrap; }}
   nav.hauptnav a {{
-    color: #eee9df; text-decoration: none; font-size: 0.92rem; font-weight: 600; padding: 0.7rem 0.9rem;
+    color: #eee9df; text-decoration: none; font-size: 0.85rem; font-weight: 600; padding: 0.65rem 0.85rem;
     border-bottom: 3px solid transparent; white-space: nowrap;
   }}
   nav.hauptnav a:hover {{ color: #fff; }}
@@ -254,57 +299,82 @@ def seite(
   main {{ padding: 1.25rem; max-width: 1150px; margin: 0 auto; }}
   h1, h2, h3 {{ color: var(--anthrazit); }}
   a {{ color: var(--anthrazit); }}
+  a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible,
+  textarea:focus-visible, summary:focus-visible {{
+    outline: 2px solid var(--gold-dunkel); outline-offset: 2px;
+  }}
   table {{ border-collapse: collapse; width: 100%; margin: 0.75rem 0; background: #fff; }}
-  th, td {{ border: 1px solid #ddd; padding: 0.35rem 0.55rem; text-align: left; font-size: 0.88rem; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; }}
-  th {{ background: #efeae0; }}
+  th, td {{ border: 1px solid #ddd; padding: 0.35rem 0.55rem; text-align: left; font-size: 0.85rem; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; }}
+  th {{ background: #efeae0; font-weight: 600; }}
   .card {{ background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }}
-  .warn {{ color: var(--gold-dunkel); font-weight: 600; }}
+  .warn {{ color: #8a6416; font-weight: 600; }}
   .error {{ color: #b00020; font-weight: 600; }}
   .ok {{ color: #1a7f37; font-weight: 600; }}
   .muted {{ color: #666; font-size: 0.85rem; }}
-  .flash-ok {{ background: #e6f4ea; border: 1px solid #1a7f37; padding: 0.55rem 0.9rem; border-radius: 4px; margin-bottom: 1rem; }}
-  .flash-error {{ background: #fbeaea; border: 1px solid #b00020; padding: 0.55rem 0.9rem; border-radius: 4px; margin-bottom: 1rem; }}
-  .gesperrt-row {{ background: #fbeaea; }}
+  .flash-ok {{ background: #eef7f0; border: 1px solid #bcdfc4; padding: 0.55rem 0.9rem; border-radius: 4px; margin-bottom: 1rem; }}
+  .flash-error {{ background: #fbeaea; border: 1px solid #e0a8a8; padding: 0.55rem 0.9rem; border-radius: 4px; margin-bottom: 1rem; }}
+  .gesperrt-row {{ background: #fdf3f3; }}
   .kpi-grid {{ display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 0.75rem; }}
   .kpi {{ background: #fff; border: 1px solid #ddd; border-left: 4px solid var(--gold); border-radius: 6px; padding: 0.65rem 0.9rem; flex: 1 1 170px; min-width: 150px; }}
-  .kpi .zahl {{ font-size: 1.3rem; font-weight: 700; display: block; color: var(--anthrazit); }}
+  .kpi .zahl {{ font-size: 1.2rem; font-weight: 600; display: block; color: var(--anthrazit); }}
   .kpi .kpi-label {{ font-size: 0.76rem; color: #666; }}
-  .badge {{ display: inline-block; padding: 0.05rem 0.4rem; border-radius: 3px; font-size: 0.78rem; font-weight: 600; }}
+  .badge {{ display: inline-block; padding: 0.1rem 0.5rem; border-radius: 3px; font-size: 0.78rem; font-weight: 600; }}
   .badge-error {{ background: #fbeaea; color: #b00020; }}
-  .badge-warn {{ background: #fdf0dc; color: #a15c00; }}
+  .badge-warn {{ background: #fdf0dc; color: #8a6416; }}
   .badge-ok {{ background: #e6f4ea; color: #1a7f37; }}
   .badge-muted {{ background: #eee; color: #555; }}
   .tabelle-scroll {{ overflow-x: auto; max-width: 100%; }}
   label {{ display: block; margin: 0.5rem 0 0.15rem; font-weight: 600; font-size: 0.85rem; }}
-  input, select, textarea {{ width: 100%; box-sizing: border-box; padding: 0.35rem 0.5rem; font: inherit; border: 1px solid #ccc; border-radius: 4px; }}
-  button, input[type=submit] {{ font: inherit; padding: 0.45rem 0.95rem; cursor: pointer; border-radius: 4px; border: 1px solid var(--anthrazit); background: var(--anthrazit); color: #fff; width: auto; margin-top: 0.6rem; }}
+  input, select, textarea {{ width: 100%; max-width: 100%; box-sizing: border-box; padding: 0.35rem 0.5rem; font: inherit; border: 1px solid #ccc; border-radius: 4px; }}
+  button, input[type=submit] {{ font: inherit; font-weight: 600; padding: 0.45rem 0.95rem; cursor: pointer; border-radius: 4px; border: 1px solid var(--anthrazit); background: var(--anthrazit); color: #fff; width: auto; max-width: 100%; margin-top: 0.6rem; }}
   button:hover, input[type=submit]:hover {{ background: var(--anthrazit-hell); }}
   button.secondary {{ background: #fff; color: var(--anthrazit); }}
   button.secondary:hover {{ background: #f0ede5; }}
-  button.gross {{ background: var(--gold); color: var(--anthrazit); border-color: var(--gold-dunkel); font-size: 1rem; padding: 0.6rem 1.3rem; font-weight: 700; }}
+  button.gross {{ background: var(--gold); color: var(--anthrazit); border-color: var(--gold-dunkel); font-size: 1rem; padding: 0.6rem 1.3rem; font-weight: 600; }}
   button.gross:hover {{ background: var(--gold-dunkel); color: #fff; }}
   fieldset {{ border: 1px solid #ddd; border-radius: 6px; margin-bottom: 1rem; padding: 0.75rem 1rem; }}
-  nav.tabs a {{ margin-right: 1rem; font-size: 0.9rem; }}
-  code {{ background: #f0f0f0; padding: 0.05rem 0.3rem; border-radius: 3px; }}
+  nav.tabs a {{ margin-right: 1rem; font-size: 0.88rem; }}
+  code {{ background: #f0f0f0; padding: 0.05rem 0.3rem; border-radius: 3px; font-size: 0.9em; }}
   .bereich-karten {{ display: flex; flex-wrap: wrap; gap: 0.9rem; }}
   .bereich-karten .card {{ flex: 1 1 260px; margin-bottom: 0; }}
   .todo-liste {{ list-style: none; margin: 0; padding: 0; }}
   .todo-liste li {{ padding: 0.4rem 0; border-bottom: 1px solid #eee; }}
   .todo-liste li:last-child {{ border-bottom: none; }}
+  /* Aufgabenliste (Dashboard "Das ist zu erledigen"): Name in eigener
+     Zeile, Objekt/Top sekundär (kleiner/gedämpft) darunter, je Grund
+     Text links und Aktionsbutton rechts ausgerichtet - siehe
+     Media-Query unten fürs geordnete Stapeln ab 820px. */
   .aufgaben-liste {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.6rem; }}
-  .aufgaben-karte {{ border: 1px solid #ddd; border-left: 4px solid var(--gold); border-radius: 6px; padding: 0.6rem 0.8rem; background: #fcfbf8; }}
-  .aufgaben-karte-kopf {{ margin-bottom: 0.3rem; }}
-  .aufgaben-gruende {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; }}
-  .aufgaben-gruende li {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }}
-  a.aufgabe-aktion {{ display: inline-block; padding: 0.3rem 0.75rem; border-radius: 4px; border: 1px solid var(--anthrazit); background: var(--anthrazit); color: #fff; text-decoration: none; font-size: 0.82rem; font-weight: 600; }}
+  .aufgaben-karte {{ border: 1px solid #ddd; border-left: 3px solid var(--gold); border-radius: 6px; padding: 0.6rem 0.8rem; background: #fff; }}
+  .aufgaben-karte-kopf {{ margin-bottom: 0.4rem; display: flex; flex-direction: column; gap: 0.1rem; }}
+  .aufgaben-name {{ font-weight: 600; }}
+  .aufgaben-gruende {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }}
+  .aufgaben-gruende li {{
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.4rem 0.75rem;
+  }}
+  .aufgaben-grund-text {{ flex: 1 1 auto; min-width: 0; }}
+  a.aufgabe-aktion {{
+    display: inline-block; flex: 0 0 auto; padding: 0.3rem 0.75rem; border-radius: 4px;
+    border: 1px solid var(--anthrazit); background: var(--anthrazit); color: #fff; text-decoration: none;
+    font-size: 0.82rem; font-weight: 600; white-space: nowrap;
+  }}
   a.aufgabe-aktion:hover {{ background: var(--anthrazit-hell); }}
   .status-zeile {{ display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; font-size: 0.85rem; color: #555; margin: 0.5rem 0; }}
   details > summary {{ cursor: pointer; color: var(--anthrazit); font-weight: 600; }}
+  img {{ max-width: 100%; }}
+  @media (max-width: 820px) {{
+    /* Auftrag HV-20260914-UI-LESBAR: Button/Grund-Zeilen wrappten hier
+       bisher chaotisch - ab dieser Breite wird geordnet gestapelt statt
+       nebeneinander gequetscht. */
+    .aufgaben-gruende li {{ flex-direction: column; align-items: stretch; }}
+    a.aufgabe-aktion {{ text-align: center; }}
+  }}
   @media (max-width: 640px) {{
     main {{ padding: 0.75rem; }}
     header {{ padding: 0.5rem 0.75rem; }}
+    .pilot-banner {{ padding: 0.3rem 0.75rem; }}
     nav.hauptnav {{ padding: 0 0.5rem; }}
-    nav.hauptnav a {{ padding: 0.6rem 0.55rem; font-size: 0.82rem; }}
+    nav.hauptnav a {{ padding: 0.6rem 0.55rem; font-size: 0.8rem; }}
     .kpi {{ flex: 1 1 100%; }}
     .bereich-karten .card {{ flex: 1 1 100%; }}
     /* Kompakte Kontentabelle wird zu lesbaren Karten/Zeilen statt seitlich
