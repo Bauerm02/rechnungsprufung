@@ -13,6 +13,7 @@ from mietinkasso.indexautomatik.mailops_transport import MailOpsTransportadapter
 from mietinkasso.infrastructure.db.tables import (
     AuditEventTable, ErhoehungsschreibenTable, MahnFallTable, VertragsendeErinnerungTable,
 )
+from mietinkasso.mahnwesen.kosten import zins_bis_einschliesslich
 from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
 from mietinkasso.mahnwesen.kosten_service import MahnkostenService
 from mietinkasso.mahnwesen.repository import (
@@ -64,15 +65,22 @@ def _mahnkosten_text_baustein(vorschau) -> str:
     neu_zinsen = vorschau.neue_zinsen_delta_cent
     if neu_zinsen > 0:
         satz_text = f"{vorschau.zinssatz_prozent} % p.a." if vorschau.zinssatz_prozent is not None else "mehreren Sätzen (siehe Zeiträume unten)"
-        zeitraum_text = f"{vorschau.zins_von.strftime('%d.%m.%Y')} bis {vorschau.zins_bis.strftime('%d.%m.%Y')}" if vorschau.zins_von and vorschau.zins_bis else ""
+        # `zins_bis`/`segment.bis` sind EXKLUSIV (siehe `kosten.py::
+        # ZinsSegment`-Docstring) - für den Mieter wird der tatsächlich
+        # letzte verzinste Tag ausgewiesen (`zins_bis_einschliesslich`),
+        # nie das exklusive Enddatum selbst.
+        zeitraum_text = (
+            f"{vorschau.zins_von.strftime('%d.%m.%Y')} bis {zins_bis_einschliesslich(vorschau.zins_bis).strftime('%d.%m.%Y')} (einschließlich)"
+            if vorschau.zins_von and vorschau.zins_bis else ""
+        )
         zeilen.append(f"Neu anzusetzende Verzugszinsen: {_eur_text(neu_zinsen)} EUR ({satz_text}, Zeitraum {zeitraum_text}).")
         if len(vorschau.zins_segmente) > 1:
             for segment in vorschau.zins_segmente:
                 if segment.zinsen_cent <= 0:
                     continue
                 zeilen.append(
-                    f"  - {segment.von.strftime('%d.%m.%Y')} bis {segment.bis.strftime('%d.%m.%Y')}: "
-                    f"{_eur_text(segment.zinsen_cent)} EUR ({segment.satz_prozent} % p.a.)."
+                    f"  - {segment.von.strftime('%d.%m.%Y')} bis {zins_bis_einschliesslich(segment.bis).strftime('%d.%m.%Y')} "
+                    f"(einschließlich): {_eur_text(segment.zinsen_cent)} EUR ({segment.satz_prozent} % p.a.)."
                 )
     if vorschau.zins_teilweise_ungeklaert:
         zeilen.append(

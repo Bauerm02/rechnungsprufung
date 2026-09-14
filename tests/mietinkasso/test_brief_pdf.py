@@ -204,9 +204,11 @@ def test_zinssegmente_werden_mit_zeitraum_und_satz_aufgelistet():
         gesamtbetrag_cent=83_000 + 2073 + 54,
     )
     text = PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text()
-    assert "01.06.2026" in text and "30.06.2026" in text
+    # `Zinssegment.bis` ist EXKLUSIV - angezeigt wird der tatsächlich
+    # letzte verzinste Tag (bis minus 1 Tag), ausdrücklich "einschließlich".
+    assert "01.06.2026" in text and "29.06.2026" in text and "(einschließlich)" in text
     assert "1.530" in text
-    assert "01.07.2026" in text and "28.09.2026" in text
+    assert "01.07.2026" in text and "27.09.2026" in text
     assert "2.000" in text
 
 

@@ -24,6 +24,8 @@ from pathlib import Path
 
 from fpdf import FPDF
 
+from mietinkasso.mahnwesen.kosten import zins_bis_einschliesslich
+
 _FALLBACK_FONT_REGULAR = "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"
 _FALLBACK_FONT_BOLD = "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf"
 
@@ -270,8 +272,11 @@ def erzeuge_mahnbrief_pdf(
             if segment.zinsen_cent <= 0:
                 continue
             satz = f"{segment.satz_prozent} % p.a." if segment.satz_prozent is not None else "Satz ungeklärt"
+            # `segment.bis` ist EXKLUSIV (siehe `kosten.py::ZinsSegment`) -
+            # angezeigt wird der tatsächlich letzte verzinste Tag.
+            bis_einschliesslich = zins_bis_einschliesslich(segment.bis)
             _zeile(
-                pdf, f"{segment.von.strftime('%d.%m.%Y')}–{segment.bis.strftime('%d.%m.%Y')}: {satz}",
+                pdf, f"{segment.von.strftime('%d.%m.%Y')}–{bis_einschliesslich.strftime('%d.%m.%Y')} (einschließlich): {satz}",
                 segment.zinsen_cent, einzug=6,
             )
 

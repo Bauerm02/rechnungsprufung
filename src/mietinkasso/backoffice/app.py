@@ -97,6 +97,7 @@ from mietinkasso.mahnwesen.brief_pdf import (
     Absender as _BriefAbsender, AdressfehlerError as _BriefAdressfehlerError, Forderungszeile as _BriefForderungszeile,
     Zinssegment as _BriefZinssegment, erzeuge_mahnbrief_pdf as _erzeuge_mahnbrief_pdf,
 )
+from mietinkasso.mahnwesen.kosten import zins_bis_einschliesslich as _zins_bis_einschliesslich
 from mietinkasso.op.service import compute_content_hash as _compute_content_hash
 from mietinkasso.mahnwesen.repository import (
     BriefAnbieterProfilRepository, MahnFallRepository, MahnKanalregelRepository, MahnPolicyRepository,
@@ -1619,8 +1620,11 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
         if vorschau is None:
             continue
         satz_text = f"{vorschau.zinssatz_prozent} % p.a." if vorschau.zinssatz_prozent is not None else "ungeklärt"
+        # `zins_bis` ist EXKLUSIV (siehe `kosten.py::ZinsSegment`-
+        # Docstring) - angezeigt wird der tatsächlich letzte verzinste
+        # Tag, nie das exklusive Enddatum selbst.
         zeitraum_text = (
-            f"{vorschau.zins_von.isoformat()} – {vorschau.zins_bis.isoformat()}"
+            f"{vorschau.zins_von.isoformat()} – {_zins_bis_einschliesslich(vorschau.zins_bis).isoformat()} (einschließlich)"
             if vorschau.zins_von and vorschau.zins_bis else "–"
         )
         gebuehr_text = eur(vorschau.gebuehr_cent) if vorschau.gebuehr_cent is not None else "keine (bereits erhoben oder ungeklärt)"
@@ -1633,13 +1637,13 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
                     return "<span class=\"warn\">ungeklärt</span>"
                 return h(f"{s.satz_prozent} %")
             zeilen_segmente = "".join(
-                f"<tr><td>{s.von.isoformat()} – {s.bis.isoformat()}</td><td>{eur(s.rest_cent)}</td>"
+                f"<tr><td>{s.von.isoformat()} – {_zins_bis_einschliesslich(s.bis).isoformat()}</td><td>{eur(s.rest_cent)}</td>"
                 f"<td>{_satz_zelle(s)}</td>"
                 f"<td>{eur(s.zinsen_cent)}</td><td>{h(s.quelle)}</td></tr>"
                 for s in vorschau.zins_segmente
             )
             segmente_html = f"""<details><summary>Zinssegmente ({len(vorschau.zins_segmente)}, je Forderung/Halbjahr)</summary>
-              <table><tr><th>Zeitraum</th><th>Basis</th><th>Satz</th><th>Zinsen</th><th>Quelle</th></tr>{zeilen_segmente}</table>
+              <table><tr><th>Zeitraum (bis einschließlich)</th><th>Basis</th><th>Satz</th><th>Zinsen</th><th>Quelle</th></tr>{zeilen_segmente}</table>
             </details>"""
         gebuehr_segmente_html = ""
         if len(vorschau.gebuehr_segmente) > 1:

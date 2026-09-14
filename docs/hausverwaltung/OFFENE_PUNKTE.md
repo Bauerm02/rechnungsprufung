@@ -3310,4 +3310,12 @@ behoben:
    der Download bleibt ausdrücklich eine aktuelle Live-Vorschau, kein
    eingefrorener Versandnachweis.
 
+6. **Präzisierungsfix Zinszeitraum-Anzeige**: `ZinsSegment.bis`/
+   `MahnkostenVorschau.zins_bis` sind ausdrücklich EXKLUSIV (unverändert
+   an der bereits geprüften Zinsberechnung), wurden in PDF, E-Mail-Text
+   und Portal aber als "bis DD.MM." angezeigt, als wäre `bis` der letzte
+   verzinste Tag. Neue gemeinsame Hilfsfunktion
+   `kosten.zins_bis_einschliesslich(bis)` (= `bis - 1 Tag`) in allen drei
+   Ausgabestellen verwendet, jeweils mit Zusatz "(einschließlich)".
+
 18 neue/erweiterte Tests, 1042/1042 grün im Gesamtlauf. Keine Liveaktionen.

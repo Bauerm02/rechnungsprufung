@@ -260,6 +260,16 @@ def balance_zeitreihe_fuer_forderung(
     return perioden
 
 
+def zins_bis_einschliesslich(bis: date) -> date:
+    """`ZinsSegment.bis`/`MahnkostenVorschau.zins_bis` sind EXKLUSIV
+    (siehe `ZinsSegment`-Docstring) - für jede Anzeige gegenüber Mieter/
+    Portal/Brief wird stattdessen der tatsächlich letzte verzinste Tag
+    gebraucht (`bis - 1 Tag`), NIE das exklusive Enddatum selbst.
+    Ändert NICHTS an der Zinsberechnung, nur an deren Anzeige."""
+
+    return bis - timedelta(days=1)
+
+
 @dataclass(frozen=True)
 class ZinsSegment:
     """Ein taggenau abgegrenztes Teilstück EINER `BalancePeriode` mit
