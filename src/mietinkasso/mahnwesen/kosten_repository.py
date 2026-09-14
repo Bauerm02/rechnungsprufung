@@ -11,7 +11,12 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from mietinkasso.infrastructure.db.tables import MahnkostenBuchungTable, OenbBasiszinssatzTable, ZinsprofilTable
+from mietinkasso.infrastructure.db.tables import (
+    MahnkostenBuchungTable,
+    MahnkostenGebuehrTable,
+    OenbBasiszinssatzTable,
+    ZinsprofilTable,
+)
 
 
 class MahnkostenRepository:
@@ -91,20 +96,46 @@ class MahnkostenRepository:
 
     # -- OeNB-Basiszinssatz ---------------------------------------------------
     def basiszinssatz_fuer_datum(self, datum: date) -> OenbBasiszinssatzTable | None:
+        """`.limit(1)` ist bewusst gesetzt: `basiszinssatz_erfassen` lehnt
+        neue, sich überlappende Zeiträume bereits beim Erfassen ab, aber
+        ein `.scalar_one_or_none()` ohne Limit würde bei doch vorhandenen
+        Altdaten mit überlappenden Zeiträumen mit `MultipleResultsFound`
+        abstürzen statt die Zinsberechnung mit einem klaren Hinweis
+        weiterlaufen zu lassen - siehe `basiszinssatz_erfassen`."""
+
         with self._session_factory() as session:
             return session.execute(
                 select(OenbBasiszinssatzTable)
                 .where(OenbBasiszinssatzTable.gueltig_von <= datum)
                 .where(OenbBasiszinssatzTable.gueltig_bis >= datum)
+                .order_by(OenbBasiszinssatzTable.gueltig_von)
+                .limit(1)
             ).scalar_one_or_none()
 
     def basiszinssatz_erfassen(
         self, *, id: str, gueltig_von: date, gueltig_bis: date, basiszinssatz_prozent, erfasst_von: str, quelle_referenz: str,
     ) -> OenbBasiszinssatzTable:
+        if gueltig_bis < gueltig_von:
+            raise ValueError(f"Basiszinssatz '{id}': gueltig_bis ({gueltig_bis}) liegt vor gueltig_von ({gueltig_von}).")
         with self._session_factory() as session:
             bestehend = session.get(OenbBasiszinssatzTable, id)
             if bestehend is not None:
                 raise ValueError(f"Basiszinssatz '{id}' bereits erfasst - Halbjahreswerte sind unveränderlich, ggf. neuen Zeitraum verwenden.")
+            # Zwei verschiedene IDs mit überlappenden Gültigkeitszeiträumen
+            # würden `basiszinssatz_fuer_datum` für Tage im Überlappungs-
+            # bereich mehrdeutig machen - das wird HIER beim Erfassen
+            # abgelehnt, nicht erst bei der Zinsberechnung entdeckt.
+            ueberlappung = session.execute(
+                select(OenbBasiszinssatzTable)
+                .where(OenbBasiszinssatzTable.gueltig_von <= gueltig_bis)
+                .where(OenbBasiszinssatzTable.gueltig_bis >= gueltig_von)
+                .limit(1)
+            ).scalar_one_or_none()
+            if ueberlappung is not None:
+                raise ValueError(
+                    f"Basiszinssatz '{id}' ({gueltig_von}–{gueltig_bis}) überschneidet sich mit bereits "
+                    f"erfasstem Zeitraum '{ueberlappung.id}' ({ueberlappung.gueltig_von}–{ueberlappung.gueltig_bis})."
+                )
             row = OenbBasiszinssatzTable(
                 id=id, gueltig_von=gueltig_von, gueltig_bis=gueltig_bis,
                 basiszinssatz_prozent=basiszinssatz_prozent, erfasst_von=erfasst_von, quelle_referenz=quelle_referenz,
@@ -117,6 +148,21 @@ class MahnkostenRepository:
     def liste_basiszinssaetze(self) -> list[OenbBasiszinssatzTable]:
         with self._session_factory() as session:
             return list(session.execute(select(OenbBasiszinssatzTable).order_by(OenbBasiszinssatzTable.gueltig_von)).scalars().all())
+
+    def naechster_basiszinssatz_ab(self, datum: date) -> OenbBasiszinssatzTable | None:
+        """Der FRÜHESTE erfasste Basiszinssatz, dessen Gültigkeit erst
+        NACH `datum` beginnt - für eine präzise Lückenabgrenzung in
+        `kosten.py::_segmentiere_periode_ugb`, falls ein Zwischenhalbjahr
+        fehlt, ein späteres aber schon erfasst ist (statt die Lücke bis
+        zum Periodenende pauschal als ungeklärt zu markieren)."""
+
+        with self._session_factory() as session:
+            return session.execute(
+                select(OenbBasiszinssatzTable)
+                .where(OenbBasiszinssatzTable.gueltig_von > datum)
+                .order_by(OenbBasiszinssatzTable.gueltig_von)
+                .limit(1)
+            ).scalar_one_or_none()
 
     # -- Mahnkosten-Buchungsledger --------------------------------------------
     def bereits_gebuchte_zinsen_cent(self, *, vertrag_id: str) -> int:
@@ -132,19 +178,52 @@ class MahnkostenRepository:
             ).all()
             return sum(z for (z,) in zeilen)
 
-    def gebuehr_bereits_gebucht(self, *, vertrag_id: str) -> bool:
-        """§458 UGB: einmal je Forderung/Mahnlauf - hier vertragsweit
-        geprüft (nicht nur je Stufe), damit Stufe 2 keine ZWEITE Gebühr
-        für dieselbe zugrunde liegende Entgeltforderung ansetzt."""
+    def bereits_erhobene_gebuehr_schluessel(self, *, vertrag_id: str) -> frozenset[str]:
+        """Alle `entgeltforderung_schluessel`, für die für DIESEN Vertrag
+        bereits PERMANENT eine §458-UGB-Pauschale erhoben wurde - über
+        ALLE Mahnläufe/Stufen hinweg (siehe
+        `kosten.py::MahnkostenGebuehrTable`-Moduldoc). Eine hier
+        enthaltene Entgeltforderung löst NIE wieder eine zweite Pauschale
+        aus; eine GENUIN andere (nicht enthaltene) Entgeltforderung kann
+        weiterhin ihre eigene, separate Pauschale auslösen."""
 
         with self._session_factory() as session:
-            treffer = session.execute(
-                select(MahnkostenBuchungTable.id)
-                .where(MahnkostenBuchungTable.vertrag_id == vertrag_id)
-                .where(MahnkostenBuchungTable.gebuehr_cent.is_not(None))
-                .limit(1)
-            ).first()
-            return treffer is not None
+            zeilen = session.execute(
+                select(MahnkostenGebuehrTable.entgeltforderung_schluessel)
+                .where(MahnkostenGebuehrTable.vertrag_id == vertrag_id)
+            ).all()
+            return frozenset(s for (s,) in zeilen)
+
+    def gebuehr_erheben(
+        self, *, vertrag_id: str, entgeltforderung_schluessel: str, betrag_cent: int, rechtsgrundlage: str,
+        mahnkosten_buchung_id: int | None, gebuehr_op_position_id: int | None, erstellt_von: str,
+        session: Session | None = None,
+    ) -> MahnkostenGebuehrTable:
+        """Schreibt die PERMANENTE Erhebung fest - die Unique-Constraint
+        `uq_mahnkosten_gebuehr_forderung` ist hier das FACHLICHE Gate
+        selbst (siehe Tabellen-Docstring), kein bloßes Race-Netz: ein
+        zweiter Versuch für dieselbe Entgeltforderung MUSS mit
+        `IntegrityError` scheitern."""
+
+        def _schreiben(active_session: Session) -> MahnkostenGebuehrTable:
+            row = MahnkostenGebuehrTable(
+                vertrag_id=vertrag_id, entgeltforderung_schluessel=entgeltforderung_schluessel,
+                betrag_cent=betrag_cent, rechtsgrundlage=rechtsgrundlage,
+                mahnkosten_buchung_id=mahnkosten_buchung_id, gebuehr_op_position_id=gebuehr_op_position_id,
+                erstellt_von=erstellt_von,
+            )
+            active_session.add(row)
+            return row
+
+        if session is not None:
+            row = _schreiben(session)
+            session.flush()
+            return row
+        with self._session_factory() as owned_session:
+            row = _schreiben(owned_session)
+            owned_session.commit()
+            owned_session.refresh(row)
+            return row
 
     def buchung_fuer_stichtag(self, *, vertrag_id: str, stufe: int, zins_bis: date) -> MahnkostenBuchungTable | None:
         with self._session_factory() as session:
@@ -160,7 +239,7 @@ class MahnkostenRepository:
         hauptforderung_cent: int, zinsbasis: str, zinssatz_prozent, zins_von: date, zins_bis: date,
         zinsen_cent: int, gebuehr_cent: int | None, rechtsgrundlage_gebuehr: str | None,
         versandnachweis_referenz: str, zinsen_op_position_id: int | None, gebuehr_op_position_id: int | None,
-        erstellt_von: str, session: Session | None = None,
+        erstellt_von: str, zins_segmente_json: str = "[]", session: Session | None = None,
     ) -> MahnkostenBuchungTable:
         """`session`: siehe `stammdaten/repository.py::upsert_gesellschaft` -
         übergeben, um diese Buchung Teil derselben atomaren Transaktion
@@ -181,7 +260,7 @@ class MahnkostenRepository:
                 zins_von=zins_von, zins_bis=zins_bis, zinsen_cent=zinsen_cent, gebuehr_cent=gebuehr_cent,
                 rechtsgrundlage_gebuehr=rechtsgrundlage_gebuehr, versandnachweis_referenz=versandnachweis_referenz,
                 zinsen_op_position_id=zinsen_op_position_id, gebuehr_op_position_id=gebuehr_op_position_id,
-                erstellt_von=erstellt_von,
+                zins_segmente_json=zins_segmente_json, erstellt_von=erstellt_von,
             )
             active_session.add(row)
             return row

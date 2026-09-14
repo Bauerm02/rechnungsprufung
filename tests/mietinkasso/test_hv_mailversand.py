@@ -177,6 +177,162 @@ def _seed_index(service, contract, ctx):
     return b.outbox_repository.get(result.erhoehungsschreiben_id)
 
 
+# -- Mahnlauf-Bündelung (Rückprüfung 14.09.2026): ein Schreiben je Vertrag+Stufe --
+
+
+def _bank_bestaetigen(service, contract, bis):
+    service.bank_repo.upsert_bank_konto(id="SYNTHETIC-BANK", gesellschaft_id=contract.gesellschaft_id,
+        iban="SYNTHETIC-NOT-A-REAL-IBAN", bezeichnung="Testkonto")
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="SYNTHETIC-BANK",
+        bestaetigt_bis=bis, bestaetigt_von="SYNTHETIC-TEST")
+
+
+def _seed_zwei_komponenten(hv, contract, account, ctx, *, faelligkeit=date(2026, 9, 5)):
+    service, _ = hv
+    belegdatum = faelligkeit.replace(day=1)
+    policy = service.policy_repo.anlegen(stufe1_tage_nach_faelligkeit=7,
+        stufe2_mindesttage_nach_stufe1_versand=14, zinsen_prozent=Decimal("0"), gebuehr_cent=0, status="ENTWURF")
+    service.policy_repo.freigeben(policy.id)
+    service.op_service.buchen(ctx=ctx, konto=account, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=belegdatum, buchungsdatum=belegdatum, faelligkeit=faelligkeit,
+        leistungsperiode=faelligkeit.strftime("%Y-%m"), beleg_referenz="SYNTHETIC HMZ")
+    service.op_service.buchen(ctx=ctx, konto=account, typ=OPTyp.SOLL, betrag_cent=15_000,
+        belegdatum=belegdatum, buchungsdatum=belegdatum, faelligkeit=faelligkeit,
+        leistungsperiode=faelligkeit.strftime("%Y-%m"), beleg_referenz="SYNTHETIC BK")
+
+
+def test_mahnlauf_buendelt_zwei_komponenten_derselben_periode_zu_einem_schreiben(hv, basis_vertrag, admin_ctx):
+    """Abnahmekriterium 14.09.2026: HMZ + BK derselben Vorschreibung
+    dürfen NICHT zu zwei separaten Mahnschreiben führen - genau EIN
+    tatsächlicher Versand je Vertrag und Mahnstufe, auch wenn zwei
+    MahnFälle (je OP-Zeile) geplant werden."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    state["status"] = "GESENDET"
+    _seed_zwei_komponenten(hv, contract, account, admin_ctx)
+    _bank_bestaetigen(service, contract, date(2026, 9, 13))
+
+    result = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+
+    assert result["geplant"] == 2  # zwei MahnFälle geplant (je OP-Zeile) ...
+    assert len(state["calls"]) == 1  # ... aber GENAU EIN tatsächlicher Versand
+    assert result["gesendet"] == 1
+    body = json.loads(state["calls"][0].content)
+    assert "750,00 EUR" in body["text"]  # 600 + 150 EUR kombiniert
+
+    faelle = service.mahn_repo.list_fuer_vertrag(contract.id)
+    assert len(faelle) == 2
+    assert all(f.status == "GESENDET" for f in faelle)
+    # Derselbe tatsächliche Versandzeitpunkt für BEIDE MahnFälle - EIN Brief.
+    assert len({f.gesendet_am for f in faelle}) == 1
+
+
+def test_mahnlauf_zwei_gleichzeitige_aufrufe_fuer_verschiedene_gruppenmitglieder_senden_nur_einmal(
+    hv, basis_vertrag, admin_ctx,
+):
+    """Synthetische Regression für konkurrierende/mehrfache
+    Versandverarbeitung: zwei (hier sequenziell simulierte, aber je für
+    ein ANDERES Gruppenmitglied aufgerufene) Dispatch-Versuche dürfen
+    NIEMALS zwei E-Mails auslösen - beide lösen dieselbe Gruppe/denselben
+    führenden Fall auf und konkurrieren um dessen atomaren Claim."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    state["status"] = "GESENDET"
+    _seed_zwei_komponenten(hv, contract, account, admin_ctx)
+    _bank_bestaetigen(service, contract, date(2026, 9, 13))
+    policy = service.policy_repo.aktuelle_freigegebene()
+    geplant = service.mahn_service.plane_alle_offenen_forderungen(
+        ctx=admin_ctx, vertrag=contract, konto=account, policy=policy, heute=date(2026, 9, 13),
+        bank_bestaetigt_bis=date(2026, 9, 13),
+    )
+    assert len(geplant) == 2
+    id_a, id_b = geplant[0].mahnfall_id, geplant[1].mahnfall_id
+
+    # Erster Dispatch-Versuch (für Mitglied A) verarbeitet die GANZE Gruppe
+    # (inkl. B) in einem Rutsch und sendet EINMAL tatsächlich.
+    ergebnis_a = service.mahnung_senden(ctx=admin_ctx, row_id=id_a, heute=date(2026, 9, 13))
+    # Ein zweiter, für das ANDERE Gruppenmitglied gestarteter Dispatch-
+    # Versuch (z. B. ein zweiter, gleichzeitig laufender Worker) findet
+    # dieselbe Forderung bereits verarbeitet vor - kein zweiter Versand.
+    ergebnis_b = service.mahnung_senden(ctx=admin_ctx, row_id=id_b, heute=date(2026, 9, 13))
+
+    assert len(state["calls"]) == 1  # trotz zweier Dispatch-Aufrufe nur EIN tatsächlicher Versand
+    assert ergebnis_a.status == "GESENDET"
+    assert ergebnis_b.status == "BEREITS_VERARBEITET"
+    assert service.mahn_repo.get(id_a).status == "GESENDET"
+    assert service.mahn_repo.get(id_b).status == "GESENDET"
+
+
+def test_mahnlauf_wiederholte_stufe_sendet_je_stufe_wieder_genau_ein_schreiben(hv, basis_vertrag, admin_ctx):
+    """Wiederholte Mahnstufen: Stufe 1 und die spätere Stufe 2 lösen JEDE
+    für sich genau EIN Schreiben aus (kein kumulativer Zähler über
+    Stufen hinweg, keine Doppelverarbeitung einer bereits gesendeten
+    Stufe)."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    state["status"] = "GESENDET"
+    _seed_zwei_komponenten(hv, contract, account, admin_ctx)
+    _bank_bestaetigen(service, contract, date(2026, 9, 13))
+
+    stufe1 = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    assert stufe1["gesendet"] == 1
+    assert len(state["calls"]) == 1
+
+    # Erneuter Lauf am selben Tag: nichts Neues zu tun (bereits GESENDET).
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    assert len(state["calls"]) == 1
+
+    # Stufe 2 verlangt einen Mindestabstand seit dem TATSÄCHLICHEN
+    # Stufe-1-Versandzeitpunkt (hier die feste synthetische Testuhrzeit
+    # 2026-09-14T22:30 UTC = 2026-09-15 in Wien) plus Zahlungsfrist - wie im
+    # bestehenden Referenztest ist der 28.9. noch zu früh, der 29.9. reicht.
+    _bank_bestaetigen(service, contract, date(2026, 9, 28))
+    zu_frueh = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 28))
+    assert zu_frueh["gesendet"] == 0
+    assert len(state["calls"]) == 1
+
+    _bank_bestaetigen(service, contract, date(2026, 9, 29))
+    stufe2 = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 29))
+    assert stufe2["gesendet"] == 1
+    assert len(state["calls"]) == 2  # ein zweites, eigenständiges Schreiben für Stufe 2
+
+    faelle = service.mahn_repo.list_fuer_vertrag(contract.id)
+    assert sorted(f.stufe for f in faelle) == [1, 1, 2, 2]
+    assert all(f.status == "GESENDET" for f in faelle)
+
+
+def test_mahnkosten_text_stimmt_exakt_mit_gebuchten_zusatzpositionen_ueberein(hv, basis_vertrag, admin_ctx):
+    """Abnahmekriterium 14.09.2026: der im TATSÄCHLICH gesendeten Text
+    ausgewiesene Zins-/Kostenbetrag muss exakt dem danach gebuchten
+    Zusatzbetrag entsprechen - beide stammen aus derselben, EINMAL
+    berechneten Vorschau (siehe `kosten_service.py`-Moduldoc)."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    state["status"] = "GESENDET"
+    _seed_zwei_komponenten(hv, contract, account, admin_ctx, faelligkeit=date(2026, 1, 5))
+    _bank_bestaetigen(service, contract, date(2026, 3, 1))
+    profil = service.mahnkosten_repo.zinsprofil_anlegen(
+        vertrag_id=contract.id, ist_b2b=False, vertragsdatum=None, erstellt_von="test",
+    )
+    service.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
+
+    result = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 3, 1))
+    assert result["gesendet"] == 1
+    body = json.loads(state["calls"][0].content)
+
+    from mietinkasso.infrastructure.db.tables import MahnkostenBuchungTable
+    with service.sf() as db:
+        buchung = db.execute(select(MahnkostenBuchungTable).where(
+            MahnkostenBuchungTable.vertrag_id == contract.id)).scalars().one()
+    zinsen_text = f"{buchung.zinsen_cent/100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    assert buchung.zinsen_cent > 0
+    assert f"{zinsen_text} EUR" in body["text"]
+
+
 def test_index_real_mail_protocol_acceptance_is_not_sending_or_rent_change(hv, basis_vertrag, admin_ctx):
     service, state = hv
     contract, _ = basis_vertrag

@@ -978,8 +978,40 @@ kosten_repository.py` (`ZinsprofilTable`/`OenbBasiszinssatzTable`/
 bestätigten Versandnachweis gekoppelt). Vertragsweite, deltabasierte
 Idempotenz (nicht je Stufe) verhindert, dass Stufe 2 bei Stufe 1
 bereits fakturierte Zinstage erneut ansetzt. Vollständige Grenzen und
-bewusst offene Punkte (u. a. der weiterhin nicht umgebaute Mahnfall-/
-Mail-Dispatcher, kein Halbjahres-Split innerhalb einer laufenden
-Verzinsungsperiode) in `OFFENE_PUNKTE.md`, Abschnitt "Paket
+bewusst offene Punkte in `OFFENE_PUNKTE.md`, Abschnitt "Paket
 Mahnkosten". Import-/Profilformat für Markus' privates Mapping in
 `IMPORT_MAHNKOSTEN.md`.
+
+### Rückprüfung 14.09.2026 (unabhängige Abnahme)
+
+Fünf konkrete, damals noch offene Abnahmekriterien wurden nachgereicht:
+(1) genau ein tatsächlicher Mailversand je Vertrag+Stufe statt je
+OP-Zeile (`mailversand_service.py::HVMailversandService.mahnung_senden`
+bündelt GEPLANTE MahnFälle automatisch, ohne den bestehenden, bereits
+getesteten `MahnwesenService.versenden()`-Zustandsautomaten
+umzuschreiben - nur eine reine Prüf-Hilfsfunktion wurde herausgezogen);
+(2) der im tatsächlich gesendeten Brieftext ausgewiesene Kosten-/
+Zinsbetrag entspricht EXAKT dem danach gebuchten Zusatzbetrag (dieselbe,
+genau einmal berechnete `MahnkostenVorschau` treibt Text UND Buchung,
+über einen neuen `versenden(..., mahnkosten_vorschau_slot=...)`-
+Parameter); (3) eine Verzugszinsenperiode über einen Halbjahreswechsel
+wird in Teilperioden mit jeweils belegtem Basiszinssatz zerlegt
+(`kosten.py::_segmentiere_periode_ugb`), ein Teilsegment ohne belegten
+Satz bleibt nur für sich genommen ungeklärt; (4) §458 UGB wird
+PERMANENT je zugrunde liegender Entgeltforderung erhoben
+(`MahnkostenGebuehrTable`, neue Tabelle) statt pauschal einmal je
+Vertrag, und NUR bei echter beiderseits unternehmensbezogener
+Unternehmerforderung (§458 selbst ist laut Gesetzesmaterialien
+verschuldensunabhängig, verlangt aber wie §456 dieselbe B2B-/Datums-
+Voraussetzung); (5) keine automatische Max-Auswahl Vertrag/Gesetz war
+bereits gegeben und wurde erneut verifiziert. Zusätzlich beim Testen
+selbst gefunden und behoben: zwei sich überschneidende
+OeNB-Basiszinssatz-Zeiträume unter verschiedenen Halbjahres-IDs ließen
+die gesamte Mahnkosten-Berechnung mit einer unbehandelten
+`MultipleResultsFound`-Exception abstürzen - jetzt bereits beim Erfassen
+mit klarer Fehlermeldung abgelehnt. 21 neue/angepasste Tests über drei
+Testdateien, 863/863 grün im Gesamtlauf. Verbleibende, ehrlich
+offene Grenzen (Leader-Wahl als Heuristik, "genau ein Schreiben" als
+Erfolgspfad- statt absolute Garantie, kein rückwirkender Split bei
+einem Wechsel der vereinbarten Zinsvereinbarung selbst) in
+`OFFENE_PUNKTE.md`, Abschnitt "Rückprüfung 14.09.2026".

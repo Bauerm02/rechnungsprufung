@@ -22,7 +22,7 @@ import pytest
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access
 from mietinkasso.domain.enums import OPTyp, Rolle
 from mietinkasso.domain.exceptions import CrossTenantError
-from mietinkasso.mahnwesen.kosten import BalancePeriode, berechne_verzugszinsen_cent, bestimme_zinssatz
+from mietinkasso.mahnwesen.kosten import bestimme_zinssatz
 from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
 from mietinkasso.mahnwesen.kosten_service import MahnkostenService
 
@@ -40,6 +40,18 @@ def kosten_service(kosten_repo, op_service, stammdaten_repo) -> MahnkostenServic
 def _profil_geprueft(kosten_repo: MahnkostenRepository, *, vertrag_id: str, **kwargs) -> None:
     profil = kosten_repo.zinsprofil_anlegen(vertrag_id=vertrag_id, erstellt_von="test", **kwargs)
     kosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
+
+
+def _segment_zinsen_cent(rest_cent: int, satz_prozent: Decimal, tage: int) -> int:
+    """Dupliziert bewusst NUR die Rundungsformel aus
+    `kosten.py::_zinsen_fuer_segment_cent` (statt sie als privates Detail
+    zu importieren), damit Tests unabhängig von internen Funktionsnamen
+    bleiben: je Segment einfache (nicht zusammengesetzte) Zinsen,
+    kaufmännisch auf den Cent gerundet."""
+
+    from decimal import ROUND_HALF_UP
+    betrag = Decimal(rest_cent) * (satz_prozent / Decimal(100)) * Decimal(tage) / Decimal(365)
+    return int(betrag.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 # -- Zwei Komponenten derselben Miete: EINE kombinierte Vorschau ------------
@@ -180,21 +192,18 @@ def test_teilzahlung_reduziert_zinsbasis_ab_zahlungsdatum(op_service, kosten_ser
 
     # Erwartete Zinsen taggenau nachgerechnet (gesetzliche 4 % p.a., kein
     # Zinsprofil hinterlegt): 100.000 Cent vom 5.1. (Fälligkeit) bis 20.1.
-    # (Zahlungsdatum), danach 60.000 Cent vom 20.1. bis 1.3. - exakt die
-    # beiden Perioden, die `balance_zeitreihe_fuer_forderung` liefern muss.
-    erwartete_perioden = [
-        BalancePeriode(von=date(2026, 1, 5), bis=date(2026, 1, 20), rest_cent=100_000),
-        BalancePeriode(von=date(2026, 1, 20), bis=date(2026, 3, 1), rest_cent=60_000),
-    ]
-    erwartete_zinsen = berechne_verzugszinsen_cent(erwartete_perioden, Decimal("4.000"))
+    # (Zahlungsdatum, 15 Tage), danach 60.000 Cent vom 20.1. bis 1.3.
+    # (40 Tage) - exakt die beiden Perioden, die
+    # `balance_zeitreihe_fuer_forderung` liefern muss. Jedes Segment wird
+    # EINZELN kaufmännisch gerundet und dann summiert (siehe
+    # `kosten.py::_zinsen_fuer_segment_cent`).
+    erwartete_zinsen = _segment_zinsen_cent(100_000, Decimal("4.000"), 15) + _segment_zinsen_cent(60_000, Decimal("4.000"), 40)
     assert vorschau_mit_teilzahlung.neue_zinsen_cent == erwartete_zinsen
 
     # Gegenprobe: würde die Teilzahlung NICHT berücksichtigt, wäre die
     # volle Basis (100.000 Cent) über die gesamte Periode verzinst worden -
     # das muss strikt mehr sein als der tatsächliche, korrekt reduzierte Wert.
-    ohne_teilzahlung = berechne_verzugszinsen_cent(
-        [BalancePeriode(von=date(2026, 1, 5), bis=date(2026, 3, 1), rest_cent=100_000)], Decimal("4.000"),
-    )
+    ohne_teilzahlung = _segment_zinsen_cent(100_000, Decimal("4.000"), 55)
     assert vorschau_mit_teilzahlung.neue_zinsen_cent < ohne_teilzahlung
 
 
@@ -271,12 +280,62 @@ def test_zukuenftiges_halbjahr_verwendet_nicht_stillschweigend_alten_basiszinssa
     )
 
     # Zweites Halbjahr 2026 wurde NICHT erfasst - darf keinesfalls den
-    # Wert des ersten Halbjahrs stillschweigend fortschreiben.
+    # Wert des ersten Halbjahrs stillschweigend fortschreiben. Die
+    # Periode läuft aber teilweise noch durchs BELEGTE erste Halbjahr
+    # (5.1.-1.7.) - dieser Teil wird jetzt korrekt segmentiert verzinst,
+    # nur der Rest (1.7.-15.7., zweites Halbjahr) bleibt ungeklärt.
     vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 7, 15))
 
     assert vorschau is not None
+    assert vorschau.zins_teilweise_ungeklaert is True
+    assert vorschau.zinssatz_prozent == Decimal("10.730")  # das einzige AUFGELÖSTE Segment
+    assert vorschau.neue_zinsen_cent > 0
+    erwartete_zinsen_h1_anteil = _segment_zinsen_cent(50_000, Decimal("10.730"), (date(2026, 7, 1) - date(2026, 1, 5)).days)
+    assert vorschau.neue_zinsen_cent == erwartete_zinsen_h1_anteil
+    assert any("ohne belegten Basiszinssatz" in h for h in vorschau.hinweise)
+
+
+def test_halbjahreswechsel_mit_beiden_erfassten_halbjahren_rechnet_in_teilperioden(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Kernfall der Rückprüfung 14.09.2026: eine Verzinsungsperiode, die
+    einen Halbjahreswechsel überspannt, MUSS in zwei Teilperioden mit je
+    EIGENEM belegtem Basiszinssatz gerechnet werden - niemals mit einem
+    einzigen, für die ganze Periode geltenden Satz."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1))
+    kosten_repo.basiszinssatz_erfassen(
+        id="2026-1", gueltig_von=date(2026, 1, 1), gueltig_bis=date(2026, 6, 30),
+        basiszinssatz_prozent=Decimal("1.530"), erfasst_von="test", quelle_referenz="OeNB 01.01.2026",
+    )
+    kosten_repo.basiszinssatz_erfassen(
+        id="2026-2", gueltig_von=date(2026, 7, 1), gueltig_bis=date(2026, 12, 31),
+        basiszinssatz_prozent=Decimal("2.000"), erfasst_von="test", quelle_referenz="OeNB 01.07.2026",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 6, 1), buchungsdatum=date(2026, 6, 1),
+        faelligkeit=date(2026, 6, 5), beleg_referenz="HMZ Juni",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 7, 20))
+
+    assert vorschau is not None
+    assert vorschau.zins_teilweise_ungeklaert is False
+    # Zwei Sätze im Spiel (10,73 % bis 30.6., 11,20 % ab 1.7.) - keine
+    # einzelne Zahl kann das korrekt zusammenfassen.
     assert vorschau.zinssatz_prozent is None
-    assert vorschau.neue_zinsen_cent == 0
+    assert len(vorschau.zins_segmente) == 2
+    segment_h1 = next(s for s in vorschau.zins_segmente if s.satz_prozent == Decimal("10.730"))
+    segment_h2 = next(s for s in vorschau.zins_segmente if s.satz_prozent == Decimal("11.200"))
+    assert segment_h1.von == date(2026, 6, 5) and segment_h1.bis == date(2026, 7, 1)
+    assert segment_h2.von == date(2026, 7, 1) and segment_h2.bis == date(2026, 7, 20)
+    erwartet = (
+        _segment_zinsen_cent(50_000, Decimal("10.730"), (date(2026, 7, 1) - date(2026, 6, 5)).days)
+        + _segment_zinsen_cent(50_000, Decimal("11.200"), (date(2026, 7, 20) - date(2026, 7, 1)).days)
+    )
+    assert vorschau.neue_zinsen_cent == erwartet
 
 
 # -- Privat/B2B-Unterscheidung ----------------------------------------------
@@ -344,24 +403,58 @@ def test_fehlendes_zinsprofil_blockiert_hauptforderung_nicht_nur_gebuehr_klaerun
     assert vorschau.gebuehr_cent is None
     assert vorschau.zinssatz_prozent == Decimal("4.000")  # gesetzliche Basis ohne Profil
     assert vorschau.neue_zinsen_cent > 0
-    assert any("Klärung erforderlich" in h for h in vorschau.hinweise)
+    # Ohne jedes Zinsprofil ist §458 UGB (Unternehmerforderung) von
+    # vornherein nicht anwendbar - die Gebühr bleibt klar begründet aus,
+    # ohne die (unabhängig davon weiterhin verzinste) Hauptforderung zu berühren.
+    assert any("beiderseits unternehmensbezogenem" in h for h in vorschau.hinweise)
 
 
-# -- Mahngebühr wird nur einmal je Vertrag/Mahnlauf angesetzt --------------
+# -- Mahngebühr (§458 UGB) - nur bei B2B, permanent je Entgeltforderung ---
 
 
-def test_mahngebuehr_wird_nur_einmal_ueber_beide_stufen_angesetzt(
+def test_mahngebuehr_erfordert_b2b_und_wird_bei_privatvertrag_nie_angesetzt(
     op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
 ):
+    """Rückprüfung 14.09.2026: §458 UGB betrifft ausschließlich eine
+    Unternehmerforderung - eine belegte Kostenbasis allein reicht NICHT,
+    ohne beiderseits unternehmensbezogenes Geschäft (B2B) wird NIE eine
+    Pauschale angesetzt, unabhängig vom Ansatz früherer Runden."""
+
     vertrag, konto = basis_vertrag
     _profil_geprueft(
-        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=None,
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
         mahngebuehr_kostenbasis_cent=1500, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
     )
     op_service.buchen(
         ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
         belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
         faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1))
+
+    assert vorschau is not None
+    assert vorschau.gebuehr_cent is None
+    assert not vorschau.gebuehr_segmente
+    assert any("beiderseits unternehmensbezogenem" in h for h in vorschau.hinweise)
+
+
+def test_mahngebuehr_wird_nur_einmal_ueber_beide_stufen_fuer_dieselbe_forderung_angesetzt(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=1500, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+    )
+    kosten_repo.basiszinssatz_erfassen(
+        id="2026-1", gueltig_von=date(2026, 1, 1), gueltig_bis=date(2026, 6, 30),
+        basiszinssatz_prozent=Decimal("1.530"), erfasst_von="test", quelle_referenz="OeNB 01.01.2026",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), leistungsperiode="2026-01", beleg_referenz="HMZ Jänner",
     )
 
     stufe1 = kosten_service.buche_bei_versand(
@@ -375,12 +468,87 @@ def test_mahngebuehr_wird_nur_einmal_ueber_beide_stufen_angesetzt(
         ctx=admin_ctx, vertrag_id=vertrag.id, stufe=2, heute=date(2026, 3, 3),
         versandnachweis_referenz="mahnung:stufe2", akteur="test",
     )
-    assert stufe2 is not None
-    assert stufe2.gebuehr_cent is None  # §458 UGB: nicht ein zweites Mal
+    assert stufe2 is not None  # weiterhin neue Zinsen seit Stufe 1 (Basiszinssatz belegt)
+    assert stufe2.gebuehr_cent is None  # §458 UGB: nicht ein zweites Mal für DIESELBE Entgeltforderung
 
     saldo_positionen = op_service.berechne_saldo(konto.id, stichtag=date(2026, 3, 3)).positionen
     gebuehr_zeilen = [p for p in saldo_positionen if p.aenderungsgrund == "Mahnkosten - Mahnspesen"]
     assert len(gebuehr_zeilen) == 1
+
+
+def test_mahngebuehr_zwei_komponenten_derselben_periode_ergeben_nur_eine_pauschale(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Nicht je Mietkomponente: HMZ und BK derselben Vorschreibungsperiode
+    teilen dieselbe `leistungsperiode` und bilden EINE Entgeltforderung -
+    also GENAU EINE Pauschale, nicht zwei."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=1500, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), leistungsperiode="2026-01", beleg_referenz="HMZ Jänner",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=15_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), leistungsperiode="2026-01", beleg_referenz="BK Jänner",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1))
+
+    assert vorschau is not None
+    assert len(vorschau.gebuehr_segmente) == 1
+    assert vorschau.gebuehr_cent == 1500
+
+
+def test_mahngebuehr_zwei_genuin_unterschiedliche_monate_ergeben_zwei_pauschalen(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Eine bereits erhobene Pauschale wird für eine GENUIN andere
+    Entgeltforderung (ein anderer Monat) NICHT blockiert - die
+    Permanenz gilt je Forderung, nicht pauschal je Vertrag."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        mahngebuehr_kostenbasis_cent=1500, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), leistungsperiode="2026-01", beleg_referenz="HMZ Jänner",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 2, 1), buchungsdatum=date(2026, 2, 1),
+        faelligkeit=date(2026, 2, 5), leistungsperiode="2026-02", beleg_referenz="HMZ Februar",
+    )
+
+    stufe1 = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1),
+        versandnachweis_referenz="mahnung:beide-monate", akteur="test",
+    )
+    assert stufe1 is not None
+    assert stufe1.gebuehr_cent == 3000  # zwei genuin unterschiedliche Entgeltforderungen, je 1500
+
+    # Ein dritter, wieder neuer Monat später löst noch eine EIGENE Pauschale
+    # aus - die beiden bereits erhobenen bleiben dauerhaft erkannt.
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 3, 1), buchungsdatum=date(2026, 3, 1),
+        faelligkeit=date(2026, 3, 5), leistungsperiode="2026-03", beleg_referenz="HMZ März",
+    )
+    stufe2 = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=2, heute=date(2026, 4, 1),
+        versandnachweis_referenz="mahnung:dritter-monat", akteur="test",
+    )
+    assert stufe2 is not None
+    assert stufe2.gebuehr_cent == 1500  # nur der DRITTE, bisher unbepauschalte Monat
 
 
 # -- Unbekannte/ungegliederte Eröffnungsstruktur: nie fiktiv verzinst ------

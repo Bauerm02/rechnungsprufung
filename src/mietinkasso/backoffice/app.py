@@ -1528,9 +1528,33 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
             f"{vorschau.zins_von.isoformat()} – {vorschau.zins_bis.isoformat()}"
             if vorschau.zins_von and vorschau.zins_bis else "–"
         )
-        gebuehr_text = eur(vorschau.gebuehr_cent) if vorschau.gebuehr_cent is not None else "keine (bereits gebucht oder ungeklärt)"
+        gebuehr_text = eur(vorschau.gebuehr_cent) if vorschau.gebuehr_cent is not None else "keine (bereits erhoben oder ungeklärt)"
         hinweise_html = "".join(f"<li>{h(hw)}</li>" for hw in vorschau.hinweise)
         ausgeschlossen_html = "".join(f"<li class='warn'>{h(hw)}</li>" for hw in vorschau.ausgeschlossene_forderungen_hinweis)
+        segmente_html = ""
+        if len(vorschau.zins_segmente) > 1 or vorschau.zins_teilweise_ungeklaert:
+            def _satz_zelle(s):
+                if s.satz_prozent is None:
+                    return "<span class=\"warn\">ungeklärt</span>"
+                return h(f"{s.satz_prozent} %")
+            zeilen_segmente = "".join(
+                f"<tr><td>{s.von.isoformat()} – {s.bis.isoformat()}</td><td>{eur(s.rest_cent)}</td>"
+                f"<td>{_satz_zelle(s)}</td>"
+                f"<td>{eur(s.zinsen_cent)}</td><td>{h(s.quelle)}</td></tr>"
+                for s in vorschau.zins_segmente
+            )
+            segmente_html = f"""<details><summary>Zinssegmente ({len(vorschau.zins_segmente)}, je Forderung/Halbjahr)</summary>
+              <table><tr><th>Zeitraum</th><th>Basis</th><th>Satz</th><th>Zinsen</th><th>Quelle</th></tr>{zeilen_segmente}</table>
+            </details>"""
+        gebuehr_segmente_html = ""
+        if len(vorschau.gebuehr_segmente) > 1:
+            zeilen_gebuehr = "".join(
+                f"<tr><td>{h(g.entgeltforderung_schluessel)}</td><td>{eur(g.betrag_cent)}</td></tr>"
+                for g in vorschau.gebuehr_segmente
+            )
+            gebuehr_segmente_html = f"""<details><summary>Neue Pauschalen je Entgeltforderung ({len(vorschau.gebuehr_segmente)})</summary>
+              <table><tr><th>Entgeltforderung</th><th>Betrag</th></tr>{zeilen_gebuehr}</table>
+            </details>"""
         zeilen.append(f"""
         <div class="card">
           <h3>Stufe {stufe}</h3>
@@ -1542,6 +1566,8 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
             <tr><th>Zinszeitraum</th><td>{h(zeitraum_text)}</td></tr>
             <tr><th>Neue Mahngebühr</th><td>{h(gebuehr_text)}{f" ({h(vorschau.gebuehr_rechtsgrundlage)})" if vorschau.gebuehr_rechtsgrundlage else ""}</td></tr>
           </table>
+          {segmente_html}
+          {gebuehr_segmente_html}
           <ul class="muted">{hinweise_html}</ul>
           {"<ul>" + ausgeschlossen_html + "</ul>" if ausgeschlossen_html else ""}
         </div>""")

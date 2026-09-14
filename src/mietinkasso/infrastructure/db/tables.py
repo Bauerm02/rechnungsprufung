@@ -1331,5 +1331,44 @@ class MahnkostenBuchungTable(Base):
     versandnachweis_referenz: Mapped[str] = mapped_column(String(256))
     zinsen_op_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     gebuehr_op_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Vollständiges Zinssegment-Bild (Halbjahres-/Basiszinssatz-Teilperioden,
+    # siehe `mahnwesen/kosten.py::ZinsSegment`) ZUM ZEITPUNKT dieser Buchung -
+    # rein deskriptiv/Audit, NICHT auf das an diesem Tag NEU gebuchte Delta
+    # isoliert (das wäre bei mehreren Segmenten nicht eindeutig zuordenbar).
+    # JSON-Liste von {von, bis, rest_cent, satz_prozent, quelle, zinsen_cent}.
+    zins_segmente_json: Mapped[str] = mapped_column(Text, default="[]", server_default=text("'[]'"))
     gebucht_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+
+
+class MahnkostenGebuehrTable(Base):
+    """Permanente, EINMALIGE Erhebung der §458-UGB-Mahnspesen-Pauschale je
+    zugrunde liegender qualifizierter Entgeltforderung (Auftrag Markus
+    14.09.2026 - Rückprüfung: "§458 UGB gilt nicht je Mahnlauf oder Brief
+    und nicht je Mietkomponente ... Anspruch auf zugrunde liegende
+    qualifizierte fällige Unternehmerforderung beziehen, bereits erhobenen
+    Ansatz dauerhaft erkennen").
+
+    `entgeltforderung_schluessel` gruppiert alle OP-Zeilen EINER
+    Vorschreibungsperiode (z. B. HMZ+BK+HK desselben Monats teilen sich
+    dieselbe `leistungsperiode`) zu EINER zugrunde liegenden
+    Entgeltforderung - eine bereits hier erfasste Zeile lässt eine
+    identische Forderung NIE wieder eine zweite Pauschale auslösen, egal
+    wie viele weitere Mahnläufe/Stufen/Wiederholungen später folgen (siehe
+    `mahnwesen/kosten.py::_entgeltforderung_schluessel`). Die
+    Unique-Constraint ist hier - anders als bei `MahnkostenBuchungTable` -
+    das FACHLICHE Gate selbst, nicht nur ein Race-Sicherheitsnetz: ein
+    zweiter Versuch für dieselbe Forderung MUSS scheitern."""
+
+    __tablename__ = "mahnkosten_gebuehren"
+    __table_args__ = (UniqueConstraint("vertrag_id", "entgeltforderung_schluessel", name="uq_mahnkosten_gebuehr_forderung"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    entgeltforderung_schluessel: Mapped[str] = mapped_column(String(200))
+    betrag_cent: Mapped[int] = mapped_column(Integer)
+    rechtsgrundlage: Mapped[str] = mapped_column(String(256))
+    mahnkosten_buchung_id: Mapped[int | None] = mapped_column(ForeignKey("mahnkosten_buchungen.id"), nullable=True)
+    gebuehr_op_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    erhoben_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     erstellt_von: Mapped[str] = mapped_column(String(128))

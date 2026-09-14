@@ -2105,10 +2105,27 @@ von Codex nach Primärquellenprüfung (ABGB §§1000/1333, KSchG §6 Abs 1
 Z 13/OGH 7Ob111/25m, §§456/458 UGB, OeNB-Basiszinssätze). Neue Module:
 `mahnwesen/kosten.py` (reine Berechnung), `mahnwesen/kosten_repository.py`
 (Persistenz: `ZinsprofilTable`, `OenbBasiszinssatzTable`,
-`MahnkostenBuchungTable`), `mahnwesen/kosten_service.py`
-(`MahnkostenService.vorschau`/`.buche_bei_versand`). Getestet in
-`tests/mietinkasso/test_mahnwesen_kosten.py` (13 Fälle) und
-`tests/mietinkasso/test_backoffice.py` (4 zusätzliche HTTP-Tests).
+`MahnkostenBuchungTable`, `MahnkostenGebuehrTable`), `mahnwesen/
+kosten_service.py` (`MahnkostenService.vorschau`/`.buche_vorschau`/
+`.buche_bei_versand`). Getestet in `tests/mietinkasso/
+test_mahnwesen_kosten.py` (17 Fälle), `tests/mietinkasso/
+test_backoffice.py` (6 zusätzliche HTTP-Tests) und `tests/mietinkasso/
+test_hv_mailversand.py` (4 zusätzliche Tests für die Mahnlauf-Bündelung).
+
+**Rückprüfung 14.09.2026 (unabhängige Abnahme, in DIESEM Commit
+umgesetzt):** die Abnahmekriterien "genau ein Schreiben je Vertrag und
+Mahnstufe statt je OP", "Kosten-/Zinsnachweis im tatsächlich gesendeten
+Text muss exakt den gebuchten Zusatzpositionen entsprechen",
+"Halbjahreswechsel in Teilperioden mit jeweils belegtem Basiszinssatz",
+"§458 UGB nie je Mahnlauf/Brief/Mietkomponente, sondern je zugrunde
+liegender qualifizierter Unternehmerforderung, dauerhaft erkannt" und
+"keine automatische Max-Auswahl Vertrag/Gesetz" waren zum Zeitpunkt
+dieser Rückprüfung NOCH NICHT umgesetzt (siehe die drei jetzt entfernten
+Punkte weiter unten in der Vorversion dieses Abschnitts) und sind ab
+diesem Commit umgesetzt und getestet - siehe Abschnitt "Rückprüfung
+14.09.2026" unten für Details, verbleibende Grenzen und den dabei
+zusätzlich gefundenen und behobenen Bug bei überlappenden
+Basiszinssatz-Zeiträumen.
 
 ### Was funktioniert und ist getestet
 
@@ -2137,7 +2154,7 @@ Z 13/OGH 7Ob111/25m, §§456/458 UGB, OeNB-Basiszinssätze). Neue Module:
    Berechnungs-/Buchungsebene gelöst, siehe Test
    `test_zwei_komponenten_derselben_miete_ergeben_eine_kombinierte_vorschau`.
 4. **Vertragsweite, deltabasierte Idempotenz statt Existenzabfrage**:
-   `MahnkostenService.buche_bei_versand` bucht bei jedem Aufruf nur die
+   `MahnkostenService.buche_vorschau` bucht bei jedem Aufruf nur die
    Differenz aus `neue_zinsen_cent` und der vertragsweit (über ALLE
    Stufen) bereits gebuchten Zinssumme. Ein Wiederholaufruf am selben
    Tag bucht dadurch natürlich nichts Neues (`test_zwei_laeufe_am_
@@ -2148,11 +2165,19 @@ Z 13/OGH 7Ob111/25m, §§456/458 UGB, OeNB-Basiszinssätze). Neue Module:
    (`vertrag_id, stufe, zins_bis`) ist NUR ein Race-Condition-
    Sicherheitsnetz für zwei gleichzeitige Aufrufe, nicht der primäre
    Idempotenzmechanismus.
-5. **§458 UGB einmal je Vertrag/Mahnlauf**: eine Mahngebühr wird nur
-   angesetzt, solange noch keine für diesen Vertrag gebucht wurde
-   (`gebuehr_bereits_gebucht`, vertragsweit über alle Stufen geprüft) -
-   Stufe 2 setzt NIE eine zweite Gebühr an
-   (`test_mahngebuehr_wird_nur_einmal_ueber_beide_stufen_angesetzt`).
+5. **§458 UGB nie je Mahnlauf/Brief/Mietkomponente, sondern je zugrunde
+   liegender qualifizierter Entgeltforderung, dauerhaft erkannt**
+   (Rückprüfung 14.09.2026 - siehe eigener Abschnitt unten für Details):
+   `MahnkostenGebuehrTable` erhebt die Pauschale EINZELN und PERMANENT
+   je `entgeltforderung_schluessel` (alle OP-Zeilen derselben
+   `leistungsperiode`, z. B. HMZ+BK desselben Monats, bilden EINE
+   Entgeltforderung); eine bereits erhobene Pauschale wird NIE
+   wiederholt, eine GENUIN andere (spätere) Entgeltforderung kann aber
+   ihre eigene, separate Pauschale auslösen. Zusätzlich NUR bei
+   beiderseits unternehmensbezogenem Geschäft mit Vertragsdatum ab
+   16.03.2013 (`ugb_anwendbar`) - eine belegte Kostenbasis allein
+   reicht seit dieser Rückprüfung NICHT mehr, wenn der Vertrag kein
+   B2B-Vertrag ist.
 6. **Hauptforderung wird nie durch eine unklare Zusatzposition
    blockiert**: fehlt ein geprüftes Zinsprofil oder eine erfasste
    Basiszinssatz-Periode, bleibt NUR der Zins-/Gebührenanteil auf
@@ -2186,42 +2211,6 @@ Z 13/OGH 7Ob111/25m, §§456/458 UGB, OeNB-Basiszinssätze). Neue Module:
 
 ### Was in dieser Runde bewusst NICHT gelöst ist (ehrlich offen)
 
-- **Kein Umbau des bestehenden Mahnfall-/Mail-Dispatchers**: Die
-  bestehende `MahnFallTable`/`MahnFallRepository`-Logik plant weiterhin
-  je EINZELNER OP-Zeile (`plane_alle_offenen_forderungen`), d. h. eine
-  Monatsvorschreibung mit getrennten HMZ/BK/HK/Küche/Parkplatz-Zeilen
-  kann weiterhin zu mehreren `MahnFallTable`-Zeilen bzw. mehreren
-  einzelnen Versandvorgängen führen. `berechne_mahnkosten_vorschau`
-  wurde bewusst als SEPARATE, vertragsweite Aggregationsschicht gebaut
-  (siehe Punkt 3 oben), die verhindert, dass daraus mehrere Gebühren/
-  Zinsbeträge entstehen - das eigentliche Mail-/Fallvolumen (wie viele
-  einzelne Mahnschreiben pro Monat verschickt werden) ist dadurch
-  NICHT verändert. Ein echter Umbau auf ein wirklich gebündeltes
-  Mahnschreiben je Vertrag/Stufe (eine Mail statt mehrerer
-  Einzelforderungs-Mails) wurde aus Umfangs-/Risikogründen nicht in
-  dieser Runde angegangen und bleibt ein offener Folgeauftrag.
-- **Kein Halbjahres-Split innerhalb einer Verzinsungsperiode**: Der
-  Zinssatz wird einmal für `heute` (den Berechnungszeitpunkt) bestimmt
-  und auf die GESAMTE offene Periode angewendet. Fällt ein
-  Basiszinssatz-Wechsel mitten in eine noch offene Verzinsungsperiode,
-  wird NICHT rückwirkend ab dem exakten Wechseldatum mit zwei
-  unterschiedlichen Sätzen gerechnet - der zum Berechnungszeitpunkt
-  gültige Satz gilt für die gesamte offene Periode. Das ist
-  konservativ in der Richtung "keine überhöhte rückwirkende
-  Verzinsung", aber fachlich nicht abschließend geprüft.
-- **Mahntext/E-Mail-Inhalt zeigt Mahnkosten (noch) nicht**: Der
-  bestehende Mahntext-Generator (`mailversand_service.py::
-  mahnung_senden.provider`) verwendet weiterhin die ALTE, separate
-  `MahnPolicyRepository`-Gebühren-/Zinslogik für den Mailtext und
-  blockiert dort explizit jede Policy mit Gebühr/Zins ungleich Null
-  ("Mahngebühren/Zinsen benötigen eine eigene belegte Berechnung.").
-  Diese Guard-Klausel wurde bewusst NICHT angetastet (sie schützt vor
-  falschen Beträgen im Mailtext einer älteren, unabhängigen
-  Policy-Struktur) - die neue `MahnkostenService`-Berechnung bucht die
-  OP-Positionen zwar korrekt, ihr Ergebnis erscheint aber noch nicht
-  automatisch im Mahnschreiben-Text selbst. Vor echtem Versand mit
-  Kostenausweis muss der Mahntext-Generator entsprechend erweitert
-  werden.
 - **Kein automatisches Erfassen von OeNB-Basiszinssätzen**: jedes
   Halbjahr muss manuell (Backoffice-Formular oder Importformat)
   nachgetragen werden; es gibt keinen automatischen Abruf.
@@ -2245,3 +2234,144 @@ Z 13/OGH 7Ob111/25m, §§456/458 UGB, OeNB-Basiszinssätze). Neue Module:
   Verzinsung alter Spesen") - eine bereits gebuchte Mahnspesen-Zeile
   fließt nicht selbst wieder in die Zinsbemessungsgrundlage ein, nur
   die tatsächliche Hauptforderung (Miete/BK/HK/etc.) wird verzinst.
+
+### Rückprüfung 14.09.2026 (unabhängige Abnahme) - behoben
+
+Fünf konkrete Abnahmekriterien wurden in diesem Commit umgesetzt und mit
+gezielten Regressionen (`test_mahnwesen_kosten.py`, `test_backoffice.py`,
+`test_hv_mailversand.py`) belegt:
+
+1. **Genau ein Schreiben je Vertrag und Mahnstufe statt je OP**:
+   `indexautomatik/mailversand_service.py::HVMailversandService.
+   mahnung_senden` bündelt jetzt automatisch ALLE zu diesem Zeitpunkt
+   GEPLANTEN `MahnFallTable`-Zeilen desselben Vertrags/derselben Stufe
+   (z. B. HMZ+BK derselben Vorschreibung) zu EINEM tatsächlichen
+   Mailversand, unabhängig davon, für welches einzelne Gruppenmitglied
+   die Methode aufgerufen wird. Die Forderung mit der kleinsten Id wird
+   deterministisch zum "führenden" Fall; nur für diesen wird der
+   externe Mailversand tatsächlich aufgerufen, alle anderen
+   Gruppenmitglieder übernehmen denselben bereits erhaltenen
+   Versandnachweis (kein zweiter externer Aufruf) und werden über den
+   UNVERÄNDERTEN, bereits ausführlich getesteten
+   `MahnwesenService.versenden()`-Zustandsautomaten (Claim/Timing/
+   Bank-/Sperr-/Empfänger-Frischprüfung je Fall) einzeln auf GESENDET
+   gesetzt. `versenden()` selbst wurde dafür NICHT umgeschrieben,
+   sondern nur eine reine Prüf-Hilfsfunktion
+   (`_pruefe_frisch_versandbereit`) herausgezogen, damit sie 1:1
+   dieselbe Logik für die Gruppenbildung wiederverwenden kann - alle 26
+   bestehenden `test_mahnwesen.py`-Tests bleiben unverändert grün.
+   Getestet: `test_mahnlauf_buendelt_zwei_komponenten_derselben_
+   periode_zu_einem_schreiben`.
+2. **Persistenter Dublettenschutz bei konkurrierender/mehrfacher
+   Versandverarbeitung**: zwei (auch gleichzeitige) Dispatch-Versuche
+   für ZWEI VERSCHIEDENE Mitglieder derselben Gruppe lösen niemals zwei
+   E-Mails aus - beide lösen dieselbe Gruppe/denselben führenden Fall
+   auf und konkurrieren um dessen atomaren, bereits vorhandenen
+   `claim_fuer_versand`-Compare-and-Swap (kein neuer Sperrmechanismus
+   nötig). Getestet:
+   `test_mahnlauf_zwei_gleichzeitige_aufrufe_fuer_verschiedene_
+   gruppenmitglieder_senden_nur_einmal`,
+   `test_mahnlauf_wiederholte_stufe_sendet_je_stufe_wieder_genau_ein_
+   schreiben` (Wiederholung am selben Tag bucht nichts Neues, Stufe 2
+   löst ein eigenständiges zweites Schreiben aus).
+3. **Kosten-/Zinsnachweis im tatsächlich gesendeten Text entspricht
+   EXAKT den danach gebuchten Zusatzpositionen**: `MahnkostenService.
+   vorschau()` wird GENAU EINMAL - unmittelbar vor dem tatsächlichen
+   Versand (nach dem atomaren Claim, berücksichtigt also auch kurz
+   zuvor eingegangene Zahlungen) - berechnet; dasselbe Objekt wird über
+   den neuen `versenden(..., mahnkosten_vorschau_slot=...)`-Parameter
+   sowohl für den Brieftext (`_mahnkosten_text_baustein`) als auch für
+   die anschließende Buchung (`MahnkostenService.buche_vorschau`)
+   verwendet - NIE eine zweite, potenziell abweichende Neuberechnung.
+   `buche_bei_versand` bleibt als dünner Kompatibilitäts-Wrapper für
+   einfache, nicht gebündelte Aufrufer erhalten. Getestet:
+   `test_mahnkosten_text_stimmt_exakt_mit_gebuchten_zusatzpositionen_
+   ueberein`.
+4. **Halbjahreswechsel während laufender Verzinsung in Teilperioden mit
+   jeweils belegtem Basiszinssatz**: `kosten.py::_segmentiere_periode_
+   ugb` zerlegt eine Verzugszinsenperiode an jedem Halbjahreswechsel
+   (bzw. jeder Erfassungslücke) in `ZinsSegment`-Teilstücke, jedes mit
+   seinem eigenen, für SEINEN Zeitraum tatsächlich belegten
+   Basiszinssatz - niemals ein einzelner, für die ganze Periode
+   geltender Satz. Ein Teilsegment ohne erfassten Basiszinssatz bleibt
+   NUR für sich genommen "ungeklärt" (`MahnkostenVorschau.
+   zins_teilweise_ungeklaert`), blockiert aber weder die übrigen,
+   belegten Segmente noch die Hauptforderung. Getestet:
+   `test_halbjahreswechsel_mit_beiden_erfassten_halbjahren_rechnet_in_
+   teilperioden`,
+   `test_zukuenftiges_halbjahr_verwendet_nicht_stillschweigend_alten_
+   basiszinssatz` (jetzt: teilweise Verzinsung für den belegten
+   Anteil statt vollständiger Blockade).
+5. **§458 UGB nie je Mahnlauf/Brief/Mietkomponente, sondern je
+   zugrunde liegender qualifizierter Entgeltforderung, dauerhaft
+   erkannt, und nur bei echter Unternehmerforderung**: siehe Punkt 5 im
+   Abschnitt "Was funktioniert" oben. Getestet:
+   `test_mahngebuehr_erfordert_b2b_und_wird_bei_privatvertrag_nie_
+   angesetzt`,
+   `test_mahngebuehr_zwei_komponenten_derselben_periode_ergeben_nur_
+   eine_pauschale`,
+   `test_mahngebuehr_zwei_genuin_unterschiedliche_monate_ergeben_zwei_
+   pauschalen`,
+   `test_mahngebuehr_wird_nur_einmal_ueber_beide_stufen_fuer_dieselbe_
+   forderung_angesetzt`.
+
+**Zusätzlich gefundener und behobener Bug** (beim Testen von Punkt 4
+selbst entdeckt, nicht Teil der ursprünglichen Rückprüfung): zwei
+verschiedene `OenbBasiszinssatzTable`-Zeilen (verschiedene Halbjahres-
+IDs) mit sich ÜBERSCHNEIDENDEN Gültigkeitszeiträumen machten
+`basiszinssatz_fuer_datum` für Tage im Überlappungsbereich mehrdeutig
+und ließen die GESAMTE Mahnkosten-Vorschau (inkl. Backoffice-Seite) mit
+einer unbehandelten `sqlalchemy.exc.MultipleResultsFound`-Exception
+abstürzen. Behoben durch eine Überlappungsprüfung direkt in
+`basiszinssatz_erfassen` (lehnt einen sich überschneidenden neuen
+Zeitraum mit klarer Fehlermeldung ab, bevor fehlerhafte Daten überhaupt
+entstehen können) plus ein defensives `.limit(1)` in
+`basiszinssatz_fuer_datum` als zusätzliches Sicherheitsnetz gegen
+etwaige Altdaten. Getestet:
+`test_ueberlappende_basiszinssaetze_werden_beim_erfassen_abgelehnt`.
+
+**Weiterhin ehrlich offen (auch nach dieser Rückprüfung):**
+
+- **Leader-Wahl ist eine Heuristik**: die Forderung mit der kleinsten
+  Id (in aller Regel die am längsten überfällige) bestimmt, WANN die
+  ganze Gruppe versandbereit ist. In einem konstruierten Sonderfall
+  (z. B. eine nachträglich manuell korrigierte Forderung mit
+  ungewöhnlicher Id-Reihenfolge) könnte eine tatsächlich bereits
+  versandbereite Forderung durch eine noch nicht fällige "führende"
+  Forderung derselben Gruppe verzögert werden, statt separat schon
+  jetzt zu senden. Für den regulären Pilotbetrieb (Ids entstehen in
+  Buchungsreihenfolge) unkritisch, aber nicht für jeden denkbaren Fall
+  bewiesen.
+- **"Genau ein Schreiben" ist eine Erfolgspfad-Garantie, kein absolutes
+  Invariant**: gerät der führende Fall in `UNSICHER` (Mailanbieter-
+  Timeout/Mehrdeutigkeit), bleiben die übrigen Gruppenmitglieder
+  GEPLANT und könnten bei einem SPÄTEREN, separaten Lauf (falls der
+  unsichere Fall bis dahin nicht manuell geklärt wurde) eine eigene,
+  kleinere Gruppe ohne den unsicheren Fall bilden und dafür ein
+  eigenständiges (kleineres) Schreiben auslösen. Kein doppelter
+  Versand derselben Forderung, aber theoretisch mehr als ein Schreiben
+  über mehrere Tage verteilt, wenn ein Versand hängen bleibt.
+- **Ein Wechsel der VEREINBARTEN Zinsvereinbarung (neue Zinsprofil-
+  Version) oder ein Wechsel zwischen den Basis-Typen selbst (z. B.
+  gesetzlich -> neu geprüfte Vereinbarung) wird NICHT rückwirkend
+  segmentiert** - nur ein Wechsel des OeNB-Basiszinssatzes INNERHALB
+  des UGB-B2B-Pfades wird taggenau in Teilperioden zerlegt (siehe
+  Punkt 4 oben). Ändert sich das zugrunde liegende Zinsprofil selbst
+  während einer offenen Verzinsungsperiode, gilt für die GESAMTE
+  Periode die aktuell gültige Einstufung - dieselbe konservative,
+  aber fachlich nicht abschließend geprüfte Vereinfachung wie zuvor.
+- **§458-Qualifikation je Entgeltforderung** prüft "mindestens eine
+  Mitgliedsposition dieser `leistungsperiode` ist bereits fällig" -
+  bei einer (untypischen) Vorschreibung mit uneinheitlichen
+  Fälligkeiten innerhalb derselben Periode ist das eine Annäherung,
+  keine exakte Einzelprüfung je Komponente.
+- **Die alte `MahnPolicyRepository`-Gebühren-/Zinslogik im Mahntext-
+  Generator bleibt unangetastet** (blockiert weiterhin jede Policy mit
+  Gebühr/Zins ungleich Null) - unabhängig und zusätzlich zur neuen,
+  jetzt tatsächlich in den Brieftext integrierten `MahnkostenService`-
+  Berechnung.
+- Kein lokales "Codex-Experiment" (`gebuehren.py` o. ä.) aus einem
+  anderen Branch wurde als Grundlage verwendet oder eingesehen - diese
+  Umsetzung basiert ausschließlich auf dem Stand dieses Branches
+  (`claude/bold-volta-7xovjq`) vor diesem Commit plus den in dieser
+  Rückprüfung genannten Anforderungen.

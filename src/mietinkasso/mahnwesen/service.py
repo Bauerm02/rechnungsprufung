@@ -269,6 +269,97 @@ class MahnwesenService:
             for forderung in forderungen
         ]
 
+    def _pruefe_frisch_versandbereit(
+        self, *, mahnfall: MahnFallTable, vertrag: VertragTable, konto: KontoTable,
+        aktuelle_policy: MahnPolicyTable | None, heute: date,
+        bank_bestaetigt_bis: date | None, ungeklaerte_eingaenge_vorhanden: bool,
+    ) -> tuple[str | None, str, OffeneForderung | None]:
+        """Reine Prüfung OHNE Nebenwirkung aller unmittelbar-vor-Versand
+        Bedingungen für EINEN MahnFall - von `versenden()` (das je nach
+        Ergebnis selbst `set_status` aufruft) UND von der reinen
+        Batch-Vorprüfung für die Mahnlauf-Bündelung in
+        `indexautomatik/mailversand_service.py` gemeinsam genutzt, damit
+        beide NIE auseinanderlaufen können.
+
+        Rückgabe `(status_code, grund, passende_forderung)`:
+        `status_code` ist `None`, wenn alles bereit ist (der Aufrufer darf
+        claimen/senden); sonst `"BLOCKIERT_PERSIST"`/`"UEBERSPRUNGEN_PERSIST"`
+        (der Fall wird dauerhaft auf diesen Status gesetzt) oder
+        `"BLOCKIERT_TRANSIENT"` (bloß "noch nicht fällig" - bleibt GEPLANT,
+        kann bei einem späteren Lauf alleine oder gemeinsam mit anderen
+        Forderungen wieder versandbereit werden)."""
+
+        if not rechtsordnung_geklaert(vertrag.rechtsordnung):
+            return "BLOCKIERT_PERSIST", "Rechtsordnung des Vertrags ist UNGEKLAERT.", None
+        aktive_sperren = self._stammdaten_repository.aktive_sperren(vertrag.id)
+        if aktive_sperren:
+            return "BLOCKIERT_PERSIST", "Sperre wurde nach der Planung gesetzt.", None
+        if self._bankstand_veraltet(heute=heute, bank_bestaetigt_bis=bank_bestaetigt_bis):
+            return "BLOCKIERT_PERSIST", (
+                f"Keine ausreichend aktuelle BESTÄTIGTE Bankvollständigkeit beim Versand "
+                f"(bestätigt bis: {bank_bestaetigt_bis}, max {self._bank_stand_max_age_days} Tage alt)."
+            ), None
+        if ungeklaerte_eingaenge_vorhanden:
+            return "BLOCKIERT_PERSIST", "Ungeklärte/teilzugeordnete Bankeingänge sind zwischen Planung und Versand aufgetaucht.", None
+
+        # Policy frisch prüfen: wurde sie seit der Planung zurückgezogen
+        # oder durch eine neue Version ersetzt, wird NICHT mit der alten,
+        # zum Planungszeitpunkt gültigen Policy weiterversendet.
+        if aktuelle_policy is None or aktuelle_policy.version != mahnfall.policy_version:
+            return "BLOCKIERT_PERSIST", (
+                f"Policy-Version {mahnfall.policy_version} ist nicht mehr die aktuell freigegebene Policy "
+                f"(aktuell: {aktuelle_policy.version if aktuelle_policy else None})."
+            ), None
+
+        # Empfänger frisch prüfen UND gegen den bei der Planung freigegebenen
+        # Snapshot vergleichen: eine bloße Nicht-Leer-Prüfung würde eine
+        # zwischenzeitlich KORRIGIERTE/GEÄNDERTE Adresse (anderer Name oder
+        # andere E-Mail als zum Planungszeitpunkt) nicht bemerken und mit der
+        # ungeprüft neuen Adresse weiterversenden - eine Empfänger-Änderung
+        # nach der Planung braucht eine neue Freigabe, kein stillschweigendes
+        # Mitziehen.
+        debitor = self._stammdaten_repository.get_debitor(konto.debitor_id)
+        if debitor is None or not (debitor.email or "").strip():
+            return "BLOCKIERT_PERSIST", f"Kein gültiger Empfänger (E-Mail) für Debitor {konto.debitor_id} mehr hinterlegt.", None
+        geplante_email = mahnfall.snapshot.get("empfaenger_email")
+        geplanter_name = mahnfall.snapshot.get("empfaenger_name")
+        if debitor.email != geplante_email or debitor.name != geplanter_name:
+            return "BLOCKIERT_PERSIST", (
+                f"Empfänger hat sich seit der Planung geändert (geplant: {geplanter_name!r} <{geplante_email!r}>, "
+                f"jetzt: {debitor.name!r} <{debitor.email!r}>); eine neue Freigabe/Planung ist erforderlich."
+            ), None
+
+        # Identitätsbasierte Neuprüfung: nicht nur "ist die Kontosumme noch
+        # groß genug" (das würde eine andere, zufällig gleich große
+        # Veränderung nicht bemerken), sondern "ist GENAU DIESE Forderung
+        # noch in mindestens der geplanten Höhe offen". Erfasst insbesondere
+        # eine kurz vor dem Versand neu eingegangene (Teil-)Zahlung.
+        offene_forderungen = self._op_service.offene_forderungen(konto.id, heute=heute)
+        passende_forderung = next(
+            (f for f in offene_forderungen if f.op_position_id == mahnfall.forderung_op_position_id), None
+        )
+        if passende_forderung is None or passende_forderung.rest_cent < mahnfall.betrag_cent:
+            return "UEBERSPRUNGEN_PERSIST", (
+                "Die Forderung ist zwischen Planung und Versand nicht mehr in geplanter Höhe offen "
+                "(Zahlung, Korrektur oder Storno)."
+            ), None
+
+        # Re-evaluate timing after a possibly delayed approval/dispatch.
+        if not passende_forderung.faelligkeit_bekannt or passende_forderung.faelligkeit is None:
+            return "BLOCKIERT_PERSIST", "Fälligkeit ist inzwischen ungeklärt.", None
+        if mahnfall.stufe == 1:
+            fruehestens = passende_forderung.faelligkeit + timedelta(days=aktuelle_policy.stufe1_tage_nach_faelligkeit)
+        else:
+            first = self._repository.letzter_mahnfall_je_stufe_fuer_forderung(mahnfall.forderung_op_position_id, 1)
+            if first is None or first.status != "GESENDET" or first.gesendet_am is None:
+                return "BLOCKIERT_PERSIST", "Zweite Mahnung benötigt die tatsächlich gesendete erste Mahnung.", None
+            fruehestens = _versandtag_wien(first.gesendet_am) + timedelta(days=max(
+                aktuelle_policy.stufe2_mindesttage_nach_stufe1_versand, vertrag.zahlungsfrist_tage))
+        if heute < fruehestens:
+            return "BLOCKIERT_TRANSIENT", "Mahnfrist ist noch nicht abgelaufen.", None
+
+        return None, "", passende_forderung
+
     def versenden(
         self,
         *,
@@ -279,11 +370,23 @@ class MahnwesenService:
         ungeklaerte_eingaenge_vorhanden: bool,
         send_enabled: bool,
         versand_fn: Callable[[dict], object],
+        mahnkosten_vorschau_slot: dict | None = None,
     ) -> VersandErgebnis:
         """`bank_bestaetigt_bis`/`ungeklaerte_eingaenge_vorhanden` MÜSSEN
         unmittelbar vor diesem Aufruf frisch ermittelt werden - ein bei der
         Planung gemessener, inzwischen veralteter Wert darf hier nicht
-        wiederverwendet werden."""
+        wiederverwendet werden.
+
+        `mahnkosten_vorschau_slot`: optionales, vom Aufrufer bereitgestelltes
+        Dict. Ist es leer (Default `None`/`{}`), berechnet diese Methode die
+        Mahnkosten-Vorschau für die Buchung INTERN frisch (altes Verhalten,
+        für einfache, nicht gebündelte Aufrufer). Trägt `versand_fn` als
+        Seiteneffekt selbst einen Schlüssel `"vorschau"` ein (z. B. weil es
+        dieselbe Vorschau bereits für den Brieftext verwendet hat), wird
+        GENAU DIESES Objekt für die Buchung übernommen - niemals eine
+        zweite, potenziell abweichende Neuberechnung. Das garantiert die
+        exakte Übereinstimmung zwischen gesendetem Kosten-/Zinsnachweis und
+        gebuchten Zusatzpositionen (siehe `kosten_service.py`-Moduldoc)."""
 
         mahnfall = self._repository.get(mahnfall_id)
         if mahnfall is None:
@@ -303,92 +406,20 @@ class MahnwesenService:
 
         self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
 
-        if not rechtsordnung_geklaert(vertrag.rechtsordnung):
-            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
-            return VersandErgebnis("BLOCKIERT", "Rechtsordnung des Vertrags ist UNGEKLAERT.")
-
-        aktive_sperren = self._stammdaten_repository.aktive_sperren(vertrag.id)
-        if aktive_sperren:
-            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
-            return VersandErgebnis("BLOCKIERT", "Sperre wurde nach der Planung gesetzt.")
-
-        if self._bankstand_veraltet(heute=heute, bank_bestaetigt_bis=bank_bestaetigt_bis):
-            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
-            return VersandErgebnis(
-                "BLOCKIERT",
-                f"Keine ausreichend aktuelle BESTÄTIGTE Bankvollständigkeit beim Versand "
-                f"(bestätigt bis: {bank_bestaetigt_bis}, max {self._bank_stand_max_age_days} Tage alt).",
-            )
-        if ungeklaerte_eingaenge_vorhanden:
-            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
-            return VersandErgebnis(
-                "BLOCKIERT", "Ungeklärte/teilzugeordnete Bankeingänge sind zwischen Planung und Versand aufgetaucht."
-            )
-
-        # Policy frisch prüfen: wurde sie seit der Planung zurückgezogen
-        # oder durch eine neue Version ersetzt, wird NICHT mit der alten,
-        # zum Planungszeitpunkt gültigen Policy weiterversendet.
         aktuelle_policy = self._mahn_policy_repository.aktuelle_freigegebene()
-        if aktuelle_policy is None or aktuelle_policy.version != mahnfall.policy_version:
-            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
-            return VersandErgebnis(
-                "BLOCKIERT",
-                f"Policy-Version {mahnfall.policy_version} ist nicht mehr die aktuell freigegebene Policy "
-                f"(aktuell: {aktuelle_policy.version if aktuelle_policy else None}).",
-            )
-
-        # Empfänger frisch prüfen UND gegen den bei der Planung freigegebenen
-        # Snapshot vergleichen: eine bloße Nicht-Leer-Prüfung würde eine
-        # zwischenzeitlich KORRIGIERTE/GEÄNDERTE Adresse (anderer Name oder
-        # andere E-Mail als zum Planungszeitpunkt) nicht bemerken und mit der
-        # ungeprüft neuen Adresse weiterversenden - eine Empfänger-Änderung
-        # nach der Planung braucht eine neue Freigabe, kein stillschweigendes
-        # Mitziehen.
-        debitor = self._stammdaten_repository.get_debitor(konto.debitor_id)
-        if debitor is None or not (debitor.email or "").strip():
-            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
-            return VersandErgebnis("BLOCKIERT", f"Kein gültiger Empfänger (E-Mail) für Debitor {konto.debitor_id} mehr hinterlegt.")
-        geplante_email = mahnfall.snapshot.get("empfaenger_email")
-        geplanter_name = mahnfall.snapshot.get("empfaenger_name")
-        if debitor.email != geplante_email or debitor.name != geplanter_name:
-            self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
-            return VersandErgebnis(
-                "BLOCKIERT",
-                f"Empfänger hat sich seit der Planung geändert (geplant: {geplanter_name!r} <{geplante_email!r}>, "
-                f"jetzt: {debitor.name!r} <{debitor.email!r}>); eine neue Freigabe/Planung ist erforderlich.",
-            )
-
-        # Identitätsbasierte Neuprüfung: nicht nur "ist die Kontosumme noch
-        # groß genug" (das würde eine andere, zufällig gleich große
-        # Veränderung nicht bemerken), sondern "ist GENAU DIESE Forderung
-        # noch in mindestens der geplanten Höhe offen".
-        offene_forderungen = self._op_service.offene_forderungen(konto.id, heute=heute)
-        passende_forderung = next(
-            (f for f in offene_forderungen if f.op_position_id == mahnfall.forderung_op_position_id), None
+        status_code, grund, passende_forderung = self._pruefe_frisch_versandbereit(
+            mahnfall=mahnfall, vertrag=vertrag, konto=konto, aktuelle_policy=aktuelle_policy, heute=heute,
+            bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
         )
-        if passende_forderung is None or passende_forderung.rest_cent < mahnfall.betrag_cent:
-            self._repository.set_status(mahnfall_id, MahnStatus.UEBERSPRUNGEN.value)
-            return VersandErgebnis(
-                "UEBERSPRUNGEN",
-                "Die Forderung ist zwischen Planung und Versand nicht mehr in geplanter Höhe offen "
-                "(Zahlung, Korrektur oder Storno).",
-            )
-
-        # Re-evaluate timing after a possibly delayed approval/dispatch.
-        if not passende_forderung.faelligkeit_bekannt or passende_forderung.faelligkeit is None:
+        if status_code == "BLOCKIERT_PERSIST":
             self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
-            return VersandErgebnis("BLOCKIERT", "Fälligkeit ist inzwischen ungeklärt.")
-        if mahnfall.stufe == 1:
-            fruehestens = passende_forderung.faelligkeit + timedelta(days=aktuelle_policy.stufe1_tage_nach_faelligkeit)
-        else:
-            first = self._repository.letzter_mahnfall_je_stufe_fuer_forderung(mahnfall.forderung_op_position_id, 1)
-            if first is None or first.status != "GESENDET" or first.gesendet_am is None:
-                self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
-                return VersandErgebnis("BLOCKIERT", "Zweite Mahnung benötigt die tatsächlich gesendete erste Mahnung.")
-            fruehestens = _versandtag_wien(first.gesendet_am) + timedelta(days=max(
-                aktuelle_policy.stufe2_mindesttage_nach_stufe1_versand, vertrag.zahlungsfrist_tage))
-        if heute < fruehestens:
-            return VersandErgebnis("BLOCKIERT", "Mahnfrist ist noch nicht abgelaufen.")
+            return VersandErgebnis("BLOCKIERT", grund)
+        if status_code == "UEBERSPRUNGEN_PERSIST":
+            self._repository.set_status(mahnfall_id, MahnStatus.UEBERSPRUNGEN.value)
+            return VersandErgebnis("UEBERSPRUNGEN", grund)
+        if status_code == "BLOCKIERT_TRANSIENT":
+            return VersandErgebnis("BLOCKIERT", grund)
+        assert status_code is None  # bereit für Claim/Versand
 
         if not send_enabled:
             return VersandErgebnis("BEREITS_VERARBEITET", "SEND_ENABLED=false: nur Preview/Outbox, kein realer Versand.")
@@ -421,10 +452,16 @@ class MahnwesenService:
         # zugestellt; ein Buchungsfehler wird geloggt/propagiert nicht
         # als Versandfehler.
         if self._mahnkosten_service is not None:
-            self._mahnkosten_service.buche_bei_versand(
-                ctx=ctx, vertrag_id=vertrag.id, stufe=mahnfall.stufe, heute=heute,
-                versandnachweis_referenz="mahnung:" + mahnfall.outbox_key, akteur=ctx.user_id,
-            )
+            vorschau = None
+            if mahnkosten_vorschau_slot is not None and "vorschau" in mahnkosten_vorschau_slot:
+                vorschau = mahnkosten_vorschau_slot["vorschau"]
+            else:
+                vorschau = self._mahnkosten_service.vorschau(vertrag_id=vertrag.id, stufe=mahnfall.stufe, heute=heute)
+            if vorschau is not None:
+                self._mahnkosten_service.buche_vorschau(
+                    ctx=ctx, vorschau=vorschau, heute=heute,
+                    versandnachweis_referenz="mahnung:" + mahnfall.outbox_key, akteur=ctx.user_id,
+                )
         return VersandErgebnis("GESENDET", "Tatsächlicher Versand im Maildienst nachgewiesen.")
 
     def markiere_verwaiste_als_unsicher(self, *, jetzt: datetime | None = None, max_alter: timedelta = timedelta(minutes=15)) -> list[MahnFallTable]:

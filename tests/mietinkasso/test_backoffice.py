@@ -2396,6 +2396,74 @@ def test_basiszinssatz_erfassen_und_duplikat_wird_abgelehnt(backoffice_client):
     assert "unveränderlich" in duplikat.text
 
 
+def test_mahnvorschau_zeigt_zinssegmente_bei_halbjahreswechsel(backoffice_client):
+    """Regressionsschutz für den neuen Segment-Detailblock (Rückprüfung
+    14.09.2026): eine Verzugszinsenperiode über einen Halbjahreswechsel
+    muss ohne Renderfehler mit mehreren Zeilen angezeigt werden."""
+
+    import mietinkasso.backoffice.app as backoffice_app
+    from mietinkasso.domain.enums import OPTyp
+    from datetime import date as _date
+    from decimal import Decimal as _Decimal
+
+    client, konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+
+    konto = backoffice_app._stammdaten_repo.get_konto(konto_id)
+    from mietinkasso.auth.service import AuthContext
+    from mietinkasso.domain.enums import Rolle
+    admin = AuthContext(user_id="test", rolle=Rolle.ADMIN, gesellschaft_ids=None)
+
+    # Eigener, mit keinem anderen Test dieser (modulweiten) Fixture
+    # kollidierender Zeitraum (2027 statt 2026, siehe
+    # `test_basiszinssatz_erfassen_und_duplikat_wird_abgelehnt` weiter
+    # oben im selben Modul).
+    op_service.buchen(
+        ctx=admin, konto=konto, typ=OPTyp.SOLL, betrag_cent=55_000,
+        belegdatum=_date(2027, 6, 1), buchungsdatum=_date(2027, 6, 1), faelligkeit=_date(2027, 6, 5),
+        beleg_referenz="TEST HMZ Juni (Segmenttest)",
+    )
+    profil = backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_anlegen(
+        vertrag_id=konto.vertrag_id, ist_b2b=True, vertragsdatum=_date(2020, 1, 1), erstellt_von="test",
+    )
+    backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
+    backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+        id="TEST-2027-1", gueltig_von=_date(2027, 1, 1), gueltig_bis=_date(2027, 6, 30),
+        basiszinssatz_prozent=_Decimal("1.530"), erfasst_von="test", quelle_referenz="Test",
+    )
+    backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+        id="TEST-2027-2", gueltig_von=_date(2027, 7, 1), gueltig_bis=_date(2027, 12, 31),
+        basiszinssatz_prozent=_Decimal("2.000"), erfasst_von="test", quelle_referenz="Test",
+    )
+
+    antwort = client.get(f"/backoffice/vertrag/{konto.vertrag_id}/mahnvorschau?heute=2027-07-20")
+    assert antwort.status_code == 200
+    assert "Zinssegmente" in antwort.text
+    assert "10.730" in antwort.text.replace(",", ".") or "10,730" in antwort.text
+
+
+def test_ueberlappende_basiszinssaetze_werden_beim_erfassen_abgelehnt(backoffice_client):
+    """Regression: zwei verschiedene Halbjahres-IDs mit sich
+    überschneidenden Gültigkeitszeiträumen machten `basiszinssatz_fuer_
+    datum` mehrdeutig und ließen die gesamte Mahnkosten-Berechnung mit
+    `MultipleResultsFound` abstürzen, statt bereits beim fehlerhaften
+    Erfassen klar abgelehnt zu werden."""
+
+    import mietinkasso.backoffice.app as backoffice_app
+    from datetime import date as _date
+    from decimal import Decimal as _Decimal
+
+    backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+        id="TEST-UEBERLAPP-1", gueltig_von=_date(2028, 1, 1), gueltig_bis=_date(2028, 6, 30),
+        basiszinssatz_prozent=_Decimal("1.0"), erfasst_von="test", quelle_referenz="Test",
+    )
+    with pytest.raises(ValueError, match="überschneidet"):
+        backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+            id="TEST-UEBERLAPP-2", gueltig_von=_date(2028, 6, 1), gueltig_bis=_date(2028, 12, 31),
+            basiszinssatz_prozent=_Decimal("2.0"), erfasst_von="test", quelle_referenz="Test",
+        )
+
+
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
     unten) - der Login-Ratelimiter ist ein globaler, prozessweiter
