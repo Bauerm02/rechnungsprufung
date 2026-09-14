@@ -2989,3 +2989,74 @@ Serverzugriff, kein Liveversand.
 
 2 neue/erweiterte Tests, 1001/1001 grün im Gesamtlauf. Nur synthetische
 Testdaten, kein Deployment, kein Serverzugriff, kein Liveversand.
+
+## Korrekturpaket Runde 7: Verzugszinsen-Startdatum + Kanalregel-Verdrahtung + Portal-UX (14.09.2026)
+
+1. **Verzugszinsen begannen fälschlich AM Fälligkeitstag statt am Tag
+   danach**: `kosten.py::balance_zeitreihe_fuer_forderung` setzte
+   `aktuelles_datum = ziel.faelligkeit` statt `faelligkeit + 1 Tag`.
+   Amtlich bestätigt (BMF/OeNB, WKO): Verzugszinsen beginnen erst mit
+   dem ERSTEN TAG NACH Fälligkeit. Bei Fälligkeit 30.06./Stichtag 02.07.
+   entstand dadurch fälschlich ein Segment ab 30.06. (2 Tage statt 1),
+   inkl. eines potenziellen Juni-Halbjahressatzes bei einer eigentlich
+   erst am 1.7. beginnenden Verzugsperiode. Fix: Startanker auf
+   `faelligkeit + timedelta(days=1)` korrigiert. Wirkt NUR auf künftig
+   neu berechnete Vorschauen/Buchungen; bereits gebuchte Ledger-Einträge
+   werden nie rückwirkend verändert (das bestehende Delta-Gegenrechnungs-
+   prinzip in `buche_vorschau` kappt neue Deltas ohnehin nur nach unten,
+   nie als rückwirkende Korrektur). 8 bestehende Tests mit dem alten,
+   falschen Tageszähler korrigiert; 2 neue gezielte Regressionstests
+   (u. a. exakt der gemeldete 30.06./02.07.-Fall inkl. Halbjahressatz-
+   Gegenprobe).
+2. **Kanalregel Stufe1=EMAIL/Stufe2=BRIEF verdrahtet** (Datenmodell/
+   Repositories waren bereits vorhanden): `MahnwesenService` bekommt
+   drei neue, ausschließlich additive Konstruktorparameter
+   (`kanalregel_repository`, `brief_anbieterprofil_repository`,
+   `brief_transport_verfuegbar`, alle `None`/`False` per Default) und
+   eine neue `_resolve_kanal(stufe)`-Methode - ohne freigegebene
+   `MahnKanalregelTable`-Version bleibt der Kanal für BEIDE Stufen
+   unverändert EMAIL (100%ige Rückwärtskompatibilität mit dem
+   produktiven Stufe-2-E-Mail-Versand). `plane_mahnlauf` löst den Kanal
+   einmal je Stufe auf und friert ihn in `MahnLaufTable.kanal` ein.
+   `_pruefe_forderung_planbar`/`_pruefe_frisch_versandbereit` verlangen
+   für Kanal BRIEF eine geprüfte Postadresse (`DebitorTable.
+   postadresse_geprueft`) statt einer E-Mail - der Namensabgleich bleibt
+   kanalunabhängig als Identitätsprüfung bestehen. Beim unmittelbar-vor-
+   Versand-Check verlangt BRIEF zusätzlich ein freigegebenes
+   `BriefAnbieterProfilTable` (sonst `BLOCKIERT_TRANSIENT`, Mitglied
+   bleibt GEPLANT - kein dauerhafter Block) UND tatsächlich verfügbaren
+   Transport (`brief_transport_verfuegbar`, in dieser Umgebung IMMER
+   `False` - kein erfundener Live-Provider, EinfachBrief sFTP/API ist
+   noch nicht freigeschaltet). 8 neue gezielte Tests: Default-Verhalten
+   ohne/mit ENTWURF-Regel, Kanalauflösung mit freigegebener Regel,
+   Stufe-2-Planung mit Postadresse statt E-Mail (inkl. Gegenprobe ohne
+   geprüfte Postadresse), sowie ein voller Bündelungs-/Versand-Ablauf,
+   der beweist, dass OHNE Anbieterprofil UND ohne Transport nichts
+   gebündelt wird und ERST mit beidem tatsächlich versendet wird.
+3. **Portal-UX-Feinschliff** (unabhängige Rückmeldung nach eigener
+   ASGI-Vorschau-Prüfung): eine reine, noch nicht gespeicherte
+   Mahnvorschau zeigte denselben Status-Text "GEPLANT" wie ein
+   tatsächlich angelegter Fall - jetzt "Planbar" für den ungespeicherten
+   Fall, "GEPLANT" bleibt für einen wirklich existierenden Mahnfall
+   reserviert. Technische Formulierungen aus dem Nutzerfluss entfernt
+   ("serverseitig aus persistierten Daten abgeleitet" → "Bankstatus:
+   ...", "(intern in Cent gespeichert)" gestrichen). Längere
+   Rechtsgrundlagen-Absätze (Zinsprofil-Formular, Mahnkosten-Vorschau je
+   Stufe) in `<details>` eingeklappt. Neue, deutlich hervorgehobene
+   Zeile "Gesamtbetrag (Hauptforderung + neue Zinsen + neue Gebühr)" in
+   der Mahnkosten-Vorschau je Stufe. 2 neue gezielte Tests (Planbar-vs-
+   GEPLANT-Unterscheidung inkl. echtem Planen-Zyklus über den neuen POST-
+   Endpunkt; bestehender Zinsprofil-Test erweitert).
+
+12 neue/erweiterte Tests, 1010/1010 grün im Gesamtlauf. Nur synthetische
+Testdaten, kein Deployment, kein Serverzugriff, kein Liveversand.
+
+**Weiterhin ehrlich offen** (unverändert, siehe frühere Runden): die
+Versandkosten-Positionen (Druck/Kuvert/Porto/Nachweis) in der Vorschau
+und im tatsächlichen Brieftext, das §1333-Kostengate für den Briefkanal,
+der PDF/A-Generator mit EinfachBrief-Layout und ehrlichem, nie aus
+bloßer Metadatenangabe abgeleitetem Formatprüfungsstatus - EinfachBrief
+sFTP/API ist noch nicht freigeschaltet (Stundungsvereinbarung mit der
+Post ausständig), daher bleibt der Briefkanal für einen echten Versand
+auch nach dieser Runde vollständig blockiert (`brief_transport_
+verfuegbar=False`), genau wie beauftragt.

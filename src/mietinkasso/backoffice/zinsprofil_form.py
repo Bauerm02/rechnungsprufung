@@ -36,11 +36,13 @@ def zinsprofil_formular(vertrag, profile, csrf):
         )
     return f'''
     <div class="card"><h1>Zinsprofil (Mahnkosten) – {h(vertrag.id)}</h1>
+      <details><summary>Rechtliche Grundlagen</summary>
       <p class="muted">§1000/§1333 ABGB: ohne geprüftes Profil gilt die gesetzliche Basis von 4 % p.a.
          Eine vereinbarte Verbraucherklausel wird NUR nach menschlicher Prüfung verwendet (KSchG §6/OGH 7Ob111/25m).
          §456 UGB (9,2 Prozentpunkte über Basiszinssatz) gilt nur bei beiderseits unternehmensbezogenem Geschäft,
          einem Vertragsdatum ab 16.03.2013 UND geprüfter Verzugsverantwortung - sonst gelten die gesetzlichen 4 %.
          §458 UGB (Mahnspesen-Pauschale) gilt verschuldensunabhängig, aber ebenfalls nur bei B2B/Datum ab 16.03.2013.</p>
+      </details>
       <p><a href="/backoffice/vertrag/{h(vertrag.id)}/mahnvorschau">Zur Mahnvorschau</a></p>
       <table>
         <tr><th>Version</th><th>Status</th><th>B2B/Privat</th><th>Vertragsdatum</th><th>Gültig ab</th>
@@ -51,7 +53,7 @@ def zinsprofil_formular(vertrag, profile, csrf):
     </div>
     <div class="card"><h2>Neues Zinsprofil</h2>
       <p class="muted">Eine neue Version pausiert die bisherige Freigabe bis zur erneuten Prüfung.
-         Beträge werden in EUR eingegeben (intern in Cent gespeichert).</p>
+         Beträge werden in EUR eingegeben.</p>
       <form method="post" action="/backoffice/vertrag/{h(vertrag.id)}/zinsprofil/erstellen">
       {csrf_feld(csrf)}
       <fieldset><legend>Vertragseinordnung</legend>

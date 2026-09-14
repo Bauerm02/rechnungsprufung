@@ -182,11 +182,13 @@ def test_bereits_gebuchte_zinsen_je_op_position_zaehlt_stufe1_delta_nicht_doppel
     ursprünglich `zins_segmente_json` (die VOLLE, ab der Fälligkeit neu
     berechnete Periode je Buchung) statt des tatsächlich an jedem Tag
     NEU gebuchten Deltas summierte. Exakter, vom unabhängigen Prüfer
-    gemeldeter Ablauf: 100.000 Cent Hauptforderung, fällig 01.01.2026,
-    Stufe 1 am 20.01. (19 Tage, 4 % gesetzlich -> 208 Cent), Stufe 2 am
-    10.02. (40 Tage seit Fälligkeit -> 438 Cent gesamt, davon 230 Cent
-    neu). Insgesamt tatsächlich gebucht: 208 + 230 = 438 Cent - NICHT
-    646 (208 fälschlich doppelt gezählt)."""
+    gemeldeter Ablauf: 100.000 Cent Hauptforderung, fällig 01.01.2026 -
+    Verzug beginnt am 02.01. (erster Tag NACH Fälligkeit, unabhängige
+    Rückprüfung Codex 14.09.2026), Stufe 1 am 20.01. (18 Tage, 4 %
+    gesetzlich -> 197 Cent), Stufe 2 am 10.02. (39 Tage seit Verzugs-
+    beginn -> 427 Cent gesamt, davon 230 Cent neu). Insgesamt
+    tatsächlich gebucht: 197 + 230 = 427 Cent - NICHT 624 (197
+    fälschlich doppelt gezählt)."""
 
     vertrag, konto = basis_vertrag
     op_service.buchen(
@@ -200,7 +202,7 @@ def test_bereits_gebuchte_zinsen_je_op_position_zaehlt_stufe1_delta_nicht_doppel
         versandnachweis_referenz="mahnung:stufe1", akteur="test",
     )
     assert stufe1 is not None
-    assert stufe1.zinsen_cent == 208
+    assert stufe1.zinsen_cent == 197
 
     stufe2 = kosten_service.buche_bei_versand(
         ctx=admin_ctx, vertrag_id=vertrag.id, stufe=2, heute=date(2026, 2, 10),
@@ -213,7 +215,7 @@ def test_bereits_gebuchte_zinsen_je_op_position_zaehlt_stufe1_delta_nicht_doppel
     hmz_op_id = min(op_ids)  # die Hauptforderung selbst (kleinste Id, vor den beiden Zinsbuchungen)
 
     bereits_je_op = kosten_repo.bereits_gebuchte_zinsen_je_op_position(vertrag_id=vertrag.id)
-    assert bereits_je_op[hmz_op_id] == 438  # NICHT 646 (208 nicht doppelt gezählt)
+    assert bereits_je_op[hmz_op_id] == 427  # NICHT 624 (197 nicht doppelt gezählt)
 
     tatsaechlich_gebucht_gesamt = stufe1.zinsen_cent + stufe2.zinsen_cent
     assert bereits_je_op[hmz_op_id] == tatsaechlich_gebucht_gesamt
@@ -314,7 +316,9 @@ def test_zinsdelta_einer_neuen_forderung_wird_nicht_durch_eine_alte_abgeloeste_g
         faelligkeit=date(2026, 2, 15), beleg_referenz="HMZ Februar",
     )
 
-    zinsen_neue_forderung = _segment_zinsen_cent(3_000, Decimal("4.000"), (date(2026, 3, 1) - date(2026, 2, 15)).days)
+    # Verzug beginnt am 16.2. (erster Tag NACH Fälligkeit 15.2.), nicht am
+    # Fälligkeitstag selbst.
+    zinsen_neue_forderung = _segment_zinsen_cent(3_000, Decimal("4.000"), (date(2026, 3, 1) - date(2026, 2, 16)).days)
     assert zinsen_neue_forderung > 0
     assert zinsen_alte_forderung > zinsen_neue_forderung  # das eigentliche Bug-Szenario
 
@@ -512,20 +516,96 @@ def test_teilzahlung_reduziert_zinsbasis_ab_zahlungsdatum(op_service, kosten_ser
     assert vorschau_mit_teilzahlung.hauptforderung_cent == 60_000
 
     # Erwartete Zinsen taggenau nachgerechnet (gesetzliche 4 % p.a., kein
-    # Zinsprofil hinterlegt): 100.000 Cent vom 5.1. (Fälligkeit) bis 20.1.
-    # (Zahlungsdatum, 15 Tage), danach 60.000 Cent vom 20.1. bis 1.3.
+    # Zinsprofil hinterlegt): Verzug beginnt erst am 6.1. (ERSTER TAG NACH
+    # Fälligkeit 5.1., nicht am Fälligkeitstag selbst - unabhängige
+    # Rückprüfung Codex 14.09.2026), 100.000 Cent vom 6.1. bis 20.1.
+    # (Zahlungsdatum, 14 Tage), danach 60.000 Cent vom 20.1. bis 1.3.
     # (40 Tage) - exakt die beiden Perioden, die
     # `balance_zeitreihe_fuer_forderung` liefern muss. Jedes Segment wird
     # EINZELN kaufmännisch gerundet und dann summiert (siehe
     # `kosten.py::_zinsen_fuer_segment_cent`).
-    erwartete_zinsen = _segment_zinsen_cent(100_000, Decimal("4.000"), 15) + _segment_zinsen_cent(60_000, Decimal("4.000"), 40)
+    erwartete_zinsen = _segment_zinsen_cent(100_000, Decimal("4.000"), 14) + _segment_zinsen_cent(60_000, Decimal("4.000"), 40)
     assert vorschau_mit_teilzahlung.neue_zinsen_cent == erwartete_zinsen
 
     # Gegenprobe: würde die Teilzahlung NICHT berücksichtigt, wäre die
     # volle Basis (100.000 Cent) über die gesamte Periode verzinst worden -
     # das muss strikt mehr sein als der tatsächliche, korrekt reduzierte Wert.
-    ohne_teilzahlung = _segment_zinsen_cent(100_000, Decimal("4.000"), 55)
+    ohne_teilzahlung = _segment_zinsen_cent(100_000, Decimal("4.000"), 54)
     assert vorschau_mit_teilzahlung.neue_zinsen_cent < ohne_teilzahlung
+
+
+def test_verzugszinsen_beginnen_erst_tag_nach_faelligkeit(op_service, kosten_service, admin_ctx, basis_vertrag):
+    """Unabhängige Rückprüfung Codex 14.09.2026, echter Bug: Fälligkeit
+    30.06.2026, Stichtag 02.07.2026 erzeugte fälschlich ein Segment
+    30.06.–02.07. (2 Tage, inkl. eines Verzugstags AM Fälligkeitstag
+    selbst). Verzugszinsen beginnen amtlich bestätigt erst mit dem
+    ERSTEN TAG NACH Fälligkeit:
+    https://finanznavi.gv.at/glossar/verzugszinsen,
+    https://www.wko.at/vertragsrecht/zahlungsverzug-des-geschaeftspartners
+    - korrekt ist GENAU EIN Tag (01.07.–02.07.), niemals ein Segment, das
+    bereits am 30.06. beginnt."""
+
+    vertrag, konto = basis_vertrag
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=100_000,
+        belegdatum=date(2026, 6, 1), buchungsdatum=date(2026, 6, 1),
+        faelligkeit=date(2026, 6, 30), beleg_referenz="HMZ Juni",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 7, 2))
+
+    assert vorschau is not None
+    assert len(vorschau.zins_segmente) == 1
+    segment = vorschau.zins_segmente[0]
+    assert segment.von == date(2026, 7, 1)
+    assert segment.bis == date(2026, 7, 2)
+    assert segment.von > date(2026, 6, 30)  # NIE ein Verzugstag AM oder VOR dem Fälligkeitstag selbst
+    assert vorschau.neue_zinsen_cent == _segment_zinsen_cent(100_000, Decimal("4.000"), 1)
+
+    # Am Fälligkeitstag selbst (heute == faelligkeit) besteht noch KEIN
+    # Verzug - null Segmente, keine Zinsen.
+    vorschau_am_faelligkeitstag = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 6, 30))
+    assert vorschau_am_faelligkeitstag is not None
+    assert vorschau_am_faelligkeitstag.zins_segmente == ()
+    assert vorschau_am_faelligkeitstag.neue_zinsen_cent == 0
+
+
+def test_faelligkeit_am_letzten_halbjahrestag_bekommt_nie_den_juni_satz(
+    op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
+):
+    """Kehrseite des Bugs für den UGB-B2B-Basiszinssatz: eine Forderung,
+    die exakt am letzten Tag eines Halbjahres (30.06.) fällig wird, darf
+    NIE ein Segment mit dem (im Vorjahres-Halbjahr geltenden) alten
+    Basiszinssatz erhalten, weil der einzig tatsächlich bestehende
+    Verzugstag (01.07.) bereits im NEUEN Halbjahr liegt."""
+
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        verzugsverantwortung_geprueft=True,
+    )
+    kosten_repo.basiszinssatz_erfassen(
+        id="2026-1", gueltig_von=date(2026, 1, 1), gueltig_bis=date(2026, 6, 30),
+        basiszinssatz_prozent=Decimal("1.530"), erfasst_von="test", quelle_referenz="OeNB 01.01.2026",
+    )
+    kosten_repo.basiszinssatz_erfassen(
+        id="2026-2", gueltig_von=date(2026, 7, 1), gueltig_bis=date(2026, 12, 31),
+        basiszinssatz_prozent=Decimal("2.000"), erfasst_von="test", quelle_referenz="OeNB 01.07.2026",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=100_000,
+        belegdatum=date(2026, 6, 1), buchungsdatum=date(2026, 6, 1),
+        faelligkeit=date(2026, 6, 30), beleg_referenz="HMZ Juni",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 7, 5))
+
+    assert vorschau is not None
+    assert len(vorschau.zins_segmente) == 1  # KEIN separates (leeres) Juni-Segment
+    segment = vorschau.zins_segmente[0]
+    assert segment.satz_prozent == Decimal("11.200")  # zweites Halbjahr (2,0 + 9,2), NIE 10,73 (erstes Halbjahr)
+    assert segment.von == date(2026, 7, 1)
+    assert segment.bis == date(2026, 7, 5)
 
 
 # -- Halbjahreswechsel ohne erfassten Basiszinssatz: B2B blockiert ---------
@@ -643,17 +723,18 @@ def test_zukuenftiges_halbjahr_verwendet_nicht_stillschweigend_alten_basiszinssa
     )
 
     # Zweites Halbjahr 2026 wurde NICHT erfasst - darf keinesfalls den
-    # Wert des ersten Halbjahrs stillschweigend fortschreiben. Die
-    # Periode läuft aber teilweise noch durchs BELEGTE erste Halbjahr
-    # (5.1.-1.7.) - dieser Teil wird jetzt korrekt segmentiert verzinst,
-    # nur der Rest (1.7.-15.7., zweites Halbjahr) bleibt ungeklärt.
+    # Wert des ersten Halbjahrs stillschweigend fortschreiben. Verzug
+    # beginnt am 6.1. (erster Tag NACH Fälligkeit 5.1.); die Periode läuft
+    # aber teilweise noch durchs BELEGTE erste Halbjahr (6.1.-1.7.) -
+    # dieser Teil wird jetzt korrekt segmentiert verzinst, nur der Rest
+    # (1.7.-15.7., zweites Halbjahr) bleibt ungeklärt.
     vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 7, 15))
 
     assert vorschau is not None
     assert vorschau.zins_teilweise_ungeklaert is True
     assert vorschau.zinssatz_prozent == Decimal("10.730")  # das einzige AUFGELÖSTE Segment
     assert vorschau.neue_zinsen_cent > 0
-    erwartete_zinsen_h1_anteil = _segment_zinsen_cent(50_000, Decimal("10.730"), (date(2026, 7, 1) - date(2026, 1, 5)).days)
+    erwartete_zinsen_h1_anteil = _segment_zinsen_cent(50_000, Decimal("10.730"), (date(2026, 7, 1) - date(2026, 1, 6)).days)
     assert vorschau.neue_zinsen_cent == erwartete_zinsen_h1_anteil
     assert any("ohne belegte Zins-/Basiszinssatzgrundlage" in h for h in vorschau.hinweise)
 
@@ -695,10 +776,12 @@ def test_halbjahreswechsel_mit_beiden_erfassten_halbjahren_rechnet_in_teilperiod
     assert len(vorschau.zins_segmente) == 2
     segment_h1 = next(s for s in vorschau.zins_segmente if s.satz_prozent == Decimal("10.730"))
     segment_h2 = next(s for s in vorschau.zins_segmente if s.satz_prozent == Decimal("11.200"))
-    assert segment_h1.von == date(2026, 6, 5) and segment_h1.bis == date(2026, 7, 1)
+    # Verzug beginnt am 6.6. (erster Tag NACH Fälligkeit 5.6.), nicht am
+    # Fälligkeitstag selbst (unabhängige Rückprüfung Codex 14.09.2026).
+    assert segment_h1.von == date(2026, 6, 6) and segment_h1.bis == date(2026, 7, 1)
     assert segment_h2.von == date(2026, 7, 1) and segment_h2.bis == date(2026, 7, 20)
     erwartet = (
-        _segment_zinsen_cent(50_000, Decimal("10.730"), (date(2026, 7, 1) - date(2026, 6, 5)).days)
+        _segment_zinsen_cent(50_000, Decimal("10.730"), (date(2026, 7, 1) - date(2026, 6, 6)).days)
         + _segment_zinsen_cent(50_000, Decimal("11.200"), (date(2026, 7, 20) - date(2026, 7, 1)).days)
     )
     assert vorschau.neue_zinsen_cent == erwartet
@@ -740,10 +823,12 @@ def test_zinsprofil_wechsel_mit_belegtem_gueltig_ab_wird_periodengerecht_segment
     assert len(vorschau.zins_segmente) == 2
     segment_v1 = next(s for s in vorschau.zins_segmente if s.satz_prozent == Decimal("5.000"))
     segment_v2 = next(s for s in vorschau.zins_segmente if s.satz_prozent == Decimal("6.000"))
-    assert segment_v1.von == date(2026, 3, 1) and segment_v1.bis == date(2026, 6, 1)
+    # Verzug beginnt am 2.3. (erster Tag NACH Fälligkeit 1.3.), nicht am
+    # Fälligkeitstag selbst (unabhängige Rückprüfung Codex 14.09.2026).
+    assert segment_v1.von == date(2026, 3, 2) and segment_v1.bis == date(2026, 6, 1)
     assert segment_v2.von == date(2026, 6, 1) and segment_v2.bis == date(2026, 8, 1)
     erwartet = (
-        _segment_zinsen_cent(50_000, Decimal("5.000"), (date(2026, 6, 1) - date(2026, 3, 1)).days)
+        _segment_zinsen_cent(50_000, Decimal("5.000"), (date(2026, 6, 1) - date(2026, 3, 2)).days)
         + _segment_zinsen_cent(50_000, Decimal("6.000"), (date(2026, 8, 1) - date(2026, 6, 1)).days)
     )
     assert vorschau.neue_zinsen_cent == erwartet

@@ -217,7 +217,19 @@ def balance_zeitreihe_fuer_forderung(
 
     perioden: list[BalancePeriode] = []
     aktueller_rest = ziel.betrag_cent
-    aktuelles_datum = ziel.faelligkeit
+    # Verzugszinsen beginnen erst mit dem ERSTEN TAG NACH Fälligkeit, nie
+    # am Fälligkeitstag selbst (unabhängige Rückprüfung Codex 14.09.2026,
+    # echter Bug, reproduziert an einer eigenen ASGI-Vorschau: Fälligkeit
+    # 30.06., Stichtag 02.07. erzeugte fälschlich ein Segment 30.06.–02.07.
+    # inkl. eines Juni-Verzugstags/-Halbjahressatzes. Amtlich bestätigt:
+    # https://finanznavi.gv.at/glossar/verzugszinsen,
+    # https://www.wko.at/vertragsrecht/zahlungsverzug-des-geschaeftspartners
+    # - "ab dem Tag NACH Fälligkeit". Ändert NUR künftig neu berechnete
+    # Vorschauen/Buchungen; bereits gebuchte Ledger-Einträge werden NIE
+    # rückwirkend korrigiert (siehe `MahnkostenService.buche_vorschau`-
+    # Moduldoc: Delta wird je Forderung gegen bereits Gebuchtes gekappt,
+    # nie negativ/rückwirkend storniert).
+    aktuelles_datum = ziel.faelligkeit + timedelta(days=1)
     for aenderung_datum, neuer_rest in aenderungen:
         if aenderung_datum <= aktuelles_datum:
             # Reduktion vor/auf Fälligkeit - mindert nur den Ausgangsbetrag,

@@ -51,6 +51,45 @@ def mahn_service(mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, 
     )
 
 
+@pytest.fixture
+def kanalregel_repo(session_factory):
+    from mietinkasso.mahnwesen.repository import MahnKanalregelRepository
+    return MahnKanalregelRepository(session_factory)
+
+
+@pytest.fixture
+def brief_anbieterprofil_repo(session_factory):
+    from mietinkasso.mahnwesen.repository import BriefAnbieterProfilRepository
+    return BriefAnbieterProfilRepository(session_factory)
+
+
+def _mahn_service_mit_brief(
+    mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+    kanalregel_repo, brief_anbieterprofil_repo, *, brief_transport_verfuegbar=False,
+) -> MahnwesenService:
+    return MahnwesenService(
+        mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, bank_stand_max_age_days=2,
+        mahnlauf_repository=mahnlauf_repo, kanalregel_repository=kanalregel_repo,
+        brief_anbieterprofil_repository=brief_anbieterprofil_repo,
+        brief_transport_verfuegbar=brief_transport_verfuegbar,
+    )
+
+
+@pytest.fixture
+def freigegebene_kanalregel_email_brief(kanalregel_repo):
+    regel = kanalregel_repo.anlegen(stufe1_kanal="EMAIL", stufe2_kanal="BRIEF", erstellt_von="test")
+    return kanalregel_repo.freigeben(regel.id, freigegeben_von="test")
+
+
+@pytest.fixture
+def freigegebenes_brief_anbieterprofil(brief_anbieterprofil_repo):
+    profil = brief_anbieterprofil_repo.anlegen(
+        anbieter_name="EinfachBrief (Test)", quelle_beleg="Testtarif", preis_druck_cent=10,
+        preis_kuvert_cent=5, preis_porto_cent=131, erstellt_von="test",
+    )
+    return brief_anbieterprofil_repo.freigeben(profil.id, freigegeben_von="test")
+
+
 def _mit_faelligem_soll(op_service, konto, ctx, betrag_cent=60_000, faelligkeit=date(2026, 4, 5)):
     op_service.buchen(
         ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=betrag_cent,
@@ -1112,3 +1151,177 @@ def test_blockierte_gruppe_vor_providerkontakt_macht_outbox_key_nicht_dauerhaft_
     )
     assert ergebnis_zwei.status == "GESENDET"
     assert mahn_fall_repo.get(geplant.mahnfall_id).status == MahnStatus.GESENDET.value
+
+
+# -- Kanalregel Stufe1=EMAIL/Stufe2=BRIEF (Auftrag HV-20260914-MAHNUNG-BRIEF) -
+
+
+def test_resolve_kanal_default_bleibt_email_ohne_konfiguration(mahn_service):
+    """Ohne konfiguriertes `kanalregel_repository` (der bisherige, in
+    Produktion unveränderte Zustand) bleibt der Kanal für BEIDE Stufen
+    EMAIL - 100%ige Rückwärtskompatibilität."""
+
+    assert mahn_service._resolve_kanal(1) == "EMAIL"
+    assert mahn_service._resolve_kanal(2) == "EMAIL"
+
+
+def test_resolve_kanal_bleibt_email_ohne_freigegebene_regel(
+    mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+    kanalregel_repo, brief_anbieterprofil_repo,
+):
+    """Ein `kanalregel_repository` ist konfiguriert, aber es existiert nur
+    eine ENTWURF-Kanalregel (noch nicht freigegeben) - der Default bleibt
+    unverändert EMAIL für beide Stufen, bis Codex die Regel tatsächlich
+    freigibt."""
+
+    service = _mahn_service_mit_brief(
+        mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+        kanalregel_repo, brief_anbieterprofil_repo,
+    )
+    kanalregel_repo.anlegen(stufe1_kanal="EMAIL", stufe2_kanal="BRIEF", erstellt_von="test")
+    assert service._resolve_kanal(1) == "EMAIL"
+    assert service._resolve_kanal(2) == "EMAIL"
+
+
+def test_resolve_kanal_nutzt_freigegebene_regel(
+    mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+    kanalregel_repo, brief_anbieterprofil_repo, freigegebene_kanalregel_email_brief,
+):
+    service = _mahn_service_mit_brief(
+        mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+        kanalregel_repo, brief_anbieterprofil_repo,
+    )
+    assert service._resolve_kanal(1) == "EMAIL"
+    assert service._resolve_kanal(2) == "BRIEF"
+
+
+def test_plane_forderung_stufe2_brief_erfordert_postadresse_nicht_email(
+    mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+    kanalregel_repo, brief_anbieterprofil_repo, freigegebene_kanalregel_email_brief,
+    basis_vertrag, ctx_factory, freigegebene_policy,
+):
+    """Mit freigegebener Kanalregel (Stufe1=EMAIL/Stufe2=BRIEF) darf
+    Stufe 2 auch für einen Debitor OHNE E-Mail geplant werden, solange
+    eine geprüfte Postadresse vorliegt - E-Mail bleibt NUR für Stufe 1
+    Pflicht."""
+
+    service = _mahn_service_mit_brief(
+        mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+        kanalregel_repo, brief_anbieterprofil_repo,
+    )
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    _mit_faelligem_soll(op_service, konto, ctx)
+    _stufe1_bis_gesendet(service, op_service, vertrag, konto, ctx, freigegebene_policy)
+
+    # Debitor verliert die E-Mail, bekommt aber eine geprüfte Postadresse.
+    stammdaten_repo.upsert_debitor(
+        id=konto.debitor_id, name="Max Mustermieter", email=None, adresse="Teststraße 1", postadresse_geprueft=True,
+    )
+
+    heute_stufe2 = date(2026, 4, 27)  # >= 14 Tage nach Stufe1-Versand (12.4.)
+    forderung2 = _einzige_forderung(op_service, konto, heute_stufe2)
+    geplant2 = _planen(
+        service, ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung2, policy=freigegebene_policy,
+        heute=heute_stufe2,
+    )
+    assert geplant2.status == "GEPLANT"
+    assert geplant2.stufe == 2
+    fall2 = mahn_fall_repo.get(geplant2.mahnfall_id)
+    assert fall2.snapshot["kanal"] == "BRIEF"
+
+
+def test_plane_forderung_stufe2_brief_ohne_postadresse_geprueft_bleibt_blockiert(
+    mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+    kanalregel_repo, brief_anbieterprofil_repo, freigegebene_kanalregel_email_brief,
+    basis_vertrag, ctx_factory, freigegebene_policy,
+):
+    service = _mahn_service_mit_brief(
+        mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+        kanalregel_repo, brief_anbieterprofil_repo,
+    )
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    _mit_faelligem_soll(op_service, konto, ctx)
+    _stufe1_bis_gesendet(service, op_service, vertrag, konto, ctx, freigegebene_policy)
+
+    # E-Mail entfernt, Postadresse angegeben, aber NIE geprüft.
+    stammdaten_repo.upsert_debitor(id=konto.debitor_id, name="Max Mustermieter", email=None, adresse="Teststraße 1")
+
+    heute_stufe2 = date(2026, 4, 27)
+    forderung2 = _einzige_forderung(op_service, konto, heute_stufe2)
+    ergebnis = _planen(
+        service, ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung2, policy=freigegebene_policy,
+        heute=heute_stufe2,
+    )
+    assert ergebnis.status == "BLOCKIERT"
+    assert "Postadress" in ergebnis.grund
+
+
+def test_brief_kanal_gate_blockiert_transient_bis_anbieterprofil_und_transport_verfuegbar(
+    mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+    kanalregel_repo, brief_anbieterprofil_repo, freigegebene_kanalregel_email_brief,
+    basis_vertrag, ctx_factory, freigegebene_policy,
+):
+    """Kein erfundener Live-Provider: solange kein freigegebenes Brief-
+    Anbieterprofil existiert ODER der Transport nicht tatsächlich
+    angebunden ist (`brief_transport_verfuegbar`), bündelt `plane_
+    mahnlauf` GAR NICHTS für den Briefkanal (BLOCKIERT_TRANSIENT - das
+    Mitglied bleibt GEPLANT, kein dauerhafter Block). Erst wenn BEIDE
+    Voraussetzungen erfüllt sind, wird tatsächlich gebündelt/versendet."""
+
+    service = _mahn_service_mit_brief(
+        mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+        kanalregel_repo, brief_anbieterprofil_repo, brief_transport_verfuegbar=False,
+    )
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    _mit_faelligem_soll(op_service, konto, ctx)
+    _stufe1_bis_gesendet(service, op_service, vertrag, konto, ctx, freigegebene_policy)
+    stammdaten_repo.upsert_debitor(
+        id=konto.debitor_id, name="Max Mustermieter", email=None, adresse="Teststraße 1", postadresse_geprueft=True,
+    )
+
+    heute_stufe2 = date(2026, 4, 27)
+    forderung2 = _einzige_forderung(op_service, konto, heute_stufe2)
+    geplant2 = _planen(
+        service, ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung2, policy=freigegebene_policy,
+        heute=heute_stufe2,
+    )
+    assert geplant2.status == "GEPLANT"
+
+    # 1) Kein Brief-Anbieterprofil vorhanden -> nichts wird gebündelt.
+    ohne_profil = service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=2, heute=heute_stufe2, bank_bestaetigt_bis=heute_stufe2,
+    )
+    assert ohne_profil is None
+    assert mahn_fall_repo.get(geplant2.mahnfall_id).status == MahnStatus.GEPLANT.value
+
+    # 2) Anbieterprofil freigegeben, aber Transport weiterhin nicht angebunden.
+    profil = brief_anbieterprofil_repo.anlegen(
+        anbieter_name="EinfachBrief (Test)", quelle_beleg="Testtarif", erstellt_von="test",
+    )
+    brief_anbieterprofil_repo.freigeben(profil.id, freigegeben_von="test")
+    ohne_transport = service.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=2, heute=heute_stufe2, bank_bestaetigt_bis=heute_stufe2,
+    )
+    assert ohne_transport is None
+    assert mahn_fall_repo.get(geplant2.mahnfall_id).status == MahnStatus.GEPLANT.value
+
+    # 3) Mit tatsächlich verfügbarem Transport klappt Bündelung UND Versand.
+    service_mit_transport = _mahn_service_mit_brief(
+        mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+        kanalregel_repo, brief_anbieterprofil_repo, brief_transport_verfuegbar=True,
+    )
+    mahnlauf = service_mit_transport.plane_mahnlauf(
+        ctx=ctx, vertrag=vertrag, konto=konto, stufe=2, heute=heute_stufe2, bank_bestaetigt_bis=heute_stufe2,
+    )
+    assert mahnlauf is not None
+    assert mahnlauf.kanal == "BRIEF"
+    ergebnis = service_mit_transport.versende_mahnlauf(
+        ctx=ctx, mahnlauf_id=mahnlauf.id, heute=heute_stufe2, bank_bestaetigt_bis=heute_stufe2,
+        ungeklaerte_eingaenge_vorhanden=False, send_enabled=True,
+        versand_fn=lambda mitglieder: _test_receipt(heute_stufe2),
+    )
+    assert ergebnis.status == "GESENDET"
+    assert mahn_fall_repo.get(geplant2.mahnfall_id).status == MahnStatus.GESENDET.value

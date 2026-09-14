@@ -1479,10 +1479,14 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
             bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaert,
         )
         aktion = ""
+        status_anzeige = ergebnis.status
         if ergebnis.status == "GEPLANT" and ergebnis.mahnfall_id is None:
             # Noch nicht tatsächlich geplant (nur die reine Vorschau sagt
-            # "dürfte geplant werden") - das dauerhafte Anlegen braucht
+            # "dürfte geplant werden") - andere Anzeige als ein bereits
+            # tatsächlich angelegter Fall, sonst nicht unterscheidbar
+            # (Auftrag Markus 14.09.2026). Das dauerhafte Anlegen braucht
             # den ausdrücklich betätigten POST.
+            status_anzeige = "Planbar"
             aktion = f"""
             <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/forderung/{forderung.op_position_id}/planen?heute={heute_datum.isoformat()}" class="inline">
               {csrf_feld(session.csrf_token)}
@@ -1506,7 +1510,7 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
         <tr>
           <td>OP #{forderung.op_position_id}</td><td>{h(forderung.art)}</td><td>{eur(forderung.rest_cent)}</td>
           <td>{forderung.faelligkeit.isoformat() if forderung.faelligkeit else 'unbekannt'}</td>
-          <td>{h(ergebnis.status)}</td><td>{h(ergebnis.grund)}</td><td>{aktion}</td>
+          <td>{h(status_anzeige)}</td><td>{h(ergebnis.grund)}</td><td>{aktion}</td>
         </tr>""")
 
     bank_status = (
@@ -1514,7 +1518,7 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
     ) + (" | <span class='warn'>ungeklärte Eingänge vorhanden</span>" if ungeklaert else "")
     inhalt += f"""
     <div class="card">
-      <p class="muted">Sperrgründe transparent, serverseitig aus persistierten Daten abgeleitet: {bank_status}</p>
+      <p class="muted">Bankstatus: {bank_status}</p>
       <table>
         <tr><th>Forderung</th><th>Art</th><th>Rest</th><th>Fälligkeit</th><th>Status</th><th>Grund</th><th></th></tr>
         {''.join(zeilen) if zeilen else '<tr><td colspan=7 class="muted">Keine offenen Forderungen.</td></tr>'}
@@ -1627,6 +1631,7 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
             gebuehr_segmente_html = f"""<details><summary>Neue Pauschalen je Entgeltforderung ({len(vorschau.gebuehr_segmente)})</summary>
               <table><tr><th>Entgeltforderung</th><th>Betrag</th></tr>{zeilen_gebuehr}</table>
             </details>"""
+        gesamtbetrag_cent = vorschau.hauptforderung_cent + vorschau.zusaetzlicher_betrag_cent
         zeilen.append(f"""
         <div class="card">
           <h3>Stufe {stufe}</h3>
@@ -1637,10 +1642,12 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
             <tr><th>Zinssatz / Basis</th><td>{h(satz_text)} ({h(vorschau.zinsbasis)})</td></tr>
             <tr><th>Zinszeitraum</th><td>{h(zeitraum_text)}</td></tr>
             <tr><th>Neue Mahngebühr</th><td>{h(gebuehr_text)}{f" ({h(vorschau.gebuehr_rechtsgrundlage)})" if vorschau.gebuehr_rechtsgrundlage else ""}</td></tr>
+            <tr><th><strong>Gesamtbetrag (Hauptforderung + neue Zinsen + neue Gebühr)</strong></th>
+                <td><strong>{eur(gesamtbetrag_cent)}</strong></td></tr>
           </table>
           {segmente_html}
           {gebuehr_segmente_html}
-          <ul class="muted">{hinweise_html}</ul>
+          <details><summary>Rechtliche Begründung</summary><ul class="muted">{hinweise_html}</ul></details>
           {"<ul>" + ausgeschlossen_html + "</ul>" if ausgeschlossen_html else ""}
         </div>""")
     if not zeilen:

@@ -100,6 +100,9 @@ class MahnwesenService:
         bank_stand_max_age_days: int = 2,
         mahnkosten_service=None,
         mahnlauf_repository: MahnLaufRepository | None = None,
+        kanalregel_repository=None,
+        brief_anbieterprofil_repository=None,
+        brief_transport_verfuegbar: bool = False,
     ):
         self._repository = repository
         self._stammdaten_repository = stammdaten_repository
@@ -116,6 +119,40 @@ class MahnwesenService:
         # Einzelfall-Methoden (`plane_forderung`/`versenden`) nutzbar,
         # bestehende Aufrufer/Tests laufen unverändert weiter.
         self._mahnlauf_repository = mahnlauf_repository
+        # Kanalregel-Paket (Auftrag HV-20260914-MAHNUNG-BRIEF, Nutzer-
+        # entscheidung 14.09.2026: "Stufe 1 EMAIL, Stufe 2 BRIEF") - ALLE
+        # DREI optional und standardmäßig unwirksam, damit jeder
+        # bestehende Aufrufer/Test OHNE Anpassung exakt das bisherige
+        # Verhalten (EMAIL für beide Stufen) behält, bis Codex eine
+        # Kanalregel tatsächlich anlegt+freigibt UND den echten Brief-
+        # transport bereitstellt (`brief_transport_verfuegbar`bleibt in
+        # dieser Umgebung IMMER `False` - kein erfundener Live-Provider,
+        # EinfachBrief sFTP/API ist noch nicht freigeschaltet). Siehe
+        # `_resolve_kanal`/`_pruefe_frisch_versandbereit`.
+        self._kanalregel_repository = kanalregel_repository
+        self._brief_anbieterprofil_repository = brief_anbieterprofil_repository
+        self._brief_transport_verfuegbar = brief_transport_verfuegbar
+
+    def _resolve_kanal(self, stufe: int) -> str:
+        """Liefert den für `stufe` (1 oder 2) tatsächlich zu verwendenden
+        Versandkanal ("EMAIL" | "BRIEF"). Default für BEIDE Stufen bleibt
+        "EMAIL", solange kein `kanalregel_repository` konfiguriert ist
+        ODER keine `MahnKanalregelTable`-Version FREIGEGEBEN ist - das
+        erhält 100%ige Rückwärtskompatibilität mit dem bisherigen,
+        produktiv laufenden Verhalten (Stufe 2 sendet aktuell immer per
+        E-Mail); die Nutzerentscheidung "Stufe1=EMAIL/Stufe2=BRIEF"
+        entfaltet erst Wirkung, sobald Codex eine Kanalregel explizit
+        anlegt UND freigibt - ein stillschweigender Default-Wechsel
+        würde den heute funktionierenden Stufe-2-E-Mail-Versand
+        andernfalls unangekündigt brechen, solange der Briefkanal noch
+        keinen echten Transport hat."""
+
+        if self._kanalregel_repository is None:
+            return "EMAIL"
+        regel = self._kanalregel_repository.aktuelle_freigegebene()
+        if regel is None:
+            return "EMAIL"
+        return regel.stufe1_kanal if stufe == 1 else regel.stufe2_kanal
 
     def _naechste_stufe_fuer_forderung(self, forderung_op_position_id: int) -> MahnStufe | None:
         letzter = self._repository.letzter_mahnfall_fuer_forderung(forderung_op_position_id)
@@ -186,8 +223,8 @@ class MahnwesenService:
             )
 
         debitor = self._stammdaten_repository.get_debitor(konto.debitor_id)
-        if debitor is None or not (debitor.email or "").strip():
-            return "BLOCKIERT", f"Kein gültiger Empfänger (E-Mail) für Debitor {konto.debitor_id} hinterlegt.", None, None
+        if debitor is None:
+            return "BLOCKIERT", f"Kein Debitor {konto.debitor_id} hinterlegt.", None, None
 
         if not forderung.faelligkeit_bekannt or forderung.faelligkeit is None:
             return "KEIN_BETRAG", "Fälligkeit unbekannt (z. B. Gesamtsaldo-Eröffnung); wird nie automatisch gemahnt.", None, None
@@ -197,6 +234,22 @@ class MahnwesenService:
         stufe = self._naechste_stufe_fuer_forderung(forderung.op_position_id)
         if stufe is None:
             return "BLOCKIERT", "Nach Stufe 2 ist nur ein interner Bearbeitungsfall zulässig, keine Stufe 3.", None, None
+
+        # Empfänger-Voraussetzung hängt vom für DIESE Stufe tatsächlich
+        # aufgelösten Kanal ab (siehe `_resolve_kanal`) - ERST HIER
+        # geprüft, weil sie die Stufe kennen muss (Default bleibt EMAIL
+        # für beide Stufen, solange keine Kanalregel freigegeben ist,
+        # siehe dortiger Docstring).
+        kanal = self._resolve_kanal(stufe.value)
+        if kanal == "BRIEF":
+            if not debitor.postadresse_geprueft:
+                return (
+                    "BLOCKIERT",
+                    f"Kein geprüfter Postadressen-Nachweis für Debitor {konto.debitor_id} hinterlegt (Kanal BRIEF).",
+                    None, None,
+                )
+        elif not (debitor.email or "").strip():
+            return "BLOCKIERT", f"Kein gültiger Empfänger (E-Mail) für Debitor {konto.debitor_id} hinterlegt.", None, None
 
         if stufe is MahnStufe.STUFE_1:
             faellig_seit_tagen = (heute - forderung.faelligkeit).days
@@ -226,6 +279,7 @@ class MahnwesenService:
         snapshot = {
             "vertrag_id": vertrag.id,
             "debitor_id": konto.debitor_id,
+            "kanal": kanal,
             "empfaenger_email": debitor.email,
             "empfaenger_name": debitor.name,
             "forderung_op_position_id": forderung.op_position_id,
@@ -362,6 +416,7 @@ class MahnwesenService:
         self, *, mahnfall: MahnFallTable, vertrag: VertragTable, konto: KontoTable,
         aktuelle_policy: MahnPolicyTable | None, heute: date,
         bank_bestaetigt_bis: date | None, ungeklaerte_eingaenge_vorhanden: bool,
+        kanal: str = "EMAIL",
     ) -> tuple[str | None, str, OffeneForderung | None]:
         """Reine Prüfung OHNE Nebenwirkung aller unmittelbar-vor-Versand
         Bedingungen für EINEN MahnFall - von `versenden()` (das je nach
@@ -370,12 +425,24 @@ class MahnwesenService:
         `indexautomatik/mailversand_service.py` gemeinsam genutzt, damit
         beide NIE auseinanderlaufen können.
 
+        `kanal`: der für DIESEN Mahnfall tatsächlich maßgebliche Kanal -
+        bei `versende_mahnlauf` der bereits eingefrorene `mahnlauf.kanal`
+        der Gruppe, bei `plane_mahnlauf` der für die Stufe frisch über
+        `_resolve_kanal` aufgelöste Kanal (die Gruppe existiert dort noch
+        nicht), bei `versenden()` der im Planungssnapshot eingefrorene
+        Kanal (Default "EMAIL" für ältere, vor diesem Auftrag angelegte
+        Snapshots ohne den Schlüssel). Bestimmt, ob die Empfänger-
+        Voraussetzung E-Mail (`kanal=="EMAIL"`) oder geprüfte Postadresse
+        (`kanal=="BRIEF"`, zusätzlich ein freigegebenes Brief-
+        Anbieterprofil UND tatsächlich angebundener Transport) ist.
+
         Rückgabe `(status_code, grund, passende_forderung)`:
         `status_code` ist `None`, wenn alles bereit ist (der Aufrufer darf
         claimen/senden); sonst `"BLOCKIERT_PERSIST"`/`"UEBERSPRUNGEN_PERSIST"`
         (der Fall wird dauerhaft auf diesen Status gesetzt) oder
-        `"BLOCKIERT_TRANSIENT"` (bloß "noch nicht fällig" - bleibt GEPLANT,
-        kann bei einem späteren Lauf alleine oder gemeinsam mit anderen
+        `"BLOCKIERT_TRANSIENT"` (bloß "noch nicht fällig"/"Briefkanal
+        systemisch noch nicht versandbereit" - bleibt GEPLANT, kann bei
+        einem späteren Lauf alleine oder gemeinsam mit anderen
         Forderungen wieder versandbereit werden)."""
 
         if not rechtsordnung_geklaert(vertrag.rechtsordnung):
@@ -406,17 +473,54 @@ class MahnwesenService:
         # andere E-Mail als zum Planungszeitpunkt) nicht bemerken und mit der
         # ungeprüft neuen Adresse weiterversenden - eine Empfänger-Änderung
         # nach der Planung braucht eine neue Freigabe, kein stillschweigendes
-        # Mitziehen.
+        # Mitziehen. Der NAME wird kanalunabhängig verglichen (Identitäts-
+        # prüfung); E-Mail nur für Kanal EMAIL, Postadresse nur für BRIEF.
         debitor = self._stammdaten_repository.get_debitor(konto.debitor_id)
-        if debitor is None or not (debitor.email or "").strip():
-            return "BLOCKIERT_PERSIST", f"Kein gültiger Empfänger (E-Mail) für Debitor {konto.debitor_id} mehr hinterlegt.", None
-        geplante_email = mahnfall.snapshot.get("empfaenger_email")
+        if debitor is None:
+            return "BLOCKIERT_PERSIST", f"Kein Debitor {konto.debitor_id} mehr hinterlegt.", None
         geplanter_name = mahnfall.snapshot.get("empfaenger_name")
-        if debitor.email != geplante_email or debitor.name != geplanter_name:
+        if debitor.name != geplanter_name:
             return "BLOCKIERT_PERSIST", (
-                f"Empfänger hat sich seit der Planung geändert (geplant: {geplanter_name!r} <{geplante_email!r}>, "
-                f"jetzt: {debitor.name!r} <{debitor.email!r}>); eine neue Freigabe/Planung ist erforderlich."
+                f"Empfänger hat sich seit der Planung geändert (geplant: {geplanter_name!r}, jetzt: {debitor.name!r}); "
+                "eine neue Freigabe/Planung ist erforderlich."
             ), None
+
+        if kanal == "BRIEF":
+            # `postadresse_geprueft` wird bei jeder ECHTEN Adressänderung
+            # automatisch zurückgesetzt (siehe `upsert_debitor`-Fix) - ein
+            # frischer Prüf-Zugriff auf GENAU dieses Flag deckt eine
+            # zwischenzeitliche Adressänderung deshalb bereits ab, ohne die
+            # Adresse selbst textuell mit einem Snapshot vergleichen zu
+            # müssen.
+            if not debitor.postadresse_geprueft:
+                return (
+                    "BLOCKIERT_PERSIST",
+                    f"Kein geprüfter Postadressen-Nachweis für Debitor {konto.debitor_id} mehr hinterlegt (Kanal BRIEF).",
+                    None,
+                )
+            if self._brief_anbieterprofil_repository is None or self._brief_anbieterprofil_repository.aktuelle_freigegebene() is None:
+                return (
+                    "BLOCKIERT_TRANSIENT",
+                    "Kein freigegebenes Brief-Anbieterprofil hinterlegt - Briefkanal systemisch (noch) nicht "
+                    "versandbereit; ein späterer Lauf greift automatisch, sobald eines freigegeben ist.",
+                    None,
+                )
+            if not self._brief_transport_verfuegbar:
+                return (
+                    "BLOCKIERT_TRANSIENT",
+                    "Brief-Versandtransport ist (noch) nicht angebunden (kein erfundener Live-Provider) - "
+                    "kein automatischer Versand möglich, bis ein echter Transport konfiguriert ist.",
+                    None,
+                )
+        else:
+            geplante_email = mahnfall.snapshot.get("empfaenger_email")
+            if not (debitor.email or "").strip():
+                return "BLOCKIERT_PERSIST", f"Kein gültiger Empfänger (E-Mail) für Debitor {konto.debitor_id} mehr hinterlegt.", None
+            if debitor.email != geplante_email:
+                return "BLOCKIERT_PERSIST", (
+                    f"Empfänger-E-Mail hat sich seit der Planung geändert (geplant: {geplante_email!r}, "
+                    f"jetzt: {debitor.email!r}); eine neue Freigabe/Planung ist erforderlich."
+                ), None
 
         # Identitätsbasierte Neuprüfung: nicht nur "ist die Kontosumme noch
         # groß genug" (das würde eine andere, zufällig gleich große
@@ -499,6 +603,7 @@ class MahnwesenService:
         status_code, grund, passende_forderung = self._pruefe_frisch_versandbereit(
             mahnfall=mahnfall, vertrag=vertrag, konto=konto, aktuelle_policy=aktuelle_policy, heute=heute,
             bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
+            kanal=mahnfall.snapshot.get("kanal", "EMAIL"),
         )
         if status_code == "BLOCKIERT_PERSIST":
             self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
@@ -624,6 +729,11 @@ class MahnwesenService:
             return bestehende_offene_gruppe
 
         aktuelle_policy = self._mahn_policy_repository.aktuelle_freigegebene()
+        # Der Kanal DIESER Gruppe wird HIER EINMAL für die ganze Stufe
+        # aufgelöst (`_resolve_kanal`) und danach eingefroren - siehe
+        # `claim_mitglieder_und_erstelle_gruppe(kanal=...)` weiter unten
+        # und `MahnLaufTable.kanal`.
+        kanal = self._resolve_kanal(stufe)
         kandidaten = [
             f for f in self._repository.list_fuer_vertrag(vertrag.id)
             if f.stufe == stufe and f.status == MahnStatus.GEPLANT.value
@@ -633,6 +743,7 @@ class MahnwesenService:
             status_code, _grund, _forderung = self._pruefe_frisch_versandbereit(
                 mahnfall=mahnfall, vertrag=vertrag, konto=konto, aktuelle_policy=aktuelle_policy, heute=heute,
                 bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
+                kanal=kanal,
             )
             if status_code is None:
                 bereit_ids.append(mahnfall.id)
@@ -660,7 +771,7 @@ class MahnwesenService:
         # Mitglieder ohne zugehörige Gruppe zurücklassen.
         return self._mahnlauf_repository.claim_mitglieder_und_erstelle_gruppe(
             mahnfall_ids=bereit_ids_sortiert, outbox_key=outbox_key, vertrag_id=vertrag.id,
-            gesellschaft_id=vertrag.gesellschaft_id, stufe=stufe,
+            gesellschaft_id=vertrag.gesellschaft_id, stufe=stufe, kanal=kanal,
         )
 
     def versende_mahnlauf(
@@ -733,6 +844,7 @@ class MahnwesenService:
             status_code, grund, _forderung = self._pruefe_frisch_versandbereit(
                 mahnfall=mahnfall, vertrag=vertrag, konto=konto, aktuelle_policy=aktuelle_policy, heute=heute,
                 bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
+                kanal=mahnlauf.kanal,
             )
             if status_code is not None:
                 if status_code == "BLOCKIERT_PERSIST":
@@ -740,11 +852,13 @@ class MahnwesenService:
                 elif status_code == "UEBERSPRUNGEN_PERSIST":
                     self._repository.set_status(mahnfall.id, MahnStatus.UEBERSPRUNGEN.value)
                 else:
-                    # BLOCKIERT_TRANSIENT ("Frist noch nicht abgelaufen"):
-                    # dieses Mitglied bekommt KEINEN dauerhaften Status -
-                    # es wird stattdessen selbst auf GEPLANT zurückgesetzt,
-                    # damit eine spätere Planung es erneut berücksichtigt,
-                    # sobald es tatsächlich fällig ist.
+                    # BLOCKIERT_TRANSIENT ("Frist noch nicht abgelaufen"
+                    # ODER, für den Briefkanal, "Anbieterprofil/Transport
+                    # systemisch noch nicht verfügbar"): dieses Mitglied
+                    # bekommt KEINEN dauerhaften Status - es wird
+                    # stattdessen selbst auf GEPLANT zurückgesetzt, damit
+                    # eine spätere Planung es erneut berücksichtigt,
+                    # sobald es tatsächlich versandbereit ist.
                     self._repository.set_status(mahnfall.id, MahnStatus.GEPLANT.value)
                 self._mahnlauf_repository.set_status(
                     mahnlauf_id, "BLOCKIERT", fehlergrund=f"Mitglied {mahnfall.id}: {grund}"

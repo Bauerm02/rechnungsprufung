@@ -699,6 +699,89 @@ def test_mahnvorschau_blockiert_ohne_bankbestaetigung_und_sendet_nie_echt(backof
     assert 'action="/backoffice/mahnfall/' not in vorschau.text
 
 
+def test_mahnvorschau_unterscheidet_planbar_von_tatsaechlich_geplant(backoffice_client):
+    """Auftrag Markus 14.09.2026: eine reine (noch nicht gespeicherte)
+    Vorschau darf nicht denselben Status-Text wie ein tatsächlich
+    angelegter Mahnfall zeigen ("Planbar" statt "GEPLANT"), sonst sind
+    beide Zustände für den Nutzer nicht unterscheidbar. Erst NACH dem
+    ausdrücklichen POST auf den neuen Planen-Endpunkt erscheint "GEPLANT"
+    mit Sendebereitschafts-Aktion."""
+
+    import mietinkasso.backoffice.app as backoffice_app
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    from mietinkasso.bank.repository import BankRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    # Eigene, isolierte Gesellschaft statt der geteilten "7DI": die
+    # Bank-Vollständigkeitsableitung verlangt eine Bestätigung für ALLE
+    # Bankkonten EINER Gesellschaft (Minimum über alle Konten) - andere
+    # Tests in diesem Modul legen unter "7DI" bereits weitere, dort NIE
+    # bestätigte Bankkonten an, die eine gemeinsame Gesellschaft sonst
+    # dauerhaft auf "keine Bestätigung" ziehen würden.
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_gesellschaft(id="7DI-PLANBAR", name="7D Immobilien GmbH (Planbar-Test)")
+    stammdaten.upsert_objekt(id="601-PLANBAR", gesellschaft_id="7DI-PLANBAR", bezeichnung="Am Corso (Planbar-Test)")
+    stammdaten.upsert_einheit(id="601-TOP-PLANBAR", objekt_id="601-PLANBAR", bezeichnung="Top Planbar", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_debitor(id="DEB-PLANBAR", name="Test Mieterin Planbar", email="planbar@example.at")
+    stammdaten.upsert_vertrag(
+        id="V-601-PLANBAR", einheit_id="601-TOP-PLANBAR", debitor_id="DEB-PLANBAR", gesellschaft_id="7DI-PLANBAR",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-PLANBAR"))
+
+    from mietinkasso.mahnwesen.repository import MahnPolicyRepository
+    mahn_policy_repo = MahnPolicyRepository(build_session_factory(get_settings().database_url))
+    if mahn_policy_repo.aktuelle_freigegebene() is None:
+        policy = mahn_policy_repo.anlegen(
+            stufe1_tage_nach_faelligkeit=7, stufe2_mindesttage_nach_stufe1_versand=14, status="ENTWURF",
+        )
+        mahn_policy_repo.freigeben(policy.id)
+
+    bank_repo = BankRepository(build_session_factory(get_settings().database_url))
+    bank_repo.upsert_bank_konto(id="BK-PLANBAR", gesellschaft_id="7DI-PLANBAR", iban="AT000000000000000099", bezeichnung="Test-Bankkonto Planbar")
+    bestaetigt = client.post(
+        "/backoffice/bank/BK-PLANBAR/vollstaendigkeit-bestaetigen",
+        data={"csrf_token": csrf, "bestaetigt_bis": "2026-01-20"},
+        follow_redirects=False,
+    )
+    assert bestaetigt.status_code == 303
+
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1), faelligkeit=date(2026, 1, 5),
+        beleg_referenz="Planbar-Testforderung",
+    )
+    heute = date(2026, 1, 20).isoformat()  # 15 Tage nach Fälligkeit, Policy verlangt 7; == bestätigtes Bankdatum
+
+    vorschau = client.get("/backoffice/vertrag/V-601-PLANBAR/mahnvorschau", params={"heute": heute})
+    assert vorschau.status_code == 200
+    assert "Planbar" in vorschau.text
+    assert "GEPLANT" not in vorschau.text  # noch nicht tatsächlich angelegt
+    assert "Jetzt planen" in vorschau.text
+    assert 'action="/backoffice/mahnfall/' not in vorschau.text  # keine Sendebereitschafts-Aktion vor dem Planen
+
+    # Wiederholte GETs legen weiterhin NICHTS an.
+    client.get("/backoffice/vertrag/V-601-PLANBAR/mahnvorschau", params={"heute": heute})
+    assert backoffice_app._mahn_fall_repo.list_fuer_vertrag("V-601-PLANBAR") == []
+
+    forderung = op_service.offene_forderungen(konto.id, heute=date(2026, 1, 20))[0]
+    geplant = client.post(
+        f"/backoffice/vertrag/V-601-PLANBAR/forderung/{forderung.op_position_id}/planen",
+        params={"heute": heute}, data={"csrf_token": csrf}, follow_redirects=False,
+    )
+    assert geplant.status_code == 303
+
+    nach_planen = client.get("/backoffice/vertrag/V-601-PLANBAR/mahnvorschau", params={"heute": heute})
+    assert "GEPLANT" in nach_planen.text
+    assert 'action="/backoffice/mahnfall/' in nach_planen.text  # jetzt Sendebereitschafts-Aktion sichtbar
+
+
 def test_mahnpolicy_seite_zeigt_genau_zwei_stufen_und_erzwingt_null_zinsen_gebuehr(backoffice_client):
     """HV-20260912-ECHTBETRIEB Punkt 2: die Mahnstufen-Konfiguration ist
     im Backoffice sichtbar/speicherbar - genau zwei Stufen (kein
