@@ -364,6 +364,15 @@ def seite(
   code {{ background: #f0f0f0; padding: 0.05rem 0.3rem; border-radius: 3px; font-size: 0.9em; }}
   .bereich-karten {{ display: flex; flex-wrap: wrap; gap: 0.9rem; }}
   .bereich-karten .card {{ flex: 1 1 260px; margin-bottom: 0; }}
+  /* Index-Monatsbericht (UI-Abnahme: "schmale, responsive Mieter-Karten
+     statt einer breiten Tabelle mit horizontalem Scrollen") - jede Zeile
+     eine eigenständige, schmale Karte statt einer <table>-Spalte; auf
+     schmalen Viewports stapeln die Karten automatisch (flex-wrap), keine
+     zusätzliche Media-Query nötig. */
+  .monatsbericht-karten {{ display: flex; flex-wrap: wrap; gap: 0.9rem; }}
+  .monatsbericht-karte {{ flex: 1 1 300px; max-width: 380px; margin-bottom: 0; }}
+  .monatsbericht-kopf {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin-bottom: 0.5rem; }}
+  .monatsbericht-zeilen {{ display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; margin-bottom: 0.5rem; }}
   .todo-liste {{ list-style: none; margin: 0; padding: 0; }}
   .todo-liste li {{ padding: 0.4rem 0; border-bottom: 1px solid #eee; }}
   .todo-liste li:last-child {{ border-bottom: none; }}

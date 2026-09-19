@@ -797,6 +797,20 @@ class IndexQuellenFaktenRepository:
             session.refresh(row)
             return row
 
+    def anlegen_batch(self, rows: list[IndexQuellenFaktenTable]) -> list[IndexQuellenFaktenTable]:
+        """Codex-Korrektur: "Bei reinem quellen_fakten-Batch wenigstens
+        atomar schreiben; keine halben 17 Datensätze" - EINE Transaktion
+        für den GESAMTEN Batch statt eines Commits je Zeile."""
+
+        if not rows:
+            return []
+        with self._session_factory() as session:
+            session.add_all(rows)
+            session.commit()
+            for row in rows:
+                session.refresh(row)
+            return rows
+
 
 class IndexMonatsberichtRepository:
     """Siehe `IndexMonatsberichtTable`/`IndexMonatsberichtZeileTable`-
@@ -840,11 +854,17 @@ class IndexMonatsberichtRepository:
                 bericht = IndexMonatsberichtTable(periode=periode, status="BEREIT")
                 session.add(bericht)
                 session.flush()
-            elif bericht.status != "BEREIT":
+            elif bericht.status not in ("BEREIT", "VPI_FEHLER"):
                 return None
             session.execute(delete(IndexMonatsberichtZeileTable).where(IndexMonatsberichtZeileTable.periode == periode))
             for felder in zeilen_felder:
                 session.add(IndexMonatsberichtZeileTable(bericht_id=bericht.id, **felder))
+            # Ein zuvor per `markiere_vpi_fehler` markierter Fehlerstand wird
+            # durch einen erfolgreichen Nachlauf (VPI-Quelle repariert) wieder
+            # normalisiert - `fehlergrund` darf nach erfolgreicher Berechnung
+            # nicht als veralteter Fehlertext stehen bleiben.
+            bericht.status = "BEREIT"
+            bericht.fehlergrund = None
             bericht.anzahl_vertraege = zusammenfassung["anzahl_vertraege"]
             bericht.anzahl_moeglich = zusammenfassung["anzahl_moeglich"]
             bericht.anzahl_noch_nicht_moeglich = zusammenfassung["anzahl_noch_nicht_moeglich"]
@@ -880,15 +900,51 @@ class IndexMonatsberichtRepository:
             return row
 
     def claim_fuer_versand(self, id: int, *, jetzt: datetime | None = None) -> bool:
+        """Erlaubte Quellzustände sind BEREIT (normaler Bericht) UND
+        VPI_FEHLER (Codex: "sichtbarer Monats-Fehlerbericht/Owner-Hinweis,
+        nicht nur Jobabbruch ohne Nachricht") - ein VPI-Fehlerstand ist
+        genauso ein fälliger, einmalig zu versendender Owner-Hinweis wie
+        ein normaler Bericht, nur mit anderem Text (siehe
+        `IndexMonatsberichtService._text_fuer_bericht`)."""
+
         with self._session_factory() as session:
             result = session.execute(
                 update(IndexMonatsberichtTable)
                 .where(IndexMonatsberichtTable.id == id)
-                .where(IndexMonatsberichtTable.status == "BEREIT")
+                .where(IndexMonatsberichtTable.status.in_(["BEREIT", "VPI_FEHLER"]))
                 .values(status="IN_VERSAND", versand_beansprucht_am=jetzt or datetime.now(timezone.utc))
             )
             session.commit()
             return result.rowcount > 0
+
+    def markiere_vpi_fehler(self, periode: str, *, fehlergrund: str) -> IndexMonatsberichtTable:
+        """Codex-Auftrag: "Bei fehlgeschlagenem VPI-Abruf muss ein
+        sichtbarer Monats-Fehlerbericht/Owner-Hinweis entstehen, nicht nur
+        Jobabbruch ohne Nachricht; keine stille Berechnung mit alten
+        Werten." Wird von `scripts/indexautomatik_monatslauf.py`
+        aufgerufen, BEVOR der Monatslauf selbst (und damit
+        `ersetze_zeilen_falls_bereit`) je erreicht wird - legt die
+        Kopfzeile ggf. neu an (keine Zeilen, da nichts berechnet wurde) und
+        setzt Status VPI_FEHLER, DAMIT der Bericht (a) im Portal sichtbar
+        ist und (b) über denselben Owner-Only-Versandpfad wie ein normaler
+        Monatsbericht als Hinweis versendet werden kann. Ändert NIE einen
+        bereits eingefrorenen Bericht (IN_VERSAND/GESENDET/UNKLAR) - ein
+        späterer VPI-Ausfall NACH bereits erfolgtem Versand darf dessen
+        Historie nicht überschreiben."""
+
+        with self._session_factory() as session:
+            bericht = session.execute(
+                select(IndexMonatsberichtTable).where(IndexMonatsberichtTable.periode == periode)
+            ).scalars().first()
+            if bericht is None:
+                bericht = IndexMonatsberichtTable(periode=periode, status="VPI_FEHLER", fehlergrund=fehlergrund)
+                session.add(bericht)
+            elif bericht.status in ("BEREIT", "VPI_FEHLER"):
+                bericht.status = "VPI_FEHLER"
+                bericht.fehlergrund = fehlergrund
+            session.commit()
+            session.refresh(bericht)
+            return bericht
 
     def verwaiste_in_versand(self, *, aelter_als: datetime) -> list[IndexMonatsberichtTable]:
         with self._session_factory() as session:
@@ -898,7 +954,7 @@ class IndexMonatsberichtRepository:
             )
             return list(session.execute(statement).scalars().all())
 
-    def liste_faellig(self, *, ab_periode: str | None) -> list[IndexMonatsberichtTable]:
+    def liste_faellig(self, *, ab_periode: str | None, bis_periode: str) -> list[IndexMonatsberichtTable]:
         """`ab_periode`: Aktivierungsperiode (Codex-Betriebsdetail: "erstes
         reguläres automatisches Mailing soll 01.10.2026 ... Aktivierungs-
         periode ... ältere September-Vorschau darf nicht am nächsten
@@ -908,14 +964,25 @@ class IndexMonatsberichtRepository:
         wenn `SEND_ENABLED=True` gesetzt wäre. Eine Periode VOR
         `ab_periode` bleibt dauerhaft `BEREIT` (im Portal sichtbar,
         nie automatisch versendet - genau die "nur zur Portalansicht"-
-        Vorgabe)."""
+        Vorgabe).
+
+        `bis_periode` (Codex-Korrektur: "zukünftige Monate dürfen nie
+        versendet werden") - PFLICHT, üblicherweise die tatsächliche
+        aktuelle Periode ("YYYY-MM" von `heute`): eine Periode NACH
+        `bis_periode` (z. B. durch eine versehentlich vorab erzeugte
+        künftige Kopfzeile) wird NIE automatisch versendet.
+
+        VPI_FEHLER-Kopfzeilen (siehe `markiere_vpi_fehler`) gelten
+        ebenfalls als fällig - derselbe Aktivierungs-/Zukunfts-Schutz gilt
+        für sie unverändert, es ist derselbe Owner-Only-Kanal."""
 
         if not ab_periode:
             return []
         with self._session_factory() as session:
             statement = (
                 select(IndexMonatsberichtTable)
-                .where(IndexMonatsberichtTable.status == "BEREIT")
+                .where(IndexMonatsberichtTable.status.in_(["BEREIT", "VPI_FEHLER"]))
                 .where(IndexMonatsberichtTable.periode >= ab_periode)
+                .where(IndexMonatsberichtTable.periode <= bis_periode)
             )
             return list(session.execute(statement).scalars().all())

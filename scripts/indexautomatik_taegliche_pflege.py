@@ -106,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     def _arbeit() -> dict:
         verwaiste = bundle.outbox_service.markiere_verwaiste_als_unklar()
         verwaiste_erinnerungen = bundle.vertragsende_service.markiere_verwaiste_als_unklar()
+        verwaiste_monatsberichte = bundle.monatsbericht_service.markiere_verwaiste_als_unklar()
         mail.mahn_service.markiere_verwaiste_als_unsicher()
         nachgewiesen = mail.status_abgleichen(ctx=_ADMIN_CTX)
 
@@ -159,6 +160,20 @@ def main(argv: list[str] | None = None) -> int:
             send_enabled=vertragsende_send_enabled,
             versand_fn=mail.owner_senden,
         )
+
+        # Auftrag HV-20260919-INDEX-MONATSBERICHT, Umfang B: eigener,
+        # unabhängiger Owner-Only-Schalter (weder von SEND_ENABLED noch
+        # von indexautomatik_send_enabled/vertragsende_erinnerung_
+        # send_enabled abhängig) - identisches "kein Transport = hart
+        # deaktiviert"-Muster wie oben bei Vertragsende-Erinnerungen.
+        monatsbericht_send_enabled = (
+            settings.index_monatsbericht_send_enabled and settings.hv_mail_allowlist_bestaetigt and mail.client is not None
+        )
+        monatsbericht_versendet = bundle.monatsbericht_service.benachrichtige_faellige(
+            heute=heute, send_enabled=monatsbericht_send_enabled,
+            send_ab_periode=settings.index_monatsbericht_send_ab, versand_fn=mail.monatsbericht_senden,
+        )
+
         mahnlauf = mail.mahnlauf(ctx=_ADMIN_CTX, heute=heute)
 
         return {
@@ -175,6 +190,8 @@ def main(argv: list[str] | None = None) -> int:
             "vertragsende_verwaiste_als_unklar_markiert": len(verwaiste_erinnerungen),
             "vertragsende_neu_geplant": len(vertragsende_geplant),
             "vertragsende_benachrichtigt": len(vertragsende_benachrichtigt),
+            "monatsbericht_verwaiste_als_unklar_markiert": len(verwaiste_monatsberichte),
+            "monatsbericht_versendet": len(monatsbericht_versendet),
         }
 
     ergebnis = runner.einmalig_ausfuehren(job_name="indexautomatik_taegliche_pflege", fachschluessel=fachschluessel, fn=_arbeit)

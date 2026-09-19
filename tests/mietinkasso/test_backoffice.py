@@ -2161,6 +2161,72 @@ def test_indexautomatik_outbox_und_vertragsende_seiten_erreichbar(backoffice_cli
     assert client.get("/backoffice/indexautomatik/laeufe").status_code == 200
 
 
+def test_indexautomatik_monatsbericht_liste_und_karten_ansicht(backoffice_client):
+    """UI-Abnahme (Auftrag HV-20260919-INDEX-MONATSBERICHT): "schmale,
+    responsive Mieter-Karten statt einer breiten Tabelle mit horizontalem
+    Scrollen" - prüft, dass die Detailseite tatsächlich Karten
+    (`.monatsbericht-karte`) statt einer Zeilen-<table> für die Verträge
+    rendert, inklusive direktem Mieterakte-Link und verständlichem
+    Statusnamen statt des technischen Codes."""
+
+    from mietinkasso.indexautomatik.repository import IndexMonatsberichtRepository
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+
+    client, *_ = backoffice_client
+    _login(client)
+
+    session_factory = build_session_factory(get_settings().database_url)
+    repo = IndexMonatsberichtRepository(session_factory)
+    repo.ersetze_zeilen_falls_bereit(
+        "2026-09",
+        [{
+            "vertrag_id": "V-601-1", "periode": "2026-09", "status": "PRUEFUNG_NOETIG",
+            "status_grund": "Kein gültiges, freigegebenes Rechtsprofil.", "vorschlag_cent": None,
+            "differenz_cent": None, "fruehester_termin": None, "fruehester_termin_status": None,
+            "gesamtvorschreibung_cent": 55_000, "gesamtvorschreibung_quelle": "KOMPONENTEN",
+            "indexierbarer_mietanteil_cent": None, "indexierbarer_mietanteil_hinweis": "Noch nicht freigegeben.",
+            "snapshot_json": {"mieter_name": "Test Mieterin", "objekt_bezeichnung": "Am Corso (Test)", "einheit_bezeichnung": "Top 1"},
+            "rechtsprofil_id": None, "rechtsprofil_version": None, "quellen_fakten_id": None,
+            "indexautomatik_lauf_id": None, "erhoehungsschreiben_id": None,
+        }],
+        zusammenfassung={"anzahl_vertraege": 1, "anzahl_moeglich": 0, "anzahl_noch_nicht_moeglich": 0, "anzahl_pruefung_noetig": 1},
+    )
+
+    liste = client.get("/backoffice/indexautomatik/monatsbericht")
+    assert liste.status_code == 200
+    assert "2026-09" in liste.text
+    assert "AUSSCHLIESSLICH die eine automatische Owner-Sammelmail" in liste.text
+
+    detail = client.get("/backoffice/indexautomatik/monatsbericht/2026-09")
+    assert detail.status_code == 200
+    assert "monatsbericht-karte" in detail.text
+    assert "<tr>" not in detail.text and "<tr " not in detail.text  # Karten statt breiter Tabelle - UI-Abnahme.
+    assert "Prüfung nötig" in detail.text
+    assert "PRUEFUNG_NOETIG" not in detail.text
+    assert '/backoffice/vertrag/V-601-1">Mieterakte öffnen' in detail.text
+    assert "noch nicht berechenbar" in detail.text
+
+
+def test_indexautomatik_monatsbericht_vpi_fehler_wird_sichtbar_erklaert(backoffice_client):
+    from mietinkasso.indexautomatik.repository import IndexMonatsberichtRepository
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+
+    client, *_ = backoffice_client
+    _login(client)
+
+    session_factory = build_session_factory(get_settings().database_url)
+    repo = IndexMonatsberichtRepository(session_factory)
+    repo.markiere_vpi_fehler("2026-10", fehlergrund="Statistik-Austria-Abruf fehlgeschlagen (Verbindungsfehler).")
+
+    detail = client.get("/backoffice/indexautomatik/monatsbericht/2026-10")
+    assert detail.status_code == 200
+    assert "VPI-Abruf fehlgeschlagen" in detail.text
+    assert "Statistik-Austria-Abruf fehlgeschlagen (Verbindungsfehler)." in detail.text
+    assert "bewusst NICHT" in detail.text
+
+
 def test_indexautomatik_rechtsprofil_freigabe_ohne_csrf_wird_abgelehnt(backoffice_client):
     client, *_ = backoffice_client
     _login(client)

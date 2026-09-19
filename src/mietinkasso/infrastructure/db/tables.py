@@ -1098,6 +1098,15 @@ class IndexQuellenFaktenTable(Base):
     version: Mapped[int] = mapped_column(Integer)
     quelle: Mapped[str] = mapped_column(String(256))
     inhalt_hash: Mapped[str] = mapped_column(String(64))
+    # Codex-Korrektur: `VertragTable.rechtsordnung` (MRG_VOLL/MRG_TEIL)
+    # allein sagt NICHTS über tatsächliche Wohnungsnutzung aus - ein
+    # MRG_TEIL-Objekt kann Büro/Geschäftsraum sein. DREIWERTIG wie
+    # `RechtsprofilTable.ist_hauptmiete`: `None` (ungeklärt) sperrt den
+    # Gewerbe-Rechenvorschlag GENAUSO wie `True` (Wohnung) - NUR eine
+    # explizit verifizierte `False` (geprüft: KEINE Wohnungsnutzung)
+    # erlaubt ihn (siehe `monatsbericht_service.py::
+    # _gewerbe_rechenvorschlag`, fail-closed).
+    ist_wohnungsnutzung: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # Ursprüngliche, laut Vertragswortlaut dokumentierte Klauselbasis -
     # KEINE aktuell freigegebene `IndexKlauselTable` (die bleibt der
     # einzige Weg zu einer echten Berechnung).

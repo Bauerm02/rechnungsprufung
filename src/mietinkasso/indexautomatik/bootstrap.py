@@ -12,11 +12,14 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.index.repository import IndexRepository
 from mietinkasso.index.service import IndexService
+from mietinkasso.indexautomatik.monatsbericht_service import IndexMonatsberichtService
 from mietinkasso.indexautomatik.outbox_service import ErhoehungsschreibenOutboxService
 from mietinkasso.indexautomatik.rechtsprofil import RechtsprofilService
 from mietinkasso.indexautomatik.repository import (
     ErhoehungsschreibenRepository,
     IndexautomatikLaufRepository,
+    IndexMonatsberichtRepository,
+    IndexQuellenFaktenRepository,
     RechtsprofilRepository,
     VertragsendeErinnerungRepository,
     VpiRepository,
@@ -45,6 +48,9 @@ class IndexautomatikBundle:
     vertragsende_repository: VertragsendeErinnerungRepository
     vertragsende_service: VertragsendeErinnerungService
     soll_umsetzung_service: IndexSollUmsetzungService
+    quellen_fakten_repository: IndexQuellenFaktenRepository
+    monatsbericht_repository: IndexMonatsberichtRepository
+    monatsbericht_service: IndexMonatsberichtService
 
 
 def bauen(session_factory: sessionmaker[Session], settings: Settings) -> IndexautomatikBundle:
@@ -87,6 +93,20 @@ def bauen(session_factory: sessionmaker[Session], settings: Settings) -> Indexau
         erhoehungsschreiben_repository=outbox_repository,
     )
 
+    quellen_fakten_repository = IndexQuellenFaktenRepository(session_factory)
+    monatsbericht_repository = IndexMonatsberichtRepository(session_factory)
+    monatsbericht_service = IndexMonatsberichtService(
+        session_factory=session_factory,
+        repository=monatsbericht_repository,
+        stammdaten_repository=stammdaten_repository,
+        rechtsprofil_repository=rechtsprofil_repository,
+        outbox_repository=outbox_repository,
+        quellen_fakten_repository=quellen_fakten_repository,
+        vpi_repository=vpi_repository,
+        owner_email=settings.owner_email,
+        backoffice_basis_url=settings.backoffice_basis_url,
+    )
+
     return IndexautomatikBundle(
         stammdaten_repository=stammdaten_repository,
         rechtsprofil_repository=rechtsprofil_repository,
@@ -101,4 +121,7 @@ def bauen(session_factory: sessionmaker[Session], settings: Settings) -> Indexau
         vertragsende_repository=vertragsende_repository,
         vertragsende_service=vertragsende_service,
         soll_umsetzung_service=soll_umsetzung_service,
+        quellen_fakten_repository=quellen_fakten_repository,
+        monatsbericht_repository=monatsbericht_repository,
+        monatsbericht_service=monatsbericht_service,
     )

@@ -4026,3 +4026,120 @@ Buchung/kein Versand/kein Deployment.
 Ausschließlich synthetische Testdaten, keine Buchung/kein Versand/kein
 Deployment. 1018/1018 grün im `tests/mietinkasso`-Gesamtlauf (einmaliger
 Lauf nach Abschluss aller vier Punkte).
+
+## HV-20260919-INDEX-MONATSBERICHT: Owner-Monatsbericht, Owner-Mailversand,
+## Quellenimport Rechtsprofile/Quellenfakten (19.09.2026)
+
+Neuer, dreiteiliger Auftrag: (A) persistenter, deterministischer Owner-
+Monatsbericht — eine Zeile je aktivem Vertrag/Monat, ausschließlich aus
+dem bereits real berechneten `IndexautomatikLaufTable`/
+`ErhoehungsschreibenTable` abgeleitet, KEINE zweite Berechnung des
+MieWeG-Wohnungsrechner-Pfads; (B) eigener, unabhängiger Owner-Only-
+Mailversand-Schalter (`index_monatsbericht_send_enabled` +
+`index_monatsbericht_send_ab`) über den bestehenden geprüften
+Mailadapter; (C) generischer, validierbarer Quellenimport für
+`RechtsprofilTable`-ENTWÜRFE und die neue, lockerere
+`IndexQuellenFaktenTable` (Schema/Beispiel: `IMPORT_RECHTSPROFIL_
+QUELLENFAKTEN.md`).
+
+Neue Tabellen/Spalten (additiv, `Base.metadata.create_all`/
+`ensure_additive_columns`): `IndexQuellenFaktenTable`,
+`IndexMonatsberichtTable`, `IndexMonatsberichtZeileTable`,
+`RechtsprofilTable.import_quelle`/`import_inhalt_hash`. Neue Dateien:
+`indexautomatik/monatsbericht_service.py`,
+`indexautomatik/rechtsprofil_import.py`,
+`scripts/rechtsprofil_quellenimport.py`. Alleiniger Erzeuger bleibt der
+bestehende `scripts/indexautomatik_monatslauf.py` (kein neuer
+Scheduler); der Versand läuft über die bestehende
+`scripts/indexautomatik_taegliche_pflege.py`.
+
+**Über mehrere Korrekturrunden behobene fachliche Rückfragen** (alle vor
+diesem Commit umgesetzt, siehe Git-Historie für die Einzelschritte):
+tatsächliche neue Gesamtvorschreibung aus der REALEN `komponenten_
+verteilung`-`{"eintraege": [...]}`-Struktur statt eines erfundenen
+flachen Werts; ursprüngliche Vertragsbasis (Quellenfakten) und zuletzt
+dokumentierte Basis (freigegebenes Rechtsprofil) als zwei GETRENNTE
+Snapshot-Felder; "bereits tatsächlich umgesetzt" ausschließlich aus
+`IndexSollUmsetzungTable.status == "UMGESETZT"`, NIE aus einer bloßen
+Zustellbestätigung; die gesetzliche 1.-April-Grenze nur bei
+`ist_wohnungsnutzung is True` (nicht pauschal jedem MRG_TEIL-Fall);
+`bedingter_naechster_monat` als dynamisch aufgelöster Kalendermonat
+statt eines einmal statisch gespeicherten Datums; "Quellenfakten ohne
+Ausführungsfreigabe" statt einer irreführenden "ungeprüft"-Kennzeichnung
+belegter Fakten; `indexierbarer_mietanteil_cent = None` (mit
+erklärendem Hinweisfeld) statt eines materiellen 0-EUR-Werts, wenn
+Komponenten existieren, aber keine als indexierbar markiert ist; ein
+begrenzter, rein lesender Gewerbe-Rechenvorschlag ausschließlich über
+bestehende `IndexService`-Bausteine, fail-closed hinter dem NEUEN,
+explizit verifizierten Tri-State-Feld `IndexQuellenFaktenTable.
+ist_wohnungsnutzung` (nur `false` schaltet frei, `null`/`true` sperren
+identisch); Roh- vs. wirksame VPI-Veränderung getrennt ausgewiesen
+(eine unterschrittene Schwelle erscheint nie als irreführendes "0%");
+isolierter neuer Indexanteil vs. neue GESAMTvorschreibung als zwei
+getrennte Größen (Gesamtvorschreibung nur mit bestätigter aktueller
+Gesamtmiete); atomare, frozen-report-sichere Berichtserzeugung
+(`IndexMonatsberichtRepository.ersetze_zeilen_falls_bereit`, EINE
+Transaktion für Kopfzeile + alle Zeilen + Zusammenfassung, niemals ein
+bereits IN_VERSAND/GESENDET/UNKLAR eingefrorener Bericht überschrieben);
+atomarer `quellen_fakten`-Batch-Import (`anlegen_batch`, EINE
+Transaktion für den gesamten Batch); strikte Typ-/Decimal-Endlichkeits-/
+Basis>0-/Bool-Validierung im Import (siehe `IMPORT_RECHTSPROFIL_
+QUELLENFAKTEN.md`); Aktivierungsperiode (`SEND_AB`) UND tatsächlicher
+Kalendermonat (`bis_periode`, aus `heute` berechnet) verhindern
+gemeinsam sowohl ein unbeabsichtigtes Nachsenden alter Vorschau-Perioden
+als auch ein verfrühtes Senden künftiger Perioden; verständliche
+Statusnamen (`status_label`) statt technischer Codes in Portal UND
+Mailtext; absoluter Portal-Link (`backoffice_basis_url`) im Mailtext
+statt eines im E-Mail-Client nicht klickbaren relativen Pfads.
+
+**Sichtbarer VPI-Fehlerbericht statt stillem Jobabbruch:** Schlägt der
+automatische VPI-Abruf/-Import im Monatslauf fehl, bricht der Lauf
+weiterhin sichtbar (Exception, `JobLockTable` FEHLGESCHLAGEN) UND
+zusätzlich wird über `IndexMonatsberichtService.markiere_vpi_fehler`
+eine Kopfzeile mit Status `VPI_FEHLER` angelegt — im Portal sichtbar
+(eigene Fehlerseite statt leerer/fehlender Bericht) und über denselben
+Owner-Only-Kanal wie ein normaler Monatsbericht als Hinweis versendbar.
+Ein späterer erfolgreicher Nachlauf normalisiert den Fehlerstand
+automatisch zurück auf `BEREIT` mit vollständigem Inhalt.
+
+**Offene Punkte / bewusste Grenzen dieser Runde:**
+- Kein Vollrollback über den gesamten `rechtsprofile`-Importbatch (jede
+  `entwurf_anlegen`-Zeile committet für sich, da der zugrunde liegende
+  bestehende Service das bereits so tut) — bereits angelegte ENTWURF-
+  Zeilen bei einem Teilfehler bleiben additiv bestehen, ohne jede
+  Wirkung auf Soll/Bank/OP (beide Zeilenarten sind inert bis zu einer
+  separaten menschlichen Freigabe). Der `quellen_fakten`-Batch selbst
+  IST atomar (siehe oben).
+- Die tatsächliche serverseitige Annahme des neuen MailOps-Kinds
+  `INDEX_MONATSBERICHT` (inkl. harter Empfängergrenze `mb@jlb-immo.at`)
+  liegt im GETRENNTEN, privaten MailOps-Repository und ist NICHT Teil
+  dieses Commits — der App-`MailOpsClient` verwendet bereits genau
+  diesen Kind (client- und provider-seitig separat getestet).
+- Kein Backoffice-Formular für den Quellenimport selbst — Anwendung nur
+  über `scripts/rechtsprofil_quellenimport.py` (CLI, `plan`/`apply`,
+  siehe `IMPORT_RECHTSPROFIL_QUELLENFAKTEN.md`); die Berichtsansicht
+  selbst ist vollständig im Backoffice (`/backoffice/indexautomatik/
+  monatsbericht`, schmale Mieter-Karten statt breiter Tabelle).
+- Kein automatischer Rückkanal, der eine `quellen_fakten`-Zeile beim
+  Anlegen eines passenden Rechtsprofils automatisch verknüpft/veraltet
+  markiert — beide Zeilenarten bleiben unabhängig nebeneinander
+  bestehen; die Berichtszeile wählt selbst pro Lauf die jeweils
+  richtige Quelle (freigegebenes Profil bevorzugt, Quellenfakten nur als
+  Fallback für den generischen "kein Profil"-Fall).
+- Reale Stammdaten/Salden/Mailbetrieb bleiben ausschließlich Codex'
+  Verantwortung (privates Datenmapping, separate MailOps-Erweiterung,
+  kontrollierter Serverbetrieb) — Claude griff zu keinem Zeitpunkt auf
+  einen Server zu, hat nie deployt und nie eine echte Mail versendet;
+  ausschließlich synthetische Testdaten in diesem Repository.
+- `SEND_ENABLED`/`indexautomatik_send_enabled`/
+  `vertragsende_erinnerung_send_enabled` bleiben unverändert `false`;
+  `index_monatsbericht_send_enabled`/`index_monatsbericht_send_ab` sind
+  ein eigener, engerer Schalter und standardmäßig ebenfalls
+  deaktiviert/unkonfiguriert ("closed by default" — ohne gesetztes
+  `SEND_AB` wird NIE automatisch versendet, egal wie der Enable-Schalter
+  steht).
+
+34 neue/geänderte synthetische Tests (`tests/mietinkasso/
+test_index_monatsbericht.py`, Ergänzungen in `test_mailops_client.py`
+und `test_backoffice.py`) plus die bestehende Suite — 1052/1052 grün im
+`tests/mietinkasso`-Gesamtlauf.

@@ -14,6 +14,11 @@ Sendet NIE selbst (das übernimmt `indexautomatik_taegliche_pflege.py`
 unter `SEND_ENABLED`/Allowlist-Kontrolle) - dieser Lauf berechnet nur
 und legt die Outbox-Zeile an.
 
+Erzeugt zusätzlich (Auftrag HV-20260919-INDEX-MONATSBERICHT, alleiniger
+Erzeuger, kein neuer Scheduler) den persistenten Owner-Monatsbericht
+für diese Periode (`IndexMonatsberichtService.erstellen_fuer_periode`) -
+auch versendet wird dieser NIE hier, sondern über die tägliche Pflege.
+
 Ist `MIETINKASSO_INDEXAUTOMATIK_VPI_AUTOMATISCHER_ABRUF=true` gesetzt,
 werden VOR der Monatsprüfung die vier amtlichen VPI-Reihen über den
 geprüften Statistik-Austria-Client abgerufen und atomar importiert
@@ -21,7 +26,12 @@ geprüften Statistik-Austria-Client abgerufen und atomar importiert
 vier verifizierten amtlichen Reihen vor Monatsprüfung aktualisieren").
 Schlägt DAS fehl (Netzwerk, Schema, Validierung), scheitert der
 gesamte Lauf sichtbar - es wird NIE mit veralteten/stillschweigend
-übernommenen Werten weitergerechnet."""
+übernommenen Werten weitergerechnet. Zusätzlich wird für die betroffene
+Periode ein sichtbarer VPI-Fehlerbericht angelegt
+(`IndexMonatsberichtService.markiere_vpi_fehler`, Status VPI_FEHLER) -
+im Portal sichtbar und über denselben Owner-Only-Kanal wie ein normaler
+Monatsbericht versendbar, statt eines stillen Jobabbruchs ohne
+fachliche Nachricht."""
 
 from __future__ import annotations
 
@@ -97,16 +107,39 @@ def main(argv: list[str] | None = None) -> int:
     periode = f"{heute.year:04d}-{heute.month:02d}"
 
     def _arbeit() -> dict:
-        vpi_aktualisiert = _aktualisiere_vpi_reihen(settings=settings, vpi_repository=bundle.vpi_repository)
+        try:
+            vpi_aktualisiert = _aktualisiere_vpi_reihen(settings=settings, vpi_repository=bundle.vpi_repository)
+        except VpiAktualisierungFehlgeschlagenError as exc:
+            # Auftrag HV-20260919-INDEX-MONATSBERICHT (Codex-Ergänzung):
+            # "Bei fehlgeschlagenem VPI-Abruf muss ein sichtbarer Monats-
+            # Fehlerbericht/Owner-Hinweis entstehen, nicht nur Jobabbruch
+            # ohne Nachricht; keine stille Berechnung mit alten Werten."
+            # Der Monatslauf bricht weiterhin sichtbar ab (Exception wird
+            # unten weitergereicht, JobLockTable markiert FEHLGESCHLAGEN,
+            # kein stiller Erfolg) - ZUSÄTZLICH entsteht hier ein für
+            # Portal und Owner-Mail sichtbarer Fehlerbericht, damit ein
+            # Ausbleiben nicht nur als leerer/verschwundener Bericht
+            # wahrgenommen wird. Kein neuer Job, keine neue Berechnung mit
+            # veralteten Werten - `monatslauf_alle` wird NICHT erreicht.
+            bundle.monatsbericht_service.markiere_vpi_fehler(periode=periode, fehlergrund=str(exc))
+            raise
         laeufe = bundle.index_automatik_service.monatslauf_alle(
             ctx=_ADMIN_CTX, heute=heute, akteur="indexautomatik-monatslauf"
         )
         zusammenfassung: dict[str, int] = {}
         for lauf in laeufe:
             zusammenfassung[lauf.status] = zusammenfassung.get(lauf.status, 0) + 1
+
+        # Auftrag HV-20260919-INDEX-MONATSBERICHT: alleiniger Erzeuger des
+        # Owner-Monatsberichts (Umfang A) - unmittelbar nach dem
+        # Monatslauf, kein neuer Scheduler. Sendet NIE selbst (das
+        # übernimmt `indexautomatik_taegliche_pflege.py`).
+        bericht = bundle.monatsbericht_service.erstellen_fuer_periode(periode=periode, laeufe=laeufe, heute=heute)
+        monatsbericht_status = bericht.status if bericht is not None else "BEREITS_EINGEFROREN_UEBERSPRUNGEN"
+
         return {
             "periode": periode, "vertraege_geprueft": len(laeufe), "nach_status": zusammenfassung,
-            "vpi_monatszeilen_aktualisiert": vpi_aktualisiert,
+            "vpi_monatszeilen_aktualisiert": vpi_aktualisiert, "monatsbericht_status": monatsbericht_status,
         }
 
     ergebnis = runner.einmalig_ausfuehren(job_name="indexautomatik_monatslauf", fachschluessel=periode, fn=_arbeit)
@@ -117,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Monatslauf {periode}: {ergebnis['vertraege_geprueft']} Verträge geprüft.")
     for status, anzahl in sorted(ergebnis["nach_status"].items()):
         print(f"  {status}: {anzahl}")
+    print(f"Index-Monatsbericht {periode}: {ergebnis['monatsbericht_status']}")
     return 0
 
 

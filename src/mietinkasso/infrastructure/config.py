@@ -124,6 +124,13 @@ class Settings(BaseSettings):
     # bleibt dauerhaft nur im Portal sichtbar (Status BEREIT), wird aber
     # NIE automatisch versendet.
     index_monatsbericht_send_ab: str | None = None
+    # Absolute Basis-URL für den Portal-Link in der Owner-Mail (Codex:
+    # "Mail-Link absolut, nicht relativ" - eine Mail landet im
+    # E-Mail-Client, nicht im Browser-Kontext des Backoffice, ein
+    # relativer Pfad wäre dort nicht klickbar). Zeigt auf die reale,
+    # bestehende Hetzner-/JLB-Domain - Claude selbst greift NIE auf
+    # diesen Server zu, dies ist nur der Textbaustein für die Mail.
+    backoffice_basis_url: str = "https://verwaltung.jlb-immo.at"
     # Auftrag HV-20260913-VERSAND-SOLL: eigenes, GETRENNTES Flag für die
     # tatsächliche Soll-Umsetzung (Vertragskomponenten-/Rechtsprofil-
     # änderung) - bewusst UNABHÄNGIG von `indexautomatik_send_enabled`

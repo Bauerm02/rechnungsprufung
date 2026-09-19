@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import Decimal, InvalidOperation
 
 from mietinkasso.auth.service import AuthContext
 from mietinkasso.domain.exceptions import MietinkassoError
@@ -54,6 +55,10 @@ _RECHTSPROFIL_OPTIONALFELDER = {
 _RECHTSPROFIL_DATUMSFELDER = ("mietzinsobergrenze_gueltig_bis", "vertraglicher_fruehestmoeglicher_termin")
 
 _QUELLEN_FAKTEN_OPTIONALFELDER = {
+    # Codex-Korrektur: `ist_wohnungsnutzung` fehlte im Import - fail-closed
+    # tri-state (`None` = ungeklärt, sperrt genau wie `True` die
+    # Gewerbe-Rechenvorschau) wie bei `RechtsprofilTable.ist_hauptmiete`.
+    "ist_wohnungsnutzung": None,
     "urspruengliche_klauselbasis": None, "urspruenglicher_indexbetrag_cent": None,
     "betrag_basisbindung_belegt": False, "schwelle_prozent": None, "schwelle_inklusive": None,
     "daempfung_prozent": None, "vertragliche_grenze_prozent": None, "klauselregel_text": None,
@@ -73,6 +78,62 @@ def _parse_datum(wert, feld: str, vertrag_id: str) -> date | None:
         return date.fromisoformat(wert)
     except (TypeError, ValueError) as exc:
         raise RechtsprofilImportFehlerError(f"{vertrag_id}: Feld '{feld}' ist kein gültiges ISO-Datum ({wert!r}).") from exc
+
+
+def _pruefe_bool_oder_none(wert, feld: str, vertrag_id: str) -> bool | None:
+    """Codex-Korrektur: "Wohnungsflag fehlt fail-closed, string false
+    niemals bool(true)" - ein JSON-String `"false"` ist in Python truthy
+    (`bool("false") == True`); nur ein tatsächlicher JSON-Bool oder `null`
+    wird akzeptiert, alles andere (String, 0/1, ...) wird hart abgelehnt
+    statt stillschweigend (falsch) nach bool umgewandelt zu werden."""
+
+    if wert is None or isinstance(wert, bool):
+        return wert
+    raise RechtsprofilImportFehlerError(
+        f"{vertrag_id}: Feld '{feld}' muss ein JSON-Bool (true/false) oder null sein, kein "
+        f"{type(wert).__name__} ({wert!r})."
+    )
+
+
+def _pruefe_bool(wert, feld: str, vertrag_id: str) -> bool:
+    ergebnis = _pruefe_bool_oder_none(wert, feld, vertrag_id)
+    if ergebnis is None:
+        raise RechtsprofilImportFehlerError(f"{vertrag_id}: Feld '{feld}' darf nicht null sein (true/false erforderlich).")
+    return ergebnis
+
+
+def _pruefe_int_oder_none(wert, feld: str, vertrag_id: str) -> int | None:
+    if wert is None:
+        return None
+    if isinstance(wert, bool) or not isinstance(wert, int):
+        raise RechtsprofilImportFehlerError(
+            f"{vertrag_id}: Feld '{feld}' muss eine ganze Zahl (int, Cent) oder null sein, kein "
+            f"{type(wert).__name__} ({wert!r})."
+        )
+    return wert
+
+
+def _pruefe_decimal_oder_none(wert, feld: str, vertrag_id: str, *, nur_positiv: bool = False) -> Decimal | None:
+    """Codex-Korrektur: "alle Typen/Decimal-endlich/Basis>0 ... explizit
+    validieren" - lehnt Bool (Python-`bool` ist eine `int`-Unterklasse),
+    NaN/Infinity und (bei `nur_positiv`) einen Basiswert <= 0 explizit ab,
+    statt eine schwer nachvollziehbare spätere Falschrechnung zuzulassen."""
+
+    if wert is None:
+        return None
+    if isinstance(wert, bool) or not isinstance(wert, (int, float, str, Decimal)):
+        raise RechtsprofilImportFehlerError(
+            f"{vertrag_id}: Feld '{feld}' hat einen unzulässigen Zahlentyp ({type(wert).__name__}: {wert!r})."
+        )
+    try:
+        dezimal = Decimal(str(wert))
+    except (InvalidOperation, ValueError) as exc:
+        raise RechtsprofilImportFehlerError(f"{vertrag_id}: Feld '{feld}' ist keine gültige Zahl ({wert!r}).") from exc
+    if not dezimal.is_finite():
+        raise RechtsprofilImportFehlerError(f"{vertrag_id}: Feld '{feld}' muss endlich sein (NaN/Infinity abgelehnt).")
+    if nur_positiv and dezimal <= 0:
+        raise RechtsprofilImportFehlerError(f"{vertrag_id}: Feld '{feld}' muss > 0 sein (erhalten: {dezimal}).")
+    return dezimal
 
 
 @dataclass(frozen=True)
@@ -146,6 +207,13 @@ def _rechtsprofil_felder_aus_zeile(zeile: dict, index: int) -> dict:
 
 
 def _quellen_fakten_felder_aus_zeile(zeile: dict, index: int) -> dict:
+    """Codex-Korrektur: "Import bitte alle Typen/Decimal-endlich/Basis>0/
+    Cent-int/bool explizit validieren. Wohnungsflag fehlt fail-closed,
+    string false niemals bool(true)." Alle sicherheitsrelevanten Felder
+    werden HIER strikt typgeprüft (nicht erst beim Schreiben) - `felder`
+    enthält danach bereits geparste `Decimal`/`bool`/`int`-Werte, keine
+    rohen JSON-Primitive mehr."""
+
     vertrag_id = zeile.get("vertrag_id")
     if not isinstance(vertrag_id, str) or not vertrag_id.strip():
         raise RechtsprofilImportFehlerError(f"quellen_fakten[{index}]: 'vertrag_id' fehlt oder ist leer.")
@@ -154,13 +222,45 @@ def _quellen_fakten_felder_aus_zeile(zeile: dict, index: int) -> dict:
         felder[optionalfeld] = zeile.get(optionalfeld, default)
     for datumsfeld in _QUELLEN_FAKTEN_DATUMSFELDER:
         felder[datumsfeld] = _parse_datum(felder[datumsfeld], datumsfeld, vertrag_id)
-    klauselbasis = felder["urspruengliche_klauselbasis"]
-    if klauselbasis is not None and not isinstance(klauselbasis, dict):
-        raise RechtsprofilImportFehlerError(f"{vertrag_id}: 'urspruengliche_klauselbasis' muss ein Objekt {{reihe,monat,wert}} sein.")
-    if felder["bestaetigte_gesamtmiete_cent"] is not None and felder["bestaetigte_gesamtmiete_cent"] < 0:
-        raise RechtsprofilImportFehlerError(f"{vertrag_id}: 'bestaetigte_gesamtmiete_cent' ist negativ.")
+
+    felder["ist_wohnungsnutzung"] = _pruefe_bool_oder_none(felder["ist_wohnungsnutzung"], "ist_wohnungsnutzung", vertrag_id)
+    felder["betrag_basisbindung_belegt"] = _pruefe_bool(
+        felder["betrag_basisbindung_belegt"], "betrag_basisbindung_belegt", vertrag_id
+    )
+    felder["schwelle_inklusive"] = _pruefe_bool_oder_none(felder["schwelle_inklusive"], "schwelle_inklusive", vertrag_id)
+
+    felder["urspruenglicher_indexbetrag_cent"] = _pruefe_int_oder_none(
+        felder["urspruenglicher_indexbetrag_cent"], "urspruenglicher_indexbetrag_cent", vertrag_id
+    )
     if felder["urspruenglicher_indexbetrag_cent"] is not None and felder["urspruenglicher_indexbetrag_cent"] < 0:
         raise RechtsprofilImportFehlerError(f"{vertrag_id}: 'urspruenglicher_indexbetrag_cent' ist negativ.")
+    felder["bestaetigte_gesamtmiete_cent"] = _pruefe_int_oder_none(
+        felder["bestaetigte_gesamtmiete_cent"], "bestaetigte_gesamtmiete_cent", vertrag_id
+    )
+    if felder["bestaetigte_gesamtmiete_cent"] is not None and felder["bestaetigte_gesamtmiete_cent"] < 0:
+        raise RechtsprofilImportFehlerError(f"{vertrag_id}: 'bestaetigte_gesamtmiete_cent' ist negativ.")
+
+    felder["schwelle_prozent"] = _pruefe_decimal_oder_none(felder["schwelle_prozent"], "schwelle_prozent", vertrag_id)
+    felder["daempfung_prozent"] = _pruefe_decimal_oder_none(felder["daempfung_prozent"], "daempfung_prozent", vertrag_id)
+    felder["vertragliche_grenze_prozent"] = _pruefe_decimal_oder_none(
+        felder["vertragliche_grenze_prozent"], "vertragliche_grenze_prozent", vertrag_id
+    )
+
+    klauselbasis = felder["urspruengliche_klauselbasis"]
+    if klauselbasis is not None:
+        if not isinstance(klauselbasis, dict):
+            raise RechtsprofilImportFehlerError(
+                f"{vertrag_id}: 'urspruengliche_klauselbasis' muss ein Objekt {{reihe,monat,wert}} sein."
+            )
+        # "Basis>0": eine ursprüngliche Klauselbasis von 0 oder negativ
+        # wäre eine Division-durch-0/eine sinnlose Referenzbasis in jeder
+        # nachgelagerten Veränderungsberechnung (`_gewerbe_rechenvorschlag`).
+        klauselbasis = dict(klauselbasis)
+        klauselbasis["wert"] = _pruefe_decimal_oder_none(
+            klauselbasis.get("wert"), "urspruengliche_klauselbasis.wert", vertrag_id, nur_positiv=True
+        )
+        felder["urspruengliche_klauselbasis"] = klauselbasis
+
     if felder["bedingter_naechster_monat"] is not None and not (1 <= felder["bedingter_naechster_monat"] <= 12):
         raise RechtsprofilImportFehlerError(f"{vertrag_id}: 'bedingter_naechster_monat' muss zwischen 1 und 12 liegen.")
     if not isinstance(felder["quellenreferenzen"], list):
@@ -254,12 +354,17 @@ def wende_an(
     veralteten Stand zu schreiben. Legt NUR Zeilen mit Aktion "ANLEGEN"
     an; "UNVERAENDERT_UEBERSPRUNGEN" bleibt ein reiner Zähler.
 
-    Kein Vollrollback bei einem Teilfehler mitten im Batch (bewusste,
-    dokumentierte Grenze - siehe OFFENE_PUNKTE.md): bereits angelegte
-    ENTWURF-/Quellenfakten-Zeilen dieses Laufs bleiben additiv bestehen,
-    sichtbar im Portal, ohne jede Wirkung auf Soll/Bank/OP - das ist
-    unschädlich, da beide Zeilenarten inert sind, bis ein Mensch eine
-    Freigabe erteilt."""
+    Die `quellen_fakten`-Zeilen werden ALLE zusammen erst in einem
+    einzigen `anlegen_batch`-Aufruf geschrieben (Codex-Korrektur: "bei
+    reinem quellen_fakten-Batch wenigstens atomar schreiben; keine halben
+    17 Datensätze") - ein Fehler beim Bauen einer Zeile lässt keine
+    einzige davon in der Datenbank landen. Für die `rechtsprofile`-Zeilen
+    bleibt dagegen bewusst KEIN Vollrollback über den gesamten Batch
+    hinweg bestehen (dokumentierte Grenze - siehe OFFENE_PUNKTE.md): jede
+    über `RechtsprofilService.entwurf_anlegen` angelegte ENTWURF-Zeile
+    committet für sich, da dieser bestehende Service selbst je Aufruf
+    committet. Das ist unschädlich, da beide Zeilenarten inert sind
+    (kein Effekt auf Soll/Bank/OP), bis ein Mensch eine Freigabe erteilt."""
 
     if bestaetige_hash != plan.paket_hash:
         raise RechtsprofilImportFehlerError(
@@ -277,8 +382,13 @@ def wende_an(
         rechtsprofil_repository.setze_import_provenienz(angelegt.id, quelle=plan.quelle, inhalt_hash=zeile.inhalt_hash)
         rechtsprofile_angelegt += 1
 
-    quellen_fakten_angelegt = 0
+    # Codex-Korrektur: "Bei reinem quellen_fakten-Batch wenigstens atomar
+    # schreiben; keine halben 17 Datensätze" - ALLE Zeilen dieses Laufs
+    # werden erst vollständig im Speicher gebaut und dann in EINEM Aufruf
+    # (`anlegen_batch`, eine Transaktion) geschrieben, statt je Zeile
+    # einzeln zu committen.
     quellen_fakten_uebersprungen = 0
+    neue_quellen_fakten_zeilen: list[IndexQuellenFaktenTable] = []
     for zeile in plan.quellen_fakten_zeilen:
         if zeile.aktion == "UNVERAENDERT_UEBERSPRUNGEN":
             quellen_fakten_uebersprungen += 1
@@ -286,16 +396,17 @@ def wende_an(
         felder = zeile.felder
         klauselbasis = felder["urspruengliche_klauselbasis"] or {}
         version = quellen_fakten_repository.naechste_version(zeile.vertrag_id)
-        quellen_fakten_repository.anlegen(
+        neue_quellen_fakten_zeilen.append(
             IndexQuellenFaktenTable(
                 vertrag_id=zeile.vertrag_id, version=version, quelle=plan.quelle, inhalt_hash=zeile.inhalt_hash,
+                ist_wohnungsnutzung=felder["ist_wohnungsnutzung"],
                 urspruengliche_klauselbasis_reihe=klauselbasis.get("reihe"),
                 urspruengliche_klauselbasis_monat=klauselbasis.get("monat"),
                 urspruengliche_klauselbasis_wert=(
                     str(klauselbasis["wert"]) if klauselbasis.get("wert") is not None else None
                 ),
                 urspruenglicher_indexbetrag_cent=felder["urspruenglicher_indexbetrag_cent"],
-                betrag_basisbindung_belegt=bool(felder["betrag_basisbindung_belegt"]),
+                betrag_basisbindung_belegt=felder["betrag_basisbindung_belegt"],
                 schwelle_prozent=(str(felder["schwelle_prozent"]) if felder["schwelle_prozent"] is not None else None),
                 schwelle_inklusive=felder["schwelle_inklusive"],
                 daempfung_prozent=(str(felder["daempfung_prozent"]) if felder["daempfung_prozent"] is not None else None),
@@ -317,7 +428,8 @@ def wende_an(
                 erstellt_von=akteur,
             )
         )
-        quellen_fakten_angelegt += 1
+    quellen_fakten_repository.anlegen_batch(neue_quellen_fakten_zeilen)
+    quellen_fakten_angelegt = len(neue_quellen_fakten_zeilen)
 
     return {
         "rechtsprofile_angelegt": rechtsprofile_angelegt,

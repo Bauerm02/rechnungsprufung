@@ -64,6 +64,22 @@ _WOHNUNGSRECHNER_RECHTSORDNUNGEN = {"OESTERREICH_MRG_VOLL", "OESTERREICH_MRG_TEI
 #: jede aus `IndexQuellenFaktenTable` stammende Anzeige verwendet.
 _QUELLE_OHNE_AUSFUEHRUNGSFREIGABE = "QUELLENFAKTEN_OHNE_AUSFUEHRUNGSFREIGABE"
 
+#: Codex-Präzisierung: "In Portal UND Owner-Mail verständliche Statusnamen
+#: statt PRUEFUNG_NOETIG/MOEGLICH" - EINE zentrale Übersetzung, von
+#: `_text_fuer_bericht` (Mail) UND vom Backoffice (`backoffice/app.py`)
+#: gemeinsam genutzt, damit beide Oberflächen nie auseinanderlaufen. Der
+#: interne Statuscode (`IndexMonatsberichtZeileTable.status`) bleibt
+#: unverändert die technische Datenbank-/API-Wahrheit.
+STATUS_LABELS = {
+    "MOEGLICH": "Erhöhung möglich",
+    "NOCH_NICHT_MOEGLICH": "Noch nicht möglich",
+    "PRUEFUNG_NOETIG": "Prüfung nötig",
+}
+
+
+def status_label(status: str) -> str:
+    return STATUS_LABELS.get(status, status)
+
 
 def _naechste_gesetzliche_april_grenze(heute: date) -> date:
     """Dieselbe Formel wie `indexautomatik/service.py::_monatslauf_mieweg`
@@ -86,6 +102,7 @@ class IndexMonatsberichtService:
         quellen_fakten_repository: IndexQuellenFaktenRepository,
         vpi_repository: VpiRepository,
         owner_email: str | None,
+        backoffice_basis_url: str = "",
     ):
         self._session_factory = session_factory
         self._repository = repository
@@ -95,6 +112,7 @@ class IndexMonatsberichtService:
         self._quellen_fakten_repository = quellen_fakten_repository
         self._vpi_repository = vpi_repository
         self._owner_email = owner_email
+        self._backoffice_basis_url = backoffice_basis_url.rstrip("/")
 
     # -- Umfang A: Bericht erzeugen -----------------------------------------
     def erstellen_fuer_periode(
@@ -130,13 +148,13 @@ class IndexMonatsberichtService:
 
         qf = self._quellen_fakten_repository.neueste_fuer_vertrag(lauf.vertrag_id) if vertrag else None
         if status == "PRUEFUNG_NOETIG" and grund == _GENERISCHER_KEIN_PROFIL_GRUND and qf is not None:
-            # Codex: "Der Nutzer beauftragt monatliches Durchrechnen,
-            # nicht nur unveränderliche Fehlermeldungen" - NUR für
-            # Geschäftsraum (kein Wohnungsrechner laut Vertrag) UND NUR
-            # bei vollständig belegter Quelle wird ein unverbindlicher
-            # Rechenvorschlag über den bestehenden Rechner ermittelt.
-            ist_wohnung = vertrag is not None and vertrag.rechtsordnung in _WOHNUNGSRECHNER_RECHTSORDNUNGEN
-            vorschau = None if ist_wohnung else self._gewerbe_rechenvorschlag(qf, heute=heute)
+            # Codex-Korrektur: `VertragTable.rechtsordnung` (MRG_VOLL/
+            # MRG_TEIL) allein sagt NICHTS über Wohnungsnutzung aus - ein
+            # MRG_TEIL-Objekt kann Büro/Geschäftsraum sein. NUR eine
+            # EXPLIZIT verifizierte `qf.ist_wohnungsnutzung is False`
+            # erlaubt den Gewerbe-Rechenvorschlag (fail-closed: `None`
+            # (ungeklärt) sperrt genauso wie `True`).
+            vorschau = self._gewerbe_rechenvorschlag(qf, heute=heute) if qf.ist_wohnungsnutzung is False else None
             if vorschau is not None:
                 vorschlag_cent, differenz_cent, grund = vorschau
             elif qf.pruefhinweis:
@@ -247,11 +265,22 @@ class IndexMonatsberichtService:
 
     def _gewerbe_rechenvorschlag(
         self, qf: IndexQuellenFaktenTable, *, heute: date,
-    ) -> tuple[int, int, str] | None:
+    ) -> tuple[int | None, int, str] | None:
         """Read-only Vorschau AUSSCHLIESSLICH über bestehende
         `IndexService`-Bausteine - schreibt NICHTS. `None`, wenn die
         Quelle nicht vollständig belegt ist (dann bleibt der generische/
-        pruefhinweis-Text unverändert die einzige Anreicherung)."""
+        pruefhinweis-Text unverändert die einzige Anreicherung).
+
+        Rückgabe `(vorschlag_cent, differenz_cent, grund)`:
+        `differenz_cent` ist IMMER die Veränderung des dokumentierten
+        indexierten Anteils (`urspruenglicher_indexbetrag_cent`).
+        `vorschlag_cent` (Codex-Korrektur: "indexierbarer Teil nicht mit
+        neuer GESAMTvorschreibung verwechseln") ist NUR gesetzt, wenn
+        zusätzlich eine bestätigte AKTUELLE Gesamtmiete
+        (`bestaetigte_gesamtmiete_cent`) vorliegt - dann: neue Gesamtsumme
+        = aktuelles Gesamt + Differenz. Ohne bestätigte Gesamtmiete bleibt
+        `vorschlag_cent` `None` (nur der isolierte Indexanteil ist
+        bekannt) statt eine Gesamtsumme zu unterstellen."""
 
         if qf is None or not qf.betrag_basisbindung_belegt:
             return None
@@ -261,35 +290,55 @@ class IndexMonatsberichtService:
             return None
         if qf.schwelle_prozent is None or qf.schwelle_inklusive is None:
             return None
-        aktueller_vpi = self._vpi_repository.neuester_endgueltiger_monatswert(qf.urspruengliche_klauselbasis_reihe, heute)
+        aktueller_vpi = self._vpi_repository.neuester_endgueltiger_monatswert_mit_periode(
+            qf.urspruengliche_klauselbasis_reihe, heute
+        )
         if aktueller_vpi is None:
             return None
 
         alter_wert = Decimal(qf.urspruengliche_klauselbasis_wert)
+        # Codex-Korrektur: Rohveränderung (reiner VPI-Quotient) und
+        # wirksame (gedämpfte/geschwellte) Veränderung getrennt ausweisen
+        # - bei unterschrittener Schwelle bleibt die WIRKSAME Änderung 0
+        # (kein Betrag), die tatsächliche VPI-Rohveränderung bleibt aber
+        # im Text sichtbar, statt als "0%" zu erscheinen.
+        rohe_veraenderung = (aktueller_vpi.wert - alter_wert) / alter_wert * 100
         daempfung = Decimal(qf.daempfung_prozent) if qf.daempfung_prozent is not None else None
         grenze = Decimal(qf.vertragliche_grenze_prozent) if qf.vertragliche_grenze_prozent is not None else None
         effektive_veraenderung = IndexService.effektive_veraenderung_prozent(
-            alter_wert=alter_wert, neuer_wert=aktueller_vpi, daempfung_prozent=daempfung, vertragliche_grenze_prozent=grenze,
+            alter_wert=alter_wert, neuer_wert=aktueller_vpi.wert, daempfung_prozent=daempfung, vertragliche_grenze_prozent=grenze,
         )
         schwelle_prozent = Decimal(qf.schwelle_prozent)
         ueberschritten = IndexService.ueberschreitet_schwelle(
             effektive_veraenderung, schwelle_prozent=schwelle_prozent, schwelle_inklusive=qf.schwelle_inklusive,
         )
-        if not ueberschritten:
-            effektive_veraenderung = Decimal("0")
+        betragswirksame_veraenderung = effektive_veraenderung if ueberschritten else Decimal("0")
 
-        neuer_betrag_cent = to_cents(
-            round_index_half_cent_down(cents_to_decimal(qf.urspruenglicher_indexbetrag_cent) * (1 + effektive_veraenderung / 100))
+        neuer_indexanteil_cent = to_cents(
+            round_index_half_cent_down(
+                cents_to_decimal(qf.urspruenglicher_indexbetrag_cent) * (1 + betragswirksame_veraenderung / 100)
+            )
         )
-        differenz_cent = neuer_betrag_cent - qf.urspruenglicher_indexbetrag_cent
+        differenz_cent = neuer_indexanteil_cent - qf.urspruenglicher_indexbetrag_cent
+        if qf.bestaetigte_gesamtmiete_cent is not None:
+            vorschlag_cent = qf.bestaetigte_gesamtmiete_cent + differenz_cent
+        else:
+            vorschlag_cent = None
+
         schwelle_text = "Schwelle überschritten" if ueberschritten else "Schwelle NICHT überschritten"
+        vorschlag_hinweis = (
+            "" if vorschlag_cent is not None
+            else " Keine bestätigte aktuelle Gesamtmiete hinterlegt - nur der isolierte Indexanteil ist berechenbar, "
+            "keine neue Gesamtvorschreibung."
+        )
         grund = (
             f"Rechenvorschlag (unverbindliche Vorschau aus Quellenfakten) – Ausführung noch nicht freigegeben: "
-            f"VPI {qf.urspruengliche_klauselbasis_reihe} {aktueller_vpi} gegen Basis {alter_wert} "
-            f"({effektive_veraenderung}% Veränderung, {schwelle_text}). "
+            f"VPI {qf.urspruengliche_klauselbasis_reihe} {aktueller_vpi.jahr}-{aktueller_vpi.monat:02d}="
+            f"{aktueller_vpi.wert} gegen Basis {alter_wert} (Rohveränderung {rohe_veraenderung}%, wirksame "
+            f"Veränderung {betragswirksame_veraenderung}%, {schwelle_text})." + vorschlag_hinweis + " "
             + (qf.pruefhinweis or "Weitere Nachweise/eine echte Vertragsklausel für die Ausführung sind erforderlich.")
         )
-        return neuer_betrag_cent, differenz_cent, grund
+        return vorschlag_cent, differenz_cent, grund
 
     def _gesamtvorschreibung(
         self, vertrag_id: str, *, heute: date, qf: IndexQuellenFaktenTable | None,
@@ -405,8 +454,29 @@ class IndexMonatsberichtService:
             ),
         }
 
+    # -- VPI-Ausfall: sichtbarer Fehlerbericht statt stillem Jobabbruch -------
+    def markiere_vpi_fehler(self, *, periode: str, fehlergrund: str) -> IndexMonatsberichtTable:
+        """Aufrufer: `scripts/indexautomatik_monatslauf.py`, BEVOR
+        `monatslauf_alle`/`erstellen_fuer_periode` überhaupt erreicht
+        werden - Codex-Auftrag: "Bei fehlgeschlagenem VPI-Abruf muss ein
+        sichtbarer Monats-Fehlerbericht/Owner-Hinweis entstehen, nicht nur
+        Jobabbruch ohne Nachricht; keine stille Berechnung mit alten
+        Werten." Der Monatslauf selbst bricht weiterhin sichtbar mit
+        Fehler/Exitcode ab (kein stiller Erfolg) - dies schreibt
+        ZUSÄTZLICH einen für Portal und Owner-Mail sichtbaren Datensatz."""
+
+        return self._repository.markiere_vpi_fehler(periode, fehlergrund=fehlergrund)
+
     # -- Umfang B: Owner-Sammelmail ------------------------------------------
     def _text_fuer_bericht(self, periode: str, bericht: IndexMonatsberichtTable) -> str:
+        if bericht.status == "VPI_FEHLER":
+            return (
+                f"Index-Monatsbericht {periode}: FEHLGESCHLAGEN - kein Bericht erzeugt.\n\n"
+                f"Grund: {bericht.fehlergrund or 'unbekannt'}\n\n"
+                "Es wurde bewusst NICHT mit veralteten/zuletzt erfolgreichen VPI-Werten weitergerechnet. "
+                "Bitte den amtlichen VPI-Abruf/-Import prüfen und den Monatslauf danach erneut ausführen; "
+                "erst dann wird für diese Periode ein vollständiger Bericht erzeugt."
+            )
         zeilen = self._repository.zeilen_fuer_periode(periode)
         teile = [
             f"Index-Monatsbericht {periode}",
@@ -428,11 +498,13 @@ class IndexMonatsberichtService:
                 if zeile.fruehester_termin else "kein Termin ermittelbar"
             )
             teile.append(
-                f"- {objekt} / {mieter} (Vertrag {zeile.vertrag_id}): {zeile.status} - {betrag_text} - "
+                f"- {objekt} / {mieter} (Vertrag {zeile.vertrag_id}): {status_label(zeile.status)} - {betrag_text} - "
                 f"Termin: {termin_text} - {zeile.status_grund}"
             )
         teile.append("")
-        teile.append("Vollständige Details im Backoffice unter /backoffice/indexautomatik/monatsbericht/" + periode)
+        # Codex-Präzisierung: "Mail-Link absolut, nicht relativ" - eine Mail
+        # wird außerhalb des Backoffice-Browserkontexts gelesen.
+        teile.append(f"Vollständige Details im Backoffice unter {self._backoffice_basis_url}/backoffice/indexautomatik/monatsbericht/{periode}")
         return "\n".join(teile)
 
     def benachrichtige_faellige(
@@ -444,12 +516,17 @@ class IndexMonatsberichtService:
         echter atomarer Claim (BEREIT->IN_VERSAND) vor jedem Aufruf.
         `send_ab_periode`: siehe `IndexMonatsberichtRepository.
         liste_faellig` - eine Periode VOR der Aktivierungsperiode wird
-        NIE automatisch versendet, bleibt aber im Portal sichtbar."""
+        NIE automatisch versendet, bleibt aber im Portal sichtbar. Codex-
+        Korrektur: `heute` wird jetzt tatsächlich zur aktuellen Periode
+        verrechnet und als `bis_periode` an `liste_faellig` durchgereicht -
+        eine (z. B. versehentlich vorab erzeugte) KÜNFTIGE Periode wird
+        NIE automatisch versendet, unabhängig von `send_ab_periode`."""
 
         if not send_enabled or not (self._owner_email or "").strip():
             return []
+        aktuelle_periode = f"{heute.year:04d}-{heute.month:02d}"
         benachrichtigt: list[IndexMonatsberichtTable] = []
-        for bericht in self._repository.liste_faellig(ab_periode=send_ab_periode):
+        for bericht in self._repository.liste_faellig(ab_periode=send_ab_periode, bis_periode=aktuelle_periode):
             if not self._repository.claim_fuer_versand(bericht.id):
                 continue
             text = self._text_fuer_bericht(bericht.periode, bericht)

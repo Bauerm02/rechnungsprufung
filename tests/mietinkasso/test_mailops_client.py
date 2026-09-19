@@ -37,10 +37,10 @@ def client_factory(tmp_path):
     return factory
 
 
-@pytest.mark.parametrize("kind", ["INDEX", "MAHNUNG", "VERTRAGSENDE"])
+@pytest.mark.parametrize("kind", ["INDEX", "MAHNUNG", "VERTRAGSENDE", "INDEX_MONATSBERICHT"])
 def test_exact_protocol_and_acceptance_is_not_sending(kind, auftrag, client_factory):
     auftrag = replace(auftrag, art=kind,
-        empfaenger_email="mb@jlb-immo.at" if kind == "VERTRAGSENDE" else auftrag.empfaenger_email)
+        empfaenger_email="mb@jlb-immo.at" if kind in ("VERTRAGSENDE", "INDEX_MONATSBERICHT") else auftrag.empfaenger_email)
     seen = []
     def provider(req):
         seen.append(req)
@@ -53,6 +53,18 @@ def test_exact_protocol_and_acceptance_is_not_sending(kind, auftrag, client_fact
     result = client_factory(provider).senden(auftrag)
     assert len(seen) == 1 and result.status == "ANGENOMMEN"
     assert result.versendet_am is None and not result.versand_bestaetigt
+
+
+@pytest.mark.parametrize("kind", ["VERTRAGSENDE", "INDEX_MONATSBERICHT"])
+def test_owner_only_kinds_reject_any_other_recipient(kind, auftrag):
+    """Codex-Betriebsdetail: "Ownerkonfig muss denselben Empfänger erzwingen
+    wie die Provider-Empfängergrenze" - selbst ein technisch gültiger,
+    aber falscher Empfänger darf für diese beiden Owner-only-Kinds NIE ein
+    versandfähiges Payload erzeugen, unabhängig vom Provider."""
+
+    auftrag = replace(auftrag, art=kind, empfaenger_email="jemand-anderes@example.invalid")
+    with pytest.raises(ValueError):
+        auftrag.payload()
 
 
 def test_uncertain_send_is_resolved_by_get_only(auftrag, client_factory):
