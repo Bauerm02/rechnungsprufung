@@ -8,13 +8,16 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.infrastructure.db.tables import (
     ErhoehungsschreibenTable,
     IndexautomatikLaufTable,
+    IndexMonatsberichtTable,
+    IndexMonatsberichtZeileTable,
+    IndexQuellenFaktenTable,
     RechtsprofilTable,
     VertragsendeErinnerungTable,
     VpiJahreswertTable,
@@ -360,6 +363,26 @@ class RechtsprofilRepository:
                 raise ValueError(f"Unbekanntes Rechtsprofil {id}")
             row.status = "INVALIDIERT"
             session.commit()
+
+    def existiert_import_inhalt_bereits(self, vertrag_id: str, inhalt_hash: str) -> bool:
+        """Codex-Korrektur (HV-20260919-INDEX-MONATSBERICHT): "bereits 34
+        Drafts vorhanden ... keine unnötigen dritten identischen Drafts.
+        Bei unveränderten Daten wiederholter Import ohne neue Version" -
+        prüft ALLE bisherigen Versionen dieses Vertrags (unabhängig vom
+        Status), nicht nur die neueste."""
+
+        return any(v.import_inhalt_hash == inhalt_hash for v in self.liste_fuer_vertrag(vertrag_id) if v.import_inhalt_hash)
+
+    def setze_import_provenienz(self, id: int, *, quelle: str, inhalt_hash: str) -> RechtsprofilTable:
+        with self._session_factory() as session:
+            row = session.get(RechtsprofilTable, id)
+            if row is None:
+                raise ValueError(f"Unbekanntes Rechtsprofil {id}")
+            row.import_quelle = quelle
+            row.import_inhalt_hash = inhalt_hash
+            session.commit()
+            session.refresh(row)
+            return row
 
 
 #: Ein Lauf in einem dieser Zustände darf erneut versucht werden (z. B.
@@ -726,4 +749,173 @@ class VertragsendeErinnerungRepository:
     def liste_alle(self) -> list[VertragsendeErinnerungTable]:
         with self._session_factory() as session:
             statement = select(VertragsendeErinnerungTable).order_by(VertragsendeErinnerungTable.faellig_am)
+            return list(session.execute(statement).scalars().all())
+
+
+class IndexQuellenFaktenRepository:
+    """Siehe `IndexQuellenFaktenTable`-Docstring - rein informative,
+    versionierte Quellenfakten, NIE Eingabe für eine echte Berechnung."""
+
+    def __init__(self, session_factory: sessionmaker[Session]):
+        self._session_factory = session_factory
+
+    def naechste_version(self, vertrag_id: str) -> int:
+        with self._session_factory() as session:
+            bisher = session.execute(
+                select(func.max(IndexQuellenFaktenTable.version)).where(
+                    IndexQuellenFaktenTable.vertrag_id == vertrag_id
+                )
+            ).scalar_one_or_none()
+            return (bisher or 0) + 1
+
+    def liste_fuer_vertrag(self, vertrag_id: str) -> list[IndexQuellenFaktenTable]:
+        with self._session_factory() as session:
+            statement = (
+                select(IndexQuellenFaktenTable)
+                .where(IndexQuellenFaktenTable.vertrag_id == vertrag_id)
+                .order_by(IndexQuellenFaktenTable.version.desc())
+            )
+            return list(session.execute(statement).scalars().all())
+
+    def neueste_fuer_vertrag(self, vertrag_id: str) -> IndexQuellenFaktenTable | None:
+        return next(iter(self.liste_fuer_vertrag(vertrag_id)), None)
+
+    def existiert_inhalt_bereits(self, vertrag_id: str, inhalt_hash: str) -> bool:
+        """Codex-Korrektur (HV-20260919-INDEX-MONATSBERICHT): "bei
+        unveränderten Daten wiederholter Import ohne neue Version" - JEDE
+        bisherige Version zählt (nicht nur die neueste), damit ein Import
+        nicht durch zwischenzeitlich abweichende Versionen erneut
+        dupliziert wird, solange der exakt gleiche Inhalt irgendwann
+        schon einmal importiert wurde."""
+
+        return any(v.inhalt_hash == inhalt_hash for v in self.liste_fuer_vertrag(vertrag_id))
+
+    def anlegen(self, row: IndexQuellenFaktenTable) -> IndexQuellenFaktenTable:
+        with self._session_factory() as session:
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+
+class IndexMonatsberichtRepository:
+    """Siehe `IndexMonatsberichtTable`/`IndexMonatsberichtZeileTable`-
+    Docstrings. Claim/Recovery-Methoden sind bewusst identisch zu
+    `VertragsendeErinnerungRepository` (dieselbe Fachregel: genau EIN
+    atomarer Versand je Kopfzeile, kein Doppelversand bei parallelen
+    Workern, Absturz-Recovery über einen Zeitstempel-Schwellwert)."""
+
+    def __init__(self, session_factory: sessionmaker[Session]):
+        self._session_factory = session_factory
+
+    def get(self, id: int) -> IndexMonatsberichtTable | None:
+        with self._session_factory() as session:
+            return session.get(IndexMonatsberichtTable, id)
+
+    def get_by_periode(self, periode: str) -> IndexMonatsberichtTable | None:
+        with self._session_factory() as session:
+            statement = select(IndexMonatsberichtTable).where(IndexMonatsberichtTable.periode == periode)
+            return session.execute(statement).scalars().first()
+
+    def ersetze_zeilen_falls_bereit(
+        self, periode: str, zeilen_felder: list[dict], *, zusammenfassung: dict,
+    ) -> IndexMonatsberichtTable | None:
+        """Codex-Korrektur (HV-20260919-INDEX-MONATSBERICHT, Punkt 6):
+        "Bericht nach BEREIT/Claim/Gesendet unveränderbar ... Erstellung
+        inkl. 17 Zeilen atomar, Monatsretry darf Versandstatus nicht
+        zurücksetzen." EIN Aufruf, EINE Transaktion: legt die Kopfzeile
+        an (falls sie fehlt), ersetzt ALLE Zeilen dieser Periode UND
+        aktualisiert die Zusammenfassung atomar - oder tut GAR NICHTS,
+        wenn die Kopfzeile bereits IN_VERSAND/GESENDET/UNKLAR ist (liefert
+        dann `None` statt den bereits eingefrorenen Bericht zu verändern).
+        `zeilen_felder`: Liste von `IndexMonatsberichtZeileTable`-Kwargs
+        OHNE `bericht_id` (wird hier gesetzt, da die Kopfzeilen-ID vorher
+        nicht feststeht)."""
+
+        with self._session_factory() as session:
+            bericht = session.execute(
+                select(IndexMonatsberichtTable).where(IndexMonatsberichtTable.periode == periode)
+            ).scalars().first()
+            if bericht is None:
+                bericht = IndexMonatsberichtTable(periode=periode, status="BEREIT")
+                session.add(bericht)
+                session.flush()
+            elif bericht.status != "BEREIT":
+                return None
+            session.execute(delete(IndexMonatsberichtZeileTable).where(IndexMonatsberichtZeileTable.periode == periode))
+            for felder in zeilen_felder:
+                session.add(IndexMonatsberichtZeileTable(bericht_id=bericht.id, **felder))
+            bericht.anzahl_vertraege = zusammenfassung["anzahl_vertraege"]
+            bericht.anzahl_moeglich = zusammenfassung["anzahl_moeglich"]
+            bericht.anzahl_noch_nicht_moeglich = zusammenfassung["anzahl_noch_nicht_moeglich"]
+            bericht.anzahl_pruefung_noetig = zusammenfassung["anzahl_pruefung_noetig"]
+            session.commit()
+            session.refresh(bericht)
+            return bericht
+
+    def zeilen_fuer_periode(self, periode: str) -> list[IndexMonatsberichtZeileTable]:
+        with self._session_factory() as session:
+            statement = (
+                select(IndexMonatsberichtZeileTable)
+                .where(IndexMonatsberichtZeileTable.periode == periode)
+                .order_by(IndexMonatsberichtZeileTable.vertrag_id)
+            )
+            return list(session.execute(statement).scalars().all())
+
+    def liste_alle(self) -> list[IndexMonatsberichtTable]:
+        with self._session_factory() as session:
+            statement = select(IndexMonatsberichtTable).order_by(IndexMonatsberichtTable.periode.desc())
+            return list(session.execute(statement).scalars().all())
+
+    def set_status(self, id: int, status: str, **felder) -> IndexMonatsberichtTable:
+        with self._session_factory() as session:
+            row = session.get(IndexMonatsberichtTable, id)
+            if row is None:
+                raise ValueError(f"Unbekannter IndexMonatsbericht {id}")
+            row.status = status
+            for feld, wert in felder.items():
+                setattr(row, feld, wert)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def claim_fuer_versand(self, id: int, *, jetzt: datetime | None = None) -> bool:
+        with self._session_factory() as session:
+            result = session.execute(
+                update(IndexMonatsberichtTable)
+                .where(IndexMonatsberichtTable.id == id)
+                .where(IndexMonatsberichtTable.status == "BEREIT")
+                .values(status="IN_VERSAND", versand_beansprucht_am=jetzt or datetime.now(timezone.utc))
+            )
+            session.commit()
+            return result.rowcount > 0
+
+    def verwaiste_in_versand(self, *, aelter_als: datetime) -> list[IndexMonatsberichtTable]:
+        with self._session_factory() as session:
+            statement = select(IndexMonatsberichtTable).where(
+                IndexMonatsberichtTable.status == "IN_VERSAND",
+                IndexMonatsberichtTable.versand_beansprucht_am < aelter_als,
+            )
+            return list(session.execute(statement).scalars().all())
+
+    def liste_faellig(self, *, ab_periode: str | None) -> list[IndexMonatsberichtTable]:
+        """`ab_periode`: Aktivierungsperiode (Codex-Betriebsdetail: "erstes
+        reguläres automatisches Mailing soll 01.10.2026 ... Aktivierungs-
+        periode ... ältere September-Vorschau darf nicht am nächsten
+        täglichen Lauf unbeabsichtigt nachgesendet werden"). `None`
+        (nicht konfiguriert) liefert IMMER eine leere Liste - "closed by
+        default", kein Versand ohne bewusst gesetztes Startdatum, auch
+        wenn `SEND_ENABLED=True` gesetzt wäre. Eine Periode VOR
+        `ab_periode` bleibt dauerhaft `BEREIT` (im Portal sichtbar,
+        nie automatisch versendet - genau die "nur zur Portalansicht"-
+        Vorgabe)."""
+
+        if not ab_periode:
+            return []
+        with self._session_factory() as session:
+            statement = (
+                select(IndexMonatsberichtTable)
+                .where(IndexMonatsberichtTable.status == "BEREIT")
+                .where(IndexMonatsberichtTable.periode >= ab_periode)
+            )
             return list(session.execute(statement).scalars().all())

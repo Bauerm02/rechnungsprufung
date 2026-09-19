@@ -138,6 +138,20 @@ class HVMailversandService:
             "Mietvertrag endet: Entscheidung zur Verlängerung", auftrag["text"],
             "OWNER-ONLY-DREI-KALENDERMONATE:" + auftrag["vertrag_id"]))
 
+    def monatsbericht_senden(self, auftrag):
+        """Umfang B (HV-20260919-INDEX-MONATSBERICHT): eigener Kind
+        `INDEX_MONATSBERICHT`, unabhängig von `owner_senden`/
+        `index_senden` - siehe `mailops_client.py` für die harte
+        Empfängergrenze und `infrastructure/config.py` für den eigenen
+        Aktivierungsschalter."""
+
+        if self.client is None or not self.settings.hv_mail_allowlist_bestaetigt:
+            raise ValueError("Privater Mailweg ist nicht freigegeben.")
+        return self.client.senden(MailOpsAuftrag(
+            auftrag["idempotenzschluessel"], "INDEX_MONATSBERICHT", auftrag["empfaenger"], "Markus Bauer",
+            f"Index-Monatsbericht {auftrag['periode']}", auftrag["text"],
+            "OWNER-ONLY-MONATSBERICHT:" + auftrag["periode"]))
+
     def index_senden(self, *, ctx, row_id, heute):
         if self.client is None:
             raise ValueError("Privater Mailweg ist nicht eingerichtet.")

@@ -1052,6 +1052,106 @@ class RechtsprofilTable(Base):
     freigegeben_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     erstellt_von: Mapped[str] = mapped_column(String(128))
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Additiv (Auftrag HV-20260919-INDEX-MONATSBERICHT, Codex-Korrektur:
+    # "bereits 34 Drafts vorhanden ... keine unnötigen dritten identischen
+    # Drafts. Bei unveränderten Daten wiederholter Import ohne neue
+    # Version"). `import_inhalt_hash` ist der Hash über GENAU die vom
+    # generischen Quellenimport (`indexautomatik/rechtsprofil_import.py`)
+    # übergebenen Eingabefelder dieser Zeile - VOR jedem Anlegen einer
+    # neuen Version prüft der Import gegen ALLE bestehenden Versionen
+    # desselben Vertrags; ein Treffer überspringt den Import ersatzlos
+    # (kein Duplikat). NIE für manuell im Portal erstellte Profile
+    # gesetzt (bleibt dort `None`) - unterscheidet importierte von
+    # manuell erfassten Zeilen, ohne deren Verhalten zu ändern.
+    import_quelle: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    import_inhalt_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class IndexQuellenFaktenTable(Base):
+    """Versionierte, rein INFORMATIVE Quellenfakten je Vertrag (Auftrag
+    HV-20260919-INDEX-MONATSBERICHT, Codex-Korrektur: "Ein weiterer
+    ENTWURF allein reicht nicht ... neue Quellenfakten müssen im Bericht
+    tatsächlich nutzbar/sichtbar sein"). Diese Zeile ist NIEMALS Eingabe
+    für `IndexautomatikService`/`mieweg_vorschau_service`/`index/service.py`
+    - sie fließt AUSSCHLIESSLICH in die Textanreicherung des
+    `IndexMonatsberichtZeileTable`-Berichts ein (Grund/Vertragsbasis-
+    Anzeige), wenn (noch) kein freigegebenes `RechtsprofilTable` existiert
+    und der reale Monatslauf deshalb nur die generische "kein Profil"-
+    Meldung liefert. Deckt bewusst einen unvollständigen Zwischenstand ab
+    (z. B. eine bestätigte AKTUELLE Gesamtmiete OHNE jede erfasste
+    `VertragsKomponenteTable`-Zeile) - eine solche Lücke wird hier
+    dokumentiert sichtbar gemacht, NIE stillschweigend durch einen
+    erfundenen Komponentenwert oder eine Nullmiete ersetzt.
+
+    Versioniert wie `RechtsprofilTable` (`naechste_version`), aber ohne
+    Freigabemechanismus - jede Version ist von Anfang an "wirksam" für
+    die Berichtsanreicherung (die neueste Version je Vertrag zählt).
+    `inhalt_hash` ist der Hash über GENAU die importierten Fachfelder
+    (siehe `indexautomatik/rechtsprofil_import.py`) - identischer
+    Re-Import erzeugt KEINE neue Version."""
+
+    __tablename__ = "index_quellen_fakten"
+    __table_args__ = (UniqueConstraint("vertrag_id", "version", name="uq_index_quellen_fakten_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    quelle: Mapped[str] = mapped_column(String(256))
+    inhalt_hash: Mapped[str] = mapped_column(String(64))
+    # Ursprüngliche, laut Vertragswortlaut dokumentierte Klauselbasis -
+    # KEINE aktuell freigegebene `IndexKlauselTable` (die bleibt der
+    # einzige Weg zu einer echten Berechnung).
+    urspruengliche_klauselbasis_reihe: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    urspruengliche_klauselbasis_monat: Mapped[str | None] = mapped_column(String(7), nullable=True)
+    urspruengliche_klauselbasis_wert: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Betrag ZUM ZEITPUNKT der ursprünglichen Klauselbasis - NIE der
+    # heute tatsächlich verrechnete (ggf. bereits erhöhte) Betrag
+    # (Codex: "nie den heutigen bereits erhöhten Betrag mit
+    # ursprünglicher Basis multiplizieren"). `betrag_basisbindung_belegt`
+    # ist eine EXPLIZITE, gesondert bestätigte Aussage, dass dieser
+    # Betrag tatsächlich zur obigen Klauselbasis gehört - ohne dieses
+    # Flag wird der Betrag NIE für den Gewerbe-Rechenvorschlag verwendet
+    # (siehe `monatsbericht_service.py::_gewerbe_rechenvorschlag`).
+    urspruenglicher_indexbetrag_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    betrag_basisbindung_belegt: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Schwellen-/Dämpfungsparameter der dokumentierten Gewerbeklausel -
+    # AUSSCHLIESSLICH für den read-only Gewerbe-Rechenvorschlag, NIEMALS
+    # für eine echte `IndexKlauselTable`/Buchung. `schwelle_inklusive`
+    # bleibt bewusst NULLABLE (kein Default) - ohne explizite Angabe
+    # bleibt der Rechenvorschlag gesperrt statt eine Vertragsauslegung
+    # zu raten.
+    schwelle_prozent: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    schwelle_inklusive: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    daempfung_prozent: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    vertragliche_grenze_prozent: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    klauselregel_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Bestätigte AKTUELLE Gesamtmiete - bewusst GETRENNT von
+    # `VertragsKomponenteTable` (die kann fehlen, siehe Klassendoc).
+    bestaetigte_gesamtmiete_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bestaetigte_gesamtmiete_quelle: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    bestaetigte_gesamtmiete_stichtag: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Letzte TATSÄCHLICHE Indexbasis - NIE aus `VertragTable.gueltig_von`
+    # abgeleitet (Codex: "Wohnungsbasis-Vertragsmonat ist nicht
+    # automatisch bezugsmonat letzter Erhöhung"), bleibt `None`, wenn
+    # unbekannt.
+    letzte_tatsaechliche_basis_jahr: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    letzte_tatsaechliche_basis_monat: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    letzte_tatsaechliche_basis_hinweis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bereits_enthaltene_erhoehungen_hinweis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pruefhinweis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Strukturierter, WIEDERKEHRENDER Kalendermonat (1-12, z. B. 1 für
+    # eine Jännerklausel) statt eines eingefrorenen Datums (Codex:
+    # "Januar-/Apriltermine aus Regeln dynamisch ableiten, nicht 2027
+    # ewig als Festtext konservieren") - der Bericht berechnet daraus
+    # JEDEN Lauf erneut den nächsten tatsächlichen Kalendertermin
+    # (`indexautomatik/service.py::_naechster_gueltiger_kalendermonat`,
+    # wiederverwendet, keine zweite Formel). `None`, wenn keinerlei
+    # Periodizität bekannt ist - dann bleibt nur der Freitexthinweis.
+    bedingter_naechster_monat: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bedingter_fruehester_termin_hinweis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    quellenreferenzen: Mapped[list] = mapped_column(JSON, default=list)
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class IndexautomatikLaufTable(Base):
@@ -1231,6 +1331,86 @@ class VertragsendeErinnerungTable(Base):
     entschieden_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     mieterentwurf_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     mieterentwurf_erstellt_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class IndexMonatsberichtTable(Base):
+    """Persistenter, deterministischer Owner-Monatsbericht (Auftrag
+    HV-20260919-INDEX-MONATSBERICHT) - GENAU eine Kopfzeile je Kalender-
+    monat "YYYY-MM", vom monatlichen Indexautomatik-Lauf erzeugt
+    (`scripts/indexautomatik_monatslauf.py`, alleiniger Erzeuger - kein
+    neuer Scheduler). Trägt den Versandstatus der EINEN Owner-Sammelmail
+    für diesen Monat (Auftrag Umfang B); Claim/Recovery/Status-Abgleich
+    laufen exakt wie bei `VertragsendeErinnerungTable` über die
+    bestehende tägliche Pflege."""
+
+    __tablename__ = "index_monatsberichte"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    periode: Mapped[str] = mapped_column(String(7), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(24), default="BEREIT")
+    anzahl_vertraege: Mapped[int] = mapped_column(Integer, default=0)
+    anzahl_moeglich: Mapped[int] = mapped_column(Integer, default=0)
+    anzahl_noch_nicht_moeglich: Mapped[int] = mapped_column(Integer, default=0)
+    anzahl_pruefung_noetig: Mapped[int] = mapped_column(Integer, default=0)
+    versand_beansprucht_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    versendet_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    externe_versandreferenz: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    fehlergrund: Mapped[str | None] = mapped_column(Text, nullable=True)
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class IndexMonatsberichtZeileTable(Base):
+    """Eine Zeile je (Bericht, Vertrag) - der eigentliche fachliche
+    Snapshot für Umfang A. Wird AUSSCHLIESSLICH aus dem bereits real
+    berechneten `IndexautomatikLaufTable`/`ErhoehungsschreibenTable`
+    dieses Monats abgeleitet (keine zweite Berechnung); `IndexQuellen
+    FaktenTable` liefert NUR Text-/Anzeige-Anreicherung, wenn (noch)
+    kein freigegebenes Profil existiert. `vorschlag_cent`/
+    `differenz_cent`/`gesamtvorschreibung_cent`/`indexierbarer_
+    mietanteil_cent` bleiben bewusst NULLABLE ohne Default - eine fehlende
+    Zahl wird NIE durch 0 ersetzt (Auftrag: "kein 0-EUR-Ersatz")."""
+
+    __tablename__ = "index_monatsbericht_zeilen"
+    __table_args__ = (UniqueConstraint("vertrag_id", "periode", name="uq_index_monatsbericht_zeile"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    bericht_id: Mapped[int] = mapped_column(ForeignKey("index_monatsberichte.id"), index=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    periode: Mapped[str] = mapped_column(String(7))
+    # "MOEGLICH" | "NOCH_NICHT_MOEGLICH" | "PRUEFUNG_NOETIG" - siehe
+    # `monatsbericht_service.py::_status_aus_lauf`.
+    status: Mapped[str] = mapped_column(String(24))
+    status_grund: Mapped[str] = mapped_column(Text)
+    vorschlag_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    differenz_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fruehester_termin: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # "BEDINGT" (nächste gesetzlich/vertraglich mögliche Grenze, keine
+    # Individualzusage) | "GEPRUEFT" (konkreter Termin dieses Vertrags,
+    # z. B. aus einem bereits erzeugten Erhöhungsschreiben).
+    fruehester_termin_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    gesamtvorschreibung_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # "KOMPONENTEN" (aus aktiven VertragsKomponenteTable-Zeilen summiert)
+    # | "BESTAETIGT_OHNE_KOMPONENTEN" (aus IndexQuellenFaktenTable, keine
+    # Komponentenzeilen vorhanden - Codex-Beispiel Pietsch/IMG).
+    gesamtvorschreibung_quelle: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    indexierbarer_mietanteil_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Codex-Korrektur: "15 Ist-Komponentensätze haben indexierbar=false
+    # bis Freigabe; daraus nicht 'indexierbarer Mietanteil 0 EUR' als
+    # materielle Aussage" - wenn `indexierbarer_mietanteil_cent` NULL
+    # ist, WEIL keine aktive Komponente (noch) als indexierbar markiert
+    # ist (nicht weil keine Komponenten existieren), erklärt dieses Feld
+    # das explizit statt einen stillen Nullwert zu zeigen.
+    indexierbarer_mietanteil_hinweis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Mieter/Objekt/Einheit-Anzeige, Vertragsbasis (Reihe/Monat/Wert),
+    # letzte tatsächliche Indexierung, Quellenfakten-Hinweise - reine
+    # Anzeigedaten, siehe `monatsbericht_service.py::_snapshot`.
+    snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    rechtsprofil_id: Mapped[int | None] = mapped_column(ForeignKey("rechtsprofile.id"), nullable=True)
+    rechtsprofil_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quellen_fakten_id: Mapped[int | None] = mapped_column(ForeignKey("index_quellen_fakten.id"), nullable=True)
+    indexautomatik_lauf_id: Mapped[int | None] = mapped_column(ForeignKey("indexautomatik_laeufe.id"), nullable=True)
+    erhoehungsschreiben_id: Mapped[int | None] = mapped_column(ForeignKey("erhoehungsschreiben.id"), nullable=True)
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

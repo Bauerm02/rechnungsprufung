@@ -103,6 +103,27 @@ class Settings(BaseSettings):
     hv_mail_socket_path: str | None = None
     hv_mail_token_file: str | None = None
     hv_mail_allowlist_bestaetigt: bool = False
+
+    # Owner-Monatsbericht (Auftrag HV-20260919-INDEX-MONATSBERICHT): eigener,
+    # eng begrenzter Schalter - unabhängig von `send_enabled`/
+    # `indexautomatik_send_enabled`/`vertragsende_erinnerung_send_enabled`
+    # (Codex: "unabhängig von ausgeschaltetem Mieter-/Mahnsenden aktivierbar,
+    # ohne allgemeines SEND_ENABLED zu öffnen"). Läuft trotzdem weiterhin
+    # zusätzlich über `hv_mail_allowlist_bestaetigt` + den echten Transport-
+    # Client (kein paralleler, ungeprüfter Versandweg). Empfänger ist
+    # IMMER `owner_email`, serverseitig zusätzlich gegen die feste
+    # MailOps-Empfängergrenze für den Kind INDEX_MONATSBERICHT geprüft
+    # (siehe `indexautomatik/mailops_client.py`).
+    index_monatsbericht_send_enabled: bool = False
+    # Aktivierungsperiode "YYYY-MM" (Betriebsdetail Codex: "erstes reguläres
+    # automatisches Mailing soll 01.10.2026 ... ältere September-Vorschau
+    # darf nicht unbeabsichtigt nachgesendet werden"). `None` (Default) -
+    # "closed by default": KEIN automatischer Versand irgendeiner Periode,
+    # selbst wenn `index_monatsbericht_send_enabled=True` gesetzt ist. Ein
+    # bereits erzeugter Bericht für eine Periode VOR dieser Aktivierung
+    # bleibt dauerhaft nur im Portal sichtbar (Status BEREIT), wird aber
+    # NIE automatisch versendet.
+    index_monatsbericht_send_ab: str | None = None
     # Auftrag HV-20260913-VERSAND-SOLL: eigenes, GETRENNTES Flag für die
     # tatsächliche Soll-Umsetzung (Vertragskomponenten-/Rechtsprofil-
     # änderung) - bewusst UNABHÄNGIG von `indexautomatik_send_enabled`

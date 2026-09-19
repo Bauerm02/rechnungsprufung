@@ -21,7 +21,12 @@ from mietinkasso.domain.exceptions import TransportFehlerUngewissError
 
 _STATUSES = frozenset({"ANGENOMMEN", "GESENDET", "UNKLAR", "IN_BEARBEITUNG",
                       "DEAKTIVIERT", "NICHT_GEFUNDEN", "FEHLER"})
-_KINDS = frozenset({"INDEX", "MAHNUNG", "VERTRAGSENDE"})
+# "INDEX_MONATSBERICHT" (Auftrag HV-20260919-INDEX-MONATSBERICHT): Codex
+# ergänzt als alleiniger Writer des getrennten MailOps-Repositories
+# denselben Kind serverseitig - siehe dortige Transportpräzisierung
+# ("harte Provider-Empfängergrenze mb@jlb-immo.at, unveränderte
+# JLB-Signatur/Dedupe"). Der App-Client muss GENAU diesen Kind verwenden.
+_KINDS = frozenset({"INDEX", "MAHNUNG", "VERTRAGSENDE", "INDEX_MONATSBERICHT"})
 
 
 def _reference(value: str) -> None:
@@ -58,6 +63,13 @@ class MailOpsAuftrag:
             raise ValueError("Genau eine gültige MailOps-Empfängeradresse ist erforderlich.")
         if self.art == "VERTRAGSENDE" and self.empfaenger_email.lower() != "mb@jlb-immo.at":
             raise ValueError("Vertragsendehinweise gehen zuerst ausschließlich an Markus.")
+        # Codex-Betriebsdetail: Ownerkonfig muss denselben Empfänger
+        # erzwingen wie die Provider-Empfängergrenze im getrennten
+        # MailOps-Repository - "Alle Empfänger serverseitig strikt aus
+        # Ownerkonfig, nie aus Request-/Vertragsdaten" (identisches
+        # Defense-in-Depth-Muster wie VERTRAGSENDE oben).
+        if self.art == "INDEX_MONATSBERICHT" and self.empfaenger_email.lower() != "mb@jlb-immo.at":
+            raise ValueError("Der Index-Monatsbericht geht ausschließlich an Markus.")
         if not self.text.strip() or len(self.text) > 20000 or "\0" in self.text:
             raise ValueError("MailOps-Nachrichtentext fehlt oder ist zu lang.")
         if re.search(r"\b(?:undefined|null)\b|\{\{.+?\}\}", self.text, re.I):
