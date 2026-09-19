@@ -137,7 +137,7 @@ davon (folgen erst nach Rückmeldung des Nutzers).
   GEPRUEFT, Sperren-Aufhebung mit/ohne Begründung, Index-Prüfbedarf,
   Bank-Verknüpfung inkl. Replay/Link-Duplikat, sowie der route-seitige
   403-Block der automatischen Zuordnung außerhalb bekannter
-  Demo-Umgebungen über `monkeypatch` auf `backoffice/app.py::_DEMO_UMGEBUNG`
+  Demo-Umgebungen über `monkeypatch` auf `backoffice/dependencies.py::_DEMO_UMGEBUNG`
   — ein direkter End-to-End-Test mit echtem
   `MIETINKASSO_ENVIRONMENT=production`-Prozessstart ist wegen der
   bereits in Paket A dokumentierten Modul-Import-Einmaligkeit von

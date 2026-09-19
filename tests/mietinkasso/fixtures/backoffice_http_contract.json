@@ -1,0 +1,1683 @@
+{
+  "baseline_commit": "4467674d045e78d1f35f2d7cb35411bf04a9068d",
+  "routes": [
+    {
+      "path": "/backoffice/",
+      "method": "GET",
+      "endpoint": "dashboard",
+      "resolved_endpoint": "dashboard",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/abrechnungen",
+      "method": "GET",
+      "endpoint": "abrechnungen_hub",
+      "resolved_endpoint": "abrechnungen_hub",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank",
+      "method": "GET",
+      "endpoint": "bank_formular",
+      "resolved_endpoint": "bank_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank/importieren",
+      "method": "POST",
+      "endpoint": "bank_importieren",
+      "resolved_endpoint": "bank_importieren",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank/unzugeordnet",
+      "method": "GET",
+      "endpoint": "bank_unzugeordnet",
+      "resolved_endpoint": "bank_unzugeordnet",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank/vollstaendigkeit",
+      "method": "GET",
+      "endpoint": "bank_vollstaendigkeit_formular",
+      "resolved_endpoint": "bank_vollstaendigkeit_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank/vorschau",
+      "method": "POST",
+      "endpoint": "bank_vorschau",
+      "resolved_endpoint": "bank_vorschau",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank/{bank_konto_id}/vollstaendigkeit-bestaetigen",
+      "method": "POST",
+      "endpoint": "bank_vollstaendigkeit_bestaetigen",
+      "resolved_endpoint": "bank_vollstaendigkeit_bestaetigen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank/{transaktion_id}/automatisch-zuordnen",
+      "method": "POST",
+      "endpoint": "bank_automatisch_zuordnen",
+      "resolved_endpoint": "bank_automatisch_zuordnen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank/{transaktion_id}/manuell-zuordnen",
+      "method": "POST",
+      "endpoint": "bank_manuell_zuordnen",
+      "resolved_endpoint": "bank_manuell_zuordnen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank/{transaktion_id}/verknuepfen",
+      "method": "GET",
+      "endpoint": "bank_verknuepfen_formular",
+      "resolved_endpoint": "bank_verknuepfen_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank/{transaktion_id}/verknuepfen",
+      "method": "POST",
+      "endpoint": "bank_verknuepfen",
+      "resolved_endpoint": "bank_verknuepfen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/basiszinssatz",
+      "method": "GET",
+      "endpoint": "basiszinssatz_uebersicht",
+      "resolved_endpoint": "basiszinssatz_uebersicht",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/basiszinssatz/erfassen",
+      "method": "POST",
+      "endpoint": "basiszinssatz_erfassen",
+      "resolved_endpoint": "basiszinssatz_erfassen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/dashboard/monatsuebersicht",
+      "method": "GET",
+      "endpoint": "dashboard_monatsuebersicht",
+      "resolved_endpoint": "dashboard_monatsuebersicht",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/einstellungen",
+      "method": "GET",
+      "endpoint": "einstellungen_hub",
+      "resolved_endpoint": "einstellungen_hub",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/eroeffnung",
+      "method": "GET",
+      "endpoint": "eroeffnung_formular",
+      "resolved_endpoint": "eroeffnung_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/eroeffnung/verbuchen",
+      "method": "POST",
+      "endpoint": "eroeffnung_verbuchen",
+      "resolved_endpoint": "eroeffnung_verbuchen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/eroeffnung/vorschau",
+      "method": "POST",
+      "endpoint": "eroeffnung_vorschau",
+      "resolved_endpoint": "eroeffnung_vorschau",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/laeufe",
+      "method": "GET",
+      "endpoint": "indexautomatik_laeufe",
+      "resolved_endpoint": "indexautomatik_laeufe",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/monatsbericht",
+      "method": "GET",
+      "endpoint": "indexautomatik_monatsbericht_liste",
+      "resolved_endpoint": "indexautomatik_monatsbericht_liste",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/monatsbericht/{periode}",
+      "method": "GET",
+      "endpoint": "indexautomatik_monatsbericht_detail",
+      "resolved_endpoint": "indexautomatik_monatsbericht_detail",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/outbox",
+      "method": "GET",
+      "endpoint": "indexautomatik_outbox",
+      "resolved_endpoint": "indexautomatik_outbox",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/outbox/{erhoehungsschreiben_id}/versenden",
+      "method": "POST",
+      "endpoint": "indexautomatik_outbox_versenden",
+      "resolved_endpoint": "indexautomatik_outbox_versenden",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/outbox/{erhoehungsschreiben_id}/zugang-bestaetigen",
+      "method": "POST",
+      "endpoint": "indexautomatik_outbox_zugang_bestaetigen",
+      "resolved_endpoint": "indexautomatik_outbox_zugang_bestaetigen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/rechtsprofil/{rechtsprofil_id}/freigeben",
+      "method": "POST",
+      "endpoint": "rechtsprofil_freigeben",
+      "resolved_endpoint": "rechtsprofil_freigeben",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/soll-umsetzung",
+      "method": "GET",
+      "endpoint": "indexautomatik_soll_umsetzung",
+      "resolved_endpoint": "indexautomatik_soll_umsetzung",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/soll-umsetzung/{erhoehungsschreiben_id}",
+      "method": "GET",
+      "endpoint": "indexautomatik_soll_umsetzung_detail",
+      "resolved_endpoint": "indexautomatik_soll_umsetzung_detail",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/soll-umsetzung/{erhoehungsschreiben_id}/umsetzen",
+      "method": "POST",
+      "endpoint": "indexautomatik_soll_umsetzung_umsetzen",
+      "resolved_endpoint": "indexautomatik_soll_umsetzung_umsetzen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/vertragsende",
+      "method": "GET",
+      "endpoint": "indexautomatik_vertragsende",
+      "resolved_endpoint": "indexautomatik_vertragsende",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/vertragsende/{erinnerung_id}/entscheiden",
+      "method": "POST",
+      "endpoint": "indexautomatik_vertragsende_entscheiden",
+      "resolved_endpoint": "indexautomatik_vertragsende_entscheiden",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/vertragsende/{erinnerung_id}/mieterentwurf",
+      "method": "POST",
+      "endpoint": "indexautomatik_vertragsende_mieterentwurf",
+      "resolved_endpoint": "indexautomatik_vertragsende_mieterentwurf",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/vpi",
+      "method": "GET",
+      "endpoint": "indexautomatik_vpi",
+      "resolved_endpoint": "indexautomatik_vpi",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/vpi/erfassen",
+      "method": "POST",
+      "endpoint": "indexautomatik_vpi_erfassen",
+      "resolved_endpoint": "indexautomatik_vpi_erfassen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/vpi/veroeffentlichung",
+      "method": "POST",
+      "endpoint": "vpi_veroeffentlichung_belegen",
+      "resolved_endpoint": "vpi_veroeffentlichung_belegen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexklausel/{klausel_id}/freigeben",
+      "method": "POST",
+      "endpoint": "indexklausel_freigeben",
+      "resolved_endpoint": "indexklausel_freigeben",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/konto/{konto_id}",
+      "method": "GET",
+      "endpoint": "kontoauszug",
+      "resolved_endpoint": "kontoauszug",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/konto/{konto_id}/buchen",
+      "method": "GET",
+      "endpoint": "nachbuchung_formular",
+      "resolved_endpoint": "nachbuchung_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/konto/{konto_id}/buchen",
+      "method": "POST",
+      "endpoint": "nachbuchung_absenden",
+      "resolved_endpoint": "nachbuchung_absenden",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/login",
+      "method": "GET",
+      "endpoint": "login_formular",
+      "resolved_endpoint": "login_formular",
+      "dependencies": []
+    },
+    {
+      "path": "/backoffice/login",
+      "method": "POST",
+      "endpoint": "login_absenden",
+      "resolved_endpoint": "login_absenden",
+      "dependencies": []
+    },
+    {
+      "path": "/backoffice/logout",
+      "method": "POST",
+      "endpoint": "logout",
+      "resolved_endpoint": "logout",
+      "dependencies": []
+    },
+    {
+      "path": "/backoffice/mahnfall/{mahnfall_id}/sendebereitschaft",
+      "method": "POST",
+      "endpoint": "mahnfall_sendebereitschaft",
+      "resolved_endpoint": "mahnfall_sendebereitschaft",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/mahnfall/{mahnfall_id}/versenden",
+      "method": "POST",
+      "endpoint": "mahnfall_versenden",
+      "resolved_endpoint": "mahnfall_versenden",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/mahnwesen/policy",
+      "method": "GET",
+      "endpoint": "mahnpolicy_uebersicht",
+      "resolved_endpoint": "mahnpolicy_uebersicht",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/mahnwesen/policy/anlegen",
+      "method": "POST",
+      "endpoint": "mahnpolicy_anlegen",
+      "resolved_endpoint": "mahnpolicy_anlegen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/mahnwesen/policy/{policy_id}/freigeben",
+      "method": "POST",
+      "endpoint": "mahnpolicy_freigeben",
+      "resolved_endpoint": "mahnpolicy_freigeben",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/mailversand",
+      "method": "GET",
+      "endpoint": "mailversand_uebersicht",
+      "resolved_endpoint": "mailversand_uebersicht",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/mailversand/status-abgleichen",
+      "method": "POST",
+      "endpoint": "mailversand_status_abgleichen",
+      "resolved_endpoint": "mailversand_status_abgleichen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/op/{op_id}/korrigieren",
+      "method": "GET",
+      "endpoint": "korrektur_formular",
+      "resolved_endpoint": "korrektur_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/op/{op_id}/korrigieren",
+      "method": "POST",
+      "endpoint": "korrektur_absenden",
+      "resolved_endpoint": "korrektur_absenden",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/variable-abrechnung",
+      "method": "GET",
+      "endpoint": "variable_abrechnung_liste",
+      "resolved_endpoint": "variable_abrechnung_liste",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/erfassen",
+      "method": "GET",
+      "endpoint": "variable_abrechnung_erfassen_formular",
+      "resolved_endpoint": "variable_abrechnung_erfassen_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/erfassen",
+      "method": "POST",
+      "endpoint": "variable_abrechnung_erfassen",
+      "resolved_endpoint": "variable_abrechnung_erfassen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/import",
+      "method": "GET",
+      "endpoint": "variable_abrechnung_import_formular",
+      "resolved_endpoint": "variable_abrechnung_import_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/import/uebernehmen",
+      "method": "POST",
+      "endpoint": "variable_abrechnung_import_uebernehmen",
+      "resolved_endpoint": "variable_abrechnung_import_uebernehmen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/import/vorschau",
+      "method": "POST",
+      "endpoint": "variable_abrechnung_import_vorschau",
+      "resolved_endpoint": "variable_abrechnung_import_vorschau",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/versionen",
+      "method": "GET",
+      "endpoint": "variable_abrechnung_versionen",
+      "resolved_endpoint": "variable_abrechnung_versionen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/{id}/korrigieren",
+      "method": "GET",
+      "endpoint": "variable_abrechnung_korrigieren_formular",
+      "resolved_endpoint": "variable_abrechnung_korrigieren_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/{id}/korrigieren",
+      "method": "POST",
+      "endpoint": "variable_abrechnung_korrigieren",
+      "resolved_endpoint": "variable_abrechnung_korrigieren",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertraege",
+      "method": "GET",
+      "endpoint": "vertragsanlage_liste",
+      "resolved_endpoint": "vertragsanlage_liste",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertraege/neu",
+      "method": "GET",
+      "endpoint": "vertragsanlage_neu_formular",
+      "resolved_endpoint": "vertragsanlage_neu_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/weiterleiten",
+      "method": "GET",
+      "endpoint": "vertragsanlage_weiterleiten",
+      "resolved_endpoint": "vertragsanlage_weiterleiten",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}",
+      "method": "GET",
+      "endpoint": "vertragsanlage_detail",
+      "resolved_endpoint": "vertragsanlage_detail",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/forderung/{op_position_id}/planen",
+      "method": "POST",
+      "endpoint": "forderung_planen",
+      "resolved_endpoint": "forderung_planen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/index-pruefbedarf/anlegen",
+      "method": "POST",
+      "endpoint": "vertragspruefung_index_pruefbedarf_anlegen",
+      "resolved_endpoint": "vertragspruefung_index_pruefbedarf_anlegen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/indexklausel/erstellen",
+      "method": "POST",
+      "endpoint": "indexklausel_erstellen",
+      "resolved_endpoint": "indexklausel_erstellen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/indexklauseln",
+      "method": "GET",
+      "endpoint": "indexklauseln_uebersicht",
+      "resolved_endpoint": "indexklauseln_uebersicht",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/komponenten-freigabe",
+      "method": "GET",
+      "endpoint": "komponenten_freigabe_formular",
+      "resolved_endpoint": "komponenten_freigabe_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/komponenten-freigabe/{komponente_id}/freigeben",
+      "method": "POST",
+      "endpoint": "komponenten_freigabe_erstellen",
+      "resolved_endpoint": "komponenten_freigabe_erstellen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnbrief.pdf",
+      "method": "GET",
+      "endpoint": "mahnbrief_pdf",
+      "resolved_endpoint": "mahnbrief_pdf",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnvorschau",
+      "method": "GET",
+      "endpoint": "mahnvorschau",
+      "resolved_endpoint": "mahnvorschau",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mietvertragsprofil/bearbeiten",
+      "method": "GET",
+      "endpoint": "vertragsanlage_bearbeiten_formular",
+      "resolved_endpoint": "vertragsanlage_bearbeiten_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mieweg-vorschau",
+      "method": "GET",
+      "endpoint": "mieweg_vorschau_uebersicht",
+      "resolved_endpoint": "mieweg_vorschau_uebersicht",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mieweg-vorschau/erstellen",
+      "method": "POST",
+      "endpoint": "mieweg_vorschau_erstellen",
+      "resolved_endpoint": "mieweg_vorschau_erstellen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/pruefung",
+      "method": "GET",
+      "endpoint": "vertragspruefung_uebersicht",
+      "resolved_endpoint": "vertragspruefung_uebersicht",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/pruefung/anlegen",
+      "method": "POST",
+      "endpoint": "vertragspruefung_anlegen",
+      "resolved_endpoint": "vertragspruefung_anlegen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/rechtsprofil",
+      "method": "GET",
+      "endpoint": "rechtsprofil_uebersicht",
+      "resolved_endpoint": "rechtsprofil_uebersicht",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/rechtsprofil/erstellen",
+      "method": "POST",
+      "endpoint": "rechtsprofil_erstellen",
+      "resolved_endpoint": "rechtsprofil_erstellen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/sperre/{sperre_id}/aufheben",
+      "method": "POST",
+      "endpoint": "vertragspruefung_sperre_aufheben",
+      "resolved_endpoint": "vertragspruefung_sperre_aufheben",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/vorschreibung",
+      "method": "GET",
+      "endpoint": "vorschreibung_formular",
+      "resolved_endpoint": "vorschreibung_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/vorschreibung/sollstellen",
+      "method": "POST",
+      "endpoint": "vorschreibung_sollstellen",
+      "resolved_endpoint": "vorschreibung_sollstellen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/zinsprofil",
+      "method": "GET",
+      "endpoint": "zinsprofil_uebersicht",
+      "resolved_endpoint": "zinsprofil_uebersicht",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/zinsprofil/erstellen",
+      "method": "POST",
+      "endpoint": "zinsprofil_erstellen",
+      "resolved_endpoint": "zinsprofil_erstellen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertragsanlage/pdf-hochladen",
+      "method": "POST",
+      "endpoint": "vertragsanlage_pdf_hochladen",
+      "resolved_endpoint": "vertragsanlage_pdf_hochladen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertragsanlage/uebernehmen",
+      "method": "POST",
+      "endpoint": "vertragsanlage_uebernehmen",
+      "resolved_endpoint": "vertragsanlage_uebernehmen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertragsanlage/vorschau",
+      "method": "POST",
+      "endpoint": "vertragsanlage_vorschau",
+      "resolved_endpoint": "vertragsanlage_vorschau",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/zahlungen",
+      "method": "GET",
+      "endpoint": "zahlungen_hub",
+      "resolved_endpoint": "zahlungen_hub",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/zinsprofil/{zinsprofil_id}/freigeben",
+      "method": "POST",
+      "endpoint": "zinsprofil_freigeben",
+      "resolved_endpoint": "zinsprofil_freigeben",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    }
+  ],
+  "closed": [
+    {
+      "path": "/backoffice/",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/abrechnungen",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/importieren",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/unzugeordnet",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/vollstaendigkeit",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/vorschau",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/{bank_konto_id}/vollstaendigkeit-bestaetigen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/{transaktion_id}/automatisch-zuordnen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/{transaktion_id}/manuell-zuordnen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/{transaktion_id}/verknuepfen",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/{transaktion_id}/verknuepfen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/basiszinssatz",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/basiszinssatz/erfassen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/dashboard/monatsuebersicht",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/einstellungen",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/eroeffnung",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/eroeffnung/verbuchen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/eroeffnung/vorschau",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/laeufe",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/monatsbericht",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/monatsbericht/{periode}",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/outbox",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/outbox/{erhoehungsschreiben_id}/versenden",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/outbox/{erhoehungsschreiben_id}/zugang-bestaetigen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/rechtsprofil/{rechtsprofil_id}/freigeben",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/soll-umsetzung",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/soll-umsetzung/{erhoehungsschreiben_id}",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/soll-umsetzung/{erhoehungsschreiben_id}/umsetzen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/vertragsende",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/vertragsende/{erinnerung_id}/entscheiden",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/vertragsende/{erinnerung_id}/mieterentwurf",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/vpi",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/vpi/erfassen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/vpi/veroeffentlichung",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexklausel/{klausel_id}/freigeben",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/konto/{konto_id}",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/konto/{konto_id}/buchen",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/konto/{konto_id}/buchen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/login",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/login",
+      "method": "post",
+      "status": 422,
+      "location": null,
+      "body_sha256": "0b727182030296a0a550fec7f93944d7cd82d9d3a13621a7006b995396c3bb1a"
+    },
+    {
+      "path": "/backoffice/logout",
+      "method": "post",
+      "status": 422,
+      "location": null,
+      "body_sha256": "d670cda71552a13e2b5a7b46a6c8116be0a4ec74064a08837d4a49e2fbc9d762"
+    },
+    {
+      "path": "/backoffice/mahnfall/{mahnfall_id}/sendebereitschaft",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/mahnfall/{mahnfall_id}/versenden",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/mahnwesen/policy",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/mahnwesen/policy/anlegen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/mahnwesen/policy/{policy_id}/freigeben",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/mailversand",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/mailversand/status-abgleichen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/op/{op_id}/korrigieren",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/op/{op_id}/korrigieren",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/variable-abrechnung",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/erfassen",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/erfassen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/import",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/import/uebernehmen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/import/vorschau",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/versionen",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/{id}/korrigieren",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/variable-abrechnung/{id}/korrigieren",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertraege",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertraege/neu",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/weiterleiten",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/forderung/{op_position_id}/planen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/index-pruefbedarf/anlegen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/indexklausel/erstellen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/indexklauseln",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/komponenten-freigabe",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/komponenten-freigabe/{komponente_id}/freigeben",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnbrief.pdf",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnvorschau",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mietvertragsprofil/bearbeiten",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mieweg-vorschau",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mieweg-vorschau/erstellen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/pruefung",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/pruefung/anlegen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/rechtsprofil",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/rechtsprofil/erstellen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/sperre/{sperre_id}/aufheben",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/vorschreibung",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/vorschreibung/sollstellen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/zinsprofil",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/zinsprofil/erstellen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertragsanlage/pdf-hochladen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertragsanlage/uebernehmen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertragsanlage/vorschau",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/zahlungen",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/zinsprofil/{zinsprofil_id}/freigeben",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    }
+  ]
+}

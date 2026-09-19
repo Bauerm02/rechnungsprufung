@@ -1097,7 +1097,7 @@ def test_mahnvorschau_unterscheidet_planbar_von_tatsaechlich_geplant(backoffice_
     ausdrücklichen POST auf den neuen Planen-Endpunkt erscheint "GEPLANT"
     mit Sendebereitschafts-Aktion."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
     from mietinkasso.domain.enums import OPTyp
     from mietinkasso.infrastructure.config import get_settings
     from mietinkasso.infrastructure.db.session import build_session_factory
@@ -1158,7 +1158,7 @@ def test_mahnvorschau_unterscheidet_planbar_von_tatsaechlich_geplant(backoffice_
 
     # Wiederholte GETs legen weiterhin NICHTS an.
     client.get("/backoffice/vertrag/V-601-PLANBAR/mahnvorschau", params={"heute": heute})
-    assert backoffice_app._mahn_fall_repo.list_fuer_vertrag("V-601-PLANBAR") == []
+    assert backoffice_deps._mahn_fall_repo.list_fuer_vertrag("V-601-PLANBAR") == []
 
     forderung = op_service.offene_forderungen(konto.id, heute=date(2026, 1, 20))[0]
     geplant = client.post(
@@ -1463,13 +1463,13 @@ def test_automatische_bankzuordnung_route_ist_ausserhalb_bekannter_demo_umgebung
     bekannter Demo-Umgebungen (also im Echtbetrieb) die Ausführung
     verweigern, unabhängig von der angefragten Transaktions-ID."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
 
     client, *_ = backoffice_client
     _login(client)
     csrf = _csrf_token(client)
 
-    monkeypatch.setattr(backoffice_app, "_DEMO_UMGEBUNG", False)
+    monkeypatch.setattr(backoffice_deps, "_DEMO_UMGEBUNG", False)
     gesperrt = client.post("/backoffice/bank/999999/automatisch-zuordnen", data={"csrf_token": csrf})
     assert gesperrt.status_code == 403
 
@@ -1480,7 +1480,7 @@ def test_bankseite_zeigt_keine_automatik_schaltflaeche_ausserhalb_der_demo_umgeb
     für die automatische Zuordnung erscheinen, nur der Hinweis auf die
     zurückgestellte automatische Bankzuordnung."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
 
     client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
     _login(client)
@@ -1491,7 +1491,7 @@ def test_bankseite_zeigt_keine_automatik_schaltflaeche_ausserhalb_der_demo_umgeb
     )
     assert re.search(r"/backoffice/bank/\d+/automatisch-zuordnen", seiten_text_in_demo) is not None
 
-    monkeypatch.setattr(backoffice_app, "_DEMO_UMGEBUNG", False)
+    monkeypatch.setattr(backoffice_deps, "_DEMO_UMGEBUNG", False)
     seite_ohne_demo = client.get("/backoffice/bank/unzugeordnet", params={"bank_konto_id": "BK-TEST-GATING"})
     assert seite_ohne_demo.status_code == 200
     assert "automatisch-zuordnen" not in seite_ohne_demo.text
@@ -1720,7 +1720,7 @@ def test_bankuebersicht_teilrueckbuchung_zeigt_verarbeitet_und_pruefrest(backoff
     verbleibenden Prüfrest zeigen, nicht nur den ursprünglichen
     Bankbetrag."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
 
     client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
     _login(client)
@@ -1769,9 +1769,9 @@ def test_bankuebersicht_teilrueckbuchung_zeigt_verarbeitet_und_pruefrest(backoff
     assert treffer_id is not None
     ruecklast_transaktion_id = int(treffer_id.group(1))
 
-    frische_transaktion = backoffice_app._bank_repo.get_transaktion(ruecklast_transaktion_id)
+    frische_transaktion = backoffice_deps._bank_repo.get_transaktion(ruecklast_transaktion_id)
     assert frische_transaktion is not None
-    backoffice_app._bank_service.verarbeite_ruecklastschrift(
+    backoffice_deps._bank_service.verarbeite_ruecklastschrift(
         ctx=_ctx_admin(), transaktion=frische_transaktion, original_op_position=zahlung, konto=konto,
         betrag_cent=40_000,  # bewusst TEILWEISE - Rest muss offen bleiben (900 - 400 = 500)
     )
@@ -3262,7 +3262,8 @@ def test_debitoren_filterung_zeigt_nur_gesellschaftsscope_erlaubte_debitoren(bac
     from mietinkasso.infrastructure.config import get_settings
     from mietinkasso.infrastructure.db.session import build_session_factory
     from mietinkasso.stammdaten.repository import StammdatenRepository
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+    from mietinkasso.backoffice.routes import vertragsanlage as backoffice_vertragsanlage
 
     client, *_ = backoffice_client
     stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
@@ -3276,9 +3277,9 @@ def test_debitoren_filterung_zeigt_nur_gesellschaftsscope_erlaubte_debitoren(bac
     )
 
     scoped_ctx = ctx_factory("7DI")
-    alle_vertraege = backoffice_app._stammdaten_repo.list_alle_vertraege()
-    erlaubte_ids = {v.debitor_id for v in alle_vertraege if backoffice_app._hat_gesellschaft_zugriff(scoped_ctx, v.gesellschaft_id)}
-    sichtbare_debitoren = {d.id for d in backoffice_app._stammdaten_repo.list_alle_debitoren() if d.id in erlaubte_ids}
+    alle_vertraege = backoffice_deps._stammdaten_repo.list_alle_vertraege()
+    erlaubte_ids = {v.debitor_id for v in alle_vertraege if backoffice_vertragsanlage._hat_gesellschaft_zugriff(scoped_ctx, v.gesellschaft_id)}
+    sichtbare_debitoren = {d.id for d in backoffice_deps._stammdaten_repo.list_alle_debitoren() if d.id in erlaubte_ids}
     assert "DEB-1" in sichtbare_debitoren  # 7DI-Mieter bleibt sichtbar
     assert "DEB-FREMD" not in sichtbare_debitoren  # fremder Mieter ausgeschlossen
 
@@ -3479,16 +3480,16 @@ def test_mahnvorschau_get_legt_nie_einen_mahnfall_an(backoffice_client):
     tatsächliche Anlegen läuft ausschließlich über den separaten,
     CSRF-geschützten POST `/vertrag/{id}/forderung/{op_id}/planen`."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
 
     client, *_ = backoffice_client
     _login(client)
 
-    vorher = len(backoffice_app._mahn_fall_repo.list_fuer_vertrag("V-601-1"))
+    vorher = len(backoffice_deps._mahn_fall_repo.list_fuer_vertrag("V-601-1"))
     for heute in (date.today().isoformat(), (date.today() + timedelta(days=200)).isoformat()):
         antwort = client.get("/backoffice/vertrag/V-601-1/mahnvorschau", params={"heute": heute})
         assert antwort.status_code == 200
-    nachher = len(backoffice_app._mahn_fall_repo.list_fuer_vertrag("V-601-1"))
+    nachher = len(backoffice_deps._mahn_fall_repo.list_fuer_vertrag("V-601-1"))
     assert nachher == vorher
 
     # Ein POST ohne gültiges CSRF-Token wird abgelehnt (wie bei jedem
@@ -3498,7 +3499,7 @@ def test_mahnvorschau_get_legt_nie_einen_mahnfall_an(backoffice_client):
         data={"csrf_token": "ungueltig"},
     )
     assert abgelehnt.status_code in (400, 403)
-    assert len(backoffice_app._mahn_fall_repo.list_fuer_vertrag("V-601-1")) == vorher
+    assert len(backoffice_deps._mahn_fall_repo.list_fuer_vertrag("V-601-1")) == vorher
 
 
 def test_basiszinssatz_erfassen_und_duplikat_wird_abgelehnt(backoffice_client):
@@ -3538,7 +3539,7 @@ def test_mahnvorschau_zeigt_zinssegmente_bei_halbjahreswechsel(backoffice_client
     14.09.2026): eine Verzugszinsenperiode über einen Halbjahreswechsel
     muss ohne Renderfehler mit mehreren Zeilen angezeigt werden."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
     from mietinkasso.domain.enums import OPTyp
     from datetime import date as _date
     from decimal import Decimal as _Decimal
@@ -3575,16 +3576,16 @@ def test_mahnvorschau_zeigt_zinssegmente_bei_halbjahreswechsel(backoffice_client
         belegdatum=_date(2027, 6, 1), buchungsdatum=_date(2027, 6, 1), faelligkeit=_date(2027, 6, 5),
         beleg_referenz="TEST HMZ Juni (Segmenttest)",
     )
-    profil = backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_anlegen(
+    profil = backoffice_deps._hv_mail.mahnkosten_repo.zinsprofil_anlegen(
         vertrag_id=konto.vertrag_id, ist_b2b=True, vertragsdatum=_date(2020, 1, 1),
         verzugsverantwortung_geprueft=True, erstellt_von="test",
     )
-    backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
-    backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+    backoffice_deps._hv_mail.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
+    backoffice_deps._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
         id="TEST-2027-1", gueltig_von=_date(2027, 1, 1), gueltig_bis=_date(2027, 6, 30),
         basiszinssatz_prozent=_Decimal("1.530"), erfasst_von="test", quelle_referenz="Test",
     )
-    backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+    backoffice_deps._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
         id="TEST-2027-2", gueltig_von=_date(2027, 7, 1), gueltig_bis=_date(2027, 12, 31),
         basiszinssatz_prozent=_Decimal("2.000"), erfasst_von="test", quelle_referenz="Test",
     )
@@ -3602,16 +3603,16 @@ def test_ueberlappende_basiszinssaetze_werden_beim_erfassen_abgelehnt(backoffice
     `MultipleResultsFound` abstürzen, statt bereits beim fehlerhaften
     Erfassen klar abgelehnt zu werden."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
     from datetime import date as _date
     from decimal import Decimal as _Decimal
 
-    backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+    backoffice_deps._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
         id="TEST-UEBERLAPP-1", gueltig_von=_date(2028, 1, 1), gueltig_bis=_date(2028, 6, 30),
         basiszinssatz_prozent=_Decimal("1.0"), erfasst_von="test", quelle_referenz="Test",
     )
     with pytest.raises(ValueError, match="überschneidet"):
-        backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+        backoffice_deps._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
             id="TEST-UEBERLAPP-2", gueltig_von=_date(2028, 6, 1), gueltig_bis=_date(2028, 12, 31),
             basiszinssatz_prozent=_Decimal("2.0"), erfasst_von="test", quelle_referenz="Test",
         )
@@ -3626,7 +3627,7 @@ def test_mahnvorschau_zaehlt_bereits_gebuchte_mahnkosten_nicht_doppelt_zur_haupt
     Berechnung: 870,82 € statt 830,00 €) - sie erscheinen stattdessen in
     einer eigenen, sichtbaren Zeile."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
     from mietinkasso.domain.enums import OPTyp
     from mietinkasso.infrastructure.config import get_settings
     from mietinkasso.infrastructure.db.session import build_session_factory
@@ -3656,13 +3657,13 @@ def test_mahnvorschau_zaehlt_bereits_gebuchte_mahnkosten_nicht_doppelt_zur_haupt
         belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
         leistungsperiode="2026-08", beleg_referenz="HMZ August (Doppelzählung-Test)",
     )
-    profil = backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_anlegen(
+    profil = backoffice_deps._hv_mail.mahnkosten_repo.zinsprofil_anlegen(
         vertrag_id=konto.vertrag_id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
         mahngebuehr_kostenbasis_cent=4000, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis", erstellt_von="test",
     )
-    backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
+    backoffice_deps._hv_mail.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
 
-    gebucht = backoffice_app._hv_mail.mahnkosten_service.buche_bei_versand(
+    gebucht = backoffice_deps._hv_mail.mahnkosten_service.buche_bei_versand(
         ctx=_ctx_admin(), vertrag_id=konto.vertrag_id, stufe=1, heute=date(2026, 9, 14),
         versandnachweis_referenz="mahnung:test-doppelzaehlung", akteur="test",
     )
@@ -3756,7 +3757,7 @@ def test_mahnvorschau_zeigt_brief_wartet_auf_anbindung_und_pdf_link_bei_kanal_br
     und trotzdem die Vorbereitung/den Download des Brief-PDFs erlauben
     (eine Kostenvorschau ist noch kein erzeugter Brief)."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
     from mietinkasso.infrastructure.config import get_settings
     from mietinkasso.infrastructure.db.session import build_session_factory
     from mietinkasso.mahnwesen.repository import MahnPolicyRepository
@@ -3771,9 +3772,9 @@ def test_mahnvorschau_zeigt_brief_wartet_auf_anbindung_und_pdf_link_bei_kanal_br
         )
         mahn_policy_repo.freigeben(policy.id)
 
-    if backoffice_app._mahn_kanalregel_repo.aktuelle_freigegebene() is None:
-        regel = backoffice_app._mahn_kanalregel_repo.anlegen(erstellt_von="test")
-        backoffice_app._mahn_kanalregel_repo.freigeben(regel.id, freigegeben_von="test")
+    if backoffice_deps._mahn_kanalregel_repo.aktuelle_freigegebene() is None:
+        regel = backoffice_deps._mahn_kanalregel_repo.anlegen(erstellt_von="test")
+        backoffice_deps._mahn_kanalregel_repo.freigeben(regel.id, freigegeben_von="test")
 
     antwort = client.get("/backoffice/vertrag/V-601-1/mahnvorschau", params={"heute": "2026-09-01"})
     assert antwort.status_code == 200
