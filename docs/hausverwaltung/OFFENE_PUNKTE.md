@@ -3859,3 +3859,140 @@ gebuchter Bestandszeilen.
   `offene_forderungen`-Bindung, 2 `balance_zeitreihe_fuer_forderung`,
   5 End-zu-Ende Bankzweck->Periode->Forderung, davon 3 im ersten Zug
   und danach ergänzt). 997/997 grün im `tests/mietinkasso`-Gesamtlauf.
+
+## Korrekturrunde zu HV-20260919-GEORGE-CODE: Codex-Abnahme auf Commit
+## b8d700d NICHT bestanden — sechs Befunde + Whitespace-Nachforderung (19.09.2026)
+
+Codex hat Commit `b8d700d` mit 17 echten Konten/11 Originalbewegungen
+schreibfrei sowie 17 eigenen synthetischen Tests geprüft (5/17 FAIL) und
+sechs konkrete Fehler benannt; parallel kam eine Nutzer-Zwischenmeldung
+zu einer Whitespace-Variante im Bank-Verwendungszweck. Alle sieben Punkte
+sind in dieser Runde behoben, ausschließlich synthetisch getestet, keine
+Buchung/kein Versand/kein Deployment.
+
+1. **Periodenbindung ohne explizite Ziel-ID ignorierte die Periode
+   (Codex-Zahlenbeispiel Alt=8000/Sept=9000+1000, Zahlung=10000 mit
+   `leistungsperiode=2026-09` ohne `bezieht_sich_auf_id`).** Bisher lief
+   eine ungebundene, aber periodenmarkierte Zahlung direkt in den
+   generischen FIFO-Pool und tilgte dadurch zuerst die ÄLTERE, periodenfremde
+   Forderung — genau umgekehrt zur Fachregel. `op/service.py::offene_forderungen`
+   und `mahnwesen/kosten.py::balance_zeitreihe_fuer_forderung` verarbeiten
+   Minderungen jetzt chronologisch (`buchungsdatum`, `id`) und wenden je
+   Minderung ZWEI Stufen an, bevor der Rest generisch verteilt wird: (a)
+   die explizite Ziel-ID (falls gesetzt, unverändert wie zuvor), dann (b)
+   ALLE ÜBRIGEN offenen Forderungen DERSELBEN `leistungsperiode` — erst ein
+   danach verbleibender Überschuss fließt in den periodenfreien FIFO-Pool.
+   Beide Funktionen nutzen identische Logik (Mahn- und Zinsrelevanz
+   konsistent, kein UI-kosmetischer Fix). Regressionstests mit exakt
+   Codex' Zahlen:
+   `test_offene_forderungen_periode_ohne_explizite_id_deckt_alle_komponenten_derselben_periode_zuerst`
+   (`test_op_ledger.py`) und
+   `test_balance_zeitreihe_periode_ohne_explizite_id_deckt_alle_komponenten_derselben_periode_zuerst`
+   (`test_mahnwesen_kosten.py`).
+2. **`erkenne_leistungsperiode` unterschied KEINE Angabe nicht von
+   MEHRDEUTIG** — ein bloßer Monatsname ohne Jahr ("Miete August") sowie
+   mehrere unterschiedliche Monats-/Jahresangaben im selben Text ("Miete
+   August und September 2026", "Miete 08/2026 und 09/2026") wurden bisher
+   tatsächlich automatisch gebucht (entgegen dem vorherigen Bericht); bei
+   zwei Monaten wurde zudem nur der LETZTE erkannt statt beide. Neu: die
+   Funktion zählt jedes Monatssignal (numerisch, ISO, Monatsname) separat;
+   bei GENAU einem Signal UND genau einer daraus resultierenden Periode
+   wird gebucht, in JEDEM anderen Fall (kein Jahr zu einem Monatsnamen,
+   mehr als ein Signal/mehr als eine Periode) wirft die Funktion die neue
+   `LeistungsperiodeMehrdeutigError` — automatische UND manuelle Zuordnung
+   lehnen die Buchung mit dieser Ausnahme VOR jedem Schreibzugriff ab
+   (kein stiller Verzicht, kein Raten), die Rohtransaktion bleibt für eine
+   bewusste manuelle Klärung sichtbar/unzugeordnet. Tests:
+   `test_monatsname_ohne_jahr_wird_vor_jeder_buchung_zurueckgehalten`,
+   `test_zwei_monatsnamen_im_text_werden_beide_erkannt_nicht_nur_der_letzte`,
+   `test_mehrmonatiger_mietzweck_wird_vor_jeder_buchung_zurueckgehalten`,
+   `test_ohne_jeden_monatsverweis_bleibt_normale_ungebundene_zuordnung_moeglich`.
+3. **Eindeutiges ISO-Format "2026-09" wurde übersehen.** Neues Regex
+   für `YYYY-MM` ergänzt, mit negativem Lookahead gegen ein volles
+   Tagesdatum (`YYYY-MM-DD` wird NICHT als Monat fehlinterpretiert).
+   Mehrzeilige `Ustrd`-Zeilen werden jetzt vollständig zusammengeführt
+   (`_find_all_texts` statt nur der ersten Zeile), damit ein Monatshinweis
+   in einer zweiten Verwendungszweckzeile nicht verloren geht. Tests:
+   `test_erkenne_leistungsperiode_unterstuetzt_iso_monat`,
+   `test_erkenne_leistungsperiode_verwechselt_volles_tagesdatum_nicht_mit_monat`,
+   `test_camt053_mehrzeiliges_ustrd_wird_vollstaendig_erfasst`.
+4. **Parser-Upgrade ohne native ID hätte Altimporte nach dem Upgrade
+   doppelt eingefügt**, weil der Fingerprint für Zeilen OHNE
+   bankseitig-eindeutige ID aus genau den Feldern gebildet wird, die
+   dieser Parser jetzt korrigiert hat (Gegenpartei/Referenz) — eine VOR
+   dem Fix importierte Zeile hätte nach dem Fix einen anderen
+   `fingerprint_hash` erzeugt und wäre beim erneuten Einlesen derselben
+   Datei als "neu" durchgerutscht. Neu: `RohTransaktion` trägt zusätzlich
+   `legacy_gegenkonto_iban`/`legacy_referenz` (ausschließlich zur
+   Konflikterkennung, nie für die real gespeicherten Felder), berechnet
+   über die bewusst NAIV nachgebildete alte Logik
+   (`_legacy_gegenpartei_naiv`/`_legacy_referenz_text`). `_speichere_roh`
+   prüft zusätzlich zum regulären Fingerprint einen `_legacy_fingerprint`
+   und lehnt einen Treffer darauf mit `MehrfachbuchungsKonfliktError` ab,
+   statt einen stillen Doppelimport zuzulassen — bewusst KEINE
+   Bestandsmigration, nur ein Konfliktschutz beim nächsten Einlesen.
+   Regressionstest mit einem synthetisch konstruierten Altparser-Seed:
+   `test_altparser_seed_ohne_native_id_erzeugt_konflikt_statt_stillen_doppelimport`.
+5. **`RvslInd="1"` (gültiges XML-boolean neben `"true"`) lieferte noch
+   die eigene Partei statt `None`; `Ref` wurde bisher aus JEDEM `<Ref>`-
+   Element im Tx-Baum gelesen, nicht nur aus der strukturierten SCOR-
+   Referenz.** `_ist_reversal` akzeptiert jetzt beide gültigen
+   boolean-Literale. Neue `_strukturierte_referenz` traversiert
+   AUSSCHLIESSLICH `RmtInf` → direktes `Strd` → direktes `CdtrRefInf` →
+   direktes `Ref` (statt einer breiten Teilbaumsuche) — ein unrelated
+   `<Ref>` an anderer Stelle in der Transaktion wird nicht mehr
+   übernommen. Tests:
+   `test_camt053_rvslind_als_ziffer_eins_gilt_ebenso_als_reversal`,
+   `test_camt053_beliebiges_ref_ausserhalb_cdtrrefinf_wird_nicht_uebernommen`.
+6. **Perioden-/Zielauflösung lag VOR dem Schreib-Lock, nicht darin** —
+   ein Retry mit derselben `vorgang_id` hätte nach zwischenzeitlicher
+   Tilgung der ursprünglich aufgelösten Zielforderung eine ANDERE
+   Ziel-ID neu auflösen und dadurch einen Konflikt mit der bereits
+   gespeicherten Bindung erzeugen können. `bank/service.py::
+   _zuordnen_atomar` löst `leistungsperiode`/`bezieht_sich_auf_id` jetzt
+   INNERHALB derselben `schreibgesperrte_session` unmittelbar vor der
+   OP-Buchung auf (`_resolve_periode_und_forderung` verlangt jetzt
+   zwingend eine Session statt optional). Ein Retry bleibt sicher, weil
+   die bestehende `import_id`/`quelle_hash`-Idempotenz `bezieht_sich_auf_id`
+   bewusst NICHT in den Inhalts-Hash einschließt — ein Retry liefert
+   dieselbe bereits gespeicherte OP-Zeile samt ihrer ursprünglichen
+   Bindung zurück, statt neu aufzulösen. Regressionstest:
+   `test_retry_derselben_vorgang_id_nach_zwischenzeitlicher_tilgung_erzeugt_keinen_konflikt`.
+7. **Nutzer-Zwischenmeldung (unabhängige Parserprüfung, ohne Echtdaten):**
+   Bankfall "Miete 09/ 2026" (Leerzeichen nach dem Schrägstrich) sowie
+   "09 / 2026" wurden vom bisherigen Regex ohne Whitespace-Toleranz
+   verloren. Numerisches Muster erlaubt jetzt beliebigen Whitespace um
+   den Trenner (`\s*[./]\s*`). End-zu-Ende getestet wie ausdrücklich
+   verlangt: `test_erkenne_leistungsperiode_toleriert_whitespace_um_den_slash_trenner`
+   (Einzelfunktion) und
+   `test_automatische_zuordnung_erkennt_mietmonat_mit_whitespace_um_slash_end_to_end`
+   (voller Bankimport-Pfad bis zur gebuchten Forderung).
+
+**Offene Punkte / bewusste Grenzen dieser Korrekturrunde:**
+- Die Monatserkennung bleibt bewusst konservativ (numerisch MM.YYYY/
+  MM/YYYY inkl. Whitespace, ISO YYYY-MM, deutscher Monatsname + Jahr) und
+  wurde weiterhin NICHT gegen ein vollständiges echtes Bankexportformat
+  kalibriert — jedes nicht abgedeckte Schreibmuster bleibt bewusst
+  unzugeordnet (sicherer Fehlschlag) statt geraten zu werden.
+- Der `_legacy_fingerprint`-Konfliktschutz (Punkt 4) deckt nur Zeilen
+  OHNE bankseitig-eindeutige `native_id` ab — für Zeilen MIT `native_id`
+  bleibt die bereits vorher dokumentierte, unveränderte Garantie
+  (`import_id` stabil über `native_id`) maßgeblich. Ein tatsächlicher
+  Re-Import einer vor diesem Fix eingelesenen Altdatei ohne `native_id`
+  wird jetzt als Konflikt gemeldet und verlangt eine manuelle Klärung
+  durch Codex/Markus, nicht durch diesen Automatismus.
+- `_resolve_periode_und_forderung` liest `offene_forderungen` jetzt zwar
+  innerhalb des Schreib-Locks, ruft aber weiterhin denselben bestehenden
+  Op-Service ohne zusätzliche Zeilensperre auf einzelne
+  `OPPositionTable`-Zeilen auf — für Datei-SQLite ausreichend
+  (`BEGIN IMMEDIATE` serialisiert bereits den gesamten Schreibpfad),
+  für eine künftige Mehrprozess-/PostgreSQL-Konfiguration wäre eine
+  echte Zeilensperre zusätzlich zu prüfen (außerhalb dieses eng gefassten
+  Auftrags).
+- Keine Buchung/kein Versand/keine Produktionsdaten/kein Deployment in
+  dieser Runde; ausschließlich synthetische Testdaten. 12 neue/geänderte
+  Tests (7 Punkte, teils mit mehreren Regressionstests je Punkt) plus
+  Anpassung der bestehenden `CAMT_XML`-Fixture (expliziter Jahreszusatz,
+  da der bisherige bare Monatsname jetzt korrekt als mehrdeutig gilt).
+  1011/1011 grün im `tests/mietinkasso`-Gesamtlauf (einmalig nach
+  Abschluss aller sieben Punkte, wie von Codex verlangt).

@@ -11,12 +11,13 @@ from mietinkasso.bank.importer import (
     CsvSpaltenMapping,
 )
 from mietinkasso.bank.repository import BankRepository
-from mietinkasso.bank.service import BankImportService
+from mietinkasso.bank.service import BankImportService, erkenne_leistungsperiode
 from mietinkasso.domain.enums import OPTyp
 from mietinkasso.domain.exceptions import (
     BindungInkonsistentError,
     CrossTenantError,
     FremdwaehrungNichtUnterstuetztError,
+    LeistungsperiodeMehrdeutigError,
     MehrfachbuchungsKonfliktError,
     VorgangIdKonfliktError,
     ZuordnungUngueltigError,
@@ -48,7 +49,7 @@ CAMT_XML = """<?xml version="1.0" encoding="UTF-8"?>
         <ValDt><Dt>2026-04-06</Dt></ValDt>
         <NtryDtls>
           <TxDtls>
-            <RmtInf><Ustrd>VERTRAG:V-601-3 Miete April</Ustrd></RmtInf>
+            <RmtInf><Ustrd>VERTRAG:V-601-3 Miete April 2026</Ustrd></RmtInf>
             <RltdPties><Dbtr><Nm>Max Mustermieter</Nm></Dbtr></RltdPties>
             <AcctSvcrRef>REF-0001</AcctSvcrRef>
           </TxDtls>
@@ -242,6 +243,64 @@ def test_camt053_formatierungsaenderung_ist_kein_neuer_inhalt(bank_service, bank
     bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=CAMT_XML.encode("utf-8"))
     transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=anders_formatiert.encode("utf-8"))
     assert len(transaktionen) == 1  # kein ImportConflictError, kein zweiter Datensatz
+
+
+def test_altparser_seed_ohne_native_id_erzeugt_konflikt_statt_stillen_doppelimport(bank_service, bank_repo, ctx_factory):
+    """Codex-Rückprüfung b8d700d, Punkt 4: eine Zeile OHNE bankseitig
+    eindeutige native_id, die VOR dem CAMT-Gegenpartei-Fix bereits
+    importiert wurde (hier rein synthetisch mit dem ALTEN,
+    richtungsUNabhängigen Fingerprint geseedet - KEINE Bestandsmigration,
+    KEINE Echtdaten), darf beim erneuten Einlesen derselben
+    wirtschaftlichen Zahlung durch den NEUEN Parser NICHT unbemerkt ein
+    zweites Mal eingefügt werden, nur weil sich Gegenpartei-Ermittlung/
+    Fingerprint geändert haben - es muss ein Konflikt zur manuellen
+    Klärung entstehen."""
+
+    from mietinkasso.bank.importer import RohTransaktion
+    from mietinkasso.bank.service import _fingerprint
+    from mietinkasso.infrastructure.db.tables import BankTransaktionTable
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-ALTPARSER", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-ALTPARSER")
+
+    # Simuliert, was der ALTE Parser (vor dem Fix) für einen DBIT mit
+    # Dbtr (eigene Kontopartei) VOR Cdtr im Dokument gespeichert hätte:
+    # die eigene Partei als vermeintliches "Gegenkonto".
+    alter_roh = RohTransaktion(
+        betrag_cent=-25_000, waehrung="EUR", buchungsdatum=date(2026, 9, 6), valuta=None,
+        referenz="Rechnung Lieferant X", gegenkonto_iban="AT000000000000000000",
+        gegenkonto_name="7D Immobilien GmbH (eigenes Konto)", native_id=None, roh_zeile="alt-seed",
+    )
+    alter_fingerprint = _fingerprint("BK-ALTPARSER", alter_roh)
+    bank_repo.insert_transaktion_idempotent(
+        BankTransaktionTable(
+            bank_konto_id="BK-ALTPARSER", betrag_cent=alter_roh.betrag_cent, waehrung=alter_roh.waehrung,
+            buchungsdatum=alter_roh.buchungsdatum, valuta=None, referenz=alter_roh.referenz,
+            gegenkonto_iban=alter_roh.gegenkonto_iban, gegenkonto_name=alter_roh.gegenkonto_name,
+            quelle_typ="CAMT", quelle_hash="alt-seed-hash", import_id="BK-ALTPARSER:CAMT:NOID:alt-seed",
+            hat_native_id=False, fingerprint_hash=alter_fingerprint, roh_zeile="alt-seed",
+        )
+    )
+
+    xml = _camt_ntry(
+        betrag="250.00", richtung="DBIT",
+        rltd_pties=(
+            "<Dbtr><Nm>7D Immobilien GmbH (eigenes Konto)</Nm></Dbtr>"
+            "<DbtrAcct><Id><IBAN>AT000000000000000000</IBAN></Id></DbtrAcct>"
+            "<Cdtr><Nm>Lieferant X</Nm></Cdtr>"
+            "<CdtrAcct><Id><IBAN>AT999999999999999999</IBAN></Id></CdtrAcct>"
+        ),
+    ).replace("<Ustrd>Zahlung</Ustrd>", "<Ustrd>Rechnung Lieferant X</Ustrd>").replace(
+        "<AcctSvcrRef>REF-GC-1</AcctSvcrRef>", ""
+    )
+
+    with pytest.raises(MehrfachbuchungsKonfliktError):
+        bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+
+    # Kein stiller Doppelimport - weiterhin nur die synthetisch geseedete
+    # Alt-Zeile auf diesem Bankkonto.
+    assert len(bank_repo.list_unzugeordnet("BK-ALTPARSER")) == 1
 
 
 def test_camt053_mehrteilige_ntry_wird_nicht_der_ersten_referenz_zugeordnet(bank_service, bank_repo, ctx_factory):
@@ -461,6 +520,105 @@ def test_camt053_reversal_ordnet_gegenpartei_nicht_der_eigenen_seite_zu(bank_ser
     assert tx.gegenkonto_iban is None
 
 
+def test_camt053_rvslind_als_ziffer_eins_gilt_ebenso_als_reversal(bank_service, bank_repo, ctx_factory):
+    """Codex-Rückprüfung b8d700d: `RvslInd` ist laut ISO-20022-Schema ein
+    xs:boolean - "1" ist GLEICHWERTIG zu "true", kein Sonderfall. Wurde
+    dieser Wert nicht erkannt, hätte die naive Richtungsregel hier die
+    eigene Kontopartei als Gegenpartei ausgewiesen."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    xml = _camt_ntry(
+        betrag="80.00", richtung="CRDT", extra="<RvslInd>1</RvslInd>",
+        rltd_pties=(
+            "<Dbtr><Nm>7D Immobilien GmbH (eigenes Konto)</Nm></Dbtr>"
+            "<Cdtr><Nm>Ursprünglicher Empfänger GmbH</Nm></Cdtr>"
+        ),
+    )
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+    tx = transaktionen[0]
+    assert tx.gegenkonto_name is None
+    assert tx.gegenkonto_iban is None
+
+
+def test_camt053_beliebiges_ref_ausserhalb_cdtrrefinf_wird_nicht_uebernommen(bank_service, bank_repo, ctx_factory):
+    """Codex-Rückprüfung b8d700d: nur `RmtInf/Strd/CdtrRefInf/Ref` zählt
+    als strukturierte Zahlungsreferenz - ein irgendwo sonst platziertes
+    `<Ref>`-Element (hier absichtlich außerhalb von RmtInf, als Beispiel
+    für einen unrelated Referenzblock) darf NICHT als SCOR-Referenz
+    übernommen werden."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
+  <BkToCstmrStmt>
+    <Stmt>
+      <Acct><Id><IBAN>AT000000000000000000</IBAN></Id></Acct>
+      <Ntry>
+        <Amt Ccy="EUR">600.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <BookgDt><Dt>2026-09-06</Dt></BookgDt>
+        <NtryDtls>
+          <TxDtls>
+            <RmtInf><Ustrd>Miete September</Ustrd></RmtInf>
+            <RltdPties><Dbtr><Nm>Max Mustermieter</Nm></Dbtr></RltdPties>
+            <SomeOtherBlock><Ref>UNRELATED-REF-1</Ref></SomeOtherBlock>
+            <AcctSvcrRef>REF-UNRELATED-1</AcctSvcrRef>
+          </TxDtls>
+        </NtryDtls>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>
+"""
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+    assert transaktionen[0].referenz == "Miete September"
+    assert "UNRELATED-REF-1" not in (transaktionen[0].referenz or "")
+
+
+def test_camt053_mehrzeiliges_ustrd_wird_vollstaendig_erfasst(bank_service, bank_repo, ctx_factory):
+    """Codex-Rückprüfung b8d700d: `RmtInf` kann mehrere `Ustrd`-Zeilen
+    tragen (die unstrukturierte Referenz ist je Zeile längenbegrenzt) -
+    bisher ging jede Zeile außer der ersten stillschweigend verloren.
+    Der Mietmonat steht hier absichtlich erst in der ZWEITEN Zeile."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
+  <BkToCstmrStmt>
+    <Stmt>
+      <Acct><Id><IBAN>AT000000000000000000</IBAN></Id></Acct>
+      <Ntry>
+        <Amt Ccy="EUR">600.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <BookgDt><Dt>2026-09-06</Dt></BookgDt>
+        <NtryDtls>
+          <TxDtls>
+            <RmtInf><Ustrd>Miete Top 5</Ustrd><Ustrd>September 2026</Ustrd></RmtInf>
+            <RltdPties><Dbtr><Nm>Max Mustermieter</Nm></Dbtr></RltdPties>
+            <AcctSvcrRef>REF-MULTILINE-1</AcctSvcrRef>
+          </TxDtls>
+        </NtryDtls>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>
+"""
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+    referenz = transaktionen[0].referenz
+    assert "Miete Top 5" in referenz
+    assert "September 2026" in referenz
+    assert erkenne_leistungsperiode(referenz) == "2026-09"
+
+
 def test_camt053_strukturierte_scor_referenz_wird_zusaetzlich_erfasst(bank_service, bank_repo, ctx_factory):
     """Eine strukturierte Zahlungsreferenz (RmtInf/Strd/CdtrRefInf/Ref,
     z. B. SCOR) ging bisher verloren, wenn kein Ustrd-Feld vorhanden war
@@ -570,7 +728,7 @@ def test_automatische_zuordnung_erkennt_expliziten_mietmonat_und_bindet_forderun
         leistungsperiode="2026-09", beleg_referenz="Miete September",
     )
 
-    xml = CAMT_XML.replace("VERTRAG:V-601-3 Miete April", "VERTRAG:V-601-3 Miete 09/2026")
+    xml = CAMT_XML.replace("VERTRAG:V-601-3 Miete April 2026", "VERTRAG:V-601-3 Miete 09/2026")
     transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
     transaktion = transaktionen[0]
     assert transaktion.betrag_cent == 60_000
@@ -586,6 +744,57 @@ def test_automatische_zuordnung_erkennt_expliziten_mietmonat_und_bindet_forderun
     # aus - die September-Forderung ist gedeckt, KEIN reines FIFO mehr.
     forderungen = bank_service._op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))
     assert september_soll.id not in {f.op_position_id for f in forderungen}
+
+
+def test_retry_derselben_vorgang_id_nach_zwischenzeitlicher_tilgung_erzeugt_keinen_konflikt(
+    bank_service, bank_repo, basis_vertrag, ctx_factory,
+):
+    """Codex-Rückprüfung b8d700d, Punkt 6: die Perioden-/Zielauflösung
+    läuft jetzt INNERHALB desselben Schreib-Locks wie die OP-Buchung. Ein
+    exakter Retry DERSELBEN `vorgang_id` (z. B. nach einem Netzwerk-
+    Timeout) darf NICHT deshalb scheitern oder eine geänderte Ziel-ID
+    erzeugen, nur weil die ursprünglich gebundene Forderung ZWISCHEN dem
+    ersten Aufruf und dem Retry bereits vollständig gedeckt wurde (und
+    beim Retry selbst also keine offene Forderung dieser Periode mehr
+    fände) - `import_id`/`quelle_hash` entscheiden über den sicheren
+    No-Op, nicht die (bei jedem Aufruf neu aufgelöste) Ziel-ID."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    september_soll = bank_service._op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="Miete September",
+    )
+    transaktion = _bank_datei_importieren_fuer_test(
+        bank_service, bank_repo, ctx, bank_konto_id="BK-RETRY-PERIODE", betrag_text="600.00",
+        referenz="Miete 09/2026",
+    )
+
+    erste_zuordnung = bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=60_000,
+        beleg_referenz="Manuelle Zuordnung Retry-Test", vorgang_id="RETRY-PERIODE-1",
+    )
+    op_row_erst = bank_service._op_service.get_position(erste_zuordnung.op_position_id)
+    assert op_row_erst.bezieht_sich_auf_id == september_soll.id
+
+    # "Zwischenzeitliche Tilgung": die Zielforderung ist jetzt bereits
+    # vollständig gedeckt - ein NEU aufgelöster Versuch würde KEINE
+    # offene Forderung dieser Periode mehr finden.
+    assert september_soll.id not in {
+        f.op_position_id for f in bank_service._op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))
+    }
+
+    # Exakter Retry (identische Transaktion/Betrag/vorgang_id) - bleibt
+    # ein sicherer No-Op, KEIN Konflikt, KEINE geänderte Ziel-ID.
+    zweite_zuordnung = bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=60_000,
+        beleg_referenz="Manuelle Zuordnung Retry-Test", vorgang_id="RETRY-PERIODE-1",
+    )
+    assert zweite_zuordnung.id == erste_zuordnung.id
+    op_row_retry = bank_service._op_service.get_position(zweite_zuordnung.op_position_id)
+    assert op_row_retry.id == op_row_erst.id
+    assert op_row_retry.bezieht_sich_auf_id == september_soll.id  # unverändert, nicht auf None zurückgesetzt
 
 
 def test_manuelle_zuordnung_wendet_dieselbe_periodenregel_an_wie_automatische(
@@ -617,44 +826,157 @@ def test_manuelle_zuordnung_wendet_dieselbe_periodenregel_an_wie_automatische(
     assert op_row.bezieht_sich_auf_id == september_soll.id
 
 
-def test_mehrdeutiger_mietzweck_wird_nicht_automatisch_per_fifo_gebunden(
+def test_mehrmonatiger_mietzweck_wird_vor_jeder_buchung_zurueckgehalten(
     bank_service, bank_repo, basis_vertrag, ctx_factory,
 ):
-    """Ein mehrmonatiger/mehrdeutiger Zweck bleibt bewusst UNGEBUNDEN
-    (weder leistungsperiode noch bezieht_sich_auf_id) - die Referenz
-    selbst bleibt am Beleg sichtbar/prüfbar, statt einen der beiden Monate
-    zu erraten."""
+    """Codex-Rückprüfung b8d700d: ein mehrmonatiger/mehrdeutiger Zweck
+    (mehr als eine unterschiedliche Monats-/Jahresangabe im selben Text)
+    darf NICHT stillschweigend ungebunden gebucht werden - er muss VOR
+    jeder Buchung (automatisch UND manuell) mit prüfbarem Grund
+    zurückbleiben, keine der möglichen Perioden wird geraten."""
 
     _, konto = basis_vertrag
     ctx = ctx_factory("7DI")
-    bank_service._op_service.buchen(
-        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
-        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
-        leistungsperiode="2026-08", beleg_referenz="Miete August",
+    saldo_vorher = bank_service._op_service.berechne_saldo(konto.id).saldo_cent
+
+    transaktion = _bank_datei_importieren_fuer_test(
+        bank_service, bank_repo, ctx, bank_konto_id="BK-MEHRDEUTIG", betrag_text="600.00",
+        referenz="Miete 08/2026 und 09/2026",
     )
+    with pytest.raises(LeistungsperiodeMehrdeutigError):
+        bank_service.zuordnen_manuell(
+            ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=60_000,
+            beleg_referenz="Manuelle Zuordnung mehrdeutig", vorgang_id="MEHRDEUTIG-1",
+        )
+    # Kein Teilerfolg - weder gebucht noch zugeordnet, keine Nebenwirkung.
+    assert bank_service._op_service.berechne_saldo(konto.id).saldo_cent == saldo_vorher
+    assert bank_repo.zugeordneter_betrag(transaktion.id) == 0
+
+
+def test_monatsname_ohne_jahr_wird_vor_jeder_buchung_zurueckgehalten(
+    bank_service, bank_repo, basis_vertrag, ctx_factory,
+):
+    """Ein Monatsname OHNE Jahresangabe ("Miete August") ist ein echtes
+    Signal (ein Monat ist gemeint), aber KEINE eindeutig auflösbare
+    Periode - das ist NICHT dasselbe wie "kein Monat erwähnt" und darf
+    daher ebenfalls nicht stillschweigend ungebunden durchgehen."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    transaktion = _bank_datei_importieren_fuer_test(
+        bank_service, bank_repo, ctx, bank_konto_id="BK-OHNE-JAHR", betrag_text="600.00",
+        referenz="Miete August",
+    )
+    with pytest.raises(LeistungsperiodeMehrdeutigError):
+        bank_service.zuordnen_manuell(
+            ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=60_000,
+            beleg_referenz="Manuelle Zuordnung ohne Jahr", vorgang_id="OHNE-JAHR-1",
+        )
+
+
+def test_zwei_monatsnamen_im_text_werden_beide_erkannt_nicht_nur_der_letzte(
+    bank_service, bank_repo, basis_vertrag, ctx_factory,
+):
+    """Konkreter Codex-Fund: "Miete August und September 2026" wurde
+    bisher NUR als "September 2026" gelesen (das benachbarte "August"
+    ging unter) - jetzt zählt jede Monatsnamen-Erwähnung, auch ohne
+    eigenes Jahr, als eigenes Signal und macht den Text mehrdeutig."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    transaktion = _bank_datei_importieren_fuer_test(
+        bank_service, bank_repo, ctx, bank_konto_id="BK-ZWEI-MONATE", betrag_text="600.00",
+        referenz="Miete August und September 2026",
+    )
+    with pytest.raises(LeistungsperiodeMehrdeutigError):
+        bank_service.zuordnen_manuell(
+            ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=60_000,
+            beleg_referenz="Manuelle Zuordnung zwei Monate", vorgang_id="ZWEI-MONATE-1",
+        )
+
+
+def test_ohne_jeden_monatsverweis_bleibt_normale_ungebundene_zuordnung_moeglich(
+    bank_service, bank_repo, basis_vertrag, ctx_factory,
+):
+    """Regressionsschutz: der ALLERMEISTE Regelfall (kein Monat im
+    Verwendungszweck erwähnt) bleibt unverändert unauffällig - keine
+    Ausnahme, ganz normale ungebundene manuelle Zuordnung."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    transaktion = _bank_datei_importieren_fuer_test(
+        bank_service, bank_repo, ctx, bank_konto_id="BK-OHNE-MONAT", betrag_text="600.00",
+        referenz="Miete laut Vereinbarung",
+    )
+    zuordnung = bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=60_000,
+        beleg_referenz="Manuelle Zuordnung ohne Monat", vorgang_id="OHNE-MONAT-1",
+    )
+    op_row = bank_service._op_service.get_position(zuordnung.op_position_id)
+    assert op_row.leistungsperiode is None
+    assert op_row.bezieht_sich_auf_id is None
+
+
+# ---------------------------------------------------------------------------
+# Codex-Rückprüfung b8d700d, Formatfall aus unabhängiger Parserprüfung: reale
+# Bankexporte trennen Zahl/Trenner/Jahr nicht immer eng zusammen ("09/ 2026",
+# "09 / 2026"). Ebenso: ISO-Monat "YYYY-MM" unterstützen, ein volles
+# Tagesdatum "YYYY-MM-DD" aber NIE als Mietmonat missverstehen.
+# ---------------------------------------------------------------------------
+
+
+def test_erkenne_leistungsperiode_toleriert_whitespace_um_den_slash_trenner():
+    assert erkenne_leistungsperiode("Miete 09/2026") == "2026-09"
+    assert erkenne_leistungsperiode("Miete 09/ 2026") == "2026-09"
+    assert erkenne_leistungsperiode("Miete 09 / 2026") == "2026-09"
+    assert erkenne_leistungsperiode("Miete 09 /2026") == "2026-09"
+
+
+def test_erkenne_leistungsperiode_unterstuetzt_iso_monat():
+    assert erkenne_leistungsperiode("Miete 2026-09") == "2026-09"
+
+
+def test_erkenne_leistungsperiode_verwechselt_volles_tagesdatum_nicht_mit_monat():
+    """Ein volles ISO-Tagesdatum ("YYYY-MM-DD", z. B. ein mitgesendetes
+    Valutadatum im Verwendungszweck) darf NIE als Mietmonat gelesen
+    werden - ohne erkennbaren, EIGENSTÄNDIGEN Monatshinweis bleibt der
+    Zweck unauffällig (kein Signal, keine Ausnahme)."""
+
+    assert erkenne_leistungsperiode("Valuta 2026-09-15") is None
+
+
+def test_automatische_zuordnung_erkennt_mietmonat_mit_whitespace_um_slash_end_to_end(
+    bank_service, bank_repo, basis_vertrag, ctx_factory,
+):
+    """End-zu-Ende-Regression für den gemeldeten Formatfall: "Miete 09/
+    2026" (Leerzeichen nach dem Schrägstrich) muss über den vollen Pfad
+    Bankzweck -> OP.leistungsperiode -> offene_forderungen genauso
+    deterministisch binden wie die eng geschriebene Variante."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
     september_soll = bank_service._op_service.buchen(
         ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
         belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
         leistungsperiode="2026-09", beleg_referenz="Miete September",
     )
 
-    transaktion = _bank_datei_importieren_fuer_test(
-        bank_service, bank_repo, ctx, bank_konto_id="BK-MEHRDEUTIG", betrag_text="600.00",
-        referenz="Miete 08/2026 und 09/2026",
-    )
-    zuordnung = bank_service.zuordnen_manuell(
-        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=60_000,
-        beleg_referenz="Manuelle Zuordnung mehrdeutig", vorgang_id="MEHRDEUTIG-1",
-    )
-    op_row = bank_service._op_service.get_position(zuordnung.op_position_id)
-    assert op_row.leistungsperiode is None
-    assert op_row.bezieht_sich_auf_id is None
+    xml = CAMT_XML.replace("VERTRAG:V-601-3 Miete April 2026", "VERTRAG:V-601-3 Miete 09/ 2026")
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+    transaktion = transaktionen[0]
 
-    # Ohne Bindung bleibt es beim klassischen FIFO (ältere Forderung zuerst
-    # gedeckt) - kein Fehler, aber auch keine erratene Zielforderung: die
-    # ÄLTERE Augustforderung ist getilgt, September bleibt VOLL offen.
-    forderungen = {f.op_position_id: f for f in bank_service._op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))}
-    assert forderungen[september_soll.id].rest_cent == 60_000
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=transaktion)
+    assert ergebnis.zugeordnet is True
+
+    op_row = bank_service._op_service.get_position(ergebnis.op_position_id)
+    assert op_row.leistungsperiode == "2026-09"
+    assert op_row.bezieht_sich_auf_id == september_soll.id
+
+    forderungen = bank_service._op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))
+    assert september_soll.id not in {f.op_position_id for f in forderungen}
 
 
 def test_mietmonat_ohne_passende_forderung_bleibt_ohne_bindung_aber_sichtbar(

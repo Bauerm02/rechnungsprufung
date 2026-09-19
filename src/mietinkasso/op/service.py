@@ -544,30 +544,53 @@ class OPService:
         )
 
     # -- Forderungen (für das Mahnwesen) -------------------------------------
-    def offene_forderungen(self, konto_id: str, *, heute: date | None = None) -> list["OffeneForderung"]:
+    def offene_forderungen(
+        self, konto_id: str, *, heute: date | None = None, session: Session | None = None
+    ) -> list["OffeneForderung"]:
         """Ordnet Zahlungen/Gutschriften den offenen Forderungen zu, damit
         jede Forderung (Eröffnung/Soll/Rücklastschrift) ihren EIGENEN
         Reststand und damit ihren eigenen Mahnzyklus hat - eine Nettosumme
         über das ganze Konto ist keine Mahngrundlage (Fachregel: Soll-/
         Habensalden je Forderung getrennt führen). Nur Forderungen mit
-        rest_cent > 0 werden zurückgegeben.
+        rest_cent > 0 werden zurückgegeben. `session`: siehe `buchen` -
+        übergeben, um diese Leseabfrage Teil einer größeren, vom Aufrufer
+        verwalteten (ggf. schreibgesperrten) Transaktion zu machen (siehe
+        `bank.service._zuordnen_atomar`, Codex-Rückprüfung b8d700d).
 
-        Codex-Rückprüfung (echter Bug): eine Zahlung/Gutschrift mit
-        EXPLIZITER Zahlungszweckbindung (`bezieht_sich_auf_id`) wurde
+        Codex-Rückprüfung (echter Bug, Runde 1): eine Zahlung/Gutschrift
+        mit EXPLIZITER Zahlungszweckbindung (`bezieht_sich_auf_id`) wurde
         bisher wie jede andere ungebundene Zahlung blind in einen
         gemeinsamen Minderungs-Pool geworfen und rein chronologisch
-        (FIFO nach Fälligkeit/Belegdatum) verteilt - eine gezielte
-        September-Zahlung konnte so fälschlich zuerst eine ÄLTERE,
-        unbezogene Forderung tilgen, während die tatsächlich gemeinte
-        September-Forderung offen blieb (Gesamtsaldo blieb dabei richtig,
-        nur die Verteilung auf die einzelnen Forderungen war falsch).
-        JETZT: eine gebundene Zahlung deckt IMMER zuerst ihre explizite
-        Zielforderung (bis zu deren eigenem Restbetrag); nur ein
-        tatsächlicher ÜBERSCHUSS darüber hinaus fließt in den generischen
-        FIFO-Pool für die übrigen Forderungen - kein Doppelverbrauch,
-        keine verdeckte Fehlbindung (siehe `resolve_zahlungsziel`)."""
+        (FIFO nach Fälligkeit/Belegdatum) verteilt. JETZT: eine gebundene
+        Zahlung deckt IMMER zuerst ihre explizite Zielforderung (bis zu
+        deren eigenem Restbetrag); nur ein tatsächlicher ÜBERSCHUSS
+        darüber hinaus fließt weiter (siehe `resolve_zahlungsziel`).
 
-        positionen = self._op_repository.list_aktiv(konto_id)
+        Codex-Rückprüfung (echter Bug, Runde 2): auch eine Zahlung OHNE
+        `bezieht_sich_auf_id`, aber MIT gesetzter `leistungsperiode`
+        (z. B. weil mehrere Forderungen exakt dieselbe Periode tragen und
+        `bank.service._resolve_periode_und_forderung` deshalb bewusst
+        KEINE eindeutige Ziel-ID gesetzt hat), wurde bisher rein
+        chronologisch über ALLE Forderungen verteilt und konnte dabei
+        eine ÄLTERE Forderung EINER ANDEREN Periode tilgen, während die
+        tatsächlich gemeinte Periode offen blieb (belegtes Muster:
+        Anfangsforderung 8.000 + zwei September-Komponenten 9.000/1.000 +
+        Zahlung 10.000 mit `leistungsperiode=2026-09` ohne eindeutige
+        Ziel-ID -> die Anfangsforderung wurde fälschlich getilgt, obwohl
+        die Zahlung explizit für September bestimmt war). JETZT: der nach
+        einer etwaigen expliziten Bindung verbleibende Betrag deckt ZUERST
+        alle ÜBRIGEN Forderungen DERSELBEN Periode (in Fälligkeits-/
+        Belegdatum-Reihenfolge untereinander), bevor ein weiterer
+        Überschuss in den vollständig generischen FIFO-Pool (alle
+        übrigen Perioden) fließt - eine explizit erkannte Periode darf
+        NIE eine andere, unbeteiligte Periode blind vorziehen. Mehrere
+        konkurrierende Minderungen werden dafür chronologisch
+        (Buchungsdatum, dann ID) verarbeitet - dieselbe Reihenfolge wie
+        `mahnwesen.kosten.balance_zeitreihe_fuer_forderung`, damit beide
+        Funktionen bei mehreren Minderungen konsistent bleiben (Mahn- UND
+        Zinsrelevante Restpositionen nutzen identische Logik)."""
+
+        positionen = self._op_repository.list_aktiv(konto_id, session=session)
 
         # Nur ECHTE Forderungen (positiver Betrag) zählen als Forderungszeile;
         # eine "positive Typ"-Zeile mit NEGATIVEM Betrag (z. B. ein
@@ -580,31 +603,60 @@ class OPService:
         forderung_by_id = {p.id: p for p in forderungs_rows}
         rest_by_id = {p.id: p.betrag_cent for p in forderungs_rows}
 
-        minderungs_pool = 0
+        # Minderungsereignisse (Zahlung/Gutschrift, Guthaben in
+        # forderungsseitiger Zeile, negative KORREKTUR) chronologisch
+        # sammeln - `quelle` ist NUR für Zahlung/Gutschrift gesetzt (die
+        # einzigen Typen, die eine `bezieht_sich_auf_id`/`leistungsperiode`
+        # im hier relevanten Sinn tragen können).
+        minderungen: list[tuple[date, int, OPPositionTable | None, int]] = []
         for p in positionen:
             typ = OPTyp(p.typ)
             if typ in _NEGATIVE_TYPEN:
-                betrag = p.betrag_cent
-                if p.bezieht_sich_auf_id is not None:
-                    ziel = resolve_zahlungsziel(p, forderung_by_id)
-                    abzug = min(betrag, rest_by_id[ziel.id])
-                    rest_by_id[ziel.id] -= abzug
-                    betrag -= abzug  # nur ein tatsächlicher Überschuss fließt in den generischen Pool
-                minderungs_pool += betrag
+                minderungen.append((p.buchungsdatum, p.id, p, p.betrag_cent))
             elif typ in _POSITIVE_TYPEN and p.betrag_cent < 0:
-                minderungs_pool += -p.betrag_cent
+                minderungen.append((p.buchungsdatum, p.id, None, -p.betrag_cent))
             elif typ is OPTyp.KORREKTUR:
                 effekt = _effect_cent(p)
                 if effekt < 0:
-                    minderungs_pool += -effekt
+                    minderungen.append((p.buchungsdatum, p.id, None, -effekt))
+        minderungen.sort(key=lambda m: (m[0], m[1]))
+
+        generischer_pool = 0
+        for _datum, _id, quelle, betrag in minderungen:
+            rest_zu_verteilen = betrag
+            direktes_ziel_id: int | None = None
+            periode: str | None = None
+            if quelle is not None:
+                periode = quelle.leistungsperiode
+                if quelle.bezieht_sich_auf_id is not None:
+                    ziel = resolve_zahlungsziel(quelle, forderung_by_id)
+                    direktes_ziel_id = ziel.id
+                    abzug = min(rest_zu_verteilen, rest_by_id[ziel.id])
+                    rest_by_id[ziel.id] -= abzug
+                    rest_zu_verteilen -= abzug
+
+            if periode is not None and rest_zu_verteilen > 0:
+                for p in forderungs_rows:
+                    if rest_zu_verteilen <= 0:
+                        break
+                    if p.id == direktes_ziel_id or p.leistungsperiode != periode:
+                        continue
+                    aktuell = rest_by_id[p.id]
+                    if aktuell <= 0:
+                        continue
+                    abzug = min(aktuell, rest_zu_verteilen)
+                    rest_by_id[p.id] -= abzug
+                    rest_zu_verteilen -= abzug
+
+            generischer_pool += rest_zu_verteilen
 
         ergebnisse: list[OffeneForderung] = []
         for p in forderungs_rows:
             rest = rest_by_id[p.id]
-            if minderungs_pool > 0 and rest > 0:
-                abzug = min(minderungs_pool, rest)
+            if generischer_pool > 0 and rest > 0:
+                abzug = min(generischer_pool, rest)
                 rest -= abzug
-                minderungs_pool -= abzug
+                generischer_pool -= abzug
             if rest > 0:
                 ergebnisse.append(
                     OffeneForderung(

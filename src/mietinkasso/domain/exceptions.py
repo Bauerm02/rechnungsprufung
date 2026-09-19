@@ -63,6 +63,17 @@ class ZuordnungUngueltigError(MietinkassoError):
     remaining balance, Konto/Vertrag mismatch, wrong OP type, ...)."""
 
 
+class LeistungsperiodeMehrdeutigError(MietinkassoError):
+    """Der Bank-Verwendungszweck erwähnt einen Mietmonat NICHT eindeutig
+    (ein Monatsname ganz ohne Jahresangabe, oder mehr als eine
+    unterschiedliche Monats-/Jahresangabe im selben Text). Die
+    automatische ODER manuelle Bankzuordnung wird VOR jeder Buchung
+    abgelehnt statt eine der möglichen Perioden zu erraten oder das
+    Signal stillschweigend zu verwerfen - die Rohtransaktion bleibt
+    unzugeordnet und damit für eine bewusste, validierte manuelle
+    Klärung sichtbar (Codex-Rückprüfung b8d700d)."""
+
+
 class ZahlungsbindungInkonsistentError(MietinkassoError):
     """Eine Zahlung/Gutschrift trägt eine explizite Zahlungszweckbindung
     (`OPPositionTable.bezieht_sich_auf_id`), deren Ziel sich nicht sicher

@@ -35,6 +35,7 @@ from mietinkasso.domain.exceptions import (
     BindungInkonsistentError,
     CrossTenantError,
     FremdwaehrungNichtUnterstuetztError,
+    LeistungsperiodeMehrdeutigError,
     MehrfachbuchungsKonfliktError,
     ZuordnungUngueltigError,
 )
@@ -63,33 +64,77 @@ _MONATSNAMEN = {
     "april": 4, "mai": 5, "juni": 6, "juli": 7, "august": 8, "september": 9,
     "oktober": 10, "november": 11, "dezember": 12,
 }
-_MONAT_JAHR_NUMERISCH = re.compile(r"\b(0[1-9]|1[0-2])[./](\d{4})\b")
+# Codex-Rückprüfung b8d700d: Bankexporte trennen Zahl/Trenner/Jahr nicht
+# immer eng ("09/ 2026", "09 / 2026") - der Trenner (Punkt/Schrägstrich)
+# toleriert deshalb beidseitig Whitespace, ohne die Ziffernfolge selbst
+# aufzuweichen (kein zusätzliches Ratepotenzial).
+_MONAT_JAHR_NUMERISCH = re.compile(r"\b(0[1-9]|1[0-2])\s*[./]\s*(\d{4})\b")
 _MONAT_NAME_JAHR = re.compile(
-    r"\b(" + "|".join(_MONATSNAMEN) + r")\b\D{0,3}(\d{4})\b", re.IGNORECASE
+    r"\b(" + "|".join(_MONATSNAMEN) + r")\b\s*\D{0,3}(\d{4})\b", re.IGNORECASE
 )
+# ISO-Monat "YYYY-MM" (z. B. "Miete 2026-09") - NIE ein volles Tagesdatum
+# "YYYY-MM-DD" als Mietmonat missverstehen (negative Lookahead auf ein
+# unmittelbar folgendes "-DD").
+_MONAT_JAHR_ISO = re.compile(r"\b(\d{4})-(0[1-9]|1[0-2])\b(?!\s*-\s*\d{2})")
+# JEDE Erwähnung eines Monatsnamens (auch OHNE Jahr) - allein das Vorkommen
+# zählt schon als "Monat gemeint, aber ggf. nicht eindeutig auflösbar".
+_MONATSNAME_MUSTER = re.compile(r"\b(" + "|".join(_MONATSNAMEN) + r")\b", re.IGNORECASE)
 
 
 def erkenne_leistungsperiode(referenz: str | None) -> str | None:
-    """Erkennt EINEN eindeutigen, explizit genannten Mietmonat
-    (Format "MM.YYYY"/"MM/YYYY" ODER ein voller deutscher Monatsname
-    gefolgt von einer 4-stelligen Jahreszahl, z. B. "Miete 09/2026" oder
-    "September 2026") aus dem Bank-Verwendungszweck - liefert `None`
-    (bewusst KEINE Periode), wenn der Text KEINE oder MEHRERE
-    unterschiedliche Monats-/Jahresangaben enthält (mehrdeutiger oder
-    mehrmonatiger Zweck, z. B. "Miete August+September 2026") statt eine
-    davon zu erraten. Reine Textanalyse, kein DB-Zugriff, keine
-    Kontierung."""
+    """Erkennt EINEN eindeutigen, explizit genannten Mietmonat aus dem
+    Bank-Verwendungszweck - unterstützte Formate: "MM.YYYY"/"MM/YYYY"
+    (auch mit Whitespace um den Trenner, z. B. "09/ 2026"), ISO "YYYY-MM"
+    (nie ein volles Tagesdatum "YYYY-MM-DD"), oder ein voller deutscher
+    Monatsname gefolgt von einer 4-stelligen Jahreszahl (z. B.
+    "September 2026"). Liefert `None`, wenn der Text GAR KEIN
+    Monats-Signal enthält (der normale, unauffällige Fall - die
+    allermeisten Bankbewegungen erwähnen keinen Mietmonat).
+
+    Codex-Rückprüfung b8d700d: KEINE Angabe (kein Monats-Signal
+    überhaupt) ist NICHT dasselbe wie MEHRDEUTIG (ein Monat wird zwar
+    erwähnt, aber nicht sicher EINER Periode zuordenbar) - beides gab die
+    Vorversion fälschlich als identisches `None` zurück. Ein erwähnter,
+    aber nicht eindeutig auflösbarer Monat (Monatsname OHNE Jahresangabe,
+    z. B. "Miete August", ODER mehr als EIN Monats-Signal im selben Text,
+    z. B. "Miete August und September 2026" oder "Miete 08/2026 und
+    09/2026") wird NICHT stillschweigend verworfen, sondern lehnt die
+    gesamte Zuordnung über `LeistungsperiodeMehrdeutigError` ab - siehe
+    `_zuordnen_atomar`/`_resolve_periode_und_forderung`. Reine
+    Textanalyse, kein DB-Zugriff, keine Kontierung."""
 
     if not referenz:
         return None
-    treffer: set[str] = set()
-    for monat, jahr in _MONAT_JAHR_NUMERISCH.findall(referenz):
-        treffer.add(f"{jahr}-{monat}")
-    for name, jahr in _MONAT_NAME_JAHR.findall(referenz):
-        treffer.add(f"{jahr}-{_MONATSNAMEN[name.lower()]:02d}")
-    if len(treffer) != 1:
-        return None
-    return treffer.pop()
+
+    numerische_treffer = _MONAT_JAHR_NUMERISCH.findall(referenz)
+    iso_treffer = _MONAT_JAHR_ISO.findall(referenz)
+    namens_treffer = _MONAT_NAME_JAHR.findall(referenz)
+    alle_monatsnamen = _MONATSNAME_MUSTER.findall(referenz)
+
+    anzahl_monatssignale = len(numerische_treffer) + len(iso_treffer) + len(alle_monatsnamen)
+    if anzahl_monatssignale == 0:
+        return None  # kein Hinweis auf einen Mietmonat - unauffälliger Regelfall
+
+    eindeutige_perioden: set[str] = set()
+    for monat, jahr in numerische_treffer:
+        eindeutige_perioden.add(f"{jahr}-{monat}")
+    for jahr, monat in iso_treffer:
+        eindeutige_perioden.add(f"{jahr}-{monat}")
+    for name, jahr in namens_treffer:
+        eindeutige_perioden.add(f"{jahr}-{_MONATSNAMEN[name.lower()]:02d}")
+
+    # Eindeutig NUR, wenn GENAU EIN Monats-Signal im gesamten Text
+    # vorkommt UND dieses genau eine, eindeutig auflösbare Periode ergibt
+    # (ein Monatsname ganz ohne Jahr zählt als Signal, ergibt aber KEINE
+    # Periode und macht den Fall damit mehrdeutig statt "keine Angabe").
+    if anzahl_monatssignale == 1 and len(eindeutige_perioden) == 1:
+        return eindeutige_perioden.pop()
+
+    raise LeistungsperiodeMehrdeutigError(
+        f"Bank-Verwendungszweck '{referenz}' erwähnt einen Mietmonat nicht eindeutig (Monatsname ohne "
+        "Jahresangabe oder mehr als eine unterschiedliche Monats-/Jahresangabe) - wird NICHT automatisch "
+        "gebucht, sondern zur manuellen Klärung zurückgehalten."
+    )
 
 # -- Auftrag HV-20260914-BANKUEBERSICHT: reine Anzeigekategorisierung -----------
 #
@@ -190,6 +235,34 @@ def _fingerprint(bank_konto_id: str, roh: RohTransaktion) -> str:
             "waehrung": roh.waehrung,
             "referenz": (roh.referenz or "").strip().lower(),
             "gegenkonto_iban": (roh.gegenkonto_iban or "").strip().upper(),
+        }
+    )
+
+
+def _legacy_fingerprint(bank_konto_id: str, roh: RohTransaktion) -> str | None:
+    """Rekonstruiert den Fingerprint, den `_fingerprint` VOR dem
+    CAMT-Gegenpartei-/Referenz-Fix (Codex-Rückprüfung b8d700d) für
+    dieselbe Rohzeile geliefert hätte - AUSSCHLIESSLICH zur konservativen
+    Erkennung eines sonst stillen Doppelimports (siehe `_speichere_roh`):
+    eine Zeile ohne bankseitig eindeutige `native_id`, die VOR diesem Fix
+    bereits importiert wurde, trägt in der DB noch den ALTEN Fingerprint
+    (alte Gegenpartei-Ermittlung/nur erste Ustrd-Zeile) - der NEUE
+    Fingerprint dieser exakt gleichen Zahlung kann davon abweichen, ohne
+    dass sich an der Zahlung selbst irgendetwas geändert hätte. Liefert
+    `None`, wenn der Parser keine Legacy-Felder gesetzt hat (z. B.
+    CSV-Zeilen - von diesem Fix nicht betroffen) - dann entfällt der
+    Zusatzvergleich ersatzlos."""
+
+    if roh.legacy_referenz is None and roh.legacy_gegenkonto_iban is None:
+        return None
+    return _hash(
+        {
+            "bank_konto_id": bank_konto_id,
+            "buchungsdatum": str(roh.buchungsdatum),
+            "betrag_cent": roh.betrag_cent,
+            "waehrung": roh.waehrung,
+            "referenz": (roh.legacy_referenz or "").strip().lower(),
+            "gegenkonto_iban": (roh.legacy_gegenkonto_iban or "").strip().upper(),
         }
     )
 
@@ -330,6 +403,32 @@ class BankImportService:
                     f"automatisch entscheiden und wird daher NICHT still zusammengelegt oder dupliziert, "
                     f"sondern zur manuellen Klärung verweigert."
                 )
+            # Codex-Rückprüfung b8d700d: der Fingerprint hängt an
+            # referenz/gegenkonto_iban - Felder, die ein Parser-Update
+            # (z. B. der CAMT-Gegenpartei-Fix selbst) ändern kann, OHNE
+            # dass sich an der zugrunde liegenden Zahlung etwas geändert
+            # hätte. Ohne diesen Zusatzvergleich würde eine VOR einem
+            # solchen Update bereits importierte Zeile beim erneuten
+            # Einlesen derselben Datei NICHT mehr gefunden (neuer
+            # Fingerprint != alter, gespeicherter Fingerprint) und
+            # STILLSCHWEIGEND ein zweites Mal eingefügt. Konservativ: nur
+            # relevant, wenn der Parser überhaupt Legacy-Felder geliefert
+            # hat (z. B. CAMT, nicht CSV) UND sich Alt-/Neu-Fingerprint
+            # tatsächlich unterscheiden.
+            legacy_fingerprint_hash = _legacy_fingerprint(bank_konto.id, roh)
+            if legacy_fingerprint_hash is not None and legacy_fingerprint_hash != fingerprint_hash:
+                legacy_bestehende = self._repository.find_by_fingerprint(
+                    bank_konto.id, legacy_fingerprint_hash, session=session
+                )
+                if legacy_bestehende is not None:
+                    raise MehrfachbuchungsKonfliktError(
+                        f"Banktransaktion ohne bankseitig eindeutige Kennung auf Bankkonto {bank_konto.id}: "
+                        f"Datum/Betrag/Währung stimmen mit der bereits importierten Transaktion "
+                        f"#{legacy_bestehende.id} überein, die noch mit der VOR diesem Parser-Update "
+                        "gültigen Gegenpartei-/Referenzermittlung gespeichert wurde. Um einen stillen "
+                        "Doppelimport nach dem Update zu vermeiden, wird das NICHT automatisch als neue, "
+                        "unabhängige Zahlung eingefügt, sondern zur manuellen Klärung verweigert."
+                    )
             # Bewusst kein wiederverwendbarer Schlüssel: ohne native ID kann
             # ein Replay nicht von einer echten zweiten Zahlung
             # unterschieden werden, daher entscheidet ausschließlich der
@@ -474,7 +573,7 @@ class BankImportService:
         return zuordnung
 
     def _resolve_periode_und_forderung(
-        self, konto_id: str, referenz: str | None
+        self, konto_id: str, referenz: str | None, *, session: Session
     ) -> tuple[str | None, int | None]:
         """Deterministische End-zu-Ende-Verbindung Bank-Verwendungszweck ->
         `OP.leistungsperiode` -> `offene_forderungen` (Auftrag
@@ -505,17 +604,27 @@ class BankImportService:
         Erkennung unberührt - dort validiert bereits die bestehende
         Konto-/Typ-/Status-Prüfung die explizite menschliche Auswahl.
 
-        Reine Lesevoroperation VOR dem Schreib-Lock (wie die bereits
-        bestehende `verbleibend`-Vorabberechnung in `automatisch_zuordnen`);
-        die eigentliche Buchung bleibt atomar und idempotent (`vorgang_id`/
-        `import_id`) - keine rückwirkende Änderung bereits gebuchter
-        Bestandszeilen."""
+        Codex-Rückprüfung b8d700d: läuft INNERHALB derselben
+        schreibgesperrten Transaktion wie die anschließende OP-Buchung
+        (`session` Pflichtparameter, kein eigener Vorab-Read mehr VOR dem
+        Lock) - eine Auflösung VOR dem Lock wäre ein TOCTOU-Fenster
+        (zwischenzeitliche Tilgung/Änderung der Zielforderung durch eine
+        andere, echt gleichzeitige Transaktion). Ein exakter Retry
+        DERSELBEN `vorgang_id` bleibt trotzdem ein sicherer No-Op: die
+        eigentliche Buchung entscheidet ausschließlich über `import_id`/
+        `quelle_hash` (siehe `OPRepository.insert_idempotent`), der hier
+        neu aufgelöste `bezieht_sich_auf_id`-Wert eines Retries wird bei
+        einem Treffer auf die bereits bestehende Zeile NICHT mehr
+        geschrieben (die bestehende Zeile wird unverändert zurückgegeben)
+        - eine zwischenzeitlich geänderte Ziel-ID erzeugt dabei NIE einen
+        Konflikt, weil `bezieht_sich_auf_id` bewusst kein Bestandteil des
+        Inhalts-Hashs ist."""
 
         leistungsperiode = erkenne_leistungsperiode(referenz)
         if leistungsperiode is None:
             return None, None
         treffer = [
-            f for f in self._op_service.offene_forderungen(konto_id)
+            f for f in self._op_service.offene_forderungen(konto_id, session=session)
             if f.leistungsperiode == leistungsperiode and f.quelle_system != "mahnkosten"
         ]
         if len(treffer) != 1:
@@ -543,12 +652,16 @@ class BankImportService:
         unter Datei-SQLite nimmt diese Transaktion ihren Schreib-Lock bereits
         bei ihrem ersten Statement, nicht erst beim Insert - siehe
         `infrastructure/db/sqlite_write_lock.py` (Codex-Rückprüfung Paket B,
-        `with_for_update` schützt SQLite nicht)."""
-
-        leistungsperiode, bezieht_sich_auf_id = self._resolve_periode_und_forderung(konto.id, transaktion.referenz)
+        `with_for_update` schützt SQLite nicht). Die Perioden-/Zielauflösung
+        (`_resolve_periode_und_forderung`) läuft INNERHALB dieser Sperre,
+        nicht davor (Codex-Rückprüfung b8d700d) - siehe dortige
+        Docstring-Begründung."""
 
         with schreibgesperrte_session(self._session_factory) as session:
             try:
+                leistungsperiode, bezieht_sich_auf_id = self._resolve_periode_und_forderung(
+                    konto.id, transaktion.referenz, session=session,
+                )
                 op_row = self._op_service.buchen(
                     ctx=ctx,
                     konto=konto,

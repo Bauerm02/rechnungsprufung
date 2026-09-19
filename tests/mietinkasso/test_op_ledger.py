@@ -615,6 +615,50 @@ def test_offene_forderungen_ohne_bindung_bleibt_klassisches_fifo(op_service, bas
     assert forderungen[0].rest_cent == 54_792
 
 
+def test_offene_forderungen_periode_ohne_explizite_id_deckt_alle_komponenten_derselben_periode_zuerst(
+    op_service, basis_vertrag, ctx_factory,
+):
+    """Konkreter Codex-Fund (Abnahme b8d700d): eine Zahlung MIT
+    `leistungsperiode`, aber OHNE eindeutige `bezieht_sich_auf_id` (z. B.
+    weil zwei Komponenten - HMZ und BK - separat als eigene Forderungen
+    DERSELBEN Periode geführt werden), wurde bisher rein chronologisch
+    über ALLE Forderungen verteilt und konnte dabei eine ÄLTERE,
+    unbeteiligte Periode tilgen, während die tatsächlich gemeinte Periode
+    offen blieb. Belegtes Muster: Alt=8.000 (älter, andere/keine
+    Periode) + zwei September-Komponenten 9.000/1.000 + Zahlung 10.000
+    mit `leistungsperiode=2026-09` ohne Ziel-ID -> muss BEIDE September-
+    Komponenten decken (9.000+1.000=10.000) und die Alt-Forderung
+    UNBERÜHRT lassen, nicht umgekehrt."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    alt = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=8_000,
+        belegdatum=date(2026, 6, 1), buchungsdatum=date(2026, 6, 1), faelligkeit=date(2026, 6, 5),
+        beleg_referenz="Alte Forderung ohne Bezug zu September",
+    )
+    sept_a = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=9_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="HMZ September",
+    )
+    sept_b = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=1_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="BK September",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=10_000,
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        leistungsperiode="2026-09", beleg_referenz="Zahlung September (Periode ohne eindeutige Ziel-ID)",
+    )
+
+    forderungen = {f.op_position_id: f for f in op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))}
+    assert sept_a.id not in forderungen  # vollständig gedeckt
+    assert sept_b.id not in forderungen  # vollständig gedeckt
+    assert forderungen[alt.id].rest_cent == 8_000  # UNBERÜHRT - nicht blind FIFO-getilgt
+
+
 def test_offene_forderungen_bindung_an_fremdes_konto_wird_abgelehnt(op_service, stammdaten_repo, ctx_factory):
     ctx = ctx_factory("7DI")
     stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")

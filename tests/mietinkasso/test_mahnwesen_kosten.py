@@ -689,6 +689,50 @@ def test_balance_zeitreihe_ohne_bindung_bleibt_klassisches_fifo(op_service, admi
     assert perioden[-1].rest_cent == 60_000
 
 
+def test_balance_zeitreihe_periode_ohne_explizite_id_deckt_alle_komponenten_derselben_periode_zuerst(
+    op_service, admin_ctx, basis_vertrag,
+):
+    """Dieselbe Fachregel wie `offene_forderungen` - "bei OP und Zinsen
+    identisch" (Codex-Abnahme b8d700d): eine Zahlung MIT
+    `leistungsperiode`, aber ohne eindeutige `bezieht_sich_auf_id` (zwei
+    Komponenten derselben Periode), deckt zuerst beide September-
+    Komponenten - eine ÄLTERE, unbeteiligte Forderung bleibt unberührt
+    und wird deshalb weiterhin in voller Höhe verzinst."""
+
+    from mietinkasso.mahnwesen.kosten import balance_zeitreihe_fuer_forderung
+
+    _, konto = basis_vertrag
+    alt = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=8_000,
+        belegdatum=date(2026, 6, 1), buchungsdatum=date(2026, 6, 1), faelligkeit=date(2026, 6, 5),
+        beleg_referenz="Alte Forderung ohne Bezug zu September",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=9_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="HMZ September",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=1_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="BK September",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=10_000,
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        leistungsperiode="2026-09", beleg_referenz="Zahlung September (Periode ohne eindeutige Ziel-ID)",
+    )
+    alle_positionen = op_service.list_alle_positionen(konto.id)
+
+    perioden_alt = balance_zeitreihe_fuer_forderung(
+        ziel_op_position_id=alt.id, alle_positionen=alle_positionen, heute=date(2026, 9, 10),
+    )
+    assert perioden_alt is not None
+    # Die Alt-Forderung bleibt UNBERÜHRT (voller Betrag durchgehend
+    # verzinst) - die Zahlung deckt stattdessen beide September-Zeilen.
+    assert all(p.rest_cent == 8_000 for p in perioden_alt)
+
+
 def test_faelligkeit_am_letzten_halbjahrestag_bekommt_nie_den_juni_satz(
     op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
 ):

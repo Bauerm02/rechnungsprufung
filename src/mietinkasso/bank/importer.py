@@ -71,6 +71,14 @@ class RohTransaktion:
     gegenkonto_name: str | None
     native_id: str | None
     roh_zeile: str
+    # NUR für den konservativen Fingerprint-Vergleich in
+    # `bank.service._speichere_roh` (Codex-Rückprüfung b8d700d): die
+    # richtungsUNabhängige Gegenpartei-/Ustrd-only-Ermittlung, wie sie
+    # VOR diesem Fix bestand - niemals für die tatsächlich gespeicherten
+    # Felder verwendet. `None` bei CSV-Zeilen (von diesem Parser-Update
+    # nicht betroffen).
+    legacy_gegenkonto_iban: str | None = None
+    legacy_referenz: str | None = None
 
 
 def _localname(tag: str) -> str:
@@ -114,8 +122,11 @@ def _ist_reversal(quelle: ET.Element, entry: ET.Element) -> bool:
     Referenz/native ID bleiben unberührt) statt stillschweigend
     fehlzuordnen."""
 
-    wert = _find_text(quelle, "RvslInd") or _find_text(entry, "RvslInd")
-    return (wert or "").strip().lower() == "true"
+    wert = (_find_text(quelle, "RvslInd") or _find_text(entry, "RvslInd") or "").strip().lower()
+    # xs:boolean (das ISO-20022-Schema für RvslInd) erlaubt GLEICHWERTIG
+    # "true"/"1" (und "false"/"0") - "1" ist kein Sonderfall, sondern ein
+    # genauso gültiger Reversal-Marker wie "true".
+    return wert in ("true", "1")
 
 
 def _gegenpartei(quelle: ET.Element, richtung: str) -> tuple[str | None, str | None]:
@@ -152,20 +163,72 @@ def _gegenpartei(quelle: ET.Element, richtung: str) -> tuple[str | None, str | N
     return iban, name
 
 
+def _find_all_texts(element: ET.Element, localname: str) -> list[str]:
+    """Wie `_find_text`, aber sammelt ALLE Fundstellen statt nur der
+    ersten - `RmtInf` kann mehrere `Ustrd`-Zeilen tragen (die
+    unstrukturierte Zahlungsreferenz ist je Zeile längenbegrenzt); die
+    bisherige `_find_text`-basierte Ermittlung verlor jede Zeile außer
+    der ersten stillschweigend."""
+
+    return [child.text.strip() for child in element.iter() if _localname(child.tag) == localname and child.text and child.text.strip()]
+
+
+def _strukturierte_referenz(quelle: ET.Element) -> str | None:
+    """Liest die strukturierte Zahlungsreferenz GEZIELT aus dem Pfad
+    `RmtInf/Strd/CdtrRefInf/Ref` (z. B. eine SCOR-Referenz) - NICHT
+    irgendein beliebiges `<Ref>`-Element irgendwo in der Transaktion, das
+    zu einem völlig anderen, unrelated Referenzblock gehören könnte."""
+
+    rmt_inf = _find_element(quelle, "RmtInf")
+    if rmt_inf is None:
+        return None
+    for strd in _direct_children(rmt_inf, "Strd"):
+        for cdtr_ref_inf in _direct_children(strd, "CdtrRefInf"):
+            ref = _direct_child(cdtr_ref_inf, "Ref")
+            if ref is not None and ref.text and ref.text.strip():
+                return ref.text.strip()
+    return None
+
+
 def _referenz_text(quelle: ET.Element) -> str | None:
-    """Kombiniert unstrukturierte (`RmtInf/Ustrd`) UND strukturierte
-    Zahlungsreferenz (`RmtInf/Strd/CdtrRefInf/Ref`, z. B. eine SCOR-
-    Referenz) - bisher wurde ausschließlich `Ustrd` gelesen und eine rein
-    strukturiert übermittelte Referenz (kein `Ustrd`-Feld) ging verloren.
+    """Kombiniert die vollständige unstrukturierte Referenz (ALLE
+    `RmtInf/Ustrd`-Zeilen, nicht nur die erste) UND die GEZIELT aus
+    `RmtInf/Strd/CdtrRefInf/Ref` gelesene strukturierte Zahlungsreferenz
+    (z. B. eine SCOR-Referenz) - bisher wurde nur die erste `Ustrd`-Zeile
+    und ein beliebiges erstes `<Ref>`-Element irgendwo im Baum gelesen.
     Beide vorhanden -> beide durch ein Leerzeichen getrennt zusammen
     erfasst, damit spätere Referenz-basierte Zuordnung (`_VERTRAG_REFERENZ`
     in `bank.service`) auf beiden Quellen suchen kann."""
 
-    unstrukturiert = _find_text(quelle, "Ustrd")
-    strukturiert = _find_text(quelle, "Ref")
+    ustrd_zeilen = _find_all_texts(quelle, "Ustrd")
+    unstrukturiert = " ".join(ustrd_zeilen) if ustrd_zeilen else None
+    strukturiert = _strukturierte_referenz(quelle)
     if unstrukturiert and strukturiert and strukturiert not in unstrukturiert:
         return f"{unstrukturiert} {strukturiert}"
     return unstrukturiert or strukturiert
+
+
+def _legacy_gegenpartei_naiv(quelle: ET.Element) -> tuple[str | None, str | None]:
+    """Reproduziert ABSICHTLICH die ALTE, richtungsUNabhängige
+    Gegenpartei-Ermittlung (die erste im Dokument gefundene `IBAN`/`Nm`-
+    Stelle) - AUSSCHLIESSLICH für den konservativen Fingerprint-Vergleich
+    in `bank.service._speichere_roh` (Codex-Rückprüfung b8d700d): eine
+    VOR diesem Parser-Fix bereits ohne bankseitig eindeutige `native_id`
+    importierte Zeile darf beim erneuten Einlesen derselben Datei NICHT
+    unbemerkt ein zweites Mal eingefügt werden, nur weil sich ihr
+    Fingerprint durch die jetzt geänderte (korrekte) Gegenpartei-
+    Ermittlung geändert hat. NIE für die tatsächlich gespeicherten
+    Felder verwenden."""
+
+    return _find_text(quelle, "IBAN"), _find_text(quelle, "Nm")
+
+
+def _legacy_referenz_text(quelle: ET.Element) -> str | None:
+    """Reproduziert ABSICHTLICH die ALTE Referenzermittlung (nur die
+    ERSTE `Ustrd`-Zeile, keine strukturierte Referenz) - nur für den
+    Fingerprint-Vergleich, siehe `_legacy_gegenpartei_naiv`."""
+
+    return _find_text(quelle, "Ustrd")
 
 
 def _to_cents(value: str) -> int:
@@ -344,10 +407,12 @@ def parse_camt053(xml_bytes: bytes, *, erwartete_iban: str) -> list[RohTransakti
             else:
                 gegenkonto_iban, gegenkonto_name = _gegenpartei(quelle, richtung)
             native_id = _find_text(quelle, "AcctSvcrRef") or _find_text(entry, "AcctSvcrRef")
+            legacy_iban, _legacy_name = _legacy_gegenpartei_naiv(quelle)
             ergebnisse.append(
                 _bauen_camt_zeile(
                     entry_betrag_cent, waehrung, buchungsdatum, valuta, referenz, gegenkonto_iban,
                     gegenkonto_name, native_id,
+                    legacy_gegenkonto_iban=legacy_iban, legacy_referenz=_legacy_referenz_text(quelle),
                 )
             )
             continue
@@ -381,11 +446,13 @@ def parse_camt053(xml_bytes: bytes, *, erwartete_iban: str) -> list[RohTransakti
                 tx_gegenkonto_iban, tx_gegenkonto_name = None, None
             else:
                 tx_gegenkonto_iban, tx_gegenkonto_name = _gegenpartei(tx_dtls, richtung)
+            tx_legacy_iban, _tx_legacy_name = _legacy_gegenpartei_naiv(tx_dtls)
             teil_zeilen.append(
                 _bauen_camt_zeile(
                     tx_betrag_cent, tx_waehrung, buchungsdatum, valuta,
                     _referenz_text(tx_dtls), tx_gegenkonto_iban, tx_gegenkonto_name,
                     _find_text(tx_dtls, "AcctSvcrRef"),
+                    legacy_gegenkonto_iban=tx_legacy_iban, legacy_referenz=_legacy_referenz_text(tx_dtls),
                 )
             )
         if sum(teil_betraege) != entry_betrag_cent:
@@ -406,6 +473,9 @@ def _bauen_camt_zeile(
     gegenkonto_iban: str | None,
     gegenkonto_name: str | None,
     native_id: str | None,
+    *,
+    legacy_gegenkonto_iban: str | None = None,
+    legacy_referenz: str | None = None,
 ) -> RohTransaktion:
     roh_zeile = (
         f"betrag_cent={betrag_cent};waehrung={waehrung};buchungsdatum={buchungsdatum};valuta={valuta};"
@@ -422,6 +492,8 @@ def _bauen_camt_zeile(
         gegenkonto_name=gegenkonto_name,
         native_id=native_id,
         roh_zeile=roh_zeile,
+        legacy_gegenkonto_iban=legacy_gegenkonto_iban,
+        legacy_referenz=legacy_referenz,
     )
 
 

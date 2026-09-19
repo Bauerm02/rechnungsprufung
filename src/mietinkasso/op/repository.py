@@ -76,15 +76,27 @@ class OPRepository:
         with self._session_factory() as owned_session:
             return _query(owned_session)
 
-    def list_aktiv(self, konto_id: str) -> list[OPPositionTable]:
-        with self._session_factory() as session:
+    def list_aktiv(self, konto_id: str, *, session: Session | None = None) -> list[OPPositionTable]:
+        """`session`: siehe `insert_idempotent` - übergeben, um diese
+        Leseabfrage Teil einer größeren, vom Aufrufer verwalteten
+        (ggf. schreibgesperrten) Transaktion zu machen, statt eine eigene,
+        separate Session zu öffnen (Codex-Rückprüfung b8d700d: eine
+        Perioden-/Zielauflösung VOR einem Schreib-Lock ist ein TOCTOU-
+        Fenster - siehe `bank.service._zuordnen_atomar`)."""
+
+        def _query(active_session: Session) -> list[OPPositionTable]:
             statement = (
                 select(OPPositionTable)
                 .where(OPPositionTable.konto_id == konto_id)
                 .where(OPPositionTable.status == OPPositionStatus.AKTIV.value)
                 .order_by(OPPositionTable.belegdatum)
             )
-            return list(session.execute(statement).scalars().all())
+            return list(active_session.execute(statement).scalars().all())
+
+        if session is not None:
+            return _query(session)
+        with self._session_factory() as owned_session:
+            return _query(owned_session)
 
     def list_alle(self, konto_id: str) -> list[OPPositionTable]:
         with self._session_factory() as session:

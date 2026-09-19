@@ -169,16 +169,27 @@ def balance_zeitreihe_fuer_forderung(
     *, ziel_op_position_id: int, alle_positionen: list[OPPositionTable], heute: date,
 ) -> list[BalancePeriode] | None:
     """Reproduziert EXAKT dieselbe Zuordnungsregel wie
-    `OPService.offene_forderungen` (eine explizit gebundene Zahlung/
-    Gutschrift - `bezieht_sich_auf_id` - deckt IMMER zuerst ihre
-    Zielforderung, nur ein tatsächlicher Überschuss fließt in die
-    generische FIFO-Verteilung nach Fälligkeit/Belegdatum über die
-    übrigen Forderungen), aber mit dem tatsächlichen BUCHUNGSDATUM jeder
-    Reduktion, um den Reststand der Zielforderung ÜBER DIE ZEIT (nicht
-    nur den Endstand) zu rekonstruieren - Grundlage für eine taggenaue
-    Verzinsung, die eine datierte Teilzahlung korrekt ab ihrem
-    tatsächlichen Datum berücksichtigt statt den Ausgangsbetrag über die
-    gesamte Periode zu verzinsen.
+    `OPService.offene_forderungen`:
+
+    1. Eine explizit gebundene Zahlung/Gutschrift (`bezieht_sich_auf_id`)
+       deckt IMMER zuerst ihre Zielforderung, nur ein tatsächlicher
+       Überschuss fließt weiter.
+    2. Ein danach verbleibender Betrag (oder eine Zahlung ganz ohne
+       `bezieht_sich_auf_id`, aber MIT `leistungsperiode`, z. B. weil
+       mehrere Forderungen exakt dieselbe Periode tragen und keine
+       eindeutige Ziel-ID gesetzt werden konnte) deckt ZUERST alle
+       ÜBRIGEN Forderungen DERSELBEN Periode, bevor ein weiterer
+       Überschuss in die vollständig generische FIFO-Verteilung nach
+       Fälligkeit/Belegdatum über ALLE übrigen Forderungen/Perioden
+       fließt - eine erkannte Periode darf NIE eine andere, unbeteiligte
+       Periode blind vorziehen (Codex-Rückprüfung b8d700d).
+
+    Arbeitet mit dem tatsächlichen BUCHUNGSDATUM jeder Reduktion, um den
+    Reststand der Zielforderung ÜBER DIE ZEIT (nicht nur den Endstand) zu
+    rekonstruieren - Grundlage für eine taggenaue Verzinsung, die eine
+    datierte Teilzahlung korrekt ab ihrem tatsächlichen Datum
+    berücksichtigt statt den Ausgangsbetrag über die gesamte Periode zu
+    verzinsen.
 
     Liefert `None`, wenn die Zielforderung unbekannte/keine Fälligkeit
     hat (z. B. eine ungegliederte GESAMTSALDO-Eröffnung) - eine solche
@@ -200,26 +211,28 @@ def balance_zeitreihe_fuer_forderung(
 
     # Reduktionsereignisse mit Datum (Zahlung/Gutschrift, negative
     # KORREKTUR, ein Guthaben in einer eigentlich forderungsseitigen
-    # Zeile) - exakt dieselben Quellen wie im Minderungs-Pool von
-    # `offene_forderungen`, hier aber mit `buchungsdatum` statt nur als
-    # aufsummierter Gesamtpool. `ziel_id` trägt die explizite
-    # Zahlungszweckbindung (falls gesetzt) für die vorrangige Zuordnung
-    # unten - `None` bedeutet "ungebunden, generisch verteilen".
-    ereignisse: list[tuple[date, int, int, int | None]] = []  # (datum, betrag, id, ziel_id)
+    # Zeile) - exakt dieselben Quellen wie in `offene_forderungen`, hier
+    # aber mit `buchungsdatum` statt nur als aufsummierter Gesamtpool.
+    # `ziel_id`/`periode` tragen die explizite Zahlungszweckbindung bzw.
+    # `leistungsperiode` (nur für Zahlung/Gutschrift gesetzt) für die
+    # vorrangige Zuordnung unten - beide `None` bedeutet "vollständig
+    # generisch verteilen".
+    ereignisse: list[tuple[date, int, int, int | None, str | None]] = []
     for p in alle_positionen:
         if p.typ in negative_typen and p.betrag_cent > 0:
-            ereignisse.append((p.buchungsdatum, p.betrag_cent, p.id, p.bezieht_sich_auf_id))
+            ereignisse.append((p.buchungsdatum, p.betrag_cent, p.id, p.bezieht_sich_auf_id, p.leistungsperiode))
         elif p.typ in positive_typen and p.betrag_cent < 0:
-            ereignisse.append((p.buchungsdatum, -p.betrag_cent, p.id, None))
+            ereignisse.append((p.buchungsdatum, -p.betrag_cent, p.id, None, None))
         elif p.typ == OPTyp.KORREKTUR.value and p.betrag_cent < 0:
-            ereignisse.append((p.buchungsdatum, -p.betrag_cent, p.id, None))
+            ereignisse.append((p.buchungsdatum, -p.betrag_cent, p.id, None, None))
     ereignisse.sort(key=lambda e: (e[0], e[2]))
 
     verbleibend = {p.id: p.betrag_cent for p in forderungs_rows}
     aenderungen: list[tuple[date, int]] = []  # (datum, neuer_rest der Zielforderung)
 
-    for ereignis_datum, betrag, _eid, gebundene_ziel_id in ereignisse:
+    for ereignis_datum, betrag, _eid, gebundene_ziel_id, periode in ereignisse:
         rest_zu_verteilen = betrag
+        direktes_ziel_id: int | None = None
         if gebundene_ziel_id is not None:
             # Dieselbe Bindungsauflösung/-prüfung wie `offene_forderungen`
             # (gleiche Kontozugehörigkeit, konsistente Leistungsperiode) -
@@ -227,17 +240,36 @@ def balance_zeitreihe_fuer_forderung(
             # NICHT stillschweigend generisch verteilt, sondern abgelehnt.
             zahlung = next(p for p in alle_positionen if p.id == _eid)
             ziel_row = resolve_zahlungsziel(zahlung, forderung_by_id)
+            direktes_ziel_id = ziel_row.id
             aktuell = verbleibend[ziel_row.id]
             abzug = min(aktuell, rest_zu_verteilen)
             verbleibend[ziel_row.id] = aktuell - abzug
             rest_zu_verteilen -= abzug
             if ziel_row.id == ziel_op_position_id:
                 aenderungen.append((ereignis_datum, verbleibend[ziel_row.id]))
+
+        if periode is not None and rest_zu_verteilen > 0:
+            for p in forderungs_rows:
+                if rest_zu_verteilen <= 0:
+                    break
+                if p.id == direktes_ziel_id or p.leistungsperiode != periode:
+                    continue
+                aktuell = verbleibend[p.id]
+                if aktuell <= 0:
+                    continue
+                abzug = min(aktuell, rest_zu_verteilen)
+                verbleibend[p.id] = aktuell - abzug
+                rest_zu_verteilen -= abzug
+                if p.id == ziel_op_position_id:
+                    aenderungen.append((ereignis_datum, verbleibend[p.id]))
+
         for p in forderungs_rows:
             if rest_zu_verteilen <= 0:
                 break
-            if p.id == gebundene_ziel_id:
+            if p.id == direktes_ziel_id:
                 continue  # bereits oben direkt/vorrangig bedient
+            if periode is not None and p.leistungsperiode == periode:
+                continue  # bereits in der Perioden-Vorrangstufe behandelt
             aktuell = verbleibend[p.id]
             if aktuell <= 0:
                 continue
