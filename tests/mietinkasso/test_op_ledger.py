@@ -11,6 +11,7 @@ from mietinkasso.domain.exceptions import (
     ImportConflictError,
     ObjektAusgeschlossenError,
     StornierungKonfliktError,
+    ZahlungsbindungInkonsistentError,
 )
 
 
@@ -540,3 +541,214 @@ def test_guthaben_eroeffnung_mindert_offene_forderung_und_faelligen_rest(op_serv
     forderungen = op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))
     assert len(forderungen) == 1  # das Guthaben selbst ist KEINE eigene (negative) Forderung
     assert forderungen[0].rest_cent == 50_000  # nicht die vollen 60000 - das Guthaben wurde bereits verrechnet
+
+
+# ---------------------------------------------------------------------------
+# HV-20260919-GEORGE-CODE, Fix 2: explizite Zahlungszweckbindung
+# (bezieht_sich_auf_id) hat Vorrang vor generischem FIFO - Codex-Fund
+# anhand des belegten anonymisierten Musters: Anfangsforderung ohne
+# Fälligkeit 548,10 + September-Soll 1.224,68 + Zahlung 1.224,86 mit
+# leistungsperiode=2026-09 UND expliziter Bindung an das September-Soll.
+# Gesamtsaldo 547,92 war schon vorher richtig - NUR die Verteilung auf
+# die einzelnen Forderungen (und damit der Mahnzyklus je Forderung) war
+# falsch, weil das reine FIFO die ältere Anfangsforderung zuerst bediente.
+# ---------------------------------------------------------------------------
+
+
+def test_offene_forderungen_explizite_bindung_deckt_zielforderung_zuerst(op_service, basis_vertrag, ctx_factory):
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    anfang = op_service.eroeffnen_gesamtsaldo(
+        ctx=ctx, konto=konto, betrag_cent=54_810, stichtag=date(2026, 8, 1),
+        import_id="ERO-ANFANG", akteur="test",
+    )
+    september_soll = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=122_468,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="Miete September",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=122_486,
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        leistungsperiode="2026-09", beleg_referenz="Zahlung September",
+        bezieht_sich_auf_id=september_soll.id,
+    )
+
+    saldo = op_service.berechne_saldo(konto.id, stichtag=date(2026, 9, 10))
+    assert saldo.saldo_cent == 54_792  # Gesamtsaldo war schon vorher richtig (548,10+1224,68-1224,86)
+
+    forderungen = op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))
+    # September-Soll ist (bis auf den 0,18-Überschuss) explizit gedeckt und
+    # verschwindet daher aus der Liste; NUR die Anfangsforderung bleibt mit
+    # dem tatsächlich verbleibenden Rest offen - NICHT umgekehrt, wie es
+    # das alte reine FIFO (älteste zuerst) ergeben hätte.
+    assert [f.op_position_id for f in forderungen] == [anfang.id]
+    assert forderungen[0].rest_cent == 54_792
+
+
+def test_offene_forderungen_ohne_bindung_bleibt_klassisches_fifo(op_service, basis_vertrag, ctx_factory):
+    """Regressionsschutz: exakt dasselbe Muster, aber OHNE
+    bezieht_sich_auf_id, ergibt weiterhin das alte (unveränderte)
+    FIFO-Verhalten - die Zahlung deckt zuerst die ÄLTERE Anfangsforderung,
+    der Rest bleibt auf dem September-Soll offen. Zeigt zugleich, dass der
+    Fix wirklich etwas ändert (anderes Ergebnis als der gebundene Fall)."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    op_service.eroeffnen_gesamtsaldo(
+        ctx=ctx, konto=konto, betrag_cent=54_810, stichtag=date(2026, 8, 1),
+        import_id="ERO-ANFANG-FIFO", akteur="test",
+    )
+    september_soll = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=122_468,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="Miete September",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=122_486,
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        beleg_referenz="Zahlung ohne Bindung",
+    )
+
+    forderungen = op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))
+    assert [f.op_position_id for f in forderungen] == [september_soll.id]
+    assert forderungen[0].rest_cent == 54_792
+
+
+def test_offene_forderungen_bindung_an_fremdes_konto_wird_abgelehnt(op_service, stammdaten_repo, ctx_factory):
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")
+    stammdaten_repo.upsert_einheit(id="601-TOP-X", objekt_id="601", bezeichnung="Top X", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-X", name="Anderer Mieter")
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-X", einheit_id="601-TOP-X", debitor_id="DEB-X", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    fremdes_konto = stammdaten_repo.get_or_create_konto(vertrag=stammdaten_repo.get_vertrag("V-601-X"))
+    fremde_forderung = op_service.buchen(
+        ctx=ctx, konto=fremdes_konto, typ=OPTyp.SOLL, betrag_cent=100_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        beleg_referenz="Miete anderes Konto",
+    )
+
+    stammdaten_repo.upsert_einheit(id="601-TOP-Y", objekt_id="601", bezeichnung="Top Y", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-Y", name="Mieter Y")
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-Y", einheit_id="601-TOP-Y", debitor_id="DEB-Y", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    eigenes_konto = stammdaten_repo.get_or_create_konto(vertrag=stammdaten_repo.get_vertrag("V-601-Y"))
+    op_service.buchen(
+        ctx=ctx, konto=eigenes_konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        beleg_referenz="Miete eigenes Konto",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=eigenes_konto, typ=OPTyp.ZAHLUNG, betrag_cent=50_000,
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        beleg_referenz="Zahlung mit fremder Bindung",
+        bezieht_sich_auf_id=fremde_forderung.id,
+    )
+
+    with pytest.raises(ZahlungsbindungInkonsistentError):
+        op_service.offene_forderungen(eigenes_konto.id, heute=date(2026, 9, 10))
+
+
+def test_offene_forderungen_bindung_an_unbekannte_id_wird_abgelehnt(op_service, basis_vertrag, ctx_factory):
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        beleg_referenz="Miete September",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=50_000,
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        beleg_referenz="Zahlung mit erfundener Bindung",
+        bezieht_sich_auf_id=999_999,
+    )
+
+    with pytest.raises(ZahlungsbindungInkonsistentError):
+        op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))
+
+
+def test_offene_forderungen_bindung_mit_abweichender_leistungsperiode_wird_abgelehnt(op_service, basis_vertrag, ctx_factory):
+    """Eine Bindung mit widersprüchlicher Leistungsperiode deutet auf eine
+    verwechselte OP-ID hin - wird nicht stillschweigend akzeptiert."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    august_soll = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
+        leistungsperiode="2026-08", beleg_referenz="Miete August",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=50_000,
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        leistungsperiode="2026-09", beleg_referenz="Zahlung mit abweichender Periode",
+        bezieht_sich_auf_id=august_soll.id,
+    )
+
+    with pytest.raises(ZahlungsbindungInkonsistentError):
+        op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))
+
+
+def test_offene_forderungen_ueberschuss_der_bindung_deckt_andere_forderung(op_service, basis_vertrag, ctx_factory):
+    """Eine gezielte Zahlung, die IHRE Zielforderung übersteigt, darf den
+    Überschuss nicht verlieren (Doppelverbrauch) UND darf ihn nicht der
+    schon vollständig gedeckten Zielforderung ein zweites Mal gutschreiben
+    - er fließt in den generischen Pool für die ÜBRIGEN Forderungen."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    aeltere_forderung = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=30_000,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
+        beleg_referenz="Miete August",
+    )
+    september_soll = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        beleg_referenz="Miete September",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=60_000,  # 10.000 Cent Überschuss
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        beleg_referenz="Überzahlung mit Bindung", bezieht_sich_auf_id=september_soll.id,
+    )
+
+    forderungen = {f.op_position_id: f for f in op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))}
+    assert september_soll.id not in forderungen  # vollständig gedeckt
+    assert forderungen[aeltere_forderung.id].rest_cent == 20_000  # 30.000 - 10.000 Überschuss
+    assert sum(f.rest_cent for f in forderungen.values()) == 20_000  # kein Doppelverbrauch, korrekter Gesamtrest
+
+
+def test_offene_forderungen_ruecklastschrift_bindung_an_zahlung_bleibt_unberuehrt(op_service, basis_vertrag, ctx_factory):
+    """Regressionsschutz: RUECKLASTSCHRIFT nutzt bezieht_sich_auf_id mit
+    einer ANDEREN Bedeutung (Verweis auf die zurückgebuchte ZAHLUNG, kein
+    Forderungsziel) - die neue Bindungsprüfung darf das nicht mit einer
+    Zahlungszweckbindung verwechseln oder fälschlich ablehnen."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 6, 1), buchungsdatum=date(2026, 6, 1), faelligkeit=date(2026, 6, 5),
+        beleg_referenz="Miete Juni",
+    )
+    zahlung = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=60_000,
+        belegdatum=date(2026, 6, 5), buchungsdatum=date(2026, 6, 5), faelligkeit=None,
+        beleg_referenz="Zahlung Juni",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.RUECKLASTSCHRIFT, betrag_cent=60_000,
+        belegdatum=date(2026, 6, 8), buchungsdatum=date(2026, 6, 8), faelligkeit=date(2026, 6, 8),
+        beleg_referenz="Rücklastschrift Zahlung Juni", bezieht_sich_auf_id=zahlung.id,
+    )
+
+    forderungen = op_service.offene_forderungen(konto.id, heute=date(2026, 6, 10))
+    assert len(forderungen) == 1
+    assert forderungen[0].rest_cent == 60_000

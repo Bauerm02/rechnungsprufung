@@ -598,6 +598,97 @@ def test_verzugszinsen_beginnen_erst_tag_nach_faelligkeit(op_service, kosten_ser
     assert vorschau_am_faelligkeitstag.neue_zinsen_cent == 0
 
 
+# ---------------------------------------------------------------------------
+# HV-20260919-GEORGE-CODE, Fix 2 (Zinsseite): dieselbe explizite
+# Zahlungszweckbindung (bezieht_sich_auf_id) muss auch die Zins-Zeitreihe
+# steuern - "Mahn-/Zinsrelevante Restpositionen müssen dieselbe Logik
+# verwenden" wie `OPService.offene_forderungen`. Ohne diesen Fix hätte
+# `balance_zeitreihe_fuer_forderung` (die eigene, parallele FIFO-
+# Rekonstruktion für die taggenaue Verzinsung) eine gezielte Zahlung
+# weiterhin rein chronologisch verteilt und damit eine bereits explizit
+# gedeckte Forderung fälschlich noch als teilweise offen verzinst.
+# ---------------------------------------------------------------------------
+
+
+def test_balance_zeitreihe_folgt_derselben_expliziten_bindung_wie_offene_forderungen(
+    op_service, admin_ctx, basis_vertrag,
+):
+    from mietinkasso.mahnwesen.kosten import balance_zeitreihe_fuer_forderung
+
+    _, konto = basis_vertrag
+    anfang = op_service.eroeffnen_gesamtsaldo(
+        ctx=admin_ctx, konto=konto, betrag_cent=54_810, stichtag=date(2026, 8, 1),
+        import_id="ERO-ANFANG-ZINS", akteur="test",
+    )
+    september_soll = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=122_468,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="Miete September",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=122_486,
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        leistungsperiode="2026-09", beleg_referenz="Zahlung September",
+        bezieht_sich_auf_id=september_soll.id,
+    )
+
+    alle_positionen = op_service.list_alle_positionen(konto.id)
+
+    # September-Soll ist (bis auf den 0,18-Überschuss) explizit gedeckt -
+    # die letzte verzinsbare Periode muss auf dem winzigen Restbetrag
+    # (18 Cent), NICHT auf dem vollen Betrag (1.224,68) beruhen.
+    perioden_september = balance_zeitreihe_fuer_forderung(
+        ziel_op_position_id=september_soll.id, alle_positionen=alle_positionen, heute=date(2026, 9, 10),
+    )
+    assert perioden_september is not None
+    assert all(p.rest_cent <= 18 for p in perioden_september)
+
+    # Die ÄLTERE Anfangsforderung trägt stattdessen den tatsächlichen
+    # Rest (548,10 - 0,18 Überschuss = 547,92) - das alte reine FIFO hätte
+    # sie fälschlich zuerst voll getilgt und September-Soll den großen
+    # Rest zugewiesen (siehe Gegenprobe unten).
+    perioden_anfang = balance_zeitreihe_fuer_forderung(
+        ziel_op_position_id=anfang.id, alle_positionen=alle_positionen, heute=date(2026, 9, 10),
+    )
+    # Die Anfangsforderung hat keine bekannte Fälligkeit -> wird laut
+    # Docstring NIE fiktiv verzinst (liefert None), das ist unverändert
+    # richtig; die Bindung wirkt sich hier nur auf `offene_forderungen`
+    # (Mahngrundlage) aus, nicht auf eine fiktive Verzinsung ohne Fälligkeit.
+    assert perioden_anfang is None
+
+
+def test_balance_zeitreihe_ohne_bindung_bleibt_klassisches_fifo(op_service, admin_ctx, basis_vertrag):
+    """Regressionsschutz: ohne bezieht_sich_auf_id verzinst
+    `balance_zeitreihe_fuer_forderung` weiterhin exakt wie zuvor (älteste
+    Forderung zuerst getilgt) - der Fix ändert nichts am ungebundenen
+    Fall."""
+
+    from mietinkasso.mahnwesen.kosten import balance_zeitreihe_fuer_forderung
+
+    _, konto = basis_vertrag
+    september_soll = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=100_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        beleg_referenz="Miete September",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=40_000,
+        belegdatum=date(2026, 9, 20), buchungsdatum=date(2026, 9, 20), faelligkeit=None,
+        beleg_referenz="Teilzahlung ohne Bindung",
+    )
+    alle_positionen = op_service.list_alle_positionen(konto.id)
+
+    perioden = balance_zeitreihe_fuer_forderung(
+        ziel_op_position_id=september_soll.id, alle_positionen=alle_positionen, heute=date(2026, 10, 1),
+    )
+    assert perioden is not None
+    # Verzug ab 6.9., voller Betrag bis zur Teilzahlung am 20.9., danach Rest.
+    assert perioden[0].rest_cent == 100_000
+    assert perioden[0].von == date(2026, 9, 6)
+    assert perioden[0].bis == date(2026, 9, 20)
+    assert perioden[-1].rest_cent == 60_000
+
+
 def test_faelligkeit_am_letzten_halbjahrestag_bekommt_nie_den_juni_satz(
     op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
 ):

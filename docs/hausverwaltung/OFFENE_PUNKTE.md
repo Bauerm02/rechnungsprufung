@@ -3739,3 +3739,123 @@ Hinweis.
 Zwei neue Tests (Teilrücklastschrift zeigt verarbeitet+Prüfrest im
 HTML, Nullbewegung bleibt sichtbar als Klärfall ohne Zahlungsformular).
 975/975 grün im `tests/mietinkasso`-Gesamtlauf.
+
+## HV-20260919-GEORGE-CODE: CAMT-Gegenpartei bei DBIT + explizite
+## Zahlungszweckbindung statt pauschalem FIFO
+
+**Fix 1 — `bank/importer.py::parse_camt053`:** die Gegenpartei
+(`gegenkonto_iban`/`gegenkonto_name`) wurde bisher unabhängig von der
+Zahlungsrichtung als ERSTE im Dokument gefundene `IBAN`/`Nm`-Stelle
+übernommen - bei einem Zahlungsausgang (DBIT) steht `Dbtr`/`DbtrAcct`
+(die EIGENE Kontopartei) in `RltdPties` laut ISO-20022-Konvention
+üblicherweise VOR `Cdtr`/`CdtrAcct` und wurde dadurch fälschlich als
+"Gegenpartei" ausgewiesen. Jetzt richtungsabhängig: CRDT ->
+`Dbtr`/`DbtrAcct`, DBIT -> `Cdtr`/`CdtrAcct` (neue Funktion
+`_gegenpartei`), mit Namens-Fallback auf `UltmtDbtr`/`UltmtCdtr`
+DERSELBEN Seite (nie auf die eigene Seite) und explizitem Reject für
+ein unbekanntes `CdtDbtInd` (`_ist_reversal`/`CamtUnvollstaendigError`).
+Eine Stornobuchung (`RvslInd=true`) ordnet die Gegenpartei jetzt
+GARNICHT mehr zu (bleibt `None`) statt sie über die naive
+Richtungsregel zu erraten - `Dbtr`/`Cdtr` beschreiben laut ISO-20022 bei
+einem Reversal weiterhin die Parteien der URSPRÜNGLICHEN Buchung.
+Zusätzlich erfasst `_referenz_text` jetzt auch eine strukturierte
+`RmtInf/Strd/CdtrRefInf/Ref`-Referenz (z. B. SCOR), nicht mehr nur
+`Ustrd`. Multi-TxDtls-Sammelbuchungen wenden dieselbe Regel JE Teilzeile
+an (eigene `RltdPties`/Referenz je Leg).
+
+**Upgradefolge (bewusst KEINE Migration/Massenmigration durchgeführt,
+wie beauftragt):** `_speichere_roh`s `content_hash`/`quelle_hash`
+umfasst `gegenkonto_iban`/`gegenkonto_name`/`referenz`. Für Zeilen MIT
+bankseitig eindeutiger `native_id` ist `import_id` stabil
+(`{bank_konto_id}:{quelle_typ}:{native_id}`) - wird DIESELBE bereits vor
+diesem Fix importierte CAMT-Datei nach dem Fix ein zweites Mal
+importiert, liefert eine betroffene DBIT-/Reversal-/SCOR-Zeile jetzt
+einen ANDEREN `content_hash` als beim ursprünglichen Import und
+`_insert_transaktion` lehnt den Re-Import mit `ImportConflictError` ab
+(vorher ein stiller No-Op). Das ist eine bewusste Konsequenz des Fixes,
+kein neuer Bug - ein tatsächlicher Re-Import einer VOR diesem Fix
+eingelesenen Datei müsste im Echtbetrieb manuell geprüft werden; keine
+bereits importierten Bestandszeilen wurden rückwirkend verändert.
+
+**Fix 2 — `op/service.py::offene_forderungen` +
+`mahnwesen/kosten.py::balance_zeitreihe_fuer_forderung`:** eine
+Zahlung/Gutschrift mit expliziter Zahlungszweckbindung
+(`OPPositionTable.bezieht_sich_auf_id`) wurde bisher wie jede andere
+ungebundene Zahlung blind in einen gemeinsamen Minderungs-Pool geworfen
+und rein chronologisch (FIFO nach Fälligkeit/Belegdatum) auf ALLE
+offenen Forderungen verteilt - eine gezielte Zahlung konnte dadurch
+fälschlich zuerst eine ÄLTERE, unbezogene Forderung tilgen, während die
+tatsächlich gemeinte Forderung (Gesamtsaldo blieb dabei immer schon
+korrekt) formal offen blieb. Belegtes anonymisiertes Muster: Anfangs-
+forderung ohne Fälligkeit 548,10 + September-Soll 1.224,68 + Zahlung
+1.224,86 (`leistungsperiode=2026-09`, `bezieht_sich_auf_id`=September-
+Soll) - Gesamtsaldo 547,92 war schon richtig, NUR die Verteilung auf die
+einzelnen Forderungen (und damit der Mahn-/Zinszyklus je Forderung) war
+falsch.
+
+Jetzt: eine gebundene Zahlung deckt IMMER zuerst ihre explizite
+Zielforderung (bis zu deren eigenem Restbetrag); nur ein tatsächlicher
+ÜBERSCHUSS darüber hinaus fließt in den generischen FIFO-Pool für die
+ÜBRIGEN Forderungen - kein Doppelverbrauch. Neue, geteilte Hilfsfunktionen
+`op.service.validiere_zahlungsbindung`/`resolve_zahlungsziel` prüfen JEDE
+Bindung auf gleiche Kontozugehörigkeit und (falls beidseitig hinterlegt)
+konsistente `leistungsperiode`; eine unauflösbare/widersprüchliche
+Bindung wird NICHT stillschweigend generisch verteilt, sondern als neue
+`ZahlungsbindungInkonsistentError` abgelehnt (Ambiguität wird nicht per
+FIFO verdeckt). `mahnwesen/kosten.py::balance_zeitreihe_fuer_forderung`
+(die eigene, parallele FIFO-Rekonstruktion für die taggenaue Verzinsung)
+nutzt jetzt DIESELBE Regel/Prüfung (`resolve_zahlungsziel`) - Mahn- und
+Zinsrelevante Restpositionen sind damit konsistent, kein rein
+UI-kosmetischer Fix. `berechne_saldo` (Gesamtsaldo) war schon vorher
+korrekt und bleibt unverändert; keine bestehenden OP-Zeilen, Salden,
+Sperren oder historischen Bindungen wurden verändert - reine
+Berechnungslogik.
+
+**Codex-Nachforderung (End-zu-Ende-Verbindung Bankzweck ->
+OP.leistungsperiode -> offene_forderungen):** `bank/service.py::
+_zuordnen_atomar` (gemeinsamer Buchungspfad für `automatisch_zuordnen`
+UND `zuordnen_manuell` - identische Regel für beide, wie gefordert)
+bucht die ZAHLUNG jetzt mit `leistungsperiode`/`bezieht_sich_auf_id`,
+sofern der Bank-Verwendungszweck GENAU EINEN expliziten Mietmonat
+erkennen lässt (neue Funktion `erkenne_leistungsperiode`: Format
+"MM.YYYY"/"MM/YYYY" oder deutscher Monatsname + 4-stellige Jahreszahl,
+z. B. "Miete 09/2026" oder "September 2026") UND dieser Monat GENAU
+EINER offenen Forderung (keine Mahnkosten-Nebenforderung) DIESES Kontos
+entspricht (neue Methode `_resolve_periode_und_forderung`). Mehrere
+Monate im selben Zweck (mehrdeutig/mehrmonatig), kein Monat, oder
+mehrere/keine Forderung(en) mit dieser Periode bleiben BEWUSST
+ungebunden (Fachregel: nicht per FIFO raten) - eine erkannte Periode
+wird trotzdem auf der Zahlung vermerkt, wenn sie (noch) keiner
+Forderung zugeordnet werden kann, damit sie am Beleg sichtbar/prüfbar
+bleibt statt spurlos zu verschwinden. Nie eine Jahresvermutung ohne
+explizite 4-stellige Jahresangabe im Text. `verknuepfe_mit_bestehender_
+zahlung` (explizite manuelle Auswahl einer bereits bestehenden Zahlung,
+bucht keine neue OP-Zeile) ist unverändert - dort validiert bereits die
+bestehende Konto-/Typ-/Status-Prüfung die menschliche Auswahl. Bestehende
+Idempotenz (`vorgang_id`/`import_id`) und Atomarität von
+`_zuordnen_atomar` unverändert; keine rückwirkende Änderung bereits
+gebuchter Bestandszeilen.
+
+**Offene Punkte / bewusste Grenzen:**
+- Die Monatserkennung (`erkenne_leistungsperiode`) ist bewusst
+  konservativ/generisch (numerisches MM.YYYY/MM/YYYY oder ein deutscher
+  Monatsname + Jahr) und wurde NICHT gegen echte Bankexportformate aus
+  dem Echtbetrieb kalibriert - ein numerisches "MM/YYYY"-Muster kann in
+  seltenen Fällen zufällig mit einer unrelated Zahlenfolge (z. B. einer
+  Rechnungsnummer) übereinstimmen; das Risiko wird durch die Pflicht zu
+  GENAU EINER passenden offenen Forderung mit exakt dieser Periode stark
+  begrenzt (ein Zufallstreffer ohne passende Forderung bleibt ungebunden).
+- `_resolve_periode_und_forderung` liest `offene_forderungen` VOR dem
+  Schreib-Lock (wie die bereits bestehende `verbleibend`-Berechnung in
+  `automatisch_zuordnen`) - ein theoretisches TOCTOU-Fenster bei echter
+  Nebenläufigkeit bleibt (bestehende Toleranzgrenze dieses Moduls,
+  nicht neu eingeführt); eine zwischenzeitlich ungültig gewordene
+  Bindung würde beim nächsten `offene_forderungen`-Aufruf als
+  `ZahlungsbindungInkonsistentError` sichtbar, nicht still falsch
+  verrechnet.
+- Keine Buchung/kein Versand/keine Produktionsdaten/kein Deployment in
+  dieser Runde; ausschließlich synthetische Testdaten. 25 neue Tests
+  (8 CAMT-Gegenpartei/Reversal/SCOR/Multi-TxDtls, 7
+  `offene_forderungen`-Bindung, 2 `balance_zeitreihe_fuer_forderung`,
+  5 End-zu-Ende Bankzweck->Periode->Forderung, davon 3 im ersten Zug
+  und danach ergänzt). 997/997 grün im `tests/mietinkasso`-Gesamtlauf.

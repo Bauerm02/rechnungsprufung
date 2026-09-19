@@ -51,6 +51,46 @@ from mietinkasso.stammdaten.repository import StammdatenRepository
 
 _VERTRAG_REFERENZ = re.compile(r"VERTRAG:([A-Za-z0-9\-]+)")
 
+# -- Auftrag HV-20260919-GEORGE-CODE: deterministische Mietmonat-Erkennung ------
+#
+# Fachregel (wie `_VERTRAG_REFERENZ`/Fachregel 4): NIE eine Jahresvermutung
+# ohne explizite 4-stellige Jahresangabe im Text, NIE eine automatische
+# FIFO-Zuordnung bei mehrdeutigem/mehrmonatigem Zweck - ein solcher Zweck
+# bleibt bewusst UNGEBUNDEN (die Referenz selbst bleibt am Beleg sichtbar
+# und damit weiterhin manuell prüfbar), statt geraten zu werden.
+_MONATSNAMEN = {
+    "jänner": 1, "janner": 1, "januar": 1, "februar": 2, "märz": 3, "maerz": 3,
+    "april": 4, "mai": 5, "juni": 6, "juli": 7, "august": 8, "september": 9,
+    "oktober": 10, "november": 11, "dezember": 12,
+}
+_MONAT_JAHR_NUMERISCH = re.compile(r"\b(0[1-9]|1[0-2])[./](\d{4})\b")
+_MONAT_NAME_JAHR = re.compile(
+    r"\b(" + "|".join(_MONATSNAMEN) + r")\b\D{0,3}(\d{4})\b", re.IGNORECASE
+)
+
+
+def erkenne_leistungsperiode(referenz: str | None) -> str | None:
+    """Erkennt EINEN eindeutigen, explizit genannten Mietmonat
+    (Format "MM.YYYY"/"MM/YYYY" ODER ein voller deutscher Monatsname
+    gefolgt von einer 4-stelligen Jahreszahl, z. B. "Miete 09/2026" oder
+    "September 2026") aus dem Bank-Verwendungszweck - liefert `None`
+    (bewusst KEINE Periode), wenn der Text KEINE oder MEHRERE
+    unterschiedliche Monats-/Jahresangaben enthält (mehrdeutiger oder
+    mehrmonatiger Zweck, z. B. "Miete August+September 2026") statt eine
+    davon zu erraten. Reine Textanalyse, kein DB-Zugriff, keine
+    Kontierung."""
+
+    if not referenz:
+        return None
+    treffer: set[str] = set()
+    for monat, jahr in _MONAT_JAHR_NUMERISCH.findall(referenz):
+        treffer.add(f"{jahr}-{monat}")
+    for name, jahr in _MONAT_NAME_JAHR.findall(referenz):
+        treffer.add(f"{jahr}-{_MONATSNAMEN[name.lower()]:02d}")
+    if len(treffer) != 1:
+        return None
+    return treffer.pop()
+
 # -- Auftrag HV-20260914-BANKUEBERSICHT: reine Anzeigekategorisierung -----------
 #
 # Fachregel 4 gilt auch hier: NIEMALS Lieferanten-/Personennamen
@@ -433,6 +473,55 @@ class BankImportService:
         )
         return zuordnung
 
+    def _resolve_periode_und_forderung(
+        self, konto_id: str, referenz: str | None
+    ) -> tuple[str | None, int | None]:
+        """Deterministische End-zu-Ende-Verbindung Bank-Verwendungszweck ->
+        `OP.leistungsperiode` -> `offene_forderungen` (Auftrag
+        HV-20260919-GEORGE-CODE, ergänzt bei Codex-Abnahme von 8a677e7/
+        db3755a): löst `erkenne_leistungsperiode` gegen die AKTUELL offenen
+        Forderungen DIESES Kontos auf.
+
+        Eine erkannte Periode wird IMMER auf der neuen ZAHLUNG vermerkt
+        (`leistungsperiode`) - das bleibt am Beleg sichtbar/prüfbar, auch
+        wenn keine automatische Bindung entsteht. Eine verbindliche
+        `bezieht_sich_auf_id`-Bindung entsteht dagegen NUR, wenn GENAU EINE
+        offene Forderung (keine Mahnkosten-Nebenforderung) exakt diese
+        Periode trägt - mehrere Treffer (z. B. zwei Komponenten derselben
+        Periode wurden separat als eigene Forderungen geführt) oder gar
+        keiner bleiben bewusst UNGEBUNDEN statt per FIFO geraten zu werden.
+        Dieselbe Fachregel wie `op.service.offene_forderungen`/
+        `resolve_zahlungsziel` - eine hier entstehende Bindung wird dort
+        wie jede andere geprüft (Konto-/Periodenkonsistenz), ein Überhang
+        über die Zielforderung hinaus fließt identisch in den generischen
+        Pool, der auch für die Zinsberechnung (`mahnwesen.kosten.
+        balance_zeitreihe_fuer_forderung`) maßgeblich ist.
+
+        Gilt IDENTISCH für automatische (`automatisch_zuordnen`) und
+        manuelle (`zuordnen_manuell`) Zuordnung, da beide über
+        `_zuordnen_atomar` laufen; eine explizite manuelle Verknüpfung mit
+        einer bereits BESTEHENDEN Zahlung (`verknuepfe_mit_bestehender_
+        zahlung`) bucht ohnehin keine neue OP-Zeile und ist von dieser
+        Erkennung unberührt - dort validiert bereits die bestehende
+        Konto-/Typ-/Status-Prüfung die explizite menschliche Auswahl.
+
+        Reine Lesevoroperation VOR dem Schreib-Lock (wie die bereits
+        bestehende `verbleibend`-Vorabberechnung in `automatisch_zuordnen`);
+        die eigentliche Buchung bleibt atomar und idempotent (`vorgang_id`/
+        `import_id`) - keine rückwirkende Änderung bereits gebuchter
+        Bestandszeilen."""
+
+        leistungsperiode = erkenne_leistungsperiode(referenz)
+        if leistungsperiode is None:
+            return None, None
+        treffer = [
+            f for f in self._op_service.offene_forderungen(konto_id)
+            if f.leistungsperiode == leistungsperiode and f.quelle_system != "mahnkosten"
+        ]
+        if len(treffer) != 1:
+            return leistungsperiode, None
+        return leistungsperiode, treffer[0].op_position_id
+
     def _zuordnen_atomar(
         self,
         *,
@@ -456,6 +545,8 @@ class BankImportService:
         `infrastructure/db/sqlite_write_lock.py` (Codex-Rückprüfung Paket B,
         `with_for_update` schützt SQLite nicht)."""
 
+        leistungsperiode, bezieht_sich_auf_id = self._resolve_periode_und_forderung(konto.id, transaktion.referenz)
+
         with schreibgesperrte_session(self._session_factory) as session:
             try:
                 op_row = self._op_service.buchen(
@@ -467,6 +558,8 @@ class BankImportService:
                     buchungsdatum=transaktion.buchungsdatum,
                     faelligkeit=None,
                     beleg_referenz=beleg_referenz,
+                    leistungsperiode=leistungsperiode,
+                    bezieht_sich_auf_id=bezieht_sich_auf_id,
                     import_id=f"ZAHLUNG-BANK-{transaktion.id}-{vorgang_id}",
                     quelle_system=quelle_system,
                     bank_transaktion_id=transaktion.id,

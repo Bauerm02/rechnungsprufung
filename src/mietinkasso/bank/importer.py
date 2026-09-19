@@ -95,6 +95,79 @@ def _find_text(element: ET.Element, localname: str) -> str | None:
     return None
 
 
+def _find_element(element: ET.Element, localname: str) -> ET.Element | None:
+    for child in element.iter():
+        if _localname(child.tag) == localname:
+            return child
+    return None
+
+
+def _ist_reversal(quelle: ET.Element, entry: ET.Element) -> bool:
+    """`RvslInd` kann je nach Bank auf `TxDtls`- ODER `Ntry`-Ebene stehen.
+    Bei einer Stornobuchung (Reversal) beschreiben `Dbtr`/`Cdtr` in
+    `RltdPties` laut ISO-20022-Konvention weiterhin die Parteien des
+    URSPRÜNGLICHEN Zahlungsvorgangs, NICHT neu zugeordnet für die
+    Rückbuchungsrichtung - eine einfache richtungsbasierte Auswahl (siehe
+    `_gegenpartei`) würde hier leicht die eigene Kontopartei als
+    vermeintliche Gegenpartei ausweisen. Deshalb wird bei einer erkannten
+    Reversal-Kennzeichnung KEINE Gegenpartei zugeordnet (Betrag/Datum/
+    Referenz/native ID bleiben unberührt) statt stillschweigend
+    fehlzuordnen."""
+
+    wert = _find_text(quelle, "RvslInd") or _find_text(entry, "RvslInd")
+    return (wert or "").strip().lower() == "true"
+
+
+def _gegenpartei(quelle: ET.Element, richtung: str) -> tuple[str | None, str | None]:
+    """Gegenkonto-IBAN/-Name RICHTUNGSABHÄNGIG ermitteln: bei einem
+    Zahlungseingang (CRDT) ist die Gegenpartei der Zahlungspflichtige
+    (`Dbtr`/`DbtrAcct`), bei einem Zahlungsausgang (DBIT) der
+    Zahlungsempfänger (`Cdtr`/`CdtrAcct`) - NIE automatisch die eigene
+    Kontopartei (vorheriger Fehler: `_find_text` nahm unabhängig von der
+    Richtung schlicht das ERSTE `IBAN`/`Nm` im Dokument, was bei DBIT
+    meist `Dbtr` = die eigene Partei traf). Fehlt die Gegenpartei ganz,
+    wird sinnvoll auf die `UltmtDbtr`/`UltmtCdtr`-Partei DERSELBEN Seite
+    zurückgefallen (nur der Name, da diese Partei üblicherweise kein
+    eigenes Konto trägt) - NIEMALS auf die jeweils andere (eigene) Seite,
+    um keine Gegenpartei zu behaupten, wo keine bekannt ist."""
+
+    if richtung == "CRDT":
+        acct_localname, party_localname, ultimate_localname = "DbtrAcct", "Dbtr", "UltmtDbtr"
+    elif richtung == "DBIT":
+        acct_localname, party_localname, ultimate_localname = "CdtrAcct", "Cdtr", "UltmtCdtr"
+    else:
+        raise CamtUnvollstaendigError(
+            f"Unbekanntes Soll/Haben-Kennzeichen '{richtung}' (nur CRDT/DBIT unterstützt); Gegenpartei kann "
+            "nicht sicher zugeordnet werden."
+        )
+
+    acct = _find_element(quelle, acct_localname)
+    iban = _eindeutige_iban(acct) if acct is not None else None
+
+    partei = _find_element(quelle, party_localname)
+    name = _find_text(partei, "Nm") if partei is not None else None
+    if name is None:
+        ultimate_partei = _find_element(quelle, ultimate_localname)
+        name = _find_text(ultimate_partei, "Nm") if ultimate_partei is not None else None
+    return iban, name
+
+
+def _referenz_text(quelle: ET.Element) -> str | None:
+    """Kombiniert unstrukturierte (`RmtInf/Ustrd`) UND strukturierte
+    Zahlungsreferenz (`RmtInf/Strd/CdtrRefInf/Ref`, z. B. eine SCOR-
+    Referenz) - bisher wurde ausschließlich `Ustrd` gelesen und eine rein
+    strukturiert übermittelte Referenz (kein `Ustrd`-Feld) ging verloren.
+    Beide vorhanden -> beide durch ein Leerzeichen getrennt zusammen
+    erfasst, damit spätere Referenz-basierte Zuordnung (`_VERTRAG_REFERENZ`
+    in `bank.service`) auf beiden Quellen suchen kann."""
+
+    unstrukturiert = _find_text(quelle, "Ustrd")
+    strukturiert = _find_text(quelle, "Ref")
+    if unstrukturiert and strukturiert and strukturiert not in unstrukturiert:
+        return f"{unstrukturiert} {strukturiert}"
+    return unstrukturiert or strukturiert
+
+
 def _to_cents(value: str) -> int:
     try:
         return int((Decimal(value) * 100).to_integral_value())
@@ -240,6 +313,11 @@ def parse_camt053(xml_bytes: bytes, *, erwartete_iban: str) -> list[RohTransakti
         richtung = _find_text(entry, "CdtDbtInd")
         if richtung is None:
             raise CamtUnvollstaendigError("Ntry ohne CdtDbtInd (Soll/Haben-Kennzeichen) gefunden.")
+        if richtung not in ("CRDT", "DBIT"):
+            raise CamtUnvollstaendigError(
+                f"Ntry mit unbekanntem CdtDbtInd-Wert '{richtung}' (nur CRDT/DBIT unterstützt); "
+                "Zeile wird nicht still einer Richtung zugeordnet."
+            )
         if richtung == "DBIT":
             entry_betrag_cent = -entry_betrag_cent
 
@@ -260,9 +338,11 @@ def parse_camt053(xml_bytes: bytes, *, erwartete_iban: str) -> list[RohTransakti
 
         if len(tx_dtls_liste) <= 1:
             quelle = tx_dtls_liste[0] if tx_dtls_liste else entry
-            referenz = _find_text(quelle, "Ustrd")
-            gegenkonto_iban = _find_text(quelle, "IBAN")
-            gegenkonto_name = _find_text(quelle, "Nm")
+            referenz = _referenz_text(quelle)
+            if _ist_reversal(quelle, entry):
+                gegenkonto_iban, gegenkonto_name = None, None
+            else:
+                gegenkonto_iban, gegenkonto_name = _gegenpartei(quelle, richtung)
             native_id = _find_text(quelle, "AcctSvcrRef") or _find_text(entry, "AcctSvcrRef")
             ergebnisse.append(
                 _bauen_camt_zeile(
@@ -297,10 +377,14 @@ def parse_camt053(xml_bytes: bytes, *, erwartete_iban: str) -> list[RohTransakti
             if richtung == "DBIT":
                 tx_betrag_cent = -tx_betrag_cent
             teil_betraege.append(tx_betrag_cent)
+            if _ist_reversal(tx_dtls, entry):
+                tx_gegenkonto_iban, tx_gegenkonto_name = None, None
+            else:
+                tx_gegenkonto_iban, tx_gegenkonto_name = _gegenpartei(tx_dtls, richtung)
             teil_zeilen.append(
                 _bauen_camt_zeile(
                     tx_betrag_cent, tx_waehrung, buchungsdatum, valuta,
-                    _find_text(tx_dtls, "Ustrd"), _find_text(tx_dtls, "IBAN"), _find_text(tx_dtls, "Nm"),
+                    _referenz_text(tx_dtls), tx_gegenkonto_iban, tx_gegenkonto_name,
                     _find_text(tx_dtls, "AcctSvcrRef"),
                 )
             )

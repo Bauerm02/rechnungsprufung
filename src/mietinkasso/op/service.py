@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import OPTyp
-from mietinkasso.domain.exceptions import DoppelteEroeffnungsartError
+from mietinkasso.domain.exceptions import DoppelteEroeffnungsartError, ZahlungsbindungInkonsistentError
 from mietinkasso.infrastructure.db.tables import KontoTable, OPPositionTable
 from mietinkasso.op.repository import OPRepository
 from mietinkasso.stammdaten.repository import StammdatenRepository
@@ -60,6 +60,52 @@ def _effect_cent(row: OPPositionTable) -> int:
     if typ is OPTyp.KORREKTUR:
         return row.betrag_cent  # sign carried explicitly by the caller
     raise ValueError(f"Unbekannter OP-Typ {row.typ}")
+
+
+def validiere_zahlungsbindung(zahlung: OPPositionTable, forderung: OPPositionTable) -> None:
+    """Plausibilisiert eine explizite Zahlungszweckbindung
+    (`zahlung.bezieht_sich_auf_id == forderung.id`) BEVOR ihr Betrag der
+    Zielforderung vorrangig vor der generischen FIFO-Verteilung
+    zugeordnet wird: gleiche Kontozugehörigkeit, und - falls auf BEIDEN
+    Seiten eine `leistungsperiode` hinterlegt ist - deren Übereinstimmung.
+    Eine Abweichung deutet auf eine falsche/ambige Bindung hin (z. B.
+    eine verwechselte OP-ID) und wird NICHT stillschweigend generisch
+    per FIFO verteilt, sondern als Dateninkonsistenz abgelehnt."""
+
+    if zahlung.konto_id != forderung.konto_id:
+        raise ZahlungsbindungInkonsistentError(
+            f"Zahlung #{zahlung.id} (Konto {zahlung.konto_id}) referenziert über bezieht_sich_auf_id eine "
+            f"Forderung #{forderung.id} eines ANDEREN Kontos ({forderung.konto_id})."
+        )
+    if zahlung.leistungsperiode and forderung.leistungsperiode and zahlung.leistungsperiode != forderung.leistungsperiode:
+        raise ZahlungsbindungInkonsistentError(
+            f"Zahlung #{zahlung.id} (Leistungsperiode {zahlung.leistungsperiode}) referenziert über "
+            f"bezieht_sich_auf_id eine Forderung #{forderung.id} mit ABWEICHENDER Leistungsperiode "
+            f"({forderung.leistungsperiode})."
+        )
+
+
+def resolve_zahlungsziel(
+    zahlung: OPPositionTable, forderung_by_id: dict[int, OPPositionTable]
+) -> OPPositionTable:
+    """Löst `zahlung.bezieht_sich_auf_id` gegen die aktiven Forderungen
+    DIESES Kontos auf (`forderung_by_id`, bereits konto-/typ-gefiltert
+    von `offene_forderungen`/`balance_zeitreihe_fuer_forderung`). Weder
+    eine unbekannte/stornierte Ziel-ID noch eine widersprüchliche
+    Leistungsperiode werden stillschweigend als "unbekannt = generisch
+    verteilen" behandelt - beides ist eine echte Fehlbindung, die den
+    Reststand verfälschen würde, würde sie stattdessen per FIFO
+    verdeckt."""
+
+    ziel = forderung_by_id.get(zahlung.bezieht_sich_auf_id)
+    if ziel is None:
+        raise ZahlungsbindungInkonsistentError(
+            f"Zahlung #{zahlung.id} referenziert über bezieht_sich_auf_id die Position "
+            f"#{zahlung.bezieht_sich_auf_id}, die keine aktive Forderung dieses Kontos ist (unbekannt, "
+            "storniert, fremdes Konto oder kein Forderungstyp)."
+        )
+    validiere_zahlungsbindung(zahlung, ziel)
+    return ziel
 
 
 @dataclass(frozen=True)
@@ -499,12 +545,27 @@ class OPService:
 
     # -- Forderungen (für das Mahnwesen) -------------------------------------
     def offene_forderungen(self, konto_id: str, *, heute: date | None = None) -> list["OffeneForderung"]:
-        """Ordnet Zahlungen/Gutschriften den ältesten offenen Forderungen
-        FIFO zu, damit jede Forderung (Eröffnung/Soll/Rücklastschrift) ihren
-        EIGENEN Reststand und damit ihren eigenen Mahnzyklus hat - eine
-        Nettosumme über das ganze Konto ist keine Mahngrundlage (Fachregel:
-        Soll-/Habensalden je Forderung getrennt führen). Nur Forderungen mit
-        rest_cent > 0 werden zurückgegeben."""
+        """Ordnet Zahlungen/Gutschriften den offenen Forderungen zu, damit
+        jede Forderung (Eröffnung/Soll/Rücklastschrift) ihren EIGENEN
+        Reststand und damit ihren eigenen Mahnzyklus hat - eine Nettosumme
+        über das ganze Konto ist keine Mahngrundlage (Fachregel: Soll-/
+        Habensalden je Forderung getrennt führen). Nur Forderungen mit
+        rest_cent > 0 werden zurückgegeben.
+
+        Codex-Rückprüfung (echter Bug): eine Zahlung/Gutschrift mit
+        EXPLIZITER Zahlungszweckbindung (`bezieht_sich_auf_id`) wurde
+        bisher wie jede andere ungebundene Zahlung blind in einen
+        gemeinsamen Minderungs-Pool geworfen und rein chronologisch
+        (FIFO nach Fälligkeit/Belegdatum) verteilt - eine gezielte
+        September-Zahlung konnte so fälschlich zuerst eine ÄLTERE,
+        unbezogene Forderung tilgen, während die tatsächlich gemeinte
+        September-Forderung offen blieb (Gesamtsaldo blieb dabei richtig,
+        nur die Verteilung auf die einzelnen Forderungen war falsch).
+        JETZT: eine gebundene Zahlung deckt IMMER zuerst ihre explizite
+        Zielforderung (bis zu deren eigenem Restbetrag); nur ein
+        tatsächlicher ÜBERSCHUSS darüber hinaus fließt in den generischen
+        FIFO-Pool für die übrigen Forderungen - kein Doppelverbrauch,
+        keine verdeckte Fehlbindung (siehe `resolve_zahlungsziel`)."""
 
         positionen = self._op_repository.list_aktiv(konto_id)
 
@@ -516,12 +577,20 @@ class OPService:
         # spurlos verschwinden, ohne spätere Forderungen zu mindern.
         forderungs_rows = [p for p in positionen if OPTyp(p.typ) in _POSITIVE_TYPEN and p.betrag_cent > 0]
         forderungs_rows.sort(key=lambda p: (p.faelligkeit or p.belegdatum, p.belegdatum, p.id))
+        forderung_by_id = {p.id: p for p in forderungs_rows}
+        rest_by_id = {p.id: p.betrag_cent for p in forderungs_rows}
 
         minderungs_pool = 0
         for p in positionen:
             typ = OPTyp(p.typ)
             if typ in _NEGATIVE_TYPEN:
-                minderungs_pool += p.betrag_cent
+                betrag = p.betrag_cent
+                if p.bezieht_sich_auf_id is not None:
+                    ziel = resolve_zahlungsziel(p, forderung_by_id)
+                    abzug = min(betrag, rest_by_id[ziel.id])
+                    rest_by_id[ziel.id] -= abzug
+                    betrag -= abzug  # nur ein tatsächlicher Überschuss fließt in den generischen Pool
+                minderungs_pool += betrag
             elif typ in _POSITIVE_TYPEN and p.betrag_cent < 0:
                 minderungs_pool += -p.betrag_cent
             elif typ is OPTyp.KORREKTUR:
@@ -531,8 +600,8 @@ class OPService:
 
         ergebnisse: list[OffeneForderung] = []
         for p in forderungs_rows:
-            rest = p.betrag_cent
-            if minderungs_pool > 0:
+            rest = rest_by_id[p.id]
+            if minderungs_pool > 0 and rest > 0:
                 abzug = min(minderungs_pool, rest)
                 rest -= abzug
                 minderungs_pool -= abzug

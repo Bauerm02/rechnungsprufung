@@ -299,6 +299,433 @@ def test_camt053_fremdwaehrung_wird_blockiert(bank_service, bank_repo, ctx_facto
 
 
 # ---------------------------------------------------------------------------
+# HV-20260919-GEORGE-CODE, Fix 1: CAMT-Gegenpartei richtungsabhängig statt
+# der eigenen Kontopartei bei DBIT (Codex-Fund). Dbtr/DbtrAcct gehört zur
+# Gegenpartei nur bei CRDT, Cdtr/CdtrAcct nur bei DBIT.
+# ---------------------------------------------------------------------------
+
+
+def _camt_ntry(*, betrag: str, richtung: str, rltd_pties: str, extra: str = "", ref_extra: str = "") -> str:
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
+  <BkToCstmrStmt>
+    <Stmt>
+      <Acct><Id><IBAN>AT000000000000000000</IBAN></Id></Acct>
+      <Ntry>
+        <Amt Ccy="EUR">{betrag}</Amt>
+        <CdtDbtInd>{richtung}</CdtDbtInd>
+        {extra}
+        <BookgDt><Dt>2026-09-06</Dt></BookgDt>
+        <NtryDtls>
+          <TxDtls>
+            <RmtInf><Ustrd>Zahlung</Ustrd>{ref_extra}</RmtInf>
+            <RltdPties>{rltd_pties}</RltdPties>
+            <AcctSvcrRef>REF-GC-1</AcctSvcrRef>
+          </TxDtls>
+        </NtryDtls>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>
+"""
+
+
+def test_camt053_dbit_gegenpartei_ist_zahlungsempfaenger_nicht_eigene_kontopartei(bank_service, bank_repo, ctx_factory):
+    """Konkreter Codex-Fund: bei einem Zahlungsausgang (DBIT) muss die
+    Gegenpartei der Zahlungsempfänger (Cdtr/CdtrAcct) sein - NICHT die
+    eigene Kontopartei (Dbtr/DbtrAcct, die bei einem Zahlungsausgang oft
+    zufällig VOR Cdtr im Dokument steht und bisher blind als erste
+    IBAN/Nm-Fundstelle übernommen wurde)."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    xml = _camt_ntry(
+        betrag="250.00", richtung="DBIT",
+        rltd_pties=(
+            "<Dbtr><Nm>7D Immobilien GmbH (eigenes Konto)</Nm></Dbtr>"
+            "<DbtrAcct><Id><IBAN>AT000000000000000000</IBAN></Id></DbtrAcct>"
+            "<Cdtr><Nm>Handwerker Mustermann OG</Nm></Cdtr>"
+            "<CdtrAcct><Id><IBAN>AT111111111111111111</IBAN></Id></CdtrAcct>"
+        ),
+    )
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+    assert len(transaktionen) == 1
+    tx = transaktionen[0]
+    assert tx.betrag_cent == -25_000
+    assert tx.gegenkonto_name == "Handwerker Mustermann OG"
+    assert tx.gegenkonto_iban == "AT111111111111111111"
+    assert tx.gegenkonto_name != "7D Immobilien GmbH (eigenes Konto)"
+    assert tx.gegenkonto_iban != "AT000000000000000000"
+
+
+def test_camt053_crdt_gegenpartei_ist_zahlungspflichtiger(bank_service, bank_repo, ctx_factory):
+    """Positivfall/Regressionsschutz: bei einem Zahlungseingang (CRDT)
+    bleibt die Gegenpartei der Zahlungspflichtige (Dbtr/DbtrAcct)."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    xml = _camt_ntry(
+        betrag="600.00", richtung="CRDT",
+        rltd_pties=(
+            "<Dbtr><Nm>Max Mustermieter</Nm></Dbtr>"
+            "<DbtrAcct><Id><IBAN>AT222222222222222222</IBAN></Id></DbtrAcct>"
+            "<Cdtr><Nm>7D Immobilien GmbH (eigenes Konto)</Nm></Cdtr>"
+            "<CdtrAcct><Id><IBAN>AT000000000000000000</IBAN></Id></CdtrAcct>"
+        ),
+    )
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+    tx = transaktionen[0]
+    assert tx.betrag_cent == 60_000
+    assert tx.gegenkonto_name == "Max Mustermieter"
+    assert tx.gegenkonto_iban == "AT222222222222222222"
+
+
+def test_camt053_dbit_ohne_cdtr_faellt_auf_ultimate_creditor_zurueck_nie_auf_eigene_seite(
+    bank_service, bank_repo, ctx_factory
+):
+    """Fehlt die direkte Cdtr-Partei, ist ein sinnvoller Fallback die
+    UltmtCdtr-Partei (derselben Seite) - NIEMALS Dbtr (die eigene
+    Kontopartei), auch wenn sonst gar keine Gegenpartei bekannt ist."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    xml = _camt_ntry(
+        betrag="80.00", richtung="DBIT",
+        rltd_pties=(
+            "<Dbtr><Nm>7D Immobilien GmbH (eigenes Konto)</Nm></Dbtr>"
+            "<UltmtCdtr><Nm>Endbegünstigter GmbH</Nm></UltmtCdtr>"
+        ),
+    )
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+    tx = transaktionen[0]
+    assert tx.gegenkonto_name == "Endbegünstigter GmbH"
+    assert tx.gegenkonto_iban is None  # UltmtCdtr trägt kein eigenes Konto - kein erfundener Wert
+
+
+def test_camt053_dbit_ohne_jede_gegenpartei_bleibt_unbekannt_statt_eigene_seite_zu_behaupten(
+    bank_service, bank_repo, ctx_factory
+):
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    xml = _camt_ntry(
+        betrag="80.00", richtung="DBIT",
+        rltd_pties="<Dbtr><Nm>7D Immobilien GmbH (eigenes Konto)</Nm></Dbtr>",
+    )
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+    tx = transaktionen[0]
+    assert tx.gegenkonto_name is None
+    assert tx.gegenkonto_iban is None
+
+
+def test_camt053_unbekannte_richtung_wird_nicht_still_zugeordnet(bank_service, bank_repo, ctx_factory):
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    xml = _camt_ntry(betrag="80.00", richtung="XTND", rltd_pties="<Dbtr><Nm>Irgendwer</Nm></Dbtr>")
+    with pytest.raises(CamtUnvollstaendigError):
+        bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+
+
+def test_camt053_reversal_ordnet_gegenpartei_nicht_der_eigenen_seite_zu(bank_service, bank_repo, ctx_factory):
+    """Bei einer Stornobuchung (RvslInd=true) beschreiben Dbtr/Cdtr laut
+    ISO-20022-Konvention weiterhin die Parteien des URSPRÜNGLICHEN
+    Zahlungsvorgangs - eine naive richtungsbasierte Auswahl würde hier
+    leicht die eigene Kontopartei als Gegenpartei ausweisen. Der Import
+    lehnt eine Zuordnung ab (Gegenpartei bleibt unbekannt), Betrag/
+    Richtung/Referenz bleiben aber unverändert korrekt."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    xml = _camt_ntry(
+        betrag="80.00", richtung="CRDT", extra="<RvslInd>true</RvslInd>",
+        rltd_pties=(
+            "<Dbtr><Nm>7D Immobilien GmbH (eigenes Konto)</Nm></Dbtr>"
+            "<Cdtr><Nm>Ursprünglicher Empfänger GmbH</Nm></Cdtr>"
+        ),
+    )
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+    tx = transaktionen[0]
+    assert tx.betrag_cent == 8_000  # Richtung/Betrag bleiben unberührt
+    assert tx.gegenkonto_name is None
+    assert tx.gegenkonto_iban is None
+
+
+def test_camt053_strukturierte_scor_referenz_wird_zusaetzlich_erfasst(bank_service, bank_repo, ctx_factory):
+    """Eine strukturierte Zahlungsreferenz (RmtInf/Strd/CdtrRefInf/Ref,
+    z. B. SCOR) ging bisher verloren, wenn kein Ustrd-Feld vorhanden war
+    - jetzt wird sie zusätzlich (bzw. bei fehlendem Ustrd allein)
+    erfasst."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    nur_strukturiert = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
+  <BkToCstmrStmt>
+    <Stmt>
+      <Acct><Id><IBAN>AT000000000000000000</IBAN></Id></Acct>
+      <Ntry>
+        <Amt Ccy="EUR">600.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <BookgDt><Dt>2026-09-06</Dt></BookgDt>
+        <NtryDtls>
+          <TxDtls>
+            <RmtInf><Strd><CdtrRefInf><Ref>RF18539007547034</Ref></CdtrRefInf></Strd></RmtInf>
+            <RltdPties><Dbtr><Nm>Max Mustermieter</Nm></Dbtr></RltdPties>
+            <AcctSvcrRef>REF-SCOR-1</AcctSvcrRef>
+          </TxDtls>
+        </NtryDtls>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>
+"""
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=nur_strukturiert.encode("utf-8"))
+    assert transaktionen[0].referenz == "RF18539007547034"
+
+
+def test_camt053_mehrteilige_ntry_ordnet_jede_teilzeile_richtungsabhaengig_zu(bank_service, bank_repo, ctx_factory):
+    """Multi-TxDtls: jede Teilzeile bekommt ihre EIGENE, richtungsabhängige
+    Gegenpartei aus ihrer EIGENEN RltdPties - nicht die der ersten Zeile
+    und nicht die eigene Kontopartei."""
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
+  <BkToCstmrStmt>
+    <Stmt>
+      <Acct><Id><IBAN>AT000000000000000000</IBAN></Id></Acct>
+      <Ntry>
+        <Amt Ccy="EUR">150.00</Amt>
+        <CdtDbtInd>DBIT</CdtDbtInd>
+        <BookgDt><Dt>2026-09-06</Dt></BookgDt>
+        <NtryDtls>
+          <TxDtls>
+            <Amt Ccy="EUR">100.00</Amt>
+            <RmtInf><Ustrd>Rechnung A</Ustrd></RmtInf>
+            <RltdPties>
+              <Dbtr><Nm>7D Immobilien GmbH (eigenes Konto)</Nm></Dbtr>
+              <Cdtr><Nm>Lieferant A</Nm></Cdtr>
+            </RltdPties>
+            <AcctSvcrRef>REF-MULTI-A</AcctSvcrRef>
+          </TxDtls>
+          <TxDtls>
+            <Amt Ccy="EUR">50.00</Amt>
+            <RmtInf><Ustrd>Rechnung B</Ustrd></RmtInf>
+            <RltdPties>
+              <Dbtr><Nm>7D Immobilien GmbH (eigenes Konto)</Nm></Dbtr>
+              <Cdtr><Nm>Lieferant B</Nm></Cdtr>
+            </RltdPties>
+            <AcctSvcrRef>REF-MULTI-B</AcctSvcrRef>
+          </TxDtls>
+        </NtryDtls>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>
+"""
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+    assert len(transaktionen) == 2
+    nach_name = {tx.gegenkonto_name: tx for tx in transaktionen}
+    assert nach_name["Lieferant A"].betrag_cent == -10_000
+    assert nach_name["Lieferant B"].betrag_cent == -5_000
+    assert "7D Immobilien GmbH (eigenes Konto)" not in nach_name
+
+
+# ---------------------------------------------------------------------------
+# HV-20260919-GEORGE-CODE, Codex-Nachforderung: End-to-End-Verbindung
+# Bankzweck -> OP.leistungsperiode -> offene_forderungen. `_zuordnen_atomar`
+# bucht die ZAHLUNG bisher ohne leistungsperiode/bezieht_sich_auf_id - erst
+# damit wirkt sich die explizite Bindungsregel (Fix 2) auf ECHTE
+# Bankzuordnungen aus, nicht nur auf manuell im Test gesetzte Bindungen.
+# ---------------------------------------------------------------------------
+
+
+def test_automatische_zuordnung_erkennt_expliziten_mietmonat_und_bindet_forderung(
+    bank_service, bank_repo, basis_vertrag, ctx_factory,
+):
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+
+    september_soll = bank_service._op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="Miete September",
+    )
+
+    xml = CAMT_XML.replace("VERTRAG:V-601-3 Miete April", "VERTRAG:V-601-3 Miete 09/2026")
+    transaktionen = bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+    transaktion = transaktionen[0]
+    assert transaktion.betrag_cent == 60_000
+
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=transaktion)
+    assert ergebnis.zugeordnet is True
+
+    op_row = bank_service._op_service.get_position(ergebnis.op_position_id)
+    assert op_row.leistungsperiode == "2026-09"
+    assert op_row.bezieht_sich_auf_id == september_soll.id
+
+    # Ende-zu-Ende: die explizite Bindung wirkt sich auf offene_forderungen
+    # aus - die September-Forderung ist gedeckt, KEIN reines FIFO mehr.
+    forderungen = bank_service._op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))
+    assert september_soll.id not in {f.op_position_id for f in forderungen}
+
+
+def test_manuelle_zuordnung_wendet_dieselbe_periodenregel_an_wie_automatische(
+    bank_service, bank_repo, basis_vertrag, ctx_factory,
+):
+    """Codex-Vorgabe: identische Regel für automatische UND manuelle
+    Bankzuordnung, da beide über _zuordnen_atomar laufen."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+
+    september_soll = bank_service._op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="Miete September",
+    )
+
+    transaktion = _bank_datei_importieren_fuer_test(
+        bank_service, bank_repo, ctx, bank_konto_id="BK-MANUELL-PERIODE", betrag_text="600.00",
+        referenz="September 2026",
+    )
+
+    zuordnung = bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=60_000,
+        beleg_referenz="Manuelle Zuordnung", vorgang_id="MANUELL-PERIODE-1",
+    )
+    op_row = bank_service._op_service.get_position(zuordnung.op_position_id)
+    assert op_row.leistungsperiode == "2026-09"
+    assert op_row.bezieht_sich_auf_id == september_soll.id
+
+
+def test_mehrdeutiger_mietzweck_wird_nicht_automatisch_per_fifo_gebunden(
+    bank_service, bank_repo, basis_vertrag, ctx_factory,
+):
+    """Ein mehrmonatiger/mehrdeutiger Zweck bleibt bewusst UNGEBUNDEN
+    (weder leistungsperiode noch bezieht_sich_auf_id) - die Referenz
+    selbst bleibt am Beleg sichtbar/prüfbar, statt einen der beiden Monate
+    zu erraten."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_service._op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
+        leistungsperiode="2026-08", beleg_referenz="Miete August",
+    )
+    september_soll = bank_service._op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="Miete September",
+    )
+
+    transaktion = _bank_datei_importieren_fuer_test(
+        bank_service, bank_repo, ctx, bank_konto_id="BK-MEHRDEUTIG", betrag_text="600.00",
+        referenz="Miete 08/2026 und 09/2026",
+    )
+    zuordnung = bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=60_000,
+        beleg_referenz="Manuelle Zuordnung mehrdeutig", vorgang_id="MEHRDEUTIG-1",
+    )
+    op_row = bank_service._op_service.get_position(zuordnung.op_position_id)
+    assert op_row.leistungsperiode is None
+    assert op_row.bezieht_sich_auf_id is None
+
+    # Ohne Bindung bleibt es beim klassischen FIFO (ältere Forderung zuerst
+    # gedeckt) - kein Fehler, aber auch keine erratene Zielforderung: die
+    # ÄLTERE Augustforderung ist getilgt, September bleibt VOLL offen.
+    forderungen = {f.op_position_id: f for f in bank_service._op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))}
+    assert forderungen[september_soll.id].rest_cent == 60_000
+
+
+def test_mietmonat_ohne_passende_forderung_bleibt_ohne_bindung_aber_sichtbar(
+    bank_service, bank_repo, basis_vertrag, ctx_factory,
+):
+    """Ein eindeutig erkannter Monat ohne (noch) existierende Forderung
+    dieser Periode wird trotzdem auf der Zahlung vermerkt (prüfbar), aber
+    NICHT an irgendeine andere Forderung gebunden."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    transaktion = _bank_datei_importieren_fuer_test(
+        bank_service, bank_repo, ctx, bank_konto_id="BK-OHNE-FORDERUNG", betrag_text="600.00",
+        referenz="Miete 09/2026",
+    )
+    zuordnung = bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=60_000,
+        beleg_referenz="Manuelle Zuordnung ohne Forderung", vorgang_id="OHNE-FORDERUNG-1",
+    )
+    op_row = bank_service._op_service.get_position(zuordnung.op_position_id)
+    assert op_row.leistungsperiode == "2026-09"
+    assert op_row.bezieht_sich_auf_id is None
+
+
+def test_mehrere_forderungen_derselben_periode_bleiben_ohne_automatische_bindung(
+    bank_service, bank_repo, basis_vertrag, ctx_factory,
+):
+    """Zwei eigenständige Forderungen mit DERSELBEN Periode (z. B. HMZ und
+    BK separat gebucht) sind selbst bei eindeutig erkanntem Monat nicht
+    eindeutig zuordenbar - keine automatische Bindung, aber auch keine
+    stillschweigend falsche."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_service._op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="HMZ September",
+    )
+    bank_service._op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=10_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="BK September",
+    )
+    transaktion = _bank_datei_importieren_fuer_test(
+        bank_service, bank_repo, ctx, bank_konto_id="BK-MEHRERE-FORDERUNGEN", betrag_text="600.00",
+        referenz="Miete 09/2026",
+    )
+    zuordnung = bank_service.zuordnen_manuell(
+        ctx=ctx, transaktion=transaktion, konto=konto, betrag_cent=60_000,
+        beleg_referenz="Manuelle Zuordnung mehrere Forderungen", vorgang_id="MEHRERE-FORDERUNGEN-1",
+    )
+    op_row = bank_service._op_service.get_position(zuordnung.op_position_id)
+    assert op_row.leistungsperiode == "2026-09"
+    assert op_row.bezieht_sich_auf_id is None
+
+
+def _bank_datei_importieren_fuer_test(bank_service, bank_repo, ctx, *, bank_konto_id, betrag_text, referenz):
+    """Wie `_bank_datei_importieren` in `test_backoffice.py`, aber auf
+    Service-Ebene (ohne HTTP-Client) - importiert genau eine CSV-Zeile und
+    gibt die resultierende, noch unzugeordnete `BankTransaktionTable` zurück."""
+
+    bank_repo.upsert_bank_konto(id=bank_konto_id, gesellschaft_id="7DI", iban=f"AT{bank_konto_id[-10:]:0>10}", bezeichnung=bank_konto_id)
+    bank_konto = bank_repo.get_bank_konto(bank_konto_id)
+    csv_text = f"betrag,datum,referenz\n{betrag_text},2026-09-06,{referenz}\n"
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+    transaktionen = bank_service.importiere_csv(ctx=ctx, bank_konto=bank_konto, text=csv_text, mapping=mapping)
+    return transaktionen[0]
+
+
+# ---------------------------------------------------------------------------
 # CAMT.053 Konto-Validierung (Nutzerauftrag vor Paket C): EBICS-C53 kann
 # kundenweite Sammeldateien mit MEHREREN Konten liefern - kein Stmt/Acct
 # darf pauschal dem ausgewählten Bankkonto zugeordnet werden.

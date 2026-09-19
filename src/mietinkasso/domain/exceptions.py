@@ -63,6 +63,17 @@ class ZuordnungUngueltigError(MietinkassoError):
     remaining balance, Konto/Vertrag mismatch, wrong OP type, ...)."""
 
 
+class ZahlungsbindungInkonsistentError(MietinkassoError):
+    """Eine Zahlung/Gutschrift trägt eine explizite Zahlungszweckbindung
+    (`OPPositionTable.bezieht_sich_auf_id`), deren Ziel sich nicht sicher
+    auflösen lässt: die Ziel-ID ist keine aktive Forderung DIESES Kontos
+    (unbekannt, storniert, falscher Typ), oder Zahlung und Zielforderung
+    tragen widersprüchliche `leistungsperiode`-Angaben. Wird NICHT
+    stillschweigend der generischen FIFO-Verteilung überlassen (das
+    würde eine echte Fehlbindung als scheinbar plausiblen Reststand
+    verdecken), sondern als Dateninkonsistenz abgelehnt."""
+
+
 class VorgangIdKonfliktError(MietinkassoError):
     """A `vorgang_id` was reused for a different bank_transaktion_id/
     op_position_id/betrag_cent than the Zuordnung already stored under it.
