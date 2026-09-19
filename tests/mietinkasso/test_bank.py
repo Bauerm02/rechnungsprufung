@@ -303,6 +303,75 @@ def test_altparser_seed_ohne_native_id_erzeugt_konflikt_statt_stillen_doppelimpo
     assert len(bank_repo.list_unzugeordnet("BK-ALTPARSER")) == 1
 
 
+def test_altparser_seed_mit_null_null_legacy_scor_erzeugt_ebenfalls_konflikt(bank_service, bank_repo, ctx_factory):
+    """Codex-Abnahme 543dab8, Punkt 4: die vorherige Fassung von
+    `_legacy_fingerprint` übersprang den Konfliktvergleich, sobald
+    `legacy_referenz` UND `legacy_gegenkonto_iban` beide `None` waren -
+    das verwechselte "nicht anwendbar (CSV)" mit "ergibt zufällig keine
+    Werte". Ein echtes CAMT-Original mit NUR einer strukturierten
+    SCOR-Referenz (kein Ustrd) und ohne Gegenkonto-IBAN lieferte auch VOR
+    diesem Parser-Update `referenz=None`/`gegenkonto_iban=None` - ein
+    gültiger Altwert, der weiterhin gegengeprüft werden muss. Der NEUE
+    Parser liest jetzt zusätzlich die strukturierte SCOR-Referenz (`Ref`
+    wird non-None), wodurch sich der reguläre Fingerprint ändert - ohne
+    den Fix würde dieselbe wirtschaftliche Zahlung unbemerkt ein zweites
+    Mal eingefügt."""
+
+    from mietinkasso.bank.importer import RohTransaktion
+    from mietinkasso.bank.service import _fingerprint
+    from mietinkasso.infrastructure.db.tables import BankTransaktionTable
+
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-ALTPARSER-SCOR", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-ALTPARSER-SCOR")
+
+    # Simuliert, was der ALTE Parser (vor diesem Fix) für eine Ntry mit
+    # NUR strukturierter SCOR-Referenz (kein Ustrd) und ohne Gegenkonto-IBAN
+    # gespeichert hätte: referenz=None, gegenkonto_iban=None - beide echt
+    # `None`, kein Sonderfall.
+    alter_roh = RohTransaktion(
+        betrag_cent=30_000, waehrung="EUR", buchungsdatum=date(2026, 9, 6), valuta=None,
+        referenz=None, gegenkonto_iban=None, gegenkonto_name="Zahlerin XY", native_id=None,
+        roh_zeile="alt-seed-scor",
+    )
+    alter_fingerprint = _fingerprint("BK-ALTPARSER-SCOR", alter_roh)
+    bank_repo.insert_transaktion_idempotent(
+        BankTransaktionTable(
+            bank_konto_id="BK-ALTPARSER-SCOR", betrag_cent=alter_roh.betrag_cent, waehrung=alter_roh.waehrung,
+            buchungsdatum=alter_roh.buchungsdatum, valuta=None, referenz=alter_roh.referenz,
+            gegenkonto_iban=alter_roh.gegenkonto_iban, gegenkonto_name=alter_roh.gegenkonto_name,
+            quelle_typ="CAMT", quelle_hash="alt-seed-scor-hash", import_id="BK-ALTPARSER-SCOR:CAMT:NOID:alt-seed-scor",
+            hat_native_id=False, fingerprint_hash=alter_fingerprint, roh_zeile="alt-seed-scor",
+        )
+    )
+
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
+  <BkToCstmrStmt>
+    <Stmt>
+      <Acct><Id><IBAN>AT000000000000000000</IBAN></Id></Acct>
+      <Ntry>
+        <Amt Ccy="EUR">300.00</Amt>
+        <CdtDbtInd>CRDT</CdtDbtInd>
+        <BookgDt><Dt>2026-09-06</Dt></BookgDt>
+        <NtryDtls>
+          <TxDtls>
+            <RmtInf><Strd><CdtrRefInf><Ref>SCOR123</Ref></CdtrRefInf></Strd></RmtInf>
+            <RltdPties><Dbtr><Nm>Zahlerin XY</Nm></Dbtr></RltdPties>
+          </TxDtls>
+        </NtryDtls>
+      </Ntry>
+    </Stmt>
+  </BkToCstmrStmt>
+</Document>
+"""
+
+    with pytest.raises(MehrfachbuchungsKonfliktError):
+        bank_service.importiere_camt053(ctx=ctx, bank_konto=bank_konto, xml_bytes=xml.encode("utf-8"))
+
+    assert len(bank_repo.list_unzugeordnet("BK-ALTPARSER-SCOR")) == 1
+
+
 def test_camt053_mehrteilige_ntry_wird_nicht_der_ersten_referenz_zugeordnet(bank_service, bank_repo, ctx_factory):
     ctx = ctx_factory("7DI")
     bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
@@ -943,6 +1012,26 @@ def test_erkenne_leistungsperiode_verwechselt_volles_tagesdatum_nicht_mit_monat(
     Zweck unauffällig (kein Signal, keine Ausnahme)."""
 
     assert erkenne_leistungsperiode("Valuta 2026-09-15") is None
+
+
+# ---------------------------------------------------------------------------
+# Codex-Abnahme 543dab8, Punkt 1: ein volles deutsches Tagesdatum
+# ("TT.MM.JJJJ"/"TT/MM/JJJJ", auch mit Whitespace) enthält zufällig die für
+# sich genommen gültige Teilsequenz "MM.JJJJ" - das darf NICHT als Mietmonat
+# gelesen werden. Eine ECHTE MM/YYYY-Angabe bleibt davon unberührt.
+# ---------------------------------------------------------------------------
+
+
+def test_erkenne_leistungsperiode_verwechselt_volles_deutsches_datum_nicht_mit_monat():
+    assert erkenne_leistungsperiode("Überweisung vom 01.09.2026") is None
+    assert erkenne_leistungsperiode("Zahlung am 1.9.2026 erhalten") is None
+    assert erkenne_leistungsperiode("Fällig 01/09/2026") is None
+    assert erkenne_leistungsperiode("Beleg vom 01. 09. 2026") is None
+
+
+def test_erkenne_leistungsperiode_erkennt_echte_monatsangabe_trotz_datumsmaskierung():
+    assert erkenne_leistungsperiode("Miete 09/2026") == "2026-09"
+    assert erkenne_leistungsperiode("Rechnung vom 01.09.2026 - Miete 09/2026") == "2026-09"
 
 
 def test_automatische_zuordnung_erkennt_mietmonat_mit_whitespace_um_slash_end_to_end(

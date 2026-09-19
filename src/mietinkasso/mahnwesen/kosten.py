@@ -193,10 +193,19 @@ def balance_zeitreihe_fuer_forderung(
 
     Liefert `None`, wenn die Zielforderung unbekannte/keine Fälligkeit
     hat (z. B. eine ungegliederte GESAMTSALDO-Eröffnung) - eine solche
-    Forderung wird NIE fiktiv ab einem erfundenen Datum verzinst."""
+    Forderung wird NIE fiktiv ab einem erfundenen Datum verzinst.
+
+    Codex-Rückprüfung (echter Bug, Runde 3, 543dab8): verteilt jedes
+    Ereignis jetzt über dieselbe `op.service.verteile_minderung`-
+    Hilfsfunktion wie `OPService.offene_forderungen` (statt einer eigenen,
+    parallelen Kopie derselben drei Stufen) - beide Funktionen kamen bei
+    mehreren gleichrangigen Forderungen (z. B. identischer Fälligkeit)
+    bisher zu UNTERSCHIEDLICHEN Ergebnissen, weil `offene_forderungen` den
+    generischen Rest erst gesammelt am Ende verteilte, diese Funktion
+    aber schon je Ereignis - jetzt identisch, Ereignis für Ereignis."""
 
     from mietinkasso.domain.enums import OPTyp
-    from mietinkasso.op.service import resolve_zahlungsziel
+    from mietinkasso.op.service import verteile_minderung
 
     positive_typen = {OPTyp.EROEFFNUNG.value, OPTyp.SOLL.value, OPTyp.RUECKLASTSCHRIFT.value}
     negative_typen = {OPTyp.GUTSCHRIFT.value, OPTyp.ZAHLUNG.value}
@@ -211,73 +220,35 @@ def balance_zeitreihe_fuer_forderung(
 
     # Reduktionsereignisse mit Datum (Zahlung/Gutschrift, negative
     # KORREKTUR, ein Guthaben in einer eigentlich forderungsseitigen
-    # Zeile) - exakt dieselben Quellen wie in `offene_forderungen`, hier
-    # aber mit `buchungsdatum` statt nur als aufsummierter Gesamtpool.
-    # `ziel_id`/`periode` tragen die explizite Zahlungszweckbindung bzw.
-    # `leistungsperiode` (nur für Zahlung/Gutschrift gesetzt) für die
-    # vorrangige Zuordnung unten - beide `None` bedeutet "vollständig
-    # generisch verteilen".
-    ereignisse: list[tuple[date, int, int, int | None, str | None]] = []
+    # Zeile) - exakt dieselben Quellen wie in `offene_forderungen`.
+    # `quelle` trägt für Zahlung/Gutschrift die volle Zeile (für
+    # `bezieht_sich_auf_id`/`leistungsperiode` in `verteile_minderung`),
+    # `None` für die übrigen beiden Ereignisarten (kein Bindungskonzept).
+    ereignisse: list[tuple[date, int, OPPositionTable | None, int]] = []
     for p in alle_positionen:
         if p.typ in negative_typen and p.betrag_cent > 0:
-            ereignisse.append((p.buchungsdatum, p.betrag_cent, p.id, p.bezieht_sich_auf_id, p.leistungsperiode))
+            ereignisse.append((p.buchungsdatum, p.id, p, p.betrag_cent))
         elif p.typ in positive_typen and p.betrag_cent < 0:
-            ereignisse.append((p.buchungsdatum, -p.betrag_cent, p.id, None, None))
+            ereignisse.append((p.buchungsdatum, p.id, None, -p.betrag_cent))
         elif p.typ == OPTyp.KORREKTUR.value and p.betrag_cent < 0:
-            ereignisse.append((p.buchungsdatum, -p.betrag_cent, p.id, None, None))
-    ereignisse.sort(key=lambda e: (e[0], e[2]))
+            ereignisse.append((p.buchungsdatum, p.id, None, -p.betrag_cent))
+    ereignisse.sort(key=lambda e: (e[0], e[1]))
 
     verbleibend = {p.id: p.betrag_cent for p in forderungs_rows}
     aenderungen: list[tuple[date, int]] = []  # (datum, neuer_rest der Zielforderung)
 
-    for ereignis_datum, betrag, _eid, gebundene_ziel_id, periode in ereignisse:
-        rest_zu_verteilen = betrag
-        direktes_ziel_id: int | None = None
-        if gebundene_ziel_id is not None:
-            # Dieselbe Bindungsauflösung/-prüfung wie `offene_forderungen`
-            # (gleiche Kontozugehörigkeit, konsistente Leistungsperiode) -
-            # eine unauflösbare/widersprüchliche Bindung wird auch hier
-            # NICHT stillschweigend generisch verteilt, sondern abgelehnt.
-            zahlung = next(p for p in alle_positionen if p.id == _eid)
-            ziel_row = resolve_zahlungsziel(zahlung, forderung_by_id)
-            direktes_ziel_id = ziel_row.id
-            aktuell = verbleibend[ziel_row.id]
-            abzug = min(aktuell, rest_zu_verteilen)
-            verbleibend[ziel_row.id] = aktuell - abzug
-            rest_zu_verteilen -= abzug
-            if ziel_row.id == ziel_op_position_id:
-                aenderungen.append((ereignis_datum, verbleibend[ziel_row.id]))
-
-        if periode is not None and rest_zu_verteilen > 0:
-            for p in forderungs_rows:
-                if rest_zu_verteilen <= 0:
-                    break
-                if p.id == direktes_ziel_id or p.leistungsperiode != periode:
-                    continue
-                aktuell = verbleibend[p.id]
-                if aktuell <= 0:
-                    continue
-                abzug = min(aktuell, rest_zu_verteilen)
-                verbleibend[p.id] = aktuell - abzug
-                rest_zu_verteilen -= abzug
-                if p.id == ziel_op_position_id:
-                    aenderungen.append((ereignis_datum, verbleibend[p.id]))
-
-        for p in forderungs_rows:
-            if rest_zu_verteilen <= 0:
-                break
-            if p.id == direktes_ziel_id:
-                continue  # bereits oben direkt/vorrangig bedient
-            if periode is not None and p.leistungsperiode == periode:
-                continue  # bereits in der Perioden-Vorrangstufe behandelt
-            aktuell = verbleibend[p.id]
-            if aktuell <= 0:
-                continue
-            abzug = min(aktuell, rest_zu_verteilen)
-            verbleibend[p.id] = aktuell - abzug
-            rest_zu_verteilen -= abzug
-            if p.id == ziel_op_position_id:
-                aenderungen.append((ereignis_datum, verbleibend[p.id]))
+    for ereignis_datum, _eid, quelle, betrag in ereignisse:
+        vor = verbleibend[ziel_op_position_id]
+        verteile_minderung(
+            quelle=quelle,
+            rest_zu_verteilen=betrag,
+            forderungs_rows=forderungs_rows,
+            forderung_by_id=forderung_by_id,
+            rest_by_id=verbleibend,
+        )
+        nach = verbleibend[ziel_op_position_id]
+        if nach != vor:
+            aenderungen.append((ereignis_datum, nach))
 
     perioden: list[BalancePeriode] = []
     aktueller_rest = ziel.betrag_cent

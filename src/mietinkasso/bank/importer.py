@@ -79,6 +79,15 @@ class RohTransaktion:
     # nicht betroffen).
     legacy_gegenkonto_iban: str | None = None
     legacy_referenz: str | None = None
+    # Codex-Rückprüfung 543dab8, Punkt 4: OB der Legacy-Vergleich in
+    # `bank.service._legacy_fingerprint` überhaupt greift, muss an der
+    # QUELLE (CAMT vs. CSV) hängen, NICHT daran, ob `legacy_referenz`/
+    # `legacy_gegenkonto_iban` zufällig beide `None` sind - ein echtes
+    # CAMT-Original mit NUR strukturierter SCOR-Referenz (kein Ustrd) und
+    # ohne Gegenkonto-IBAN lieferte auch VOR diesem Parser-Update
+    # `legacy_referenz=None`/`legacy_gegenkonto_iban=None`; das ist ein
+    # gültiger, prüfbarer Altwert und kein "keine Legacy-Felder vorhanden".
+    quelle_ist_camt: bool = False
 
 
 def _localname(tag: str) -> str:
@@ -494,6 +503,7 @@ def _bauen_camt_zeile(
         roh_zeile=roh_zeile,
         legacy_gegenkonto_iban=legacy_gegenkonto_iban,
         legacy_referenz=legacy_referenz,
+        quelle_ist_camt=True,
     )
 
 

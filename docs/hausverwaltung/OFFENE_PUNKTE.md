@@ -3996,3 +3996,33 @@ Buchung/kein Versand/kein Deployment.
   da der bisherige bare Monatsname jetzt korrekt als mehrdeutig gilt).
   1011/1011 grün im `tests/mietinkasso`-Gesamtlauf (einmalig nach
   Abschluss aller sieben Punkte, wie von Codex verlangt).
+
+## Korrekturrunde 2 zu HV-20260919-GEORGE-CODE: Codex-Abnahme auf Commit
+## 543dab8 (25/27 grün) — vier belegte Randfehler behoben (19.09.2026)
+
+1. **Volles deutsches Tagesdatum "01.09.2026" ergab fälschlich Periode
+   2026-09** (enthält zufällig die gültige Teilsequenz "09.2026").
+   `erkenne_leistungsperiode` maskiert jetzt jedes volle Tagesdatum
+   (TT.MM.JJJJ/TT/MM/JJJJ, auch mit Whitespace) VOR jeder Erkennung aus;
+   eine echte MM/YYYY-Angabe im selben Text bleibt erkennbar.
+2. **Zahlung mit `leistungsperiode` ohne JEDE Forderung dieser Periode
+   fiel noch in den generischen Pool** und tilgte eine ältere,
+   unbeteiligte Periode. Neue gemeinsame Hilfsfunktion
+   `op.service.verteile_minderung`: existiert für die vermerkte Periode
+   überhaupt keine Forderung, bleibt der Betrag ein ungeklärtes/
+   gebundenes Guthaben statt generisch verteilt zu werden - gilt
+   identisch für `offene_forderungen` und die Zinsberechnung.
+3. **OP und Zinsen blieben inkonsistent**, weil `offene_forderungen` den
+   generischen Rest bisher gesammelt erst am Ende verteilte, die
+   Zinsberechnung aber schon je Ereignis. Beide Funktionen rufen jetzt je
+   Minderungsereignis dieselbe `verteile_minderung`-Hilfsfunktion auf.
+4. **`_legacy_fingerprint` übersprang den Konfliktvergleich, wenn Legacy-
+   IBAN UND Legacy-Ustrd zufällig beide `None` waren** - das verwechselte
+   "nicht anwendbar (CSV)" mit "ergibt zufällig keine Werte" (ein echtes
+   CAMT-Original mit nur SCOR-Referenz ohne IBAN lieferte auch vor diesem
+   Fix beide Felder `None`). Neuer Marker `RohTransaktion.quelle_ist_camt`
+   entscheidet jetzt statt der Null-Heuristik.
+
+Ausschließlich synthetische Testdaten, keine Buchung/kein Versand/kein
+Deployment. 1018/1018 grün im `tests/mietinkasso`-Gesamtlauf (einmaliger
+Lauf nach Abschluss aller vier Punkte).

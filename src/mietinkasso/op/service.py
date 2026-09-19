@@ -108,6 +108,84 @@ def resolve_zahlungsziel(
     return ziel
 
 
+def verteile_minderung(
+    *,
+    quelle: OPPositionTable | None,
+    rest_zu_verteilen: int,
+    forderungs_rows: list[OPPositionTable],
+    forderung_by_id: dict[int, OPPositionTable],
+    rest_by_id: dict[int, int],
+) -> None:
+    """Verteilt EIN einzelnes Minderungsereignis (Zahlung/Gutschrift,
+    Guthaben in forderungsseitiger Zeile, negative KORREKTUR) UNMITTELBAR
+    auf `rest_by_id` (in place) - GEMEINSAME Hilfslogik für
+    `offene_forderungen` UND `mahnwesen.kosten.balance_zeitreihe_fuer_forderung`,
+    die beide ihre Minderungen chronologisch, EREIGNIS FÜR EREIGNIS mit
+    genau diesem Aufruf verarbeiten müssen (Codex-Rückprüfung 543dab8,
+    Punkt 3: `offene_forderungen` verteilte den generischen Rest bisher
+    erst gesammelt am ENDE, die Zinsberechnung bereits JE EREIGNIS - bei
+    mehreren gleichrangigen Forderungen (z. B. identische Fälligkeit)
+    ergab das je nach Funktion unterschiedliche Restbestände).
+
+    Reihenfolge je Ereignis:
+    1. Ein explizites Ziel (`quelle.bezieht_sich_auf_id`) deckt IMMER
+       zuerst seine Zielforderung, bis zu deren eigenem Restbetrag.
+    2. Ein danach verbleibender Betrag MIT `leistungsperiode` deckt ZUERST
+       alle ÜBRIGEN Forderungen DERSELBEN Periode - ABER NUR, wenn
+       IRGENDEINE Forderung dieser Periode unter `forderungs_rows`
+       überhaupt existiert (nicht nur "hat noch Restbetrag"). Existiert
+       KEINE, bleibt der Betrag ein ungeklärtes/gebundenes Guthaben und
+       wird NICHT in den generischen Pool geschoben (Codex-Rückprüfung
+       543dab8, Punkt 2: eine Zahlung mit `leistungsperiode=2026-09` darf
+       keine Forderung einer ANDEREN, unbeteiligten Periode wie 2026-08
+       tilgen, nur weil für 2026-09 selbst (noch) keine Forderung erfasst
+       ist).
+    3. Ein danach verbleibender Betrag (ohne `leistungsperiode`, oder nach
+       vollständiger Deckung der eigenen Periode) fließt generisch nach
+       Fälligkeit/Belegdatum (`forderungs_rows`-Reihenfolge) auf alle
+       übrigen Forderungen."""
+
+    direktes_ziel_id: int | None = None
+    if quelle is not None and quelle.bezieht_sich_auf_id is not None:
+        ziel = resolve_zahlungsziel(quelle, forderung_by_id)
+        direktes_ziel_id = ziel.id
+        abzug = min(rest_zu_verteilen, rest_by_id[ziel.id])
+        rest_by_id[ziel.id] -= abzug
+        rest_zu_verteilen -= abzug
+
+    periode = quelle.leistungsperiode if quelle is not None else None
+    if periode is not None and rest_zu_verteilen > 0:
+        if not any(p.leistungsperiode == periode for p in forderungs_rows):
+            return  # keine Forderung dieser Periode existiert - Rest bleibt ungeklärtes Guthaben
+        for p in forderungs_rows:
+            if rest_zu_verteilen <= 0:
+                break
+            if p.id == direktes_ziel_id or p.leistungsperiode != periode:
+                continue
+            aktuell = rest_by_id[p.id]
+            if aktuell <= 0:
+                continue
+            abzug = min(aktuell, rest_zu_verteilen)
+            rest_by_id[p.id] -= abzug
+            rest_zu_verteilen -= abzug
+
+    if rest_zu_verteilen <= 0:
+        return
+    for p in forderungs_rows:
+        if rest_zu_verteilen <= 0:
+            break
+        if p.id == direktes_ziel_id:
+            continue
+        if periode is not None and p.leistungsperiode == periode:
+            continue  # bereits in der Perioden-Vorrangstufe behandelt
+        aktuell = rest_by_id[p.id]
+        if aktuell <= 0:
+            continue
+        abzug = min(aktuell, rest_zu_verteilen)
+        rest_by_id[p.id] -= abzug
+        rest_zu_verteilen -= abzug
+
+
 @dataclass(frozen=True)
 class OPSaldo:
     konto_id: str
@@ -588,7 +666,19 @@ class OPService:
         (Buchungsdatum, dann ID) verarbeitet - dieselbe Reihenfolge wie
         `mahnwesen.kosten.balance_zeitreihe_fuer_forderung`, damit beide
         Funktionen bei mehreren Minderungen konsistent bleiben (Mahn- UND
-        Zinsrelevante Restpositionen nutzen identische Logik)."""
+        Zinsrelevante Restpositionen nutzen identische Logik).
+
+        Codex-Rückprüfung (echter Bug, Runde 3, 543dab8): (a) eine
+        periodenmarkierte Zahlung OHNE jede Forderung dieser Periode fiel
+        bisher trotzdem in den generischen Pool und tilgte eine ÄLTERE,
+        unbeteiligte Forderung einer ANDEREN Periode - jetzt bleibt ein
+        solcher Betrag ein ungeklärtes/gebundenes Guthaben (siehe
+        `verteile_minderung`). (b) der generische Rest wurde bisher erst
+        NACH allen Ereignissen gesammelt verteilt, während die
+        Zinsberechnung bereits JE EREIGNIS verteilte - bei mehreren
+        gleichrangigen Forderungen (z. B. identischer Fälligkeit) ergab
+        das unterschiedliche Ergebnisse. Beide Funktionen rufen jetzt je
+        Ereignis dieselbe `verteile_minderung`-Hilfsfunktion auf."""
 
         positionen = self._op_repository.list_aktiv(konto_id, session=session)
 
@@ -621,42 +711,18 @@ class OPService:
                     minderungen.append((p.buchungsdatum, p.id, None, -effekt))
         minderungen.sort(key=lambda m: (m[0], m[1]))
 
-        generischer_pool = 0
         for _datum, _id, quelle, betrag in minderungen:
-            rest_zu_verteilen = betrag
-            direktes_ziel_id: int | None = None
-            periode: str | None = None
-            if quelle is not None:
-                periode = quelle.leistungsperiode
-                if quelle.bezieht_sich_auf_id is not None:
-                    ziel = resolve_zahlungsziel(quelle, forderung_by_id)
-                    direktes_ziel_id = ziel.id
-                    abzug = min(rest_zu_verteilen, rest_by_id[ziel.id])
-                    rest_by_id[ziel.id] -= abzug
-                    rest_zu_verteilen -= abzug
-
-            if periode is not None and rest_zu_verteilen > 0:
-                for p in forderungs_rows:
-                    if rest_zu_verteilen <= 0:
-                        break
-                    if p.id == direktes_ziel_id or p.leistungsperiode != periode:
-                        continue
-                    aktuell = rest_by_id[p.id]
-                    if aktuell <= 0:
-                        continue
-                    abzug = min(aktuell, rest_zu_verteilen)
-                    rest_by_id[p.id] -= abzug
-                    rest_zu_verteilen -= abzug
-
-            generischer_pool += rest_zu_verteilen
+            verteile_minderung(
+                quelle=quelle,
+                rest_zu_verteilen=betrag,
+                forderungs_rows=forderungs_rows,
+                forderung_by_id=forderung_by_id,
+                rest_by_id=rest_by_id,
+            )
 
         ergebnisse: list[OffeneForderung] = []
         for p in forderungs_rows:
             rest = rest_by_id[p.id]
-            if generischer_pool > 0 and rest > 0:
-                abzug = min(generischer_pool, rest)
-                rest -= abzug
-                generischer_pool -= abzug
             if rest > 0:
                 ergebnisse.append(
                     OffeneForderung(

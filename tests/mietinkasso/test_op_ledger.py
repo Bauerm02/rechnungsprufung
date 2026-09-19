@@ -659,6 +659,83 @@ def test_offene_forderungen_periode_ohne_explizite_id_deckt_alle_komponenten_der
     assert forderungen[alt.id].rest_cent == 8_000  # UNBERÜHRT - nicht blind FIFO-getilgt
 
 
+def test_offene_forderungen_periode_ohne_jede_forderung_dieser_periode_bleibt_ungeklaertes_guthaben(
+    op_service, basis_vertrag, ctx_factory,
+):
+    """Codex-Abnahme 543dab8, Punkt 2: existiert für die auf der Zahlung
+    vermerkte `leistungsperiode` GAR KEINE Forderung (nicht nur "bereits
+    ausgeglichene"), darf der Betrag NICHT blind in den generischen
+    FIFO-Pool fallen und eine ÄLTERE, unbeteiligte Periode tilgen. Alt-Soll
+    (2026-08) = 8.000, Zahlung 5.000 mit `leistungsperiode=2026-09` ohne
+    Ziel-ID, obwohl KEINE Forderung mit Periode 2026-09 existiert -> Alt
+    muss vollständig UNBERÜHRT bei 8.000 bleiben."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    alt = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=8_000,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
+        leistungsperiode="2026-08", beleg_referenz="Miete August",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=5_000,
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        leistungsperiode="2026-09", beleg_referenz="Zahlung ohne jede September-Forderung",
+    )
+
+    forderungen = {f.op_position_id: f for f in op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))}
+    assert forderungen[alt.id].rest_cent == 8_000
+
+
+def test_offene_forderungen_generischer_rest_wird_je_ereignis_verteilt_konsistent_mit_zinsberechnung(
+    op_service, basis_vertrag, ctx_factory,
+):
+    """Codex-Abnahme 543dab8, Punkt 3: `offene_forderungen` verteilte den
+    generischen Rest bisher erst NACH allen Ereignissen gesammelt, während
+    `mahnwesen.kosten.balance_zeitreihe_fuer_forderung` bereits JE EREIGNIS
+    verteilte - bei mehreren gleichrangigen Forderungen (identische
+    Fälligkeit) ergab das UNTERSCHIEDLICHE Ergebnisse. Drei Soll-Positionen
+    je 10.000 (Perioden September/August/September, identische Fälligkeit
+    05.09.), eine ungebundene Zahlung 10.000 am 06.09. und eine
+    September-gebundene (ohne Ziel-ID) Zahlung 5.000 am 10.09. müssen
+    beide Funktionen zum IDENTISCHEN Ergebnis führen: ID2 (August)
+    unberührt bei 10.000, ID3 (September) bei 5.000 (ID1 vollständig
+    getilgt)."""
+
+    _, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    id1 = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=10_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="September Komponente A",
+    )
+    id2 = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=10_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-08", beleg_referenz="August-Restforderung, gleiche Fälligkeit",
+    )
+    id3 = op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=10_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="September Komponente B",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=10_000,
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        beleg_referenz="Ungebundene Zahlung",
+    )
+    op_service.buchen(
+        ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=5_000,
+        belegdatum=date(2026, 9, 10), buchungsdatum=date(2026, 9, 10), faelligkeit=None,
+        leistungsperiode="2026-09", beleg_referenz="September-Teilzahlung ohne Ziel-ID",
+    )
+
+    forderungen = {f.op_position_id: f for f in op_service.offene_forderungen(konto.id, heute=date(2026, 9, 15))}
+    assert id1.id not in forderungen  # vollständig durch die ungebundene Zahlung getilgt
+    assert forderungen[id2.id].rest_cent == 10_000  # August unberührt
+    assert forderungen[id3.id].rest_cent == 5_000
+
+
 def test_offene_forderungen_bindung_an_fremdes_konto_wird_abgelehnt(op_service, stammdaten_repo, ctx_factory):
     ctx = ctx_factory("7DI")
     stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")

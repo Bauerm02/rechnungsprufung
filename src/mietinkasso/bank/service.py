@@ -79,6 +79,13 @@ _MONAT_JAHR_ISO = re.compile(r"\b(\d{4})-(0[1-9]|1[0-2])\b(?!\s*-\s*\d{2})")
 # JEDE Erwähnung eines Monatsnamens (auch OHNE Jahr) - allein das Vorkommen
 # zählt schon als "Monat gemeint, aber ggf. nicht eindeutig auflösbar".
 _MONATSNAME_MUSTER = re.compile(r"\b(" + "|".join(_MONATSNAMEN) + r")\b", re.IGNORECASE)
+# Volles Datum TT.MM.JJJJ/TT/MM/JJJJ (auch mit Whitespace um die Trenner) -
+# Codex-Rückprüfung 543dab8, Punkt 1: ein Text wie "Überweisung vom
+# 01.09.2026" enthält zufällig die für sich genommen gültige Teilsequenz
+# "09.2026" (Monat.Jahr) - ein volles Tagesdatum wird deshalb VOR jeder
+# Monatserkennung ausmaskiert, damit nur eine ECHTE MM.YYYY/MM/YYYY-Angabe
+# (ohne vorangestellten Tag) übrig bleibt.
+_VOLLES_DATUM = re.compile(r"\b\d{1,2}\s*[./]\s*\d{1,2}\s*[./]\s*\d{4}\b")
 
 
 def erkenne_leistungsperiode(referenz: str | None) -> str | None:
@@ -87,9 +94,13 @@ def erkenne_leistungsperiode(referenz: str | None) -> str | None:
     (auch mit Whitespace um den Trenner, z. B. "09/ 2026"), ISO "YYYY-MM"
     (nie ein volles Tagesdatum "YYYY-MM-DD"), oder ein voller deutscher
     Monatsname gefolgt von einer 4-stelligen Jahreszahl (z. B.
-    "September 2026"). Liefert `None`, wenn der Text GAR KEIN
-    Monats-Signal enthält (der normale, unauffällige Fall - die
-    allermeisten Bankbewegungen erwähnen keinen Mietmonat).
+    "September 2026"). Ein volles Tagesdatum "TT.MM.JJJJ"/"TT/MM/JJJJ"
+    (z. B. "Überweisung vom 01.09.2026") wird VOR jeder Erkennung
+    ausmaskiert, statt seine eingebettete MM.YYYY-Teilsequenz als
+    Mietmonat misszuverstehen (Codex-Rückprüfung 543dab8). Liefert `None`,
+    wenn der Text GAR KEIN Monats-Signal enthält (der normale,
+    unauffällige Fall - die allermeisten Bankbewegungen erwähnen keinen
+    Mietmonat).
 
     Codex-Rückprüfung b8d700d: KEINE Angabe (kein Monats-Signal
     überhaupt) ist NICHT dasselbe wie MEHRDEUTIG (ein Monat wird zwar
@@ -106,10 +117,16 @@ def erkenne_leistungsperiode(referenz: str | None) -> str | None:
     if not referenz:
         return None
 
-    numerische_treffer = _MONAT_JAHR_NUMERISCH.findall(referenz)
-    iso_treffer = _MONAT_JAHR_ISO.findall(referenz)
-    namens_treffer = _MONAT_NAME_JAHR.findall(referenz)
-    alle_monatsnamen = _MONATSNAME_MUSTER.findall(referenz)
+    # Volle Tagesdaten VOR jeder Signalzählung ausmaskieren (Codex-
+    # Rückprüfung 543dab8, Punkt 1) - sonst würde z. B. "01.09.2026" über
+    # seine eingebettete Teilsequenz "09.2026" fälschlich als Mietmonat
+    # September 2026 erkannt.
+    bereinigt = _VOLLES_DATUM.sub(" ", referenz)
+
+    numerische_treffer = _MONAT_JAHR_NUMERISCH.findall(bereinigt)
+    iso_treffer = _MONAT_JAHR_ISO.findall(bereinigt)
+    namens_treffer = _MONAT_NAME_JAHR.findall(bereinigt)
+    alle_monatsnamen = _MONATSNAME_MUSTER.findall(bereinigt)
 
     anzahl_monatssignale = len(numerische_treffer) + len(iso_treffer) + len(alle_monatsnamen)
     if anzahl_monatssignale == 0:
@@ -249,11 +266,20 @@ def _legacy_fingerprint(bank_konto_id: str, roh: RohTransaktion) -> str | None:
     (alte Gegenpartei-Ermittlung/nur erste Ustrd-Zeile) - der NEUE
     Fingerprint dieser exakt gleichen Zahlung kann davon abweichen, ohne
     dass sich an der Zahlung selbst irgendetwas geändert hätte. Liefert
-    `None`, wenn der Parser keine Legacy-Felder gesetzt hat (z. B.
-    CSV-Zeilen - von diesem Fix nicht betroffen) - dann entfällt der
-    Zusatzvergleich ersatzlos."""
+    `None`, wenn die Zeile NICHT aus dem CAMT-Parser stammt
+    (`roh.quelle_ist_camt`, z. B. CSV-Zeilen - von diesem Fix nicht
+    betroffen) - dann entfällt der Zusatzvergleich ersatzlos.
 
-    if roh.legacy_referenz is None and roh.legacy_gegenkonto_iban is None:
+    Codex-Rückprüfung 543dab8, Punkt 4: die frühere Bedingung prüfte
+    stattdessen, ob BEIDE Legacy-Felder `None` sind - das verwechselte
+    "Legacy-Vergleich nicht anwendbar" mit "Legacy-Vergleich ergibt
+    zufällig keine Werte". Ein echtes CAMT-Original mit NUR einer
+    strukturierten SCOR-Referenz (kein Ustrd) und ohne Gegenkonto-IBAN
+    lieferte auch VOR diesem Parser-Update `referenz=None`/
+    `gegenkonto_iban=None` - genau dieser (gültige) Altwert muss weiter
+    gegengeprüft werden, statt den Vergleich komplett zu überspringen."""
+
+    if not roh.quelle_ist_camt:
         return None
     return _hash(
         {

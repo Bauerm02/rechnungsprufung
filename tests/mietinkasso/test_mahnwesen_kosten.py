@@ -733,6 +733,97 @@ def test_balance_zeitreihe_periode_ohne_explizite_id_deckt_alle_komponenten_ders
     assert all(p.rest_cent == 8_000 for p in perioden_alt)
 
 
+def test_balance_zeitreihe_periode_ohne_jede_forderung_dieser_periode_reduziert_andere_periode_nicht(
+    op_service, admin_ctx, basis_vertrag,
+):
+    """Codex-Abnahme 543dab8, Punkt 2 ("Auch Zinsen dürfen Alt nicht
+    reduzieren"): existiert für die auf der Zahlung vermerkte
+    `leistungsperiode` GAR KEINE Forderung, darf der Betrag NICHT in den
+    generischen Pool fallen und die Verzinsung einer ÄLTEREN, unbeteiligten
+    Periode reduzieren. Alt-Soll (2026-08) = 8.000, Zahlung 5.000 mit
+    `leistungsperiode=2026-09` ohne Ziel-ID, obwohl KEINE Forderung mit
+    Periode 2026-09 existiert -> Alt bleibt durchgehend voll verzinst."""
+
+    from mietinkasso.mahnwesen.kosten import balance_zeitreihe_fuer_forderung
+
+    _, konto = basis_vertrag
+    alt = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=8_000,
+        belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
+        leistungsperiode="2026-08", beleg_referenz="Miete August",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=5_000,
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        leistungsperiode="2026-09", beleg_referenz="Zahlung ohne jede September-Forderung",
+    )
+    alle_positionen = op_service.list_alle_positionen(konto.id)
+
+    perioden_alt = balance_zeitreihe_fuer_forderung(
+        ziel_op_position_id=alt.id, alle_positionen=alle_positionen, heute=date(2026, 9, 10),
+    )
+    assert perioden_alt is not None
+    assert all(p.rest_cent == 8_000 for p in perioden_alt)
+
+
+def test_balance_zeitreihe_und_offene_forderungen_ergeben_bei_mehreren_gleichrangigen_forderungen_identisches_bild(
+    op_service, admin_ctx, basis_vertrag,
+):
+    """Codex-Abnahme 543dab8, Punkt 3: `offene_forderungen` verteilte den
+    generischen Rest bisher erst NACH allen Ereignissen gesammelt,
+    `balance_zeitreihe_fuer_forderung` bereits JE EREIGNIS - bei mehreren
+    gleichrangigen Forderungen (identische Fälligkeit) ergab das
+    UNTERSCHIEDLICHE Ergebnisse (ID2/ID3 vertauscht). Beide Funktionen
+    müssen jetzt exakt dasselbe Bild liefern: ID2 (August) unberührt bei
+    10.000, ID3 (September) bei 5.000."""
+
+    from mietinkasso.mahnwesen.kosten import balance_zeitreihe_fuer_forderung
+
+    _, konto = basis_vertrag
+    id1 = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=10_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="September Komponente A",
+    )
+    id2 = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=10_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-08", beleg_referenz="August-Restforderung, gleiche Fälligkeit",
+    )
+    id3 = op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=10_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
+        leistungsperiode="2026-09", beleg_referenz="September Komponente B",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=10_000,
+        belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
+        beleg_referenz="Ungebundene Zahlung",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=5_000,
+        belegdatum=date(2026, 9, 10), buchungsdatum=date(2026, 9, 10), faelligkeit=None,
+        leistungsperiode="2026-09", beleg_referenz="September-Teilzahlung ohne Ziel-ID",
+    )
+    alle_positionen = op_service.list_alle_positionen(konto.id)
+
+    forderungen = {
+        f.op_position_id: f for f in op_service.offene_forderungen(konto.id, heute=date(2026, 9, 15))
+    }
+    assert id1.id not in forderungen
+    assert forderungen[id2.id].rest_cent == 10_000
+    assert forderungen[id3.id].rest_cent == 5_000
+
+    perioden_id2 = balance_zeitreihe_fuer_forderung(
+        ziel_op_position_id=id2.id, alle_positionen=alle_positionen, heute=date(2026, 9, 15),
+    )
+    perioden_id3 = balance_zeitreihe_fuer_forderung(
+        ziel_op_position_id=id3.id, alle_positionen=alle_positionen, heute=date(2026, 9, 15),
+    )
+    assert perioden_id2 is not None and all(p.rest_cent == 10_000 for p in perioden_id2)
+    assert perioden_id3 is not None and perioden_id3[-1].rest_cent == 5_000
+
+
 def test_faelligkeit_am_letzten_halbjahrestag_bekommt_nie_den_juni_satz(
     op_service, kosten_repo, kosten_service, admin_ctx, basis_vertrag,
 ):
