@@ -243,46 +243,86 @@ def test_gesendeter_bericht_wird_von_erneutem_lauf_nicht_ueberschrieben(bundle, 
 
 
 def test_vpi_fehler_erzeugt_sichtbaren_bericht_und_wird_bei_erfolg_normalisiert(bundle, stammdaten_repo, basis_vertrag):
+    """Schlussreview-Korrektur (2d45e27): `vpi_fehlergrund` ist ein vom
+    Versandstatus (`status`) VOLLSTÄNDIG unabhängiges Feld - `status`
+    bleibt der normale BEREIT-Lebenszyklus (identisch zu jeder anderen
+    Owner-Outbox), NIE ein eigener "VPI_FEHLER"-Wert (der bei Claim/
+    Versand sonst überschrieben würde)."""
+
     vertrag, _konto = basis_vertrag
     fehlerbericht = bundle.monatsbericht_service.markiere_vpi_fehler(
         periode="2026-09", fehlergrund="Statistik-Austria-Abruf fehlgeschlagen: Verbindungsfehler."
     )
-    assert fehlerbericht.status == "VPI_FEHLER"
-    assert "Verbindungsfehler" in fehlerbericht.fehlergrund
+    assert fehlerbericht.status == "BEREIT"
+    assert "Verbindungsfehler" in fehlerbericht.vpi_fehlergrund
     assert bundle.monatsbericht_repo.zeilen_fuer_periode("2026-09") == []
 
     # Nach Behebung: ein normaler, erfolgreicher Lauf normalisiert den
-    # eingefrorenen Fehlerstand zurück auf BEREIT mit vollem Inhalt.
+    # fachlichen Fehlerstand (nicht den Versandstatus, der war nie
+    # verändert).
     laeufe = [_lauf(vertrag_id=vertrag.id, periode="2026-09", status="KEIN_ERHOEHUNGSBEDARF")]
     erneut = bundle.monatsbericht_service.erstellen_fuer_periode(periode="2026-09", laeufe=laeufe, heute=date(2026, 9, 19))
     assert erneut is not None
     assert erneut.status == "BEREIT"
-    assert erneut.fehlergrund is None
+    assert erneut.vpi_fehlergrund is None
     assert len(bundle.monatsbericht_repo.zeilen_fuer_periode("2026-09")) == 1
 
 
 def test_vpi_fehler_mailtext_erklaert_ausbleiben_statt_leerem_bericht(bundle):
     bericht = bundle.monatsbericht_service.markiere_vpi_fehler(periode="2026-09", fehlergrund="Netzwerkfehler beim OGD-Abruf.")
     text = bundle.monatsbericht_service._text_fuer_bericht("2026-09", bericht)
-    assert "FEHLGESCHLAGEN" in text and "Netzwerkfehler beim OGD-Abruf." in text
+    assert "VPI-Abruf fehlgeschlagen" in text and "Netzwerkfehler beim OGD-Abruf." in text
     assert "veralteten" in text
+    # Keine Behauptung einer automatischen Wiederholung (Codex: "UI-
+    # Behauptung automatischer Wiederholung korrigieren") - der Text darf
+    # nur die EXPLIZITE Verneinung ("KEINE automatische Wiederholung")
+    # enthalten, nie eine Zusage wie "wird automatisch erzeugt".
+    assert "wird automatisch" not in text and "automatisch erzeugt" not in text
+    assert "KEINE" in text and "automatische Wiederholung" in text
+    assert "technische Klärung" in text
 
 
-def test_vpi_fehler_versendet_ueber_denselben_owner_kanal(bundle):
+def test_vpi_fehler_bleibt_nach_erfolgreichem_versand_sichtbar(bundle):
+    """Regression zum zweiten Schlussreview-Befund: "VPI_FEHLER ist
+    gerade zugleich Versandstatus. Nach claim->IN_VERSAND->GESENDET zeigt
+    Portal keinen VPI-Fehler mehr ... Transportfehler überschreibt
+    fehlergrund." Ein erfolgreicher Owner-Mailversand DARF den
+    fachlichen VPI-Fehlerhinweis nicht löschen."""
+
     bericht = bundle.monatsbericht_service.markiere_vpi_fehler(periode="2026-08", fehlergrund="VPI-Import fehlgeschlagen.")
-    belege = []
-
-    def versand_fn(auftrag):
-        belege.append(auftrag)
-        return MailOpsErgebnis("GESENDET", "REF-1", "PROVIDER-REF-1", datetime.now(timezone.utc))
-
     versendet = bundle.monatsbericht_service.benachrichtige_faellige(
-        heute=date(2026, 9, 19), send_enabled=True, send_ab_periode="2026-01", versand_fn=versand_fn,
+        heute=date(2026, 9, 19), send_enabled=True, send_ab_periode="2026-01",
+        versand_fn=lambda a: MailOpsErgebnis("GESENDET", "REF-1", "PROVIDER-REF-1", datetime.now(timezone.utc)),
     )
-    assert len(versendet) == 1 and versendet[0].id == bericht.id
-    assert len(belege) == 1
+    assert len(versendet) == 1
     aktualisiert = bundle.monatsbericht_repo.get(bericht.id)
     assert aktualisiert.status == "GESENDET"
+    assert aktualisiert.vpi_fehlergrund == "VPI-Import fehlgeschlagen."
+    # Der Mailtext für diesen Bericht bleibt der VPI-Fehlerhinweis, egal
+    # dass der Versand selbst erfolgreich war.
+    text = bundle.monatsbericht_service._text_fuer_bericht("2026-08", aktualisiert)
+    assert "VPI-Abruf fehlgeschlagen" in text
+
+
+def test_vpi_fehler_und_transportfehler_ueberschreiben_sich_nicht_gegenseitig(bundle):
+    """`fehlergrund` (Transport-/Mailversand-Diagnose) und
+    `vpi_fehlergrund` (fachlicher VPI-Ausfallgrund) sind getrennte
+    Spalten - ein unsicherer Versandversuch darf den VPI-Grund nicht
+    überschreiben, und umgekehrt bleibt eine spätere `markiere_vpi_fehler`
+    für eine bereits eingefrorene (GESENDET/UNKLAR) Kopfzeile wirkungslos."""
+
+    bundle.monatsbericht_service.markiere_vpi_fehler(periode="2026-08", fehlergrund="VPI-Import fehlgeschlagen.")
+
+    def kaputter_versand(auftrag):
+        raise TransportFehlerUngewissError("Verbindungsabbruch - Status ungewiss.")
+
+    bundle.monatsbericht_service.benachrichtige_faellige(
+        heute=date(2026, 9, 19), send_enabled=True, send_ab_periode="2026-01", versand_fn=kaputter_versand,
+    )
+    bericht = bundle.monatsbericht_repo.get_by_periode("2026-08")
+    assert bericht.status == "UNKLAR"
+    assert bericht.fehlergrund == "Verbindungsabbruch - Status ungewiss."
+    assert bericht.vpi_fehlergrund == "VPI-Import fehlgeschlagen."
 
 
 # -- Umfang B: Aktivierungsperiode/Zukunftsschutz/Claim-Recovery ------------
@@ -404,10 +444,17 @@ def test_absoluter_mail_link_zeigt_auf_konfigurierte_domain(bundle, stammdaten_r
 
 
 def _volle_quellenfakten(vertrag_id: str, **overrides) -> IndexQuellenFaktenTable:
+    # `aktueller_indexbetrag_cent == urspruenglicher_indexbetrag_cent`
+    # entspricht genau Codex' "drei freigabefreien Quellenvorschauen ...
+    # Original=aktuellerTeil=Gesamt (keine bisherigen Erhöhungen)" -
+    # in diesem Fall verhält sich die korrigierte Delta-Berechnung
+    # identisch zur ursprünglichen (fälschlich gegen die Basis
+    # gerechneten) Fassung.
     basis = dict(
         vertrag_id=vertrag_id, version=1, quelle="Test", inhalt_hash="h1", ist_wohnungsnutzung=False, erstellt_von="test",
         urspruengliche_klauselbasis_reihe="VPI20C18", urspruengliche_klauselbasis_monat="2024-01",
         urspruengliche_klauselbasis_wert="130.0", urspruenglicher_indexbetrag_cent=50_000,
+        aktueller_indexbetrag_cent=50_000,
         betrag_basisbindung_belegt=True, schwelle_prozent="3", schwelle_inklusive=False,
         bestaetigte_gesamtmiete_cent=200_000, bestaetigte_gesamtmiete_quelle="Kontoauszug",
     )
@@ -481,6 +528,142 @@ def test_gewerbevorschau_ohne_bestaetigte_gesamtmiete_liefert_nur_isolierten_ind
     assert zeile.vorschlag_cent is None
     assert zeile.differenz_cent is not None
     assert "Keine bestätigte aktuelle Gesamtmiete" in zeile.status_grund
+
+
+# -- Schlussreview-Korrektur (2d45e27, Punkt 40(5)): Delta gegen den
+# tatsächlich AKTUELLEN Indexanteil, nie gegen die ursprüngliche Basis --
+
+
+def test_gewerbevorschau_rechnet_delta_gegen_aktuellen_nicht_gegen_urspruenglichen_anteil(
+    bundle, stammdaten_repo, basis_vertrag,
+):
+    """Codex' Beispiel: original 50000 EUR-Cent @ VPI 130, HEUTE bereits
+    55000 EUR-Cent (frühere Teilerhöhung) plus 20000 EUR-Cent BK = 75000
+    Gesamt. Neuer Indexanteil (kumulierte Veränderung seit Basis) = 60000.
+    Erwartetes Delta = 60000 - 55000 = 5000, neues Gesamt = 80000 - NICHT
+    85000 (der alte, doppelt zählende Fehler: 75000 + (60000-50000))."""
+
+    vertrag, _konto = basis_vertrag
+    qf = _volle_quellenfakten(
+        vertrag.id, aktueller_indexbetrag_cent=55_000, bestaetigte_gesamtmiete_cent=75_000,
+        bestaetigte_gesamtmiete_quelle="Kontoauszug September 2026",
+    )
+    bundle.quellen_fakten_repo.anlegen(qf)
+    # 130 * 1,2 = 156 ergibt exakt die im Beispiel vorausgesetzten 60000
+    # (50000 * 1,2) als neuen Indexanteil.
+    bundle.vpi_repo.monatswert_erfassen(
+        reihe="VPI20C18", jahr=2026, monat=6, wert=Decimal("156.0"), finalitaet="ENDGUELTIG",
+        quelle_datei="test.csv", quelle_zeile=1, quelle_hash="h", abgerufen_am=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        importiert_von="test",
+    )
+    laeufe = [_lauf(vertrag_id=vertrag.id, periode="2026-09", status="BLOCKIERT", blockiert_gruende=["Kein gültiges, freigegebenes Rechtsprofil (fehlt, nie freigegeben, oder seit Freigabe entwertet)."])]
+    bundle.monatsbericht_service.erstellen_fuer_periode(periode="2026-09", laeufe=laeufe, heute=date(2026, 9, 19))
+    zeile = bundle.monatsbericht_repo.zeilen_fuer_periode("2026-09")[0]
+    assert zeile.differenz_cent == 5_000
+    assert zeile.vorschlag_cent == 80_000
+    assert zeile.vorschlag_cent != 85_000
+
+
+def test_gewerbevorschau_unveraenderter_anteil_ergibt_dasselbe_wie_zuvor(bundle, stammdaten_repo, basis_vertrag):
+    """Codex' zweites Beispiel: OHNE zwischenzeitliche Erhöhung (aktueller
+    Anteil == ursprünglicher Anteil == 50000) bleibt das Ergebnis
+    identisch zur (für diesen Sonderfall bereits vorher korrekten)
+    alten Rechnung: 200000 + (60000-50000) = 210000."""
+
+    vertrag, _konto = basis_vertrag
+    qf = _volle_quellenfakten(vertrag.id, aktueller_indexbetrag_cent=50_000, bestaetigte_gesamtmiete_cent=200_000)
+    bundle.quellen_fakten_repo.anlegen(qf)
+    bundle.vpi_repo.monatswert_erfassen(
+        reihe="VPI20C18", jahr=2026, monat=6, wert=Decimal("156.0"), finalitaet="ENDGUELTIG",
+        quelle_datei="test.csv", quelle_zeile=1, quelle_hash="h", abgerufen_am=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        importiert_von="test",
+    )
+    laeufe = [_lauf(vertrag_id=vertrag.id, periode="2026-09", status="BLOCKIERT", blockiert_gruende=["Kein gültiges, freigegebenes Rechtsprofil (fehlt, nie freigegeben, oder seit Freigabe entwertet)."])]
+    bundle.monatsbericht_service.erstellen_fuer_periode(periode="2026-09", laeufe=laeufe, heute=date(2026, 9, 19))
+    zeile = bundle.monatsbericht_repo.zeilen_fuer_periode("2026-09")[0]
+    assert zeile.differenz_cent == 10_000
+    assert zeile.vorschlag_cent == 210_000
+
+
+def test_gewerbevorschau_unter_schwelle_laesst_aktuellen_anteil_unveraendert(bundle, stammdaten_repo, basis_vertrag):
+    """"Bei Unter-Schwelle darf keine fiktive Rücknahme bereits
+    enthaltener Erhöhung entstehen: dann aktuellenTeil unverändert
+    lassen." - selbst wenn der aktuelle Anteil (55000) HÖHER ist als
+    eine Hochrechnung der ursprünglichen Basis (was ohne diese Regel
+    einen negativen/rückwirkenden Delta ergäbe), bleibt das Delta bei
+    unterschrittener Schwelle exakt 0."""
+
+    vertrag, _konto = basis_vertrag
+    qf = _volle_quellenfakten(vertrag.id, aktueller_indexbetrag_cent=55_000, bestaetigte_gesamtmiete_cent=75_000)
+    bundle.quellen_fakten_repo.anlegen(qf)
+    # Rohe Veränderung 130 -> 131 ist 0,77% - klar unter der 3%-Schwelle.
+    bundle.vpi_repo.monatswert_erfassen(
+        reihe="VPI20C18", jahr=2026, monat=6, wert=Decimal("131.0"), finalitaet="ENDGUELTIG",
+        quelle_datei="test.csv", quelle_zeile=1, quelle_hash="h", abgerufen_am=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        importiert_von="test",
+    )
+    laeufe = [_lauf(vertrag_id=vertrag.id, periode="2026-09", status="BLOCKIERT", blockiert_gruende=["Kein gültiges, freigegebenes Rechtsprofil (fehlt, nie freigegeben, oder seit Freigabe entwertet)."])]
+    bundle.monatsbericht_service.erstellen_fuer_periode(periode="2026-09", laeufe=laeufe, heute=date(2026, 9, 19))
+    zeile = bundle.monatsbericht_repo.zeilen_fuer_periode("2026-09")[0]
+    assert zeile.differenz_cent == 0
+    assert zeile.vorschlag_cent == 75_000
+
+
+def test_gewerbevorschau_fehlender_aktueller_anteil_ist_fail_closed(bundle, stammdaten_repo, basis_vertrag):
+    """"Vorschlag nur bei belegtem aktuellem Teilbetrag ... Fehlt er,
+    fail-closed kein Gesamtvorschlag." - bei überschrittener Schwelle
+    OHNE `aktueller_indexbetrag_cent` bleibt sowohl `differenz_cent` als
+    auch `vorschlag_cent` `None`, obwohl die Prozentinformation weiterhin
+    als reine Information gezeigt wird."""
+
+    vertrag, _konto = basis_vertrag
+    qf = _volle_quellenfakten(vertrag.id, aktueller_indexbetrag_cent=None, bestaetigte_gesamtmiete_cent=75_000)
+    bundle.quellen_fakten_repo.anlegen(qf)
+    bundle.vpi_repo.monatswert_erfassen(
+        reihe="VPI20C18", jahr=2026, monat=6, wert=Decimal("156.0"), finalitaet="ENDGUELTIG",
+        quelle_datei="test.csv", quelle_zeile=1, quelle_hash="h", abgerufen_am=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        importiert_von="test",
+    )
+    laeufe = [_lauf(vertrag_id=vertrag.id, periode="2026-09", status="BLOCKIERT", blockiert_gruende=["Kein gültiges, freigegebenes Rechtsprofil (fehlt, nie freigegeben, oder seit Freigabe entwertet)."])]
+    bundle.monatsbericht_service.erstellen_fuer_periode(periode="2026-09", laeufe=laeufe, heute=date(2026, 9, 19))
+    zeile = bundle.monatsbericht_repo.zeilen_fuer_periode("2026-09")[0]
+    assert zeile.differenz_cent is None
+    assert zeile.vorschlag_cent is None
+    assert "Kein belegter aktueller Indexanteil" in zeile.status_grund
+    assert "Schwelle überschritten" in zeile.status_grund
+
+
+def test_gewerbevorschau_zeigt_normale_dezimaldarstellung_statt_wissenschaftlicher_notation(
+    bundle, stammdaten_repo, basis_vertrag,
+):
+    """Schlussreview-Präzisierung: eine privat importierte Basis wie
+    "1.3E+2" darf NICHT als wissenschaftliche Notation im Anzeigetext
+    landen, und Prozentwerte dürfen NICHT mit bis zu 28 Nachkommastellen
+    erscheinen - nur die ANZEIGE wird gerundet, die Rechnung selbst bleibt
+    unverändert (siehe die exakten Delta-Werte in den Tests oben)."""
+
+    vertrag, _konto = basis_vertrag
+    qf = _volle_quellenfakten(
+        vertrag.id, urspruengliche_klauselbasis_wert="1.3E+2", aktueller_indexbetrag_cent=50_000,
+        bestaetigte_gesamtmiete_cent=200_000,
+    )
+    bundle.quellen_fakten_repo.anlegen(qf)
+    bundle.vpi_repo.monatswert_erfassen(
+        reihe="VPI20C18", jahr=2026, monat=6, wert=Decimal("133.9"), finalitaet="ENDGUELTIG",
+        quelle_datei="test.csv", quelle_zeile=1, quelle_hash="h", abgerufen_am=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        importiert_von="test",
+    )
+    laeufe = [_lauf(vertrag_id=vertrag.id, periode="2026-09", status="BLOCKIERT", blockiert_gruende=["Kein gültiges, freigegebenes Rechtsprofil (fehlt, nie freigegeben, oder seit Freigabe entwertet)."])]
+    bundle.monatsbericht_service.erstellen_fuer_periode(periode="2026-09", laeufe=laeufe, heute=date(2026, 9, 19))
+    zeile = bundle.monatsbericht_repo.zeilen_fuer_periode("2026-09")[0]
+    assert "E+" not in zeile.status_grund and "e+" not in zeile.status_grund
+    assert "130,0" in zeile.status_grund
+    # Kein Rohveränderungswert mit mehr als 4 Nachkommastellen.
+    import re
+
+    for prozent_text in re.findall(r"(\d+,\d+)%", zeile.status_grund):
+        nachkomma = prozent_text.split(",")[1]
+        assert len(nachkomma) == 4, zeile.status_grund
 
 
 # -- Jahreswechsel: dynamische Aprilgrenze -----------------------------------

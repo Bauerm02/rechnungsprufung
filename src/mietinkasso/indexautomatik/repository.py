@@ -854,17 +854,18 @@ class IndexMonatsberichtRepository:
                 bericht = IndexMonatsberichtTable(periode=periode, status="BEREIT")
                 session.add(bericht)
                 session.flush()
-            elif bericht.status not in ("BEREIT", "VPI_FEHLER"):
+            elif bericht.status != "BEREIT":
                 return None
             session.execute(delete(IndexMonatsberichtZeileTable).where(IndexMonatsberichtZeileTable.periode == periode))
             for felder in zeilen_felder:
                 session.add(IndexMonatsberichtZeileTable(bericht_id=bericht.id, **felder))
-            # Ein zuvor per `markiere_vpi_fehler` markierter Fehlerstand wird
-            # durch einen erfolgreichen Nachlauf (VPI-Quelle repariert) wieder
-            # normalisiert - `fehlergrund` darf nach erfolgreicher Berechnung
-            # nicht als veralteter Fehlertext stehen bleiben.
-            bericht.status = "BEREIT"
-            bericht.fehlergrund = None
+            # Ein zuvor per `markiere_vpi_fehler` gesetzter fachlicher
+            # VPI-Fehlergrund wird durch einen erfolgreichen Nachlauf
+            # (VPI-Quelle repariert) normalisiert - `vpi_fehlergrund` darf
+            # nach erfolgreicher Berechnung nicht als veralteter Fehlertext
+            # stehen bleiben. `status` bleibt unverändert BEREIT (Versand-
+            # Lebenszyklus ist von diesem fachlichen Feld unabhängig).
+            bericht.vpi_fehlergrund = None
             bericht.anzahl_vertraege = zusammenfassung["anzahl_vertraege"]
             bericht.anzahl_moeglich = zusammenfassung["anzahl_moeglich"]
             bericht.anzahl_noch_nicht_moeglich = zusammenfassung["anzahl_noch_nicht_moeglich"]
@@ -900,48 +901,49 @@ class IndexMonatsberichtRepository:
             return row
 
     def claim_fuer_versand(self, id: int, *, jetzt: datetime | None = None) -> bool:
-        """Erlaubte Quellzustände sind BEREIT (normaler Bericht) UND
-        VPI_FEHLER (Codex: "sichtbarer Monats-Fehlerbericht/Owner-Hinweis,
-        nicht nur Jobabbruch ohne Nachricht") - ein VPI-Fehlerstand ist
-        genauso ein fälliger, einmalig zu versendender Owner-Hinweis wie
-        ein normaler Bericht, nur mit anderem Text (siehe
-        `IndexMonatsberichtService._text_fuer_bericht`)."""
-
         with self._session_factory() as session:
             result = session.execute(
                 update(IndexMonatsberichtTable)
                 .where(IndexMonatsberichtTable.id == id)
-                .where(IndexMonatsberichtTable.status.in_(["BEREIT", "VPI_FEHLER"]))
+                .where(IndexMonatsberichtTable.status == "BEREIT")
                 .values(status="IN_VERSAND", versand_beansprucht_am=jetzt or datetime.now(timezone.utc))
             )
             session.commit()
             return result.rowcount > 0
 
     def markiere_vpi_fehler(self, periode: str, *, fehlergrund: str) -> IndexMonatsberichtTable:
-        """Codex-Auftrag: "Bei fehlgeschlagenem VPI-Abruf muss ein
-        sichtbarer Monats-Fehlerbericht/Owner-Hinweis entstehen, nicht nur
-        Jobabbruch ohne Nachricht; keine stille Berechnung mit alten
-        Werten." Wird von `scripts/indexautomatik_monatslauf.py`
-        aufgerufen, BEVOR der Monatslauf selbst (und damit
-        `ersetze_zeilen_falls_bereit`) je erreicht wird - legt die
-        Kopfzeile ggf. neu an (keine Zeilen, da nichts berechnet wurde) und
-        setzt Status VPI_FEHLER, DAMIT der Bericht (a) im Portal sichtbar
-        ist und (b) über denselben Owner-Only-Versandpfad wie ein normaler
-        Monatsbericht als Hinweis versendet werden kann. Ändert NIE einen
+        """Codex-Auftrag + Schlussreview-Korrektur (2d45e27): "Bei
+        fehlgeschlagenem VPI-Abruf muss ein sichtbarer Monats-
+        Fehlerbericht/Owner-Hinweis entstehen ... VPI_FEHLER ist gerade
+        zugleich Versandstatus - nach GESENDET zeigt Portal keinen
+        VPI-Fehler mehr, Transportfehler überschreibt fehlergrund."
+        `vpi_fehlergrund` ist deshalb ein von `status`/`fehlergrund`
+        VOLLSTÄNDIG unabhängiges, dauerhaftes Feld (siehe
+        `IndexMonatsberichtTable`-Docstring): `status` bleibt
+        ausschließlich der normale Versand-Lebenszyklus (BEREIT ->
+        IN_VERSAND -> GESENDET/UNKLAR, identisch zu jeder anderen Outbox
+        dieses Moduls) - dieselbe Kopfzeile bleibt dadurch normal über
+        `claim_fuer_versand`/`liste_faellig` als Owner-Hinweis versendbar,
+        OHNE dass `vpi_fehlergrund` beim Versand verändert oder gelöscht
+        wird. Legt die Kopfzeile ggf. neu an (keine Zeilen, da nichts
+        berechnet wurde, Status bleibt regulär BEREIT). Ändert NIE einen
         bereits eingefrorenen Bericht (IN_VERSAND/GESENDET/UNKLAR) - ein
         späterer VPI-Ausfall NACH bereits erfolgtem Versand darf dessen
-        Historie nicht überschreiben."""
+        Historie nicht überschreiben. Wird NIE automatisch erneut
+        aufgerufen: der bestehende `JobRunner`/`JobLockTable` markiert die
+        Periode FEHLGESCHLAGEN und verhindert einen impliziten
+        Doppellauf - eine gesetzte `vpi_fehlergrund` verlangt daher immer
+        eine technische Klärung, kein automatisches Abwarten."""
 
         with self._session_factory() as session:
             bericht = session.execute(
                 select(IndexMonatsberichtTable).where(IndexMonatsberichtTable.periode == periode)
             ).scalars().first()
             if bericht is None:
-                bericht = IndexMonatsberichtTable(periode=periode, status="VPI_FEHLER", fehlergrund=fehlergrund)
+                bericht = IndexMonatsberichtTable(periode=periode, status="BEREIT", vpi_fehlergrund=fehlergrund)
                 session.add(bericht)
-            elif bericht.status in ("BEREIT", "VPI_FEHLER"):
-                bericht.status = "VPI_FEHLER"
-                bericht.fehlergrund = fehlergrund
+            elif bericht.status == "BEREIT":
+                bericht.vpi_fehlergrund = fehlergrund
             session.commit()
             session.refresh(bericht)
             return bericht
@@ -972,16 +974,20 @@ class IndexMonatsberichtRepository:
         `bis_periode` (z. B. durch eine versehentlich vorab erzeugte
         künftige Kopfzeile) wird NIE automatisch versendet.
 
-        VPI_FEHLER-Kopfzeilen (siehe `markiere_vpi_fehler`) gelten
-        ebenfalls als fällig - derselbe Aktivierungs-/Zukunfts-Schutz gilt
-        für sie unverändert, es ist derselbe Owner-Only-Kanal."""
+        Eine per `markiere_vpi_fehler` fachlich markierte Periode bleibt
+        dabei ganz normal `status == "BEREIT"` (das fachliche Feld
+        `vpi_fehlergrund` ist vom Versand-Lebenszyklus unabhängig, siehe
+        dortige Docstring) und gilt daher bereits über die normale
+        BEREIT-Bedingung als fällig - derselbe Aktivierungs-/Zukunfts-
+        Schutz gilt für sie unverändert, es ist derselbe Owner-Only-
+        Kanal."""
 
         if not ab_periode:
             return []
         with self._session_factory() as session:
             statement = (
                 select(IndexMonatsberichtTable)
-                .where(IndexMonatsberichtTable.status.in_(["BEREIT", "VPI_FEHLER"]))
+                .where(IndexMonatsberichtTable.status == "BEREIT")
                 .where(IndexMonatsberichtTable.periode >= ab_periode)
                 .where(IndexMonatsberichtTable.periode <= bis_periode)
             )

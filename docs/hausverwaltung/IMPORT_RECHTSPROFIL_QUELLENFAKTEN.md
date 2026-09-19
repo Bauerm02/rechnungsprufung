@@ -99,6 +99,7 @@ Ausführungsfreigabe — sie wird im Bericht konsequent als
       "ist_wohnungsnutzung": false,
       "urspruengliche_klauselbasis": { "reihe": "VPI20C18", "monat": "2024-01", "wert": 130.0 },
       "urspruenglicher_indexbetrag_cent": 50000,
+      "aktueller_indexbetrag_cent": 50000,
       "betrag_basisbindung_belegt": true,
       "schwelle_prozent": 3,
       "schwelle_inklusive": false,
@@ -127,6 +128,7 @@ Ausführungsfreigabe — sie wird im Bericht konsequent als
 | `ist_wohnungsnutzung` | nein (Default `null`) | JSON-Bool oder `null` — **niemals** ein String wie `"false"` (wird hart abgelehnt, kein `bool("false")`-Fehlschluss) | Tri-State, fail-closed: NUR `false` erlaubt die Gewerbe-Rechenvorschau unten; `null` (ungeklärt) sperrt genau wie `true` (tatsächliche Wohnung). |
 | `urspruengliche_klauselbasis` | nein | Objekt `{reihe, monat, wert}` oder `null` | `wert` MUSS eine endliche, positive Zahl sein (`> 0`) — NaN/Infinity/0/negativ werden hart abgelehnt (Division-durch-0/sinnlose Referenzbasis in jeder späteren Veränderungsberechnung). |
 | `urspruenglicher_indexbetrag_cent` | nein | `int` (Cent) oder `null`, `>= 0` | Der ursprünglich indexierte Teilbetrag zur Basis oben — NIE der heute bereits erhöhte Betrag. |
+| `aktueller_indexbetrag_cent` | nein | `int` (Cent) oder `null`, `>= 0` | Der HEUTE tatsächlich verrechnete Indexanteil — bei einem Vertrag OHNE jede zwischenzeitliche (Teil-)Erhöhung identisch zu `urspruenglicher_indexbetrag_cent`, sonst höher. PFLICHT für jeden Gesamtvorschlag der Gewerbe-Rechenvorschau (siehe unten) — fehlt er, bleibt bei überschrittener Schwelle sowohl das Delta als auch die neue Gesamtsumme fail-closed `null` (die reine Prozentinformation bleibt trotzdem sichtbar). |
 | `betrag_basisbindung_belegt` | nein (Default `false`) | JSON-Bool, strikt | Muss `true` sein, damit die Rechenvorschau überhaupt startet. |
 | `schwelle_prozent` | nein | endliche Zahl oder `null` | |
 | `schwelle_inklusive` | nein | JSON-Bool oder `null`, strikt | |
@@ -150,10 +152,10 @@ Ausführungsfreigabe — sie wird im Bericht konsequent als
   Umwandlung, die z. B. den String `"false"` fälschlich als `True`
   behandeln würde.
 - **Cent-Felder** (`urspruenglicher_indexbetrag_cent`,
-  `bestaetigte_gesamtmiete_cent`): NUR ein `int` oder `null` wird
-  akzeptiert (kein `float`, kein `bool` — `bool` ist in Python technisch
-  eine `int`-Unterklasse und wird deshalb EXPLIZIT ausgeschlossen), und
-  zusätzlich `>= 0`.
+  `aktueller_indexbetrag_cent`, `bestaetigte_gesamtmiete_cent`): NUR ein
+  `int` oder `null` wird akzeptiert (kein `float`, kein `bool` — `bool`
+  ist in Python technisch eine `int`-Unterklasse und wird deshalb
+  EXPLIZIT ausgeschlossen), und zusätzlich `>= 0`.
 - **Prozent-/Basis-Felder** (`schwelle_prozent`, `daempfung_prozent`,
   `vertragliche_grenze_prozent`, `urspruengliche_klauselbasis.wert`):
   müssen zu einer ENDLICHEN `Decimal` parsbar sein — NaN/Infinity werden
@@ -191,15 +193,29 @@ zweite/parallele Formel. Die Vorschau:
   GETRENNT (eine unterschrittene Schwelle erscheint nie als
   irreführendes "0%", sondern als "Rohveränderung X%, wirksame
   Veränderung 0%, Schwelle NICHT überschritten"),
+- rechnet das Delta IMMER gegen `aktueller_indexbetrag_cent` (den HEUTE
+  tatsächlich verrechneten Indexanteil), NIE gegen
+  `urspruenglicher_indexbetrag_cent` — sonst würden zwischenzeitlich
+  bereits umgesetzte (Teil-)Erhöhungen ein zweites Mal mitgezählt. Ist
+  die Schwelle NICHT überschritten, bleibt das Delta IMMER `0`
+  ("aktuellenTeil unverändert lassen" — keine fiktive Rücknahme einer
+  bereits enthaltenen früheren Erhöhung). Ist die Schwelle überschritten
+  UND fehlt `aktueller_indexbetrag_cent`, bleiben Delta und
+  Gesamtvorschlag fail-closed `null` (siehe Feldtabelle oben),
 - liefert eine neue GESAMTvorschreibung NUR, wenn zusätzlich eine
   bestätigte aktuelle Gesamtmiete (`bestaetigte_gesamtmiete_cent`)
   vorliegt — sonst bleibt nur der isolierte neue Indexanteil bekannt,
   NIE eine unterstellte Gesamtsumme,
 - ist im Text unmissverständlich als "Rechenvorschlag (unverbindliche
   Vorschau aus Quellenfakten) — Ausführung noch nicht freigegeben"
-  gekennzeichnet,
+  gekennzeichnet, mit VPI-Werten und Prozentangaben in normaler
+  (nicht-wissenschaftlicher), gerundeter Darstellung (VPI 1–4, Prozent
+  fix 4 Nachkommastellen) — die zugrunde liegende Rechnung selbst bleibt
+  ungerundet,
 - schreibt NIE eine `IndexAnpassungTable`/ein `ErhoehungsschreibenTable`/
   eine Soll-Umsetzung — reine Anzeige.
 
-Fehlt IRGENDEINE Voraussetzung, bleibt der bisherige `pruefhinweis`-Text
-die einzige Anreicherung, ohne eine Zahl vorzutäuschen.
+Fehlt IRGENDEINE der übrigen Voraussetzungen (Basisbindung, Klauselbasis,
+`urspruenglicher_indexbetrag_cent`, Schwellenparameter, auflösbarer VPI),
+bleibt der bisherige `pruefhinweis`-Text die einzige Anreicherung, ohne
+eine Zahl vorzutäuschen.

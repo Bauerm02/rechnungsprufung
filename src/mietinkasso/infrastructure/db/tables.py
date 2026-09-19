@@ -1122,6 +1122,21 @@ class IndexQuellenFaktenTable(Base):
     # Flag wird der Betrag NIE für den Gewerbe-Rechenvorschlag verwendet
     # (siehe `monatsbericht_service.py::_gewerbe_rechenvorschlag`).
     urspruenglicher_indexbetrag_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Codex-Korrektur (Schlussreview 2d45e27, Punkt 40(5)): der bisherige
+    # Rechenvorschlag stellte die neue kumulierte Hochrechnung ab der
+    # URSPRÜNGLICHEN Basis (`urspruenglicher_indexbetrag_cent`) der
+    # AKTUELLEN Gesamtmiete gegenüber - das zählt zwischenzeitlich
+    # bereits umgesetzte (Teil-)Erhöhungen ein zweites Mal mit. Dieses
+    # SEPARATE, GETRENNTE Feld ist der tatsächlich HEUTE verrechnete
+    # Indexanteil (kann > `urspruenglicher_indexbetrag_cent` sein, wenn
+    # bereits frühere Anpassungen stattfanden). NUR wenn dieser Betrag
+    # belegt ist, darf `_gewerbe_rechenvorschlag` überhaupt eine neue
+    # Gesamtvorschreibung ausweisen (Delta = neuer Indexanteil MINUS
+    # dieser aktuelle Anteil, NIE minus der ursprünglichen Basis) - fehlt
+    # er, bleibt der Gesamtvorschlag fail-closed `None`. Bei EINEM
+    # Vertrag ohne jede zwischenzeitliche Erhöhung ist dieser Wert
+    # identisch zu `urspruenglicher_indexbetrag_cent`.
+    aktueller_indexbetrag_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
     betrag_basisbindung_belegt: Mapped[bool] = mapped_column(Boolean, default=False)
     # Schwellen-/Dämpfungsparameter der dokumentierten Gewerbeklausel -
     # AUSSCHLIESSLICH für den read-only Gewerbe-Rechenvorschlag, NIEMALS
@@ -1365,6 +1380,28 @@ class IndexMonatsberichtTable(Base):
     versand_beansprucht_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     versendet_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     externe_versandreferenz: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Codex-Korrektur (Schlussreview 2d45e27): `fehlergrund` ist der
+    # TRANSPORT-/Mailversand-Diagnosetext (von `set_status(..., "UNKLAR",
+    # fehlergrund=...)`/`versand_belegen`, das ihn bei jedem erfolgreichen
+    # Versand wieder auf `None` löscht) - GENAU DAS überschrieb bisher
+    # fälschlich auch den fachlichen VPI-Ausfallgrund, sobald der
+    # Fehlerbericht beansprucht/versendet/als UNKLAR markiert wurde
+    # ("VPI_FEHLER ist zugleich Versandstatus ... nach GESENDET zeigt
+    # Portal keinen VPI-Fehler mehr"). `vpi_fehlergrund` ist ein von
+    # `status`/`fehlergrund` VOLLSTÄNDIG unabhängiges, dauerhaftes Feld:
+    # `status` bleibt ausschließlich der Versand-Lebenszyklus (BEREIT ->
+    # IN_VERSAND -> GESENDET/UNKLAR, wie bei jeder anderen Outbox dieses
+    # Moduls), `vpi_fehlergrund` bleibt unabhängig davon sichtbar, bis
+    # ein NEUER erfolgreicher Monatslauf für dieselbe Periode ihn löscht
+    # (`IndexMonatsberichtRepository.ersetze_zeilen_falls_bereit`). Es
+    # gibt KEINEN automatischen Wiederholungsmechanismus, der einen
+    # gescheiterten Monatslauf von selbst erneut anstößt (der bestehende
+    # `JobRunner`/`JobLockTable` markiert die Periode FEHLGESCHLAGEN und
+    # verhindert damit einen impliziten Doppellauf) - eine gesetzte
+    # `vpi_fehlergrund` verlangt daher IMMER eine technische Klärung
+    # (VPI-Quelle/-Import prüfen, ggf. den Job-Lock dieser Periode
+    # gezielt zurücksetzen), nie ein bloßes Abwarten.
+    vpi_fehlergrund: Mapped[str | None] = mapped_column(Text, nullable=True)
     fehlergrund: Mapped[str | None] = mapped_column(Text, nullable=True)
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

@@ -21,7 +21,7 @@ gerechnet). Schreibt NIE eine `IndexAnpassungTable`/ein
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable
 
 from sqlalchemy import select
@@ -79,6 +79,30 @@ STATUS_LABELS = {
 
 def status_label(status: str) -> str:
     return STATUS_LABELS.get(status, status)
+
+
+def _format_vpi_anzeige(wert: Decimal) -> str:
+    """Reine Anzeige-Formatierung (NIE für die tatsächliche Berechnung
+    verwendet - `Rechnung selbst ungerundet lassen"). Behebt zwei
+    Darstellungsfehler des Schlussreviews: (1) ein privat importierter
+    Basiswert wie "1.3E+2" behält als `Decimal` seine ursprüngliche
+    wissenschaftliche Notation bei einer naiven `str()`-Ausgabe -
+    `format(..., "f")` erzwingt IMMER Festkommanotation. (2) 1-4
+    Nachkommastellen (nie mehr, mindestens 1) statt eines rohen
+    Divisionsergebnisses mit bis zu 28 Nachkommastellen."""
+
+    quantisiert = wert.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    ganzzahl, _, nachkomma = format(quantisiert, "f").partition(".")
+    nachkomma = nachkomma.rstrip("0") or "0"
+    return f"{ganzzahl},{nachkomma}"
+
+
+def _format_prozent_anzeige(wert: Decimal) -> str:
+    """Wie `_format_vpi_anzeige`, aber IMMER genau 4 Nachkommastellen
+    (Prozentwerte) statt variabel 1-4."""
+
+    quantisiert = wert.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    return format(quantisiert, "f").replace(".", ",")
 
 
 def _naechste_gesetzliche_april_grenze(heute: date) -> date:
@@ -265,15 +289,28 @@ class IndexMonatsberichtService:
 
     def _gewerbe_rechenvorschlag(
         self, qf: IndexQuellenFaktenTable, *, heute: date,
-    ) -> tuple[int | None, int, str] | None:
+    ) -> tuple[int | None, int | None, str] | None:
         """Read-only Vorschau AUSSCHLIESSLICH über bestehende
         `IndexService`-Bausteine - schreibt NICHTS. `None`, wenn die
         Quelle nicht vollständig belegt ist (dann bleibt der generische/
         pruefhinweis-Text unverändert die einzige Anreicherung).
 
         Rückgabe `(vorschlag_cent, differenz_cent, grund)`:
-        `differenz_cent` ist IMMER die Veränderung des dokumentierten
-        indexierten Anteils (`urspruenglicher_indexbetrag_cent`).
+        `differenz_cent` ist die Veränderung des HEUTE tatsächlich
+        verrechneten Indexanteils (`aktueller_indexbetrag_cent`) - NICHT
+        der ursprünglichen Vertragsbasis (Codex-Korrektur Schlussreview
+        2d45e27: "differenz_cent berechnet weiterhin neuer_indexanteil -
+        URSPRÜNGLICHER Indexbetrag ... das rechnet bereits im aktuellen
+        Teilbetrag enthaltene Erhöhungen nochmals dazu"). Ist die
+        wirksame Veränderung 0 (Schwelle nicht überschritten), bleibt
+        `differenz_cent` IMMER 0 ("aktuellenTeil unverändert lassen" -
+        keine fiktive Rücknahme einer bereits enthaltenen früheren
+        Erhöhung). Wird die Schwelle überschritten, ist `aktueller_
+        indexbetrag_cent` PFLICHT für jede Zahl - fehlt er, bleiben
+        `differenz_cent`/`vorschlag_cent` fail-closed `None` (kein
+        Gesamtvorschlag), auch wenn die Prozentangaben weiterhin als
+        reine Information gezeigt werden.
+
         `vorschlag_cent` (Codex-Korrektur: "indexierbarer Teil nicht mit
         neuer GESAMTvorschreibung verwechseln") ist NUR gesetzt, wenn
         zusätzlich eine bestätigte AKTUELLE Gesamtmiete
@@ -301,7 +338,10 @@ class IndexMonatsberichtService:
         # wirksame (gedämpfte/geschwellte) Veränderung getrennt ausweisen
         # - bei unterschrittener Schwelle bleibt die WIRKSAME Änderung 0
         # (kein Betrag), die tatsächliche VPI-Rohveränderung bleibt aber
-        # im Text sichtbar, statt als "0%" zu erscheinen.
+        # im Text sichtbar, statt als "0%" zu erscheinen. Volle Präzision
+        # bleibt hier für die eigentliche Rechnung erhalten - nur die
+        # TEXTAUSGABE unten wird über `_format_prozent_anzeige`/
+        # `_format_vpi_anzeige` gerundet dargestellt.
         rohe_veraenderung = (aktueller_vpi.wert - alter_wert) / alter_wert * 100
         daempfung = Decimal(qf.daempfung_prozent) if qf.daempfung_prozent is not None else None
         grenze = Decimal(qf.vertragliche_grenze_prozent) if qf.vertragliche_grenze_prozent is not None else None
@@ -314,28 +354,45 @@ class IndexMonatsberichtService:
         )
         betragswirksame_veraenderung = effektive_veraenderung if ueberschritten else Decimal("0")
 
-        neuer_indexanteil_cent = to_cents(
-            round_index_half_cent_down(
-                cents_to_decimal(qf.urspruenglicher_indexbetrag_cent) * (1 + betragswirksame_veraenderung / 100)
+        aktueller_hinweis = ""
+        if not ueberschritten:
+            # "Bei Unter-Schwelle darf keine fiktive Rücknahme bereits
+            # enthaltener Erhöhung entstehen: dann aktuellenTeil
+            # unverändert lassen." - 0 ist unabhängig von
+            # `aktueller_indexbetrag_cent` immer korrekt.
+            differenz_cent = 0
+        elif qf.aktueller_indexbetrag_cent is not None:
+            neuer_indexanteil_cent = to_cents(
+                round_index_half_cent_down(
+                    cents_to_decimal(qf.urspruenglicher_indexbetrag_cent) * (1 + betragswirksame_veraenderung / 100)
+                )
             )
-        )
-        differenz_cent = neuer_indexanteil_cent - qf.urspruenglicher_indexbetrag_cent
-        if qf.bestaetigte_gesamtmiete_cent is not None:
+            differenz_cent = neuer_indexanteil_cent - qf.aktueller_indexbetrag_cent
+        else:
+            differenz_cent = None
+            aktueller_hinweis = (
+                " Kein belegter aktueller Indexanteil (aktueller_indexbetrag_cent) hinterlegt - Delta/"
+                "Gesamtvorschlag nicht berechenbar."
+            )
+
+        if differenz_cent is not None and qf.bestaetigte_gesamtmiete_cent is not None:
             vorschlag_cent = qf.bestaetigte_gesamtmiete_cent + differenz_cent
         else:
             vorschlag_cent = None
 
         schwelle_text = "Schwelle überschritten" if ueberschritten else "Schwelle NICHT überschritten"
         vorschlag_hinweis = (
-            "" if vorschlag_cent is not None
+            "" if vorschlag_cent is not None or differenz_cent is None
             else " Keine bestätigte aktuelle Gesamtmiete hinterlegt - nur der isolierte Indexanteil ist berechenbar, "
             "keine neue Gesamtvorschreibung."
         )
         grund = (
             f"Rechenvorschlag (unverbindliche Vorschau aus Quellenfakten) – Ausführung noch nicht freigegeben: "
             f"VPI {qf.urspruengliche_klauselbasis_reihe} {aktueller_vpi.jahr}-{aktueller_vpi.monat:02d}="
-            f"{aktueller_vpi.wert} gegen Basis {alter_wert} (Rohveränderung {rohe_veraenderung}%, wirksame "
-            f"Veränderung {betragswirksame_veraenderung}%, {schwelle_text})." + vorschlag_hinweis + " "
+            f"{_format_vpi_anzeige(aktueller_vpi.wert)} gegen Basis {_format_vpi_anzeige(alter_wert)} "
+            f"(Rohveränderung {_format_prozent_anzeige(rohe_veraenderung)}%, wirksame Veränderung "
+            f"{_format_prozent_anzeige(betragswirksame_veraenderung)}%, {schwelle_text})."
+            + aktueller_hinweis + vorschlag_hinweis + " "
             + (qf.pruefhinweis or "Weitere Nachweise/eine echte Vertragsklausel für die Ausführung sind erforderlich.")
         )
         return vorschlag_cent, differenz_cent, grund
@@ -469,13 +526,22 @@ class IndexMonatsberichtService:
 
     # -- Umfang B: Owner-Sammelmail ------------------------------------------
     def _text_fuer_bericht(self, periode: str, bericht: IndexMonatsberichtTable) -> str:
-        if bericht.status == "VPI_FEHLER":
+        # Codex-Korrektur (Schlussreview 2d45e27): `vpi_fehlergrund` ist
+        # vom Versandstatus (`bericht.status`) UNABHÄNGIG - dieser Text
+        # muss unverändert erscheinen, EGAL ob die Kopfzeile gerade
+        # BEREIT/IN_VERSAND/GESENDET/UNKLAR ist. Behauptet KEINE
+        # automatische Wiederholung (es gibt keine): eine gesetzte
+        # `vpi_fehlergrund` verlangt immer eine technische Klärung.
+        if bericht.vpi_fehlergrund:
             return (
-                f"Index-Monatsbericht {periode}: FEHLGESCHLAGEN - kein Bericht erzeugt.\n\n"
-                f"Grund: {bericht.fehlergrund or 'unbekannt'}\n\n"
+                f"Index-Monatsbericht {periode}: VPI-Abruf fehlgeschlagen - es liegt (noch) kein "
+                "vollständiger Bericht vor.\n\n"
+                f"Grund: {bericht.vpi_fehlergrund}\n\n"
                 "Es wurde bewusst NICHT mit veralteten/zuletzt erfolgreichen VPI-Werten weitergerechnet. "
-                "Bitte den amtlichen VPI-Abruf/-Import prüfen und den Monatslauf danach erneut ausführen; "
-                "erst dann wird für diese Periode ein vollständiger Bericht erzeugt."
+                "Das erfordert eine technische Klärung (amtliche VPI-Quelle/-Import prüfen, ggf. den "
+                "fehlgeschlagenen Job-Lock dieser Periode gezielt zurücksetzen) - es gibt KEINE "
+                "automatische Wiederholung; erst ein manuell veranlasster, erfolgreicher Monatslauf für "
+                "diese Periode erzeugt den vollständigen Bericht."
             )
         zeilen = self._repository.zeilen_fuer_periode(periode)
         teile = [

@@ -3979,12 +3979,11 @@ _MONATSBERICHT_STATUS_BADGE = {
     "MOEGLICH": "badge-ok", "NOCH_NICHT_MOEGLICH": "badge-muted", "PRUEFUNG_NOETIG": "badge-warn",
 }
 _MONATSBERICHT_KOPF_BADGE = {
-    "BEREIT": "badge-muted", "IN_VERSAND": "badge-warn", "GESENDET": "badge-ok",
-    "UNKLAR": "badge-error", "VPI_FEHLER": "badge-error",
+    "BEREIT": "badge-muted", "IN_VERSAND": "badge-warn", "GESENDET": "badge-ok", "UNKLAR": "badge-error",
 }
 _MONATSBERICHT_KOPF_TEXT = {
     "BEREIT": "Bereit (noch nicht versendet)", "IN_VERSAND": "Versand läuft", "GESENDET": "Versendet",
-    "UNKLAR": "Versand unklar - prüfen", "VPI_FEHLER": "VPI-Abruf fehlgeschlagen",
+    "UNKLAR": "Versand unklar - prüfen",
 }
 
 
@@ -3992,6 +3991,12 @@ def _monatsbericht_kopf_badge(status: str) -> str:
     klasse = _MONATSBERICHT_KOPF_BADGE.get(status, "badge-muted")
     text = _MONATSBERICHT_KOPF_TEXT.get(status, status)
     return f'<span class="badge {klasse}">{h(text)}</span>'
+
+
+def _vpi_ausfall_badge(vpi_fehlergrund: str | None) -> str:
+    if not vpi_fehlergrund:
+        return "-"
+    return '<span class="badge badge-error">VPI-Ausfall</span>'
 
 
 def _monatsbericht_kv_text(daten) -> str:
@@ -4082,10 +4087,16 @@ def indexautomatik_monatsbericht_liste(request: Request, session=Depends(_curren
     zeilen = "".join(
         f'<tr><td><a href="/backoffice/indexautomatik/monatsbericht/{h(b.periode)}">{h(b.periode)}</a></td>'
         f"<td>{_monatsbericht_kopf_badge(b.status)}</td>"
+        # Codex-Korrektur (Schlussreview 2d45e27): `vpi_fehlergrund` ist
+        # vom Versandstatus/`fehlergrund` (Transport-Diagnose) getrennt -
+        # eine eigene Spalte, damit ein VPI-Ausfall auch NACH bereits
+        # versendetem/UNKLAREM Owner-Hinweis in der Übersicht sichtbar
+        # bleibt (nicht nur auf der Detailseite).
+        f"<td>{_vpi_ausfall_badge(b.vpi_fehlergrund)}</td>"
         f"<td>{b.anzahl_vertraege}</td><td>{b.anzahl_moeglich}</td><td>{b.anzahl_noch_nicht_moeglich}</td>"
         f"<td>{b.anzahl_pruefung_noetig}</td><td>{h(b.fehlergrund or '-')}</td></tr>"
         for b in berichte
-    ) or '<tr><td colspan=7 class="muted">Noch kein Monatsbericht erzeugt.</td></tr>'
+    ) or '<tr><td colspan=8 class="muted">Noch kein Monatsbericht erzeugt.</td></tr>'
     aktivierung_text = (
         f"aktiv ab Periode {h(_settings.index_monatsbericht_send_ab)}" if _settings.index_monatsbericht_send_ab
         else "noch nicht gesetzt - kein automatischer Versand irgendeiner Periode"
@@ -4106,7 +4117,7 @@ def indexautomatik_monatsbericht_liste(request: Request, session=Depends(_curren
          bleibt davon vollständig unberührt und unverändert deaktiviert, solange er nicht separat
          freigegeben wurde - eine Aktivierung hier öffnet NIEMALS den Mieterversand.</p>
       <table>
-        <tr><th>Periode</th><th>Versandstatus</th><th>Verträge</th><th>Möglich</th><th>Noch nicht möglich</th>
+        <tr><th>Periode</th><th>Versandstatus</th><th>VPI</th><th>Verträge</th><th>Möglich</th><th>Noch nicht möglich</th>
           <th>Prüfung nötig</th><th>Fehlergrund</th></tr>
         {zeilen}
       </table>
@@ -4123,21 +4134,29 @@ def indexautomatik_monatsbericht_detail(request: Request, periode: str, session=
             session, "Index-Monatsbericht", f"Kein Bericht für Periode {periode} vorhanden.",
             "/backoffice/indexautomatik/monatsbericht",
         )
-    if bericht.status == "VPI_FEHLER":
-        inhalt = f"""
+    # Codex-Korrektur (Schlussreview 2d45e27): `vpi_fehlergrund` ist ein
+    # vom Versandstatus (`bericht.status`) UNABHÄNGIGES, dauerhaftes Feld
+    # (siehe `IndexMonatsberichtTable`-Docstring) - dieser Hinweis muss
+    # UNVERÄNDERT sichtbar bleiben, auch nachdem der Owner-Hinweis dazu
+    # bereits beansprucht/versendet/als UNKLAR markiert wurde ("nach
+    # GESENDET zeigt Portal keinen VPI-Fehler mehr"). Er behauptet KEINE
+    # automatische Wiederholung - der bestehende JobRunner lässt eine
+    # bereits FEHLGESCHLAGENE Periode nicht von selbst erneut laufen.
+    vpi_fehler_block = ""
+    if bericht.vpi_fehlergrund:
+        vpi_fehler_block = f"""
         <div class="card">
-          <h1>Index-Monatsbericht {h(periode)}</h1>
-          <p>{_monatsbericht_kopf_badge(bericht.status)}</p>
-          <p class="error">Der amtliche VPI-Abruf/-Import für diese Periode ist fehlgeschlagen - es wurde
-             bewusst NICHT mit veralteten Werten weitergerechnet, daher liegt für diese Periode kein
-             vollständiger Bericht vor.</p>
-          <p><strong>Grund:</strong> {h(bericht.fehlergrund or "unbekannt")}</p>
-          <p class="muted">Nach Behebung der VPI-Quelle erzeugt der nächste erneute Monatslauf für diese
-             Periode den vollständigen Bericht automatisch.</p>
-          <p><a href="/backoffice/indexautomatik/monatsbericht">&larr; zurück</a></p>
+          <p class="error">VPI-Abruf fehlgeschlagen - der amtliche VPI-Abruf/-Import für diese Periode ist
+             fehlgeschlagen, es wurde bewusst NICHT mit veralteten Werten weitergerechnet, daher liegt für
+             diese Periode (noch) kein vollständiger Bericht vor.</p>
+          <p><strong>Grund:</strong> {h(bericht.vpi_fehlergrund)}</p>
+          <p class="muted">Das erfordert eine technische Klärung (amtliche VPI-Quelle/-Import prüfen, ggf.
+             den fehlgeschlagenen Job-Lock dieser Periode gezielt zurücksetzen) - es gibt KEINE
+             automatische Wiederholung; erst ein manuell veranlasster, erfolgreicher Monatslauf für diese
+             Periode erzeugt den vollständigen Bericht. Versandstatus des Owner-Hinweises dazu:
+             {_monatsbericht_kopf_badge(bericht.status)}.</p>
         </div>
         """
-        return _layout(request, session, f"Index-Monatsbericht {periode}", inhalt)
 
     zeilen = _indexautomatik.monatsbericht_repository.zeilen_fuer_periode(periode)
     karten = "".join(_monatsbericht_karte_html(z) for z in zeilen) or '<p class="muted">Keine Verträge in dieser Periode.</p>'
@@ -4150,6 +4169,7 @@ def indexautomatik_monatsbericht_detail(request: Request, periode: str, session=
          nötig.</span></p>
       <p><a href="/backoffice/indexautomatik/monatsbericht">&larr; alle Perioden</a></p>
     </div>
+    {vpi_fehler_block}
     <div class="monatsbericht-karten">
       {karten}
     </div>

@@ -4143,3 +4143,55 @@ automatisch zurück auf `BEREIT` mit vollständigem Inhalt.
 test_index_monatsbericht.py`, Ergänzungen in `test_mailops_client.py`
 und `test_backoffice.py`) plus die bestehende Suite — 1052/1052 grün im
 `tests/mietinkasso`-Gesamtlauf.
+
+## Schlussreview-Korrekturrunde auf Commit 2d45e27 (19.09.2026)
+
+Zwei letzte fachliche Befunde vor Übernahme durch Codex, beide behoben:
+
+1. **Doppelzählung im Gewerbe-Rechenvorschlag**: `_gewerbe_rechenvorschlag`
+   rechnete das Delta weiterhin `neuer Indexanteil - URSPRÜNGLICHER
+   Indexbetrag` und addierte das zur AKTUELLEN Gesamtmiete - das zählt
+   zwischenzeitlich bereits umgesetzte (Teil-)Erhöhungen ein zweites Mal
+   mit. Neues, separates, Cent-validiertes Feld
+   `IndexQuellenFaktenTable.aktueller_indexbetrag_cent` (nullable) im
+   Datenmodell UND im Import (`rechtsprofil_import.py`): das Delta
+   rechnet jetzt IMMER gegen diesen HEUTE tatsächlich verrechneten
+   Anteil. Ist die Schwelle nicht überschritten, bleibt das Delta IMMER
+   `0` ("keine fiktive Rücknahme bereits enthaltener Erhöhung"); ist sie
+   überschritten und fehlt `aktueller_indexbetrag_cent`, bleiben
+   Delta/Gesamtvorschlag fail-closed `None` (die reine Prozentinformation
+   bleibt sichtbar). Zusätzlich behoben: die Anzeige von VPI-Werten/
+   Prozentangaben zeigte teils wissenschaftliche Notation (z. B.
+   "1.3E+2", aus einer so importierten Quelle) bzw. bis zu 28
+   Nachkommastellen (rohes `Decimal`-Divisionsergebnis) - zwei neue reine
+   Anzeige-Helfer (`_format_vpi_anzeige`/`_format_prozent_anzeige`)
+   normalisieren NUR die Textausgabe (Festkommanotation, VPI 1-4 und
+   Prozent fix 4 Nachkommastellen); die zugrunde liegende Rechnung bleibt
+   ungerundet.
+2. **VPI-Fehler war zugleich Versandstatus**: die vorherige Fassung
+   nutzte `status="VPI_FEHLER"` als eigenen Statuswert, der beim
+   Claim/Versand des Owner-Hinweises auf IN_VERSAND/GESENDET/UNKLAR
+   überschrieben wurde - nach einem erfolgreichen (auch synthetischen)
+   Mailnachweis zeigte das Portal danach keinen VPI-Fehler mehr, und ein
+   Transportfehler überschrieb zusätzlich den fachlichen Fehlergrund
+   (beide nutzten dieselbe `fehlergrund`-Spalte). Neues, von `status`
+   VOLLSTÄNDIG unabhängiges Feld `IndexMonatsberichtTable.
+   vpi_fehlergrund`: `status` bleibt ausschließlich der normale
+   Versand-Lebenszyklus (BEREIT -> IN_VERSAND -> GESENDET/UNKLAR, wie bei
+   jeder anderen Outbox dieses Moduls), `vpi_fehlergrund` bleibt davon
+   unberührt sichtbar (Portal-Detailseite UND Mailtext), bis ein neuer
+   ERFOLGREICHER Monatslauf für dieselbe Periode ihn normalisiert.
+   Zusätzlich korrigiert: Portal-/Mailtext behaupteten fälschlich eine
+   automatische Wiederholung nach Behebung der VPI-Quelle - der
+   bestehende `JobRunner`/`JobLockTable` lässt eine bereits
+   FEHLGESCHLAGENE Periode NICHT von selbst erneut laufen; beide Texte
+   verlangen jetzt explizit eine technische Klärung (VPI-Quelle prüfen,
+   ggf. den Job-Lock der Periode gezielt zurücksetzen) statt eines
+   impliziten Abwartens.
+
+11 neue/geänderte synthetische Regressionstests
+(`test_index_monatsbericht.py`) für beide Punkte, inklusive der beiden
+konkreten Codex-Zahlenbeispiele (original 50000/aktuell 55000/Gesamt
+75000 → 80000, NICHT 85000; unverändert 50000/Gesamt 200000 → 210000)
+und der Fail-closed-/Unter-Schwelle-/Persistenz-nach-Versand-Fälle.
+1058/1058 grün im `tests/mietinkasso`-Gesamtlauf.

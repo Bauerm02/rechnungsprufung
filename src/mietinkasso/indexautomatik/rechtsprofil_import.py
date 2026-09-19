@@ -60,6 +60,13 @@ _QUELLEN_FAKTEN_OPTIONALFELDER = {
     # Gewerbe-Rechenvorschau) wie bei `RechtsprofilTable.ist_hauptmiete`.
     "ist_wohnungsnutzung": None,
     "urspruengliche_klauselbasis": None, "urspruenglicher_indexbetrag_cent": None,
+    # Codex-Korrektur (Schlussreview 2d45e27): separater, HEUTE
+    # tatsächlich verrechneter Indexanteil - Pflicht für jeden
+    # Gesamtvorschlag der Gewerbe-Rechenvorschau (siehe
+    # `monatsbericht_service.py::_gewerbe_rechenvorschlag`), NIE
+    # identisch mit `urspruenglicher_indexbetrag_cent`, falls
+    # zwischenzeitlich bereits (Teil-)Erhöhungen stattfanden.
+    "aktueller_indexbetrag_cent": None,
     "betrag_basisbindung_belegt": False, "schwelle_prozent": None, "schwelle_inklusive": None,
     "daempfung_prozent": None, "vertragliche_grenze_prozent": None, "klauselregel_text": None,
     "bestaetigte_gesamtmiete_cent": None, "bestaetigte_gesamtmiete_quelle": None,
@@ -234,6 +241,11 @@ def _quellen_fakten_felder_aus_zeile(zeile: dict, index: int) -> dict:
     )
     if felder["urspruenglicher_indexbetrag_cent"] is not None and felder["urspruenglicher_indexbetrag_cent"] < 0:
         raise RechtsprofilImportFehlerError(f"{vertrag_id}: 'urspruenglicher_indexbetrag_cent' ist negativ.")
+    felder["aktueller_indexbetrag_cent"] = _pruefe_int_oder_none(
+        felder["aktueller_indexbetrag_cent"], "aktueller_indexbetrag_cent", vertrag_id
+    )
+    if felder["aktueller_indexbetrag_cent"] is not None and felder["aktueller_indexbetrag_cent"] < 0:
+        raise RechtsprofilImportFehlerError(f"{vertrag_id}: 'aktueller_indexbetrag_cent' ist negativ.")
     felder["bestaetigte_gesamtmiete_cent"] = _pruefe_int_oder_none(
         felder["bestaetigte_gesamtmiete_cent"], "bestaetigte_gesamtmiete_cent", vertrag_id
     )
@@ -406,6 +418,7 @@ def wende_an(
                     str(klauselbasis["wert"]) if klauselbasis.get("wert") is not None else None
                 ),
                 urspruenglicher_indexbetrag_cent=felder["urspruenglicher_indexbetrag_cent"],
+                aktueller_indexbetrag_cent=felder["aktueller_indexbetrag_cent"],
                 betrag_basisbindung_belegt=felder["betrag_basisbindung_belegt"],
                 schwelle_prozent=(str(felder["schwelle_prozent"]) if felder["schwelle_prozent"] is not None else None),
                 schwelle_inklusive=felder["schwelle_inklusive"],
