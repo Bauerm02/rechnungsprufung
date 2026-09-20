@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from mietinkasso.bank.referenzen import parse_vertragskennungen
+
 from datetime import date
 
 from sqlalchemy import func, select
@@ -436,14 +438,13 @@ class BankRepository:
     def hat_ungeklaerte_relevante_eingaenge(self, *, bank_konto_id: str, vertrag_id: str) -> bool:
         """True, wenn eine positive Banktransaktion auf diesem Bankkonto
         existiert, deren Referenz EXPLIZIT auf `vertrag_id` verweist
-        (VERTRAG:<id>), aber noch einen unzugeordneten Restbetrag > 0 hat -
-        z. B. weil der Automatch aus einem anderen Grund verweigert wurde
-        oder nur teilweise manuell zugeordnet wurde. Solange das offen ist,
-        darf für diesen Vertrag nicht automatisch gemahnt werden."""
+        (VERTRAG:<id>, exakte Kennung - kein Präfix-Treffer wie
+        V-601-3 in V-601-3-NACHFOLGER), aber noch einen unzugeordneten
+        Restbetrag > 0 hat - z. B. weil der Automatch aus einem anderen
+        Grund verweigert wurde oder nur teilweise manuell zugeordnet
+        wurde. Solange das offen ist, darf für diesen Vertrag nicht
+        automatisch gemahnt werden."""
 
-        import re
-
-        muster = re.compile(rf"VERTRAG:{re.escape(vertrag_id)}(\b|$)")
         with self._session_factory() as session:
             transaktionen = session.execute(
                 select(BankTransaktionTable)
@@ -451,7 +452,7 @@ class BankRepository:
                 .where(BankTransaktionTable.betrag_cent > 0)
             ).scalars().all()
             for transaktion in transaktionen:
-                if not transaktion.referenz or not muster.search(transaktion.referenz):
+                if vertrag_id not in parse_vertragskennungen(transaktion.referenz).ids:
                     continue
                 zugeordnet = self.zugeordneter_betrag(transaktion.id)
                 if transaktion.betrag_cent - zugeordnet > 0:

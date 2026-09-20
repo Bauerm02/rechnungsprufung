@@ -24,6 +24,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import date
 
+from mietinkasso.bank.referenzen import parse_vertragskennungen
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -50,7 +52,6 @@ from mietinkasso.infrastructure.db.tables import (
 from mietinkasso.op.service import OPService
 from mietinkasso.stammdaten.repository import StammdatenRepository
 
-_VERTRAG_REFERENZ = re.compile(r"VERTRAG:([A-Za-z0-9\-]+)")
 
 # -- Auftrag HV-20260919-GEORGE-CODE: deterministische Mietmonat-Erkennung ------
 #
@@ -486,14 +487,21 @@ class BankImportService:
         der reinen Vorab-Vorschau (`vorschau_zuordnungsvorschlaege`) auf
         noch NICHT importierten Rohzeilen zugrunde liegt. Ausschließlich
         eine eindeutige `VERTRAG:<id>`-Kennung zählt; Name/Betrag allein
-        reichen nie."""
+        reichen nie. Mehrere unterschiedliche Kennungen oder eine nicht
+        sauber abgegrenzte Kennung blockieren die Auto-Zuordnung."""
 
         if not referenz:
             return None, "Keine Referenz vorhanden; nur manuelle Zuordnung möglich."
-        treffer = _VERTRAG_REFERENZ.search(referenz)
-        if not treffer:
+        befund = parse_vertragskennungen(referenz)
+        if not befund.ids and not befund.unklar:
             return None, "Referenz enthält keine eindeutige Vertragskennung; Name/Betrag allein reichen nicht."
-        vertrag_id = treffer.group(1)
+        vertrag_id = befund.eindeutige_id
+        if vertrag_id is None:
+            gefunden = ", ".join(sorted(befund.ids)) or "keine verwertbare Kennung"
+            return None, (
+                "Referenz enthält keine eindeutige Vertragskennung "
+                f"(gefunden: {gefunden}); manuelle Zuordnung erforderlich."
+            )
         konto = self._stammdaten_repository.get_konto_by_vertrag(vertrag_id)
         if konto is None:
             return None, f"Referenzierter Vertrag {vertrag_id} hat kein Konto."

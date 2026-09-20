@@ -1,5 +1,34 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## Codeprüfung 20.09.2026 — HV-20260920-FACHREVIEW
+
+Auf dem Qualitätsbranch sind zwei Bankreferenzfehler behoben: mehrere
+unterschiedliche VERTRAG-Kennungen werden nicht mehr als eindeutig verbucht;
+eine längere ID wie V-601-3-NACHFOLGER blockiert nicht mehr V-601-3.
+Gemeinsamer Parser für Vorschau, Zuordnung und Mahnrelevanz; synthetische Tests.
+Diese Änderung ist noch nicht produktiv übernommen.
+
+Zwei weitere reproduzierte Fehler bleiben ausdrücklich **offen** in
+`op/service.py::storniere_und_korrigiere`:
+
+- Der Korrekturweg übernimmt `original.typ`, prüft den Ersatzbetrag aber
+  nicht mit `_pruefe_betrag_positiv`. Damit kann eine SOLL-Korrektur einen
+  negativen Betrag speichern, obwohl die normale Buchung diesen ablehnt.
+- Eine Zahlungskorrektur übernimmt die ausdrückliche Forderungsbindung
+  `bezieht_sich_auf_id` nicht. Eine unverändert hohe Korrektur kann dadurch
+  statt der bestimmten Forderung eine ältere Forderung tilgen. Im
+  synthetischen Beispiel wechselt der offene 100-Euro-Posten von August auf
+  September, obwohl sich der Gesamtsaldo nicht ändert.
+
+Für die Korrektur müssen zusammenhängende Bankzuordnungen, Rücklastschriften,
+Stornierung der Zielforderung, Betragsprüfung und Wiederholung gemeinsam
+abgesichert werden; keine bloße Feldkopie als vollständige Lösung ausgeben.
+Unabhängige Reproduktionen und Bericht liegen im führenden CEO-Projekt unter
+`02_Ergebnisse/HV-20260920-FACHREVIEW` und
+`01_Arbeit/HV-20260920-FACHREVIEW/offene_reviewtests`.
+Keine Gesamtfehlerfreiheit behauptet; keine produktiven Buchungen oder Mails.
+
+
 Stand: lokaler synthetischer Backoffice-Pilot, 11.09.2026; keine Produktionsfreigabe.
 Alles hier ist bewusst offen gelassen bzw. bewusst konservativ gebaut —
 keine stillschweigend übersprungenen Punkte.
