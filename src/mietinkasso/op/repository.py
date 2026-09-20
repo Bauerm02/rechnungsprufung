@@ -3,9 +3,11 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from mietinkasso.domain.enums import OPPositionStatus
+from mietinkasso.domain.enums import OPPositionStatus, OPTyp
 from mietinkasso.domain.exceptions import ImportConflictError
-from mietinkasso.infrastructure.db.tables import OPPositionTable
+from mietinkasso.infrastructure.db.tables import OPPositionTable, ZuordnungTable
+from mietinkasso.infrastructure.db.sqlite_write_lock import schreibgesperrte_session
+from mietinkasso.op.validierung import pruefe_betrag_positiv, pruefe_bezug
 
 
 class OPRepository:
@@ -40,7 +42,7 @@ class OPRepository:
 
         if session is not None:
             return self._insert_idempotent(session, row)
-        with self._session_factory() as owned_session:
+        with schreibgesperrte_session(self._session_factory) as owned_session:
             result = self._insert_idempotent(owned_session, row)
             owned_session.commit()
             owned_session.refresh(result)
@@ -58,6 +60,10 @@ class OPRepository:
                         f"(gespeichert: {existing.quelle_hash}, neu: {row.quelle_hash})."
                     )
                 return existing
+        pruefe_betrag_positiv(OPTyp(row.typ), row.betrag_cent)
+        if row.bezieht_sich_auf_id is not None:
+            ziel = session.get(OPPositionTable, row.bezieht_sich_auf_id, with_for_update=True)
+            pruefe_bezug(row, ziel)
         session.add(row)
         session.flush()
         return row
@@ -107,63 +113,96 @@ class OPRepository:
             )
             return list(session.execute(statement).scalars().all())
 
-    def get(self, op_position_id: int) -> OPPositionTable | None:
+    def get(self, op_position_id: int, *, session: Session | None = None, with_for_update: bool = False) -> OPPositionTable | None:
+        if session is not None:
+            return session.get(OPPositionTable, op_position_id, with_for_update=with_for_update)
         with self._session_factory() as session:
             return session.get(OPPositionTable, op_position_id)
 
     def storno(
-        self, *, original_id: int, neue_row: OPPositionTable | None, akteur: str, vorgang_id: str | None = None
+        self, *, original_id: int, neue_row: OPPositionTable | None, akteur: str,
+        vorgang_id: str | None = None, session: Session | None = None,
     ) -> OPPositionTable | None:
-        """Mark `original_id` STORNIERT and optionally insert a replacement
-        AKTIV row (the Korrektur). Never edits the original row's amount.
+        """Atomarer Storno/Ersatz; identische Vorgänge bleiben wirkungslose Retries.
 
-        Ein bereits STORNIERTES Original darf NICHT nochmals eine aktive
-        Ersatzzeile bekommen (das würde den Saldo verdoppeln - z. B. bei
-        einer doppelten Formularbestätigung im Backoffice). Nur ein exakt
-        identischer Retry (gleiche `vorgang_id`, gleicher `import_id`/
-        `quelle_hash` der neuen Zeile) wird als sicherer No-Op erkannt und
-        liefert die bereits angelegte Ersatzzeile zurück; jede Abweichung
-        (andere `vorgang_id`, anderer Inhalt, oder ein reiner Storno ohne
-        Ersatz gegen ein bereits MIT Ersatz storniertes Original) ist ein
-        `StornierungKonfliktError`."""
+        Eine übergebene Session gehört dem Aufrufer und wird nicht committet.
+        Ohne Session wird dieselbe Schreibsperre wie im Bankdienst verwendet.
+        Bankgebundene oder aktiv referenzierte Positionen bleiben unverändert.
+        """
+        if session is not None:
+            return self._storno(session, original_id, neue_row, vorgang_id)
+        with schreibgesperrte_session(self._session_factory) as owned_session:
+            result = self._storno(owned_session, original_id, neue_row, vorgang_id)
+            owned_session.commit()
+            if result is not None:
+                owned_session.refresh(result)
+            return result
 
+    def _storno(
+        self, session: Session, original_id: int,
+        neue_row: OPPositionTable | None, vorgang_id: str | None,
+    ) -> OPPositionTable | None:
         from mietinkasso.domain.exceptions import StornierungKonfliktError
 
-        with self._session_factory() as session:
-            original = session.get(OPPositionTable, original_id)
-            if original is None:
-                raise ValueError(f"Unbekannte OPPosition {original_id}")
+        original = session.get(OPPositionTable, original_id, with_for_update=True)
+        if original is None:
+            raise ValueError(f"Unbekannte OPPosition {original_id}")
 
-            if original.status == OPPositionStatus.STORNIERT.value:
-                bestehender_ersatz = (
-                    session.get(OPPositionTable, original.storniert_durch_id)
-                    if original.storniert_durch_id is not None
-                    else None
-                )
-                if neue_row is None and bestehender_ersatz is None:
-                    return None  # reiner Storno, bereits erledigt -> No-op
-                if (
-                    neue_row is not None
-                    and bestehender_ersatz is not None
-                    and vorgang_id is not None
-                    and neue_row.import_id is not None
-                    and bestehender_ersatz.import_id == neue_row.import_id
-                    and bestehender_ersatz.quelle_hash == neue_row.quelle_hash
-                ):
-                    return bestehender_ersatz  # echter Retry (identischer Vorgang) -> No-op
-                raise StornierungKonfliktError(
-                    f"OPPosition {original_id} ist bereits storniert "
-                    f"(Ersatz: {original.storniert_durch_id}); eine erneute, abweichende "
-                    "Stornierung/Korrektur desselben Originals wird abgelehnt."
-                )
+        if original.status == OPPositionStatus.STORNIERT.value:
+            bestehender_ersatz = (
+                session.get(OPPositionTable, original.storniert_durch_id)
+                if original.storniert_durch_id is not None else None
+            )
+            if neue_row is None and bestehender_ersatz is None:
+                return None
+            if (
+                neue_row is not None and bestehender_ersatz is not None
+                and vorgang_id is not None and neue_row.import_id is not None
+                and bestehender_ersatz.import_id == neue_row.import_id
+                and bestehender_ersatz.quelle_hash == neue_row.quelle_hash
+            ):
+                return bestehender_ersatz
+            raise StornierungKonfliktError(
+                f"OPPosition {original_id} ist bereits storniert "
+                f"(Ersatz: {original.storniert_durch_id}); eine erneute, abweichende "
+                "Stornierung/Korrektur desselben Originals wird abgelehnt."
+            )
 
-            if neue_row is not None:
-                session.add(neue_row)
-                session.flush()
-                original.storniert_durch_id = neue_row.id
-            original.status = OPPositionStatus.STORNIERT.value
-            session.commit()
-            if neue_row is not None:
-                session.refresh(neue_row)
-                return neue_row
-            return None
+        if neue_row is not None:
+            if (neue_row.konto_id != original.konto_id or neue_row.typ != original.typ
+                    or neue_row.bezieht_sich_auf_id != original.bezieht_sich_auf_id
+                    or neue_row.bank_transaktion_id is not None):
+                raise ValueError("Korrektur muss Konto, Buchungstyp und ausdrückliche Bindung erhalten.")
+            pruefe_betrag_positiv(OPTyp(neue_row.typ), neue_row.betrag_cent)
+            if neue_row.bezieht_sich_auf_id is not None:
+                ziel = session.get(OPPositionTable, neue_row.bezieht_sich_auf_id, with_for_update=True)
+                pruefe_bezug(neue_row, ziel)
+
+        banklink = session.scalar(select(ZuordnungTable.id).where(
+            ZuordnungTable.op_position_id == original_id
+        ).limit(1))
+        if original.bank_transaktion_id is not None or banklink is not None:
+            raise ValueError(
+                f"OPPosition #{original_id} ist mit der Bank verknüpft. Manuelle OP-Korrektur/Storno "
+                "würde Bankzuordnungen verändern; Bankbeleg und Zuordnung müssen gemeinsam geklärt werden."
+            )
+        referenz = session.scalar(select(OPPositionTable.id).where(
+            OPPositionTable.bezieht_sich_auf_id == original_id,
+            OPPositionTable.status == OPPositionStatus.AKTIV.value,
+        ).limit(1))
+        if referenz is not None:
+            raise ValueError(
+                f"OPPosition #{original_id} wird von aktiver Position #{referenz} referenziert. "
+                "Bitte zuerst die abhängige Buchung klären."
+            )
+
+        # Erst die alte Eröffnung deaktivieren, sonst verletzt der Ersatz den
+        # Unique-Index. Alles bleibt in EINER Transaktion rückrollbar.
+        original.status = OPPositionStatus.STORNIERT.value
+        session.flush()
+        if neue_row is not None:
+            session.add(neue_row)
+            session.flush()
+            original.storniert_durch_id = neue_row.id
+        session.flush()
+        return neue_row

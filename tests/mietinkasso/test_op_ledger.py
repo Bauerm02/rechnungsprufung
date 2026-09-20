@@ -736,7 +736,20 @@ def test_offene_forderungen_generischer_rest_wird_je_ereignis_verteilt_konsisten
     assert forderungen[id3.id].rest_cent == 5_000
 
 
-def test_offene_forderungen_bindung_an_fremdes_konto_wird_abgelehnt(op_service, stammdaten_repo, ctx_factory):
+def _buche_historische_fehlbindung(op_service, session_factory, **kwargs):
+    """Neue Fehler bereits beim Schreiben ablehnen; Altbestand weiter beim Lesen erkennen."""
+    from mietinkasso.infrastructure.db.tables import OPPositionTable
+
+    with pytest.raises(ZahlungsbindungInkonsistentError):
+        op_service.buchen(**kwargs)
+    ziel_id = kwargs.pop("bezieht_sich_auf_id")
+    row = op_service.buchen(**kwargs)
+    with session_factory() as session:
+        session.get(OPPositionTable, row.id).bezieht_sich_auf_id = ziel_id
+        session.commit()
+
+
+def test_offene_forderungen_bindung_an_fremdes_konto_wird_abgelehnt(op_service, stammdaten_repo, ctx_factory, session_factory):
     ctx = ctx_factory("7DI")
     stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")
     stammdaten_repo.upsert_einheit(id="601-TOP-X", objekt_id="601", bezeichnung="Top X", nutzungsstatus="DAUERVERMIETUNG")
@@ -764,7 +777,7 @@ def test_offene_forderungen_bindung_an_fremdes_konto_wird_abgelehnt(op_service, 
         belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
         beleg_referenz="Miete eigenes Konto",
     )
-    op_service.buchen(
+    _buche_historische_fehlbindung(op_service, session_factory,
         ctx=ctx, konto=eigenes_konto, typ=OPTyp.ZAHLUNG, betrag_cent=50_000,
         belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
         beleg_referenz="Zahlung mit fremder Bindung",
@@ -775,7 +788,7 @@ def test_offene_forderungen_bindung_an_fremdes_konto_wird_abgelehnt(op_service, 
         op_service.offene_forderungen(eigenes_konto.id, heute=date(2026, 9, 10))
 
 
-def test_offene_forderungen_bindung_an_unbekannte_id_wird_abgelehnt(op_service, basis_vertrag, ctx_factory):
+def test_offene_forderungen_bindung_an_unbekannte_id_wird_abgelehnt(op_service, basis_vertrag, ctx_factory, session_factory):
     _, konto = basis_vertrag
     ctx = ctx_factory("7DI")
     op_service.buchen(
@@ -783,7 +796,7 @@ def test_offene_forderungen_bindung_an_unbekannte_id_wird_abgelehnt(op_service, 
         belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5),
         beleg_referenz="Miete September",
     )
-    op_service.buchen(
+    _buche_historische_fehlbindung(op_service, session_factory,
         ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=50_000,
         belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
         beleg_referenz="Zahlung mit erfundener Bindung",
@@ -794,7 +807,7 @@ def test_offene_forderungen_bindung_an_unbekannte_id_wird_abgelehnt(op_service, 
         op_service.offene_forderungen(konto.id, heute=date(2026, 9, 10))
 
 
-def test_offene_forderungen_bindung_mit_abweichender_leistungsperiode_wird_abgelehnt(op_service, basis_vertrag, ctx_factory):
+def test_offene_forderungen_bindung_mit_abweichender_leistungsperiode_wird_abgelehnt(op_service, basis_vertrag, ctx_factory, session_factory):
     """Eine Bindung mit widersprüchlicher Leistungsperiode deutet auf eine
     verwechselte OP-ID hin - wird nicht stillschweigend akzeptiert."""
 
@@ -805,7 +818,7 @@ def test_offene_forderungen_bindung_mit_abweichender_leistungsperiode_wird_abgel
         belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
         leistungsperiode="2026-08", beleg_referenz="Miete August",
     )
-    op_service.buchen(
+    _buche_historische_fehlbindung(op_service, session_factory,
         ctx=ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=50_000,
         belegdatum=date(2026, 9, 6), buchungsdatum=date(2026, 9, 6), faelligkeit=None,
         leistungsperiode="2026-09", beleg_referenz="Zahlung mit abweichender Periode",

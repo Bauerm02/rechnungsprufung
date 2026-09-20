@@ -19,31 +19,17 @@ from sqlalchemy.orm import Session
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import OPTyp
 from mietinkasso.domain.exceptions import DoppelteEroeffnungsartError, ZahlungsbindungInkonsistentError
+from mietinkasso.infrastructure.db.sqlite_write_lock import schreibgesperrte_session
 from mietinkasso.infrastructure.db.tables import KontoTable, OPPositionTable
 from mietinkasso.op.repository import OPRepository
+from mietinkasso.op.validierung import (
+    pruefe_betrag_positiv as _pruefe_betrag_positiv,
+    validiere_zahlungsbindung,
+)
 from mietinkasso.stammdaten.repository import StammdatenRepository
 
 _POSITIVE_TYPEN = {OPTyp.EROEFFNUNG, OPTyp.SOLL, OPTyp.RUECKLASTSCHRIFT}
 _NEGATIVE_TYPEN = {OPTyp.GUTSCHRIFT, OPTyp.ZAHLUNG}
-
-
-def _pruefe_betrag_positiv(typ: OPTyp, betrag_cent: int) -> None:
-    """SOLL/GUTSCHRIFT/ZAHLUNG/RUECKLASTSCHRIFT leiten ihr Vorzeichen aus
-    `typ` ab (siehe `_effect_cent` oben) - `betrag_cent` muss deshalb
-    IMMER positiv übergeben werden, auch für GUTSCHRIFT/ZAHLUNG (die den
-    Saldo MINDERN, aber als positiver Betrag gebucht werden). Ein
-    negativer Eingabewert würde sonst ein zweites Mal negiert und z. B.
-    eine GUTSCHRIFT versehentlich zu einer Schulderhöhung machen statt
-    zu mindern - das wird hier blockiert statt stillschweigend verbucht.
-    Nur `EROEFFNUNG` (Gesamtsaldo, eine Nettosumme ohne eigenes
-    typ-Vorzeichen - ein Guthaben ist ein legitimer negativer Saldo) und
-    `KORREKTUR` (Vorzeichen wird vom Aufrufer bewusst gesetzt, siehe
-    `storniere_und_korrigiere`) sind ausgenommen."""
-
-    if typ in (OPTyp.EROEFFNUNG, OPTyp.KORREKTUR):
-        return
-    if betrag_cent <= 0:
-        raise ValueError(f"betrag_cent muss für {typ.value} positiv sein (erhalten: {betrag_cent}).")
 
 
 def compute_content_hash(fields: dict) -> str:
@@ -60,29 +46,6 @@ def _effect_cent(row: OPPositionTable) -> int:
     if typ is OPTyp.KORREKTUR:
         return row.betrag_cent  # sign carried explicitly by the caller
     raise ValueError(f"Unbekannter OP-Typ {row.typ}")
-
-
-def validiere_zahlungsbindung(zahlung: OPPositionTable, forderung: OPPositionTable) -> None:
-    """Plausibilisiert eine explizite Zahlungszweckbindung
-    (`zahlung.bezieht_sich_auf_id == forderung.id`) BEVOR ihr Betrag der
-    Zielforderung vorrangig vor der generischen FIFO-Verteilung
-    zugeordnet wird: gleiche Kontozugehörigkeit, und - falls auf BEIDEN
-    Seiten eine `leistungsperiode` hinterlegt ist - deren Übereinstimmung.
-    Eine Abweichung deutet auf eine falsche/ambige Bindung hin (z. B.
-    eine verwechselte OP-ID) und wird NICHT stillschweigend generisch
-    per FIFO verteilt, sondern als Dateninkonsistenz abgelehnt."""
-
-    if zahlung.konto_id != forderung.konto_id:
-        raise ZahlungsbindungInkonsistentError(
-            f"Zahlung #{zahlung.id} (Konto {zahlung.konto_id}) referenziert über bezieht_sich_auf_id eine "
-            f"Forderung #{forderung.id} eines ANDEREN Kontos ({forderung.konto_id})."
-        )
-    if zahlung.leistungsperiode and forderung.leistungsperiode and zahlung.leistungsperiode != forderung.leistungsperiode:
-        raise ZahlungsbindungInkonsistentError(
-            f"Zahlung #{zahlung.id} (Leistungsperiode {zahlung.leistungsperiode}) referenziert über "
-            f"bezieht_sich_auf_id eine Forderung #{forderung.id} mit ABWEICHENDER Leistungsperiode "
-            f"({forderung.leistungsperiode})."
-        )
 
 
 def resolve_zahlungsziel(
@@ -531,47 +494,54 @@ class OPService:
         heute: date | None = None,
         vorgang_id: str | None = None,
     ) -> OPPositionTable | None:
-        """`vorgang_id`: vom Aufrufer vergebene Kennung für DIESE
-        Korrektur-Anfrage (z. B. gegen eine doppelte Formularbestätigung im
-        Backoffice). Ein zweiter Aufruf mit DERSELBEN `vorgang_id` (und
-        sonst identischem Inhalt) gegen ein bereits korrigiertes Original
-        ist ein sicherer No-Op; jeder andere zweite Aufruf auf ein bereits
-        storniertes Original wird als `StornierungKonfliktError`
-        abgelehnt, statt eine zweite aktive Ersatzzeile anzulegen."""
+        """Korrektur mit frischer Berechtigungsprüfung und atomarem Storno/Ersatz.
 
-        require_gesellschaft_access(ctx, konto.gesellschaft_id)
-        require_schreibrecht(ctx)
+        Betrag und Bindung werden durch dieselben Regeln wie eine neue Buchung
+        geprüft. Bankgebundene/aktiv referenzierte Originale bleiben unangetastet.
+        Identische vorgang_id/Inhalte bleiben No-Op, Abweichungen sind Konflikte.
+        """
         heute = heute or date.today()
-        original = self._op_repository.get(original_id)
-        if original is None or original.konto_id != konto.id:
-            raise ValueError(f"OPPosition {original_id} gehört nicht zu Konto {konto.id}")
-        neue_row = None
-        if neuer_betrag_cent is not None:
-            neue_row = OPPositionTable(
-                konto_id=konto.id,
-                typ=original.typ,
-                betrag_cent=neuer_betrag_cent,
-                leistungsperiode=original.leistungsperiode,
-                belegdatum=original.belegdatum,
-                buchungsdatum=heute,
-                faelligkeit=neue_faelligkeit if neue_faelligkeit is not None else original.faelligkeit,
-                faelligkeit_bekannt=(neue_faelligkeit or original.faelligkeit) is not None,
-                beleg_referenz=f"Korrektur zu #{original.id}: {original.beleg_referenz}",
-                aenderungsgrund=aenderungsgrund,
-                quelle_hash=compute_content_hash(
-                    {
+        with schreibgesperrte_session(self.session_factory) as session:
+            frisches_konto = session.get(KontoTable, konto.id)
+            if frisches_konto is None:
+                raise ValueError(f"Unbekanntes Konto {konto.id}")
+            require_gesellschaft_access(ctx, frisches_konto.gesellschaft_id)
+            require_schreibrecht(ctx)
+            self._stammdaten_repository.pruefe_konto_nicht_ausgeschlossen(frisches_konto, session=session)
+            original = self._op_repository.get(original_id, session=session, with_for_update=True)
+            if original is None or original.konto_id != frisches_konto.id:
+                raise ValueError(f"OPPosition {original_id} gehört nicht zu Konto {frisches_konto.id}")
+            neue_row = None
+            if neuer_betrag_cent is not None:
+                neue_row = OPPositionTable(
+                    konto_id=frisches_konto.id,
+                    typ=original.typ,
+                    betrag_cent=neuer_betrag_cent,
+                    leistungsperiode=original.leistungsperiode,
+                    belegdatum=original.belegdatum,
+                    buchungsdatum=heute,
+                    faelligkeit=neue_faelligkeit if neue_faelligkeit is not None else original.faelligkeit,
+                    faelligkeit_bekannt=(neue_faelligkeit or original.faelligkeit) is not None,
+                    beleg_referenz=f"Korrektur zu #{original.id}: {original.beleg_referenz}",
+                    aenderungsgrund=aenderungsgrund,
+                    quelle_hash=compute_content_hash({
                         "korrektur_von": original.id,
                         "betrag_cent": neuer_betrag_cent,
                         "faelligkeit": str(neue_faelligkeit) if neue_faelligkeit else None,
                         "grund": aenderungsgrund,
-                    }
-                ),
-                quelle_system="korrektur",
-                import_id=f"KORREKTUR-{original_id}-{vorgang_id}" if vorgang_id is not None else None,
+                    }),
+                    quelle_system="korrektur",
+                    import_id=f"KORREKTUR-{original_id}-{vorgang_id}" if vorgang_id is not None else None,
+                    bezieht_sich_auf_id=original.bezieht_sich_auf_id,
+                )
+            ergebnis = self._op_repository.storno(
+                original_id=original_id, neue_row=neue_row, akteur=ctx.user_id,
+                vorgang_id=vorgang_id, session=session,
             )
-        return self._op_repository.storno(
-            original_id=original_id, neue_row=neue_row, akteur=ctx.user_id, vorgang_id=vorgang_id
-        )
+            session.commit()
+            if ergebnis is not None:
+                session.refresh(ergebnis)
+            return ergebnis
 
     def get_position(self, op_position_id: int) -> OPPositionTable | None:
         return self._op_repository.get(op_position_id)

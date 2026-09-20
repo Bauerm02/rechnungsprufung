@@ -39,6 +39,7 @@ from mietinkasso.domain.exceptions import (
     FremdwaehrungNichtUnterstuetztError,
     LeistungsperiodeMehrdeutigError,
     MehrfachbuchungsKonfliktError,
+    VorgangIdKonfliktError,
     ZuordnungUngueltigError,
 )
 from mietinkasso.infrastructure.db.sqlite_write_lock import schreibgesperrte_session
@@ -1036,6 +1037,34 @@ class BankImportService:
                 if effektiver_betrag <= 0:
                     raise ZuordnungUngueltigError("Rücklastschriftbetrag muss positiv sein.")
 
+                # Erst nach allen Zugriffs-/Bindungsprüfungen: ein bereits
+                # verbuchter identischer Vorgang verbraucht keinen Rest erneut.
+                import_id = f"RUECKLASTSCHRIFT-{transaktion_id}-{original_op_position_id}"
+                bestehend = session.execute(
+                    select(OPPositionTable).where(OPPositionTable.import_id == import_id)
+                ).scalar_one_or_none()
+                if bestehend is not None:
+                    erwartet = {
+                        "typ": OPTyp.RUECKLASTSCHRIFT.value,
+                        "status": "AKTIV",
+                        "konto_id": frisches_konto.id,
+                        "betrag_cent": effektiver_betrag,
+                        "bank_transaktion_id": transaktion_id,
+                        "bezieht_sich_auf_id": original_op_position_id,
+                        "belegdatum": frische_transaktion.buchungsdatum,
+                        "buchungsdatum": frische_transaktion.buchungsdatum,
+                        "faelligkeit": frische_transaktion.buchungsdatum,
+                        "faelligkeit_bekannt": True,
+                        "leistungsperiode": None,
+                        "quelle_system": "bank_ruecklastschrift",
+                    }
+                    if any(getattr(bestehend, feld) != wert for feld, wert in erwartet.items()):
+                        raise VorgangIdKonfliktError(
+                            f"Rücklastschrift-Vorgang {import_id} existiert bereits mit abweichendem Stand."
+                        )
+                    session.expunge(bestehend)
+                    return bestehend
+
                 # Kumulative Rückbuchungsgrenze der Ursprungszahlung: nie mehr
                 # zurückbuchen als ursprünglich bezahlt wurde, auch nicht über
                 # mehrere Teil-Rücklastschriften hinweg.
@@ -1074,7 +1103,7 @@ class BankImportService:
                     buchungsdatum=frische_transaktion.buchungsdatum,
                     faelligkeit=frische_transaktion.buchungsdatum,
                     beleg_referenz=f"Rücklastschrift zu OP #{original_op_position_id}",
-                    import_id=f"RUECKLASTSCHRIFT-{transaktion_id}-{original_op_position_id}",
+                    import_id=import_id,
                     quelle_system="bank_ruecklastschrift",
                     bank_transaktion_id=transaktion_id,
                     bezieht_sich_auf_id=original_op_position_id,

@@ -1,5 +1,33 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## OP-Korrekturen und Ablaufprüfung 20.09.2026 — HV-20260920-OP-ABLAEUFE
+
+Die beiden OP-Befunde des Fachreviews sind auf `codex/hv-op-ablaeufe-20260920`
+behoben; die nachfolgende ältere Offenmeldung ist damit für diesen Branch
+abgelöst. Noch keine Produktivübernahme.
+
+- Gemeinsame Betrags- und Bezugsprüfung für neue Buchung und Korrektur;
+  ausdrückliche Forderungsbindung und Leistungsperiode bleiben erhalten.
+- Korrektur liest Konto/Original frisch unter Schreibsperre. Identischer
+  Vorgang bleibt wirkungslos, abweichender Vorgang wird abgelehnt. Storno
+  und Ersatz werden gemeinsam zurückgerollt; auch Eröffnungskorrekturen
+  beachten die Einmaligkeitsregel in der richtigen Reihenfolge.
+- Bankgebundene oder von aktiven Buchungen referenzierte Positionen können
+  über die allgemeine OP-Korrektur nicht mehr verändert werden. Die
+  vorhandenen Verknüpfungen bleiben erhalten; eine fachlich abgestimmte
+  Änderung der Bankzuordnung ist ein separater, hier nicht implementierter
+  Ablauf. Keine automatische Umhängung historischer Buchungen.
+- Identische Rücklastschrift-Wiederholung liefert die bestehende Zeile
+  erst nach sämtlichen Zugriffs-/Bindungsprüfungen zurück. Abweichungen
+  bleiben Konflikte; Betragsgrenzen für neue Rücklastschriften bleiben bestehen.
+- Synthetische Ablaufprüfung: Vorschreibung, Teilzahlung, Korrektur,
+  Bankverknüpfung, Rücklastschrift und Mahnvorschau, einschließlich
+  mehrfacher Ausführung, Commitfehler und konkurrierender Korrekturen.
+
+Abnahme und Grenzen: führende CEO-Zentrale,
+`02_Ergebnisse/HV-20260920-OP-ABLAEUFE/Ergebnis.md`.
+Keine nachträgliche Reparatur historischer Produktivdaten und kein Versand.
+
 ## Codeprüfung 20.09.2026 — HV-20260920-FACHREVIEW
 
 Auf dem Qualitätsbranch sind zwei Bankreferenzfehler behoben: mehrere
