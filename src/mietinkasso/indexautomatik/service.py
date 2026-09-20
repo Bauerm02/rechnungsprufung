@@ -131,6 +131,12 @@ class IndexautomatikService:
             if k.id not in referenzierte_ids
         ]
 
+    def _mietbeginn(self, vertrag: VertragTable) -> date:
+        # Die technische Buchhaltungslaufzeit kann erst mit der Verwaltung
+        # beginnen. Eine belegte ursprüngliche Mietlaufzeit bleibt davon getrennt.
+        profil = self._stammdaten_repository.neuestes_mietvertragsprofil(vertrag.id)
+        return (profil.urspruenglicher_mietbeginn if profil else None) or vertrag.gueltig_von
+
     def monatslauf_fuer_vertrag(
         self, *, ctx: AuthContext, vertrag: VertragTable, heute: date, akteur: str
     ) -> IndexautomatikLaufTable:
@@ -142,6 +148,15 @@ class IndexautomatikService:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
         self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
+
+        # Vor dem Claim abbrechen: Ein früher Aufruf darf den späteren
+        # Mietbeginn im selben Monat nicht durch eine Periodensperre blockieren.
+        ab = max(vertrag.gueltig_von, self._mietbeginn(vertrag))
+        if heute < ab:
+            raise ValueError(
+                f"Indexprüfung für Vertrag {vertrag.id} frühestens ab {ab.isoformat()}: "
+                "Mietbeginn beziehungsweise Verwaltungsbeginn noch nicht erreicht."
+            )
 
         periode = f"{heute.year:04d}-{heute.month:02d}"
         claim = self._lauf_repository.claim_periode(vertrag.id, periode)
@@ -448,7 +463,7 @@ class IndexautomatikService:
             # schlicht die nächste tatsächliche Kalendermonats-Wiederkehr,
             # NICHT Vertragsbeginn + Mindestintervall).
             if effektiver_letzter_anpassung_monat is None:
-                erster_moeglicher_termin = _naechster_gueltiger_kalendermonat(vertrag.gueltig_von, klausel.anpassungsmonat)
+                erster_moeglicher_termin = _naechster_gueltiger_kalendermonat(self._mietbeginn(vertrag), klausel.anpassungsmonat)
                 if heute_monatserster < erster_moeglicher_termin:
                     return _abschliessen("TERMIN_NICHT_ERREICHT")
             else:
@@ -476,7 +491,7 @@ class IndexautomatikService:
             # + Mindestintervall - beides taggenau auf Kalendermonate, nie
             # eine Tage-Umrechnung (Auftrag Markus).
             if effektiver_letzter_anpassung_monat is None:
-                erster_moeglicher_termin = _monate_addieren(vertrag.gueltig_von, klausel.mindestintervall_monate)
+                erster_moeglicher_termin = _monate_addieren(self._mietbeginn(vertrag), klausel.mindestintervall_monate)
                 if heute_monatserster < erster_moeglicher_termin:
                     return _abschliessen("TERMIN_NICHT_ERREICHT")
             else:
@@ -704,7 +719,7 @@ class IndexautomatikService:
                 self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
             except ObjektAusgeschlossenError:
                 continue
-            if vertrag.gueltig_von > heute:
+            if max(vertrag.gueltig_von, self._mietbeginn(vertrag)) > heute:
                 continue  # Vertrag hat noch nicht begonnen
             if vertrag.gueltig_bis is not None and vertrag.gueltig_bis < heute:
                 # Abgelaufener Vertrag: keine künftige Erhöhung mehr sinnvoll,

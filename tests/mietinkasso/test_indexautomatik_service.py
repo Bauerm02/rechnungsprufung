@@ -836,6 +836,59 @@ def test_zukuenftiger_vertrag_wird_im_batch_uebersprungen(admin_ctx, basis_vertr
     assert laeufe == []
 
 
+@pytest.mark.parametrize("ursprung_separat", [False, True])
+def test_mietbeginn_guard_belegt_keine_periode(admin_ctx, basis_vertrag, bundle, stammdaten_repo, ursprung_separat):
+    vertrag, _ = basis_vertrag
+    if ursprung_separat:
+        stammdaten_repo.add_mietvertragsprofil(
+            vertrag_id=vertrag.id, nutzungsart="BUERO", quelle_typ="MANUELL", erstellt_von="test",
+            urspruenglicher_mietbeginn=date(2026, 12, 15))
+    else:
+        stammdaten_repo.upsert_vertrag(
+            id=vertrag.id, einheit_id=vertrag.einheit_id, debitor_id=vertrag.debitor_id,
+            gesellschaft_id=vertrag.gesellschaft_id, rechtsordnung=vertrag.rechtsordnung,
+            gueltig_von=date(2026, 12, 15))
+        vertrag = stammdaten_repo.get_vertrag(vertrag.id)
+    with pytest.raises(ValueError, match="2026-12-15"):
+        bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 12, 3), akteur="test")
+    assert bundle.lauf_repo.get_by_periode(vertrag.id, "2026-12") is None
+    assert bundle.outbox_repo.liste_fuer_vertrag(vertrag.id) == []
+    assert bundle.index_service.monatslauf_alle(ctx=admin_ctx, heute=date(2026, 12, 3), akteur="test") == []
+    lauf = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 12, 15), akteur="test")
+    assert lauf.status == "BLOCKIERT"  # Noch kein Rechtsprofil, aber Mietbeginn erreicht.
+    assert bundle.lauf_repo.get_by_periode(vertrag.id, "2026-12").id == lauf.id
+
+
+def test_verwaltungsuebernahme_startet_gewerbeintervall_nicht_neu(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    vertrag, _ = basis_vertrag
+    stammdaten_repo.upsert_vertrag(
+        id=vertrag.id, einheit_id=vertrag.einheit_id, debitor_id=vertrag.debitor_id,
+        gesellschaft_id=vertrag.gesellschaft_id, rechtsordnung=vertrag.rechtsordnung,
+        gueltig_von=date(2026, 8, 1))
+    vertrag = stammdaten_repo.get_vertrag(vertrag.id)
+    stammdaten_repo.add_mietvertragsprofil(
+        vertrag_id=vertrag.id, nutzungsart="BUERO", quelle_typ="MANUELL", erstellt_von="test",
+        urspruenglicher_mietbeginn=date(2025, 12, 1), verwaltungsuebernahme_am=date(2026, 8, 1))
+    _mit_komponente(stammdaten_repo, vertrag, id="HMZ")
+    klausel = _mit_kalenderklausel(bundle, vertrag, terminmodus="INTERVALL", anpassungsmonat=None)
+    profil = _freigegebenes_wohnungsprofil(
+        admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
+        ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
+        basis_komponenten_ids=["HMZ"], vertragsklausel_id=klausel.id)
+    _seed_vpi_monat(bundle, jahr=2026, monat=10, wert="105")
+    november = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 11, 1), akteur="test")
+    assert november.status == "TERMIN_NICHT_ERREICHT"
+    dezember = bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx, vertrag=vertrag, heute=date(2026, 12, 1), akteur="test")
+    assert dezember.status == "ERHOEHUNG_ERZEUGT"
+    original = bundle.index_repo.get_klausel(klausel.id)
+    assert original.basis_monat == "2024-01" and original.abschlussdatum == date(2024, 1, 1)
+    # Quellenänderung muss eine frühere Ausführungsfreigabe entwerten.
+    stammdaten_repo.add_mietvertragsprofil(
+        vertrag_id=vertrag.id, nutzungsart="BUERO", quelle_typ="MANUELL", erstellt_von="test",
+        urspruenglicher_mietbeginn=date(2026, 1, 1))
+    assert bundle.rechtsprofil_service.aktives_gueltiges_profil(vertrag.id, heute=date(2026, 12, 1)) is None
+
+
 def test_blockierter_lauf_wird_im_folgemonat_erneut_versucht_ohne_terminalen_status_zu_verlieren(
     admin_ctx, basis_vertrag, bundle, stammdaten_repo
 ):

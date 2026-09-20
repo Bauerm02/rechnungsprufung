@@ -4252,3 +4252,7 @@ konkreten Codex-Zahlenbeispiele (original 50000/aktuell 55000/Gesamt
 75000 → 80000, NICHT 85000; unverändert 50000/Gesamt 200000 → 210000)
 und der Fail-closed-/Unter-Schwelle-/Persistenz-nach-Versand-Fälle.
 1058/1058 grün im `tests/mietinkasso`-Gesamtlauf.
+
+## 20.09.2026 – Mietbeginn und Indexbasis
+
+Siehe INDEXSTART_20260920.md: technische Übernahme und ursprünglicher Mietbeginn getrennt. Keine pauschale Indexfreigabe aus Datumsübernahme; fehlende Vertrags-/Historiennachweise und globale Versand-/Soll-Aktivierung bleiben gesondert zu erledigen.

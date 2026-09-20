@@ -6,7 +6,9 @@ from html import escape as h
 from mietinkasso.backoffice.views import csrf_feld, eur, option
 
 
-def klausel_formular(vertrag, komponenten, klauseln, csrf):
+def klausel_formular(vertrag, komponenten, klauseln, csrf, mietprofil=None):
+    beginn = mietprofil.urspruenglicher_mietbeginn if mietprofil else None
+    beginn_text = beginn.strftime("%d.%m.%Y") if beginn else "noch nicht gesondert belegt"
     komponenten_html = "".join(
         f'<label><input type="checkbox" name="komponenten" value="{h(k.id)}">'
         f'{h(k.bezeichnung)} ({eur(k.betrag_cent)})</label><br>' for k in komponenten if k.indexierbar
@@ -35,7 +37,12 @@ def klausel_formular(vertrag, komponenten, klauseln, csrf):
       <form method="post" action="/backoffice/vertrag/{h(vertrag.id)}/indexklausel/erstellen">
       {csrf_feld(csrf)}
       <fieldset><legend>Vertrag und letzte tatsächlich verwendete Basis</legend>
-        <label>Datum des Vertragsabschlusses</label><input type="date" name="abschlussdatum" required>
+        <p><strong>Ursprünglicher Mietbeginn: {h(beginn_text)}</strong><br>
+           Buchhaltung im System ab: {vertrag.gueltig_von.strftime("%d.%m.%Y")}.</p>
+        <p class="muted">Unterschrift im Juni, Mietbeginn im Dezember: keine Anpassung vor Dezember.
+           Eine ausdrücklich vereinbarte VPI-Basis bleibt erhalten. Das Abschlussdatum wird für
+           gesetzliche Fristen separat geführt. Frühere Erhöhungen werden nicht nochmals gerechnet.</p>
+        <label>Datum des Vertragsabschlusses (Unterschrift)</label><input type="date" name="abschlussdatum" required>
         <label>VPI-Reihe laut Vertrag</label><select name="basis_reihe">{reihen}</select>
         <label>VPI-Basismonat</label><input type="month" name="basis_monat" required>
         <label>Tatsächlich verwendeter VPI-Basiswert</label><input name="basis_wert" required placeholder="z. B. 130,0">

@@ -86,7 +86,8 @@ def indexklauseln_uebersicht(request: Request, vertrag_id: str, session=Depends(
         klauseln = list(db.execute(select(IndexKlauselTable).where(IndexKlauselTable.vertrag_id == vertrag_id)
                                   .order_by(IndexKlauselTable.version.desc())).scalars())
     return _layout(request, session, "Vertragliche Indexklauseln",
-                   klausel_formular(vertrag, komponenten, klauseln, session.csrf_token))
+                   klausel_formular(vertrag, komponenten, klauseln, session.csrf_token,
+                                    mietprofil=deps._stammdaten_repo.neuestes_mietvertragsprofil(vertrag_id)))
 
 
 @router.post("/vertrag/{vertrag_id}/indexklausel/erstellen")
