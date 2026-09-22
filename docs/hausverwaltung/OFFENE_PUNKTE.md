@@ -4256,3 +4256,7 @@ und der Fail-closed-/Unter-Schwelle-/Persistenz-nach-Versand-Fälle.
 ## 20.09.2026 – Mietbeginn und Indexbasis
 
 Siehe INDEXSTART_20260920.md: technische Übernahme und ursprünglicher Mietbeginn getrennt. Keine pauschale Indexfreigabe aus Datumsübernahme; fehlende Vertrags-/Historiennachweise und globale Versand-/Soll-Aktivierung bleiben gesondert zu erledigen.
+
+
+## 22.09.2026 – Selfstorage-Fortschreibung
+Deterministischer lokaler XLSX-Prüfer `scripts/selfstorage_fortschreibung.py`; keine KI zur Laufzeit. Portal zeigt Rechenergebnisse unter `/backoffice/selfstorage-pruefung`, Zahlungseingänge separat in der Monatsabrechnung. Bekannte Dateien werden per SHA-256 dem ausdrücklich bestätigten Leistungsmonat zugeordnet. Neue/inhaltlich geänderte Dateien brauchen eine belastbare Monatszuordnung, geänderte Formeln bleiben Prüffälle. Keine automatische Nettofreigabe, Rechnungserzeugung, OP-Buchung oder Zahlungszuordnung aus bloßer Betragsgleichheit. Quelle/zeitliche Verfügbarkeit des lokalen Rechners bleiben im Betrieb relevant. Claude-CLI wurde organisationsseitig abgewiesen; Codex führte die Implementierung und Tests durch, keine erfolgreiche Claude-Gegenprüfung behauptet. Native Mahnstufen-Fortschreibung bleibt ein gesonderter offener Vorgang.

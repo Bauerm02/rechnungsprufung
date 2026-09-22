@@ -11,6 +11,9 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from html import escape as h
+import json
+from pathlib import Path, PureWindowsPath
+from sqlalchemy.engine import make_url
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -65,6 +68,7 @@ def _variable_abrechnung_zeile_html(z) -> str:
         f"<td>{netto_anteil_html}</td>"
         f"<td>{eur(z.berichteter_betrag_cent) if z.berichteter_betrag_cent is not None else '-'} "
         f"{h(z.berichteter_betragsart or '')}</td>"
+        f"<td>{eur(z.tatsaechlicher_zahlungseingang_cent) if z.tatsaechlicher_zahlungseingang_cent is not None else 'Nicht zugeordnet'}</td>"
         f"<td>{h(z.quelle_referenz)}</td>"
         f"<td><a href=\"/backoffice/variable-abrechnung/{z.id}/korrigieren\">Korrigieren</a> | "
         f"<a href=\"/backoffice/variable-abrechnung/versionen?einheit_id={h(z.einheit_id)}&art={h(z.art)}&monat={h(z.leistungsmonat)}\">Versionen</a></td>"
@@ -76,7 +80,7 @@ def _variable_abrechnung_zeile_html(z) -> str:
 def variable_abrechnung_liste(request: Request, monat: str | None = None, session=Depends(_current_session)) -> HTMLResponse:
     zeilen = deps._variableabrechnung.service.liste_aktuelle(ctx=_ctx(session), leistungsmonat=monat or None)
     zeilen_html = "".join(_variable_abrechnung_zeile_html(z) for z in zeilen) or (
-        '<tr><td colspan=9 class="muted">Keine Monatsabrechnung vorhanden.</td></tr>'
+        '<tr><td colspan=10 class="muted">Keine Monatsabrechnung vorhanden.</td></tr>'
     )
     inhalt = f"""
     <div class="card">
@@ -93,16 +97,42 @@ def variable_abrechnung_liste(request: Request, monat: str | None = None, sessio
       <p>
         <a href="/backoffice/variable-abrechnung/erfassen">+ Neu erfassen</a> &nbsp;|&nbsp;
         <a href="/backoffice/variable-abrechnung/import">CSV-Import</a> &nbsp;|&nbsp;
+        <a href="/backoffice/selfstorage-pruefung">Selfstorage: automatische Excel-Prüfung</a> &nbsp;|&nbsp;
         <a href="/backoffice/dashboard/monatsuebersicht">Monatsübersicht (Nettomieterlös)</a>
       </p>
       <table>
         <tr><th>Einheit</th><th>Art</th><th>Monat</th><th>Status</th><th>Version</th>
-            <th>Unser Nettoanteil</th><th>Gemeldeter Betrag</th><th>Quelle</th><th>Aktion</th></tr>
+            <th>Unser Nettoanteil</th><th>Gemeldeter Betrag</th><th>Zahlungseingang</th><th>Quelle</th><th>Aktion</th></tr>
         {zeilen_html}
       </table>
     </div>
     """
     return _layout(request, session, "Variable Monatsabrechnung", inhalt)
+
+
+@router.get('/selfstorage-pruefung', response_class=HTMLResponse)
+def selfstorage_pruefung(request: Request, session=Depends(_current_session)):
+    """Read-only results from the sole local workbook checker. Never posts amounts."""
+    database = make_url(deps._settings.database_url).database
+    path = Path(database or '.').parent / 'selfstorage-pruefung.json'
+    if not path.is_file():
+        return _layout(request, session, 'Selfstorage-Prüfung', '<div class="card"><h1>Selfstorage-Prüfung</h1><p>Noch kein Prüflauf vorhanden.</p></div>')
+    data = json.loads(path.read_text(encoding='utf-8'))
+    obj = deps._stammdaten_repo.objekt_fuer_einheit(data['unit'])
+    require_gesellschaft_access(_ctx(session), obj.gesellschaft_id)
+    deps._stammdaten_repo.pruefe_einheit_nicht_ausgeschlossen(data['unit'])
+    rows = []
+    labels = {'GERECHNET':'Rechnerisch geprüft', 'MONAT_ZU_BESTAETIGEN':'Abrechnungsmonat bestätigen', 'PRUEFUNG_ERFORDERLICH':'Formel oder Quelldaten prüfen'}
+    for row in data.get('reports', []):
+        amount = eur(row['payout_cent']) if row.get('payout_cent') is not None else 'Nicht berechnet'
+        rows.append(f"<tr><td>{h(PureWindowsPath(row['source']).name)}</td><td>{h(row.get('period') or 'Noch nicht bestätigt')}</td><td>{amount}</td><td>{h(labels.get(row['status'],row['status']))}</td><td>{h(row.get('error',''))}</td></tr>")
+    body = f'''<div class="card"><h1>Selfstorage: Excel-Prüfung</h1>
+    <p>Letzter Lauf: {h(data.get('checked_at','unbekannt'))}. Quelle erreichbar: {'Ja' if data.get('source_available') else 'Nein'}.</p>
+    <p>Neue Monatsdateien werden nachgerechnet. Fehlende Abrechnungsmonate und geänderte Formeln bleiben zur Prüfung offen.
+    Eine rechnerisch passende Auszahlung bestätigt weder den Nettoertrag noch einen Bankeingang. Es werden keine Beträge aus dem Vormonat übernommen.</p>
+    <table><tr><th>Datei</th><th>Monat</th><th>Auszahlung laut Berechnung</th><th>Prüfung</th><th>Grund</th></tr>{''.join(rows)}</table>
+    <p><a href="/backoffice/variable-abrechnung">Zur Monatsabrechnung und den zugeordneten Zahlungen</a></p></div>'''
+    return _layout(request, session, 'Selfstorage-Prüfung', body)
 
 
 def _variable_abrechnung_formularfelder(*, einheit_id: str | None = None, vorbelegung=None) -> str:
