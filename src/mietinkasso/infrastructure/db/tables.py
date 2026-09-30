@@ -88,6 +88,13 @@ class DebitorTable(Base):
     # Update von Name/E-Mail darf eine einmal erteilte Prüfung nicht
     # stillschweigend zurücksetzen.
     postadresse_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
+    # Auftrag HV-20260930-PORTAL-LISTEN: optionale Telefonnummer für die
+    # Mieterliste. Additiv, nullable, ohne FK (ensure_additive_columns-
+    # sicher) - eine Bestandszeile erhält NULL = "Nicht hinterlegt".
+    # Wird über `StammdatenRepository.upsert_debitor(telefon=...)` NUR
+    # bei ausdrücklicher Übergabe verändert: ein Import/Upsert, der das
+    # Feld gar nicht kennt, darf eine gespeicherte Nummer nie löschen.
+    telefon: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class VertragTable(Base):

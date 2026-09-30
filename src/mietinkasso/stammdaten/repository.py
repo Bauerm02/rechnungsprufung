@@ -19,6 +19,11 @@ from mietinkasso.infrastructure.db.tables import (
     VertragTable,
     VertragsKomponenteTable,
 )
+from mietinkasso.stammdaten.telefon import normalisiere_telefon
+
+#: Sentinel für `upsert_debitor(telefon=...)`: "Feld nicht übergeben" -
+#: unterscheidbar von einem ausdrücklichen `None` (= Nummer löschen).
+TELEFON_UNVERAENDERT = object()
 
 
 class StammdatenRepository:
@@ -177,7 +182,8 @@ class StammdatenRepository:
     # -- Debitor ------------------------------------------------------------
     def upsert_debitor(
         self, *, id: str, name: str, email: str | None = None, adresse: str | None = None,
-        postadresse_geprueft: bool | None = None, session: Session | None = None,
+        postadresse_geprueft: bool | None = None, telefon: str | None | object = TELEFON_UNVERAENDERT,
+        session: Session | None = None,
     ) -> None:
         """`session`: siehe `upsert_gesellschaft`. `postadresse_geprueft`:
         NUR bei explizitem Setzen (`True`/`False`) verändert - `None`
@@ -193,7 +199,18 @@ class StammdatenRepository:
         zurückgesetzt - eine bereits geprüfte Adresse gilt nicht mehr für
         eine GENUIN ANDERE, seither nie geprüfte Adresse. Ein reines
         Update anderer Felder (z. B. E-Mail) bei UNVERÄNDERTER `adresse`
-        bleibt davon unberührt (Flag erhalten, wie oben beschrieben)."""
+        bleibt davon unberührt (Flag erhalten, wie oben beschrieben).
+
+        `telefon` (Auftrag HV-20260930-PORTAL-LISTEN): OHNE Übergabe
+        (`TELEFON_UNVERAENDERT`, Default) bleibt eine bereits gespeicherte
+        Nummer erhalten - jeder ältere Aufrufer/Import, der das Feld nicht
+        kennt, löscht also nie etwas. Ausdrücklich `None`/"" löscht die
+        Nummer, ein Text setzt sie (geprüft über `normalisiere_telefon`,
+        `TelefonUngueltigError` bei unzulässigem Wert, BEVOR irgendetwas
+        geschrieben wird)."""
+
+        telefon_setzen = telefon is not TELEFON_UNVERAENDERT
+        neues_telefon = normalisiere_telefon(telefon) if telefon_setzen else None
 
         def _schreiben(active_session: Session) -> None:
             row = active_session.get(DebitorTable, id)
@@ -201,6 +218,7 @@ class StammdatenRepository:
                 active_session.add(DebitorTable(
                     id=id, name=name, email=email, adresse=adresse,
                     postadresse_geprueft=bool(postadresse_geprueft) if postadresse_geprueft is not None else False,
+                    telefon=neues_telefon,
                 ))
             else:
                 adresse_geaendert = adresse != row.adresse
@@ -211,6 +229,8 @@ class StammdatenRepository:
                     row.postadresse_geprueft = postadresse_geprueft
                 elif adresse_geaendert:
                     row.postadresse_geprueft = False
+                if telefon_setzen:
+                    row.telefon = neues_telefon
 
         if session is not None:
             _schreiben(session)
@@ -219,6 +239,24 @@ class StammdatenRepository:
         with self._session_factory() as owned_session:
             _schreiben(owned_session)
             owned_session.commit()
+
+    def set_debitor_telefon(self, *, debitor_id: str, telefon: str | None) -> bool:
+        """Ändert AUSSCHLIESSLICH die Telefonnummer (Mieterakte) - Name,
+        E-Mail, Adresse und `postadresse_geprueft` werden weder gelesen
+        noch neu geschrieben. `None`/"" löscht die Nummer ausdrücklich.
+        Gibt zurück, ob sich der gespeicherte Wert tatsächlich geändert
+        hat."""
+
+        neues_telefon = normalisiere_telefon(telefon)
+        with self._session_factory() as session:
+            row = session.get(DebitorTable, debitor_id)
+            if row is None:
+                raise ValueError(f"Unbekannter Debitor {debitor_id}")
+            if row.telefon == neues_telefon:
+                return False
+            row.telefon = neues_telefon
+            session.commit()
+            return True
 
     def get_debitor(self, id: str) -> DebitorTable | None:
         with self._session_factory() as session:

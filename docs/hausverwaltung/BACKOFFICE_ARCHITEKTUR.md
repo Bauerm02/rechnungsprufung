@@ -37,9 +37,10 @@ Wildcard-Importe, keine Import- oder `exec`-Magie.
 | `app.py` | erzeugt den `/backoffice`-Router und bindet die Teil-Router in einer kommentierten, festgelegten Reihenfolge ein | keine Route, kein HTML, keine Abhängigkeit |
 | `dependencies.py` | Konfiguration, Session-Factory, Repositories/Services, `SessionStore`, `LoginRateLimiter`, Cookie-Name, Umgebungs-Kennzeichen | keine Route, kein HTML, keine Fachlogik |
 | `auth.py` | `_require_enabled`, `_current_session`, `_ctx`, `_verify_csrf`, Origin-Prüfung, `_layout`/`_fehlerseite`, Objekt-Sperrprüfung | keine Route (die Login-Routen liegen in `routes/auth.py`) |
-| `routes/shared.py` | nur, was nachweislich mehrere Fachbereiche brauchen (derzeit die Auswahlliste der Rechtsordnungen) | kein Router, kein Sammelbecken |
+| `routes/shared.py` | nur, was nachweislich mehrere Fachbereiche brauchen (derzeit die Auswahlliste der Rechtsordnungen und die Linkzeile zu den drei automatischen Listen) | kein Router, kein Sammelbecken |
 | `routes/auth.py` | Anmeldung, Abmeldung | Sitzungsmechanik (die liegt in `security.py`/`auth.py`) |
 | `routes/dashboard.py` | Rückstandsübersicht, drei Bereichs-Startseiten | eigene Berechnung — alles kommt aus `rueckstaende.service` |
+| `routes/listen.py` | Mieterliste, Zinsliste, Salden (Auftrag `HV-20260930-PORTAL-LISTEN`, siehe `PORTAL_LISTEN.md`) — drei rein lesende GET-Seiten | eigene Saldo-/Ledgerrechnung, Vorschreibung, Mahnplanung, jede Schreibung — alles kommt aus `portallisten.service` bzw. `rueckstaende.service` |
 | `routes/konten.py` | Kontoauszug, Nachbuchung, Storno/Korrektur, Eröffnungsimport, Vorschreibungsentwurf/Sollstellung | Bankzuordnung, Mahnwesen |
 | `routes/bank.py` | Bankdatei-Import/Vorschau, Zuordnung (automatisch/manuell/verknüpfen), Bankvollständigkeit | Mahnfreigabe-Ableitung (die liegt beim Mahnwesen) |
 | `routes/mahnwesen.py` | Mahnvorschau, ausdrückliches Planen, Mahnbrief-PDF, Sendebereitschaft, Versand, Mahnstufen-Konfiguration | Zinsprofilpflege, Mailnachweise |
@@ -51,7 +52,7 @@ Wildcard-Importe, keine Import- oder `exec`-Magie.
 | `routes/indexbetrieb.py` | Outbox, Monatsläufe, Soll-Umsetzung, VPI-Pflege, Vertragsende-Erinnerungen | der Monats-/Tageslauf selbst (läuft über `scripts/indexautomatik_*.py`, nicht über HTTP) |
 | `routes/monatsbericht.py` | Index-Monatsbericht (Owner), Liste und Detail | zweite/eigene Berechnung |
 | `routes/variableabrechnung.py` | variable Monatsabrechnung, CSV-Import, Versionen, Netto-Monatsübersicht, Netto-Mietanteil-Freigabe | Bank-Ist |
-| `routes/vertragsanlage.py` | Vertragsliste, Mieterakte, Vertragsanlage/-bearbeitung über die Intake-Strecke | zweite Buchungsstrecke, Original-PDFs in der Datenbank |
+| `routes/vertragsanlage.py` | Vertragsliste, Mieterakte, Vertragsanlage/-bearbeitung über die Intake-Strecke; Telefonnummer des Mieters aus der Akte (`POST /vertrag/{vertrag_id}/telefon`, ändert nur dieses eine Feld) | zweite Buchungsstrecke, Original-PDFs in der Datenbank |
 
 ## Zwei Regeln, die nicht verhandelbar sind
 

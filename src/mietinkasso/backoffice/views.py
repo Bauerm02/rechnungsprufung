@@ -94,13 +94,17 @@ _BEREICHE = (
 #: sie von dort (der Mieterakte) aus erreicht wird, nicht dem
 #: fachlichen Thema der Zielseite.
 _BEREICH_PFADPRAEFIXE = {
-    "mieter": ("/backoffice/vertraege", "/backoffice/vertrag/", "/backoffice/konto/", "/backoffice/op/"),
+    "mieter": (
+        "/backoffice/vertraege", "/backoffice/vertrag/", "/backoffice/konto/", "/backoffice/op/",
+        "/backoffice/mieterliste",
+    ),
     "zahlungen": (
         "/backoffice/zahlungen", "/backoffice/bank", "/backoffice/mahnwesen", "/backoffice/mailversand",
-        "/backoffice/mahnfall",
+        "/backoffice/mahnfall", "/backoffice/salden",
     ),
     "abrechnungen": (
         "/backoffice/abrechnungen", "/backoffice/variable-abrechnung", "/backoffice/dashboard/monatsuebersicht",
+        "/backoffice/zinsliste",
     ),
     "einstellungen": (
         "/backoffice/einstellungen", "/backoffice/eroeffnung", "/backoffice/indexautomatik", "/backoffice/basiszinssatz",
@@ -411,6 +415,14 @@ def seite(
   }}
   a.aufgabe-aktion:hover {{ background: #f2f0ea; }}
   .status-zeile {{ display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; font-size: 0.85rem; color: #555; margin: 0.5rem 0; }}
+  /* Filter der drei automatischen Listen: Felder + Button in EINER Zeile,
+     damit die Tabelle im ersten Bildschirm bleibt; unter 640px gestapelt.
+     Bewusst eigene Klasse - alle übrigen Formulare bleiben unverändert. */
+  .listen-filter {{ display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0.5rem 0.75rem; margin: 0.6rem 0; }}
+  .listen-filter > div {{ flex: 1 1 180px; min-width: 0; }}
+  .listen-filter label {{ margin-top: 0; }}
+  td.listen-status {{ min-width: 9rem; word-break: normal; overflow-wrap: normal; }}
+  .listen-filter button {{ flex: 0 0 auto; margin-top: 0; white-space: nowrap; }}
   details > summary {{ cursor: pointer; color: var(--anthrazit); font-weight: 600; }}
   img {{ max-width: 100%; }}
   code, pre {{ overflow-wrap: anywhere; }}
@@ -427,6 +439,7 @@ def seite(
     nav.hauptnav {{ padding: 0 0.5rem; }}
     nav.hauptnav a {{ padding: 0.6rem 0.55rem; font-size: 0.8rem; }}
     .kpi {{ flex: 1 1 100%; }}
+    .listen-filter > div {{ flex: 1 1 100%; }}
     .bereich-karten .card {{ flex: 1 1 100%; }}
     /* Kompakte Kontentabelle wird zu lesbaren Karten/Zeilen statt seitlich
        zu scrollen (Rückprüfung 14.09.2026) - technische Detailtabellen in

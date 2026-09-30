@@ -71,13 +71,16 @@ class PruefBefund:
       widerspricht einer anderen Zeile desselben Pakets.
     - "GESPERRT": Objekt 107/ausgeschlossen, oder ein Anfangssaldo ohne
       `quelle_bestaetigt`.
-    - "AKTUALISIERUNG": NUR für `Mietvertragsprofil` (Auftrag
+    - "AKTUALISIERUNG": für `Mietvertragsprofil` (Auftrag
       HV-20260913-VERTRAGSANLAGE) - existiert bereits, aber mit
       abweichendem Inhalt gegenüber der zuletzt gespeicherten Version.
       Anders als "KONFLIKT" blockiert das NICHT den Lauf: laufende
       Datenpflege an rein deskriptiven Verwaltungsfeldern ist gewollt
       (siehe `MietvertragsprofilTable`-Docstring) und erzeugt beim Apply
       eine neue, sichtbare Version statt den gesamten Lauf abzulehnen.
+      Außerdem für einen `Debitor` (Auftrag HV-20260930-PORTAL-LISTEN),
+      dessen AUSDRÜCKLICH angegebene Telefonnummer von der gespeicherten
+      abweicht, während Name/E-Mail/Adresse identisch sind.
     "NEU"/"UNVERAENDERT"/"AKTUALISIERUNG" sind unproblematisch; ein Paket
     mit irgendeinem KONFLIKT/GESPERRT ist NICHT anwendbar (siehe
     `IntakePlan.anwendbar`)."""
@@ -407,7 +410,20 @@ def pruefe_paket(
         if bestehend is None:
             befunde.append(PruefBefund("Debitor", z.id, "NEU"))
         elif _felder_hash(_debitor_felder(bestehend.name, bestehend.email, bestehend.adresse)) == _felder_hash(felder):
-            befunde.append(PruefBefund("Debitor", z.id, "UNVERAENDERT"))
+            # Telefon zählt NUR bei ausdrücklicher Angabe: ein Paket ohne
+            # das Feld bleibt UNVERAENDERT und lässt eine gespeicherte
+            # Nummer stehen. Eine ausdrücklich abweichende Angabe ist bei
+            # sonst identischem Debitor kein KONFLIKT, sondern sichtbare
+            # Kontaktdatenpflege.
+            bestehendes_telefon = (bestehend.telefon or "").strip() or None
+            if not z.telefon_angegeben or z.telefon == bestehendes_telefon:
+                befunde.append(PruefBefund("Debitor", z.id, "UNVERAENDERT"))
+            else:
+                aenderung = "gelöscht" if z.telefon is None else ("geändert" if bestehendes_telefon else "neu hinterlegt")
+                befunde.append(PruefBefund(
+                    "Debitor", z.id, "AKTUALISIERUNG",
+                    f"Telefonnummer von Debitor '{z.id}' wird {aenderung} - Name, E-Mail und Adresse bleiben unverändert.",
+                ))
         else:
             befunde.append(PruefBefund("Debitor", z.id, "KONFLIKT", f"Debitor '{z.id}' existiert bereits mit abweichendem Inhalt."))
 

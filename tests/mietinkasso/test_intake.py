@@ -284,6 +284,85 @@ def test_geaenderter_gleicher_inhalt_ist_konflikt(session_factory, stammdaten_re
     assert stammdaten_repo.get_debitor("DEB-1").name == "Erika Musterfrau"  # unverändert
 
 
+def test_import_ohne_telefon_erhaelt_gespeicherte_nummer_und_behaelt_den_pakethash(session_factory, stammdaten_repo, op_service):
+    """Auftrag HV-20260930-PORTAL-LISTEN: ein (Alt-)Paket ohne `telefon`
+    ist ein wirkungsloser Wiederholimport - die inzwischen gepflegte
+    Nummer bleibt stehen, der Debitor ist weder KONFLIKT noch geändert."""
+
+    paket = _paket()
+    assert (paket.debitoren[0].telefon, paket.debitoren[0].telefon_angegeben) == (None, False)
+    plan = _plan(paket, session_factory)
+    _apply(paket, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    assert stammdaten_repo.get_debitor("DEB-1").telefon is None
+
+    stammdaten_repo.set_debitor_telefon(debitor_id="DEB-1", telefon="+43 660 000 00 00")
+
+    for wiederholung in (_paket(), _paket(debitoren=[{"id": "DEB-1", "name": "Erika Musterfrau", "email": "erika@example.at", "telefon": "  "}])):
+        plan2 = _plan(wiederholung, session_factory)
+        assert plan2.anwendbar
+        assert next(b for b in plan2.befunde if b.entitaet == "Debitor").status == "UNVERAENDERT"
+        assert plan2.paket_hash == plan.paket_hash  # Feld nicht angegeben -> Hash wie vor Einführung des Felds
+        _apply(wiederholung, plan2, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+        assert stammdaten_repo.get_debitor("DEB-1").telefon == "+43 660 000 00 00"
+
+    # CSV: fehlende Spalte UND leere Zelle heißen beide "nicht angegeben".
+    for debitoren_csv in (
+        "id,name,email\r\nDEB-1,Erika Musterfrau,erika@example.at\r\n",
+        "id,name,email,telefon\r\nDEB-1,Erika Musterfrau,erika@example.at,\r\n",
+        "id,name,email,telefon\r\nDEB-1,Erika Musterfrau,erika@example.at\r\n",
+    ):
+        zeile = parse_csv_buendel(quelle="csv-test", dateien={"debitoren": debitoren_csv}).debitoren[0]
+        assert (zeile.telefon, zeile.telefon_angegeben) == (None, False)
+
+
+def test_import_mit_telefon_setzt_aendert_und_loescht_nur_bei_ausdruecklicher_angabe(session_factory, stammdaten_repo, op_service):
+    def _mit_telefon(wert):
+        return _paket(debitoren=[{"id": "DEB-1", "name": "Erika Musterfrau", "email": "erika@example.at", "telefon": wert}])
+
+    neu = _mit_telefon("0660 000 000")
+    plan = _plan(neu, session_factory)
+    assert next(b for b in plan.befunde if b.entitaet == "Debitor").status == "NEU"
+    assert plan.paket_hash != paket_hash(_paket())
+    _apply(neu, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    assert stammdaten_repo.get_debitor("DEB-1").telefon == "0660 000 000"
+    assert next(b for b in _plan(neu, session_factory).befunde if b.entitaet == "Debitor").status == "UNVERAENDERT"
+
+    # Abweichende ausdrückliche Nummer: sichtbare AKTUALISIERUNG, kein KONFLIKT, sonst nichts geändert.
+    geaendert = _mit_telefon("+43 660 111 11 11")
+    plan_geaendert = _plan(geaendert, session_factory)
+    befund = next(b for b in plan_geaendert.befunde if b.entitaet == "Debitor")
+    assert (befund.status, plan_geaendert.anwendbar) == ("AKTUALISIERUNG", True)
+    assert "geändert" in befund.grund and "660" not in befund.grund  # keine Nummer im Plantext
+    _apply(geaendert, plan_geaendert, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    debitor = stammdaten_repo.get_debitor("DEB-1")
+    assert (debitor.name, debitor.email, debitor.telefon) == ("Erika Musterfrau", "erika@example.at", "+43 660 111 11 11")
+
+    # Ausdrückliches JSON-null löscht - sichtbar als AKTUALISIERUNG.
+    geloescht = _mit_telefon(None)
+    assert (geloescht.debitoren[0].telefon, geloescht.debitoren[0].telefon_angegeben) == (None, True)
+    plan_geloescht = _plan(geloescht, session_factory)
+    befund = next(b for b in plan_geloescht.befunde if b.entitaet == "Debitor")
+    assert befund.status == "AKTUALISIERUNG" and "gelöscht" in befund.grund
+    _apply(geloescht, plan_geloescht, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    assert stammdaten_repo.get_debitor("DEB-1").telefon is None
+
+    # Ein abweichender NAME bleibt trotz Telefonangabe ein KONFLIKT.
+    konflikt = _paket(debitoren=[{"id": "DEB-1", "name": "ANDERER NAME", "email": "erika@example.at", "telefon": "0660 000 000"}])
+    assert next(b for b in _plan(konflikt, session_factory).befunde if b.entitaet == "Debitor").status == "KONFLIKT"
+
+    # CSV setzt eine Nummer wie JSON.
+    csv_zeile = parse_csv_buendel(
+        quelle="csv-test", dateien={"debitoren": "id,name,telefon\r\nDEB-1,Erika Musterfrau,0660 000 000\r\n"},
+    ).debitoren[0]
+    assert (csv_zeile.telefon, csv_zeile.telefon_angegeben) == ("0660 000 000", True)
+
+
+@pytest.mark.parametrize("ungueltig", ["1" * 41, "<b>0660</b>", "anrufen ab 9"])
+def test_parse_lehnt_ungueltiges_telefon_ab(ungueltig):
+    with pytest.raises(IntakeFormatFehlerError):
+        _paket(debitoren=[{"id": "DEB-1", "name": "Erika Musterfrau", "telefon": ungueltig}])
+
+
 def test_atomarer_rollback_bei_einer_kaputten_zeile(session_factory, stammdaten_repo, op_service):
     paket = _paket(nachbuchungen=[
         {"import_id": "N1", "vertrag_id": "V-1", "typ": "SOLL", "betrag_cent": 100, "belegdatum": "2026-01-01", "buchungsdatum": "2026-01-01"},

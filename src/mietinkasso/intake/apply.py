@@ -95,7 +95,12 @@ def wende_an(
                 )
 
             for z in paket.debitoren:
-                stammdaten_repo.upsert_debitor(id=z.id, name=z.name, email=z.email, adresse=z.adresse, session=session)
+                # Telefon NUR bei ausdrücklicher Angabe weiterreichen - ein
+                # Paket ohne das Feld lässt eine gespeicherte Nummer stehen.
+                telefon_argument = {"telefon": z.telefon} if z.telefon_angegeben else {}
+                stammdaten_repo.upsert_debitor(
+                    id=z.id, name=z.name, email=z.email, adresse=z.adresse, session=session, **telefon_argument,
+                )
 
             for z in paket.vertraege:
                 stammdaten_repo.upsert_vertrag(

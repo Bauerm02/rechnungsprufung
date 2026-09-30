@@ -575,6 +575,18 @@
       ]
     },
     {
+      "path": "/backoffice/mieterliste",
+      "method": "GET",
+      "endpoint": "mieterliste",
+      "resolved_endpoint": "mieterliste",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
       "path": "/backoffice/op/{op_id}/korrigieren",
       "method": "GET",
       "endpoint": "korrektur_formular",
@@ -591,6 +603,18 @@
       "method": "POST",
       "endpoint": "korrektur_absenden",
       "resolved_endpoint": "korrektur_absenden",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/salden",
+      "method": "GET",
+      "endpoint": "salden",
+      "resolved_endpoint": "salden",
       "dependencies": [
         {
           "call": "_current_session",
@@ -959,6 +983,18 @@
       ]
     },
     {
+      "path": "/backoffice/vertrag/{vertrag_id}/telefon",
+      "method": "POST",
+      "endpoint": "vertragsanlage_debitor_telefon",
+      "resolved_endpoint": "vertragsanlage_debitor_telefon",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
       "path": "/backoffice/vertrag/{vertrag_id}/vorschreibung",
       "method": "GET",
       "endpoint": "vorschreibung_formular",
@@ -1047,6 +1083,18 @@
       "method": "GET",
       "endpoint": "zahlungen_hub",
       "resolved_endpoint": "zahlungen_hub",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/zinsliste",
+      "method": "GET",
+      "endpoint": "zinsliste",
+      "resolved_endpoint": "zinsliste",
       "dependencies": [
         {
           "call": "_current_session",
@@ -1412,6 +1460,13 @@
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
     },
     {
+      "path": "/backoffice/mieterliste",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
       "path": "/backoffice/op/{op_id}/korrigieren",
       "method": "get",
       "status": 503,
@@ -1421,6 +1476,13 @@
     {
       "path": "/backoffice/op/{op_id}/korrigieren",
       "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/salden",
+      "method": "get",
       "status": 503,
       "location": null,
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
@@ -1636,6 +1698,13 @@
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
     },
     {
+      "path": "/backoffice/vertrag/{vertrag_id}/telefon",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
       "path": "/backoffice/vertrag/{vertrag_id}/vorschreibung",
       "method": "get",
       "status": 503,
@@ -1686,6 +1755,13 @@
     },
     {
       "path": "/backoffice/zahlungen",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/zinsliste",
       "method": "get",
       "status": 503,
       "location": null,

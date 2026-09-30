@@ -633,6 +633,63 @@ def test_ensure_mahnkosten_gebuehr_status_backfill_korrigiert_bereits_gebuchte_a
     assert ensure_mahnkosten_gebuehr_status_backfill(engine) is False
 
 
+def test_ensure_additive_columns_zieht_debitoren_telefon_nach_und_ist_idempotent(tmp_path: Path):
+    """Auftrag HV-20260930-PORTAL-LISTEN: `debitoren` existiert produktiv
+    OHNE `telefon`. Die Spalte wird additiv und nullable nachgezogen, eine
+    Bestandszeile bleibt unverändert (Telefon NULL = "Nicht hinterlegt"),
+    ein zweiter Lauf ändert nichts mehr."""
+
+    from mietinkasso.infrastructure.db.tables import DebitorTable
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'debitoren-alt.db'}", future=True)
+    meta = sa.MetaData()
+    debitoren_alt = sa.Table(
+        "debitoren",
+        meta,
+        sa.Column("id", sa.String(48), primary_key=True),
+        sa.Column("name", sa.String(256), nullable=False),
+        sa.Column("email", sa.String(256), nullable=True),
+        sa.Column("adresse", sa.String(512), nullable=True),
+        sa.Column("postadresse_geprueft", sa.Boolean, nullable=False, server_default=sa.text("0")),
+        # telefon: NEU, bewusst NICHT hier.
+    )
+    try:
+        meta.create_all(engine)
+        with engine.begin() as conn:
+            conn.execute(debitoren_alt.insert().values(
+                id="DEB-ALT", name="Synthetische Altmieterin", email="alt@example.at",
+                adresse="Altgasse 1, 1010 Wien", postadresse_geprueft=True,
+            ))
+
+        ausgefuehrt = ensure_additive_columns(engine)
+        # Genau EINE Änderung an `debitoren`: die neue Spalte, sonst nichts.
+        assert len(ausgefuehrt) == 1
+        assert ausgefuehrt[0].startswith("ALTER TABLE debitoren ADD COLUMN telefon ")
+        spalte = next(s for s in sa.inspect(engine).get_columns("debitoren") if s["name"] == "telefon")
+        assert spalte["nullable"] is True
+
+        with engine.begin() as conn:
+            zeile = conn.execute(sa.text("SELECT * FROM debitoren WHERE id = 'DEB-ALT'")).mappings().one()
+        assert zeile["name"] == "Synthetische Altmieterin" and zeile["email"] == "alt@example.at"
+        assert zeile["adresse"] == "Altgasse 1, 1010 Wien" and zeile["postadresse_geprueft"] == 1
+        assert zeile["telefon"] is None
+
+        assert ensure_additive_columns(engine) == []  # idempotent
+
+        # ORM liest die Altzeile und kann die neue Spalte beschreiben.
+        session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False, class_=Session)
+        with session_factory() as session:
+            debitor = session.get(DebitorTable, "DEB-ALT")
+            assert debitor.telefon is None
+            debitor.telefon = "+43 1 000 00 00"
+            session.commit()
+        with session_factory() as session:
+            assert session.get(DebitorTable, "DEB-ALT").telefon == "+43 1 000 00 00"
+        assert ensure_additive_columns(engine) == []
+    finally:
+        engine.dispose()
+
+
 def test_ensure_additive_columns_bei_frischer_db_no_op():
     """Eine frisch über `Base.metadata.create_all()` angelegte DB hat
     bereits alle Spalten - hier gibt es nichts nachzuziehen (reine

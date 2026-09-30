@@ -17,6 +17,7 @@ from mietinkasso.rueckstaende.service import berechne_rueckstandsuebersicht
 
 from mietinkasso.backoffice import dependencies as deps
 from mietinkasso.backoffice.auth import _ctx, _current_session, _fehlerseite, _layout
+from mietinkasso.backoffice.routes.shared import listen_links_html
 
 
 #: Ohne eigenes Prefix - das gemeinsame `/backoffice`-Prefix wird GENAU
@@ -408,7 +409,12 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
     except (MietinkassoError, ValueError) as exc:
         return _fehlerseite(session, "Rückstandsübersicht", str(exc), "/backoffice/")
 
-    auswahl_form = _rueckstaende_objekt_filter_form(uebersicht)
+    # Auftrag HV-20260930-PORTAL-LISTEN: die drei automatischen Listen
+    # sind direkt von der Übersicht erreichbar, der aktive Objektfilter
+    # wird mitgenommen - reine Verlinkung.
+    auswahl_form = _rueckstaende_objekt_filter_form(uebersicht) + (
+        f'<div class="card">{listen_links_html(objekt_id=uebersicht.objekt_filter)}</div>'
+    )
     kpi_html = _rueckstaende_kpi_html(uebersicht.kennzahlen)
 
     if uebersicht.objekt_filter is None:
@@ -582,6 +588,7 @@ def zahlungen_hub(request: Request, session=Depends(_current_session)) -> HTMLRe
          geöffnet (Mieter &amp; Objekte).</p>
     </div>
     {_bereich_karten_html([
+        ("/backoffice/salden", "Salden", "Alle Mietkonten mit offenem Saldo, fälligem Betrag, Guthaben und Bankstand."),
         ("/backoffice/bank", "Bankdatei einlesen", "CSV-/CAMT.053-Import mit Vorschau vor der Übernahme."),
         ("/backoffice/bank/unzugeordnet", "Offene Zahlungen zuordnen", "Bankbuchungen, die noch keinem Mietkonto zugeordnet sind."),
         ("/backoffice/bank/vollstaendigkeit", "Bankvollständigkeit", "Bestätigt je Bankkonto, dass ein Zeitraum lückenlos eingelesen ist."),
@@ -599,6 +606,10 @@ def abrechnungen_hub(request: Request, session=Depends(_current_session)) -> HTM
          Netto-Monatsübersicht sind hier zusammen erreichbar.</p>
     </div>
     {_bereich_karten_html([
+        (
+            "/backoffice/zinsliste", "Zinsliste",
+            "Monatliche vertragliche Beträge je Einheit - inkl. Leerstand, Kurzzeitvermietung, Selfstorage.",
+        ),
         (
             "/backoffice/variable-abrechnung", "Kurzzeit-/Selfstorage-Abrechnung",
             "Variable Monatsabrechnung erfassen/prüfen, CSV-Import, Versionen.",

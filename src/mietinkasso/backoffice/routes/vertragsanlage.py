@@ -53,6 +53,7 @@ from mietinkasso.vertragsanlage.vorschlaege import (
 
 from mietinkasso.backoffice import dependencies as deps
 from mietinkasso.backoffice.auth import _ctx, _current_session, _fehlerseite, _layout, _objekt_fuer_vertrag_gesperrt, _verify_csrf
+from mietinkasso.backoffice.routes.shared import listen_links_html
 
 
 #: Ohne eigenes Prefix - das gemeinsame `/backoffice`-Prefix wird GENAU
@@ -131,7 +132,8 @@ def vertragsanlage_liste(request: Request, session=Depends(_current_session)) ->
 
     return _layout(
         request, session, "Mieter & Objekte",
-        _vertragsanlage_liste_formular(zeilen, session.csrf_token, leerstand_zeilen=leerstand_zeilen),
+        f'<div class="card">{listen_links_html()}</div>'
+        + _vertragsanlage_liste_formular(zeilen, session.csrf_token, leerstand_zeilen=leerstand_zeilen),
     )
 
 
@@ -327,6 +329,40 @@ def vertragsanlage_detail(
     return _layout(request, session, f"Mieterakte {debitor.name}", inhalt)
 
 
+@router.post("/vertrag/{vertrag_id}/telefon")
+def vertragsanlage_debitor_telefon(
+    request: Request,
+    vertrag_id: str,
+    telefon: str = Form(""),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    """Pflegt AUSSCHLIESSLICH die Telefonnummer des Mieters dieses
+    Vertrags (Auftrag HV-20260930-PORTAL-LISTEN) - bewusst NICHT über die
+    Intake-Strecke der Vertragsanlage: eine Kontaktangabe braucht keine
+    neue Profilversion, und Name/E-Mail/Adresse werden hier gar nicht
+    angefasst. Ein leeres Feld löscht die Nummer ausdrücklich."""
+
+    _verify_csrf(session, csrf_token)
+    ctx = _ctx(session)
+    require_schreibrecht(ctx)
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Mieterakte", "Vertrag nicht verfügbar.", "/backoffice/vertraege")
+    require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
+    try:
+        geaendert = deps._stammdaten_repo.set_debitor_telefon(debitor_id=vertrag.debitor_id, telefon=telefon)
+        if geaendert:
+            # Die Nummer selbst steht bewusst NICHT im Audit-Protokoll.
+            deps._audit_service.log(
+                entity_typ="debitor", entity_id=vertrag.debitor_id, aktion="TELEFON_GEAENDERT", akteur=session.user_id,
+                payload={"vertrag_id": vertrag_id, "telefon_hinterlegt": bool(telefon.strip())},
+            )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Mieterakte", str(exc), f"/backoffice/vertrag/{vertrag_id}")
+    return RedirectResponse(f"/backoffice/vertrag/{vertrag_id}", status_code=303)
+
+
 @router.post("/vertragsanlage/pdf-hochladen", response_class=HTMLResponse)
 async def vertragsanlage_pdf_hochladen(
     request: Request,
@@ -343,6 +379,7 @@ async def vertragsanlage_pdf_hochladen(
     neuer_debitor_name: str = Form(""),
     neuer_debitor_email: str = Form(""),
     neuer_debitor_adresse: str = Form(""),
+    neuer_debitor_telefon: str = Form(""),
     komponente_hmz: str = Form(""),
     komponente_bk: str = Form(""),
     komponente_hk: str = Form(""),
@@ -367,6 +404,7 @@ async def vertragsanlage_pdf_hochladen(
                 "gueltig_von": gueltig_von, "gueltig_bis": gueltig_bis,
                 "neuer_debitor_id": neuer_debitor_id, "neuer_debitor_name": neuer_debitor_name,
                 "neuer_debitor_email": neuer_debitor_email, "neuer_debitor_adresse": neuer_debitor_adresse,
+                "neuer_debitor_telefon": neuer_debitor_telefon,
             })
         except ValueError as exc:
             return _fehlerseite(session, "Neuer Mietvertrag", str(exc), "/backoffice/vertraege/neu")
@@ -448,6 +486,7 @@ async def vertragsanlage_pdf_hochladen(
                 "neuer_debitor_id": kontext["neuer_debitor"]["id"], "neuer_debitor_name": kontext["neuer_debitor"]["name"],
                 "neuer_debitor_email": kontext["neuer_debitor"].get("email") or "",
                 "neuer_debitor_adresse": kontext["neuer_debitor"].get("adresse") or "",
+                "neuer_debitor_telefon": kontext["neuer_debitor"].get("telefon") or "",
             })
             mieter_anzeige = f"{kontext['neuer_debitor']['name']} (neu: {kontext['neuer_debitor']['id']})"
         else:
@@ -511,6 +550,8 @@ async def vertragsanlage_vorschau(request: Request, session=Depends(_current_ses
                 "id": neuer_debitor_id, "name": neuer_debitor_name,
                 "email": str(form.get("neuer_debitor_email", "")).strip() or None,
                 "adresse": str(form.get("neuer_debitor_adresse", "")).strip() or None,
+                # Geprüft wird im Intake-Parser (ungültig -> Fehlerseite unten).
+                "telefon": str(form.get("neuer_debitor_telefon", "")).strip() or None,
             }
             neuer_vertrag["debitor_id"] = neuer_debitor_id
         elif deps._stammdaten_repo.get_debitor(neuer_vertrag["debitor_id"]) is None:
