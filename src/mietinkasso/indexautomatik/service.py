@@ -349,6 +349,7 @@ class IndexautomatikService:
             return _abschliessen("KEIN_ERHOEHUNGSBEDARF", mieweg_vorschau_id=vorschau.id)
 
         schreiben = self._outbox_service.erstellen_aus_mieweg(
+            heute=heute,
             ctx=ctx,
             vertrag=vertrag,
             profil=profil,
@@ -685,6 +686,7 @@ class IndexautomatikService:
         # kalenderregelkonformen Laufs) - kein erneut aus dem heutigen
         # Tagesdatum erfundener Termin.
         schreiben = self._outbox_service.erstellen_aus_index_anpassung(
+            heute=heute,
             ctx=ctx,
             vertrag=vertrag,
             profil=profil,

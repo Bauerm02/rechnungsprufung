@@ -10,12 +10,15 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from html import escape as h
+from pathlib import Path
+import base64
 
-from fastapi import APIRouter, Depends, Form, Request
+from fastapi import APIRouter, Depends, Form, Request, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
 
-from mietinkasso.auth.service import require_schreibrecht
+from mietinkasso.auth.service import require_schreibrecht, require_gesellschaft_access
+from mietinkasso.indexautomatik.begehren import druckansicht
 from mietinkasso.backoffice.views import csrf_feld, eur, flash_ok, option
 from mietinkasso.domain.enums import ZUGANGSFORMEN_ALLE as _ZUGANGSFORMEN_ALLE
 from mietinkasso.domain.exceptions import MietinkassoError
@@ -45,8 +48,11 @@ def _outbox_zeile_html(o) -> str:
           <button type="submit" class="secondary">Zugang bestätigen</button></form>"""
     gruende = "<br>".join(h(g) for g in (o.blockiert_gruende or [])) or "-"
     schreiben_html = (
+        f'<a href="/backoffice/indexautomatik/outbox/{o.id}/schreiben">Schreiben ansehen / drucken</a>'
         f"<details><summary>Text anzeigen</summary><pre>{h(o.schreiben_text or '(kein Text)')}</pre></details>"
     )
+    if o.status in {'ENTWURF', 'BLOCKIERT', 'BEREIT'}:
+        aktion += f'<form method="post" action="/backoffice/indexautomatik/outbox/{o.id}/vorlage-erneuern">{{csrf}}<button type="submit" class="secondary">Vorlage und Termin erneuern</button></form>'
     return (
         "<tr>"
         f"<td>{h(o.vertrag_id)}</td><td>{o.ziel_bewertungsjahr or '-'}</td><td>{o.index_anpassung_id or '-'}</td>"
@@ -58,7 +64,16 @@ def _outbox_zeile_html(o) -> str:
 
 @router.get("/indexautomatik/outbox", response_class=HTMLResponse)
 def indexautomatik_outbox(request: Request, session=Depends(_current_session)) -> HTMLResponse:
-    schreiben = deps._indexautomatik.outbox_repository.liste_alle()
+    schreiben = []
+    for row in deps._indexautomatik.outbox_repository.liste_alle():
+        contract = deps._stammdaten_repo.get_vertrag(row.vertrag_id)
+        if contract is None or not _ctx(session).has_zugriff(contract.gesellschaft_id):
+            continue
+        try:
+            deps._stammdaten_repo.pruefe_vertrag_nicht_ausgeschlossen(contract.id)
+        except MietinkassoError:
+            continue
+        schreiben.append(row)
     zeilen = "".join(_outbox_zeile_html(o).replace("{csrf}", csrf_feld(session.csrf_token)) for o in schreiben) or (
         '<tr><td colspan=10 class="muted">Noch kein Erhöhungsschreiben vorhanden.</td></tr>'
     )
@@ -77,6 +92,45 @@ def indexautomatik_outbox(request: Request, session=Depends(_current_session)) -
     </div>
     """
     return _layout(request, session, "Indexautomatik-Outbox", inhalt)
+
+
+@router.get('/indexautomatik/outbox/{erhoehungsschreiben_id}/schreiben', response_class=HTMLResponse)
+def index_schreiben_ansehen(erhoehungsschreiben_id: int, session=Depends(_current_session)):
+    row = deps._indexautomatik.outbox_repository.get(erhoehungsschreiben_id)
+    if row is None:
+        raise HTTPException(404, 'Schreiben nicht gefunden')
+    contract = deps._stammdaten_repo.get_vertrag(row.vertrag_id)
+    if contract is None:
+        raise HTTPException(404, 'Vertrag nicht gefunden')
+    try:
+        require_gesellschaft_access(_ctx(session), contract.gesellschaft_id)
+        deps._stammdaten_repo.pruefe_vertrag_nicht_ausgeschlossen(contract.id)
+    except MietinkassoError:
+        raise HTTPException(403, 'Kein Zugriff auf dieses Schreiben') from None
+    logo_uri = None
+    configured = deps._settings.brief_logo_pfad
+    if configured:
+        path = Path(configured)
+        if path.is_file() and path.stat().st_size <= 1_000_000:
+            data = path.read_bytes()
+            mime = 'image/png' if data.startswith(b'\x89PNG\r\n\x1a\n') else ('image/jpeg' if data.startswith(b'\xff\xd8\xff') else None)
+            if mime:
+                logo_uri = f'data:{mime};base64,' + base64.b64encode(data).decode('ascii')
+    status = ('ENTWURF – noch nicht versendet; keine Einzelvertragsfreigabe durch die Vorlage.'
+              if row.status in {'ENTWURF', 'BEREIT', 'BLOCKIERT'} else 'Gespeicherter Schreibentext · Status: ' + row.status)
+    return HTMLResponse(druckansicht(row.schreiben_text, status=status, logo_data_uri=logo_uri),
+                        headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
+
+
+@router.post('/indexautomatik/outbox/{erhoehungsschreiben_id}/vorlage-erneuern')
+def index_schreiben_erneuern(erhoehungsschreiben_id: int, csrf_token: str = Form(...), session=Depends(_current_session)):
+    _verify_csrf(session, csrf_token)
+    try:
+        deps._indexautomatik.outbox_service.vorlage_erneuern(ctx=_ctx(session),
+            erhoehungsschreiben_id=erhoehungsschreiben_id, heute=heute_wien())
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, 'Erhöhungsbegehren', str(exc), '/backoffice/indexautomatik/outbox')
+    return RedirectResponse('/backoffice/indexautomatik/outbox', status_code=303)
 
 
 def _lauf_zeile_html(l) -> str:

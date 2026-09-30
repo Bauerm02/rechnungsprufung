@@ -2153,6 +2153,33 @@ def test_vpi_veroeffentlichungsbeleg_aendert_keinen_indexwert(backoffice_client)
     assert row.veroeffentlichung_quelle == "Synthetischer Beleg"
 
 
+def test_erhoehungsbegehren_druckansicht_auth_scope_escape(backoffice_client, monkeypatch):
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+    from mietinkasso.backoffice import dependencies as deps
+    from mietinkasso.api.app import app
+    def row(identifier, contract):
+        return SimpleNamespace(id=identifier,vertrag_id=contract,ziel_bewertungsjahr=2026,index_anpassung_id=None,
+            erhoehung_cent=1000,massgeblicher_termin=date(2026,4,1),status='BLOCKIERT',blockiert_gruende=[],
+            zahlungspflicht_ab=None,schreiben_text='<script>evil()</script> 1.160,00 €')
+    examples={100001:row(100001,'V-601-1'),100002:row(100002,'V-107-1')}
+    monkeypatch.setattr(deps._indexautomatik.outbox_repository,'get',lambda id: examples.get(id))
+    monkeypatch.setattr(deps._indexautomatik.outbox_repository,'liste_alle',lambda: list(examples.values()))
+    with TestClient(app) as anonymous:
+        assert anonymous.get('/backoffice/indexautomatik/outbox/100001/schreiben',follow_redirects=False).status_code==303
+    client,*_=backoffice_client
+    _login(client)
+    page=client.get('/backoffice/indexautomatik/outbox/100001/schreiben')
+    assert page.status_code==200 and 'ENTWURF' in page.text
+    assert '<script>evil' not in page.text and '&lt;script&gt;' in page.text
+    assert page.headers['cache-control']=='no-store'
+    assert client.get('/backoffice/indexautomatik/outbox/100002/schreiben').status_code==403
+    assert client.get('/backoffice/indexautomatik/outbox/100003/schreiben').status_code==404
+    overview=client.get('/backoffice/indexautomatik/outbox').text
+    assert '/100001/schreiben' in overview and '/100002/schreiben' not in overview
+    assert client.post('/backoffice/indexautomatik/outbox/100001/vorlage-erneuern',data={}).status_code==422
+
+
 def test_indexautomatik_outbox_und_vertragsende_seiten_erreichbar(backoffice_client):
     client, *_ = backoffice_client
     _login(client)
@@ -4186,4 +4213,3 @@ def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
 
 # -- Variable Monatsabrechnung (KURZZEITVERMIETUNG/SELFSTORAGE) --------------
 # Auftrag 13.09., HV-20260913-DASHBOARD.
-

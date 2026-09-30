@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from hashlib import sha256
+from mietinkasso.indexautomatik.begehren import VERSION
+
+def _notice_meta(frist=14):
+    # Isolated transport fixtures; real rendered notices are covered separately.
+    return dict(version=VERSION, fehler=[], erstellt_am='2026-01-01', zugang_spaetestens='2026-12-31', faelligkeit_tag=5, frist_tage=max(14, frist or 0), zahlungstermin='2026-04-05', text_sha256=sha256(b'Testschreiben').hexdigest())
+
 
 import pytest
 
@@ -51,7 +58,7 @@ def _freigegebenes_profil(admin_ctx, rechtsprofil_service, stammdaten_repo, vert
         mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
         bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=[komponente_id],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
-        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz=None,
+        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz="Punkt 5 Wertsicherung",
         erstellt_von="markus", frist_tage_zugang_bis_wirksamkeit=frist_tage,
         frist_quellenbeleg="Synthetischer Vertrag Punkt 9" if frist_tage is not None else None,
     )
@@ -67,7 +74,7 @@ def _bereites_schreiben(
     vertrag = stammdaten_repo.get_vertrag(vertrag.id)
     debitor = stammdaten_repo.get_debitor(vertrag.debitor_id)
     empfaenger_snapshot = {
-        "debitor_id": vertrag.debitor_id, "name": debitor.name, "adresse": debitor.adresse, "email": debitor.email,
+        "begehren": _notice_meta(profil.frist_tage_zugang_bis_wirksamkeit), "komponenten_snapshot": ErhoehungsschreibenOutboxService._komponenten_snapshot(None, stammdaten_repo.list_aktive_komponenten(vertrag.id, date(2026, 4, 5))), "debitor_id": vertrag.debitor_id, "name": debitor.name, "adresse": debitor.adresse, "email": debitor.email,
         "vertrag_gueltig_bis": vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else None,
         "vertrag_rechtsordnung": vertrag.rechtsordnung,
     }
@@ -356,7 +363,7 @@ def test_zugangsfrist_konfiguriertes_fristenprofil_hebt_sperre_gezielt_auf(
         mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
         bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=["K-1"],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
-        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz=None,
+        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz="Punkt 5 Wertsicherung",
         erstellt_von="markus", frist_tage_zugang_bis_wirksamkeit=30,
         frist_quellenbeleg="Vertrag Punkt 9, belegte Gewerbeklausel",
     )
@@ -371,10 +378,10 @@ def test_zugangsfrist_konfiguriertes_fristenprofil_hebt_sperre_gezielt_auf(
             status="BEREIT", massgeblicher_termin=date(2026, 3, 1), erhoehung_cent=1000,
             schreiben_text="Testschreiben", idempotenzschluessel=f"{vertrag.id}:2026",
             empfaenger_snapshot={
-                "debitor_id": vertrag.debitor_id, "name": debitor.name, "adresse": debitor.adresse, "email": debitor.email,
+                "begehren": _notice_meta(profil.frist_tage_zugang_bis_wirksamkeit), "komponenten_snapshot": ErhoehungsschreibenOutboxService._komponenten_snapshot(None, stammdaten_repo.list_aktive_komponenten(vertrag.id, date(2026, 4, 5))), "debitor_id": vertrag.debitor_id, "name": debitor.name, "adresse": debitor.adresse, "email": debitor.email,
                 "vertrag_gueltig_bis": vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else None,
                 "vertrag_rechtsordnung": vertrag.rechtsordnung,
-                "komponenten_snapshot": [],
+
             },
         )
     )
@@ -482,7 +489,7 @@ def test_mehrkomponenten_werden_centgenau_verteilt(admin_ctx, basis_vertrag, out
         mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
         bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=["K-1", "K-2"],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
-        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz=None,
+        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz="Punkt 5 Wertsicherung",
         erstellt_von="markus",
     )
     profil = rechtsprofil_service.freigeben(profil.id, ctx=admin_ctx, freigegeben_von="markus")
@@ -558,7 +565,7 @@ def test_erstellen_aus_mieweg_befuellt_komponenten_verteilung_bei_genau_einer_ko
         mietzinsobergrenze_cent=None, mietzinsobergrenze_quellenbeleg=None, mietzinsobergrenze_gueltig_bis=None,
         bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False, basis_komponenten_ids=["K-1"],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
-        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz=None,
+        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz="Punkt 5 Wertsicherung",
         erstellt_von="markus",
     )
     profil = rechtsprofil_service.freigeben(profil.id, ctx=admin_ctx, freigegeben_von="markus")

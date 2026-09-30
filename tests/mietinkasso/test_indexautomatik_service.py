@@ -34,6 +34,67 @@ class Bundle:
     outbox_service: ErhoehungsschreibenOutboxService
 
 
+def _notice_for_review(admin_ctx, basis_vertrag, bundle, stammdaten_repo):
+    contract, _ = basis_vertrag
+    debtor = stammdaten_repo.get_debitor(contract.debitor_id)
+    stammdaten_repo.upsert_debitor(id=debtor.id,name=debtor.name,email=debtor.email,adresse='Testweg 1, Wien')
+    _mit_komponente(stammdaten_repo,contract)
+    _freigegebenes_wohnungsprofil(admin_ctx,bundle.rechtsprofil_service,contract)
+    _seed_vpi(bundle.vpi_repo,jahre_werte={2023:'100',2024:'102',2025:'104'})
+    run=bundle.index_service.monatslauf_fuer_vertrag(ctx=admin_ctx,vertrag=contract,heute=date(2026,9,13),akteur='test')
+    row=bundle.outbox_repo.get(run.erhoehungsschreiben_id)
+    assert row.status=='BEREIT',row.blockiert_gruende
+    return row
+
+
+def test_notice_regeneration_moves_expired_term_but_no_duplicate(admin_ctx,basis_vertrag,bundle,stammdaten_repo):
+    row=_notice_for_review(admin_ctx,basis_vertrag,bundle,stammdaten_repo)
+    assert row.empfaenger_snapshot['begehren']['zahlungstermin']=='2026-10-05'
+    renewed=bundle.outbox_service.vorlage_erneuern(ctx=admin_ctx,erhoehungsschreiben_id=row.id,heute=date(2026,10,1))
+    assert renewed.id==row.id and renewed.status=='BEREIT'
+    assert renewed.empfaenger_snapshot['begehren']['zahlungstermin']=='2026-11-05'
+    assert len(bundle.outbox_repo.liste_alle())==1
+
+
+def test_notice_late_receipt_delays_term_and_sent_text_immutable(admin_ctx,basis_vertrag,bundle,stammdaten_repo):
+    from mietinkasso.indexautomatik.transport import FakeTransportadapter
+    row=_notice_for_review(admin_ctx,basis_vertrag,bundle,stammdaten_repo)
+    result=bundle.outbox_service.versenden(ctx=admin_ctx,erhoehungsschreiben_id=row.id,heute=date(2026,9,13),
+        send_enabled=True,mailops_allowlist_bestaetigt=True,transport=FakeTransportadapter())
+    assert result.status=='GESENDET',result.grund
+    # Synthetic adapter returns no actual UTC send timestamp; bind the test proof explicitly.
+    from datetime import datetime, timezone
+    bundle.outbox_repo.set_status(row.id,'GESENDET',versendet_am=datetime(2026,9,13,tzinfo=timezone.utc))
+    with pytest.raises(ValueError):
+        bundle.outbox_service.vorlage_erneuern(ctx=admin_ctx,erhoehungsschreiben_id=row.id,heute=date(2026,9,20))
+    with pytest.raises(ValueError):
+        bundle.outbox_repo.aktualisieren(row.id,schreiben_text='overwritten')
+    confirmed=bundle.outbox_service.zugang_bestaetigen(ctx=admin_ctx,erhoehungsschreiben_id=row.id,
+        heute=date(2026,9,25),zugang_datum=date(2026,9,25),zugangsform='EINSCHREIBEN_RUECKSCHEIN',zugang_beleg='synthetic-proof')
+    assert confirmed.zahlungspflicht_ab==date(2026,11,5)
+    assert confirmed.schreiben_text==row.schreiben_text
+
+
+def test_notice_new_future_component_prevents_wrong_total(admin_ctx,basis_vertrag,bundle,stammdaten_repo):
+    from mietinkasso.indexautomatik.transport import FakeTransportadapter
+    row=_notice_for_review(admin_ctx,basis_vertrag,bundle,stammdaten_repo)
+    stammdaten_repo.add_komponente(id='NEW-BK',vertrag_id=row.vertrag_id,art='BK_VORAUSZAHLUNG',
+        bezeichnung='Neue BK',betrag_cent=5000,indexierbar=False,gueltig_von=date(2026,10,1))
+    transport=FakeTransportadapter()
+    result=bundle.outbox_service.versenden(ctx=admin_ctx,erhoehungsschreiben_id=row.id,heute=date(2026,9,13),
+        send_enabled=True,mailops_allowlist_bestaetigt=True,transport=transport)
+    assert result.status=='BLOCKIERT' and not transport.aufrufe
+
+
+def test_notice_legacy_can_be_rebuilt_from_original_evidence(admin_ctx,basis_vertrag,bundle,stammdaten_repo):
+    row=_notice_for_review(admin_ctx,basis_vertrag,bundle,stammdaten_repo)
+    snapshot=dict(row.empfaenger_snapshot); snapshot.pop('begehren')
+    bundle.outbox_repo.aktualisieren(row.id,empfaenger_snapshot=snapshot,schreiben_text='Alte Vorlage')
+    renewed=bundle.outbox_service.vorlage_erneuern(ctx=admin_ctx,erhoehungsschreiben_id=row.id,heute=date(2026,9,20))
+    assert renewed.status=='BEREIT' and 'Alte Vorlage' not in renewed.schreiben_text
+    assert renewed.empfaenger_snapshot['begehren']['version'].startswith('JLB-INDEX-')
+
+
 @pytest.fixture
 def bundle(session_factory, stammdaten_repo) -> Bundle:
     rechtsprofil_repo = RechtsprofilRepository(session_factory)
@@ -47,7 +108,7 @@ def bundle(session_factory, stammdaten_repo) -> Bundle:
     mieweg_service = MieWegVorschauService(mieweg_repo, stammdaten_repo)
     index_service = IndexService(index_repo, stammdaten_repo)
     outbox_service = ErhoehungsschreibenOutboxService(
-        outbox_repo, stammdaten_repo, rechtsprofil_repo, rechtsprofil_service, jlb_signatur="JLB Projects GmbH"
+        outbox_repo, stammdaten_repo, rechtsprofil_repo, rechtsprofil_service, jlb_signatur="JLB Projects GmbH", index_repository=index_repo
     )
 
     automatik = IndexautomatikService(
@@ -262,7 +323,7 @@ def test_geschaeftsraum_klausel_ohne_kalenderregel_bleibt_gesperrt(admin_ctx, ba
     _freigegebenes_wohnungsprofil(
         admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
         ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
-        vertragsklausel_id=klausel.id,
+        vertragsklausel_id=klausel.id, frist_tage_zugang_bis_wirksamkeit=14, frist_quellenbeleg="Vertrag Punkt 7",
     )
     bundle.vpi_repo.monatswert_erfassen(
         reihe="VPI20C18", jahr=2026, monat=8, wert=Decimal("105"), finalitaet="ENDGUELTIG",
@@ -315,7 +376,7 @@ def test_geschaeftsraum_ausserhalb_anpassungsmonat_kein_brief(admin_ctx, basis_v
     _freigegebenes_wohnungsprofil(
         admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
         ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
-        vertragsklausel_id=klausel.id,
+        vertragsklausel_id=klausel.id, frist_tage_zugang_bis_wirksamkeit=14, frist_quellenbeleg="Vertrag Punkt 7",
     )
     _seed_vpi_monat(bundle, jahr=2026, monat=5, wert="110")
 
@@ -335,7 +396,7 @@ def test_geschaeftsraum_januar_unter_schwelle_kein_brief(admin_ctx, basis_vertra
     _freigegebenes_wohnungsprofil(
         admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
         ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
-        vertragsklausel_id=klausel.id,
+        vertragsklausel_id=klausel.id, frist_tage_zugang_bis_wirksamkeit=14, frist_quellenbeleg="Vertrag Punkt 7",
     )
     _seed_vpi_monat(bundle, jahr=2025, monat=12, wert="102")  # +2%, unter der 5%-Schwelle
 
@@ -359,7 +420,7 @@ def test_geschaeftsraum_berechtigter_januarfall_bis_outbox_kein_doppelbrief(
     _freigegebenes_wohnungsprofil(
         admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
         ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
-        vertragsklausel_id=klausel.id,
+        vertragsklausel_id=klausel.id, frist_tage_zugang_bis_wirksamkeit=14, frist_quellenbeleg="Vertrag Punkt 7",
     )
     _seed_vpi_monat(bundle, jahr=2025, monat=12, wert="110")  # +10%
 
@@ -429,7 +490,7 @@ def test_geschaeftsraum_erster_termin_ist_naechste_kalenderwiederkehr_nicht_begi
     _freigegebenes_wohnungsprofil(
         admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
         ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
-        vertragsklausel_id=klausel.id,
+        vertragsklausel_id=klausel.id, frist_tage_zugang_bis_wirksamkeit=14, frist_quellenbeleg="Vertrag Punkt 7",
     )
     _seed_vpi_monat(bundle, jahr=2026, monat=12, wert="110")
 
@@ -586,7 +647,7 @@ def test_geschaeftsraum_bei_schwelle_ohne_kalenderbindung_loest_ausserhalb_jaenn
     _freigegebenes_wohnungsprofil(
         admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
         ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
-        vertragsklausel_id=klausel.id,
+        vertragsklausel_id=klausel.id, frist_tage_zugang_bis_wirksamkeit=14, frist_quellenbeleg="Vertrag Punkt 7",
     )
     _seed_vpi_monat(bundle, jahr=2026, monat=5, wert="110")  # +10%, Mai - AUSSERHALB Jänner
 
@@ -618,7 +679,7 @@ def test_geschaeftsraum_intervall_ohne_fixen_monat_respektiert_mindestabstand(
     _freigegebenes_wohnungsprofil(
         admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
         ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
-        vertragsklausel_id=klausel.id,
+        vertragsklausel_id=klausel.id, frist_tage_zugang_bis_wirksamkeit=14, frist_quellenbeleg="Vertrag Punkt 7",
     )
     _seed_vpi_monat(bundle, jahr=2026, monat=4, wert="105")
 
@@ -656,7 +717,7 @@ def test_geschaeftsraum_wartefrist_anker_verschiebt_sich_nicht_mit_neuen_vpi_dat
     _freigegebenes_wohnungsprofil(
         admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
         ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
-        vertragsklausel_id=klausel.id,
+        vertragsklausel_id=klausel.id, frist_tage_zugang_bis_wirksamkeit=14, frist_quellenbeleg="Vertrag Punkt 7",
     )
     # Erstes Überschreitungsereignis: Februar 2025 (+5%, Schwelle 0%).
     _seed_vpi_monat(bundle, jahr=2025, monat=2, wert="105")
@@ -722,7 +783,7 @@ def test_geschaeftsraum_senkung_erzeugt_pruefbedarf_statt_verstecktem_kein_erhoe
     _freigegebenes_wohnungsprofil(
         admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
         ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
-        vertragsklausel_id=klausel.id,
+        vertragsklausel_id=klausel.id, frist_tage_zugang_bis_wirksamkeit=14, frist_quellenbeleg="Vertrag Punkt 7",
     )
     _seed_vpi_monat(bundle, jahr=2025, monat=12, wert="90")  # -10%
 
@@ -760,7 +821,7 @@ def test_migrierte_klausel_mit_belegter_letzter_anpassung_respektiert_mindestint
     _freigegebenes_wohnungsprofil(
         admin_ctx, bundle.rechtsprofil_service, vertrag, rechtsordnung="OESTERREICH_MRG_TEIL",
         ist_wohnungsnutzung=False, vertraglich_zulaessiger_betrag_cent=None, vertraglicher_quellenbeleg=None,
-        vertragsklausel_id=klausel.id,
+        vertragsklausel_id=klausel.id, frist_tage_zugang_bis_wirksamkeit=14, frist_quellenbeleg="Vertrag Punkt 7",
     )
     _seed_vpi_monat(bundle, jahr=2026, monat=12, wert="110")
 
