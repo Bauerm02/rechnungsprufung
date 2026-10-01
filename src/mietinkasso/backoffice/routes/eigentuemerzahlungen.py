@@ -20,6 +20,9 @@ from mietinkasso.eigentuemerzahlungen.service import Profil, plan, generate, pro
 from mietinkasso.indexautomatik.zeit import WIEN
 
 router = APIRouter()
+LABELS = {'BEREIT':'Für Zahlungsdatei bereit','KLAEREN':'Klärung nötig','AUSGESCHIEDEN':'Kostenpflicht beendet',
+    'NICHT_FAELLIG':'Noch nicht fällig','BEZAHLT':'Bankzahlung belegt','DATEI_VORHANDEN':'Datei vorhanden',
+    'GEORGE_IMPORTIERT':'In George eingespielt','ERSTELLT':'Zur Bankfreigabe vorbereitet'}
 
 
 def euros(c):
@@ -41,7 +44,7 @@ def overview(request: Request, monat: str = "", session=Depends(_current_session
         run = s.get(Lauf,monat)
         last = datetime.fromisoformat(json.loads(run.bericht)["geprueft_am"]).astimezone(WIEN).strftime('%d.%m.%Y %H:%M') if run else "Noch kein automatischer Lauf für diesen Monat"
     table = "".join(f'<tr><td>{h(r["objekt"])}</td><td>{h(r["einheit"])}</td><td>{euros(r["soll_cent"])}</td>'
-        f'<td>{euros(r["bezahlt_cent"])}</td><td>{euros(r["betrag_cent"])}</td><td>{h(r["status"])}</td>'
+        f'<td>{euros(r["bezahlt_cent"])}</td><td>{euros(r["betrag_cent"])}</td><td>{h(LABELS.get(r["status"],r["status"]))}</td>'
         f'<td>{h(r["hinweis"])}</td><td><a href="/backoffice/eigentuemerzahlungen/profil/{h(r["kennung"])}">Vorschreibung / Übergabe</a></td></tr>' for r in rows)
     filelist = ""
     for f in files:
@@ -55,7 +58,8 @@ def overview(request: Request, monat: str = "", session=Depends(_current_session
             link = '<strong>Prüfbedarf nach Änderung. Datei nicht erneut einspielen.</strong>'
         elif settled:
             link = "Bankausführung ganz oder teilweise nachgewiesen – kein erneuter Download"
-        filelist += f'<div class="card"><h3>{h(items[0]["gesellschaft"]) if items else h(f.bank_konto_id)} · {euros(sum(r["betrag_cent"] for r in items))}</h3><p>{len(items)} Positionen · Ausführung {h(items[0]["ausfuehrung"]) if items else "–"} · {h(f.status)}</p><p>{link}</p><small>{h(f.nachweis)}</small></div>'
+        day = date.fromisoformat(items[0]['ausfuehrung']).strftime('%d.%m.%Y') if items else '–'
+        filelist += f'<div class="card"><h3>{h(items[0]["gesellschaft"]) if items else h(f.bank_konto_id)} · {euros(sum(r["betrag_cent"] for r in items))}</h3><p>{len(items)} Positionen · Ausführung {day} · {h(LABELS.get(f.status,f.status))}</p><p>{link}</p><details><summary>Nachweis anzeigen</summary><small>{h(f.nachweis)}</small></details></div>'
     body = f'''<div class="card"><h1>Betriebskosten zahlen</h1>
     <p>Die Eigentümervorschreibungen werden monatlich ohne KI fortgeschrieben. Die Datei bezahlt noch nichts: Bankstand und Deckung prüfen, anschließend in George importieren und freigeben.</p>
     <p><strong>Keine automatische Bankabholung:</strong> berücksichtigt werden nur vorhandene, eindeutig zuordenbare Bankimporte. Andere Zahlungen oder Entwürfe können noch fehlen.</p>
