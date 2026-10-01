@@ -1,5 +1,5 @@
 """Protected owner BK file view and source amendments; no bank execution."""
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from html import escape as h
 import json
@@ -33,10 +33,13 @@ def overview(request: Request, monat: str = "", session=Depends(_current_session
         rows = plan(deps._session_factory,monat)
     except ValueError as exc:
         return _fehlerseite(session,"Betriebskosten zahlen",str(exc))
+    for row in rows:
+        if row['status']=='BEREIT' and date.fromisoformat(row['ausfuehrung']) <= datetime.now(WIEN).date():
+            row.update(status='KLAEREN',hinweis='Ausführungstermin verstrichen oder heute – gesonderten Zahlungslauf prüfen')
     with deps._session_factory() as s:
         files = list(s.scalars(select(Datei).where(Datei.monat==monat).order_by(Datei.id)))
         run = s.get(Lauf,monat)
-        last = json.loads(run.bericht)["geprueft_am"] if run else "Noch kein automatischer Lauf für diesen Monat"
+        last = datetime.fromisoformat(json.loads(run.bericht)["geprueft_am"]).astimezone(WIEN).strftime('%d.%m.%Y %H:%M') if run else "Noch kein automatischer Lauf für diesen Monat"
     table = "".join(f'<tr><td>{h(r["objekt"])}</td><td>{h(r["einheit"])}</td><td>{euros(r["soll_cent"])}</td>'
         f'<td>{euros(r["bezahlt_cent"])}</td><td>{euros(r["betrag_cent"])}</td><td>{h(r["status"])}</td>'
         f'<td>{h(r["hinweis"])}</td><td><a href="/backoffice/eigentuemerzahlungen/profil/{h(r["kennung"])}">Vorschreibung / Übergabe</a></td></tr>' for r in rows)
@@ -59,7 +62,7 @@ def overview(request: Request, monat: str = "", session=Depends(_current_session
     <form method="get"><label>Monat <input type="month" name="monat" value="{h(monat)}"></label> <button>Anzeigen</button></form>
     <p class="muted">Letzte automatische Prüfung: {h(last)}. Ausführung am Vorschreibungstag, bei TARGET-Schließtagen am nächsten Bankarbeitstag.</p></div>
     {filelist or '<div class="card">Noch keine Datei vorhanden. Gesperrte Positionen stehen unten.</div>'}
-    <div class="card"><h2>Vorschreibungen und Ausnahmen</h2><div class="table-scroll"><table><thead><tr><th>Objekt</th><th>Einheit</th><th>Vorschreibung</th><th>Bankzahlung belegt</th><th>Rechnerischer Rest</th><th>Status</th><th>Grund</th><th>Ändern</th></tr></thead><tbody>{table}</tbody></table></div></div>'''
+    <div class="card"><h2>Vorschreibungen und Ausnahmen</h2><div class="tabelle-scroll"><table><thead><tr><th>Objekt</th><th>Einheit</th><th>Vorschreibung</th><th>Bankzahlung belegt</th><th>Rechnerischer Rest</th><th>Status</th><th>Grund</th><th>Ändern</th></tr></thead><tbody>{table}</tbody></table></div></div>'''
     return _layout(request,session,"Betriebskosten zahlen",body)
 
 
