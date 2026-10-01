@@ -57,7 +57,10 @@ Eigentümerlauf hat eigene Tabellen und funktioniert unabhängig vom Index-
 Tagesjob-Lock und Mailtransport. Fehler lassen den Dienst fehlschlagen;
 die nächste Anzeige weist den tatsächlichen letzten Prüfzeitpunkt aus.
 Nach Ausfall wird nur der aktuelle Monat geprüft, keine unbekannten Altmonate
-nachgeholt. Backup umfasst dieselbe SQLite-DB und Belege im Runtime-Ordner.
+nachgeholt. Originalbelege werden zusätzlich in der versionierten SQLite-Zeile
+gespeichert und fallen damit unter die bestehende DB-Sicherung. Die PDF-Datei
+im Runtime-Ordner ist eine zusätzliche Arbeitskopie, keine separate einzige
+Belegsicherung.
 
 Tabellen: eigentuemer_vorschriften, eigentuemer_zahlungsdateien,
 eigentuemer_zahlungspositionen, eigentuemer_zahlungslaeufe. Additiv.

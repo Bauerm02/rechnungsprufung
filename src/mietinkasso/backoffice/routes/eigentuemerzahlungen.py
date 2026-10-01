@@ -135,6 +135,7 @@ async def update(request: Request,key: str, session=Depends(_current_session)):
             raise ValueError("Betrag auf Cent genau eingeben")
         data["betrag_cent"] = int(cents)
         upload = form.get("beleg")
+        content = None
         if upload is not None and getattr(upload,"filename",""):
             content = await upload.read(15*1024*1024+1)
             if len(content)>15*1024*1024 or not content.startswith(b"%PDF-"):
@@ -158,7 +159,7 @@ async def update(request: Request,key: str, session=Depends(_current_session)):
             data.update(quelle=str(target),quelle_sha256=sha)
         elif any(data[k]!=old[k] for k in ("betrag_cent","gueltig_ab","gueltig_bis")):
             raise ValueError("Für die neue Vorschreibung bitte den PDF-Beleg hochladen")
-        save_profile(deps._session_factory,data,actor=session.user_id,expected_version=int(form.get("version","0")))
+        save_profile(deps._session_factory,data,actor=session.user_id,expected_version=int(form.get("version","0")),beleg_bytes=content)
     except (ValueError, InvalidOperation) as exc:
         return _fehlerseite(session,"Vorschreibung prüfen",str(exc))
     return RedirectResponse("/backoffice/eigentuemerzahlungen",status_code=303)

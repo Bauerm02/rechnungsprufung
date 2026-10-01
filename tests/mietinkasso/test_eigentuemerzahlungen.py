@@ -268,5 +268,9 @@ def test_ui_auth_csrf_upload_and_stale_download(session_factory,owner,monkeypatc
     result=client.post(endpoint,data=form,files={'beleg':('source.pdf',stream.getvalue(),'application/pdf')},follow_redirects=False)
     assert result.status_code==303
     assert list((tmp_path/'eigentuemer-belege').glob('*.pdf'))
+    import base64
+    with session_factory() as s:
+        latest=s.scalar(select(Vorschrift).order_by(Vorschrift.version.desc()))
+        assert base64.b64decode(latest.beleg_base64)==stream.getvalue()
     assert client.get(download).status_code==409
     assert client.post(endpoint,data=form,files={'beleg':('source.pdf',stream.getvalue(),'application/pdf')}).status_code==400

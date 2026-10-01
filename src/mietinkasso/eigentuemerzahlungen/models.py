@@ -12,6 +12,8 @@ class Vorschrift(Base):
     version: Mapped[int] = mapped_column(Integer)
     payload: Mapped[str] = mapped_column(Text)
     sha256: Mapped[str] = mapped_column(String(64))
+    # Original source travels with the existing SQLite backup/restore chain.
+    beleg_base64: Mapped[str | None] = mapped_column(Text, nullable=True)
     akteur: Mapped[str] = mapped_column(String(128))
     erstellt_am: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

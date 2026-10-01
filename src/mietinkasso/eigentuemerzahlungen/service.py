@@ -7,6 +7,7 @@ externally imported files. Sources, partial payments and holds stay explicit.
 from __future__ import annotations
 
 import calendar
+import base64
 import hashlib
 import json
 import re
@@ -130,7 +131,7 @@ def _locked(s):
     s.execute(text("BEGIN IMMEDIATE"))
 
 
-def save_profile(factory, value, *, actor, expected_version):
+def save_profile(factory, value, *, actor, expected_version, beleg_bytes=None):
     p = Profil.model_validate(value)
     with factory() as s:
         _locked(s)
@@ -143,6 +144,13 @@ def save_profile(factory, value, *, actor, expected_version):
             for field in ("kennung", "objekt_id", "bank_konto_id", "referenz", "empfaenger_iban", "start_monat"):
                 if getattr(old, field) != getattr(p, field):
                     raise ValueError("Identität/Kontowechsel benötigt gesonderte belegte Migration")
+        beleg = latest.beleg_base64 if latest and old.quelle_sha256 == p.quelle_sha256 else None
+        if beleg_bytes is not None:
+            if len(beleg_bytes) > 15*1024*1024 or hashlib.sha256(beleg_bytes).hexdigest() != p.quelle_sha256:
+                raise ValueError("Beleg passt nicht zur dokumentierten Prüfsumme")
+            beleg = base64.b64encode(beleg_bytes).decode('ascii')
+        elif latest and latest.beleg_base64 and beleg is None:
+            raise ValueError("Neuer Beleg für geänderte Quelle fehlt")
         # Another identity may never disguise the same monthly obligation.
         for row in s.scalars(select(Vorschrift)):
             other = Profil.model_validate_json(row.payload)
@@ -152,7 +160,7 @@ def save_profile(factory, value, *, actor, expected_version):
         if latest and latest.payload == payload:
             return latest.version
         version = expected_version + 1
-        s.add(Vorschrift(kennung=p.kennung, version=version, payload=payload, sha256=digest(payload), akteur=actor))
+        s.add(Vorschrift(kennung=p.kennung, version=version, payload=payload, sha256=digest(payload), beleg_base64=beleg, akteur=actor))
         s.commit()
         return version
 
