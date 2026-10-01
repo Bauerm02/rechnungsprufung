@@ -101,6 +101,17 @@ def main(argv: list[str] | None = None) -> int:
 
     heute = heute_wien(datetime.now(ZoneInfo("Europe/Vienna")))
     fachschluessel = heute.isoformat()
+    # The existing daily server timer is the sole producer. Each month/item
+    # can reserve a payment only once; no LLM, no bank upload or signature.
+    # Independent of the index job's daily lock / mail availability.
+    from mietinkasso.eigentuemerzahlungen.service import generate
+    owner_error = None
+    try:
+        owner_report = generate(session_factory, today=heute)
+        print(f"Eigentümer-Zahlungsdateien: {len(owner_report['neue_dateien'])} neu; keine Bankausführung.")
+    except Exception as exc:
+        owner_error = exc
+        print("Eigentümer-Zahlungslauf fehlgeschlagen; keine stillschweigende Freigabe.")
     mail = HVMailversandService(session_factory, bundle, settings)
 
     def _arbeit() -> dict:
@@ -197,12 +208,16 @@ def main(argv: list[str] | None = None) -> int:
     ergebnis = runner.einmalig_ausfuehren(job_name="indexautomatik_taegliche_pflege", fachschluessel=fachschluessel, fn=_arbeit)
     if ergebnis is None:
         print(f"Tägliche Pflege für {fachschluessel} lief bereits (oder läuft gerade) - kein Doppellauf.")
+        if owner_error is not None:
+            raise RuntimeError("Eigentümer-Zahlungslauf prüfen") from owner_error
         return 0
 
     if mail.client is None:
         print("Hinweis: kein Transport-Endpunkt konfiguriert - Versand strukturell blockiert (nur Vorschau/Outbox).")
     for schluessel, wert in ergebnis.items():
         print(f"  {schluessel}: {wert}")
+    if owner_error is not None:
+        raise RuntimeError("Eigentümer-Zahlungslauf prüfen") from owner_error
     return 0
 
 

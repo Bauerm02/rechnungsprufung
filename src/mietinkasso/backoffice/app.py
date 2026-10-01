@@ -9,6 +9,7 @@ Details: ``docs/hausverwaltung/BACKOFFICE_ARCHITEKTUR.md``.
 from __future__ import annotations
 
 from fastapi import APIRouter
+from mietinkasso.backoffice.routes import eigentuemerzahlungen
 
 from mietinkasso.backoffice.routes import (
     auth as auth_routes,
@@ -35,6 +36,7 @@ router = APIRouter(prefix="/backoffice", tags=["backoffice"])
 # bindend; die HTTP-Vertragstests prüfen die Auflösung gegen den Altstand.
 router.include_router(auth_routes.router)
 router.include_router(dashboard_routes.router)
+router.include_router(eigentuemerzahlungen.router)
 # Drei einsegmentige, statische GET-Pfade (/mieterliste, /zinsliste,
 # /salden) - überlappen mit keinem Platzhalter.
 router.include_router(listen_routes.router)

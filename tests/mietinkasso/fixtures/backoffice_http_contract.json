@@ -1,5 +1,4 @@
 {
-  "baseline_commit": "4467674d045e78d1f35f2d7cb35411bf04a9068d",
   "routes": [
     {
       "path": "/backoffice/",
@@ -182,6 +181,54 @@
       ]
     },
     {
+      "path": "/backoffice/eigentuemerzahlungen",
+      "method": "GET",
+      "endpoint": "overview",
+      "resolved_endpoint": "overview",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/eigentuemerzahlungen/datei/{file_id}",
+      "method": "GET",
+      "endpoint": "download",
+      "resolved_endpoint": "download",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/eigentuemerzahlungen/profil/{key}",
+      "method": "GET",
+      "endpoint": "edit",
+      "resolved_endpoint": "edit",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/eigentuemerzahlungen/profil/{key}",
+      "method": "POST",
+      "endpoint": "update",
+      "resolved_endpoint": "update",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
       "path": "/backoffice/einstellungen",
       "method": "GET",
       "endpoint": "einstellungen_hub",
@@ -278,10 +325,34 @@
       ]
     },
     {
+      "path": "/backoffice/indexautomatik/outbox/{erhoehungsschreiben_id}/schreiben",
+      "method": "GET",
+      "endpoint": "index_schreiben_ansehen",
+      "resolved_endpoint": "index_schreiben_ansehen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
       "path": "/backoffice/indexautomatik/outbox/{erhoehungsschreiben_id}/versenden",
       "method": "POST",
       "endpoint": "indexautomatik_outbox_versenden",
       "resolved_endpoint": "indexautomatik_outbox_versenden",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/indexautomatik/outbox/{erhoehungsschreiben_id}/vorlage-erneuern",
+      "method": "POST",
+      "endpoint": "index_schreiben_erneuern",
+      "resolved_endpoint": "index_schreiben_erneuern",
       "dependencies": [
         {
           "call": "_current_session",
@@ -1222,6 +1293,34 @@
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
     },
     {
+      "path": "/backoffice/eigentuemerzahlungen",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/eigentuemerzahlungen/datei/{file_id}",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/eigentuemerzahlungen/profil/{key}",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/eigentuemerzahlungen/profil/{key}",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
       "path": "/backoffice/einstellungen",
       "method": "get",
       "status": 503,
@@ -1278,7 +1377,21 @@
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
     },
     {
+      "path": "/backoffice/indexautomatik/outbox/{erhoehungsschreiben_id}/schreiben",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
       "path": "/backoffice/indexautomatik/outbox/{erhoehungsschreiben_id}/versenden",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/indexautomatik/outbox/{erhoehungsschreiben_id}/vorlage-erneuern",
       "method": "post",
       "status": 503,
       "location": null,
@@ -1774,5 +1887,7 @@
       "location": null,
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
     }
-  ]
+  ],
+  "session_dependency_count": 1,
+  "baseline_commit": "e095c73fa148f2a6ce8b8e0b8e9ab7735a8120d0 + HV-20261001-BK-AUTOMATIK"
 }

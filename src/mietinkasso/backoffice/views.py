@@ -103,6 +103,7 @@ _BEREICH_PFADPRAEFIXE = {
         "/backoffice/mahnfall", "/backoffice/salden",
     ),
     "abrechnungen": (
+        "/backoffice/eigentuemerzahlungen",
         "/backoffice/abrechnungen", "/backoffice/variable-abrechnung", "/backoffice/dashboard/monatsuebersicht",
         "/backoffice/zinsliste",
     ),

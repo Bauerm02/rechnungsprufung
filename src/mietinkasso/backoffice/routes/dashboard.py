@@ -607,6 +607,10 @@ def abrechnungen_hub(request: Request, session=Depends(_current_session)) -> HTM
     </div>
     {_bereich_karten_html([
         (
+            "/backoffice/eigentuemerzahlungen", "Betriebskosten zahlen",
+            "Monatliche Eigentümervorschreibungen, Übergaben und Zahlungsdateien für George.",
+        ),
+        (
             "/backoffice/zinsliste", "Zinsliste",
             "Monatliche vertragliche Beträge je Einheit - inkl. Leerstand, Kurzzeitvermietung, Selfstorage.",
         ),
