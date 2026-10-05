@@ -4276,3 +4276,9 @@ Offen bzw. bewusst nicht geliefert:
 - **Variable Erlöse:** Die Zinsliste nennt nur den Status des Monatsberichts und verlinkt ihn; Beträge stehen weiterhin ausschließlich in der variablen Monatsabrechnung.
 - **Mehrbenutzer:** Das Backoffice kennt weiterhin einen ADMIN-Operator; die Gesellschaftsfilterung für eingeschränkte Rollen ist auf Service-Ebene getestet, über HTTP aber nicht auslösbar.
 - **Umfang:** keine Paginierung und kein Export; jede Liste wird vollständig je Aufruf berechnet (mehrere Lesezugriffe je Vertrag). Für den Pilotbestand unkritisch, bei deutlich größerem Bestand zu messen.
+
+## 05.10.2026 – Bankimport absichern (HV-20261005-CODEVERBESSERUNG)
+
+Auf Basis cc89c2f im isolierten Branch codex/hv-bankimport-20261005: persistierte Kontobindung vor und während des Imports, optionale eigene CSV-IBAN mit Prüfung in Vorschau und Ausführung sowie formatübergreifende Wiederholerkennung bei gleicher nativer Bank-ID. Details und Grenzen: [BANKIMPORT_SICHERHEIT.md](BANKIMPORT_SICHERHEIT.md). Keine Schemaänderung oder automatische Bestandsbereinigung; kein Deployment aus diesem Codeauftrag.
+
+Offen bleiben die vollständige Bindung Objekt/Mietkonto an Provider-Kontokennung und Kontorolle, CSV-Quellen ohne eigene IBAN, widerrufbare beleggebundene Bankvollständigkeit und ein gemeinsamer Plan/Apply-Service für manuelle Zahlungsnachführung. Verschiedene native IDs werden nicht heuristisch zusammengelegt. Historische Doppelzeilen oder abweichende Exportinhalte benötigen gezielte Klärung; der Import führt diese nicht selbst aus. Mahnsperren und laufende Fachvorgänge bleiben beim zuständigen Owner.

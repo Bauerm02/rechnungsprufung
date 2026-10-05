@@ -24,6 +24,12 @@ from mietinkasso.infrastructure.db.tables import (
 )
 
 
+#: Dateiformate, deren native Bank-IDs dieselbe bankseitige Buchung
+#: bezeichnen - ein Formatwechsel darf keine zweite Zeile erzeugen
+#: (siehe `BankImportService._bestehende_native_zeile`).
+NATIVE_ID_QUELLTYPEN: tuple[str, ...] = ("CAMT053", "CSV")
+
+
 def _vorgang_stimmt_ueberein(
     bestehende_zuordnung: ZuordnungTable, bank_transaktion_id: int, op_position_id: int, betrag_cent: int
 ) -> bool:
@@ -89,6 +95,12 @@ class BankRepository:
             select(BankTransaktionTable).where(BankTransaktionTable.import_id == row.import_id)
         ).scalar_one_or_none()
         if existing is not None:
+            if existing.bank_konto_id != row.bank_konto_id:
+                raise ImportConflictError(
+                    f"Banktransaktion import_id '{row.import_id}' ist bereits durch Bankkonto "
+                    f"{existing.bank_konto_id} belegt (Kennungskollision); kein Replay für Bankkonto "
+                    f"{row.bank_konto_id} - zur manuellen Klärung verweigert."
+                )
             if existing.quelle_hash != row.quelle_hash:
                 raise ImportConflictError(
                     f"Banktransaktion import_id '{row.import_id}' bereits mit anderem Inhalt vorhanden."
@@ -97,6 +109,44 @@ class BankRepository:
         session.add(row)
         session.flush()
         return row
+
+    @staticmethod
+    def native_import_id(bank_konto_id: str, quelle_typ: str, native_id: str) -> str:
+        """Bestehendes `import_id`-Schema für Zeilen MIT nativer Bank-ID
+        (unverändert, keine Migration)."""
+
+        return f"{bank_konto_id}:{quelle_typ}:{native_id}"
+
+    def find_native_id_treffer(
+        self,
+        bank_konto_id: str,
+        native_id: str,
+        quelle_typen: tuple[str, ...] = NATIVE_ID_QUELLTYPEN,
+        *,
+        session: Session | None = None,
+    ) -> list[BankTransaktionTable]:
+        """Alle Zeilen, deren `import_id` EXAKT einer der je Format
+        gebildeten Kandidaten-IDs entspricht (`IN`, kein LIKE/Präfix -
+        `:`/`%`/`_` in IDs bleiben wörtlich). Liefert auch fremd belegte
+        Kandidaten zurück; die Plausibilisierung (Bankkonto/Format/
+        native Kennung) macht der Aufrufer. Mit `session` sieht die
+        Abfrage (Autoflush) auch Geschwisterzeilen derselben Importdatei."""
+
+        kandidaten = [self.native_import_id(bank_konto_id, typ, native_id) for typ in quelle_typen]
+
+        def _query(active_session: Session) -> list[BankTransaktionTable]:
+            return list(
+                active_session.execute(
+                    select(BankTransaktionTable)
+                    .where(BankTransaktionTable.import_id.in_(kandidaten))
+                    .order_by(BankTransaktionTable.id)
+                ).scalars().all()
+            )
+
+        if session is not None:
+            return _query(session)
+        with self._session_factory() as owned_session:
+            return _query(owned_session)
 
     def find_by_fingerprint(
         self, bank_konto_id: str, fingerprint_hash: str, *, session: Session | None = None

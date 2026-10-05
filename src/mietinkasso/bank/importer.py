@@ -60,6 +60,17 @@ class CamtKontoMismatchError(Exception):
     mehr als das ausgewählte Konto enthalten."""
 
 
+class CsvKontoMismatchError(Exception):
+    """CSV-Gegenstück zu `CamtKontoMismatchError` - nur wirksam, wenn das
+    Mapping eine EIGENE Kontospalte (`CsvSpaltenMapping.eigene_iban`)
+    deklariert: fehlende/doppelte Kopfspalte, leere erwartete IBAN, eine
+    leere oder abweichende Konto-IBAN in IRGENDEINER Zeile lehnt die
+    GESAMTE Datei ab, bevor überhaupt eine Zeile zurückgegeben wird (und
+    damit vor jeder DB-Änderung). Die Spalte ist eine Selbstauskunft der
+    Exportdatei, KEIN bankseitiger Herkunftsnachweis (siehe
+    docs/hausverwaltung/BANKIMPORT_SICHERHEIT.md)."""
+
+
 @dataclass(frozen=True)
 class RohTransaktion:
     betrag_cent: int
@@ -255,7 +266,11 @@ def _pruefe_waehrung(waehrung: str, kontext: str) -> None:
 
 
 def _normalisiere_iban(iban: str | None) -> str:
-    return (iban or "").strip().upper().replace(" ", "")
+    """Gemeinsame IBAN-Normalisierung für CAMT, CSV und die Bankkonto-
+    Bindung in `bank.service`: jeglicher Whitespace (auch Tab/geschütztes
+    Leerzeichen aus Tabellenexporten) entfernt, Großschreibung."""
+
+    return "".join((iban or "").split()).upper()
 
 
 def _eindeutige_iban(acct: ET.Element) -> str | None:
@@ -513,6 +528,22 @@ def _parse_iso_date(value: str) -> date:
 
 @dataclass(frozen=True)
 class CsvSpaltenMapping:
+    """Spaltenvertrag für den konfigurierbaren CSV-Import.
+
+    `eindeutige_referenz`: NUR eine Spalte mit einer von der Bank
+    vergebenen, je Bankkonto eindeutigen Buchungs-ID (dieselbe Kennung,
+    die die Bank z. B. als CAMT-AcctSvcrRef liefert). Eine Zeilennummer,
+    ein Laufindex oder ein selbst gebauter Schlüssel ist KEINE native ID -
+    sie würde Replays über Exportgrenzen hinweg falsch zusammenlegen bzw.
+    falsch trennen. Ohne echte Bank-ID bleibt die Spalte leer
+    (konservativer Fingerprint-Pfad).
+
+    `eigene_iban` (optional, bewusst ANGEHÄNGT, damit positionale
+    Aufrufer unverändert funktionieren): Spalte mit der IBAN des EIGENEN,
+    exportierten Kontos - nie die Gegenkonto-Spalte. Ist sie gesetzt,
+    prüft `parse_csv` jede Zeile gegen `erwartete_iban`; ohne sie gibt es
+    keinen Kontobezug aus der Datei (Legacy-Verhalten)."""
+
     betrag: str
     buchungsdatum: str
     waehrung: str | None = None
@@ -523,12 +554,64 @@ class CsvSpaltenMapping:
     valuta: str | None = None
     datumsformat: str = "%Y-%m-%d"
     dezimaltrennzeichen: str = "."
+    eigene_iban: str | None = None
 
 
-def parse_csv(text: str, mapping: CsvSpaltenMapping) -> list[RohTransaktion]:
+def _pruefe_csv_kopf_eigenes_konto(
+    fieldnames: list[str] | None, mapping: CsvSpaltenMapping, erwartete_iban: str | None
+) -> str:
+    """Validiert VOR dem Lesen der ersten Datenzeile: erwartete IBAN
+    vorhanden, eigene Kontospalte genau einmal im Kopf und nicht mit der
+    Gegenkonto-Spalte identisch. Liefert die normalisierte erwartete IBAN."""
+
+    spalte = mapping.eigene_iban or ""
+    erwartet = _normalisiere_iban(erwartete_iban)
+    if not erwartet:
+        raise CsvKontoMismatchError(
+            "Kein IBAN für das ausgewählte Bankkonto hinterlegt; CSV-Kontoprüfung nicht möglich - Import abgelehnt."
+        )
+    if mapping.gegenkonto_iban and mapping.gegenkonto_iban.strip().casefold() == spalte.strip().casefold():
+        raise CsvKontoMismatchError(
+            f"Spalte '{spalte}' ist zugleich als Gegenkonto-IBAN gemappt; die eigene Kontospalte darf nie die "
+            "Gegenkonto-Spalte sein - Import abgelehnt."
+        )
+    kopf = list(fieldnames or [])
+    gleichnamige = [name for name in kopf if (name or "").strip().casefold() == spalte.strip().casefold()]
+    if not gleichnamige or spalte not in kopf:
+        raise CsvKontoMismatchError(f"CSV-Kopfzeile enthält die eigene Kontospalte '{spalte}' nicht - Import abgelehnt.")
+    if len(gleichnamige) > 1:
+        raise CsvKontoMismatchError(
+            f"CSV-Kopfzeile enthält die eigene Kontospalte '{spalte}' mehrfach; nicht eindeutig - Import abgelehnt."
+        )
+    return erwartet
+
+
+def parse_csv(text: str, mapping: CsvSpaltenMapping, *, erwartete_iban: str | None = None) -> list[RohTransaktion]:
+    """`erwartete_iban` (keyword-only): IBAN des ausgewählten, persistierten
+    Bankkontos. Wirksam NUR mit `mapping.eigene_iban`; dann muss JEDE
+    Zeile eine nicht-leere, nach Normalisierung identische IBAN tragen,
+    sonst `CsvKontoMismatchError` für die gesamte Datei. Ohne eigene
+    Kontospalte bleibt das bisherige Verhalten unverändert (kein
+    Kontonachweis aus der Datei)."""
+
     ergebnisse: list[RohTransaktion] = []
     reader = csv.DictReader(io.StringIO(text))
-    for zeile in reader:
+    erwartet = (
+        _pruefe_csv_kopf_eigenes_konto(reader.fieldnames, mapping, erwartete_iban) if mapping.eigene_iban else None
+    )
+    for zeilennummer, zeile in enumerate(reader, start=2):
+        if erwartet is not None:
+            gefunden = _normalisiere_iban(zeile.get(mapping.eigene_iban))
+            if not gefunden:
+                raise CsvKontoMismatchError(
+                    f"CSV-Zeile {zeilennummer}: eigene Kontospalte '{mapping.eigene_iban}' ist leer - der GESAMTE "
+                    "Import wird abgelehnt."
+                )
+            if gefunden != erwartet:
+                raise CsvKontoMismatchError(
+                    f"CSV-Zeile {zeilennummer}: Konto-IBAN {gefunden} weicht vom ausgewählten Konto {erwartet} ab - "
+                    "der GESAMTE Import wird abgelehnt (keine gemischte Mehrkonten-Datei)."
+                )
         betrag_rohtext = zeile[mapping.betrag].strip()
         if mapping.dezimaltrennzeichen == ",":
             betrag_rohtext = betrag_rohtext.replace(".", "").replace(",", ".")

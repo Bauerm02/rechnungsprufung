@@ -30,13 +30,20 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
-from mietinkasso.bank.importer import CsvSpaltenMapping, RohTransaktion, parse_camt053, parse_csv
-from mietinkasso.bank.repository import BankRepository
+from mietinkasso.bank.importer import (
+    CsvSpaltenMapping,
+    RohTransaktion,
+    _normalisiere_iban,
+    parse_camt053,
+    parse_csv,
+)
+from mietinkasso.bank.repository import NATIVE_ID_QUELLTYPEN, BankRepository
 from mietinkasso.domain.enums import OPTyp, ZahlungsMatchTyp
 from mietinkasso.domain.exceptions import (
     BindungInkonsistentError,
     CrossTenantError,
     FremdwaehrungNichtUnterstuetztError,
+    ImportConflictError,
     LeistungsperiodeMehrdeutigError,
     MehrfachbuchungsKonfliktError,
     VorgangIdKonfliktError,
@@ -295,6 +302,52 @@ def _legacy_fingerprint(bank_konto_id: str, roh: RohTransaktion) -> str | None:
     )
 
 
+class BankkontoBindungError(BindungInkonsistentError):
+    """Das für einen Dateiimport übergebene Bankkonto-Objekt stimmt nicht
+    (mehr) mit dem persistierten Bankkonto überein: unbekannte ID,
+    abweichende Gesellschaft oder abweichende (normalisierte) IBAN - etwa
+    ein veraltetes oder manipuliertes, vom Repository abgelöstes Objekt,
+    oder eine zwischen Prüfung und Schreibtransaktion geänderte
+    Kontostammzeile. Der Import wird vollständig abgelehnt; Konto- und
+    Ledgerdaten bleiben unverändert."""
+
+
+@dataclass(frozen=True)
+class _BankkontoIdentitaet:
+    """Persistierte Identität, gegen die geparst wurde - wird in der
+    Schreibtransaktion erneut gegen die DB geprüft."""
+
+    id: str
+    gesellschaft_id: str
+    iban_norm: str
+
+
+def _pruefe_bankkonto_bindung(
+    ctx: AuthContext, persistiert: BankKontoTable | None, erwartet: _BankkontoIdentitaet
+) -> BankKontoTable:
+    """Gemeinsame Prüfung VOR dem Parsen und erneut IN der Schreibtransaktion:
+    Zugriffs-/Schreibrecht hängt an der PERSISTIERTEN Gesellschaft, nie an
+    der des Aufruferobjekts."""
+
+    if persistiert is None:
+        raise BankkontoBindungError(f"Unbekanntes Bankkonto {erwartet.id}; Import abgelehnt.")
+    require_gesellschaft_access(ctx, persistiert.gesellschaft_id)
+    require_schreibrecht(ctx)
+    if persistiert.gesellschaft_id != erwartet.gesellschaft_id:
+        raise BankkontoBindungError(
+            f"Bankkonto {erwartet.id}: übergebene Gesellschaft {erwartet.gesellschaft_id} entspricht nicht der "
+            f"gespeicherten Gesellschaft {persistiert.gesellschaft_id} (veraltetes/abweichendes Kontoobjekt) - "
+            "Import abgelehnt."
+        )
+    if _normalisiere_iban(persistiert.iban) != erwartet.iban_norm:
+        raise BankkontoBindungError(
+            f"Bankkonto {erwartet.id}: übergebene IBAN {erwartet.iban_norm or '-'} entspricht nicht der "
+            f"gespeicherten IBAN {_normalisiere_iban(persistiert.iban) or '-'} (veraltetes/abweichendes "
+            "Kontoobjekt oder zwischenzeitlich geändert) - Import abgelehnt."
+        )
+    return persistiert
+
+
 @dataclass(frozen=True)
 class ZuordnungsErgebnis:
     zugeordnet: bool
@@ -326,25 +379,45 @@ class BankImportService:
     def importiere_camt053(
         self, *, ctx: AuthContext, bank_konto: BankKontoTable, xml_bytes: bytes
     ) -> list[BankTransaktionTable]:
-        require_gesellschaft_access(ctx, bank_konto.gesellschaft_id)
-        require_schreibrecht(ctx)
-        # erwartete_iban erzwingt, dass jedes Stmt/Acct in der Datei zum
-        # explizit ausgewählten Bankkonto passt (siehe
-        # CamtKontoMismatchError) - kein fremdes/gemischtes Konto wird
-        # pauschal diesem Bankkonto zugeordnet.
-        rohdaten = parse_camt053(xml_bytes, erwartete_iban=bank_konto.iban)
-        return self._importiere_atomar(rohdaten, bank_konto, "CAMT053")
+        identitaet = self._gebundene_bankkonto_identitaet(ctx, bank_konto)
+        # erwartete_iban (aus dem PERSISTIERTEN Konto) erzwingt, dass jedes
+        # Stmt/Acct in der Datei zum explizit ausgewählten Bankkonto passt
+        # (siehe CamtKontoMismatchError) - kein fremdes/gemischtes Konto
+        # wird pauschal diesem Bankkonto zugeordnet.
+        rohdaten = parse_camt053(xml_bytes, erwartete_iban=identitaet.iban_norm)
+        return self._importiere_atomar(rohdaten, ctx=ctx, identitaet=identitaet, quelle_typ="CAMT053")
 
     def importiere_csv(
         self, *, ctx: AuthContext, bank_konto: BankKontoTable, text: str, mapping: CsvSpaltenMapping
     ) -> list[BankTransaktionTable]:
-        require_gesellschaft_access(ctx, bank_konto.gesellschaft_id)
-        require_schreibrecht(ctx)
-        rohdaten = parse_csv(text, mapping)
-        return self._importiere_atomar(rohdaten, bank_konto, "CSV")
+        identitaet = self._gebundene_bankkonto_identitaet(ctx, bank_konto)
+        # Die persistierte IBAN wirkt nur, wenn das Mapping eine eigene
+        # Kontospalte deklariert; Legacy-CSV ohne diese Spalte bleibt
+        # unverändert ohne Kontonachweis aus der Datei.
+        rohdaten = parse_csv(text, mapping, erwartete_iban=identitaet.iban_norm)
+        return self._importiere_atomar(rohdaten, ctx=ctx, identitaet=identitaet, quelle_typ="CSV")
+
+    def _gebundene_bankkonto_identitaet(self, ctx: AuthContext, bank_konto: BankKontoTable) -> _BankkontoIdentitaet:
+        """Bindet den Import an das PERSISTIERTE Bankkonto, bevor die Datei
+        überhaupt geparst wird - das Aufruferobjekt liefert nur die ID und
+        die behauptete Identität, die mit der DB übereinstimmen muss (siehe
+        `BankkontoBindungError`). In `_importiere_atomar` wird dieselbe
+        Identität innerhalb der Schreibtransaktion erneut geprüft."""
+
+        identitaet = _BankkontoIdentitaet(
+            id=bank_konto.id, gesellschaft_id=bank_konto.gesellschaft_id, iban_norm=_normalisiere_iban(bank_konto.iban)
+        )
+        with self._session_factory() as session:
+            _pruefe_bankkonto_bindung(ctx, session.get(BankKontoTable, identitaet.id), identitaet)
+        return identitaet
 
     def _importiere_atomar(
-        self, rohdaten: list[RohTransaktion], bank_konto: BankKontoTable, quelle_typ: str
+        self,
+        rohdaten: list[RohTransaktion],
+        *,
+        ctx: AuthContext,
+        identitaet: _BankkontoIdentitaet,
+        quelle_typ: str,
     ) -> list[BankTransaktionTable]:
         """Der gesamte Dateiimport ist EINE DB-Transaktion: scheitert eine
         Zeile (Konflikt, Formatfehler, ...), wird der GESAMTE Aufruf
@@ -369,11 +442,21 @@ class BankImportService:
         als "noch nicht vorhanden" sehen und beide dieselbe wirtschaftliche
         Zahlung als je eigene Zeile einbuchen (dieselbe Fehlerklasse wie
         Codex' Paket-B-Befund bei `verknuepfe_mit_bestehender_zahlung`,
-        siehe `infrastructure/db/sqlite_write_lock.py`)."""
+        siehe `infrastructure/db/sqlite_write_lock.py`).
+
+        Die Bankkonto-Bindung (`identitaet`, gegen die geparst wurde) wird
+        als ERSTES Statement dieser gesperrten Transaktion erneut gegen die
+        DB geprüft - eine zwischen Vorabprüfung und Schreiben geänderte
+        Gesellschaft/IBAN oder ein entzogener Zugriff lässt den gesamten
+        Import scheitern statt gegen eine veraltete Kontobindung zu
+        schreiben."""
 
         with schreibgesperrte_session(self._session_factory) as session:
             ergebnisse: list[BankTransaktionTable] = []
             try:
+                bank_konto = _pruefe_bankkonto_bindung(
+                    ctx, session.get(BankKontoTable, identitaet.id, with_for_update=True), identitaet
+                )
                 for index, roh in enumerate(rohdaten):
                     try:
                         ergebnisse.append(self._speichere_roh(bank_konto, roh, quelle_typ, session=session))
@@ -417,7 +500,12 @@ class BankImportService:
         if roh.native_id:
             hat_native_id = True
             fingerprint_hash = None
-            import_id = f"{bank_konto.id}:{quelle_typ}:{roh.native_id}"
+            import_id = BankRepository.native_import_id(bank_konto.id, quelle_typ, roh.native_id)
+            bestehende_native = self._bestehende_native_zeile(
+                bank_konto.id, roh.native_id, quelle_typ, content_hash, session=session
+            )
+            if bestehende_native is not None:
+                return bestehende_native
         else:
             hat_native_id = False
             fingerprint_hash = _fingerprint(bank_konto.id, roh)
@@ -480,6 +568,58 @@ class BankImportService:
             roh_zeile=roh.roh_zeile,
         )
         return self._repository.insert_transaktion_idempotent(row, session=session)
+
+    def _bestehende_native_zeile(
+        self, bank_konto_id: str, native_id: str, quelle_typ: str, content_hash: str, *, session: Session | None
+    ) -> BankTransaktionTable | None:
+        """Formatübergreifende Replay-Erkennung für bankseitige native IDs
+        (CSV <-> CAMT053) über die bestehende `import_id`-Konvention - exakter
+        Vergleich der Kandidaten-`import_id`s je Format, kein LIKE/Präfix.
+        ALLE Treffer werden geprüft, auch wenn bereits eine Zeile im selben
+        Format existiert:
+
+        - kein Treffer -> `None` (normaler Insert),
+        - genau ein Treffer mit identischem Inhalts-Hash -> diese Zeile
+          (Replay, egal aus welchem Format),
+        - abweichender Hash oder mehrere Treffer (historische Doppelzeilen
+          aus beiden Formaten) -> `ImportConflictError`; der gesamte
+          Dateiimport rollt zurück. Bestehende Zeilen werden NIE gelöscht,
+          zusammengelegt oder geändert, sondern zur manuellen Klärung
+          gemeldet.
+
+        Ein Kandidat zählt nur, wenn Bankkonto, Format und native ID seine
+        `import_id` exakt erzeugen - eine bloße Zeichenkettenkollision durch
+        ':' (z. B. Konto "A:CSV"/ID "x" vs. Konto "A"/ID "CSV:x") ist nie
+        ein Replay; trifft der anschließende Insert auf dieselbe
+        `import_id`, lehnt `BankRepository.insert_transaktion_idempotent`
+        ihn ab."""
+
+        typen = tuple(dict.fromkeys((*NATIVE_ID_QUELLTYPEN, quelle_typ)))
+        treffer = [
+            row
+            for row in self._repository.find_native_id_treffer(bank_konto_id, native_id, typen, session=session)
+            if row.bank_konto_id == bank_konto_id
+            and row.hat_native_id
+            and row.import_id == BankRepository.native_import_id(bank_konto_id, row.quelle_typ, native_id)
+        ]
+        if len(treffer) > 1:
+            beschreibung = ", ".join(f"#{row.id} ({row.quelle_typ})" for row in treffer)
+            raise ImportConflictError(
+                f"Native Bank-ID '{native_id}' auf Bankkonto {bank_konto_id} ist bereits MEHRFACH gespeichert "
+                f"({beschreibung}) - historische Doppelzeilen werden nicht automatisch gewählt, gelöscht oder "
+                "zusammengelegt, sondern zur manuellen Klärung gemeldet."
+            )
+        if not treffer:
+            return None
+        bestehende = treffer[0]
+        if bestehende.quelle_hash != content_hash:
+            raise ImportConflictError(
+                f"Native Bank-ID '{native_id}' auf Bankkonto {bank_konto_id} ist bereits als Banktransaktion "
+                f"#{bestehende.id} ({bestehende.quelle_typ}) mit ANDEREM Inhalt gespeichert; angeliefert als "
+                f"{quelle_typ} - Formatwechsel ist kein Grund für eine zweite Zeile, abweichender Inhalt wird zur "
+                "manuellen Klärung verweigert."
+            )
+        return bestehende
 
     # -- Zuordnung (OP-Buchung + Zuordnung + Audit als EINE Transaktion) ----
     def _resolve_konto_fuer_referenz(self, referenz: str | None) -> tuple[KontoTable | None, str]:

@@ -18,6 +18,7 @@ from mietinkasso.bank.importer import (
     CamtKontoMismatchError,
     CamtMehrteiligeBuchungError,
     CamtUnvollstaendigError,
+    CsvKontoMismatchError,
     CsvSpaltenMapping,
     parse_camt053,
     parse_csv,
@@ -65,7 +66,8 @@ def bank_formular(request: Request, session=Depends(_current_session)) -> HTMLRe
           <label>Betrag-Spalte</label><input type="text" name="spalte_betrag" value="betrag">
           <label>Datum-Spalte</label><input type="text" name="spalte_datum" value="datum">
           <label>Referenz-Spalte</label><input type="text" name="spalte_referenz" value="referenz">
-          <label>Eindeutige-Referenz-Spalte (optional)</label><input type="text" name="spalte_eindeutig" value="">
+          <label>Eindeutige-Referenz-Spalte (optional; nur eine von der Bank vergebene, je Konto eindeutige Buchungs-ID, keine Zeilennummer)</label><input type="text" name="spalte_eindeutig" value="">
+          <label>Spalte eigene Konto-IBAN (optional; IBAN des exportierten Kontos, nicht des Gegenkontos)</label><input type="text" name="spalte_eigene_iban" value="">
           <label>Dezimaltrennzeichen</label>
           <select name="dezimaltrennzeichen"><option value=".">Punkt (1234.56)</option><option value=",">Komma (1234,56)</option></select>
         </fieldset>
@@ -77,16 +79,47 @@ def bank_formular(request: Request, session=Depends(_current_session)) -> HTMLRe
     return _layout(request, session, "Bankdatei-Import", inhalt)
 
 
-def _bank_rohdaten_parsen(*, format_: str, inhalt_bytes: bytes, mapping_felder: dict, bank_konto_iban: str) -> list:
-    if format_ == "CAMT":
-        return parse_camt053(inhalt_bytes, erwartete_iban=bank_konto_iban)
-    mapping = CsvSpaltenMapping(
+#: Fehler, die Vorschau UND Import als ruhige Fehlerseite statt HTTP 500 zeigen.
+_BANKDATEI_FEHLER = (
+    MietinkassoError, ValueError, KeyError, CamtUnvollstaendigError, CamtMehrteiligeBuchungError,
+    CamtKontoMismatchError, CsvKontoMismatchError,
+)
+
+
+def _csv_mapping(mapping_felder: dict) -> CsvSpaltenMapping:
+    """Gemeinsam für Vorschau und Import, damit beide exakt dasselbe
+    Mapping (inkl. optionaler eigener Kontospalte) prüfen."""
+
+    return CsvSpaltenMapping(
         betrag=mapping_felder["spalte_betrag"], buchungsdatum=mapping_felder["spalte_datum"],
         referenz=mapping_felder["spalte_referenz"] or None,
         eindeutige_referenz=mapping_felder["spalte_eindeutig"] or None,
         dezimaltrennzeichen=mapping_felder["dezimaltrennzeichen"],
+        eigene_iban=mapping_felder.get("spalte_eigene_iban", "").strip() or None,
     )
-    return parse_csv(inhalt_bytes.decode("utf-8-sig"), mapping)
+
+
+def _bank_rohdaten_parsen(*, format_: str, inhalt_bytes: bytes, mapping_felder: dict, bank_konto_iban: str) -> list:
+    if format_ == "CAMT":
+        return parse_camt053(inhalt_bytes, erwartete_iban=bank_konto_iban)
+    return parse_csv(inhalt_bytes.decode("utf-8-sig"), _csv_mapping(mapping_felder), erwartete_iban=bank_konto_iban)
+
+
+def _kontonachweis_hinweis(format_: str, spalte_eigene_iban: str) -> str:
+    """Ehrliche Kurzaussage, worauf die Kontozuordnung dieser Datei beruht
+    (siehe docs/hausverwaltung/BANKIMPORT_SICHERHEIT.md)."""
+
+    if format_ == "CAMT":
+        return "Geprüft: jedes Statement der CAMT.053-Datei trägt die IBAN des ausgewählten Kontos."
+    if spalte_eigene_iban.strip():
+        return (
+            f"Geprüft: jede CSV-Zeile trägt in Spalte &bdquo;{h(spalte_eigene_iban.strip())}&ldquo; die IBAN des "
+            "ausgewählten Kontos. Das ist eine Angabe der Exportdatei, kein bankseitiger Herkunftsnachweis."
+        )
+    return (
+        "Kein Kontonachweis aus der Datei: ohne eigene Kontospalte beruht die Zuordnung zum ausgewählten "
+        "Bankkonto allein auf Ihrer Auswahl."
+    )
 
 
 @router.post("/bank/vorschau", response_class=HTMLResponse)
@@ -99,6 +132,7 @@ async def bank_vorschau(
     spalte_datum: str = Form("datum"),
     spalte_referenz: str = Form("referenz"),
     spalte_eindeutig: str = Form(""),
+    spalte_eigene_iban: str = Form(""),
     dezimaltrennzeichen: str = Form("."),
     csrf_token: str = Form(...),
     session=Depends(_current_session),
@@ -110,13 +144,14 @@ async def bank_vorschau(
     inhalt_bytes = await datei.read()
     mapping_felder = {
         "spalte_betrag": spalte_betrag, "spalte_datum": spalte_datum, "spalte_referenz": spalte_referenz,
-        "spalte_eindeutig": spalte_eindeutig, "dezimaltrennzeichen": dezimaltrennzeichen,
+        "spalte_eindeutig": spalte_eindeutig, "spalte_eigene_iban": spalte_eigene_iban,
+        "dezimaltrennzeichen": dezimaltrennzeichen,
     }
     try:
         rohdaten = _bank_rohdaten_parsen(
             format_=format, inhalt_bytes=inhalt_bytes, mapping_felder=mapping_felder, bank_konto_iban=bank_konto.iban,
         )
-    except (MietinkassoError, ValueError, CamtUnvollstaendigError, CamtMehrteiligeBuchungError, CamtKontoMismatchError, KeyError) as exc:
+    except _BANKDATEI_FEHLER as exc:
         return _fehlerseite(session, "Bankvorschau", f"Datei nicht importierbar: {exc}", "/backoffice/bank")
     if not rohdaten:
         return _fehlerseite(session, "Bankvorschau", "Datei enthält keine Zeilen.", "/backoffice/bank")
@@ -150,6 +185,7 @@ async def bank_vorschau(
         <tr><th>Bankkonto</th><td>{h(bank_konto.bezeichnung)} ({h(bank_konto.gesellschaft_id)}, {h(bank_konto.iban)})</td></tr>
         <tr><th>Zeitraum</th><td>{zeitraum_von.isoformat()} bis {zeitraum_bis.isoformat()}</td></tr>
         <tr><th>Zeilen</th><td>{len(rohdaten)} (davon {unklare} ohne eindeutigen Zuordnungsvorschlag)</td></tr>
+        <tr><th>Kontonachweis</th><td>{_kontonachweis_hinweis(format, spalte_eigene_iban)}</td></tr>
       </table>
       <table>
         <tr><th>Betrag</th><th>Datum</th><th>Referenz</th><th>eindeutige ID?</th><th>Vorschlag Konto</th><th>Begründung</th></tr>
@@ -166,6 +202,7 @@ async def bank_vorschau(
         <input type="hidden" name="spalte_datum" value="{h(spalte_datum)}">
         <input type="hidden" name="spalte_referenz" value="{h(spalte_referenz)}">
         <input type="hidden" name="spalte_eindeutig" value="{h(spalte_eindeutig)}">
+        <input type="hidden" name="spalte_eigene_iban" value="{h(spalte_eigene_iban)}">
         <input type="hidden" name="dezimaltrennzeichen" value="{h(dezimaltrennzeichen)}">
         <button type="submit">Datei importieren (Bankbewegungen ablegen)</button>
       </form>
@@ -184,6 +221,7 @@ def bank_importieren(
     spalte_datum: str = Form("datum"),
     spalte_referenz: str = Form("referenz"),
     spalte_eindeutig: str = Form(""),
+    spalte_eigene_iban: str = Form(""),
     dezimaltrennzeichen: str = Form("."),
     csrf_token: str = Form(...),
     session=Depends(_current_session),
@@ -199,10 +237,11 @@ def bank_importieren(
         if format == "CAMT":
             transaktionen = deps._bank_service.importiere_camt053(ctx=_ctx(session), bank_konto=bank_konto, xml_bytes=inhalt_bytes)
         else:
-            mapping = CsvSpaltenMapping(
-                betrag=spalte_betrag, buchungsdatum=spalte_datum, referenz=spalte_referenz or None,
-                eindeutige_referenz=spalte_eindeutig or None, dezimaltrennzeichen=dezimaltrennzeichen,
-            )
+            mapping = _csv_mapping({
+                "spalte_betrag": spalte_betrag, "spalte_datum": spalte_datum, "spalte_referenz": spalte_referenz,
+                "spalte_eindeutig": spalte_eindeutig, "spalte_eigene_iban": spalte_eigene_iban,
+                "dezimaltrennzeichen": dezimaltrennzeichen,
+            })
             transaktionen = deps._bank_service.importiere_csv(
                 ctx=_ctx(session), bank_konto=bank_konto, text=inhalt_bytes.decode("utf-8-sig"), mapping=mapping,
             )
@@ -210,7 +249,7 @@ def bank_importieren(
             entity_typ="bank_import", entity_id=bank_konto_id, aktion="importiert", akteur=session.user_id,
             payload={"anzahl": len(transaktionen), "format": format},
         )
-    except (MietinkassoError, ValueError, CamtUnvollstaendigError, CamtMehrteiligeBuchungError, CamtKontoMismatchError) as exc:
+    except _BANKDATEI_FEHLER as exc:
         return _fehlerseite(session, "Bankimport", f"Import abgebrochen, NICHTS wurde übernommen: {exc}", "/backoffice/bank")
     inhalt = (
         flash_ok(f"{len(transaktionen)} Bankbewegung(en) importiert (noch nicht zugeordnet).")
