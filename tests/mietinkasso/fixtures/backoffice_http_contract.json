@@ -13,6 +13,18 @@
       ]
     },
     {
+      "path": "/backoffice/abgleichstatus",
+      "method": "GET",
+      "endpoint": "abgleichstatus",
+      "resolved_endpoint": "abgleichstatus",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
       "path": "/backoffice/abrechnungen",
       "method": "GET",
       "endpoint": "abrechnungen_hub",
@@ -1189,6 +1201,13 @@
   "closed": [
     {
       "path": "/backoffice/",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/abgleichstatus",
       "method": "get",
       "status": 503,
       "location": null,

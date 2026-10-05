@@ -7,12 +7,15 @@ die Bereichsseiten verlinken nur bestehende Routen."""
 from __future__ import annotations
 
 from html import escape as h
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
 
+from mietinkasso.abgleichstatus.service import berechne_abgleichstatus
 from mietinkasso.backoffice.views import eur, nutzungsstatus_label, option, sperrgrund_label
 from mietinkasso.domain.exceptions import MietinkassoError
+from mietinkasso.indexautomatik.zeit import heute_wien
 from mietinkasso.rueckstaende.service import berechne_rueckstandsuebersicht
 
 from mietinkasso.backoffice import dependencies as deps
@@ -389,6 +392,129 @@ def _rueckstaende_mahnfall_zeile_html(m) -> str:
     )
 
 
+# -- Zahlungs- und Abgleichstand (Auftrag HV-20261005-ABGLEICHSTATUS) --------
+# Reine Anzeige von `abgleichstatus.service.berechne_abgleichstatus`, das
+# auf DERSELBEN `RueckstandsUebersicht` aufsetzt - keine eigene Saldologik,
+# keine Schreibzugriffe.
+
+
+def _datum(d) -> str:
+    return d.strftime("%d.%m.%Y")
+
+
+def _abgleich_link(objekt_filter: str | None) -> str:
+    parameter = f"?{urlencode({'objekt_id': objekt_filter})}" if objekt_filter else ""
+    return f"/backoffice/abgleichstatus{parameter}"
+
+
+def _abgleich_nachweis_satz(status) -> str:
+    if not status.objekte:
+        return '<span class="muted">Keine Objekte im Filter.</span>'
+    ohne = status.objekte_ohne_nachweis
+    if ohne == len(status.objekte):
+        return '<span class="badge badge-warn">Noch kein Abgleichnachweis</span>'
+    teile = [f"{len(status.objekte) - ohne} von {len(status.objekte)} Objekt(en) mit Abgleichnachweis"]
+    aeltester = status.aeltester_stand
+    if aeltester is not None and aeltester < status.stichtag:
+        teile.append(f'<span class="warn">Stand vom {_datum(aeltester)}; neuere Eingänge noch prüfen</span>')
+    elif aeltester is not None:
+        teile.append(f"Geprüft bis {_datum(aeltester)}")
+    if ohne:
+        teile.append(f'<span class="warn">{ohne} Objekt(e): Noch kein Abgleichnachweis</span>')
+    return " · ".join(teile)
+
+
+def _abgleich_karte_html(status) -> str:
+    return f"""
+    <div class="card" id="abgleichstand">
+      <h2>Zahlungs- und Abgleichstand</h2>
+      <p class="status-zeile">
+        <span>Offene Beträge: <strong>{eur(status.summe_offen_cent)}</strong></span>
+        <span>Guthaben der Mieter: <strong>{eur(status.summe_guthaben_cent)}</strong></span>
+        <span>Eingereicht, Bankeingang noch offen: <strong>{eur(status.einzuege_offen_cent)}</strong>
+          ({status.einzuege_offen_anzahl})</span>
+      </p>
+      <p>{_abgleich_nachweis_satz(status)}</p>
+      <p><a href="{h(_abgleich_link(status.objekt_filter))}">Abgleichstand im Detail &rarr;</a></p>
+    </div>"""
+
+
+def _abgleich_stand_html(s) -> str:
+    if s.veraltet:
+        stand = f'<span class="badge badge-warn">Stand vom {_datum(s.geprueft_bis)}; neuere Eingänge noch prüfen</span>'
+    else:
+        stand = f'<span class="badge badge-ok">Geprüft bis {_datum(s.geprueft_bis)}</span>'
+    iban = f" (IBAN endet auf {h(s.iban_letzte4)})" if s.iban_letzte4 else ""
+    vollstaendig = (
+        f"bestätigt bis {_datum(s.bankvollstaendigkeit_bis)}" if s.bankvollstaendigkeit_bis else "nicht bestätigt"
+    )
+    korrektur = (
+        f'<li class="muted">Ersetzt {s.fruehere_nachweise} früher erfasste(n) Nachweis(e) für dieses Bankkonto.</li>'
+        if s.fruehere_nachweise else ""
+    )
+    return f"""
+      <div class="abgleich-stand">
+        <p><strong>Bank: {h(s.bank_bezeichnung)}</strong>{iban}</p>
+        <p>{stand}</p>
+        <details><summary>Prüfbeleg und Umfang</summary><ul>
+          <li>Geprüfter Zeitraum: {_datum(s.geprueft_von)} bis {_datum(s.geprueft_bis)}</li>
+          <li>Geprüft am {s.geprueft_am.strftime('%d.%m.%Y %H:%M')} durch {h(s.geprueft_durch)}</li>
+          <li>Umfang: {h(s.umfang)}</li>
+          <li class="muted">Quelle hinterlegt (Prüfsumme {h(s.quelle_sha256[:12])}…)</li>
+          <li class="muted">Bankvollständigkeit (getrennte Bestätigung): {vollstaendig}</li>
+          {korrektur}
+        </ul></details>
+      </div>"""
+
+
+def _abgleich_objekt_html(o) -> str:
+    staende = "".join(_abgleich_stand_html(s) for s in o.staende) or (
+        '<p><span class="badge badge-warn">Noch kein Abgleichnachweis</span></p>'
+    )
+    ignoriert = (
+        f'<p class="warn">{o.ignorierte_nachweise} Nachweis(e) mit nicht passendem Bankkonto nicht berücksichtigt.</p>'
+        if o.ignorierte_nachweise else ""
+    )
+    return (
+        f'<div class="card"><h3>{h(o.objekt_bezeichnung)}</h3>'
+        f'<p class="muted">{h(o.gesellschaft_name)}</p>{staende}{ignoriert}</div>'
+    )
+
+
+def _abgleich_vertrag_zeile_html(v, von_objekt_param: str) -> str:
+    if v.konto_id is None:
+        zeitraeume = '<span class="muted">kein Mietkonto</span>'
+    elif not v.offene_zeitraeume:
+        zeitraeume = '<span class="muted">Keine offenen Posten aus gebuchten Vorschreibungen</span>'
+    else:
+        zeitraeume = "<br>".join(
+            f"{h(z.bezeichnung)} ({h(z.art)}): {eur(z.rest_cent)}"
+            + (' <span class="badge badge-warn">Fälligkeit prüfen</span>' if z.faelligkeitsklasse == "UNBEKANNT" else "")
+            for z in v.offene_zeitraeume
+        )
+    einzuege = "<br>".join(
+        f"{_datum(e.einzug_am)} · {eur(e.betrag_cent)} · "
+        f'<span class="badge {"badge-warn" if e.offen else "badge-muted"}">{h(e.status_label)}</span>'
+        f'<span class="muted"> · {h(e.bank_bezeichnung)}{" ••" + h(e.iban_letzte4) if e.iban_letzte4 else ""}'
+        f" · Ref. {h(e.referenz)}</span>"
+        for e in v.einzuege
+    ) or '<span class="muted">-</span>'
+    if v.ignorierte_einzuege:
+        einzuege += f'<br><span class="warn">{v.ignorierte_einzuege} Einzug/Einzüge mit nicht passendem Bankkonto nicht berücksichtigt.</span>'
+    letzte = _datum(v.letzte_erfasste_zahlung) if v.letzte_erfasste_zahlung else '<span class="muted">keine erfasst</span>'
+    return (
+        "<tr>"
+        f'<td data-label="Mieter / Einheit"><a href="/backoffice/vertrag/{h(v.vertrag_id)}{von_objekt_param}">'
+        f"{h(v.debitor_name)}</a><br><span class='muted'>{h(v.objekt_bezeichnung)} / {h(v.einheit_bezeichnung)}</span></td>"
+        f'<td data-label="Offener Betrag">{eur(v.offen_cent) if v.offen_cent is not None else "-"}</td>'
+        f'<td data-label="Guthaben">{eur(v.guthaben_cent) if v.guthaben_cent is not None else "-"}</td>'
+        f'<td data-label="Offene Zeiträume">{zeitraeume}</td>'
+        f'<td data-label="Letzte erfasste Zahlung">{letzte}</td>'
+        f'<td data-label="Einzüge">{einzuege}</td>'
+        "</tr>"
+    )
+
+
 @router.get("/", response_class=HTMLResponse)
 def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_current_session)) -> HTMLResponse:
     """Zentrale Rückstandsübersicht - Standard "Alle Objekte" (nur
@@ -416,6 +542,11 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
         f'<div class="card">{listen_links_html(objekt_id=uebersicht.objekt_filter)}</div>'
     )
     kpi_html = _rueckstaende_kpi_html(uebersicht.kennzahlen)
+    abgleich_html = _abgleich_karte_html(berechne_abgleichstatus(
+        uebersicht=uebersicht, stammdaten_repository=deps._stammdaten_repo, op_service=deps._op_service,
+        bank_repository=deps._bank_repo, bank_service=deps._bank_service,
+        nachweis_repository=deps._abgleich_nachweis_repo,
+    ))
 
     if uebersicht.objekt_filter is None:
         titel_zusatz = "Alle Objekte"
@@ -557,9 +688,82 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
         # "Das ist zu erledigen" (Reihenfolge aus dem Auftrag), unmittelbar
         # nach dem kompakten Objektfilter - reine Reihenfolgeänderung,
         # alle Werte/Berechnungen bleiben unverändert.
-        auswahl_form + kpi_html + erledigen_html + kompakt_tabelle
+        auswahl_form + kpi_html + abgleich_html + erledigen_html + kompakt_tabelle
         + mietkonten_tabelle + positionen_tabelle + mahnfaelle_tabelle + bestand_tabelle,
     )
+
+
+@router.get("/abgleichstatus", response_class=HTMLResponse)
+def abgleichstatus(request: Request, objekt_id: str | None = None, session=Depends(_current_session)) -> HTMLResponse:
+    """Zahlungs- und Abgleichstand im Detail - gleicher Login, gleicher
+    Objektfilter/Scope wie die Übersicht, bei jedem Aufruf live gelesen,
+    REIN LESEND (kein Formular in diesem Ausbauschritt)."""
+
+    heute = heute_wien()
+    try:
+        uebersicht = berechne_rueckstandsuebersicht(
+            ctx=_ctx(session), objekt_id=objekt_id or None, stammdaten_repository=deps._stammdaten_repo,
+            op_service=deps._op_service, mahn_fall_repository=deps._mahn_fall_repo, heute=heute,
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Zahlungs- und Abgleichstand", str(exc), "/backoffice/abgleichstatus")
+    status = berechne_abgleichstatus(
+        uebersicht=uebersicht, stammdaten_repository=deps._stammdaten_repo, op_service=deps._op_service,
+        bank_repository=deps._bank_repo, bank_service=deps._bank_service,
+        nachweis_repository=deps._abgleich_nachweis_repo, heute=heute,
+    )
+
+    von_objekt_param = f"?{urlencode({'von_objekt': status.objekt_filter})}" if status.objekt_filter else ""
+    zurueck_href = f"/backoffice/?{urlencode({'objekt_id': status.objekt_filter})}" if status.objekt_filter else "/backoffice/"
+    zeilen_html = "".join(_abgleich_vertrag_zeile_html(v, h(von_objekt_param)) for v in status.vertraege) or (
+        '<tr><td colspan=6 class="muted">Keine Verträge im Filter.</td></tr>'
+    )
+    objekte_html = "".join(_abgleich_objekt_html(o) for o in status.objekte) or (
+        '<div class="card muted">Keine Objekte im Filter.</div>'
+    )
+    inhalt = f"""
+    {_rueckstaende_objekt_filter_form(uebersicht, action="/backoffice/abgleichstatus")}
+    <div class="card">
+      <h1>Zahlungs- und Abgleichstand</h1>
+      <p class="status-zeile">
+        <span>Offene Beträge: <strong>{eur(status.summe_offen_cent)}</strong></span>
+        <span>Guthaben der Mieter: <strong>{eur(status.summe_guthaben_cent)}</strong></span>
+        <span>Eingereicht, Bankeingang noch offen: <strong>{eur(status.einzuege_offen_cent)}</strong>
+          ({status.einzuege_offen_anzahl})</span>
+      </p>
+      <p>{_abgleich_nachweis_satz(status)}</p>
+      <p class="muted">Live berechnet am {_datum(status.stichtag)} aus den gebuchten Vorschreibungen und Zahlungen.</p>
+      <details>
+        <summary>Was bedeutet das?</summary>
+        <ul>
+          <li><strong>Offene Beträge</strong> und <strong>Guthaben</strong> stammen aus derselben Berechnung wie die
+              Übersicht und werden nie gegeneinander verrechnet.</li>
+          <li><strong>Abgleichnachweis</strong>: ausdrücklich erfasste Prüfung der Mieteingänge je Objekt und
+              Bankkonto. Gilt nur für den genannten Zeitraum - spätere Eingänge sind noch nicht geprüft. Das ist
+              keine Bestätigung der Bankvollständigkeit und keine Mahnfreigabe.</li>
+          <li><strong>Eingereicht, Bankeingang noch offen</strong>: ein eingereichter Einzug ist noch kein
+              Zahlungseingang. Er verringert keinen offenen Betrag und gilt nicht als bezahlt.</li>
+          <li><strong>Letzte erfasste Zahlung</strong>: Buchungsdatum der jüngsten gebuchten Zahlung - keine Aussage,
+              dass alle Zahlungen erfasst sind.</li>
+          <li><strong>Keine offenen Posten</strong> heißt nur: alle bisher gebuchten Vorschreibungen sind gedeckt.
+              Ein „bezahlt bis“ wird daraus nicht abgeleitet.</li>
+        </ul>
+      </details>
+    </div>
+    <h2>Abgleichnachweise je Objekt</h2>
+    <div class="bereich-karten">{objekte_html}</div>
+    <div class="card">
+      <h2>Zahlungsstand je Mietvertrag</h2>
+      <div class="tabelle-kompakt">
+      <table>
+        <thead><tr><th>Mieter / Einheit</th><th>Offener Betrag</th><th>Guthaben</th><th>Offene Zeiträume</th>
+            <th>Letzte erfasste Zahlung</th><th>Einzüge</th></tr></thead>
+        <tbody>{zeilen_html}</tbody>
+      </table>
+      </div>
+    </div>
+    <p><a href="{h(zurueck_href)}">&larr; zur Übersicht</a></p>"""
+    return _layout(request, session, "Zahlungs- und Abgleichstand", inhalt)
 
 
 # -- Bereichs-Startseiten (Auftrag HV-20260914-UI-EINFACH) -------------------

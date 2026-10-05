@@ -21,6 +21,7 @@ löst die Initialisierung beim Import aber NICHT auf."""
 
 from __future__ import annotations
 
+from mietinkasso.abgleichstatus.repository import AbgleichNachweisRepository
 from mietinkasso.audit.service import AuditService
 from mietinkasso.backoffice.security import LoginRateLimiter, SessionStore
 from mietinkasso.backoffice.views import ist_bekannte_demo_umgebung
@@ -81,6 +82,9 @@ _bank_repo = BankRepository(_session_factory)
 
 
 _bank_service = BankImportService(_bank_repo, _stammdaten_repo, _op_service)
+
+
+_abgleich_nachweis_repo = AbgleichNachweisRepository(_session_factory)
 
 
 _vorschreibung_repo = VorschreibungRepository(_session_factory)
