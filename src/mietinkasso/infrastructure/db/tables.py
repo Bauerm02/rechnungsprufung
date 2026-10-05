@@ -40,6 +40,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from mietinkasso.infrastructure.db.base import Base
 from mietinkasso.eigentuemerzahlungen import models as _eigentuemer_models  # noqa: F401
 from mietinkasso.abgleichstatus import models as _abgleich_models  # noqa: F401
+from mietinkasso.bank import quellen_models as _bankquellen_models  # noqa: F401
 
 
 class GesellschaftTable(Base):

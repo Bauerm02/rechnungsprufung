@@ -61,6 +61,42 @@
       ]
     },
     {
+      "path": "/backoffice/bank/quellen",
+      "method": "GET",
+      "endpoint": "bankquellen_uebersicht",
+      "resolved_endpoint": "bankquellen_uebersicht",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank/quellen/binden",
+      "method": "POST",
+      "endpoint": "bankquellen_binden",
+      "resolved_endpoint": "bankquellen_binden",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank/quellen/widerrufen",
+      "method": "POST",
+      "endpoint": "bankquellen_widerrufen",
+      "resolved_endpoint": "bankquellen_widerrufen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
       "path": "/backoffice/bank/unzugeordnet",
       "method": "GET",
       "endpoint": "bank_unzugeordnet",
@@ -1229,6 +1265,27 @@
     },
     {
       "path": "/backoffice/bank/importieren",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/quellen",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/quellen/binden",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/quellen/widerrufen",
       "method": "post",
       "status": 503,
       "location": null,

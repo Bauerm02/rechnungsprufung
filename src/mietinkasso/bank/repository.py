@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from mietinkasso.bank.referenzen import parse_vertragskennungen
+from mietinkasso.bank.quellenbindung import pruefe_zahlungsbindung
+from mietinkasso.infrastructure.db.sqlite_write_lock import schreibgesperrte_session
 
 from datetime import date
 
@@ -42,6 +44,17 @@ def _vorgang_stimmt_ueberein(
         and bestehende_zuordnung.op_position_id == op_position_id
         and bestehende_zuordnung.betrag_cent == betrag_cent
     )
+
+
+def _pruefe_quellenzuordnung(session: Session, bank_transaktion_id: int, op_position_id: int) -> None:
+    """Auch direkte Repository-Aufrufer und Retries müssen die Objektbindung beachten."""
+    transaktion = session.get(BankTransaktionTable, bank_transaktion_id)
+    op_position = session.get(OPPositionTable, op_position_id)
+    if transaktion is None:
+        raise ValueError(f"Unbekannte Banktransaktion {bank_transaktion_id}")
+    if op_position is None:
+        raise ValueError(f"Unbekannte OPPosition {op_position_id}")
+    pruefe_zahlungsbindung(session, konto_id=op_position.konto_id, bank_konto_id=transaktion.bank_konto_id)
 
 
 class BankRepository:
@@ -311,7 +324,7 @@ class BankRepository:
 
         if session is not None:
             return self._create_zuordnung(session, bank_transaktion_id, op_position_id, betrag_cent, match_typ, vorgang_id)
-        with self._session_factory() as owned_session:
+        with schreibgesperrte_session(self._session_factory) as owned_session:
             try:
                 zuordnung = self._create_zuordnung(
                     owned_session, bank_transaktion_id, op_position_id, betrag_cent, match_typ, vorgang_id
@@ -336,6 +349,7 @@ class BankRepository:
                         f"{bank_transaktion_id}, OP {op_position_id}, Betrag {betrag_cent}. Für eine tatsächlich "
                         "neue, unabhängige Zuordnung muss eine NEUE, eindeutige vorgang_id vergeben werden."
                     )
+                _pruefe_quellenzuordnung(owned_session, bank_transaktion_id, op_position_id)
                 return bestehende
             owned_session.refresh(zuordnung)
             return zuordnung
@@ -349,6 +363,7 @@ class BankRepository:
         match_typ: str,
         vorgang_id: str,
     ) -> ZuordnungTable:
+        _pruefe_quellenzuordnung(session, bank_transaktion_id, op_position_id)
         bestehender_vorgang = session.execute(
             select(ZuordnungTable).where(ZuordnungTable.vorgang_id == vorgang_id)
         ).scalar_one_or_none()

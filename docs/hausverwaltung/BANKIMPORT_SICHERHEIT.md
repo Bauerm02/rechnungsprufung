@@ -30,6 +30,9 @@ Dieses Dokument beschreibt, **was** garantiert ist und **was nicht**.
   Gesellschaft/IBAN lässt den gesamten Import ohne Schreibzugriff scheitern.
 - Es werden keine Konto- oder Ledgerdaten verändert und kein Konto
   abgeleitet oder erraten.
+- Bankquellenbindung: an derselben Stelle (vor dem Parsen und in der
+  Schreibtransaktion) wird die Objekt-Bankquellenbindung geprüft, siehe
+  [BANKQUELLENBINDUNG.md](BANKQUELLENBINDUNG.md).
 
 ## 2. Eigene Kontospalte im CSV (optional)
 
@@ -64,9 +67,13 @@ kein Kontonachweis aus der Datei).
   Exportdatei**, kein bankseitiger Herkunftsnachweis (keine Signatur,
   keine Bankverbindung). Wer die Datei bearbeiten kann, kann die Spalte
   setzen.
-- Die Bindung eines Provider-/Bankzugangs und seiner Kontorolle
-  (EBICS/EBS-Teilnehmer, Provider-Account-ID, Rollen-Binding) ist damit
-  **nicht** gelöst und bleibt eigene Arbeit.
+- Die Bindung eines Provider-/Bankzugangs und seiner Kontorolle an Objekt
+  und Bankkonto ist inzwischen im Code umgesetzt, siehe
+  [BANKQUELLENBINDUNG.md](BANKQUELLENBINDUNG.md): für konfigurierte
+  Bankkonten ist die eigene CSV-Kontospalte Pflicht und ein ungebundener
+  Import abgelehnt. Nie konfigurierte Bankkonten behalten das hier
+  beschriebene Verhalten. Echte Einrichtung und Anbieteranbindung stehen
+  aus.
 - Quellen ohne jede IBAN-Angabe bleiben ohne Kontonachweis; dafür gibt es
   hier keine Lösung.
 

@@ -37,6 +37,13 @@ from mietinkasso.bank.importer import (
     parse_camt053,
     parse_csv,
 )
+from mietinkasso.bank.quellenbindung import (
+    BankQuellenKontext,
+    BankquellenBindungError,
+    QuellenbindungService,
+    pruefe_importbindung,
+    pruefe_zahlungsbindung,
+)
 from mietinkasso.bank.repository import NATIVE_ID_QUELLTYPEN, BankRepository
 from mietinkasso.domain.enums import OPTyp, ZahlungsMatchTyp
 from mietinkasso.domain.exceptions import (
@@ -374,41 +381,75 @@ class BankImportService:
         self._stammdaten_repository = stammdaten_repository
         self._op_service = op_service
         self._session_factory = repository.session_factory
+        # Konfiguration/Lesen der Objekt-Bankquellenbindung auf DERSELBEN
+        # Datenbank wie dieser Service (siehe bank/quellenbindung.py).
+        self.quellenbindung = QuellenbindungService(self._session_factory)
 
     # -- Import -----------------------------------------------------------
     def importiere_camt053(
-        self, *, ctx: AuthContext, bank_konto: BankKontoTable, xml_bytes: bytes
+        self,
+        *,
+        ctx: AuthContext,
+        bank_konto: BankKontoTable,
+        xml_bytes: bytes,
+        quellen_kontext: BankQuellenKontext | None = None,
     ) -> list[BankTransaktionTable]:
-        identitaet = self._gebundene_bankkonto_identitaet(ctx, bank_konto)
+        identitaet = self._gebundene_bankkonto_identitaet(ctx, bank_konto, quellen_kontext)
         # erwartete_iban (aus dem PERSISTIERTEN Konto) erzwingt, dass jedes
         # Stmt/Acct in der Datei zum explizit ausgewählten Bankkonto passt
         # (siehe CamtKontoMismatchError) - kein fremdes/gemischtes Konto
         # wird pauschal diesem Bankkonto zugeordnet.
         rohdaten = parse_camt053(xml_bytes, erwartete_iban=identitaet.iban_norm)
-        return self._importiere_atomar(rohdaten, ctx=ctx, identitaet=identitaet, quelle_typ="CAMT053")
+        return self._importiere_atomar(
+            rohdaten, ctx=ctx, identitaet=identitaet, quelle_typ="CAMT053", quellen_kontext=quellen_kontext
+        )
 
     def importiere_csv(
-        self, *, ctx: AuthContext, bank_konto: BankKontoTable, text: str, mapping: CsvSpaltenMapping
+        self,
+        *,
+        ctx: AuthContext,
+        bank_konto: BankKontoTable,
+        text: str,
+        mapping: CsvSpaltenMapping,
+        quellen_kontext: BankQuellenKontext | None = None,
     ) -> list[BankTransaktionTable]:
-        identitaet = self._gebundene_bankkonto_identitaet(ctx, bank_konto)
+        identitaet = self._gebundene_bankkonto_identitaet(ctx, bank_konto, quellen_kontext)
+        if quellen_kontext is not None and not (mapping.eigene_iban or "").strip():
+            raise BankquellenBindungError(
+                "Gebundener CSV-Import verlangt eine eigene Kontospalte (IBAN des exportierten Kontos) - abgelehnt."
+            )
         # Die persistierte IBAN wirkt nur, wenn das Mapping eine eigene
         # Kontospalte deklariert; Legacy-CSV ohne diese Spalte bleibt
-        # unverändert ohne Kontonachweis aus der Datei.
+        # unverändert ohne Kontonachweis aus der Datei (nur für nie
+        # konfigurierte Bankkonten, siehe oben).
         rohdaten = parse_csv(text, mapping, erwartete_iban=identitaet.iban_norm)
-        return self._importiere_atomar(rohdaten, ctx=ctx, identitaet=identitaet, quelle_typ="CSV")
+        return self._importiere_atomar(
+            rohdaten, ctx=ctx, identitaet=identitaet, quelle_typ="CSV", quellen_kontext=quellen_kontext
+        )
 
-    def _gebundene_bankkonto_identitaet(self, ctx: AuthContext, bank_konto: BankKontoTable) -> _BankkontoIdentitaet:
+    def _gebundene_bankkonto_identitaet(
+        self, ctx: AuthContext, bank_konto: BankKontoTable, quellen_kontext: BankQuellenKontext | None = None
+    ) -> _BankkontoIdentitaet:
         """Bindet den Import an das PERSISTIERTE Bankkonto, bevor die Datei
         überhaupt geparst wird - das Aufruferobjekt liefert nur die ID und
         die behauptete Identität, die mit der DB übereinstimmen muss (siehe
         `BankkontoBindungError`). In `_importiere_atomar` wird dieselbe
-        Identität innerhalb der Schreibtransaktion erneut geprüft."""
+        Identität innerhalb der Schreibtransaktion erneut geprüft.
+
+        Bankquellenbindung (bank/quellenbindung.py): ist das Bankkonto an
+        eine Objekt-Bankquelle gebunden (auch widerrufen), ist ein Import
+        nur mit gültigem, frisch gegen die DB verglichenem `quellen_kontext`
+        möglich; nie konfigurierte Bankkonten bleiben beim bisherigen
+        manuellen Import."""
 
         identitaet = _BankkontoIdentitaet(
             id=bank_konto.id, gesellschaft_id=bank_konto.gesellschaft_id, iban_norm=_normalisiere_iban(bank_konto.iban)
         )
         with self._session_factory() as session:
             _pruefe_bankkonto_bindung(ctx, session.get(BankKontoTable, identitaet.id), identitaet)
+            pruefe_importbindung(
+                session, ctx, bank_konto_id=identitaet.id, iban_norm=identitaet.iban_norm, kontext=quellen_kontext
+            )
         return identitaet
 
     def _importiere_atomar(
@@ -418,6 +459,7 @@ class BankImportService:
         ctx: AuthContext,
         identitaet: _BankkontoIdentitaet,
         quelle_typ: str,
+        quellen_kontext: BankQuellenKontext | None = None,
     ) -> list[BankTransaktionTable]:
         """Der gesamte Dateiimport ist EINE DB-Transaktion: scheitert eine
         Zeile (Konflikt, Formatfehler, ...), wird der GESAMTE Aufruf
@@ -449,13 +491,19 @@ class BankImportService:
         DB geprüft - eine zwischen Vorabprüfung und Schreiben geänderte
         Gesellschaft/IBAN oder ein entzogener Zugriff lässt den gesamten
         Import scheitern statt gegen eine veraltete Kontobindung zu
-        schreiben."""
+        schreiben. Direkt danach (unter derselben Sperre) wird auch die
+        Bankquellenbindung erneut geprüft: ein zwischen Vorabprüfung und
+        Schreiben widerrufener/neu gebundener Kontext oder eine erst jetzt
+        angelegte Bindung des Bankkontos verhindert jede Importzeile."""
 
         with schreibgesperrte_session(self._session_factory) as session:
             ergebnisse: list[BankTransaktionTable] = []
             try:
                 bank_konto = _pruefe_bankkonto_bindung(
                     ctx, session.get(BankKontoTable, identitaet.id, with_for_update=True), identitaet
+                )
+                pruefe_importbindung(
+                    session, ctx, bank_konto_id=identitaet.id, iban_norm=identitaet.iban_norm, kontext=quellen_kontext
                 )
                 for index, roh in enumerate(rohdaten):
                     try:
@@ -830,10 +878,24 @@ class BankImportService:
         `with_for_update` schützt SQLite nicht). Die Perioden-/Zielauflösung
         (`_resolve_periode_und_forderung`) läuft INNERHALB dieser Sperre,
         nicht davor (Codex-Rückprüfung b8d700d) - siehe dortige
-        Docstring-Begründung."""
+        Docstring-Begründung.
 
+        Bankquellenbindung: nach der Zugriffsprüfung wird das Objekt des
+        persistierten Kontos gegen das Bankkonto der persistierten
+        Transaktion geprüft (`pruefe_zahlungsbindung`) - gilt für manuelle
+        UND automatische Zuordnung."""
+
+        require_schreibrecht(ctx)
         with schreibgesperrte_session(self._session_factory) as session:
             try:
+                frisches_konto = session.get(KontoTable, konto.id)
+                if frisches_konto is None:
+                    raise ValueError(f"Unbekanntes Konto {konto.id}")
+                require_gesellschaft_access(ctx, frisches_konto.gesellschaft_id)
+                frische_transaktion = session.get(BankTransaktionTable, transaktion.id, with_for_update=True)
+                if frische_transaktion is None:
+                    raise ValueError(f"Unbekannte Banktransaktion {transaktion.id}")
+                pruefe_zahlungsbindung(session, konto_id=konto.id, bank_konto_id=frische_transaktion.bank_konto_id)
                 leistungsperiode, bezieht_sich_auf_id = self._resolve_periode_und_forderung(
                     konto.id, transaktion.referenz, session=session,
                 )
@@ -978,6 +1040,8 @@ class BankImportService:
                         f"Banktransaktion (Gesellschaft {bank_konto.gesellschaft_id}) darf nicht mit Konto "
                         f"{konto_id} (Gesellschaft {frisches_konto.gesellschaft_id}) verknüpft werden."
                     )
+                # Bankquellenbindung gilt AUCH für einen Replay (Identitätsprüfung).
+                pruefe_zahlungsbindung(session, konto_id=frisches_konto.id, bank_konto_id=bank_konto.id)
                 if frische_transaktion.waehrung != frisches_konto.waehrung:
                     raise FremdwaehrungNichtUnterstuetztError(
                         f"Transaktion {transaktion_id} ({frische_transaktion.waehrung}) und Konto {konto_id} "
@@ -1166,6 +1230,9 @@ class BankImportService:
                         f"{frische_transaktion.bank_konto_id}, die Ursprungszahlung aber auf "
                         f"{sorted(original_bank_konto_ids)}; passendes Bankkonto erforderlich."
                     )
+                pruefe_zahlungsbindung(
+                    session, konto_id=frisches_konto.id, bank_konto_id=frische_transaktion.bank_konto_id
+                )
                 if frische_transaktion.waehrung != frisches_konto.waehrung:
                     raise FremdwaehrungNichtUnterstuetztError(
                         f"Rücklastschrift-Transaktion {transaktion_id} ({frische_transaktion.waehrung}) und "

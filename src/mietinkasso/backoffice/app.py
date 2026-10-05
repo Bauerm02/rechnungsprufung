@@ -14,6 +14,7 @@ from mietinkasso.backoffice.routes import eigentuemerzahlungen
 from mietinkasso.backoffice.routes import (
     auth as auth_routes,
     bank as bank_routes,
+    bankquellen as bankquellen_routes,
     dashboard as dashboard_routes,
     indexbetrieb as indexbetrieb_routes,
     indexprofile as indexprofile_routes,
@@ -42,6 +43,9 @@ router.include_router(eigentuemerzahlungen.router)
 router.include_router(listen_routes.router)
 router.include_router(konten_routes.router)
 router.include_router(bank_routes.router)
+# Statische Pfade /bank/quellen[/binden|/widerrufen] - überlappen mit keinem
+# Platzhalter-Pfad des Bank-Routers (dort nur /bank/{id}/<aktion>).
+router.include_router(bankquellen_routes.router)
 router.include_router(mahnwesen_routes.router)
 router.include_router(zinsprofile_routes.router)
 router.include_router(mailversand_routes.router)

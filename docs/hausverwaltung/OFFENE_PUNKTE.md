@@ -4282,3 +4282,16 @@ Offen bzw. bewusst nicht geliefert:
 Auf Basis cc89c2f im isolierten Branch codex/hv-bankimport-20261005: persistierte Kontobindung vor und während des Imports, optionale eigene CSV-IBAN mit Prüfung in Vorschau und Ausführung sowie formatübergreifende Wiederholerkennung bei gleicher nativer Bank-ID. Details und Grenzen: [BANKIMPORT_SICHERHEIT.md](BANKIMPORT_SICHERHEIT.md). Keine Schemaänderung oder automatische Bestandsbereinigung; kein Deployment aus diesem Codeauftrag.
 
 Offen bleiben die vollständige Bindung Objekt/Mietkonto an Provider-Kontokennung und Kontorolle, CSV-Quellen ohne eigene IBAN, widerrufbare beleggebundene Bankvollständigkeit und ein gemeinsamer Plan/Apply-Service für manuelle Zahlungsnachführung. Verschiedene native IDs werden nicht heuristisch zusammengelegt. Historische Doppelzeilen oder abweichende Exportinhalte benötigen gezielte Klärung; der Import führt diese nicht selbst aus. Mahnsperren und laufende Fachvorgänge bleiben beim zuständigen Owner.
+
+## 05.10.2026 – Bankquellenbindung Objekt -> Bankquelle -> Bankkonto (HV-20261005-CODEVERBESSERUNG)
+
+Die oben offene Bindung Objekt/Mietkonto an Provider-Kontokennung und Kontorolle ist im Code umgesetzt (Basis 77dbae4); Details und Grenzen: [BANKQUELLENBINDUNG.md](BANKQUELLENBINDUNG.md). Zwei additive Tabellen (`bank_quellen`, `bank_quellen_bindungen`), transaktionale Konfiguration mit Audit und optimistischem Stand, Widerruf als fail-closed Grabstein, gebundener CAMT/CSV-Import (Prüfung vor dem Parsen und in der Schreibtransaktion), Schutz von manueller/automatischer Zuordnung, Verknüpfung mit bestehender Zahlung und Rücklastschrift gegen ein fremdes Bankkonto, anbieterneutraler Abruf-Einstieg nur mit injiziertem Adapter, Backoffice `/backoffice/bank/quellen` (drei neue Routen im HTTP-Vertrag). Code und Tests von Claude ohne Testlauf geliefert (nur Dateiwerkzeuge); `pytest` und Commit bei Codex.
+
+Offen bzw. bewusst nicht geliefert:
+
+- **Einrichtung/Rollout:** keine echten Quellen oder Bindungen konfiguriert; das erfolgt durch den Operator mit Nachweis. Bis dahin verhalten sich alle Objekte/Bankkonten wie bisher (Legacy, manueller Import).
+- **Anbieter:** kein produktiver Adapter, kein Live-Abruf, kein Scheduler, keine Zugangsdaten; `ebics-downloader` (PHP) unverändert und nicht angebunden. Automatische Bankabholung/-zuordnung bleibt zurückgestellt.
+- **Dateiupload:** auch gebunden nur Selbstauskunft der Exportdatei (IBAN geprüft), keine anbieterseitig authentifizierte Herkunft.
+- **Legacy-Lücke:** Mieter nie konfigurierter Objekte bleiben von jedem Bankkonto ihrer Gesellschaft zuordenbar, auch von einem gebundenen.
+- **Rücklastschrift nach Neubindung** auf ein anderes Bankkonto wird abgelehnt und braucht manuelle Klärung.
+- Die Saldenliste/Abgleichstatus nutzen die neue Bindung noch nicht für ihre Anzeige.

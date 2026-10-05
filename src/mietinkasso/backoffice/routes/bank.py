@@ -23,6 +23,7 @@ from mietinkasso.bank.importer import (
     parse_camt053,
     parse_csv,
 )
+from mietinkasso.bank.quellenbindung import BankQuellenKontext, BankquellenBindungError, maskiere_iban
 from mietinkasso.bank.service import (
     KATEGORIE_EINGANG_PRUEFEN,
     KATEGORIE_RUECKLASTSCHRIFT_KLAERFALL,
@@ -47,13 +48,19 @@ router = APIRouter()
 def bank_formular(request: Request, session=Depends(_current_session)) -> HTMLResponse:
     bank_konten = deps._bank_repo.list_bank_konten()
     options = "".join(option(bk.id, f"{bk.bezeichnung} ({bk.gesellschaft_id}, {bk.iban})") for bk in bank_konten)
+    objekt_options = "".join(
+        option(k.objekt_id, f"Objekt {k.objekt_id}: {k.anbieter} / {k.konto_ref} ({maskiere_iban(k.iban_norm)})")
+        for k in deps._bank_service.quellenbindung.aktive_kontexte(ctx=_ctx(session))
+    )
     inhalt = f"""
     <div class="card" style="max-width:640px;">
       <h1>Bankdatei-Import</h1>
       <form method="post" action="/backoffice/bank/vorschau" enctype="multipart/form-data">
         {csrf_feld(session.csrf_token)}
-        <label>Bankkonto</label>
-        <select name="bank_konto_id" required>{options}</select>
+        <label>Objekt mit gebundener Bankquelle (Bankkonto wird aus der Bindung abgeleitet)</label>
+        <select name="objekt_id"><option value="">-- ohne Objekt (nur nie konfigurierte Bankkonten) --</option>{objekt_options}</select>
+        <label>Bankkonto (nur ohne Objekt; an Objekt-Bankquellen gebundene Konten werden hier abgelehnt)</label>
+        <select name="bank_konto_id"><option value="">-- wählen --</option>{options}</select>
         <label>Format</label>
         <select name="format" required>
           <option value="CSV">CSV</option>
@@ -67,7 +74,7 @@ def bank_formular(request: Request, session=Depends(_current_session)) -> HTMLRe
           <label>Datum-Spalte</label><input type="text" name="spalte_datum" value="datum">
           <label>Referenz-Spalte</label><input type="text" name="spalte_referenz" value="referenz">
           <label>Eindeutige-Referenz-Spalte (optional; nur eine von der Bank vergebene, je Konto eindeutige Buchungs-ID, keine Zeilennummer)</label><input type="text" name="spalte_eindeutig" value="">
-          <label>Spalte eigene Konto-IBAN (optional; IBAN des exportierten Kontos, nicht des Gegenkontos)</label><input type="text" name="spalte_eigene_iban" value="">
+          <label>Spalte eigene Konto-IBAN (bei Objektbindung erforderlich; nicht die IBAN des Gegenkontos)</label><input type="text" name="spalte_eigene_iban" value="">
           <label>Dezimaltrennzeichen</label>
           <select name="dezimaltrennzeichen"><option value=".">Punkt (1234.56)</option><option value=",">Komma (1234,56)</option></select>
         </fieldset>
@@ -75,8 +82,37 @@ def bank_formular(request: Request, session=Depends(_current_session)) -> HTMLRe
       </form>
     </div>
     <p><a href="/backoffice/bank/unzugeordnet">Offene Zuordnungen ansehen</a> &nbsp;|&nbsp;
-       <a href="/backoffice/bank/vollstaendigkeit">Bankvollständigkeit bestätigen</a></p>"""
+       <a href="/backoffice/bank/vollstaendigkeit">Bankvollständigkeit bestätigen</a> &nbsp;|&nbsp;
+       <a href="/backoffice/bank/quellen">Bankquellen je Objekt</a></p>"""
     return _layout(request, session, "Bankdatei-Import", inhalt)
+
+
+def _bindungskontext_fuer_vorschau(
+    session, *, objekt_id: str, bank_konto_id: str, format_: str, spalte_eigene_iban: str
+) -> tuple[BankQuellenKontext | None, str]:
+    """Liefert (Kontext, Bankkonto-ID). Mit Objekt: Bankkonto ausschließlich
+    aus der persistierten Bindung, eine abweichende Auswahl wird abgelehnt.
+    Ohne Objekt: nur nie konfigurierte Bankkonten (Legacy)."""
+
+    quellen = deps._bank_service.quellenbindung
+    if objekt_id.strip():
+        kontext = quellen.kontext_fuer_objekt(ctx=_ctx(session), objekt_id=objekt_id.strip())
+        if bank_konto_id and bank_konto_id != kontext.bank_konto_id:
+            raise BankquellenBindungError(
+                f"Ausgewähltes Bankkonto {bank_konto_id} entspricht nicht der Bankquelle von Objekt {kontext.objekt_id}."
+            )
+        if format_ != "CAMT" and not spalte_eigene_iban.strip():
+            raise BankquellenBindungError(
+                "Gebundener CSV-Import verlangt die Spalte eigene Konto-IBAN (IBAN des exportierten Kontos)."
+            )
+        return kontext, kontext.bank_konto_id
+    if not bank_konto_id:
+        raise ValueError("Bitte ein Objekt mit Bankquelle oder ein Bankkonto wählen.")
+    if quellen.bank_ist_quellengebunden(bank_konto_id):
+        raise BankquellenBindungError(
+            f"Bankkonto {bank_konto_id} ist an eine Objekt-Bankquelle gebunden - bitte das Objekt wählen."
+        )
+    return None, bank_konto_id
 
 
 #: Fehler, die Vorschau UND Import als ruhige Fehlerseite statt HTTP 500 zeigen.
@@ -125,9 +161,10 @@ def _kontonachweis_hinweis(format_: str, spalte_eigene_iban: str) -> str:
 @router.post("/bank/vorschau", response_class=HTMLResponse)
 async def bank_vorschau(
     request: Request,
-    bank_konto_id: str = Form(...),
     format: str = Form(...),
     datei: UploadFile = File(...),
+    bank_konto_id: str = Form(""),
+    objekt_id: str = Form(""),
     spalte_betrag: str = Form("betrag"),
     spalte_datum: str = Form("datum"),
     spalte_referenz: str = Form("referenz"),
@@ -138,6 +175,13 @@ async def bank_vorschau(
     session=Depends(_current_session),
 ) -> HTMLResponse:
     _verify_csrf(session, csrf_token)
+    try:
+        kontext, bank_konto_id = _bindungskontext_fuer_vorschau(
+            session, objekt_id=objekt_id, bank_konto_id=bank_konto_id, format_=format,
+            spalte_eigene_iban=spalte_eigene_iban,
+        )
+    except _BANKDATEI_FEHLER as exc:
+        return _fehlerseite(session, "Bankvorschau", f"Vorschau abgelehnt: {exc}", "/backoffice/bank")
     bank_konto = deps._bank_repo.get_bank_konto(bank_konto_id)
     if bank_konto is None:
         return _fehlerseite(session, "Bankvorschau", f"Unbekanntes Bankkonto {bank_konto_id}.", "/backoffice/bank")
@@ -178,11 +222,23 @@ async def bank_vorschau(
     import base64
 
     versteckte_datei = base64.b64encode(inhalt_bytes).decode("ascii")
+    if kontext is None:
+        konto_zeile = f"{h(bank_konto.bezeichnung)} ({h(bank_konto.gesellschaft_id)}, {h(bank_konto.iban)})"
+        bindung_html = '<tr><th>Bankquelle</th><td>keine (nie konfiguriertes Bankkonto, manueller Import)</td></tr>'
+    else:
+        konto_zeile = f"{h(bank_konto.bezeichnung)} ({h(bank_konto.gesellschaft_id)}, {h(maskiere_iban(kontext.iban_norm))})"
+        bindung_html = (
+            f"<tr><th>Bankquelle</th><td>Objekt {h(kontext.objekt_id)} &middot; {h(kontext.anbieter)} / "
+            f"{h(kontext.zugang_ref)} / {h(kontext.konto_ref)} &middot; Rolle {h(kontext.kontorolle)} &middot; "
+            f"Revision {kontext.revision}<br><span class=\"muted\">Dateiupload: Konto aus der gespeicherten Bindung, "
+            "IBAN der Datei geprüft; die Herkunft der Datei ist NICHT anbieterseitig authentifiziert.</span></td></tr>"
+        )
     inhalt = f"""
     <div class="card">
       <h1>Vorschau — Bankdatei</h1>
       <table>
-        <tr><th>Bankkonto</th><td>{h(bank_konto.bezeichnung)} ({h(bank_konto.gesellschaft_id)}, {h(bank_konto.iban)})</td></tr>
+        <tr><th>Bankkonto</th><td>{konto_zeile}</td></tr>
+        {bindung_html}
         <tr><th>Zeitraum</th><td>{zeitraum_von.isoformat()} bis {zeitraum_bis.isoformat()}</td></tr>
         <tr><th>Zeilen</th><td>{len(rohdaten)} (davon {unklare} ohne eindeutigen Zuordnungsvorschlag)</td></tr>
         <tr><th>Kontonachweis</th><td>{_kontonachweis_hinweis(format, spalte_eigene_iban)}</td></tr>
@@ -204,6 +260,9 @@ async def bank_vorschau(
         <input type="hidden" name="spalte_eindeutig" value="{h(spalte_eindeutig)}">
         <input type="hidden" name="spalte_eigene_iban" value="{h(spalte_eigene_iban)}">
         <input type="hidden" name="dezimaltrennzeichen" value="{h(dezimaltrennzeichen)}">
+        <input type="hidden" name="objekt_id" value="{h(kontext.objekt_id if kontext else '')}">
+        <input type="hidden" name="bindung_token" value="{h(kontext.token if kontext else '')}">
+        <input type="hidden" name="quelle_id" value="{kontext.quelle_id if kontext else ''}">
         <button type="submit">Datei importieren (Bankbewegungen ablegen)</button>
       </form>
       <p><a href="/backoffice/bank">&larr; andere Datei wählen</a></p>
@@ -223,19 +282,38 @@ def bank_importieren(
     spalte_eindeutig: str = Form(""),
     spalte_eigene_iban: str = Form(""),
     dezimaltrennzeichen: str = Form("."),
+    objekt_id: str = Form(""),
+    bindung_token: str = Form(""),
+    quelle_id: str = Form(""),
     csrf_token: str = Form(...),
     session=Depends(_current_session),
 ) -> HTMLResponse:
     _verify_csrf(session, csrf_token)
     import base64
 
+    kontext = None
+    if objekt_id.strip():
+        # Kontext frisch aus der DB; die Hidden-Felder sind nur die
+        # Behauptung aus der Vorschau und müssen exakt übereinstimmen.
+        try:
+            kontext = deps._bank_service.quellenbindung.kontext_fuer_objekt(ctx=_ctx(session), objekt_id=objekt_id.strip())
+        except _BANKDATEI_FEHLER as exc:
+            return _fehlerseite(session, "Bankimport", f"Import abgebrochen, NICHTS wurde übernommen: {exc}", "/backoffice/bank")
+        if (bindung_token, quelle_id, bank_konto_id) != (kontext.token, str(kontext.quelle_id), kontext.bank_konto_id):
+            return _fehlerseite(
+                session, "Bankimport",
+                "Import abgebrochen, NICHTS wurde übernommen: Bankquellenbindung hat sich seit der Vorschau geändert "
+                "oder die Angaben weichen ab. Bitte Vorschau neu erstellen.", "/backoffice/bank",
+            )
     bank_konto = deps._bank_repo.get_bank_konto(bank_konto_id)
     if bank_konto is None:
         return _fehlerseite(session, "Bankimport", f"Unbekanntes Bankkonto {bank_konto_id}.", "/backoffice/bank")
     inhalt_bytes = base64.b64decode(inhalt_b64)
     try:
         if format == "CAMT":
-            transaktionen = deps._bank_service.importiere_camt053(ctx=_ctx(session), bank_konto=bank_konto, xml_bytes=inhalt_bytes)
+            transaktionen = deps._bank_service.importiere_camt053(
+                ctx=_ctx(session), bank_konto=bank_konto, xml_bytes=inhalt_bytes, quellen_kontext=kontext,
+            )
         else:
             mapping = _csv_mapping({
                 "spalte_betrag": spalte_betrag, "spalte_datum": spalte_datum, "spalte_referenz": spalte_referenz,
@@ -244,10 +322,15 @@ def bank_importieren(
             })
             transaktionen = deps._bank_service.importiere_csv(
                 ctx=_ctx(session), bank_konto=bank_konto, text=inhalt_bytes.decode("utf-8-sig"), mapping=mapping,
+                quellen_kontext=kontext,
             )
         deps._audit_service.log(
             entity_typ="bank_import", entity_id=bank_konto_id, aktion="importiert", akteur=session.user_id,
-            payload={"anzahl": len(transaktionen), "format": format},
+            payload={
+                "anzahl": len(transaktionen), "format": format,
+                "objekt_id": kontext.objekt_id if kontext else None,
+                "bindung_revision": kontext.revision if kontext else None,
+            },
         )
     except _BANKDATEI_FEHLER as exc:
         return _fehlerseite(session, "Bankimport", f"Import abgebrochen, NICHTS wurde übernommen: {exc}", "/backoffice/bank")
