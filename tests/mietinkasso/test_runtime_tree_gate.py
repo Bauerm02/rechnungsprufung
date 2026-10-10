@@ -12,13 +12,14 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize("mutation", ["none", "extra", "changed", "missing", "shadow", "cli", "pythonpath"])
+@pytest.mark.parametrize("mutation", ["none", "extra", "changed", "missing", "shadow", "cli", "pythonpath", "missing_manifest", "nested_dependency", "missing_symbol"])
 def test_runtime_gate_detects_source_drift_without_job_execution(tmp_path, mutation):
     package = tmp_path / "installed" / "mietinkasso"
     child = package / "eigentuemerzahlungen"
     child.mkdir(parents=True)
     for p in [package / "__init__.py", child / "__init__.py", child / "service.py"]:
         p.write_text("# synthetic marker\n", encoding="utf-8")
+    (child / "service.py").write_text("def generate(): raise RuntimeError('must never call business function')\n", encoding="utf-8")
     scripts = tmp_path / "app" / "scripts"
     scripts.mkdir(parents=True)
     for name in ["indexautomatik_taegliche_pflege.py", "indexautomatik_monatslauf.py"]:
@@ -28,7 +29,8 @@ def test_runtime_gate_detects_source_drift_without_job_execution(tmp_path, mutat
             if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("mietinkasso"):
                 break
             prefix.append(node)
-        (scripts / name).write_text(ast.unparse(ast.Module(body=prefix, type_ignores=[])), encoding="utf-8")
+        (scripts / name).write_text(ast.unparse(ast.Module(body=prefix, type_ignores=[])) +
+            "\ndef main():\n    from mietinkasso.eigentuemerzahlungen.service import generate\n    generate()\n", encoding="utf-8")
     digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
     expected = {"package": {p.relative_to(package).as_posix(): digest(p) for p in package.rglob("*.py")},
                 "scripts": {p.name: digest(p) for p in scripts.glob("*.py")}}
@@ -37,6 +39,15 @@ def test_runtime_gate_detects_source_drift_without_job_execution(tmp_path, mutat
     if mutation == "missing": (child / "service.py").unlink()
     if mutation == "cli": (scripts / "indexautomatik_monatslauf.py").write_text("raise RuntimeError('must not execute')", encoding="utf-8")
     if mutation == "shadow": (scripts.parent / "src" / "mietinkasso").mkdir(parents=True)
+    if mutation == "missing_manifest":
+        (child / "service.py").unlink()
+        del expected["package"]["eigentuemerzahlungen/service.py"]
+    if mutation == "nested_dependency":
+        (child / "service.py").write_text("import missing_synthetic_dependency_001", encoding="utf-8")
+        expected["package"]["eigentuemerzahlungen/service.py"] = digest(child / "service.py")
+    if mutation == "missing_symbol":
+        (child / "service.py").write_text("# generate symbol missing", encoding="utf-8")
+        expected["package"]["eigentuemerzahlungen/service.py"] = digest(child / "service.py")
     wrong = tmp_path / "wrong" / "mietinkasso"
     if mutation == "pythonpath":
         wrong.mkdir(parents=True)
@@ -55,7 +66,7 @@ print(json.dumps(result))
                             env={**os.environ, "PYTHONPATH": ""}, capture_output=True, text=True, timeout=10)
     if mutation == "none":
         assert result.returncode == 0, result.stderr
-        assert json.loads(result.stdout)["business_actions"] == 0
+        assert json.loads(result.stdout)["verification"] == "imports_only"
     else:
         assert result.returncode != 0
-        assert "RuntimeError" in result.stderr
+        assert "RuntimeError" in result.stderr or "ImportError" in result.stderr or "ModuleNotFoundError" in result.stderr

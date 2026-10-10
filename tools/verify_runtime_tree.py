@@ -1,6 +1,7 @@
 """Release gate: code provenance only; no database, jobs, mail or bank calls."""
 import ast
 import hashlib
+import importlib
 import importlib.util
 import json
 from pathlib import Path
@@ -9,7 +10,8 @@ import sys
 
 def hashes(root):
     return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in sorted(root.rglob("*.py"))}
+            for p in sorted(root.rglob("*")) if p.is_file()
+            and "__pycache__" not in p.parts and p.suffix != ".pyc"}
 
 
 def verify(expected, installed_root, scripts_root):
@@ -40,9 +42,23 @@ def verify(expected, installed_root, scripts_root):
             spec = importlib.util.find_spec("mietinkasso.eigentuemerzahlungen.service")
             if spec is None or not Path(spec.origin).resolve().is_relative_to(installed_root):
                 raise RuntimeError("Required owner-payment module is unavailable")
+            # Validate nested imports as well, particularly the payment import
+            # inside main(). Import declarations only; never call the job.
+            for node in ast.walk(tree):
+                modules = []
+                if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("mietinkasso"):
+                    modules.append(node.module)
+                elif isinstance(node, ast.Import):
+                    modules.extend(a.name for a in node.names if a.name.startswith("mietinkasso"))
+                for module in modules:
+                    loaded = importlib.import_module(module)
+                    if not Path(loaded.__file__).resolve().is_relative_to(installed_root):
+                        raise RuntimeError("Business import selects a different package")
+                if modules:
+                    exec(compile(ast.Module(body=[node], type_ignores=[]), str(script), "exec"), namespace)
         finally:
             sys.path[:] = previous_path
-    return {"package_files": len(expected["package"]), "cli_entrypoints": 2, "business_actions": 0}
+    return {"package_files": len(expected["package"]), "cli_entrypoints": 2, "verification": "imports_only"}
 
 
 if __name__ == "__main__":

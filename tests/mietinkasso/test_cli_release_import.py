@@ -45,13 +45,13 @@ except ModuleNotFoundError:
 else:
     print(json.dumps({'marker': mietinkasso.MARKER}))
 """
-    result = subprocess.run([sys.executable, "-S", "-c", probe, str(copied), str(installed_root)],
-                            env={**os.environ, "PYTHONPATH": ""}, capture_output=True, text=True, timeout=10, check=True)
+    result = subprocess.run([sys.executable, "-I", "-S", "-c", probe, str(copied), str(installed_root)],
+                            cwd=tmp_path, env={**os.environ, "PYTHONPATH": ""}, capture_output=True, text=True, timeout=10, check=True)
     assert json.loads(result.stdout)["marker"] == ("installed" if installed else "checkout" if checkout else None)
 
 
 @pytest.mark.parametrize("script", SCRIPTS)
-def test_business_body_and_main_guard_remain_unchanged(script):
+def test_main_guard_present_and_bootstrap_does_not_hide_errors(script):
     tree = ast.parse((ROOT / "scripts" / script).read_text(encoding="utf-8"))
     assert isinstance(tree.body[-1], ast.If)
     assert ast.unparse(tree.body[-1].test) == "__name__ == '__main__'"
@@ -73,7 +73,7 @@ def test_installed_package_error_is_not_hidden_by_checkout(tmp_path, script):
     probe += "sys.path.insert(0, " + repr(str(installed.parent)) + ")\n"
     probe += "__file__ = " + repr(str(tmp_path / "scripts" / script)) + "\n"
     probe += ast.unparse(helper) + "\n_ensure_mietinkasso_importable()\nimport mietinkasso\n"
-    result = subprocess.run([sys.executable, "-S", "-c", probe], env={**os.environ, "PYTHONPATH": ""},
-                            capture_output=True, text=True, timeout=10)
+    result = subprocess.run([sys.executable, "-I", "-S", "-c", probe], env={**os.environ, "PYTHONPATH": ""},
+                            cwd=tmp_path, capture_output=True, text=True, timeout=10)
     assert result.returncode != 0
     assert "dependency_that_does_not_exist_001" in result.stderr
