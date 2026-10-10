@@ -24,7 +24,18 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+def _ensure_mietinkasso_importable() -> None:
+    """Use the installed release; only a source-only checkout needs src."""
+    import importlib.util
+
+    if importlib.util.find_spec("mietinkasso") is not None:
+        return
+    src = Path(__file__).resolve().parents[1] / "src"
+    if (src / "mietinkasso" / "__init__.py").is_file():
+        sys.path.insert(0, str(src))
+
+
+_ensure_mietinkasso_importable()
 
 from mietinkasso.auth.service import AuthContext  # noqa: E402
 from mietinkasso.domain.enums import Rolle  # noqa: E402

@@ -1,0 +1,13 @@
+# Extend the exact running immutable image, preserving reviewed dependencies.
+# BASE_IMAGE must be a locally verified image ID; no latest tag or pull.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+# COPY overlays retain deleted files. Remove both old package trees first.
+RUN python -c "import shutil; shutil.rmtree('/app/src/mietinkasso', ignore_errors=True); shutil.rmtree('/usr/local/lib/python3.11/site-packages/mietinkasso', ignore_errors=True)"
+COPY src/mietinkasso /usr/local/lib/python3.11/site-packages/mietinkasso
+COPY scripts/indexautomatik_taegliche_pflege.py scripts/indexautomatik_monatslauf.py /app/scripts/
+COPY tools/verify_runtime_tree.py /tmp/verify_runtime_tree.py
+COPY runtime-tree-manifest.json /tmp/runtime-tree-manifest.json
+RUN python /tmp/verify_runtime_tree.py /tmp/runtime-tree-manifest.json
+USER mietinkasso

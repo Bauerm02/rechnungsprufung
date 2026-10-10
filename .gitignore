@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 .venv/
 data/
+runtime-tree-manifest.json
 
 # ebics-downloader (PHP/Composer) - composer.lock wird committet, vendor/ nicht
 ebics-downloader/vendor/
