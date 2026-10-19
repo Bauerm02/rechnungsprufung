@@ -3783,6 +3783,228 @@ def test_mahnvorschau_zeigt_brief_wartet_auf_anbindung_und_pdf_link_bei_kanal_br
     assert "/backoffice/vertrag/V-601-1/mahnbrief.pdf?stufe=2" in antwort.text
 
 
+# -- Mahnkostenpauschale-Freigabe & Rücklastschriftkosten (einfache UI) ------
+# Auftrag HV-20261019-MAHNKOSTEN, Backoffice-Prüfliste/Freigabemaske.
+
+
+def test_mahnpauschale_freigabe_formular_zeigt_hauptforderung_und_erteilt_freigabe(backoffice_client):
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-PAUSCHALE1", objekt_id="601", bezeichnung="Top Pauschale 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-PAUSCHALE1", einheit_id="601-TOP-PAUSCHALE1", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-PAUSCHALE1"))
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1), faelligkeit=date(2026, 1, 5),
+        beleg_referenz="HMZ Jänner",
+    )
+
+    formular = client.get(
+        "/backoffice/vertrag/V-601-PAUSCHALE1/mahnpauschale-freigabe",
+        params={"stufe": 1, "heute": "2026-02-01"},
+    )
+    assert formular.status_code == 200
+    assert "500,00" in formular.text  # Hauptforderung sichtbar
+    assert "Neue Einzelfallfreigabe" in formular.text
+
+    freigabe_antwort = client.post(
+        "/backoffice/vertrag/V-601-PAUSCHALE1/mahnpauschale-freigabe/erfassen",
+        data={
+            "csrf_token": csrf, "stufe": "1", "heute": "2026-02-01",
+            "betrag_cent": "20,00",
+            "erforderlichkeit_begruendung": "Zwei erfolglose Erinnerungen vorausgegangen.",
+            "tatsaechlicher_aufwand_cent": "20,00",
+            "tatsaechlicher_aufwand_beleg": "Zeiterfassung Sachbearbeitung + Druck/Versand.",
+            "schuldhaftigkeit_begruendung": "Kein Bank-/SEPA-Fehler erkennbar, Mieter verantwortlich.",
+            "verhaeltnismaessigkeit_begruendung": "20 EUR auf 500 EUR Hauptforderung ist verhältnismäßig.",
+        },
+        follow_redirects=False,
+    )
+    assert freigabe_antwort.status_code == 303
+
+    bestaetigung = client.get(
+        "/backoffice/vertrag/V-601-PAUSCHALE1/mahnpauschale-freigabe",
+        params={"stufe": 1, "heute": "2026-02-01"},
+    )
+    assert bestaetigung.status_code == 200
+    assert "bereits freigegeben" in bestaetigung.text.lower()
+    assert "Kein Bank-/SEPA-Fehler erkennbar" in bestaetigung.text
+
+    # Die Freigabe selbst bucht NICHTS - sie wird erst beim tatsächlichen
+    # Mahnlauf wirksam (siehe `kosten.py`). Verifikation über denselben
+    # Lookup, den `berechne_mahnkosten_vorschau` auch verwendet.
+    from mietinkasso.mahnwesen.kosten import forderungsgruppe_schluessel
+    from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    sf = build_session_factory(get_settings().database_url)
+    kosten_repo = MahnkostenRepository(sf)
+    frischer_op_service = OPService(OPRepository(sf), stammdaten)
+    offene = frischer_op_service.offene_forderungen(konto.id, heute=date(2026, 2, 1))
+    schluessel = forderungsgruppe_schluessel([f.op_position_id for f in offene])
+    gespeicherte_freigabe = kosten_repo.mahnpauschale_freigabe_fuer_gruppe(
+        vertrag_id="V-601-PAUSCHALE1", stufe=1, forderungsgruppe_schluessel=schluessel, hauptforderung_cent=50_000,
+    )
+    assert gespeicherte_freigabe is not None
+    assert gespeicherte_freigabe.betrag_cent == 2000
+    assert gespeicherte_freigabe.freigegeben_von == "markus"
+
+
+def test_mahnpauschale_freigabe_fuer_ausgeschlossenes_objekt_wird_abgelehnt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    antwort = client.get("/backoffice/vertrag/V-107-1/mahnpauschale-freigabe", params={"stufe": 1})
+    assert antwort.status_code == 400
+    assert "gesperrt" in antwort.text.lower() or "nicht verfügbar" in antwort.text.lower()
+
+
+def test_mahnpauschale_freigabe_ohne_csrf_wird_abgelehnt(backoffice_client):
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    antwort = client.post(
+        "/backoffice/vertrag/V-601-1/mahnpauschale-freigabe/erfassen",
+        data={
+            "csrf_token": "voellig-falsch", "stufe": "1", "heute": date.today().isoformat(),
+            "betrag_cent": "20,00", "erforderlichkeit_begruendung": "x", "tatsaechlicher_aufwand_cent": "20,00",
+            "tatsaechlicher_aufwand_beleg": "x", "schuldhaftigkeit_begruendung": "x",
+            "verhaeltnismaessigkeit_begruendung": "x",
+        },
+    )
+    assert antwort.status_code == 403
+
+
+def test_ruecklastschriftkosten_formular_erfasst_zurechenbare_kosten(backoffice_client):
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-RLS1", objekt_id="601", bezeichnung="Top RLS 1", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-RLS1", einheit_id="601-TOP-RLS1", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-RLS1"))
+    rls_op = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.RUECKLASTSCHRIFT, betrag_cent=60_000,
+        belegdatum=date(2026, 2, 10), buchungsdatum=date(2026, 2, 10), faelligkeit=date(2026, 2, 10),
+        beleg_referenz="Rücklastschrift zu OP #1",
+    )
+
+    formular = client.get(f"/backoffice/op/{rls_op.id}/ruecklastschriftkosten")
+    assert formular.status_code == 200
+    assert "Rücklastschriftkosten erfassen" in formular.text
+
+    antwort = client.post(
+        f"/backoffice/op/{rls_op.id}/ruecklastschriftkosten/erfassen",
+        data={
+            "csrf_token": csrf, "bankentgelt_cent": "12,50", "rueckgabeursache": "Mangels Deckung",
+            "dem_zahlungspflichtigen_zurechenbar": "1",
+            "zurechenbarkeit_begruendung": "Kein Bankfehler erkennbar, Zahlung schlicht unterblieben.",
+            "beleg_referenz": "Bankbeleg RLS-TEST-1",
+        },
+        follow_redirects=False,
+    )
+    assert antwort.status_code == 303
+
+    bestaetigung = client.get(f"/backoffice/op/{rls_op.id}/ruecklastschriftkosten")
+    assert bestaetigung.status_code == 200
+    assert "bereits erfasst" in bestaetigung.text.lower()
+    assert "12,50" in bestaetigung.text
+
+    saldo_positionen = op_service.berechne_saldo(konto.id).positionen
+    kosten_zeilen = [p for p in saldo_positionen if p.typ == OPTyp.SOLL.value and p.beleg_referenz == "Bankbeleg RLS-TEST-1"]
+    assert len(kosten_zeilen) == 1
+    assert kosten_zeilen[0].betrag_cent == 1250
+
+
+def test_ruecklastschriftkosten_ohne_zurechenbarkeit_bucht_keine_forderung(backoffice_client):
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-RLS2", objekt_id="601", bezeichnung="Top RLS 2", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-RLS2", einheit_id="601-TOP-RLS2", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-RLS2"))
+    rls_op = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.RUECKLASTSCHRIFT, betrag_cent=60_000,
+        belegdatum=date(2026, 2, 10), buchungsdatum=date(2026, 2, 10), faelligkeit=date(2026, 2, 10),
+        beleg_referenz="Rücklastschrift zu OP #2",
+    )
+
+    antwort = client.post(
+        f"/backoffice/op/{rls_op.id}/ruecklastschriftkosten/erfassen",
+        data={
+            "csrf_token": csrf, "bankentgelt_cent": "12,50", "rueckgabeursache": "Bankseitiger Fehler lt. Bank",
+            "zurechenbarkeit_begruendung": "Bank bestätigt eigenen Verarbeitungsfehler, Mieter trifft kein Verschulden.",
+            "beleg_referenz": "Bankbeleg RLS-TEST-2",
+        },
+        follow_redirects=False,
+    )
+    assert antwort.status_code == 303
+
+    saldo_positionen = op_service.berechne_saldo(konto.id).positionen
+    kosten_zeilen = [p for p in saldo_positionen if p.beleg_referenz == "Bankbeleg RLS-TEST-2"]
+    assert not kosten_zeilen  # keine Forderung ohne Zurechenbarkeit
+
+
+def test_ruecklastschriftkosten_ohne_csrf_wird_abgelehnt(backoffice_client):
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-RLS3", objekt_id="601", bezeichnung="Top RLS 3", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-RLS3", einheit_id="601-TOP-RLS3", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-RLS3"))
+    rls_op = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.RUECKLASTSCHRIFT, betrag_cent=60_000,
+        belegdatum=date(2026, 2, 10), buchungsdatum=date(2026, 2, 10), faelligkeit=date(2026, 2, 10),
+        beleg_referenz="Rücklastschrift zu OP #3",
+    )
+    antwort = client.post(
+        f"/backoffice/op/{rls_op.id}/ruecklastschriftkosten/erfassen",
+        data={
+            "csrf_token": "voellig-falsch", "bankentgelt_cent": "12,50", "rueckgabeursache": "Mangels Deckung",
+            "dem_zahlungspflichtigen_zurechenbar": "1", "zurechenbarkeit_begruendung": "x", "beleg_referenz": "y",
+        },
+    )
+    assert antwort.status_code == 403
+
+
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
     unten) - der Login-Ratelimiter ist ein globaler, prozessweiter
@@ -3811,6 +4033,9 @@ def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
 
 
 
+
 # -- Variable Monatsabrechnung (KURZZEITVERMIETUNG/SELFSTORAGE) --------------
 # Auftrag 13.09., HV-20260913-DASHBOARD.
+
+
 

@@ -4507,3 +4507,70 @@ teilzahlung_mit_unveraenderten_op_ids`): nach der Teilzahlung zunächst
 reduzierten Betrag (1000 statt 2000 Cent) genau einmal zulässig und
 korrekt wirksam - keine automatische Fortwirkung der alten Freigabe.
 1076/1076 Tests grün im Gesamtlauf.
+
+## Backoffice-Oberfläche für Mahnpauschale-Freigabe und Rücklastschriftkosten (Fortsetzung HV-20261019-MAHNKOSTEN)
+
+Einfache, bewusst minimale Bedienoberfläche für die beiden zuvor nur
+backend-seitig gebauten Mechanismen - keine weiteren Features, nur die
+beiden angefragten Masken:
+
+- **Mahnpauschale-Freigabe** (`/backoffice/vertrag/{id}/mahnpauschale-
+  freigabe?stufe=1|2`): zeigt je Mahnlauf/Forderungsgruppe die aktuelle
+  Hauptforderung, den unverbindlichen Zinsprofil-Vorschlagswert samt
+  Verhältnis und Vertragsquelle, den Versandschritt (Stufe/Kanal) und den
+  Forderungsgruppe-Schlüssel. Zeigt eine bereits bestehende, für den
+  AKTUELLEN Saldo gültige Freigabe vollständig (alle vier Begründungen,
+  Owner, Zeitpunkt) sowie die Historie älterer, durch Saldenänderung
+  ungültig gewordener Freigaben desselben Schlüssels. Fehlt eine gültige
+  Freigabe, zeigt das Formular alle vier Pflichtfelder (Erforderlichkeit,
+  tatsächlicher Aufwand, Schuldhaftigkeit, Verhältnismäßigkeit) und legt
+  bei Absenden über `MahnkostenRepository.mahnpauschale_freigabe_anlegen`
+  eine neue, für GENAU diese Forderungsgruppe UND GENAU diesen Saldo
+  gültige `MahnpauschaleFreigabeTable`-Zeile an - IMMER mit serverseitig
+  frisch neu berechneter Hauptforderung/Forderungsgruppe (nie ein vom
+  Formular mitgesendeter Wert), genau wie bei jeder anderen Fachaktion in
+  diesem Modul. Verlinkt aus dem bestehenden Mahnkosten-Block der
+  Mahnvorschau.
+- **Rücklastschriftkosten** (`/backoffice/op/{id}/ruecklastschriftkosten`):
+  je Rücklastschrift-OP-Position verlinkt aus dem Kontoauszug. Erfasst
+  ausschließlich das tatsächlich belegte Bankentgelt, Rückgabeursache,
+  Zurechenbarkeit (Checkbox) und eine Begründung dafür über
+  `RuecklastschriftkostenService.erfasse_und_buche` - bucht eine Forderung
+  NUR bei angekreuzter Zurechenbarkeit, sonst bleibt die Erfassung rein
+  dokumentarisch. Eine bereits erfasste Rücklastschrift-OP zeigt
+  stattdessen die vorhandene Erfassung schreibgeschützt (keine
+  Doppelerfassung, die darunterliegende Service-Idempotenz greift
+  ohnehin).
+
+Beide Masken sind rein additiv: `require_gesellschaft_access`/CSRF wie
+bei jeder anderen Backoffice-Aktion, Objekt-107-Ausschluss greift wie
+überall, keine Änderung an bestehenden Routen/Tabellen außer der
+zusätzlichen Verlinkung. Keine echte Buchung, kein Versand, kein
+Deployment wurde ausgeführt.
+
+### Tests
+
+6 neue HTTP-Integrationstests in `tests/mietinkasso/test_backoffice.py`
+(FastAPI TestClient gegen echte Datei-SQLite, wie bei allen anderen
+Backoffice-Tests): Freigabeformular zeigt Hauptforderung und erteilt eine
+Freigabe End-to-End (inkl. Verifikation über denselben Lookup, den die
+Buchungslogik verwendet), Objekt-107-Ausschluss blockiert die Seite,
+CSRF-Schutz auf der Freigabe-Route, Rücklastschriftkosten-Erfassung bei
+Zurechenbarkeit bucht genau eine SOLL-Position mit dem exakten
+Bankentgelt, ohne Zurechenbarkeit bucht keine Forderung, CSRF-Schutz auf
+der Rücklastschriftkosten-Route. Die neuen, login-abhängigen Tests
+wurden VOR dem bestehenden, absichtlich letzten Login-Ratelimiter-Test
+eingefügt (dessen Docstring ausdrücklich warnt, dass er als letzter Test
+laufen muss, da er den globalen Login-Zähler sperrt) - 1082/1082 Tests
+grün im Gesamtlauf.
+
+### Live-Gate (unverändert)
+
+Die mechanische Verhältnismäßigkeits-/Saldo-Prüfung bleibt vollständig
+in `kosten.py` erzwungen; diese Oberfläche ändert daran nichts, macht
+den bereits bestehenden, konservativ-sicheren Mechanismus (ohne gültige
+Freigabe: 0 EUR) nur tatsächlich bedienbar. Es gibt weiterhin KEINE
+Möglichkeit, eine Freigabe nachträglich zu ändern/zurückzunehmen (nur
+neu anzulegen) - entspricht der bestehenden Konvention dieses Moduls
+(z. B. Zinsprofil-Versionierung), keine zusätzliche Korrekturfunktion
+wurde angefragt oder gebaut.

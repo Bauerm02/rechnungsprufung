@@ -40,6 +40,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Cookie, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from mietinkasso.audit.service import AuditService
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
@@ -72,6 +73,7 @@ from mietinkasso.bank.importer import (
     parse_csv,
 )
 from mietinkasso.bank.repository import BankRepository
+from mietinkasso.bank.ruecklastschriftkosten_service import RuecklastschriftkostenRepository, RuecklastschriftkostenService
 from mietinkasso.bank.service import (
     KATEGORIE_AUSGANG_BETRIEBSAUSGABE,
     KATEGORIE_EINGANG_PRUEFEN,
@@ -107,6 +109,8 @@ from mietinkasso.mahnwesen.brief_pdf import (
     Absender as _BriefAbsender, AdressfehlerError as _BriefAdressfehlerError, Forderungszeile as _BriefForderungszeile,
     Zinssegment as _BriefZinssegment, erzeuge_mahnbrief_pdf as _erzeuge_mahnbrief_pdf,
 )
+from mietinkasso.mahnwesen.kosten import _profil_wirksam_am as _mahn_profil_wirksam_am
+from mietinkasso.mahnwesen.kosten import forderungsgruppe_schluessel as _forderungsgruppe_schluessel
 from mietinkasso.mahnwesen.kosten import zins_bis_einschliesslich as _zins_bis_einschliesslich
 from mietinkasso.op.service import compute_content_hash as _compute_content_hash
 from mietinkasso.mahnwesen.repository import (
@@ -156,6 +160,8 @@ _op_repo = OPRepository(_session_factory)
 _op_service = OPService(_op_repo, _stammdaten_repo)
 _bank_repo = BankRepository(_session_factory)
 _bank_service = BankImportService(_bank_repo, _stammdaten_repo, _op_service)
+_ruecklastschriftkosten_service = RuecklastschriftkostenService(session_factory=_session_factory, op_service=_op_service)
+_ruecklastschriftkosten_repo = RuecklastschriftkostenRepository(_session_factory)
 _vorschreibung_repo = VorschreibungRepository(_session_factory)
 _vorschreibung_service = VorschreibungService(_vorschreibung_repo, _stammdaten_repo, _op_service)
 _mahn_fall_repo = MahnFallRepository(_session_factory)
@@ -967,6 +973,10 @@ def _op_zeile_html(position) -> str:
     faelligkeit_html = position.faelligkeit.isoformat() if position.faelligkeit else '<span class="muted">unbekannt</span>'
     status_html = '<span class="ok">AKTIV</span>' if position.status == "AKTIV" else '<span class="muted">STORNIERT</span>'
     aktion_html = f'<a href="/backoffice/op/{position.id}/korrigieren">Stornieren/Korrigieren</a>' if position.status == "AKTIV" else ""
+    if position.typ == OPTyp.RUECKLASTSCHRIFT.value and position.status == "AKTIV":
+        aktion_html += (
+            f' &nbsp;<a href="/backoffice/op/{position.id}/ruecklastschriftkosten">Rücklastschriftkosten erfassen</a>'
+        )
     return (
         "<tr>"
         f"<td>#{position.id}</td><td>{h(position.typ)}</td>"
@@ -1234,6 +1244,109 @@ def korrektur_absenden(
     except (MietinkassoError, ValueError) as exc:
         return _fehlerseite(session, "Korrektur", str(exc), f"/backoffice/op/{op_id}/korrigieren")
     return RedirectResponse(url=f"/backoffice/konto/{position.konto_id}?korrigiert=1", status_code=303)
+
+
+# -- Rücklastschriftkosten (Auftrag HV-20261019-MAHNKOSTEN) -----------------
+
+
+@router.get("/op/{op_id}/ruecklastschriftkosten", response_class=HTMLResponse)
+def ruecklastschriftkosten_formular(request: Request, op_id: int, session=Depends(_current_session)) -> HTMLResponse:
+    position = _op_service.get_position(op_id)
+    if position is None:
+        return _fehlerseite(session, "Rücklastschriftkosten", f"Unbekannte OP-Position {op_id}.")
+    if position.typ != OPTyp.RUECKLASTSCHRIFT.value:
+        return _fehlerseite(session, "Rücklastschriftkosten", f"OP #{op_id} ist keine Rücklastschrift (Typ {h(position.typ)}).")
+    konto = _stammdaten_repo.get_konto(position.konto_id)
+    if konto is None:
+        return _fehlerseite(session, "Rücklastschriftkosten", f"Konto {position.konto_id} nicht gefunden.")
+    vertrag = _stammdaten_repo.get_vertrag(konto.vertrag_id)
+    if vertrag is not None:
+        require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+
+    bestehend = _ruecklastschriftkosten_repo.fuer_ruecklastschrift(op_id)
+    if bestehend is not None:
+        zurechenbar_text = (
+            "Ja - als Forderung gebucht" if bestehend.dem_zahlungspflichtigen_zurechenbar
+            else "Nein - rein dokumentarisch, KEINE Forderung gebucht"
+        )
+        inhalt = f"""
+        <div class="card" style="max-width:560px;">
+          <h1>Rücklastschriftkosten — OP #{op_id}</h1>
+          <p class="ok">Bereits erfasst{' am ' + bestehend.gebucht_am.strftime('%d.%m.%Y %H:%M') if bestehend.gebucht_am else ''}
+             von {h(bestehend.erstellt_von)}.</p>
+          <table>
+            <tr><th>Originalbankentgelt</th><td>{eur(bestehend.bankentgelt_cent)}</td></tr>
+            <tr><th>Rückgabeursache</th><td>{h(bestehend.rueckgabeursache)}</td></tr>
+            <tr><th>Dem Zahlungspflichtigen zurechenbar</th><td>{h(zurechenbar_text)}</td></tr>
+            <tr><th>Begründung Zurechenbarkeit</th><td>{h(bestehend.zurechenbarkeit_begruendung)}</td></tr>
+            <tr><th>Beleg-Referenz</th><td>{h(bestehend.beleg_referenz)}</td></tr>
+          </table>
+          <p class="muted">Eine Rücklastschrift-OP darf nur EINMAL erfasst werden (keine Doppelbuchung) -
+             diese Erfassung ist abgeschlossen.</p>
+          <p><a href="/backoffice/konto/{h(konto.id)}">&larr; zurück zum Kontoauszug</a></p>
+        </div>"""
+        return _layout(request, session, "Rücklastschriftkosten", inhalt)
+
+    inhalt = f"""
+    <div class="card" style="max-width:560px;">
+      <h1>Rücklastschriftkosten erfassen — OP #{op_id}</h1>
+      <table>
+        <tr><th>Rücklastschrift-Betrag</th><td>{eur(position.betrag_cent)}</td></tr>
+        <tr><th>Belegdatum</th><td>{position.belegdatum.isoformat()}</td></tr>
+        <tr><th>Beleg-Referenz</th><td>{h(position.beleg_referenz or '')}</td></tr>
+      </table>
+      <form method="post" action="/backoffice/op/{op_id}/ruecklastschriftkosten/erfassen">
+        {csrf_feld(session.csrf_token)}
+        <label>Tatsächliches Originalbankentgelt in EUR (Pflicht - NUR der echte Bankbeleg, kein Pauschalbetrag)</label>
+        <input name="bankentgelt_cent" required placeholder="z. B. 12,50">
+        <label>Rückgabeursache (Pflicht, laut Bankbeleg)</label>
+        <input name="rueckgabeursache" required placeholder="z. B. Mangels Deckung">
+        <label><input type="checkbox" name="dem_zahlungspflichtigen_zurechenbar" value="1">
+          Dem Zahlungspflichtigen zurechenbar (z. B. KEIN Bank-/SEPA-Fehler) - nur dann wird eine Forderung gebucht</label>
+        <label>Begründung Zurechenbarkeit (Pflicht - bei einem Bankfehler ausdrücklich NICHT zurechenbar)</label>
+        <textarea name="zurechenbarkeit_begruendung" rows="3" required></textarea>
+        <label>Beleg-Referenz (Pflicht, z. B. Bankauszugs-/Belegnummer)</label>
+        <input name="beleg_referenz" required>
+        <button type="submit">Erfassen</button>
+      </form>
+      <p class="muted">Nur das tatsächlich belegte Bankentgelt wird gebucht - kein geschätzter/pauschaler Betrag.
+         Ohne Zurechenbarkeit bleibt die Erfassung rein dokumentarisch (0 EUR Forderung).</p>
+    </div>"""
+    return _layout(request, session, "Rücklastschriftkosten", inhalt)
+
+
+@router.post("/op/{op_id}/ruecklastschriftkosten/erfassen")
+async def ruecklastschriftkosten_absenden(request: Request, op_id: int, session=Depends(_current_session)):
+    form = await request.form()
+    _verify_csrf(session, str(form.get("csrf_token", "")))
+    position = _op_service.get_position(op_id)
+    if position is None:
+        return _fehlerseite(session, "Rücklastschriftkosten", f"Unbekannte OP-Position {op_id}.")
+    konto = _stammdaten_repo.get_konto(position.konto_id)
+    if konto is None:
+        return _fehlerseite(session, "Rücklastschriftkosten", f"Konto {position.konto_id} nicht gefunden.")
+    vertrag = _stammdaten_repo.get_vertrag(konto.vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Rücklastschriftkosten", "Kein Vertrag für dieses Konto gefunden.")
+
+    try:
+        bankentgelt_cent = parse_eur_betrag(str(form.get("bankentgelt_cent", "")).strip())
+        ergebnis = _ruecklastschriftkosten_service.erfasse_und_buche(
+            ctx=_ctx(session), ruecklastschrift_op_position=position, vertrag_id=vertrag.id, konto=konto,
+            bankentgelt_cent=bankentgelt_cent,
+            rueckgabeursache=str(form.get("rueckgabeursache", "")).strip(),
+            dem_zahlungspflichtigen_zurechenbar=str(form.get("dem_zahlungspflichtigen_zurechenbar", "")) == "1",
+            zurechenbarkeit_begruendung=str(form.get("zurechenbarkeit_begruendung", "")).strip(),
+            beleg_referenz=str(form.get("beleg_referenz", "")).strip(),
+            heute=date.today(), akteur=session.user_id,
+        )
+        _audit_service.log(
+            entity_typ="ruecklastschriftkosten", entity_id=str(ergebnis.id), akteur=session.user_id,
+            aktion="ERFASST", payload={"op_position_id": op_id, "bankentgelt_cent": bankentgelt_cent},
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Rücklastschriftkosten", str(exc), f"/backoffice/op/{op_id}/ruecklastschriftkosten")
+    return RedirectResponse(url=f"/backoffice/konto/{konto.id}?ruecklastschriftkosten_erfasst=1", status_code=303)
 
 
 # -- Eröffnungssalden CSV: Vorschau -> Bestätigung -> atomarer Import -----------
@@ -2183,6 +2296,10 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
             if vorschau.zins_von and vorschau.zins_bis else "–"
         )
         gebuehr_text = eur(vorschau.gebuehr_cent) if vorschau.gebuehr_cent is not None else "keine (bereits erhoben oder ungeklärt)"
+        mahnpauschale_zeile = f"""
+            <tr><th>Mahnkostenpauschale (§1333 Abs 2, Einzelfallfreigabe)</th>
+                <td>{eur(vorschau.mahnpauschale_cent) if vorschau.mahnpauschale_cent is not None else '0,00 € - keine gültige Freigabe'}
+                &nbsp;<a href="/backoffice/vertrag/{h(vertrag_id)}/mahnpauschale-freigabe?stufe={stufe}&heute={heute_datum.isoformat()}">Freigabe prüfen/erteilen</a></td></tr>"""
         hinweise_html = "".join(f"<li>{h(hw)}</li>" for hw in vorschau.hinweise)
         ausgeschlossen_html = "".join(f"<li class='warn'>{h(hw)}</li>" for hw in vorschau.ausgeschlossene_forderungen_hinweis)
         segmente_html = ""
@@ -2256,6 +2373,7 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
             <tr><th>Zinszeitraum</th><td>{h(zeitraum_text)}</td></tr>
             <tr><th>Neue Mahngebühr</th><td>{h(gebuehr_text)}{f" ({h(vorschau.gebuehr_rechtsgrundlage)})" if vorschau.gebuehr_rechtsgrundlage else ""}</td></tr>
             {versandkosten_zeile}
+            {mahnpauschale_zeile}
             <tr><th><strong>Gesamtbetrag (Hauptforderung + bereits offene Mahnkosten + neue Zinsen + neue Gebühr)</strong></th>
                 <td><strong>{eur(gesamtbetrag_cent)}</strong></td></tr>
           </table>
@@ -2270,6 +2388,197 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
     return f"""<div class="card"><h2>Mahnkosten (Verzugszinsen/Mahngebühren) — reine Vorschau, keine Buchung</h2>
       <p><a href="/backoffice/vertrag/{h(vertrag_id)}/zinsprofil">Zinsprofil erfassen/prüfen</a> &nbsp;|&nbsp;
       <a href="/backoffice/basiszinssatz">OeNB-Basiszinssatz erfassen</a></p></div>{''.join(zeilen)}"""
+
+
+@router.get("/vertrag/{vertrag_id}/mahnpauschale-freigabe", response_class=HTMLResponse)
+def mahnpauschale_freigabe_formular(
+    request: Request, vertrag_id: str, stufe: int = 1, heute: str | None = None, session=Depends(_current_session),
+) -> HTMLResponse:
+    """Einfache Prüfliste/Freigabemaske für die Mahnkostenpauschale
+    (§1333 Abs 2 ABGB) JE KONKRETEM Mahnlauf/Forderungsgruppe (Auftrag
+    Markus, Fortsetzung HV-20261019-MAHNKOSTEN) - zeigt Hauptforderung,
+    unverbindlichen Profil-Vorschlagswert, Verhältnis, Vertragsquelle und
+    eine bereits bestehende (ggf. durch Saldenänderung ungültig
+    gewordene) Freigabe; erteilt KEINE Buchung selbst - das bleibt
+    ausschließlich `kosten.py::berechne_mahnkosten_vorschau` bei der
+    nächsten tatsächlichen Mahnlaufverarbeitung vorbehalten."""
+
+    if stufe not in (1, 2):
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Stufe muss 1 oder 2 sein.")
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", f"Unbekannter Vertrag {vertrag_id}.")
+    if _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Objekt ist gesperrt; keine Freigabe möglich.")
+    konto = _stammdaten_repo.get_konto_by_vertrag(vertrag_id)
+    if konto is None:
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Kein Konto für diesen Vertrag vorhanden.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+
+    heute_datum = date.fromisoformat(heute) if heute else date.today()
+    kanal = _hv_mail.mahn_service._resolve_kanal(stufe)
+    vorschau = _hv_mail.mahnkosten_service.vorschau(vertrag_id=vertrag_id, stufe=stufe, heute=heute_datum, kanal=kanal)
+    if vorschau is None:
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Keine Kostenvorschau für diesen Vertrag/diese Stufe verfügbar.")
+
+    schluessel = _forderungsgruppe_schluessel(vorschau.forderung_op_position_ids)
+    historie = _hv_mail.mahnkosten_repo.mahnpauschale_freigaben_historie(
+        vertrag_id=vertrag_id, stufe=stufe, forderungsgruppe_schluessel=schluessel,
+    )
+    gueltige_freigabe = next((f for f in historie if f.hauptforderung_cent == vorschau.hauptforderung_cent), None)
+
+    zinsprofil_historie = _hv_mail.mahnkosten_repo.historie_geprueft(vertrag_id)
+    aktuelles_profil, _unberechenbar = _mahn_profil_wirksam_am(zinsprofil_historie, heute_datum)
+    vorschlag_cent = aktuelles_profil.mahnpauschale_kostenbasis_cent if aktuelles_profil is not None else None
+    vorschlag_beleg = aktuelles_profil.mahnpauschale_kostenbasis_beleg if aktuelles_profil is not None else None
+    verhaeltnis_text = (
+        f"{(vorschlag_cent / vorschau.hauptforderung_cent * 100):.0f} % der Hauptforderung"
+        if vorschlag_cent and vorschau.hauptforderung_cent else "–"
+    )
+
+    kopf = f"""
+    <div class="card" style="max-width:720px;">
+      <h1>Mahnkostenpauschale-Freigabe — {h(vertrag_id)}, Stufe {stufe} (Kanal: {h(kanal)})</h1>
+      <table>
+        <tr><th>Hauptforderung dieser Forderungsgruppe (jetzt)</th><td>{eur(vorschau.hauptforderung_cent)}</td></tr>
+        <tr><th>Vorgeschlagener Betrag (Zinsprofil, unverbindlich)</th>
+            <td>{eur(vorschlag_cent) if vorschlag_cent else 'kein Vorschlag hinterlegt'}</td></tr>
+        <tr><th>Verhältnis Vorschlag / Hauptforderung</th><td>{h(verhaeltnis_text)}</td></tr>
+        <tr><th>Vertragsquelle (Profil-Beleg)</th><td>{h(vorschlag_beleg or '–')}</td></tr>
+        <tr><th>Versandschritt</th><td>Stufe {stufe}, Kanal {h(kanal)}, Simulationsdatum {heute_datum.isoformat()}</td></tr>
+        <tr><th>Forderungsgruppe-Schlüssel</th><td><code>{h(schluessel[:16])}…</code> ({len(vorschau.forderung_op_position_ids)} Forderung(en))</td></tr>
+      </table>
+      <p><a href="/backoffice/vertrag/{h(vertrag_id)}/mahnvorschau?heute={heute_datum.isoformat()}">&larr; zurück zur Mahnvorschau</a></p>
+    </div>"""
+
+    _status_gueltig = '<span class="ok">gültig für aktuellen Saldo</span>'
+    _status_ungueltig = '<span class="warn">ungültig - Saldo seither verändert</span>'
+    historie_html = ""
+    if historie:
+        zeilen_h = "".join(
+            f"<tr><td>{eur(f.hauptforderung_cent)}</td><td>{eur(f.betrag_cent)}</td>"
+            f"<td>{_status_gueltig if f is gueltige_freigabe else _status_ungueltig}</td>"
+            f"<td>{h(f.freigegeben_von)}</td><td>{f.freigegeben_am.strftime('%d.%m.%Y %H:%M') if f.freigegeben_am else ''}</td></tr>"
+            for f in historie
+        )
+        historie_html = f"""
+        <div class="card">
+          <h2>Bisherige Freigaben für diese Forderungsgruppe</h2>
+          <table>
+            <tr><th>Damalige Hauptforderung</th><th>Freigegebener Betrag</th><th>Status</th><th>Freigegeben von</th><th>Zeitpunkt</th></tr>
+            {zeilen_h}
+          </table>
+          <p class="muted">Eine Freigabe gilt ausschließlich für GENAU den damaligen Saldo - eine Teilzahlung oder
+             sonstige Saldenänderung macht eine bestehende Freigabe automatisch ungültig (0 EUR, Prüffall), ohne sie
+             zu löschen. Eine neue Freigabe für den jetzt aktuellen Saldo ist unten jederzeit möglich.</p>
+        </div>"""
+
+    if gueltige_freigabe is not None:
+        inhalt = kopf + historie_html + f"""
+        <div class="card">
+          <h2 class="ok">Für den aktuellen Saldo bereits freigegeben</h2>
+          <table>
+            <tr><th>Freigegebener Betrag</th><td>{eur(gueltige_freigabe.betrag_cent)}</td></tr>
+            <tr><th>Erforderlichkeit</th><td>{h(gueltige_freigabe.erforderlichkeit_begruendung)}</td></tr>
+            <tr><th>Tatsächlicher Aufwand</th><td>{eur(gueltige_freigabe.tatsaechlicher_aufwand_cent)} — {h(gueltige_freigabe.tatsaechlicher_aufwand_beleg)}</td></tr>
+            <tr><th>Schuldhaftigkeit (konkret)</th><td>{h(gueltige_freigabe.schuldhaftigkeit_begruendung)}</td></tr>
+            <tr><th>Verhältnismäßigkeit</th><td>{h(gueltige_freigabe.verhaeltnismaessigkeit_begruendung)}</td></tr>
+            <tr><th>Freigabe-Owner / Zeitpunkt</th><td>{h(gueltige_freigabe.freigegeben_von)} am {gueltige_freigabe.freigegeben_am.strftime('%d.%m.%Y %H:%M') if gueltige_freigabe.freigegeben_am else ''}</td></tr>
+          </table>
+        </div>"""
+        return _layout(request, session, "Mahnpauschale-Freigabe", inhalt)
+
+    formular = f"""
+    <div class="card">
+      <h2>Neue Einzelfallfreigabe für den aktuellen Saldo erteilen</h2>
+      <p class="muted">Ohne diese vollständig begründete Freigabe bleibt die Pauschale automatisch bei 0 EUR
+         (Prüffall) - ein Profil-Vorschlagswert bindet nichts automatisch.</p>
+      <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/mahnpauschale-freigabe/erfassen">
+        {csrf_feld(session.csrf_token)}
+        <input type="hidden" name="stufe" value="{stufe}">
+        <input type="hidden" name="heute" value="{heute_datum.isoformat()}">
+        <label>Freigegebener Betrag in EUR (Pflicht - nicht notwendig identisch mit dem Vorschlagswert)</label>
+        <input name="betrag_cent" required value="{(f'{vorschlag_cent/100:.2f}'.replace('.', ',') if vorschlag_cent else '')}">
+        <label>Erforderlichkeit (Pflicht - warum ist eine Mahnung in diesem Fall erforderlich)</label>
+        <textarea name="erforderlichkeit_begruendung" rows="2" required></textarea>
+        <label>Tatsächlicher Aufwand in EUR (Pflicht)</label>
+        <input name="tatsaechlicher_aufwand_cent" required placeholder="z. B. 20,00">
+        <label>Beleg tatsächlicher Aufwand (Pflicht - z. B. Zeiterfassung, Druck-/Portokosten)</label>
+        <textarea name="tatsaechlicher_aufwand_beleg" rows="2" required></textarea>
+        <label>Konkrete Schuldhaftigkeit DIESES Rückstands (Pflicht - z. B. ausdrücklich NICHT bei einem Bank-/SEPA-Fehler)</label>
+        <textarea name="schuldhaftigkeit_begruendung" rows="2" required></textarea>
+        <label>Verhältnismäßigkeit zur aktuellen Hauptforderung (Pflicht)</label>
+        <textarea name="verhaeltnismaessigkeit_begruendung" rows="2" required></textarea>
+        <button type="submit">Freigeben</button>
+      </form>
+    </div>"""
+    return _layout(request, session, "Mahnpauschale-Freigabe", kopf + historie_html + formular)
+
+
+@router.post("/vertrag/{vertrag_id}/mahnpauschale-freigabe/erfassen")
+async def mahnpauschale_freigabe_absenden(request: Request, vertrag_id: str, session=Depends(_current_session)):
+    form = await request.form()
+    _verify_csrf(session, str(form.get("csrf_token", "")))
+    vertrag = _stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", f"Unbekannter Vertrag {vertrag_id}.")
+    if _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Objekt ist gesperrt; keine Freigabe möglich.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    require_schreibrecht(_ctx(session))
+
+    try:
+        stufe = int(str(form.get("stufe", "1")))
+    except ValueError:
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Ungültige Stufe.")
+    heute_roh = str(form.get("heute", "")).strip()
+    try:
+        heute_datum = date.fromisoformat(heute_roh) if heute_roh else date.today()
+    except ValueError:
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Ungültiges Datum.")
+
+    # IMMER frisch aus dem aktuellen Server-Stand neu berechnet - NIE ein
+    # vom Formular mitgesendeter Schlüssel/Hauptforderungsbetrag (der
+    # könnte zwischen Formularanzeige und Absenden veraltet oder
+    # manipuliert sein). Genau dieselbe Methode wie die GET-Ansicht.
+    kanal = _hv_mail.mahn_service._resolve_kanal(stufe)
+    vorschau = _hv_mail.mahnkosten_service.vorschau(vertrag_id=vertrag_id, stufe=stufe, heute=heute_datum, kanal=kanal)
+    if vorschau is None:
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Keine Kostenvorschau für diesen Vertrag/diese Stufe verfügbar.")
+    schluessel = _forderungsgruppe_schluessel(vorschau.forderung_op_position_ids)
+
+    try:
+        betrag_cent = parse_eur_betrag(str(form.get("betrag_cent", "")).strip())
+        aufwand_cent = parse_eur_betrag(str(form.get("tatsaechlicher_aufwand_cent", "")).strip())
+        freigabe = _hv_mail.mahnkosten_repo.mahnpauschale_freigabe_anlegen(
+            vertrag_id=vertrag_id, stufe=stufe, forderungsgruppe_schluessel=schluessel,
+            hauptforderung_cent=vorschau.hauptforderung_cent, betrag_cent=betrag_cent,
+            erforderlichkeit_begruendung=str(form.get("erforderlichkeit_begruendung", "")).strip(),
+            tatsaechlicher_aufwand_cent=aufwand_cent,
+            tatsaechlicher_aufwand_beleg=str(form.get("tatsaechlicher_aufwand_beleg", "")).strip(),
+            schuldhaftigkeit_begruendung=str(form.get("schuldhaftigkeit_begruendung", "")).strip(),
+            verhaeltnismaessigkeit_begruendung=str(form.get("verhaeltnismaessigkeit_begruendung", "")).strip(),
+            freigegeben_von=session.user_id, erstellt_von=session.user_id,
+        )
+        _audit_service.log(
+            entity_typ="mahnpauschale_freigabe", entity_id=str(freigabe.id), akteur=session.user_id,
+            aktion="FREIGABE_ERTEILT",
+            payload={
+                "vertrag_id": vertrag_id, "stufe": stufe, "forderungsgruppe_schluessel": schluessel,
+                "hauptforderung_cent": vorschau.hauptforderung_cent, "betrag_cent": betrag_cent,
+            },
+        )
+    except (MietinkassoError, ValueError, IntegrityError) as exc:
+        return _fehlerseite(
+            session, "Mahnpauschale-Freigabe",
+            "Für diese Forderungsgruppe und diesen Saldo wurde inzwischen bereits eine Freigabe erteilt."
+            if isinstance(exc, IntegrityError) else str(exc),
+            f"/backoffice/vertrag/{vertrag_id}/mahnpauschale-freigabe?stufe={stufe}&heute={heute_datum.isoformat()}",
+        )
+    return RedirectResponse(
+        url=f"/backoffice/vertrag/{vertrag_id}/mahnpauschale-freigabe?stufe={stufe}&heute={heute_datum.isoformat()}",
+        status_code=303,
+    )
 
 
 @router.get("/vertrag/{vertrag_id}/mahnbrief.pdf")
