@@ -482,6 +482,24 @@ class MahnkostenRepository:
                 .where(MahnkostenBuchungTable.mahnlauf_schluessel == mahnlauf_schluessel)
             ).scalar_one_or_none()
 
+    def buchung_fuer_versandnachweis(
+        self, *, vertrag_id: str, stufe: int, versandnachweis_referenz: str,
+    ) -> MahnkostenBuchungTable | None:
+        """Zweiter Lookup-Pfad neben `buchung_fuer_mahnlauf` (Auftrag
+        HV-20261019-MAHNKOSTEN) - fängt einen `IntegrityError` ab, der
+        über `uq_mahnkosten_versandnachweis` statt über `uq_mahnkosten_
+        lauf` ausgelöst wurde (z. B. ein abweichender `mahnlauf_
+        schluessel` für denselben bereits bestätigten Versand, siehe
+        `MahnkostenBuchungTable`-Moduldoc)."""
+
+        with self._session_factory() as session:
+            return session.execute(
+                select(MahnkostenBuchungTable)
+                .where(MahnkostenBuchungTable.vertrag_id == vertrag_id)
+                .where(MahnkostenBuchungTable.stufe == stufe)
+                .where(MahnkostenBuchungTable.versandnachweis_referenz == versandnachweis_referenz)
+            ).scalar_one_or_none()
+
     def buchung_anlegen(
         self, *, vertrag_id: str, stufe: int, mahnlauf_schluessel: str, forderung_op_position_ids: list[int],
         hauptforderung_cent: int, zinsbasis: str, zinssatz_prozent, zins_von: date, zins_bis: date,

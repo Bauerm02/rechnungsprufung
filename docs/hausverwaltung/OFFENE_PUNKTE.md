@@ -4334,3 +4334,53 @@ test_migrations.py`, bereits bestehende Altschema-Fixtures, eine davon
 musste wegen der dadurch nun abweichenden, aber weiterhin eine echte
 Inkompatibilität korrekt meldenden Fehlerart - `IntegrityError` statt
 `OperationalError` - angepasst werden).
+
+### Codex-Rückprüfung Commit 8fc9f78 (20.10.2026) — behoben
+
+Codex hat die Mahnpauschale unabhängig geprüft und einen kritischen
+Gate-Mangel benannt: `mahnpauschale_geprueft`/`verzugsverantwortung_
+geprueft` sind statische, EINMALIG am Vertragsprofil gesetzte Flags - ein
+einmal hinterlegtes 20-EUR-Profil hätte die Pauschale automatisch auch
+dann gebucht, wenn die aktuelle, konkrete Hauptforderung dieses Mahnlaufs
+(z. B. ein Rückstand von nur 14,31 EUR) das unverhältnismäßig macht.
+Zusätzlich benannt: Idempotenz darf nicht nur an Stufe+Forderungs-IDs
+hängen, sondern muss zusätzlich am tatsächlichen Versandnachweis greifen.
+
+1. **Verhältnismäßigkeit JE MAHNLAUF statt nur am Profil.** Neue,
+   mechanische Prüfung in `kosten.py::berechne_mahnkosten_vorschau`: die
+   geprüfte Pauschale wird NUR angesetzt, wenn sie die aktuelle, GERADE
+   für diese konkrete Forderungsgruppe berechnete `hauptforderung_cent`
+   NICHT übersteigt - diese Prüfung läuft bei JEDEM Mahnlauf frisch gegen
+   den live berechneten Wert, nie gegen einen beim Profil-Review
+   eingefrorenen Zustand. Überschreitet die Pauschale die aktuelle
+   Hauptforderung, bleibt sie automatisch auf 0 EUR/Prüffall blockiert
+   (Hinweistext benennt Pauschale UND aktuelle Hauptforderung konkret).
+   Eine spätere, genuin neue Mahnung einer anderen Periode mit
+   ausreichender Hauptforderung wird davon unberührt korrekt gebucht -
+   die Blockade ist pro Mahnlauf, nicht dauerhaft.
+2. **Idempotenz zusätzlich über den Versandnachweis.** Neue zweite
+   Eindeutigkeit `MahnkostenBuchungTable.uq_mahnkosten_versandnachweis`
+   (`vertrag_id, stufe, versandnachweis_referenz`), zusätzlich zur
+   bestehenden `uq_mahnkosten_lauf` (`vertrag_id, stufe, mahnlauf_
+   schluessel`). `kosten_repository.py::buchung_fuer_versandnachweis` +
+   ein zweiter Lookup-Pfad im `IntegrityError`-Handler von
+   `kosten_service.py::buche_vorschau` stellen sicher, dass ein
+   Retry/eine abweichend zusammengesetzte Forderungsgruppe für
+   DENSELBEN tatsächlichen Versandnachweis niemals eine zweite
+   Mahnpauschale bucht, selbst wenn sich dadurch ein abweichender
+   `mahnlauf_schluessel` ergibt.
+3. Was unverändert bleibt: Verschulden (`verzugsverantwortung_geprueft`)
+   bleibt am Zinsprofil geführt, wird aber - wie schon vor dieser
+   Korrektur - bei JEDEM Mahnlauf gegen das zum jeweiligen `heute` aktuell
+   WIRKSAME Profil geprüft (`_profil_wirksam_am`), nicht gegen einen
+   historisch eingefrorenen Stand; eine neue, die Verschuldensfrage
+   ändernde Profilversion wirkt automatisch ab ihrem Gültigkeitsdatum auf
+   künftige Mahnläufe.
+
+3 neue synthetische Tests in `tests/mietinkasso/test_mahnwesen_kosten.py`:
+der konkrete 14,31-EUR-vs-20-EUR-Fall (blockiert, Prüfhinweis, 0 EUR
+tatsächlich gebucht), dieselbe Pauschale bei einer neuen Mahnung einer
+anderen Periode mit ausreichender Hauptforderung (korrekt gebucht), sowie
+die Versandnachweis-Idempotenz bei zwei unterschiedlichen
+Forderungsgruppen/`mahnlauf_schluessel` für denselben Versandnachweis
+(keine zweite Buchung). 1073/1073 grün im `tests/mietinkasso`-Gesamtlauf.

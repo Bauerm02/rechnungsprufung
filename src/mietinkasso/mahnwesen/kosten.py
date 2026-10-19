@@ -950,6 +950,28 @@ def berechne_mahnkosten_vorschau(
             hinweise.append(
                 "§1333 Abs 2 ABGB (Mahnkostenpauschale): keine fällige Entgeltforderung - keine Pauschale angesetzt."
             )
+        elif aktuelles_profil.mahnpauschale_kostenbasis_cent > hauptforderung_cent:
+            # Unabhängige Rückprüfung Codex 20.10.2026, echter Bug: eine
+            # einmal am Vertragsprofil geprüfte/hinterlegte Pauschale
+            # (z. B. 20 EUR) ist KEINE pauschale, für immer gültige
+            # Freigabe - die Verhältnismäßigkeit muss JE MAHNLAUF gegen
+            # die KONKRETE, zu diesem Zeitpunkt tatsächlich offene
+            # Hauptforderung dieser Forderungsgruppe geprüft werden, NICHT
+            # nur einmal abstrakt am Profil. Eine Pauschale, die die
+            # aktuelle Hauptforderung selbst übersteigt (z. B. 20 EUR
+            # Pauschale bei nur noch 14,31 EUR offenem Rückstand), ist
+            # evident unverhältnismäßig und wird NIE automatisch gebucht -
+            # unabhängig davon, wie lange das Profil schon geprüft ist.
+            # Diese Prüfung läuft bei JEDEM Aufruf frisch gegen den
+            # GERADE berechneten `hauptforderung_cent` dieser konkreten
+            # Forderungsgruppe, nie gegen einen beim Profil-Review
+            # eingefrorenen Wert.
+            hinweise.append(
+                f"§1333 Abs 2 ABGB (Mahnkostenpauschale): die geprüfte Pauschale "
+                f"({aktuelles_profil.mahnpauschale_kostenbasis_cent / 100:.2f} EUR) übersteigt die aktuelle "
+                f"Hauptforderung dieses Mahnlaufs ({hauptforderung_cent / 100:.2f} EUR) - unverhältnismäßig, "
+                "keine Pauschale angesetzt (Prüffall, fallbezogene Klärung erforderlich)."
+            )
         else:
             mahnpauschale_cent = aktuelles_profil.mahnpauschale_kostenbasis_cent
             mahnpauschale_rechtsgrundlage = (

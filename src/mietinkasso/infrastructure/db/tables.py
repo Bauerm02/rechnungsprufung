@@ -1755,7 +1755,23 @@ class MahnkostenBuchungTable(Base):
     gebuchte Betrag wären für die zweite Gruppe auseinandergelaufen."""
 
     __tablename__ = "mahnkosten_buchungen"
-    __table_args__ = (UniqueConstraint("vertrag_id", "stufe", "mahnlauf_schluessel", name="uq_mahnkosten_lauf"),)
+    __table_args__ = (
+        UniqueConstraint("vertrag_id", "stufe", "mahnlauf_schluessel", name="uq_mahnkosten_lauf"),
+        # Auftrag HV-20261019-MAHNKOSTEN, unabhängige Rückprüfung Codex
+        # 20.10.2026: zusätzliche, von `mahnlauf_schluessel` UNABHÄNGIGE
+        # Eindeutigkeit über den tatsächlichen Versandnachweis - schützt
+        # insbesondere die Mahnkostenpauschale (`mahnpauschale_cent`, je
+        # TATSÄCHLICH versendetem Schreiben, nicht je Forderungsgruppe)
+        # davor, bei einem künftigen Retry-Pfad, der die Forderungsgruppe
+        # zwischen zwei Versuchen desselben bereits bestätigten Versands
+        # neu zusammensetzt (und damit einen abweichenden `mahnlauf_
+        # schluessel` erzeugt), ein zweites Mal für DENSELBEN Versand
+        # gebucht zu werden. `versandnachweis_referenz` ist stets an die
+        # stabile Identität des Mahnfalls/Mahnlaufs selbst gebunden
+        # (`"mahnung:" + outbox_key`/`"mahnungslauf:" + outbox_key`,
+        # siehe `mahnwesen/service.py`), nicht an die Forderungsinhalte.
+        UniqueConstraint("vertrag_id", "stufe", "versandnachweis_referenz", name="uq_mahnkosten_versandnachweis"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)

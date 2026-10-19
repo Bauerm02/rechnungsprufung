@@ -375,6 +375,19 @@ class MahnkostenService:
             # (unabhängige Rückprüfung Codex 14.09.2026, echter Bug).
             bestehender = self._repository.buchung_fuer_mahnlauf(vertrag_id=vertrag_id, stufe=stufe, mahnlauf_schluessel=mahnlauf_schluessel)
             if bestehender is None:
+                # Zweiter Lookup-Pfad (Auftrag HV-20261019-MAHNKOSTEN,
+                # unabhängige Rückprüfung Codex 20.10.2026): die
+                # IntegrityError kann statt über `uq_mahnkosten_lauf` auch
+                # über die NEUE `uq_mahnkosten_versandnachweis`-Eindeutigkeit
+                # ausgelöst worden sein (derselbe bereits bestätigte Versand,
+                # aber ein abweichender `mahnlauf_schluessel` - siehe
+                # `MahnkostenBuchungTable`-Moduldoc). Erst wenn BEIDE
+                # Lookups leer bleiben, ist es ein echter, ungeklärter
+                # Konflikt.
+                bestehender = self._repository.buchung_fuer_versandnachweis(
+                    vertrag_id=vertrag_id, stufe=stufe, versandnachweis_referenz=versandnachweis_referenz,
+                )
+            if bestehender is None:
                 raise RuntimeError(
                     f"Mahnkosten-Buchung für Vertrag {vertrag_id} Stufe {stufe} "
                     f"(Mahnlauf-Schlüssel {mahnlauf_schluessel}) ist an einer IntegrityError gescheitert, "
