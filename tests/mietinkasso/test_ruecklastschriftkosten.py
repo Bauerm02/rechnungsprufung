@@ -14,7 +14,7 @@ from mietinkasso.bank.repository import BankRepository
 from mietinkasso.bank.ruecklastschriftkosten_service import RuecklastschriftkostenService
 from mietinkasso.bank.service import BankImportService
 from mietinkasso.domain.enums import OPTyp
-from mietinkasso.domain.exceptions import VorgangIdKonfliktError
+from mietinkasso.domain.exceptions import BindungInkonsistentError, VorgangIdKonfliktError
 from mietinkasso.op.repository import OPRepository
 from mietinkasso.op.service import OPService
 
@@ -298,3 +298,171 @@ def test_nachtraegliche_zurechenbarkeit_auf_bereits_urspruenglich_zurechenbarer_
             ctx=ctx, ruecklastschrift_op_position_id=rls_op.id, konto=konto,
             begruendung="Nachträgliche Begründung.", heute=date(2026, 4, 21), akteur="codex-test-2",
         )
+
+
+def _zweiter_vertrag(stammdaten_repo):
+    stammdaten_repo.upsert_einheit(id="601-TOP4", objekt_id="601", bezeichnung="Top 4", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-1002", name="Erika Musterfrau", email="erika@example.at")
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-4", einheit_id="601-TOP4", debitor_id="DEB-1002", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    vertrag = stammdaten_repo.get_vertrag("V-601-4")
+    konto = stammdaten_repo.get_or_create_konto(vertrag=vertrag)
+    return vertrag, konto
+
+
+def test_nachtraegliche_zurechenbarkeit_mit_rls_op_eines_fremden_kontos_wird_abgelehnt(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service, stammdaten_repo,
+):
+    """Unabhängiges Review (Commit f68b1ae): nur `konto` wurde auf Zugriff
+    geprüft, NIE ob die über `ruecklastschrift_op_position_id` gefundene
+    Kostenzeile überhaupt zu DIESEM Konto gehört - ein eigenes, erlaubtes
+    Konto mit einer FREMDEN Rücklastschrift-OP-ID hätte deren Bankentgelt
+    auf das falsche Konto/Vertrag gebucht. Beide Konten liegen bewusst in
+    DERSELBEN Gesellschaft (7DI) - ein reiner Gesellschafts-Check allein
+    hätte diese Lücke NICHT gefunden."""
+
+    vertrag_a, konto_a = basis_vertrag
+    _vertrag_b, konto_b = _zweiter_vertrag(stammdaten_repo)
+    ctx = ctx_factory("7DI")
+
+    rls_op_a = _ruecklastschrift_op(bank_service, bank_repo, vertrag_a, konto_a, ctx)
+    rls_kosten_service.erfasse_und_buche(
+        ctx=ctx, ruecklastschrift_op_position=rls_op_a, vertrag_id=vertrag_a.id, konto=konto_a,
+        bankentgelt_cent=1250, rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=False,
+        zurechenbarkeit_begruendung="Noch ungeklärt.", beleg_referenz="Bankbeleg RLS-007",
+        heute=date(2026, 4, 11), akteur="codex-test",
+    )
+
+    with pytest.raises(BindungInkonsistentError):
+        rls_kosten_service.uebernimm_zurechenbarkeit_nachtraeglich(
+            ctx=ctx, ruecklastschrift_op_position_id=rls_op_a.id, konto=konto_b,
+            begruendung="Versuchte Übernahme auf fremdes Konto.", heute=date(2026, 4, 21), akteur="codex-test-2",
+        )
+    # Keine Forderung wurde auf das fremde Konto gebucht.
+    saldo_b = bank_service._op_service.berechne_saldo(konto_b.id)
+    assert saldo_b.saldo_cent == 0
+
+
+def test_nachtraegliche_zurechenbarkeit_ignoriert_manipuliertes_konto_objekt_und_laedt_frisch_aus_db(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    """Wie `bank/service.py::verarbeite_ruecklastschrift`: nur die `id`
+    des übergebenen `konto`-Objekts ist vertrauenswürdig, nicht seine
+    übrigen (ggf. veralteten/manipulierten) Attribute - die
+    Zugriffsprüfung muss gegen die FRISCH aus der DB geladene
+    `gesellschaft_id` laufen."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    rls_op = _ruecklastschrift_op(bank_service, bank_repo, vertrag, konto, ctx)
+    rls_kosten_service.erfasse_und_buche(
+        ctx=ctx, ruecklastschrift_op_position=rls_op, vertrag_id=vertrag.id, konto=konto,
+        bankentgelt_cent=1250, rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=False,
+        zurechenbarkeit_begruendung="Noch ungeklärt.", beleg_referenz="Bankbeleg RLS-008",
+        heute=date(2026, 4, 11), akteur="codex-test",
+    )
+
+    # Reines Python-Objekt im Speicher manipuliert, OHNE die DB-Zeile
+    # selbst zu verändern - nur `konto.id` darf wirken, der Rest muss
+    # frisch aus der DB kommen.
+    konto.gesellschaft_id = "FREMD-GESELLSCHAFT"
+
+    uebernommen = rls_kosten_service.uebernimm_zurechenbarkeit_nachtraeglich(
+        ctx=ctx, ruecklastschrift_op_position_id=rls_op.id, konto=konto,
+        begruendung="Bankauskunft bestätigt Zurechenbarkeit.", heute=date(2026, 4, 21), akteur="codex-test-2",
+    )
+    # Die Buchung lief trotz manipuliertem Attribut korrekt durch, weil
+    # NUR `konto.id` verwendet und die übrige Prüfung frisch aus der DB
+    # geladen wurde (die echte, unveränderte Gesellschaft 7DI).
+    assert uebernommen.dem_zahlungspflichtigen_zurechenbar is True
+
+
+def test_nachtraegliche_zurechenbarkeit_datei_sqlite_konkurrierende_abweichende_begruendung_ist_konflikt(tmp_path):
+    """Codex-Rückprüfung Paket B / unabhängiges Review f68b1ae: Lesen
+    (Idempotenz-/Konfliktprüfung) lief vor dieser Korrektur VOR der
+    Schreibtransaktion - zwei ECHT gleichzeitige nachträgliche
+    Freigaben mit ABWEICHENDER Begründung hätten sich sonst gegenseitig
+    überschreiben können, statt dass die zweite einen Konflikt meldet.
+    Reproduktion mit zwei echten Threads auf eine echte Datei-SQLite-DB."""
+
+    import threading
+
+    from mietinkasso.auth.service import AuthContext
+    from mietinkasso.bank.importer import CsvSpaltenMapping
+    from mietinkasso.bank.repository import BankRepository
+    from mietinkasso.bank.ruecklastschriftkosten_service import RuecklastschriftkostenService
+    from mietinkasso.bank.service import BankImportService
+    from mietinkasso.domain.enums import Rolle
+    from mietinkasso.infrastructure.db.base import Base
+    from mietinkasso.infrastructure.db.session import build_engine, build_session_factory
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    db_pfad = tmp_path / "nachtraeglich-nebenlaeufig.db"
+    engine = build_engine(f"sqlite:///{db_pfad}")
+    Base.metadata.create_all(engine)
+    engine.dispose()
+    session_factory = build_session_factory(f"sqlite:///{db_pfad}")
+
+    stammdaten_repo = StammdatenRepository(session_factory)
+    op_service = OPService(OPRepository(session_factory), stammdaten_repo)
+    bank_repo = BankRepository(session_factory)
+    bank_service = BankImportService(bank_repo, stammdaten_repo, op_service)
+    rls_kosten_service = RuecklastschriftkostenService(session_factory=session_factory, op_service=op_service)
+    ctx = AuthContext(user_id="test", rolle=Rolle.BUCHHALTUNG, gesellschaft_ids=frozenset({"7DI"}))
+
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")
+    stammdaten_repo.upsert_einheit(id="601-TOP5", objekt_id="601", bezeichnung="Top 5", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-1003", name="Nebenläufige Mieterin")
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-5", einheit_id="601-TOP5", debitor_id="DEB-1003", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    vertrag = stammdaten_repo.get_vertrag("V-601-5")
+    konto = stammdaten_repo.get_or_create_konto(vertrag=vertrag)
+
+    rls_op = _ruecklastschrift_op(bank_service, bank_repo, vertrag, konto, ctx)
+    rls_kosten_service.erfasse_und_buche(
+        ctx=ctx, ruecklastschrift_op_position=rls_op, vertrag_id=vertrag.id, konto=konto,
+        bankentgelt_cent=1250, rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=False,
+        zurechenbarkeit_begruendung="Noch ungeklärt.", beleg_referenz="Bankbeleg RLS-009",
+        heute=date(2026, 4, 11), akteur="codex-test",
+    )
+
+    barrier = threading.Barrier(2)
+    ergebnisse: dict[str, tuple[str, object]] = {}
+
+    def _uebernehmen(schluessel: str, begruendung: str, akteur: str):
+        barrier.wait(timeout=5)
+        try:
+            zeile = rls_kosten_service.uebernimm_zurechenbarkeit_nachtraeglich(
+                ctx=ctx, ruecklastschrift_op_position_id=rls_op.id, konto=konto,
+                begruendung=begruendung, heute=date(2026, 4, 21), akteur=akteur,
+            )
+            ergebnisse[schluessel] = ("ok", zeile)
+        except Exception as exc:  # noqa: BLE001 - Ergebnis wird unten geprüft, nicht verschluckt
+            ergebnisse[schluessel] = ("fehler", exc)
+
+    thread_a = threading.Thread(target=_uebernehmen, args=("a", "Begründung A.", "codex-a"))
+    thread_b = threading.Thread(target=_uebernehmen, args=("b", "Begründung B.", "codex-b"))
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=15)
+    thread_b.join(timeout=15)
+
+    assert set(ergebnisse) == {"a", "b"}  # beide Threads sind tatsächlich fertig geworden, kein Hänger
+    erfolgreiche = [k for k, (status, _) in ergebnisse.items() if status == "ok"]
+    fehlgeschlagene = [k for k, (status, _) in ergebnisse.items() if status == "fehler"]
+    assert len(erfolgreiche) == 1, f"genau EINE der beiden konkurrierenden Begründungen darf gewinnen: {ergebnisse}"
+    assert len(fehlgeschlagene) == 1
+    _, fehler = ergebnisse[fehlgeschlagene[0]]
+    assert isinstance(fehler, VorgangIdKonfliktError)
+
+    # Genau EINE SOLL-Forderung, nicht zwei - die verlierende Seite hat
+    # NICHTS gebucht.
+    saldo = op_service.berechne_saldo(konto.id)
+    assert saldo.saldo_cent == 1250

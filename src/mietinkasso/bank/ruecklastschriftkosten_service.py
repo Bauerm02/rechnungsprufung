@@ -46,7 +46,8 @@ from sqlalchemy.orm import Session
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import OPTyp
-from mietinkasso.domain.exceptions import VorgangIdKonfliktError
+from mietinkasso.domain.exceptions import BindungInkonsistentError, VorgangIdKonfliktError
+from mietinkasso.infrastructure.db.sqlite_write_lock import schreibgesperrte_session
 from mietinkasso.infrastructure.db.tables import KontoTable, OPPositionTable, RuecklastschriftkostenTable
 from mietinkasso.op.service import OPService
 
@@ -69,14 +70,15 @@ class RuecklastschriftkostenRepository:
         self._session_factory = session_factory
 
     def fuer_ruecklastschrift(
-        self, ruecklastschrift_op_position_id: int, *, session: Session | None = None,
+        self, ruecklastschrift_op_position_id: int, *, with_for_update: bool = False, session: Session | None = None,
     ) -> RuecklastschriftkostenTable | None:
         def _lesen(active_session: Session) -> RuecklastschriftkostenTable | None:
-            return active_session.execute(
-                select(RuecklastschriftkostenTable).where(
-                    RuecklastschriftkostenTable.ruecklastschrift_op_position_id == ruecklastschrift_op_position_id
-                )
-            ).scalar_one_or_none()
+            stmt = select(RuecklastschriftkostenTable).where(
+                RuecklastschriftkostenTable.ruecklastschrift_op_position_id == ruecklastschrift_op_position_id
+            )
+            if with_for_update:
+                stmt = stmt.with_for_update()
+            return active_session.execute(stmt).scalar_one_or_none()
 
         if session is not None:
             return _lesen(session)
@@ -254,33 +256,73 @@ class RuecklastschriftkostenService:
         die Zurechenbarkeit belegt - siehe Moduldoc. Bucht GENAU EINMAL
         eine neue SOLL-Position für den unveränderten `bankentgelt_cent`
         (kein neu eingegebener Betrag, keine zweite Bankrückgabe/
-        Kapitalbuchung)."""
+        Kapitalbuchung).
 
-        require_gesellschaft_access(ctx, konto.gesellschaft_id)
-        require_schreibrecht(ctx)
+        Codex-Rückprüfung (unabhängiges Review f68b1ae): das übergebene
+        `konto`-Objekt kann veraltet sein, UND es wurde bislang nie
+        geprüft, ob die über `ruecklastschrift_op_position_id` gefundene
+        Kostenzeile/Rücklastschrift-OP überhaupt zu DIESEM Konto gehört -
+        ein eigenes, erlaubtes Konto mit einer FREMDEN Rücklastschrift-OP-
+        ID hätte deren Bankentgelt auf das falsche Konto/Vertrag gebucht
+        (CrossTenant-artige Lücke). Lesen (Idempotenz-/Konfliktprüfung),
+        Bindungsprüfung UND Buchung laufen deshalb jetzt - wie bei
+        `bank/service.py::verarbeite_ruecklastschrift` - in EINER
+        gesperrten DB-Transaktion, die Konto/Kostenzeile/Rücklastschrift-
+        OP per ID frisch (`with_for_update`) lädt und ausschließlich auf
+        Basis dieser frischen Zeilen validiert; das schließt auch das
+        TOCTOU-Fenster, in dem zwei konkurrierende, ABWEICHENDE
+        nachträgliche Begründungen sich sonst hätten überschreiben
+        können."""
+
         if not begruendung.strip():
             raise ValueError("Begründung für die nachträgliche Zurechenbarkeit muss belegt angegeben werden.")
 
-        bestehend = self._repository.fuer_ruecklastschrift(ruecklastschrift_op_position_id)
-        if bestehend is None:
-            raise ValueError(
-                f"Für Rücklastschrift-OP {ruecklastschrift_op_position_id} liegt noch keine Bankentgelt-"
-                "Erfassung vor; eine nachträgliche Zurechenbarkeit setzt eine bestehende, dokumentarische "
-                "Erfassung voraus."
-            )
-        if bestehend.dem_zahlungspflichtigen_zurechenbar:
-            if bestehend.nachtraeglich_zurechenbar_begruendung == begruendung:
-                return bestehend  # echter Retry, No-Op
-            raise VorgangIdKonfliktError(
-                f"Rücklastschriftkosten für OP {ruecklastschrift_op_position_id} sind bereits zurechenbar "
-                "(entweder von Anfang an oder bereits nachträglich übernommen, mit einer ABWEICHENDEN "
-                "Begründung) - eine zweite SOLL-Buchung für denselben Aufwand ist nicht zulässig."
-            )
+        konto_id = konto.id
 
-        with self._session_factory() as session:
+        with schreibgesperrte_session(self._session_factory) as session:
             try:
+                frisches_konto = session.get(KontoTable, konto_id)
+                if frisches_konto is None:
+                    raise ValueError(f"Unbekanntes Konto {konto_id}")
+                require_gesellschaft_access(ctx, frisches_konto.gesellschaft_id)
+                require_schreibrecht(ctx)
+
+                bestehend = self._repository.fuer_ruecklastschrift(
+                    ruecklastschrift_op_position_id, with_for_update=True, session=session,
+                )
+                if bestehend is None:
+                    raise ValueError(
+                        f"Für Rücklastschrift-OP {ruecklastschrift_op_position_id} liegt noch keine "
+                        "Bankentgelt-Erfassung vor; eine nachträgliche Zurechenbarkeit setzt eine "
+                        "bestehende, dokumentarische Erfassung voraus."
+                    )
+
+                # Bindungsprüfung: die gefundene Kostenzeile muss TATSÄCHLICH
+                # zu DIESEM Konto gehören - nie allein auf Basis der
+                # (vom Aufrufer kontrollierten) `ruecklastschrift_op_
+                # position_id` vertrauen.
+                frische_rls_op = session.get(
+                    OPPositionTable, bestehend.ruecklastschrift_op_position_id, with_for_update=True,
+                )
+                if frische_rls_op is None or frische_rls_op.konto_id != frisches_konto.id:
+                    raise BindungInkonsistentError(
+                        f"Rücklastschriftkosten-Zeile {bestehend.id} (Rücklastschrift-OP "
+                        f"{bestehend.ruecklastschrift_op_position_id}) gehört nicht zu Konto {konto_id}."
+                    )
+
+                if bestehend.dem_zahlungspflichtigen_zurechenbar:
+                    if bestehend.nachtraeglich_zurechenbar_begruendung == begruendung:
+                        session.expunge(bestehend)
+                        return bestehend  # echter Retry, No-Op
+                    raise VorgangIdKonfliktError(
+                        f"Rücklastschriftkosten für OP {ruecklastschrift_op_position_id} sind bereits "
+                        "zurechenbar (entweder von Anfang an oder bereits nachträglich übernommen, mit "
+                        "einer ABWEICHENDEN Begründung) - eine zweite SOLL-Buchung für denselben Aufwand "
+                        "ist nicht zulässig."
+                    )
+
                 kosten_position = self._op_service.buchen(
-                    ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=bestehend.bankentgelt_cent,
+                    ctx=ctx, konto=frisches_konto, typ=OPTyp.SOLL, betrag_cent=bestehend.bankentgelt_cent,
                     belegdatum=heute, buchungsdatum=heute, faelligkeit=None,
                     beleg_referenz=bestehend.beleg_referenz,
                     aenderungsgrund="Rücklastschriftkosten - nachträglich übernommene Zurechenbarkeit",
@@ -293,7 +335,8 @@ class RuecklastschriftkostenService:
                     begruendung=begruendung, erklaert_von=akteur, session=session,
                 )
                 session.commit()
-                return aktualisiert
             except Exception:
                 session.rollback()
                 raise
+            session.refresh(aktualisiert)
+            return aktualisiert
