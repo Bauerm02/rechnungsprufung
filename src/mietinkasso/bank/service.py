@@ -1289,6 +1289,40 @@ class BankImportService:
 
                 if bereits_verarbeiteter_kapital_op is not None:
                     kapital_cent = bereits_verarbeiteter_kapital_op.betrag_cent
+                    # Guard (Codex-Rückmeldung 19.10.2026, Review 27d90e9):
+                    # ein Retry muss GEGEN das damals tatsächlich gebuchte
+                    # Bankentgelt geprüft werden, IMMER auch wenn dieses 0
+                    # war - sonst würde ein zweiter Aufruf mit abweichendem
+                    # Wert entweder nachträglich ein NEUES Entgelt über den
+                    # bereits vollständig verbrauchten Bankbetrag hinaus
+                    # erfinden (0 -> 700, da `erfasse_und_buche` unten nur
+                    # bei `bankentgelt_cent > 0` überhaupt aufgerufen wird)
+                    # oder ein bereits gebuchtes Entgelt still verschwinden
+                    # lassen (700 -> 0, da der `if bankentgelt_cent > 0`-
+                    # Zweig dann gar nicht mehr betreten wird). Ein
+                    # abweichender `zuordnungsbetrag_cent` wird ebenso
+                    # gegen Kapital+gespeichertes Entgelt geprüft.
+                    bestehende_kosten_zeile = ruecklastschriftkosten_service._repository.fuer_ruecklastschrift(
+                        bereits_verarbeiteter_kapital_op.id, with_for_update=True, session=session,
+                    )
+                    bereits_gebuchtes_bankentgelt_cent = (
+                        bestehende_kosten_zeile.bankentgelt_cent if bestehende_kosten_zeile is not None else 0
+                    )
+                    if bankentgelt_cent != bereits_gebuchtes_bankentgelt_cent:
+                        raise VorgangIdKonfliktError(
+                            f"Transaktion {transaktion_id}/Ursprungszahlung {original_op_position_id} wurde "
+                            f"bereits mit Bankentgelt {bereits_gebuchtes_bankentgelt_cent} verarbeitet, jetzt "
+                            f"abweichend {bankentgelt_cent} übergeben - ein Retry muss identische Werte liefern."
+                        )
+                    if (
+                        zuordnungsbetrag_cent is not None
+                        and zuordnungsbetrag_cent != kapital_cent + bereits_gebuchtes_bankentgelt_cent
+                    ):
+                        raise VorgangIdKonfliktError(
+                            f"Transaktion {transaktion_id}/Ursprungszahlung {original_op_position_id} wurde "
+                            f"bereits mit Kapital {kapital_cent} + Bankentgelt {bereits_gebuchtes_bankentgelt_cent} "
+                            f"verarbeitet, jetzt abweichend zugeordneter Betrag {zuordnungsbetrag_cent} übergeben."
+                        )
                 else:
                     # Split VOR der eigentlichen Buchung bestimmen - der
                     # ZUGEORDNETE Betrag ist entweder explizit bestätigt

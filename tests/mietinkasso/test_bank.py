@@ -1973,6 +1973,106 @@ def test_mit_bankentgelt_retry_mit_abweichendem_entgelt_wird_abgelehnt(
         )
 
 
+def test_mit_bankentgelt_retry_von_null_auf_abweichendes_entgelt_wird_abgelehnt(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    """Review 27d90e9 (Codex-Rückmeldung 19.10.2026): ein erster Aufruf
+    ohne belegtes Entgelt (`bankentgelt_cent=0`) bucht die gesamte
+    Rückgabe als Kapital. Ein Retry mit DEMSELBEN Transaktion+Ursprungs-
+    zahlung-Paar, aber jetzt abweichendem `bankentgelt_cent=700`, darf
+    NICHT nachträglich ein neues Entgelt über den bereits vollständig
+    verbrauchten Bankbetrag hinaus erfinden, sondern muss als Konflikt
+    abgelehnt werden - ohne jede Mutation."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text=f"betrag,datum,referenz\n612.50,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+    rueck = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-612.50,2026-04-10,RUECKLASTSCHRIFT\n",
+        mapping=mapping,
+    )[0]
+
+    kapital_op, kosten_zeile = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+        ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+        ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=0,
+        rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=False,
+        zurechenbarkeit_begruendung="Kein Entgelt belegt.",
+        beleg_referenz="Bankbeleg RLS-NULL-ZU-700", heute=date(2026, 4, 11), akteur="codex-test",
+    )
+    assert kosten_zeile is None
+    assert kapital_op.betrag_cent == 612_50
+
+    with pytest.raises(VorgangIdKonfliktError):
+        bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+            ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+            ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=700,  # abweichend von 0
+            rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=False,
+            zurechenbarkeit_begruendung="Kein Entgelt belegt.",
+            beleg_referenz="Bankbeleg RLS-NULL-ZU-700", heute=date(2026, 4, 11), akteur="codex-test",
+        )
+    # Keine Mutation durch den abgelehnten Retry: weiterhin keine Kostenzeile.
+    assert rls_kosten_service._repository.fuer_ruecklastschrift(kapital_op.id) is None
+    saldo = bank_service._op_service.berechne_saldo(konto.id)
+    assert saldo.saldo_cent == 0
+
+
+def test_mit_bankentgelt_retry_von_entgelt_auf_null_wird_abgelehnt(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    """Review 27d90e9 (Codex-Rückmeldung 19.10.2026): spiegelbildlicher
+    Fall - ein erster Aufruf MIT belegtem Entgelt, ein Retry mit
+    abweichendem `bankentgelt_cent=0` darf das bereits gebuchte Entgelt
+    nicht still verschwinden lassen, sondern muss ebenfalls als Konflikt
+    abgelehnt werden, ohne die bestehende Kostenzeile zu verändern."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text=f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+    rueck = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-612.50,2026-04-10,RUECKLASTSCHRIFT\n",
+        mapping=mapping,
+    )[0]
+
+    kapital_op, kosten_zeile = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+        ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+        ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=1250,
+        rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=True,
+        zurechenbarkeit_begruendung="Vom Mieter zu vertreten.",
+        beleg_referenz="Bankbeleg RLS-700-ZU-NULL", heute=date(2026, 4, 11), akteur="codex-test",
+    )
+    assert kosten_zeile.bankentgelt_cent == 1250
+
+    with pytest.raises(VorgangIdKonfliktError):
+        bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+            ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+            ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=0,  # abweichend von 1250
+            rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=True,
+            zurechenbarkeit_begruendung="Vom Mieter zu vertreten.",
+            beleg_referenz="Bankbeleg RLS-700-ZU-NULL", heute=date(2026, 4, 11), akteur="codex-test",
+        )
+    # Keine Mutation durch den abgelehnten Retry: Kostenzeile unverändert bei 1250.
+    bestehend = rls_kosten_service._repository.fuer_ruecklastschrift(kapital_op.id)
+    assert bestehend.bankentgelt_cent == 1250
+
+
 def test_vorgang_id_unterscheidet_retry_von_unabhaengiger_teilzuordnung(bank_service, bank_repo, basis_vertrag, ctx_factory):
     """Regression: derselbe `vorgang_id`-Wert (Retry, z. B. nach einem
     Netzwerk-Timeout) darf keine zweite Zuordnung erzeugen; ein NEUER Wert
