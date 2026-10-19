@@ -5,6 +5,8 @@ denselben etablierten Grundsatz)."""
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from mietinkasso.domain.exceptions import TransportFehlerUngewissError
@@ -394,6 +396,11 @@ def test_paramiko_verbindung_setzt_banner_und_auth_timeout_bei_echtem_verbindung
     assert aufgerufene_adressen == [((_konfiguration().host, _konfiguration().port), 20)]
     assert fake_transport.banner_timeout == 20
     assert fake_transport.auth_timeout == 20
+    # Codex-Abnahme 19.10.2026, dritte Korrektur (unabhängige Probe gegen
+    # echtes paramiko 5.1): `channel_timeout` blieb bislang `None` -
+    # begrenzt `Transport.open_channel`/`open_session`, nicht nur die
+    # Authentifizierung selbst.
+    assert fake_transport.channel_timeout == 20
 
 
 def test_paramiko_verbindung_schliesst_transport_bei_fehlschlagendem_start_client(monkeypatch):
@@ -417,6 +424,60 @@ def test_paramiko_verbindung_schliesst_transport_bei_fehlschlagendem_start_clien
     with pytest.raises(RuntimeError):
         _ParamikoVerbindung(_konfiguration())
     assert fake_transport.geschlossen
+
+
+class _HaengenderTransport(_FakeTransport):
+    """Simuliert einen Server, der auf die Authentifizierung/den
+    anschließenden Kanalaufbau NIE antwortet - genau der Fall, den
+    paramikos eigene `Channel._wait_for_event()` (von `invoke_subsystem`
+    innerhalb von `SFTPClient.from_transport` aufgerufen) OHNE jeden
+    Timeout-Parameter unbegrenzt blockieren lässt. `auth_password`
+    wartet hier auf ein Abbruchsignal, das NUR `close()` setzt (simuliert
+    den zwangsweisen Abbruch durch den Deadline-Wächter) - mit einer
+    eigenen 5s-Obergrenze, damit der Hintergrund-Thread in jedem Fall
+    endet, selbst wenn der Deadline-Wächter fehlerhaft wäre."""
+
+    def __init__(self):
+        super().__init__()
+        self._abbruch_signal = threading.Event()
+
+    def auth_password(self, username: str, password: str) -> None:
+        self.auth_aufrufe.append((username, password))
+        self._abbruch_signal.wait(timeout=5)
+        raise RuntimeError("Fake-Hintergrund-Thread nach Abbruchsignal beendet (Test).")
+
+    def close(self) -> None:
+        super().close()
+        self._abbruch_signal.set()
+
+
+def test_sftp_kanalaufbau_wird_bei_haengender_authentifizierung_zwangsweise_abgebrochen(monkeypatch):
+    """Codex-Abnahme 19.10.2026, dritte Korrektur (unabhängige Probe gegen
+    echtes paramiko 5.1): `channel_timeout` allein reicht NICHT -
+    `SFTPClient.from_transport` ruft `invoke_subsystem` auf, das paramikos
+    eigene `_wait_for_event()`-Implementierung ohne Timeout-Parameter
+    unbegrenzt blockieren lässt. Ein Deadline-Wächter muss den GESAMTEN
+    Kanalaufbau (Auth + `from_transport` + Kanal-Timeout) daher
+    unabhängig von paramikos eigenen Timeout-Parametern begrenzen und bei
+    Überschreitung Transport/Socket zwangsweise schließen - OHNE
+    automatischen Neuversuch. `_VERBINDUNGSTIMEOUT_SEKUNDEN` wird für
+    diesen Test auf wenige Millisekunden verkürzt, damit er nicht
+    tatsächlich 20s läuft - kein echter Netzwerkzugriff (reines Fake)."""
+
+    from mietinkasso.mahnwesen import brief_sftp as brief_sftp_modul
+
+    monkeypatch.setattr(brief_sftp_modul, "_VERBINDUNGSTIMEOUT_SEKUNDEN", 0.05)
+
+    fake_transport = _HaengenderTransport()
+    verbindung = _ParamikoVerbindung(
+        _konfiguration(), transport_factory=lambda: fake_transport, sftp_client_cls=_FakeSftpClient,
+    )
+    with pytest.raises(TransportFehlerUngewissError):
+        verbindung.put_exclusive("in/bulk_tp/DATEI-HAENGT.pdf", b"%PDF-1.4 Inhalt")
+
+    assert fake_transport.geschlossen  # Transport wurde zwangsweise geschlossen
+    assert len(fake_transport.auth_aufrufe) == 1  # genau EIN Versuch, kein Retry
+    assert verbindung._sftp is None  # kein Kanal wurde erfolgreich aufgebaut
 
 
 def test_paramiko_verbindung_hostkey_fingerprint_ist_sha256_base64():

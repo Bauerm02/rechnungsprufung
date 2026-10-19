@@ -107,6 +107,21 @@ def _login_versuch(client, *, username: str = "markus", password: str = "test-pa
     )
 
 
+def _echter_beleg_pdf(text: str) -> bytes:
+    """Ein TATSÄCHLICH mit `pypdf` lesbares, einseitiges synthetisches PDF
+    (Codex-Abnahme 19.10.2026, dritte Korrektur: `importiere_anbieterbeleg`
+    prüft jetzt lesbare Seitenzahl/Unverschlüsseltheit, nicht mehr nur die
+    `%PDF-`-Kopfzeile)."""
+
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=12)
+    pdf.cell(0, 10, text)
+    return bytes(pdf.output())
+
+
 def _login(client) -> None:
     antwort = _login_versuch(client)
     assert antwort.status_code == 303
@@ -2656,6 +2671,65 @@ def test_mailversand_seite_und_csrf_ohne_versand(backoffice_client):
 # Alle PDFs sind synthetisch von Hand gebaut (`_pdf_test_helpers.py`).
 
 
+def _versandzeile_row(**overrides) -> dict:
+    werte = dict(
+        art="Mahnung", objekt="Am Corso", einheit="Top 3", vertrag_id="V-601-1",
+        status="GESENDET", versendet_am=None, nachweis="", provider_referenz="",
+    )
+    werte.update(overrides)
+    return werte
+
+
+def test_versandzeile_zeigt_microsoft_nachweis_und_exakte_uhrzeit_fuer_email(backoffice_client):
+    """Ein EMAIL-Versand (MailOps/Graph) zeigt weiterhin die tatsächliche
+    Uhrzeit UND die bisherige Beschriftung "Microsoft-Nachweis" - dieser
+    Pfad ist durch einen echten Zeitstempel belegt, keine Platzhalterzeit."""
+
+    from mietinkasso.backoffice.routes.mailversand import _versandzeile_html
+
+    row = _versandzeile_row(
+        versendet_am=datetime(2026, 9, 14, 22, 30, tzinfo=timezone.utc),
+        nachweis="msg-12345", provider_referenz="msgraph:msg-12345",
+    )
+    zeile = _versandzeile_html(row)
+    assert "Microsoft-Nachweis" in zeile
+    assert "Post-/Anbieternachweis" not in zeile
+    assert "Uhrzeit nicht belegt" not in zeile
+    assert ":" in zeile  # eine tatsächliche Uhrzeit (HH:MM) wird gezeigt
+
+
+def test_versandzeile_zeigt_post_anbieternachweis_ohne_erfundene_uhrzeit(backoffice_client):
+    """Codex-Abnahme 19.10.2026, dritte Korrektur: ein per Post-
+    Anbieterbeleg vervollständigter BRIEF-Mahnlauf speichert `versendet_am`
+    NUR als Mitternacht-UTC-Platzhalter für das belegte DATUM (siehe
+    `vervollstaendige_mahnlauf_aus_anbieterbeleg`) - die Übersicht darf
+    daraus KEINE erfundene exakte Uhrzeit zeigen und es ist KEIN
+    "Microsoft-Nachweis" (das ist MailOps/Graph, nicht die Post)."""
+
+    from mietinkasso.backoffice.routes.mailversand import _versandzeile_html
+
+    row = _versandzeile_row(
+        art="Mahnung (Brief)", versendet_am=datetime(2026, 10, 20, 0, 0, tzinfo=timezone.utc),
+        nachweis="POST-ORIGINAL-DATEINAME.pdf", provider_referenz="post-anbieterbeleg:PORTAL-AUFTRAG-4711",
+    )
+    zeile = _versandzeile_html(row)
+    assert "Post-/Anbieternachweis" in zeile
+    assert "Microsoft-Nachweis" not in zeile
+    assert "20.10.2026 (Uhrzeit nicht belegt)" in zeile
+    # Keine erfundene exakte Uhrzeit wie "02:00" (Mitternacht UTC in Wien
+    # im Oktober, MESZ/MEZ-Umrechnung) irgendwo in der Zeile.
+    assert "20.10.2026 0" not in zeile
+    assert "PORTAL-AUFTRAG-4711" in zeile
+
+
+def test_versandzeile_ohne_beleg_zeigt_noch_nicht_belegt(backoffice_client):
+    from mietinkasso.backoffice.routes.mailversand import _versandzeile_html
+
+    zeile = _versandzeile_html(_versandzeile_row())
+    assert "Noch nicht belegt" in zeile
+    assert "—" in zeile  # kein Nachweis vorhanden
+
+
 def test_vertraege_liste_zeigt_nav_und_bestehende_vertraege(backoffice_client):
     client, *_ = backoffice_client
     _login(client)
@@ -4712,6 +4786,7 @@ def test_mahnbrief_archiv_beleg_import_vervollstaendigt_mahnlauf(backoffice_clie
         empfaenger_name="Test Mieterin", empfaenger_adresse="Musterstraße 1\n1010 Wien",
         erstellt_von="codex-test",
     )
+    beleg_pdf = _echter_beleg_pdf("Original-Postaufgabebeleg")
 
     antwort = client.post(
         f"/backoffice/vertrag/V-601-1/mahnbrief-archiv/{archiv.id}/beleg",
@@ -4719,20 +4794,20 @@ def test_mahnbrief_archiv_beleg_import_vervollstaendigt_mahnlauf(backoffice_clie
             "csrf_token": csrf, "anbieterbeleg_referenz": "PORTAL-BACKOFFICE-BELEG",
             "postaufgabe_datum": date.today().isoformat(),
         },
-        files={"beleg_datei": ("beleg.pdf", b"%PDF-1.4 Original-Postaufgabebeleg", "application/pdf")},
+        files={"beleg_datei": ("beleg.pdf", beleg_pdf, "application/pdf")},
         follow_redirects=False,
     )
     assert antwort.status_code == 303
 
     aktualisiert = backoffice_deps._hv_mail.mahnbrief_archiv_repo.get(archiv.id)
     assert aktualisiert.anbieterbeleg_referenz == "PORTAL-BACKOFFICE-BELEG"
-    assert aktualisiert.anbieterbeleg_pdf_bytes == b"%PDF-1.4 Original-Postaufgabebeleg"
+    assert aktualisiert.anbieterbeleg_pdf_bytes == beleg_pdf
     mahnlauf_danach = backoffice_deps._hv_mail.mahnlauf_repo.get(mahnlauf.id)
     assert mahnlauf_danach.status == "GESENDET"
 
     beleg_download = client.get(f"/backoffice/vertrag/V-601-1/mahnbrief-archiv/{archiv.id}/anbieterbeleg.pdf")
     assert beleg_download.status_code == 200
-    assert beleg_download.content == b"%PDF-1.4 Original-Postaufgabebeleg"
+    assert beleg_download.content == beleg_pdf
 
 
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):

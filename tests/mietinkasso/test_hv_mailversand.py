@@ -40,6 +40,22 @@ def hv(session_factory, basis_vertrag, tmp_path):
     return HVMailversandService(session_factory, bundle, settings, client=client), state
 
 
+def _echter_beleg_pdf(text: str) -> bytes:
+    """Ein TATSÄCHLICH mit `pypdf` lesbares, einseitiges synthetisches PDF
+    (Codex-Abnahme 19.10.2026, dritte Korrektur: `importiere_anbieterbeleg`
+    prüft jetzt lesbare Seitenzahl/Unverschlüsseltheit, nicht mehr nur die
+    `%PDF-`-Kopfzeile). Unterschiedlicher `text` ergibt unterschiedliche
+    Bytes/Hashes für "abweichender Beleg"-Tests."""
+
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=12)
+    pdf.cell(0, 10, text)
+    return bytes(pdf.output())
+
+
 def _seed_debt(hv, contract, account, ctx, day=date(2026, 9, 13)):
     service, _ = hv
     policy = service.policy_repo.anlegen(stufe1_tage_nach_faelligkeit=7,
@@ -762,7 +778,7 @@ def test_echter_beleg_bucht_exakt_den_freigegebenen_kostensnapshot_einmal(hv, ba
     archiv = service.mahnbrief_archiv_repo.fuer_mahnlauf(
         vertrag_id=contract.id, stufe=1, mahnlauf_schluessel=mahnlauf_row.outbox_key,
     )
-    beleg_pdf = b"%PDF-1.4 Original-Postaufgabebeleg"
+    beleg_pdf = _echter_beleg_pdf("Original-Postaufgabebeleg")
 
     service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
         ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=beleg_pdf,
@@ -814,7 +830,7 @@ def test_echter_anbieterbeleg_vervollstaendigt_mahnlauf_genau_einmal(hv, basis_v
     archiv = service.mahnbrief_archiv_repo.fuer_mahnlauf(
         vertrag_id=contract.id, stufe=1, mahnlauf_schluessel=mahnlauf_row.outbox_key,
     )
-    beleg_pdf = b"%PDF-1.4 Original-Postaufgabebeleg aus dem Post-Portal"
+    beleg_pdf = _echter_beleg_pdf("Original-Postaufgabebeleg aus dem Post-Portal")
 
     service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
         ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=beleg_pdf,
@@ -875,7 +891,7 @@ def test_fehlender_oder_vertauschter_beleg_bleibt_offen_kein_fehlerhafter_abschl
         )
 
     service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
-        ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 echter Beleg",
+        ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=_echter_beleg_pdf("echter Beleg"),
         anbieterbeleg_referenz="PORTAL-AUFTRAG-ECHT", postaufgabe_datum=heute,
         importiert_von="codex-test", heute=heute,
     )
@@ -883,7 +899,7 @@ def test_fehlender_oder_vertauschter_beleg_bleibt_offen_kein_fehlerhafter_abschl
     # der bereits bestätigte Mahnlauf bleibt unangetastet GESENDET.
     with pytest.raises(VorgangIdKonfliktError):
         service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
-            ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 ANDERER Beleg",
+            ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=_echter_beleg_pdf("ANDERER Beleg"),
             anbieterbeleg_referenz="PORTAL-AUFTRAG-ANDERS", postaufgabe_datum=heute,
             importiert_von="codex-test", heute=heute,
         )

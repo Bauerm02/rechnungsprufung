@@ -232,6 +232,69 @@ def test_folgeseitenkopf_steht_ebenfalls_ausserhalb_des_sperrbereichs():
     assert _SPERRBEREICH_BREITE < _INHALT_RECHTS  # bleibt trotzdem genug Platz für den Kopftext
 
 
+def _textpositionen_mm(page) -> list[tuple[str, float, float]]:
+    """Liest die TATSÄCHLICH gerenderten Textpositionen einer `pypdf`-Seite
+    aus (`extract_text(visitor_text=...)` liefert die bereits mit `cm`
+    kombinierte Textmatrix `tm`, deren `e`/`f` die absolute Position in
+    PDF-Punkten von links/unten sind) und rechnet sie in Millimeter von
+    links/OBEN um (fpdf2s Koordinatensystem) - damit lässt sich ein
+    reales, gerendertes PDF geometrisch gegen die mm-Konstanten dieses
+    Moduls prüfen, nicht nur der Quellcode der Zeichenfunktion selbst."""
+
+    pt_je_mm = 72.0 / 25.4
+    hoehe_pt = float(page.mediabox.height)
+    treffer: list[tuple[str, float, float]] = []
+
+    def visitor(text, cm, tm, font_dict, font_size):
+        if text.strip():
+            x_mm = tm[4] / pt_je_mm
+            y_von_oben_mm = (hoehe_pt - tm[5]) / pt_je_mm
+            treffer.append((text, x_mm, y_von_oben_mm))
+
+    page.extract_text(visitor_text=visitor)
+    return treffer
+
+
+def test_koerperzeilen_auf_seite_2_bleiben_ausserhalb_des_oben_links_sperrbereichs():
+    """Codex-Abnahme 19.10.2026, dritte Korrektur: der bisherige Test oben
+    prüfte NUR, dass der Kopf selbst (`_MahnbriefPDF.header`) außerhalb des
+    Sperrbereichs liegt - `header()` setzte den Fließtext danach aber über
+    `set_y(20)` fort, was links bei `_RAND` (20 mm) mitten im 52x60-mm-
+    Sperrbereich (x<57mm, y<65mm) begann. Dieser Test rendert ein ECHTES
+    mehrseitiges PDF und prüft geometrisch (über die tatsächlich gezeichnete
+    Textposition, nicht nur den Quellcode), dass auf Seite 2 KEIN Text mit
+    x < `_SPERRBEREICH_BREITE` oberhalb von `_SPERRBEREICH_HOEHE` steht -
+    nur der rechtsbündige Kopf selbst (x >= `_SPERRBEREICH_BREITE`) darf in
+    diesem Höhenbereich erscheinen."""
+
+    viele_zeilen = [Forderungszeile(f"HMZ Monat {i}", date(2026, 1, 1), 10_000) for i in range(1, 40)]
+    pdf_bytes = _erzeugen(
+        forderungszeilen=viele_zeilen, gesamtbetrag_cent=10_000 * len(viele_zeilen) + 2073 + 54,
+    )
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    assert len(reader.pages) > 1
+
+    seite2 = reader.pages[1]
+    treffer = _textpositionen_mm(seite2)
+    assert treffer  # die Seite ist nicht leer - der Test prüft etwas Echtes
+
+    verletzungen = [
+        (text, x, y) for text, x, y in treffer
+        if x < _SPERRBEREICH_BREITE and y < _SPERRBEREICH_HOEHE
+    ]
+    assert verletzungen == [], (
+        f"Text im Sperrbereich auf Seite 2 gefunden (x<{_SPERRBEREICH_BREITE}mm, "
+        f"y<{_SPERRBEREICH_HOEHE}mm): {verletzungen}"
+    )
+
+    # Der Kopf selbst (rechtsbündig ab `_SPERRBEREICH_BREITE`) steht
+    # weiterhin oben auf Seite 2 - keine stillschweigende Verschiebung
+    # des gesamten Kopfes nach unten, nur der Fließtext darunter rutscht.
+    kopf_treffer = [(text, x, y) for text, x, y in treffer if y < _SPERRBEREICH_HOEHE]
+    assert kopf_treffer, "Der Folgeseitenkopf selbst muss weiterhin oben auf Seite 2 stehen."
+    assert all(x >= _SPERRBEREICH_BREITE for _, x, _ in kopf_treffer)
+
+
 def test_linker_rand_und_aeusserer_rand_erfuellen_bereits_bestehende_freihaltebereiche():
     """Separat genannter Freihaltebereich "links 18 mm bis 160 mm Höhe"
     sowie ein äußerer 5-mm-Rand ringsum: beide waren schon durch den

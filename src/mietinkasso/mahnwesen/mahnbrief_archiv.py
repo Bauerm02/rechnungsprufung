@@ -32,18 +32,25 @@ Status-API für Postaufgabe/Zustellung. `importiere_anbieterbeleg`
 erfasst separat den MENSCHLICH/prozessual aus der Post-Portal-
 Auftragsliste entnommenen, tatsächlichen Anbieterbeleg - ein bloßer
 Referenztext ist dabei KEIN Beleg, es wird IMMER das tatsächlich
-hochgeladene Belegdokument (PDF-Bytes + Hash) verlangt. Kosten-/
-Mahnstatusfolgen (siehe `indexautomatik/mailversand_service.py::
-HVMailversandService.vervollstaendige_mahnlauf_aus_anbieterbeleg`)
-dürfen sich AUSSCHLIESSLICH auf dieses Feld stützen, NIE auf den
-bloßen UEBERMITTELT-Uploadstatus."""
+hochgeladene Belegdokument (PDF-Bytes + Hash) verlangt - Codex-Abnahme
+19.10.2026, dritte Korrektur: `_pruefe_anbieterbeleg_pdf` verlangt dabei
+ein tatsächlich mit `pypdf` lesbares, NICHT verschlüsseltes PDF mit
+mindestens einer Seite, UNTERHALB einer Größengrenze (hier im Repository
+selbst durchgesetzt, nicht nur beim Lesen des Backoffice-Uploads) - eine
+bloße `%PDF-`-Kopfzeile vor abgeschnittenen/beschädigten Bytes reichte
+bislang aus. Kosten-/Mahnstatusfolgen (siehe `indexautomatik/
+mailversand_service.py::HVMailversandService.
+vervollstaendige_mahnlauf_aus_anbieterbeleg`) dürfen sich AUSSCHLIESSLICH
+auf dieses Feld stützen, NIE auf den bloßen UEBERMITTELT-Uploadstatus."""
 
 from __future__ import annotations
 
 import hashlib
+import io
 import uuid
 from datetime import date, datetime, timezone
 
+from pypdf import PdfReader
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -53,6 +60,54 @@ from mietinkasso.infrastructure.db.sqlite_write_lock import schreibgesperrte_ses
 from mietinkasso.infrastructure.db.tables import MahnbriefArchivTable
 
 _STATUS_REIHENFOLGE = ("VORBEREITET", "UEBERMITTELT")
+
+# Dieselbe Obergrenze wie das Backoffice-Upload-Formular
+# (`backoffice/routes/mahnwesen.py::_MAX_ANBIETERBELEG_UPLOAD_BYTES`) -
+# HIER zusätzlich durchgesetzt (Codex-Abnahme 19.10.2026, dritte
+# Korrektur), nicht nur beim Lesen des Uploads: ein künftiger, anderer
+# Aufrufer dieses Repositorys (z. B. ein Batch-Import) darf sich nicht
+# allein auf eine Begrenzung in der Backoffice-Route verlassen.
+_MAX_ANBIETERBELEG_PDF_BYTES = 15 * 1024 * 1024
+
+
+def _pruefe_anbieterbeleg_pdf(pdf_bytes: bytes) -> None:
+    """Ein bloßer Referenztext/eine bloße `%PDF-`-Kopfzeile ist KEIN
+    Beleg (Codex-Abnahme 19.10.2026, dritte Korrektur: die bisherige
+    Prüfung akzeptierte z. B. `b"%PDF-1.4 Text"` anstandslos) - verlangt
+    wird ein tatsächlich mit `pypdf` lesbares, NICHT verschlüsseltes PDF
+    mit mindestens einer Seite, UNTERHALB der Größengrenze. Abgeschnittene/
+    beschädigte Bytes werden dabei kontrolliert abgelehnt statt als
+    gültiger Beleg übernommen zu werden."""
+
+    if not pdf_bytes:
+        raise ValueError(
+            "Ein Anbieterbeleg-Import verlangt das tatsächliche Belegdokument (PDF) - ein Referenztext "
+            "allein ist kein Beleg."
+        )
+    if len(pdf_bytes) > _MAX_ANBIETERBELEG_PDF_BYTES:
+        raise ValueError(
+            f"Anbieterbeleg-PDF überschreitet mit {len(pdf_bytes)} Bytes das zulässige Limit von "
+            f"{_MAX_ANBIETERBELEG_PDF_BYTES} Bytes - im Repository selbst durchgesetzt, unabhängig von einer "
+            "eigenen Begrenzung beim Aufrufer (z. B. dem Backoffice-Upload-Formular)."
+        )
+    if pdf_bytes[:5] != b"%PDF-":
+        raise ValueError(
+            "Ein Anbieterbeleg-Import verlangt das tatsächliche Belegdokument (PDF) - ein Referenztext "
+            "allein ist kein Beleg."
+        )
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        if reader.is_encrypted:
+            raise ValueError("Anbieterbeleg-PDF ist verschlüsselt - kein lesbarer Beleg.")
+        anzahl_seiten = len(reader.pages)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(
+            f"Anbieterbeleg-PDF ist nicht lesbar/beschädigt ({type(exc).__name__}) - kein gültiger Beleg."
+        ) from exc
+    if anzahl_seiten < 1:
+        raise ValueError("Anbieterbeleg-PDF hat keine lesbare Seite - kein gültiger Beleg.")
 
 
 def _empfaenger_hash(empfaenger_name: str, empfaenger_adresse: str) -> str:
@@ -237,8 +292,7 @@ class MahnbriefArchivRepository:
 
         if not anbieterbeleg_referenz or not anbieterbeleg_referenz.strip():
             raise ValueError("Ein Anbieterbeleg-Import verlangt eine explizite, nicht-leere Referenz.")
-        if not anbieterbeleg_pdf_bytes or anbieterbeleg_pdf_bytes[:5] != b"%PDF-":
-            raise ValueError("Ein Anbieterbeleg-Import verlangt das tatsächliche Belegdokument (PDF) - ein Referenztext allein ist kein Beleg.")
+        _pruefe_anbieterbeleg_pdf(anbieterbeleg_pdf_bytes)
         if postaufgabe_datum is None:
             raise ValueError("Ein Anbieterbeleg-Import verlangt das tatsächliche Postaufgabedatum.")
 

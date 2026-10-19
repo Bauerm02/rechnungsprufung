@@ -70,6 +70,42 @@ def _betriebsstatus_mahnversand_html() -> str:
     </div>"""
 
 
+def _versandzeile_html(row: dict) -> str:
+    """Eine Tabellenzeile der Mailversand-Übersicht - als eigene, reine
+    Funktion extrahiert (Codex-Abnahme 19.10.2026, dritte Korrektur), damit
+    sie gezielt mit synthetischen `row`-Dicts geprüft werden kann, ohne
+    jedes Mal einen echten Mahnlauf/Mahnfall in der DB aufzubauen.
+
+    Ein per Post-Anbieterbeleg vervollständigter Mahnlauf speichert
+    `versendet_am` NUR als Mitternacht-UTC-Platzhalter für das tatsächlich
+    belegte DATUM (siehe `indexautomatik/mailversand_service.py::
+    vervollstaendige_mahnlauf_aus_anbieterbeleg`) - keine echte Uhrzeit.
+    Diese Übersicht darf daraus KEINE erfundene exakte Versandzeit zeigen,
+    und das ist auch kein "Microsoft-Nachweis" (MailOps/Graph), sondern ein
+    Post-/Anbieternachweis - erkennbar am `"post-anbieterbeleg:"`-Präfix,
+    den NUR `vervollstaendige_mahnlauf_aus_anbieterbeleg` vergibt."""
+
+    sent = row["versendet_am"]
+    ist_post_anbieterbeleg = bool(row["provider_referenz"]) and row["provider_referenz"].startswith(
+        "post-anbieterbeleg:"
+    )
+    if sent and sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    if sent and ist_post_anbieterbeleg:
+        sent_text = f"{sent.date().strftime('%d.%m.%Y')} (Uhrzeit nicht belegt)"
+    elif sent:
+        from zoneinfo import ZoneInfo
+        sent_text = sent.astimezone(ZoneInfo("Europe/Vienna")).strftime("%d.%m.%Y %H:%M")
+    else:
+        sent_text = "Noch nicht belegt"
+    evidence = h(row["nachweis"]) if row["nachweis"] else "—"
+    if row["provider_referenz"]:
+        nachweis_label = "Post-/Anbieternachweis" if ist_post_anbieterbeleg else "Microsoft-Nachweis"
+        evidence += f'<details><summary>{nachweis_label}</summary>{h(row["provider_referenz"])}</details>'
+    return (f'<tr><td>{h(row["art"])}</td><td>{h(row["objekt"])}, {h(row["einheit"])}</td>'
+        f'<td>{h(row["status"])}</td><td>{sent_text}</td><td>{evidence}</td></tr>')
+
+
 @router.get("/mailversand", response_class=HTMLResponse)
 def mailversand_uebersicht(request: Request, session=Depends(_current_session)):
     ready = bool(deps._hv_mail.client and deps._settings.hv_mail_allowlist_bestaetigt)
@@ -78,21 +114,7 @@ def mailversand_uebersicht(request: Request, session=Depends(_current_session)):
              ("Vertragsende an Markus", deps._settings.vertragsende_erinnerung_send_enabled)]
     modes_html = " · ".join(f"{name}: {'aktiv' if ready and enabled else 'gesperrt'}" for name, enabled in modes)
     betriebsstatus_html = _betriebsstatus_mahnversand_html()
-    rows = []
-    for row in deps._hv_mail.versanduebersicht(ctx=_ctx(session)):
-        sent = row["versendet_am"]
-        if sent and sent.tzinfo is None:
-            sent = sent.replace(tzinfo=timezone.utc)
-        if sent:
-            from zoneinfo import ZoneInfo
-            sent_text = sent.astimezone(ZoneInfo("Europe/Vienna")).strftime("%d.%m.%Y %H:%M")
-        else:
-            sent_text = "Noch nicht belegt"
-        evidence = h(row["nachweis"]) if row["nachweis"] else "—"
-        if row["provider_referenz"]:
-            evidence += f'<details><summary>Microsoft-Nachweis</summary>{h(row["provider_referenz"])}</details>'
-        rows.append(f'<tr><td>{h(row["art"])}</td><td>{h(row["objekt"])}, {h(row["einheit"])}</td>'
-            f'<td>{h(row["status"])}</td><td>{sent_text}</td><td>{evidence}</td></tr>')
+    rows = [_versandzeile_html(row) for row in deps._hv_mail.versanduebersicht(ctx=_ctx(session))]
     content = f'''<div class="card"><h1>Mailversand und Nachweise</h1>
       <p>Absender: hausverwaltung@jlb-immo.at · Originale JLB-Signatur</p>
       <p>{modes_html}</p>

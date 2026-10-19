@@ -165,7 +165,14 @@ class _MahnbriefPDF(FPDF):
         self.cell(_INHALT_RECHTS - _SPERRBEREICH_BREITE, 5, self.kopf_text, new_x="LMARGIN", new_y="NEXT")
         self.set_draw_color(*self.farbe_gold)
         self.line(_SPERRBEREICH_BREITE, 16, _INHALT_RECHTS, 16)
-        self.set_y(20)
+        # Codex-Abnahme 19.10.2026, dritte Korrektur: NICHT `set_y(20)` -
+        # der Fließtext beginnt danach links bei `_RAND` (20 mm), also
+        # mitten im oben-links-Sperrbereich (x<57mm, y<65mm). Das
+        # Originalblatt benennt diese Zone zwar nur für die Vorderseite,
+        # bei diesem Simplexprodukt ist aber JEDE gedruckte Seite eine
+        # eigene Blattvorderseite - konservativ auf jeder Seite
+        # freigehalten, nicht nur auf Seite 1.
+        self.set_y(_SPERRBEREICH_HOEHE + 5)
 
     def footer(self):
         self.set_y(-20)

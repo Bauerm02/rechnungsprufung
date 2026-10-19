@@ -12,6 +12,24 @@ from mietinkasso.domain.exceptions import VorgangIdKonfliktError
 from mietinkasso.mahnwesen.mahnbrief_archiv import MahnbriefArchivRepository
 
 
+def _echter_beleg_pdf(text: str) -> bytes:
+    """Ein TATSÄCHLICH mit `pypdf` lesbares, einseitiges synthetisches PDF
+    (Codex-Abnahme 19.10.2026, dritte Korrektur: `importiere_anbieterbeleg`
+    prüft jetzt lesbare Seitenzahl/Unverschlüsseltheit, nicht mehr nur die
+    `%PDF-`-Kopfzeile - eine bloße Textfolge wie `b"%PDF-1.4 ..."` besteht
+    diese Prüfung nicht mehr). Unterschiedlicher `text` ergibt
+    unterschiedliche Bytes/Hashes, damit "abweichender Beleg"-Tests weiter
+    zwei tatsächlich verschiedene Dokumente vergleichen."""
+
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", size=12)
+    pdf.cell(0, 10, text)
+    return bytes(pdf.output())
+
+
 @pytest.fixture
 def archiv_repo(session_factory) -> MahnbriefArchivRepository:
     return MahnbriefArchivRepository(session_factory)
@@ -218,9 +236,99 @@ def test_importiere_anbieterbeleg_verlangt_tatsaechliches_pdf_kein_bloszer_refer
         )
 
 
+def test_importiere_anbieterbeleg_lehnt_abgeschnittenes_oder_beschaedigtes_pdf_ab(archiv_repo):
+    """Codex-Abnahme 19.10.2026, dritte Korrektur: die bisherige Prüfung
+    akzeptierte JEDE Bytefolge mit `%PDF-`-Kopfzeile anstandslos als
+    Beleg (z. B. `b"%PDF-1.4 Text"`) - abgeschnittene/strukturell kaputte
+    Bytes (gültige Kopfzeile, aber kein von `pypdf` tatsächlich
+    parsebares Dokument) werden jetzt kontrolliert abgelehnt."""
+
+    row = _archiviere_fuer_beleg(archiv_repo, "GRUPPE-BELEG-ABGESCHNITTEN")
+    with pytest.raises(ValueError):
+        archiv_repo.importiere_anbieterbeleg(
+            archiv_id=row.id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 abgeschnitten und strukturell kaputt",
+            anbieterbeleg_referenz="PORTAL-AUFTRAG-KAPUTT", postaufgabe_datum=date(2026, 10, 20),
+            importiert_von="codex-test",
+        )
+    assert archiv_repo.get(row.id).anbieterbeleg_referenz is None
+
+
+def test_importiere_anbieterbeleg_lehnt_verschluesseltes_pdf_ab(archiv_repo):
+    """Ein PASSWORTGESCHÜTZTES PDF ist kein lesbarer Beleg - `pypdf`
+    meldet `is_encrypted`, bevor überhaupt eine Seitenzahl ermittelbar
+    wäre; das muss kontrolliert abgelehnt werden, nicht als "0 Seiten"
+    oder mit einem unklaren Parsing-Fehler."""
+
+    import io
+
+    from pypdf import PdfReader, PdfWriter
+
+    roh = _echter_beleg_pdf("geheimer Inhalt")
+    writer = PdfWriter()
+    for seite in PdfReader(io.BytesIO(roh)).pages:
+        writer.add_page(seite)
+    writer.encrypt(user_password="synthetisch-geheim", owner_password="synthetisch-owner")
+    puffer = io.BytesIO()
+    writer.write(puffer)
+    verschluesselt = puffer.getvalue()
+
+    row = _archiviere_fuer_beleg(archiv_repo, "GRUPPE-BELEG-VERSCHLUESSELT")
+    with pytest.raises(ValueError):
+        archiv_repo.importiere_anbieterbeleg(
+            archiv_id=row.id, anbieterbeleg_pdf_bytes=verschluesselt,
+            anbieterbeleg_referenz="PORTAL-AUFTRAG-VERSCHLUESSELT", postaufgabe_datum=date(2026, 10, 20),
+            importiert_von="codex-test",
+        )
+    assert archiv_repo.get(row.id).anbieterbeleg_referenz is None
+
+
+def test_importiere_anbieterbeleg_lehnt_pdf_ohne_seite_ab(archiv_repo):
+    """Ein strukturell gültiges, aber SEITENLOSES PDF (0 Seiten) ist
+    ebenfalls kein gültiger Beleg - mindestens eine Seite ist verlangt."""
+
+    import io
+
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    puffer = io.BytesIO()
+    writer.write(puffer)
+    seitenlos = puffer.getvalue()
+
+    row = _archiviere_fuer_beleg(archiv_repo, "GRUPPE-BELEG-SEITENLOS")
+    with pytest.raises(ValueError):
+        archiv_repo.importiere_anbieterbeleg(
+            archiv_id=row.id, anbieterbeleg_pdf_bytes=seitenlos,
+            anbieterbeleg_referenz="PORTAL-AUFTRAG-SEITENLOS", postaufgabe_datum=date(2026, 10, 20),
+            importiert_von="codex-test",
+        )
+    assert archiv_repo.get(row.id).anbieterbeleg_referenz is None
+
+
+def test_importiere_anbieterbeleg_setzt_groessenlimit_im_repository_selbst_durch(archiv_repo):
+    """Codex-Abnahme 19.10.2026, dritte Korrektur: das Größenlimit war
+    bislang NUR beim Lesen des Backoffice-Uploads durchgesetzt
+    (`backoffice/routes/mahnwesen.py::_lese_beleg_begrenzt`) - ein
+    anderer Aufrufer dieses Repositorys (z. B. ein künftiger Batch-
+    Import) hätte sich daran nicht gehalten. Hier DIREKT gegen das
+    Repository geprüft, ohne die Backoffice-Route."""
+
+    from mietinkasso.mahnwesen.mahnbrief_archiv import _MAX_ANBIETERBELEG_PDF_BYTES
+
+    zu_gross = b"%PDF-1.4\n" + b"x" * (_MAX_ANBIETERBELEG_PDF_BYTES + 1)
+    row = _archiviere_fuer_beleg(archiv_repo, "GRUPPE-BELEG-ZU-GROSS")
+    with pytest.raises(ValueError):
+        archiv_repo.importiere_anbieterbeleg(
+            archiv_id=row.id, anbieterbeleg_pdf_bytes=zu_gross,
+            anbieterbeleg_referenz="PORTAL-AUFTRAG-ZU-GROSS", postaufgabe_datum=date(2026, 10, 20),
+            importiert_von="codex-test",
+        )
+    assert archiv_repo.get(row.id).anbieterbeleg_referenz is None
+
+
 def test_importiere_anbieterbeleg_ist_idempotent_und_lehnt_abweichenden_beleg_ab(archiv_repo):
     row = _archiviere_fuer_beleg(archiv_repo, "GRUPPE-BELEG")
-    beleg_pdf = b"%PDF-1.4 Original-Postaufgabebeleg"
+    beleg_pdf = _echter_beleg_pdf("Original-Postaufgabebeleg")
 
     erster_import = archiv_repo.importiere_anbieterbeleg(
         archiv_id=row.id, anbieterbeleg_pdf_bytes=beleg_pdf, anbieterbeleg_referenz="PORTAL-AUFTRAG-4711",
@@ -248,7 +356,7 @@ def test_importiere_anbieterbeleg_ist_idempotent_und_lehnt_abweichenden_beleg_ab
     # Abweichendes Dokument für DIESELBE Referenz -> ebenfalls Konflikt.
     with pytest.raises(VorgangIdKonfliktError):
         archiv_repo.importiere_anbieterbeleg(
-            archiv_id=row.id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 ein anderes Dokument",
+            archiv_id=row.id, anbieterbeleg_pdf_bytes=_echter_beleg_pdf("ein anderes Dokument"),
             anbieterbeleg_referenz="PORTAL-AUFTRAG-4711", postaufgabe_datum=date(2026, 10, 20),
             importiert_von="codex-test",
         )
@@ -272,7 +380,7 @@ def test_importiere_anbieterbeleg_lehnt_fremde_mehrfach_genutzte_referenz_ab(arc
 
     erste_zeile = _archiviere_fuer_beleg(archiv_repo, "GRUPPE-BELEG-A")
     zweite_zeile = _archiviere_fuer_beleg(archiv_repo, "GRUPPE-BELEG-B")
-    beleg_pdf = b"%PDF-1.4 Original-Postaufgabebeleg"
+    beleg_pdf = _echter_beleg_pdf("Original-Postaufgabebeleg")
 
     archiv_repo.importiere_anbieterbeleg(
         archiv_id=erste_zeile.id, anbieterbeleg_pdf_bytes=beleg_pdf, anbieterbeleg_referenz="PORTAL-AUFTRAG-GETEILT",
@@ -333,7 +441,7 @@ def test_importiere_anbieterbeleg_mehrfachverwendung_ist_race_sicher_echte_threa
         barrier.wait(timeout=5)
         try:
             zeile = repo.importiere_anbieterbeleg(
-                archiv_id=archiv_id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 geteilter Beleg",
+                archiv_id=archiv_id, anbieterbeleg_pdf_bytes=_echter_beleg_pdf("geteilter Beleg"),
                 anbieterbeleg_referenz="PORTAL-AUFTRAG-GETEILT-RACE", postaufgabe_datum=date(2026, 10, 20),
                 importiert_von=akteur,
             )

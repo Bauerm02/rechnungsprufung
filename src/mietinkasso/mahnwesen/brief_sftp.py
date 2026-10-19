@@ -42,13 +42,24 @@ Verbindungsaufbaus selbst) ist IMMER ungewiss
 Grundsatz wie `indexautomatik/transport.py`). Verbindungsaufbau,
 Kanalverhandlung UND Authentifizierung laufen mit demselben begrenzten
 Timeout (`_VERBINDUNGSTIMEOUT_SEKUNDEN`: Socket-Connect, `banner_timeout`,
-`auth_timeout`, UND der tatsächliche SFTP-Kanal selbst via
-`channel.settimeout`) - ein hängender Verbindungsaufbau/eine hängende
-Authentifizierung/ein hängender Schreibvorgang kann den Versandlauf
-NIE unbegrenzt blockieren. Scheitert Verbindungsaufbau/Kanalverhandlung
-bereits in der Konstruktion, wird die bis dahin geöffnete
+`auth_timeout`, `channel_timeout` - Codex-Abnahme 19.10.2026, dritte
+Korrektur gegen eine unabhängige Probe mit echtem paramiko 5.1, das
+`channel_timeout` bislang `None` beließ - UND der tatsächliche SFTP-Kanal
+selbst via `channel.settimeout`) - ein hängender Verbindungsaufbau/eine
+hängende Authentifizierung/ein hängender Schreibvorgang kann den
+Versandlauf NIE unbegrenzt blockieren. Scheitert Verbindungsaufbau/
+Kanalverhandlung bereits in der Konstruktion, wird die bis dahin geöffnete
 Socket/Transport-Ressource trotzdem geschlossen (keine Ressourcen-Leaks
-bei einem gescheiterten Verbindungsversuch).
+bei einem gescheiterten Verbindungsversuch). ZUSÄTZLICH (dritte Korrektur):
+`SFTPClient.from_transport` ruft intern `Channel.invoke_subsystem` auf,
+das paramikos eigene `_wait_for_event()`-Implementierung OHNE jeden
+Timeout-Parameter unbegrenzt blockieren lässt - selbst `channel_timeout`
+bindet nur das vorgelagerte `open_channel`/`open_session`. Der gesamte
+erstmalige Kanalaufbau (Authentifizierung + `from_transport` +
+Kanal-Timeout) läuft deshalb in einem eigenen Daemon-Thread und wird bei
+Überschreitung von `_VERBINDUNGSTIMEOUT_SEKUNDEN` zwangsweise abgebrochen
+(`_ParamikoVerbindung._zwinge_abbruch`: Socket-`shutdown(SHUT_RDWR)` plus
+Transport-/Socket-`close()`) - OHNE automatischen Neuversuch.
 
 Ein erfolgreicher Upload ist AUSSCHLIESSLICH ein ÜBERMITTELT-Nachweis
 gegenüber dem SFTP-Server - KEIN Postaufgabe-/Zustellnachweis.
@@ -85,6 +96,7 @@ import hashlib
 import io
 import re
 import socket
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Protocol
@@ -307,6 +319,12 @@ class _ParamikoVerbindung:
                 # blockieren (Codex-Abnahme 19.10.2026).
                 self._transport.banner_timeout = _VERBINDUNGSTIMEOUT_SEKUNDEN
                 self._transport.auth_timeout = _VERBINDUNGSTIMEOUT_SEKUNDEN
+                # Begrenzt zusätzlich `Transport.open_channel`/`open_session`
+                # (paramikos eigener Default dafür ist eine Stunde) - Codex-
+                # Abnahme 19.10.2026, dritte Korrektur: `auth_timeout` allein
+                # bindet NUR die Authentifizierung, nicht das anschließende
+                # Öffnen des SFTP-Kanals selbst.
+                self._transport.channel_timeout = _VERBINDUNGSTIMEOUT_SEKUNDEN
                 self._transport.start_client(timeout=_VERBINDUNGSTIMEOUT_SEKUNDEN)
         except Exception:
             # Scheitert Konstruktion/`start_client` selbst, bleibt KEINE
@@ -322,20 +340,85 @@ class _ParamikoVerbindung:
 
     def put_exclusive(self, remote_pfad: str, data: bytes) -> None:
         if self._sftp is None:
-            self._transport.auth_password(self._konfiguration.username, self._konfiguration.password)
-            self._sftp = self._sftp_client_cls.from_transport(self._transport)
-            # Begrenzt auch den tatsächlichen SFTP-Kanal selbst (nicht
-            # nur Verbindungsaufbau/Authentifizierung) - ein hängender
-            # exklusiver Schreibvorgang wird dadurch ebenfalls begrenzt.
-            kanal = self._sftp.get_channel()
-            if kanal is not None:
-                kanal.settimeout(_VERBINDUNGSTIMEOUT_SEKUNDEN)
+            self._sftp = self._baue_sftp_kanal_mit_deadline()
         # "wxb" (nicht "xb" allein - Codex-Abnahme 19.10.2026): paramikos
         # `SFTPClient.open`-Modusübersetzung setzt bei einem bloßen "xb"
         # KEIN Schreib-Flag, die Datei würde exklusiv angelegt, aber nie
         # tatsächlich beschrieben.
         with self._sftp.open(remote_pfad, "wxb") as datei:
             datei.write(data)
+
+    def _baue_sftp_kanal_mit_deadline(self):
+        """Begrenzt den GESAMTEN erstmaligen Kanalaufbau (Authentifizierung
+        + `SFTPClient.from_transport` + Kanal-Timeout) zeitlich als Ganzes,
+        nicht nur über einzelne paramiko-Timeout-Parameter (Codex-Abnahme
+        19.10.2026, dritte Korrektur): `SFTPClient.from_transport` ruft
+        intern `Transport.open_session()` (durch `channel_timeout` oben
+        gebunden) UND `Channel.invoke_subsystem("sftp")` auf - Letzteres
+        wartet laut paramikos eigener `Channel._wait_for_event()`-
+        Implementierung OHNE jeden eigenen Timeout-Parameter auf die
+        Server-Antwort und kann daher trotz aller gesetzten Timeouts
+        unbegrenzt blockieren. Läuft der gesamte Aufbau deshalb in einem
+        eigenen Daemon-Thread; reagiert er nicht innerhalb von
+        `_VERBINDUNGSTIMEOUT_SEKUNDEN`, wird er über `_zwinge_abbruch`
+        zwangsweise abgebrochen (Socket/Transport geschlossen) - OHNE
+        automatischen Neuversuch. Der (dann verwaiste, aber als Daemon
+        nie prozessblockierende) Hintergrund-Thread räumt sich selbst auf,
+        sobald der erzwungene Abbruch seinen blockierenden Aufruf
+        unterbricht."""
+
+        ergebnis: dict = {}
+        fertig = threading.Event()
+
+        def _aufbauen() -> None:
+            try:
+                self._transport.auth_password(self._konfiguration.username, self._konfiguration.password)
+                sftp = self._sftp_client_cls.from_transport(self._transport)
+                kanal = sftp.get_channel()
+                if kanal is not None:
+                    kanal.settimeout(_VERBINDUNGSTIMEOUT_SEKUNDEN)
+                ergebnis["sftp"] = sftp
+            except BaseException as exc:  # noqa: BLE001 - wird unten im Aufruferthread neu geworfen
+                ergebnis["fehler"] = exc
+            finally:
+                fertig.set()
+
+        thread = threading.Thread(target=_aufbauen, daemon=True)
+        thread.start()
+        if not fertig.wait(timeout=_VERBINDUNGSTIMEOUT_SEKUNDEN):
+            self._zwinge_abbruch()
+            raise TransportFehlerUngewissError(
+                f"SFTP-Kanalaufbau (Authentifizierung/Subsystem-Anfrage) überschritt die Zeitgrenze von "
+                f"{_VERBINDUNGSTIMEOUT_SEKUNDEN}s - Verbindung zwangsweise abgebrochen, kein automatischer "
+                "Neuversuch, möglicherweise dennoch teilweise authentifiziert/verbunden."
+            )
+        if "fehler" in ergebnis:
+            raise ergebnis["fehler"]
+        return ergebnis["sftp"]
+
+    def _zwinge_abbruch(self) -> None:
+        """Bricht einen hängenden Kanalaufbau zwangsweise ab: ein reiner
+        `transport.close()` reicht NICHT zuverlässig, solange der
+        Hintergrund-Thread noch blockierend auf dem Socket liest -
+        `socket.shutdown(SHUT_RDWR)` ist (anders als `close()`)
+        threadsicher und lässt einen gerade blockierenden Lese-/
+        Schreibvorgang in einem ANDEREN Thread sofort mit einem Fehler
+        zurückkehren."""
+
+        if self._sock is not None:
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        try:
+            if self._transport is not None:
+                self._transport.close()
+        finally:
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
 
     def close(self) -> None:
         # Ein Fehler beim SFTP-Close darf das Schließen von
@@ -402,7 +485,16 @@ class PostSftpTransportadapter:
                     f"Unter der reservierten Dateireferenz {dateiname!r} liegt am Server bereits eine Datei - "
                     "kein Überschreiben, kein automatischer Neuversuch."
                 ) from exc
-        except (PostSftpHostkeyFehlerError, PostSftpDateiKonfliktError, PostSendevoraussetzungError):
+        except (
+            PostSftpHostkeyFehlerError, PostSftpDateiKonfliktError, PostSendevoraussetzungError,
+            TransportFehlerUngewissError,
+        ):
+            # `TransportFehlerUngewissError` kann bereits hier (statt erst
+            # unten neu verpackt) auftreten - etwa vom Deadline-Wächter in
+            # `_ParamikoVerbindung._baue_sftp_kanal_mit_deadline` (Codex-
+            # Abnahme 19.10.2026, dritte Korrektur) - unverändert
+            # weiterreichen statt die eigene, bereits ehrliche Meldung
+            # durch eine generische zu ersetzen.
             raise
         except Exception as exc:
             raise TransportFehlerUngewissError(

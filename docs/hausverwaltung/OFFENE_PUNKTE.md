@@ -5296,3 +5296,90 @@ nicht in dieser Runde behoben, da außerhalb des beauftragten Umfangs):
   gesondert erneut grün. Keine Livezugriffe, kein echter
   Upload/Testbrief, keine Produktivbuchung, `SEND_ENABLED` unverändert
   `false`.
+
+## HV-20261019-VERSAND-KOSTEN-ABSCHLUSS, Teil 3 (Runde 3 Korrekturen -
+## Abnahme auf Commit 65e1fb1)
+
+Eine unabhängige Linux/paramiko-5.1-Probe sowie ein gerendertes
+24-Zeilen-Muster des Mahnbriefs haben vier weitere konkrete Befunde
+erbracht; alle sind in diesem Commit behoben:
+
+1. **`Transport.channel_timeout` + Deadline-Wächter für den gesamten
+   SFTP-Kanalaufbau**: die Probe zeigte `auth_timeout=20` korrekt
+   gesetzt, aber `channel_timeout` blieb `None` (paramiko-Default: eine
+   Stunde) - jetzt ebenfalls auf `_VERBINDUNGSTIMEOUT_SEKUNDEN` gesetzt.
+   WICHTIGER: `SFTPClient.from_transport` ruft intern
+   `Channel.invoke_subsystem("sftp")` auf, das paramikos eigene
+   `Channel._wait_for_event()`-Implementierung OHNE jeden
+   Timeout-Parameter unbegrenzt blockieren lässt - selbst
+   `channel_timeout` bindet nur das vorgelagerte `open_channel`/
+   `open_session`, nicht dieses Subsystem-Request. Der GESAMTE
+   erstmalige Kanalaufbau (Authentifizierung + `from_transport` +
+   Kanal-Timeout, `_ParamikoVerbindung._baue_sftp_kanal_mit_deadline`)
+   läuft deshalb jetzt in einem eigenen Daemon-Thread und wird bei
+   Überschreitung von `_VERBINDUNGSTIMEOUT_SEKUNDEN` zwangsweise
+   abgebrochen (`_zwinge_abbruch`: `socket.shutdown(SHUT_RDWR)`, damit
+   ein im Hintergrund-Thread blockierender Lesevorgang sofort mit einem
+   Fehler zurückkehrt, danach Transport-/Socket-`close()`) - OHNE
+   automatischen Neuversuch. Getestet mit einem echten, aber
+   zeitlich begrenzten hängenden Fake (`_HaengenderTransport`, blockiert
+   höchstens 5s, der Deadline-Wächter selbst wird im Test auf wenige
+   Millisekunden verkürzt) - kein echter Netzwerkzugriff.
+2. **`importiere_anbieterbeleg` prüft jetzt ein TATSÄCHLICH lesbares
+   Dokument, nicht nur die `%PDF-`-Kopfzeile**: bislang akzeptierte die
+   Prüfung JEDE Bytefolge mit `%PDF-`-Präfix anstandslos als Beleg (z. B.
+   `b"%PDF-1.4 Text"`), ein ausdrücklicher Abnahmebefund. Neue
+   `_pruefe_anbieterbeleg_pdf` (im Repository selbst, nicht nur in der
+   Backoffice-Route) verlangt: Größe unterhalb von
+   `_MAX_ANBIETERBELEG_PDF_BYTES` (dieselbe Grenze wie das
+   Upload-Formular, hier redundant/unabhängig durchgesetzt), ein mit
+   `pypdf` tatsächlich parsebares Dokument (abgeschnittene/beschädigte
+   Bytes werden kontrolliert abgelehnt), NICHT verschlüsselt, mindestens
+   eine Seite. Neue Tests: abgeschnittenes PDF, verschlüsseltes PDF
+   (echte `pypdf`-Verschlüsselung synthetisch erzeugt), seitenloses PDF,
+   Größenlimit direkt gegen das Repository (ohne die Backoffice-Route).
+   Alle bisherigen Fake-Belegfixtures (`b"%PDF-1.4 ..."`-Textfolgen) in
+   `test_mahnbrief_archiv.py`/`test_hv_mailversand.py`/
+   `test_backoffice.py` wurden dort, wo der tatsächliche Erfolgspfad
+   geprüft wird, durch echte, mit `fpdf2` erzeugte synthetische
+   PDF-Bytes ersetzt (dort, wo ein Test ohnehin VOR Erreichen der
+   PDF-Prüfung scheitert - CSRF-Ablehnung, Objekt-107-Ausschluss,
+   Datums-Plausibilitätsprüfungen -, blieb das Fake unverändert, da der
+   Code-Pfad die Bytes nie erreicht).
+3. **Mailversand-Übersicht zeigt keine erfundene Uhrzeit/kein falsches
+   "Microsoft-Nachweis"-Etikett mehr für Postbelege**: ein per
+   Anbieterbeleg vervollständigter BRIEF-Mahnlauf speichert
+   `versendet_am` NUR als Mitternacht-UTC-Platzhalter für das belegte
+   DATUM (siehe `vervollstaendige_mahnlauf_aus_anbieterbeleg` - absichtlich
+   keine erfundene Uhrzeit). Die Übersicht (`backoffice/routes/
+   mailversand.py`) rechnete das bisher trotzdem in eine scheinbar
+   exakte Wiener Uhrzeit um UND beschriftete den Nachweis pauschal als
+   "Microsoft-Nachweis" (MailOps/Graph) - auch für die Post. Jetzt am
+   `"post-anbieterbeleg:"`-Präfix der `provider_referenz` erkannt: zeigt
+   nur das Datum mit dem Zusatz "(Uhrzeit nicht belegt)" und beschriftet
+   den Nachweis als "Post-/Anbieternachweis"; der EMAIL-Pfad (echter
+   MailOps-Zeitstempel) bleibt unverändert mit exakter Uhrzeit und
+   "Microsoft-Nachweis". Die Zeilen-Rendering-Logik wurde dafür in eine
+   eigene, reine Funktion `_versandzeile_html` extrahiert und direkt mit
+   synthetischen Zeilen getestet (kein echter Mahnlauf/keine DB nötig).
+4. **Mahnbrief-Layout: Freihaltezone auch auf Folgeseiten durchgesetzt**:
+   `_MahnbriefPDF.header()` setzte den Fließtext auf Seite 2+ bisher über
+   `set_y(20)` fort - das beginnt links bei `_RAND` (20 mm), mitten im
+   52x60-mm-Sperrbereich (x<57mm, y<65mm), obwohl der Kopf selbst
+   bereits korrekt rechtsbündig außerhalb davon steht. Das
+   Originalblatt nennt diese Zone nur für die Vorderseite; bei diesem
+   Simplexprodukt ist aber JEDE gedruckte Seite eine eigene
+   Blattvorderseite - jetzt konservativ auf JEDER Seite freigehalten
+   (`set_y(_SPERRBEREICH_HOEHE + 5)`, 70 mm). Neuer geometrischer Test
+   (`test_koerperzeilen_auf_seite_2_bleiben_ausserhalb_des_oben_links_
+   sperrbereichs`) rendert ein ECHTES mehrseitiges PDF und liest die
+   TATSÄCHLICH gezeichneten Textpositionen über `pypdf`s
+   `extract_text(visitor_text=...)` aus (Textmatrix in PDF-Punkte, in
+   mm von links/oben umgerechnet) - geprüft gegen den Quellcode
+   reproduzierbar als Regression bestätigt (Test schlägt mit der alten
+   `set_y(20)`-Zeile fehl, ist mit der Korrektur grün).
+
+Vollständiger `tests/mietinkasso`-Lauf nach dieser Runde erneut grün
+(siehe Commit-Historie für die genaue Testanzahl). Keine Livezugriffe,
+kein echter Upload/Testbrief, keine Produktivbuchung, `SEND_ENABLED`
+unverändert `false`. Bankteil unangetastet, kein Deployment.
