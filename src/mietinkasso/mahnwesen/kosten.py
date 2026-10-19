@@ -505,7 +505,7 @@ def forderungsgruppe_schluessel(op_position_ids) -> str:
     nicht nur dieselbe Idee), damit eine `MahnpauschaleFreigabeTable`-Zeile
     und der spätere Buchungs-Mahnlauf exakt dieselbe Gruppenidentität
     verwenden. Auftrag HV-20261019-MAHNKOSTEN, zweite Nachbesserung
-    (Codex-Rückprüfung 20.10.2026): EINE Freigabe gilt ausschließlich für
+    (Codex-Rückprüfung 19.10.2026): EINE Freigabe gilt ausschließlich für
     GENAU diese Menge an `forderung_op_position_ids` - jede abweichende
     Menge (eine neue fällige Periode, eine Teilzahlung, die die Gruppe
     verändert) erzeugt zwangsläufig einen ANDEREN Schlüssel und findet
@@ -949,7 +949,7 @@ def berechne_mahnkosten_vorschau(
         hinweise.append("§458 UGB gilt nur bei beiderseits unternehmensbezogenem Geschäft mit Vertragsdatum ab 16.03.2013 - keine Mahngebühr angesetzt.")
 
         # Auftrag HV-20261019-MAHNKOSTEN, ZWEITE Nachbesserung (Codex-
-        # Rückprüfung 20.10.2026, echter Gate-Mangel): die vorherige
+        # Rückprüfung 19.10.2026, echter Gate-Mangel): die vorherige
         # Fassung gestand die generische, kanal-unabhängige §1333-Abs-2-
         # ABGB-Mahnkostenpauschale bereits zu, sobald EIN statisches
         # Vertragsprofil-Flag (`mahnpauschale_geprueft`) gesetzt war -
@@ -979,16 +979,15 @@ def berechne_mahnkosten_vorschau(
         # Forderungsgruppe desselben Vertrags wirkt dabei NICHT fort -
         # andere Forderungsmenge, anderer Hash, siehe dortige Moduldoc.
         #
-        # Live-Gate (siehe docs/hausverwaltung/OFFENE_PUNKTE.md): es gibt
-        # noch KEIN Backoffice-Formular, um eine solche Freigabe
-        # anzulegen - ohne Aufrufer, der `mahnpauschale_freigabe_lookup`
-        # tatsächlich mit Daten befüllt, bleibt die Pauschale im
-        # produktiven Betrieb deshalb KONSERVATIV IMMER gesperrt, bis
-        # dieser Workflow nachgezogen ist.
+        # Backoffice-Formular (`/backoffice/vertrag/{id}/mahnpauschale-
+        # freigabe`, siehe `backoffice/app.py`) legt eine solche Freigabe
+        # an - ohne eine erteilte Freigabe liefert `mahnpauschale_
+        # freigabe_lookup` weiterhin `None`, die Pauschale bleibt dann
+        # KONSERVATIV automatisch gesperrt (0 EUR, Prüffall).
         # Der Lookup filtert IMMER auf `(forderungsgruppe_schluessel,
         # hauptforderung_cent)` GEMEINSAM (siehe `MahnpauschaleRepository.
         # mahnpauschale_freigabe_fuer_gruppe`) - unabhängige Rückprüfung
-        # Codex 20.10.2026, echter Bug: `forderungsgruppe_schluessel`
+        # Codex 19.10.2026, echter Bug: `forderungsgruppe_schluessel`
         # hasht NUR die OP-IDs, NICHT deren Restbeträge. Eine bloße
         # TEILZAHLUNG verändert die OP-ID-Menge NICHT (dieselbe Forderung
         # bleibt offen, nur mit kleinerem Rest) - ein Lookup NUR über den

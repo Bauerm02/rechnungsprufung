@@ -553,7 +553,7 @@ class MahnkostenRepository:
             return row
 
     # -- Mahnpauschale-Einzelfallfreigabe (Auftrag HV-20261019-MAHNKOSTEN,
-    # zweite Nachbesserung 20.10.2026) -----------------------------------
+    # zweite Nachbesserung 19.10.2026) -----------------------------------
 
     def mahnpauschale_freigabe_fuer_gruppe(
         self, *, vertrag_id: str, stufe: int, forderungsgruppe_schluessel: str, hauptforderung_cent: int,
@@ -622,7 +622,7 @@ class MahnkostenRepository:
         ):
             if wert <= 0:
                 raise ValueError(f"Mahnpauschale-Freigabe: {feld} muss größer als 0 sein (war {wert}).")
-        # Unabhängige Rückprüfung Codex 20.10.2026, echter Bug: §1333 Abs 2
+        # Unabhängige Rückprüfung Codex 19.10.2026, echter Bug: §1333 Abs 2
         # ABGB erlaubt NUR den tatsächlichen, notwendigen Aufwand als
         # Forderung - ein freigegebener Betrag ÜBER dem dokumentierten
         # tatsächlichen Aufwand (z. B. 20 EUR Forderung bei nur 1 EUR

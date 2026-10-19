@@ -3886,7 +3886,7 @@ def test_mahnpauschale_freigabe_ohne_csrf_wird_abgelehnt(backoffice_client):
 
 
 def test_mahnpauschale_freigabe_erfassen_ignoriert_simuliertes_heute_aus_formular(backoffice_client):
-    """Unabhängige Rückprüfung Codex 20.10.2026, echter Bug: die Freigabe
+    """Unabhängige Rückprüfung Codex 19.10.2026, echter Bug: die Freigabe
     selbst darf NIE an ein vom Formular mitgesendetes, ggf. simuliertes
     Datum gebunden werden - ein manipuliertes/veraltetes `heute` hätte
     eine Freigabe für einen fiktiven Vergangenheits-/Zukunftsstand

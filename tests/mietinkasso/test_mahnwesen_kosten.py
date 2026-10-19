@@ -1791,7 +1791,7 @@ def test_buche_bei_versand_verweigert_zugriff_ohne_gesellschaftsscope(
 
 
 # -- Mahnkostenpauschale §1333 Abs 2 ABGB (Auftrag HV-20261019-MAHNKOSTEN,
-# ZWEITE Nachbesserung Codex-Rückprüfung 20.10.2026) ------------------------
+# ZWEITE Nachbesserung Codex-Rückprüfung 19.10.2026) ------------------------
 # Kritischer Gate-Mangel der VORHERIGEN Fassung: ein statisches Vertrags-
 # profil-Flag (`mahnpauschale_geprueft`) + eine rein mechanische Deckelung
 # gegen die Hauptforderung (`mahnpauschale_cent <= hauptforderung_cent`)
@@ -1968,7 +1968,7 @@ def test_mahnpauschale_freigabe_mit_zu_hohem_betrag_bleibt_unverhaeltnismaessig_
 def test_mahnpauschale_freigabe_wirkt_nicht_nach_teilzahlung_mit_unveraenderten_op_ids(
     op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
 ):
-    """DRITTE Nachbesserung (Codex-Rückprüfung 20.10.2026, echter Bug):
+    """DRITTE Nachbesserung (Codex-Rückprüfung 19.10.2026, echter Bug):
     `forderungsgruppe_schluessel` hasht NUR die OP-IDs - eine Teilzahlung
     verändert dieselben OP-IDs NICHT, nur deren Restbetrag. Ohne den
     zusätzlichen `hauptforderung_cent`-Abgleich hätte eine für 500 EUR
@@ -2165,7 +2165,7 @@ def test_mahnpauschale_freigabe_anlegen_verlangt_vollstaendige_begruendungen(kos
 
 
 def test_mahnpauschale_freigabe_anlegen_verweigert_betrag_ueber_tatsaechlichem_aufwand(kosten_repo):
-    """Unabhängige Rückprüfung Codex 20.10.2026, echter Bug: §1333 Abs 2
+    """Unabhängige Rückprüfung Codex 19.10.2026, echter Bug: §1333 Abs 2
     ABGB erlaubt NUR den tatsächlichen, notwendigen Aufwand als Forderung
     - 20 EUR freigegebener Betrag bei nur 1 EUR dokumentiertem Aufwand ist
     evident unzulässig und darf NIE durchgehen."""

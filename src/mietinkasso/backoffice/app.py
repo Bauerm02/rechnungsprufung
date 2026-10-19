@@ -2541,7 +2541,7 @@ async def mahnpauschale_freigabe_absenden(request: Request, vertrag_id: str, ses
         return _fehlerseite(session, "Mahnpauschale-Freigabe", "Ungültige Stufe.")
     if stufe not in (1, 2):
         return _fehlerseite(session, "Mahnpauschale-Freigabe", "Stufe muss 1 oder 2 sein.")
-    # Unabhängige Rückprüfung Codex 20.10.2026, echter Bug: die Freigabe
+    # Unabhängige Rückprüfung Codex 19.10.2026, echter Bug: die Freigabe
     # selbst darf NIE auf ein vom Formular mitgesendetes, ggf. simuliertes
     # Datum erteilt werden - ein manipuliertes/veraltetes `heute` aus dem
     # verborgenen Feld hätte eine Freigabe für einen fiktiven Vergangen-

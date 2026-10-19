@@ -1758,7 +1758,7 @@ class MahnkostenBuchungTable(Base):
     __table_args__ = (
         UniqueConstraint("vertrag_id", "stufe", "mahnlauf_schluessel", name="uq_mahnkosten_lauf"),
         # Auftrag HV-20261019-MAHNKOSTEN, unabhängige Rückprüfung Codex
-        # 20.10.2026: zusätzliche, von `mahnlauf_schluessel` UNABHÄNGIGE
+        # 19.10.2026: zusätzliche, von `mahnlauf_schluessel` UNABHÄNGIGE
         # Eindeutigkeit über den tatsächlichen Versandnachweis - schützt
         # insbesondere die Mahnkostenpauschale (`mahnpauschale_cent`, je
         # TATSÄCHLICH versendetem Schreiben, nicht je Forderungsgruppe)
@@ -1956,7 +1956,7 @@ class MahnbriefArchivTable(Base):
 
 class MahnpauschaleFreigabeTable(Base):
     """Auftrag HV-20261019-MAHNKOSTEN, ZWEITE Nachbesserung (Codex-
-    Rückprüfung 20.10.2026): dokumentierte EINZELFALL-Freigabe der
+    Rückprüfung 19.10.2026): dokumentierte EINZELFALL-Freigabe der
     generischen §1333-Abs-2-ABGB-Mahnkostenpauschale JE KONKRETER,
     eingefrorener Forderungsgruppe - ersetzt die vorherige, zu Recht
     zurückgewiesene statische Profil-Freigabe
@@ -1979,7 +1979,7 @@ class MahnpauschaleFreigabeTable(Base):
     Freigabe gilt für GENAU diese Menge an OP-IDs. Eine GENUIN NEUE
     fällige Periode (neue OP-ID) hat zwangsläufig einen ANDEREN Schlüssel
     und damit KEINE Freigabe.
-    ACHTUNG, unabhängige Rückprüfung Codex 20.10.2026, echter Bug: eine
+    ACHTUNG, unabhängige Rückprüfung Codex 19.10.2026, echter Bug: eine
     bloße TEILZAHLUNG verändert die OP-ID-Menge NICHT (dieselbe Forderung
     bleibt offen, nur mit kleinerem Restbetrag) - ein Hash NUR über OP-IDs
     hätte eine für 500 EUR Hauptforderung erteilte 20-EUR-Freigabe nach
@@ -2011,11 +2011,11 @@ class MahnpauschaleFreigabeTable(Base):
     Hauptforderung gedeckelt (`berechne_mahnkosten_vorschau`, Defense in
     Depth gegen einen menschlichen Eingabefehler).
 
-    Live-Gate (siehe docs/hausverwaltung/OFFENE_PUNKTE.md): es existiert
-    noch KEIN Backoffice-Formular, das eine solche Freigabe anlegt - ohne
-    diesen Workflow bleibt die Mahnpauschale im produktiven Betrieb
-    AUTOMATISCH IMMER gesperrt (0 EUR), was das gewollte konservative
-    Verhalten ist, bis Codex den Freigabe-Workflow ergänzt."""
+    Backoffice-Formular (seit `/backoffice/vertrag/{id}/mahnpauschale-
+    freigabe`, siehe `backoffice/app.py`/`docs/hausverwaltung/
+    OFFENE_PUNKTE.md`) legt eine solche Freigabe an - ohne eine erteilte
+    Freigabe bleibt die Mahnpauschale weiterhin AUTOMATISCH gesperrt
+    (0 EUR), das bleibt das gewollte konservative Default-Verhalten."""
 
     __tablename__ = "mahnpauschale_freigaben"
     __table_args__ = (
@@ -2037,7 +2037,7 @@ class MahnpauschaleFreigabeTable(Base):
     stufe: Mapped[int] = mapped_column(Integer)
     forderungsgruppe_schluessel: Mapped[str] = mapped_column(String(128))
     # Auftrag HV-20261019-MAHNKOSTEN, dritte Nachbesserung (Codex-
-    # Rückprüfung 20.10.2026, echter Bug): die ZUM FREIGABEZEITPUNKT
+    # Rückprüfung 19.10.2026, echter Bug): die ZUM FREIGABEZEITPUNKT
     # tatsächlich bewilligte Hauptforderung - siehe Moduldoc oben
     # ("Teilzahlung ändert die OP-ID-Menge nicht"). Wird bei jeder
     # Vorschau gegen die aktuelle Hauptforderung verglichen.

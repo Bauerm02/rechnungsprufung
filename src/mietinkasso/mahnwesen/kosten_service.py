@@ -134,7 +134,7 @@ class MahnkostenService:
             bereits_erhobene_gebuehr_schluessel=bereits_erhobene_gebuehren,
             kanal=kanal, brief_anbieterprofil=brief_anbieterprofil,
             # Auftrag HV-20261019-MAHNKOSTEN, zweite Nachbesserung
-            # 20.10.2026: Lookup der dokumentierten Einzelfallfreigabe
+            # 19.10.2026: Lookup der dokumentierten Einzelfallfreigabe
             # (siehe `MahnpauschaleFreigabeTable`-Moduldoc) - der Schlüssel
             # wird ERST innerhalb von `berechne_mahnkosten_vorschau` aus
             # der dort final feststehenden Forderungsgruppe berechnet
@@ -387,7 +387,7 @@ class MahnkostenService:
             bestehender = self._repository.buchung_fuer_mahnlauf(vertrag_id=vertrag_id, stufe=stufe, mahnlauf_schluessel=mahnlauf_schluessel)
             if bestehender is None:
                 # Zweiter Lookup-Pfad (Auftrag HV-20261019-MAHNKOSTEN,
-                # unabhängige Rückprüfung Codex 20.10.2026): die
+                # unabhängige Rückprüfung Codex 19.10.2026): die
                 # IntegrityError kann statt über `uq_mahnkosten_lauf` auch
                 # über die NEUE `uq_mahnkosten_versandnachweis`-Eindeutigkeit
                 # ausgelöst worden sein (derselbe bereits bestätigte Versand,

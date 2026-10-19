@@ -4276,10 +4276,11 @@ schätzt eines).
 - `uq_ruecklastschriftkosten_je_rls`-Eindeutigkeit verhindert eine
   doppelte Erfassung/Buchung für DIESELBE Rücklastschrift (getestet:
   doppelter Aufruf liefert dieselbe Zeile, keine zweite Buchung).
-- **Live-Gate**: KEIN Backoffice-Formular für die manuelle Erfassung
-  dieser Kosten wurde gebaut (nur Service+Repository+Tests) - Codex/
-  Markus muss entscheiden, ob/wie diese Erfassung im Portal angeboten
-  wird, bevor sie im Echtbetrieb genutzt wird.
+- **Erledigt** (siehe Abschnitt "Backoffice-Oberfläche für Mahnpauschale-
+  Freigabe und Rücklastschriftkosten" weiter unten): Backoffice-Formular
+  `/backoffice/op/{id}/ruecklastschriftkosten` erfasst diese Kosten
+  inzwischen bedienbar, verlinkt aus dem Kontoauszug je Rücklastschrift-
+  OP.
 
 ### Priorität C — Archivierung des tatsächlich versendeten Mahnbrief-PDF
 
@@ -4335,7 +4336,7 @@ musste wegen der dadurch nun abweichenden, aber weiterhin eine echte
 Inkompatibilität korrekt meldenden Fehlerart - `IntegrityError` statt
 `OperationalError` - angepasst werden).
 
-### Codex-Rückprüfung Commit 8fc9f78 (20.10.2026) — behoben
+### Codex-Rückprüfung Commit 8fc9f78 (19.10.2026) — behoben
 
 Codex hat die Mahnpauschale unabhängig geprüft und einen kritischen
 Gate-Mangel benannt: `mahnpauschale_geprueft`/`verzugsverantwortung_
@@ -4385,7 +4386,7 @@ die Versandnachweis-Idempotenz bei zwei unterschiedlichen
 Forderungsgruppen/`mahnlauf_schluessel` für denselben Versandnachweis
 (keine zweite Buchung). 1073/1073 grün im `tests/mietinkasso`-Gesamtlauf.
 
-### Zweite Codex-Rückprüfung Commit d735974 (20.10.2026) — behoben, konservative Sperre als Live-Gate
+### Zweite Codex-Rückprüfung Commit d735974 (19.10.2026) — behoben, konservative Sperre als Live-Gate
 
 Codex hat die erste Nachbesserung (Verhältnismäßigkeit gegen die aktuelle
 Hauptforderung) zu Recht als unzureichend zurückgewiesen: "unter der
@@ -4426,14 +4427,16 @@ KONKRETER, eingefrorener Forderungsgruppe (Hash identisch zu
   versandnachweis`) bleibt unverändert erhalten und wurde gegen die neue
   Freigabe-Logik erneut durchgetestet.
 
-**Live-Gate, bewusst unverändert konservativ:** es existiert noch KEIN
-Backoffice-Formular, das eine solche Einzelfallfreigabe anlegt (nur
-Repository-Methode `MahnkostenRepository.mahnpauschale_freigabe_
-anlegen`). Ohne diesen Workflow bleibt die Mahnkostenpauschale im
-produktiven Betrieb für JEDE Forderungsgruppe automatisch bei 0 EUR
-(Prüffall/Hinweis im Portal) - genau das vom Eigentümer verlangte
-konservative Default-Verhalten, bis Codex den Freigabe-Workflow
-(Backoffice-Formular je Mahnlauf/Forderungsgruppe) ergänzt.
+**Live-Gate, zum Zeitpunkt dieses Commits bewusst konservativ:** zu
+diesem Zeitpunkt existierte noch KEIN Backoffice-Formular, das eine
+solche Einzelfallfreigabe anlegt (nur Repository-Methode
+`MahnkostenRepository.mahnpauschale_freigabe_anlegen`) - ohne diesen
+Workflow blieb die Mahnkostenpauschale für JEDE Forderungsgruppe
+automatisch bei 0 EUR. **Inzwischen nachgezogen:** siehe Abschnitt
+"Backoffice-Oberfläche für Mahnpauschale-Freigabe und
+Rücklastschriftkosten" weiter unten - das Formular existiert seither,
+das konservative 0-EUR-Default-Verhalten ohne erteilte Freigabe bleibt
+davon unberührt.
 
 9 neue bzw. umgeschriebene synthetische Tests in `tests/mietinkasso/
 test_mahnwesen_kosten.py`: 20-EUR-Vorschlag auf 25-EUR-Hauptforderung
@@ -4450,7 +4453,7 @@ Repository-Validierungstests (fehlende Begründung, doppelte Freigabe für
 dieselbe Gruppe). 1075/1075 Tests grün im Gesamtlauf. Keine Live-
 Buchung, kein Versand, kein Deployment.
 
-### Dritte Codex-Rückprüfung (20.10.2026, vor Fertigstellung des Freigabeformulars) — behoben
+### Dritte Codex-Rückprüfung (19.10.2026, vor Fertigstellung des Freigabeformulars) — behoben
 
 Codex hat einen weiteren echten Bug in der Zwischenstufe benannt, bevor
 das Backoffice-Formular gebaut wurde: `forderungsgruppe_schluessel`
@@ -4477,7 +4480,7 @@ test_mahnwesen_kosten.py`): belegt am konkreten 500/25-EUR-Fall mit
 UNVERÄNDERTEN OP-IDs, dass eine bestehende Freigabe nach einer großen
 Teilzahlung nicht mehr greift. 1076/1076 Tests grün im Gesamtlauf.
 
-### Vierte Codex-Rückprüfung (20.10.2026, Schema-Randfall zur Teilzahlung) — behoben
+### Vierte Codex-Rückprüfung (19.10.2026, Schema-Randfall zur Teilzahlung) — behoben
 
 Direkter Folgefund zur dritten Nachbesserung: solange die Eindeutigkeit
 von `MahnpauschaleFreigabeTable` NUR auf `(vertrag_id, stufe,
@@ -4575,7 +4578,7 @@ neu anzulegen) - entspricht der bestehenden Konvention dieses Moduls
 (z. B. Zinsprofil-Versionierung), keine zusätzliche Korrekturfunktion
 wurde angefragt oder gebaut.
 
-### Fünfte Codex-Rückprüfung (20.10.2026, Abnahme des UI-Commits a3bab69) — behoben
+### Fünfte Codex-Rückprüfung (19.10.2026, Abnahme des UI-Commits a3bab69) — behoben
 
 Drei serverseitige Gates vor Livefreigabe nachgezogen:
 
