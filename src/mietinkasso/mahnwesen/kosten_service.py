@@ -133,6 +133,16 @@ class MahnkostenService:
             bereits_gebuchte_zinsen_je_op_position=bereits_gebuchte_zinsen_je_op,
             bereits_erhobene_gebuehr_schluessel=bereits_erhobene_gebuehren,
             kanal=kanal, brief_anbieterprofil=brief_anbieterprofil,
+            # Auftrag HV-20261019-MAHNKOSTEN, zweite Nachbesserung
+            # 20.10.2026: Lookup der dokumentierten Einzelfallfreigabe
+            # (siehe `MahnpauschaleFreigabeTable`-Moduldoc) - der Schlüssel
+            # wird ERST innerhalb von `berechne_mahnkosten_vorschau` aus
+            # der dort final feststehenden Forderungsgruppe berechnet
+            # (`kosten.py::forderungsgruppe_schluessel`), deshalb ein
+            # Callback statt eines hier vorab berechneten Werts.
+            mahnpauschale_freigabe_lookup=lambda schluessel: self._repository.mahnpauschale_freigabe_fuer_gruppe(
+                vertrag_id=vertrag_id, stufe=stufe, forderungsgruppe_schluessel=schluessel,
+            ),
         )
 
     def buche_bei_versand(

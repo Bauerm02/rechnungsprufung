@@ -62,7 +62,7 @@ from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 from mietinkasso.infrastructure.db.tables import BriefAnbieterProfilTable, OPPositionTable, OenbBasiszinssatzTable, ZinsprofilTable
-from mietinkasso.op.service import OffeneForderung
+from mietinkasso.op.service import OffeneForderung, compute_content_hash
 
 _STICHTAG_UGB_456 = date(2013, 3, 16)
 _GESETZLICHER_ZINSSATZ_PROZENT = Decimal("4.000")
@@ -499,6 +499,23 @@ def _faellige_entgeltforderungs_schluessel(forderungen: list[OffeneForderung], h
     return gesehen
 
 
+def forderungsgruppe_schluessel(op_position_ids) -> str:
+    """Kanonischer Hash über eine eingefrorene Forderungsgruppe - IDENTISCH
+    zu `kosten_service.py::_mahnlauf_schluessel` (bewusst dieselbe Formel,
+    nicht nur dieselbe Idee), damit eine `MahnpauschaleFreigabeTable`-Zeile
+    und der spätere Buchungs-Mahnlauf exakt dieselbe Gruppenidentität
+    verwenden. Auftrag HV-20261019-MAHNKOSTEN, zweite Nachbesserung
+    (Codex-Rückprüfung 20.10.2026): EINE Freigabe gilt ausschließlich für
+    GENAU diese Menge an `forderung_op_position_ids` - jede abweichende
+    Menge (eine neue fällige Periode, eine Teilzahlung, die die Gruppe
+    verändert) erzeugt zwangsläufig einen ANDEREN Schlüssel und findet
+    damit STRUKTURELL keine Freigabe mehr ("Freigabe darf nicht auf
+    spätere neue Forderungen fortwirken" ist dadurch erzwungen, nicht nur
+    Konvention)."""
+
+    return compute_content_hash({"forderung_ids": sorted(op_position_ids)})
+
+
 @dataclass(frozen=True)
 class MahnkostenVorschau:
     vertrag_id: str
@@ -718,6 +735,7 @@ def berechne_mahnkosten_vorschau(
     bereits_erhobene_gebuehr_schluessel: frozenset[str],
     kanal: str = "EMAIL",
     brief_anbieterprofil: BriefAnbieterProfilTable | None = None,
+    mahnpauschale_freigabe_lookup=None,
 ) -> MahnkostenVorschau:
     """Aggregiert ALLE offenen Forderungen dieses Vertrags zu EINER
     Mahnlauf-Kostenvorschau (Hauptforderung, Zinsen, Gebühr) - NIE eine
@@ -925,123 +943,144 @@ def berechne_mahnkosten_vorschau(
                 )
             else:
                 hinweise.append("§458 UGB: keine neue Pauschale - alle fälligen Entgeltforderungen wurden bereits einmalig bepauschalt.")
-    elif aktuelles_profil is not None and aktuelles_profil.status == "GEPRUEFT" and aktuelles_profil.mahnpauschale_geprueft:
-        # Auftrag HV-20261019-MAHNKOSTEN: generische, KANAL-UNABHÄNGIGE
-        # Mahnkostenpauschale §1333 Abs 2 ABGB (siehe `ZinsprofilTable.
-        # mahnpauschale_kostenbasis_cent`-Docstring) - gilt für BEIDE
-        # Mahnstufen (E-Mail wie Brief), NICHT nur Kanal BRIEF. Sobald ein
-        # Mensch diese Pauschale für den Vertrag freigegeben hat
-        # (`mahnpauschale_geprueft`), ERSETZT sie die ältere, NUR Brief-/
-        # tatsächliche-Porto-basierte §1333-Versandkosten-Ersatzfähigkeit
-        # unten (`kanal == "BRIEF"`-Zweig) für diesen Vertrag vollständig -
-        # beide Rechtsgrundlagen für denselben Versand anzusetzen wäre
-        # eine doppelte Entschädigung für denselben Schreibaufwand.
-        if aktuelles_profil.mahnpauschale_kostenbasis_cent is None or aktuelles_profil.mahnpauschale_kostenbasis_cent <= 0:
-            hinweise.append(
-                "§1333 Abs 2 ABGB (Mahnkostenpauschale): als geprüft markiert, aber keine gültige, belegte "
-                "Kostenbasis hinterlegt - keine Pauschale angesetzt."
+    else:
+        # NICHT B2B (§458 UGB ist dafür nie einschlägig, unabhängig vom
+        # Kanal).
+        hinweise.append("§458 UGB gilt nur bei beiderseits unternehmensbezogenem Geschäft mit Vertragsdatum ab 16.03.2013 - keine Mahngebühr angesetzt.")
+
+        # Auftrag HV-20261019-MAHNKOSTEN, ZWEITE Nachbesserung (Codex-
+        # Rückprüfung 20.10.2026, echter Gate-Mangel): die vorherige
+        # Fassung gestand die generische, kanal-unabhängige §1333-Abs-2-
+        # ABGB-Mahnkostenpauschale bereits zu, sobald EIN statisches
+        # Vertragsprofil-Flag (`mahnpauschale_geprueft`) gesetzt war -
+        # zusätzlich nur gegen die aktuelle Hauptforderung gedeckelt
+        # (`mahnpauschale_cent <= hauptforderung_cent`). Codex hat das zu
+        # Recht zurückgewiesen: "unter der Hauptforderung" beweist KEINE
+        # gesetzliche Angemessenheit (20 EUR auf 25 EUR Hauptforderung
+        # = 80 % wäre weiterhin automatisch durchgegangen), und
+        # `verzugsverantwortung_geprueft` am VERTRAGSPROFIL belegt kein
+        # konkretes Verschulden DIESES Rückstands (z. B. ein Bank-/SEPA-
+        # Fehler bleibt dem Mieter nicht zurechenbar, selbst wenn er
+        # allgemein als verzugsverantwortlich geführt wird).
+        #
+        # Das Zinsprofil (`mahnpauschale_kostenbasis_cent`/
+        # `mahnpauschale_geprueft`) liefert deshalb NUR NOCH einen
+        # unverbindlichen VORSCHLAGSWERT fürs Freigabeformular - es löst
+        # SELBST KEINE Buchung mehr aus. Einzige zulässige Grundlage ist
+        # jetzt eine dokumentierte, JE KONKRETER FORDERUNGSGRUPPE erteilte
+        # `MahnpauschaleFreigabeTable`-Zeile (`mahnpauschale_freigabe_
+        # lookup`, Schlüssel über `forderungsgruppe_schluessel`) mit vier
+        # explizit begründeten Kriterien (Erforderlichkeit, tatsächlicher
+        # Aufwand, Schuldhaftigkeit DIESES Rückstands, Verhältnismäßigkeit)
+        # - OHNE eine solche Freigabe für GENAU diese eingefrorene
+        # Forderungsgruppe bleibt die Pauschale IMMER automatisch bei
+        # 0 EUR (Prüffall), unabhängig vom Profil. Eine frühere Freigabe
+        # einer ANDEREN (auch nur geringfügig abweichenden)
+        # Forderungsgruppe desselben Vertrags wirkt dabei NICHT fort -
+        # andere Forderungsmenge, anderer Hash, siehe dortige Moduldoc.
+        #
+        # Live-Gate (siehe docs/hausverwaltung/OFFENE_PUNKTE.md): es gibt
+        # noch KEIN Backoffice-Formular, um eine solche Freigabe
+        # anzulegen - ohne Aufrufer, der `mahnpauschale_freigabe_lookup`
+        # tatsächlich mit Daten befüllt, bleibt die Pauschale im
+        # produktiven Betrieb deshalb KONSERVATIV IMMER gesperrt, bis
+        # dieser Workflow nachgezogen ist.
+        freigabe = (
+            mahnpauschale_freigabe_lookup(
+                forderungsgruppe_schluessel([f.op_position_id for f in forderungen_kern])
             )
-        elif not aktuelles_profil.verzugsverantwortung_geprueft:
+            if mahnpauschale_freigabe_lookup is not None else None
+        )
+        if freigabe is None:
+            vorschlag_hinweis = ""
+            if aktuelles_profil is not None and aktuelles_profil.mahnpauschale_kostenbasis_cent:
+                vorschlag_hinweis = (
+                    f" (unverbindlicher Profil-Vorschlagswert: "
+                    f"{aktuelles_profil.mahnpauschale_kostenbasis_cent / 100:.2f} EUR)"
+                )
             hinweise.append(
-                "§1333 Abs 2 ABGB (Mahnkostenpauschale): Verzugsverantwortung (Verschulden) für diesen Vertrag "
-                "nicht geprüft - keine Pauschale angesetzt."
+                "§1333 Abs 2 ABGB (Mahnkostenpauschale): keine dokumentierte Einzelfallfreigabe (Erforderlichkeit, "
+                "tatsächlicher Aufwand, Schuldhaftigkeit, Verhältnismäßigkeit) für GENAU diese Forderungsgruppe "
+                f"vorhanden - Pauschale bleibt automatisch gesperrt (0 EUR, Prüffall){vorschlag_hinweis}. Eine "
+                "Freigabe einer anderen Forderungsgruppe wirkt nicht fort."
             )
-        elif not _faellige_entgeltforderungs_schluessel(forderungen_kern, heute):
+        elif freigabe.betrag_cent > hauptforderung_cent:
             hinweise.append(
-                "§1333 Abs 2 ABGB (Mahnkostenpauschale): keine fällige Entgeltforderung - keine Pauschale angesetzt."
-            )
-        elif aktuelles_profil.mahnpauschale_kostenbasis_cent > hauptforderung_cent:
-            # Unabhängige Rückprüfung Codex 20.10.2026, echter Bug: eine
-            # einmal am Vertragsprofil geprüfte/hinterlegte Pauschale
-            # (z. B. 20 EUR) ist KEINE pauschale, für immer gültige
-            # Freigabe - die Verhältnismäßigkeit muss JE MAHNLAUF gegen
-            # die KONKRETE, zu diesem Zeitpunkt tatsächlich offene
-            # Hauptforderung dieser Forderungsgruppe geprüft werden, NICHT
-            # nur einmal abstrakt am Profil. Eine Pauschale, die die
-            # aktuelle Hauptforderung selbst übersteigt (z. B. 20 EUR
-            # Pauschale bei nur noch 14,31 EUR offenem Rückstand), ist
-            # evident unverhältnismäßig und wird NIE automatisch gebucht -
-            # unabhängig davon, wie lange das Profil schon geprüft ist.
-            # Diese Prüfung läuft bei JEDEM Aufruf frisch gegen den
-            # GERADE berechneten `hauptforderung_cent` dieser konkreten
-            # Forderungsgruppe, nie gegen einen beim Profil-Review
-            # eingefrorenen Wert.
-            hinweise.append(
-                f"§1333 Abs 2 ABGB (Mahnkostenpauschale): die geprüfte Pauschale "
-                f"({aktuelles_profil.mahnpauschale_kostenbasis_cent / 100:.2f} EUR) übersteigt die aktuelle "
-                f"Hauptforderung dieses Mahnlaufs ({hauptforderung_cent / 100:.2f} EUR) - unverhältnismäßig, "
-                "keine Pauschale angesetzt (Prüffall, fallbezogene Klärung erforderlich)."
+                f"§1333 Abs 2 ABGB (Mahnkostenpauschale): die freigegebene Pauschale "
+                f"({freigabe.betrag_cent / 100:.2f} EUR) übersteigt die aktuelle Hauptforderung dieses Mahnlaufs "
+                f"({hauptforderung_cent / 100:.2f} EUR) - unverhältnismäßig, keine Pauschale angesetzt (Prüffall)."
             )
         else:
-            mahnpauschale_cent = aktuelles_profil.mahnpauschale_kostenbasis_cent
+            mahnpauschale_cent = freigabe.betrag_cent
             mahnpauschale_rechtsgrundlage = (
-                "§1333 Abs 2 ABGB - geprüfte Mahnkostenpauschale je versendetem Mahnschreiben "
-                f"({aktuelles_profil.mahnpauschale_kostenbasis_beleg or 'ohne Belegangabe'})"
+                f"§1333 Abs 2 ABGB - dokumentierte Einzelfallfreigabe für diese Forderungsgruppe "
+                f"(freigegeben von {freigabe.freigegeben_von})"
             )
             hinweise.append(
                 f"§1333 Abs 2 ABGB: Mahnkostenpauschale ({mahnpauschale_cent / 100:.2f} EUR) für dieses tatsächlich "
-                "versendete Mahnschreiben angesetzt - Rechtsgrundlage, tatsächlicher Aufwand, Verschulden, "
-                "Erforderlichkeit und Verhältnismäßigkeit laut geprüftem Zinsprofil fallbezogen belegt."
+                "versendete Mahnschreiben angesetzt - dokumentierte Einzelfallfreigabe (Erforderlichkeit, "
+                "tatsächlicher Aufwand, Schuldhaftigkeit, Verhältnismäßigkeit) für GENAU diese Forderungsgruppe vorhanden."
             )
-    elif kanal == "BRIEF":
-        # §1333 Abs 2 ABGB - Versandkosten-Ersatz gilt NUR für den
-        # Briefkanal bei einem NICHT-B2B-Vertrag (Verbraucher-Mieter
-        # eingeschlossen, anders als §458), NUR mit gebündelt geprüfter
-        # Ersatzfähigkeit UND einem tatsächlich freigegebenen Brief-
-        # Anbieterprofil - ein bloß vorhandenes Profil reicht NICHT
-        # (Auftrag Markus 14.09.2026).
-        if aktuelles_profil is None or aktuelles_profil.status != "GEPRUEFT" or not aktuelles_profil.versandkosten_ersatzfaehig_geprueft:
-            hinweise.append(
-                "§1333 Abs 2 ABGB: Versandkosten-Ersatzfähigkeit für diesen Vertrag nicht geprüft - "
-                "keine Versandkosten-Position angesetzt."
-            )
-        elif brief_anbieterprofil is None:
-            hinweise.append("§1333 Abs 2 ABGB: kein freigegebenes Brief-Anbieterprofil hinterlegt - keine Versandkosten-Position angesetzt.")
-        else:
-            versandkosten_anbieteraufwand_cent = (
-                brief_anbieterprofil.preis_druck_cent + brief_anbieterprofil.preis_kuvert_cent
-                + brief_anbieterprofil.preis_porto_cent + (brief_anbieterprofil.preis_nachweis_cent or 0)
-            )
-            ersatzfaehiger_betrag_cent = versandkosten_anbieteraufwand_cent
-            if brief_anbieterprofil.ersatzfaehiger_hoechstbetrag_cent is not None:
-                ersatzfaehiger_betrag_cent = min(ersatzfaehiger_betrag_cent, brief_anbieterprofil.ersatzfaehiger_hoechstbetrag_cent)
-            rechtsgrundlage = "§1333 Abs 2 ABGB - ersatzfähige Versandkosten (geprüft)"
-            fuer_gebuehr_qualifiziert = [
-                schluessel for schluessel in _faellige_entgeltforderungs_schluessel(forderungen_kern, heute)
-                if schluessel not in bereits_erhobene_gebuehr_schluessel
-            ]
-            # Rückprüfung 14.09.2026, echter Bug: §1333 Abs 2 ABGB ersetzt
-            # die TATSÄCHLICHEN Kosten DIESES EINEN Briefs (Druck+Kuvert+
-            # Porto+Nachweis) - anders als die je-Entgeltforderung
-            # gedachte §458-UGB-Pauschale entsteht dieser Aufwand GENAU
-            # EINMAL je Versand, unabhängig davon, wie viele fällige
-            # Monatsforderungen in diesem einen Brief gebündelt sind. Bei
-            # mehreren qualifizierten Entgeltforderungen in DERSELBEN
-            # Vorschau (ein einziger Brief) wird der volle, gedeckelte
-            # Ersatzbetrag deshalb NUR EINMAL angesetzt - auf die (nach
-            # `_faellige_entgeltforderungs_schluessel`, also FIFO-)
-            # ERSTE qualifizierte Entgeltforderung als Trägerin der
-            # dauerhaften Ledger-Sperre; die übrigen Entgeltforderungen
-            # dieses Briefs bleiben für §1333 unberührt (bekommen KEIN
-            # eigenes Segment) und können bei einem SPÄTEREN, separaten
-            # Brief noch ihre eigene tatsächliche Versandkosten-Position
-            # auslösen. Nie derselbe Portoaufwand mehrfach angesetzt.
-            if fuer_gebuehr_qualifiziert:
-                gebuehr_segmente.append(
-                    GebuehrSegment(fuer_gebuehr_qualifiziert[0], ersatzfaehiger_betrag_cent, rechtsgrundlage)
-                )
-            if gebuehr_segmente:
+
+        if mahnpauschale_cent is None and kanal == "BRIEF":
+            # Ältere, NUR Brief-/tatsächliche-Porto-basierte §1333-
+            # Versandkosten-Ersatzfähigkeit (unverändert, eigene Gates) -
+            # bleibt als Fallback bestehen, SOLANGE keine Mahnpauschale-
+            # Einzelfallfreigabe griff; beide Rechtsgrundlagen werden NIE
+            # gemeinsam angesetzt (keine doppelte Entschädigung für
+            # denselben Schreibaufwand).
+            if aktuelles_profil is None or aktuelles_profil.status != "GEPRUEFT" or not aktuelles_profil.versandkosten_ersatzfaehig_geprueft:
                 hinweise.append(
-                    f"§1333 Abs 2 ABGB: 1 neue ersatzfähige Versandkosten-Position ({ersatzfaehiger_betrag_cent / 100:.2f} EUR) "
-                    "für diesen einen Brief - unabhängig von der Anzahl gebündelter Entgeltforderungen."
+                    "§1333 Abs 2 ABGB: Versandkosten-Ersatzfähigkeit für diesen Vertrag nicht geprüft - "
+                    "keine Versandkosten-Position angesetzt."
                 )
+            elif brief_anbieterprofil is None:
+                hinweise.append("§1333 Abs 2 ABGB: kein freigegebenes Brief-Anbieterprofil hinterlegt - keine Versandkosten-Position angesetzt.")
             else:
-                hinweise.append(
-                    "§1333 Abs 2 ABGB: keine neue Versandkosten-Position - alle fälligen Entgeltforderungen "
-                    "wurden bereits einmalig belastet."
+                versandkosten_anbieteraufwand_cent = (
+                    brief_anbieterprofil.preis_druck_cent + brief_anbieterprofil.preis_kuvert_cent
+                    + brief_anbieterprofil.preis_porto_cent + (brief_anbieterprofil.preis_nachweis_cent or 0)
                 )
-    else:
-        hinweise.append("§458 UGB gilt nur bei beiderseits unternehmensbezogenem Geschäft mit Vertragsdatum ab 16.03.2013 - keine Mahngebühr angesetzt.")
+                ersatzfaehiger_betrag_cent = versandkosten_anbieteraufwand_cent
+                if brief_anbieterprofil.ersatzfaehiger_hoechstbetrag_cent is not None:
+                    ersatzfaehiger_betrag_cent = min(ersatzfaehiger_betrag_cent, brief_anbieterprofil.ersatzfaehiger_hoechstbetrag_cent)
+                rechtsgrundlage = "§1333 Abs 2 ABGB - ersatzfähige Versandkosten (geprüft)"
+                fuer_gebuehr_qualifiziert = [
+                    schluessel for schluessel in _faellige_entgeltforderungs_schluessel(forderungen_kern, heute)
+                    if schluessel not in bereits_erhobene_gebuehr_schluessel
+                ]
+                # Rückprüfung 14.09.2026, echter Bug: §1333 Abs 2 ABGB
+                # ersetzt die TATSÄCHLICHEN Kosten DIESES EINEN Briefs
+                # (Druck+Kuvert+Porto+Nachweis) - anders als die
+                # je-Entgeltforderung gedachte §458-UGB-Pauschale entsteht
+                # dieser Aufwand GENAU EINMAL je Versand, unabhängig davon,
+                # wie viele fällige Monatsforderungen in diesem einen Brief
+                # gebündelt sind. Bei mehreren qualifizierten
+                # Entgeltforderungen in DERSELBEN Vorschau (ein einziger
+                # Brief) wird der volle, gedeckelte Ersatzbetrag deshalb
+                # NUR EINMAL angesetzt - auf die (nach `_faellige_
+                # entgeltforderungs_schluessel`, also FIFO-) ERSTE
+                # qualifizierte Entgeltforderung als Trägerin der
+                # dauerhaften Ledger-Sperre; die übrigen Entgeltforderungen
+                # dieses Briefs bleiben für §1333 unberührt (bekommen KEIN
+                # eigenes Segment) und können bei einem SPÄTEREN,
+                # separaten Brief noch ihre eigene tatsächliche
+                # Versandkosten-Position auslösen. Nie derselbe
+                # Portoaufwand mehrfach angesetzt.
+                if fuer_gebuehr_qualifiziert:
+                    gebuehr_segmente.append(
+                        GebuehrSegment(fuer_gebuehr_qualifiziert[0], ersatzfaehiger_betrag_cent, rechtsgrundlage)
+                    )
+                if gebuehr_segmente:
+                    hinweise.append(
+                        f"§1333 Abs 2 ABGB: 1 neue ersatzfähige Versandkosten-Position ({ersatzfaehiger_betrag_cent / 100:.2f} EUR) "
+                        "für diesen einen Brief - unabhängig von der Anzahl gebündelter Entgeltforderungen."
+                    )
+                else:
+                    hinweise.append(
+                        "§1333 Abs 2 ABGB: keine neue Versandkosten-Position - alle fälligen Entgeltforderungen "
+                        "wurden bereits einmalig belastet."
+                    )
 
     gebuehr_cent = sum(s.betrag_cent for s in gebuehr_segmente) or None
     gebuehr_rechtsgrundlage = gebuehr_segmente[0].rechtsgrundlage if gebuehr_segmente else None

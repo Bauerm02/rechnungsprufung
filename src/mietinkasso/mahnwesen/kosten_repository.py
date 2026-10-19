@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from mietinkasso.infrastructure.db.tables import (
     MahnkostenBuchungTable,
     MahnkostenGebuehrTable,
+    MahnpauschaleFreigabeTable,
     OenbBasiszinssatzTable,
     ZinsprofilTable,
 )
@@ -549,4 +550,66 @@ class MahnkostenRepository:
             row = _schreiben(owned_session)
             owned_session.commit()
             owned_session.refresh(row)
+            return row
+
+    # -- Mahnpauschale-Einzelfallfreigabe (Auftrag HV-20261019-MAHNKOSTEN,
+    # zweite Nachbesserung 20.10.2026) -----------------------------------
+
+    def mahnpauschale_freigabe_fuer_gruppe(
+        self, *, vertrag_id: str, stufe: int, forderungsgruppe_schluessel: str,
+    ) -> MahnpauschaleFreigabeTable | None:
+        """Lookup-Funktion für `kosten.py::berechne_mahnkosten_vorschau`s
+        `mahnpauschale_freigabe_lookup`-Callback - siehe
+        `MahnpauschaleFreigabeTable`-Moduldoc: eine Freigabe gilt
+        AUSSCHLIESSLICH für GENAU diese eingefrorene Forderungsgruppe."""
+
+        with self._session_factory() as session:
+            return session.execute(
+                select(MahnpauschaleFreigabeTable)
+                .where(MahnpauschaleFreigabeTable.vertrag_id == vertrag_id)
+                .where(MahnpauschaleFreigabeTable.stufe == stufe)
+                .where(MahnpauschaleFreigabeTable.forderungsgruppe_schluessel == forderungsgruppe_schluessel)
+            ).scalar_one_or_none()
+
+    def mahnpauschale_freigabe_anlegen(
+        self, *, vertrag_id: str, stufe: int, forderungsgruppe_schluessel: str, betrag_cent: int,
+        erforderlichkeit_begruendung: str, tatsaechlicher_aufwand_cent: int, tatsaechlicher_aufwand_beleg: str,
+        schuldhaftigkeit_begruendung: str, verhaeltnismaessigkeit_begruendung: str, freigegeben_von: str,
+        erstellt_von: str,
+    ) -> MahnpauschaleFreigabeTable:
+        """Legt EINE dokumentierte Einzelfallfreigabe für GENAU eine
+        eingefrorene Forderungsgruppe an - KEINE Freigabe am Vertrag/
+        Profil (siehe Moduldoc). `uq_mahnpauschale_freigabe_gruppe`
+        verhindert eine zweite, widersprüchliche Freigabe für dieselbe
+        Gruppe (ein zweiter Versuch scheitert mit `IntegrityError`, statt
+        eine bestehende Freigabe stillschweigend zu überschreiben - jede
+        Korrektur verlangt eine bewusste, eigene Fachentscheidung)."""
+
+        for feld, wert in (
+            ("betrag_cent", betrag_cent), ("tatsaechlicher_aufwand_cent", tatsaechlicher_aufwand_cent),
+        ):
+            if wert <= 0:
+                raise ValueError(f"Mahnpauschale-Freigabe: {feld} muss größer als 0 sein (war {wert}).")
+        for feld, text in (
+            ("erforderlichkeit_begruendung", erforderlichkeit_begruendung),
+            ("tatsaechlicher_aufwand_beleg", tatsaechlicher_aufwand_beleg),
+            ("schuldhaftigkeit_begruendung", schuldhaftigkeit_begruendung),
+            ("verhaeltnismaessigkeit_begruendung", verhaeltnismaessigkeit_begruendung),
+        ):
+            if not text or not text.strip():
+                raise ValueError(f"Mahnpauschale-Freigabe: {feld} muss fallbezogen begründet werden.")
+
+        with self._session_factory() as session:
+            row = MahnpauschaleFreigabeTable(
+                vertrag_id=vertrag_id, stufe=stufe, forderungsgruppe_schluessel=forderungsgruppe_schluessel,
+                betrag_cent=betrag_cent, erforderlichkeit_begruendung=erforderlichkeit_begruendung,
+                tatsaechlicher_aufwand_cent=tatsaechlicher_aufwand_cent,
+                tatsaechlicher_aufwand_beleg=tatsaechlicher_aufwand_beleg,
+                schuldhaftigkeit_begruendung=schuldhaftigkeit_begruendung,
+                verhaeltnismaessigkeit_begruendung=verhaeltnismaessigkeit_begruendung,
+                freigegeben_von=freigegeben_von, erstellt_von=erstellt_von,
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
             return row

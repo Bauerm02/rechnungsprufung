@@ -4384,3 +4384,68 @@ anderen Periode mit ausreichender Hauptforderung (korrekt gebucht), sowie
 die Versandnachweis-Idempotenz bei zwei unterschiedlichen
 Forderungsgruppen/`mahnlauf_schluessel` für denselben Versandnachweis
 (keine zweite Buchung). 1073/1073 grün im `tests/mietinkasso`-Gesamtlauf.
+
+### Zweite Codex-Rückprüfung Commit d735974 (20.10.2026) — behoben, konservative Sperre als Live-Gate
+
+Codex hat die erste Nachbesserung (Verhältnismäßigkeit gegen die aktuelle
+Hauptforderung) zu Recht als unzureichend zurückgewiesen: "unter der
+Hauptforderung" beweist KEINE gesetzliche Angemessenheit (20 EUR auf
+25 EUR Hauptforderung = 80 % wäre weiterhin automatisch durchgegangen),
+und `verzugsverantwortung_geprueft` am VERTRAGSPROFIL belegt kein
+konkretes Verschulden EINES bestimmten Rückstands (z. B. ein Bank-/
+SEPA-Fehler bleibt dem Mieter nicht zurechenbar, selbst wenn er
+allgemein als verzugsverantwortlich geführt wird). Der Hinweistext
+"fallbezogen belegt" war schlicht falsch, solange die Prüfung in
+Wahrheit nur am statischen Profil hing.
+
+**Strukturelle Lösung statt Flicken:** die generische Mahnkostenpauschale
+ist jetzt AUSSCHLIESSLICH über eine neue, dokumentierte
+`MahnpauschaleFreigabeTable`-Zeile buchbar - eine EINZELFALL-Freigabe JE
+KONKRETER, eingefrorener Forderungsgruppe (Hash identisch zu
+`mahnlauf_schluessel`), nicht je Vertrag/Profil:
+
+- Vier Pflichtfelder dokumentieren GENAU die vier verlangten Kriterien
+  für DIESEN Fall: `erforderlichkeit_begruendung`, `tatsaechlicher_
+  aufwand_cent`/`_beleg`, `schuldhaftigkeit_begruendung` (das KONKRETE
+  Verschulden dieses Rückstands) und `verhaeltnismaessigkeit_begruendung`.
+- Eindeutigkeit über `(vertrag_id, stufe, forderungsgruppe_schluessel)` -
+  eine Freigabe gilt STRUKTURELL nur für GENAU diese Forderungsmenge;
+  jede neue/veränderte Gruppe (neue Periode, Teilzahlung) hat zwangsläufig
+  einen anderen Hash und damit KEINE Freigabe ("Freigabe darf nicht auf
+  spätere neue Forderungen fortwirken" ist dadurch erzwungen, nicht nur
+  Konvention - mit eigenem Test abgesichert).
+- `ZinsprofilTable.mahnpauschale_kostenbasis_cent`/`mahnpauschale_geprueft`
+  bleiben nur noch als UNVERBINDLICHER VORSCHLAGSWERT fürs künftige
+  Freigabeformular erhalten - sie lösen selbst KEINE Buchung mehr aus
+  (Portal-Formular/-Übersicht entsprechend umformuliert, damit nichts
+  mehr "automatische Freigabe" suggeriert).
+- Zusätzlich mechanisch gegen die aktuelle Hauptforderung gedeckelt
+  (Defense in Depth gegen einen menschlichen Eingabefehler bei der
+  Freigabe selbst) - unverändert aus der ersten Nachbesserung übernommen.
+- Die bestehende Versandnachweis-Idempotenz (`uq_mahnkosten_
+  versandnachweis`) bleibt unverändert erhalten und wurde gegen die neue
+  Freigabe-Logik erneut durchgetestet.
+
+**Live-Gate, bewusst unverändert konservativ:** es existiert noch KEIN
+Backoffice-Formular, das eine solche Einzelfallfreigabe anlegt (nur
+Repository-Methode `MahnkostenRepository.mahnpauschale_freigabe_
+anlegen`). Ohne diesen Workflow bleibt die Mahnkostenpauschale im
+produktiven Betrieb für JEDE Forderungsgruppe automatisch bei 0 EUR
+(Prüffall/Hinweis im Portal) - genau das vom Eigentümer verlangte
+konservative Default-Verhalten, bis Codex den Freigabe-Workflow
+(Backoffice-Formular je Mahnlauf/Forderungsgruppe) ergänzt.
+
+9 neue bzw. umgeschriebene synthetische Tests in `tests/mietinkasso/
+test_mahnwesen_kosten.py`: 20-EUR-Vorschlag auf 25-EUR-Hauptforderung
+OHNE Freigabe bleibt bei 0 EUR (der von Codex explizit genannte 80-%-
+Fall), kanal-unabhängige Buchung MIT dokumentierter Freigabe, Ersatz
+statt Stapelung mit der Brief-Versandkosten-Ersatzfähigkeit, keine
+fällige Entgeltforderung, mechanische Deckelung einer zu hoch
+freigegebenen Pauschale (14,31-EUR-Fall jetzt mit Freigabe statt Profil-
+Flag), **die neue, zentrale Fortwirkungs-Prüfung** (eine Freigabe für
+Periode A gilt nicht für eine neu hinzugekommene Periode B, obwohl
+rechnerisch sogar verhältnismäßiger), Doppellauf-Idempotenz, Versand-
+nachweis-Idempotenz bei abweichendem `mahnlauf_schluessel`, sowie zwei
+Repository-Validierungstests (fehlende Begründung, doppelte Freigabe für
+dieselbe Gruppe). 1075/1075 Tests grün im Gesamtlauf. Keine Live-
+Buchung, kein Versand, kein Deployment.

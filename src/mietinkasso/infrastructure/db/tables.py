@@ -1952,3 +1952,70 @@ class MahnbriefArchivTable(Base):
     versandnachweis_referenz: Mapped[str] = mapped_column(String(256))
     archiviert_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     erstellt_von: Mapped[str] = mapped_column(String(128))
+
+
+class MahnpauschaleFreigabeTable(Base):
+    """Auftrag HV-20261019-MAHNKOSTEN, ZWEITE Nachbesserung (Codex-
+    Rückprüfung 20.10.2026): dokumentierte EINZELFALL-Freigabe der
+    generischen §1333-Abs-2-ABGB-Mahnkostenpauschale JE KONKRETER,
+    eingefrorener Forderungsgruppe - ersetzt die vorherige, zu Recht
+    zurückgewiesene statische Profil-Freigabe
+    (`ZinsprofilTable.mahnpauschale_geprueft`/`verzugsverantwortung_
+    geprueft`). Codex' Befund: "unter der Hauptforderung" (die zuvor
+    einzige mechanische Schranke) beweist KEINE gesetzliche
+    Angemessenheit (z. B. 20 EUR auf 25 EUR Hauptforderung = 80 %), und
+    ein am VERTRAGSPROFIL geführtes Verschuldens-Flag belegt kein
+    konkretes Verschulden DIESES Rückstands (z. B. ein Bank-/SEPA-Fehler
+    bleibt dem Mieter nicht zurechenbar). `ZinsprofilTable.
+    mahnpauschale_kostenbasis_cent`/`mahnpauschale_geprueft` bleiben nur
+    noch als unverbindlicher VORSCHLAGSWERT fürs Freigabeformular
+    erhalten - sie lösen selbst KEINE Buchung mehr aus (siehe
+    `mahnwesen/kosten.py::berechne_mahnkosten_vorschau`).
+
+    `forderungsgruppe_schluessel` ist exakt dieselbe Hash-Formel wie
+    `kosten_service.py::_mahnlauf_schluessel`/`kosten.py::
+    forderungsgruppe_schluessel` (Content-Hash über die sortierten
+    `forderung_op_position_ids`) - eine Freigabe gilt AUSSCHLIESSLICH für
+    GENAU diese eingefrorene Forderungsmenge. Jede abweichende Gruppe
+    (eine neue fällige Periode, eine Teilzahlung, die die Gruppe
+    verändert) hat zwangsläufig einen ANDEREN Schlüssel und damit KEINE
+    Freigabe - "Freigabe darf nicht auf spätere neue Forderungen
+    fortwirken" ist dadurch strukturell erzwungen, nicht nur Konvention.
+
+    Vier Pflichtfelder dokumentieren GENAU die vier verlangten Kriterien
+    für DIESEN konkreten Fall (nicht pauschal am Vertrag):
+    `erforderlichkeit_begruendung`, `tatsaechlicher_aufwand_cent`/`_beleg`,
+    `schuldhaftigkeit_begruendung` (das KONKRETE Verschulden DIESES
+    Rückstands) und `verhaeltnismaessigkeit_begruendung`. `betrag_cent`
+    ist der tatsächlich freigegebene Betrag - IMMER menschlich neu
+    entschieden, NICHT notwendig identisch mit einem Profil-
+    Vorschlagswert. Zusätzlich mechanisch gegen die aktuelle
+    Hauptforderung gedeckelt (`berechne_mahnkosten_vorschau`, Defense in
+    Depth gegen einen menschlichen Eingabefehler).
+
+    Live-Gate (siehe docs/hausverwaltung/OFFENE_PUNKTE.md): es existiert
+    noch KEIN Backoffice-Formular, das eine solche Freigabe anlegt - ohne
+    diesen Workflow bleibt die Mahnpauschale im produktiven Betrieb
+    AUTOMATISCH IMMER gesperrt (0 EUR), was das gewollte konservative
+    Verhalten ist, bis Codex den Freigabe-Workflow ergänzt."""
+
+    __tablename__ = "mahnpauschale_freigaben"
+    __table_args__ = (
+        UniqueConstraint(
+            "vertrag_id", "stufe", "forderungsgruppe_schluessel", name="uq_mahnpauschale_freigabe_gruppe"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    stufe: Mapped[int] = mapped_column(Integer)
+    forderungsgruppe_schluessel: Mapped[str] = mapped_column(String(128))
+    betrag_cent: Mapped[int] = mapped_column(Integer)
+    erforderlichkeit_begruendung: Mapped[str] = mapped_column(Text)
+    tatsaechlicher_aufwand_cent: Mapped[int] = mapped_column(Integer)
+    tatsaechlicher_aufwand_beleg: Mapped[str] = mapped_column(String(256))
+    schuldhaftigkeit_begruendung: Mapped[str] = mapped_column(Text)
+    verhaeltnismaessigkeit_begruendung: Mapped[str] = mapped_column(Text)
+    freigegeben_von: Mapped[str] = mapped_column(String(128))
+    freigegeben_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    erstellt_von: Mapped[str] = mapped_column(String(128))

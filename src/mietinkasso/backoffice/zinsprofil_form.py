@@ -23,8 +23,9 @@ def zinsprofil_formular(vertrag, profile, csrf):
         verzug_text = "geprüft" if p.verzugsverantwortung_geprueft else "NICHT geprüft - §456-Zinssatz fällt auf 4 % zurück"
         versandkosten_text = "geprüft" if p.versandkosten_ersatzfaehig_geprueft else "NICHT geprüft - keine Versandkosten-Weiterverrechnung"
         mahnpauschale_text = (
-            (eur(p.mahnpauschale_kostenbasis_cent) if p.mahnpauschale_kostenbasis_cent is not None else "ungeklärt")
-            if p.mahnpauschale_geprueft else "NICHT geprüft - keine Mahnkostenpauschale"
+            (f"{eur(p.mahnpauschale_kostenbasis_cent)} (Vorschlag, keine Buchungsgrundlage)"
+             if p.mahnpauschale_kostenbasis_cent is not None else "als Vorschlag markiert, aber ohne Betrag")
+            if p.mahnpauschale_geprueft else "kein Vorschlag hinterlegt"
         )
         historien.append(
             f'<tr><td>{p.version}</td><td>{h(p.status)}</td><td>{"B2B" if p.ist_b2b else "Privat/Verbraucher"}</td>'
@@ -54,7 +55,7 @@ def zinsprofil_formular(vertrag, profile, csrf):
         <tr><th>Version</th><th>Status</th><th>B2B/Privat</th><th>Vertragsdatum</th><th>Gültig ab</th>
             <th>Vereinbarter Zinssatz</th><th>Verzugsverantwortung (§456)</th>
             <th>§458-Pauschale</th><th>Versandkosten ersatzfähig (§1333)</th>
-            <th>Mahnkostenpauschale (§1333 Abs 2)</th><th></th></tr>
+            <th>Mahnkostenpauschale (§1333 Abs 2) - Vorschlag</th><th></th></tr>
         {''.join(historien) if historien else '<tr><td colspan=11 class="muted">Noch kein Zinsprofil erfasst - es gilt die gesetzliche Basis.</td></tr>'}
       </table>
     </div>
@@ -103,18 +104,22 @@ def zinsprofil_formular(vertrag, profile, csrf):
            ein bloß vorhandenes Anbieter-Tarifprofil (Druck/Kuvert/Porto) reicht dafür NICHT aus. Der konkrete,
            ggf. gedeckelte Betrag stammt aus dem separat gepflegten Brief-Anbieterprofil, nicht aus diesem Formular.</p>
       </fieldset>
-      <fieldset><legend>Mahnkostenpauschale (§1333 Abs 2 ABGB, kanal-unabhängig - E-Mail UND Brief)</legend>
+      <fieldset><legend>Mahnkostenpauschale (§1333 Abs 2 ABGB) - NUR unverbindlicher Vorschlagswert</legend>
         <label><input type="checkbox" name="mahnpauschale_geprueft" value="1">
-          Rechtsgrundlage, tatsächlicher Aufwand, Erforderlichkeit und Verhältnismäßigkeit dieser Pauschale sind
-          fallbezogen geprüft (Verschulden separat über die Verzugsverantwortung oben)</label>
-        <label>Pauschalbetrag je tatsächlich versendetem/nachgewiesenem Mahnschreiben in EUR</label>
-        <input name="mahnpauschale_kostenbasis_cent" placeholder="z. B. 20,00 - NUR der bereits verhältnismäßig geprüfte/ggf. reduzierte Betrag">
-        <label>Beleg/Begründung (Vertragsklausel, tatsächlicher Aufwand, Verhältnismäßigkeits-Abwägung)</label>
+          Dieser Betrag ist als grundsätzlich plausibler Ausgangspunkt für eine künftige Einzelfallfreigabe
+          markiert (bindet NICHTS automatisch)</label>
+        <label>Vorschlagsbetrag je Mahnschreiben in EUR (unverbindlich)</label>
+        <input name="mahnpauschale_kostenbasis_cent" placeholder="z. B. 20,00 - reiner Vorschlagswert, keine Buchungsgrundlage">
+        <label>Beleg/Begründung (Vertragsklausel, typischer Aufwand)</label>
         <textarea name="mahnpauschale_kostenbasis_beleg" rows="3"></textarea>
-        <p class="muted">Eine vertraglich genannte Zahl (z. B. "20 EUR je Mahnung") ist NIE automatisch dieser Wert -
-           erst nach fallbezogener Prüfung/ggf. Reduktion auf das Verhältnismäßige einträgen. Gilt für BEIDE
-           Mahnstufen (E-Mail wie Brief) und ERSETZT bei aktivierter Prüfung die Versandkosten-Ersatzfähigkeit
-           oben für denselben Versand (keine doppelte Entschädigung). Ohne diese Prüfung: keine Pauschale.</p>
+        <p class="muted"><strong>Dieser Vorschlagswert löst KEINE Buchung aus.</strong> Eine Mahnkostenpauschale
+           wird ausschließlich über eine dokumentierte EINZELFALL-Freigabe JE KONKRETER Forderungsgruppe gebucht
+           (Erforderlichkeit, tatsächlicher Aufwand, Schuldhaftigkeit DIESES Rückstands, Verhältnismäßigkeit zur
+           aktuellen Hauptforderung) - ein statisches Profil-Flag beweist weder gesetzliche Angemessenheit noch
+           konkretes Verschulden eines einzelnen Rückstands (z. B. eines Bank-/SEPA-Fehlers). Ein Vertragstext
+           wie "20 EUR je Mahnung" ist NIE automatisch dieser Wert. Live-Gate: das Formular zur Erteilung einer
+           solchen Einzelfallfreigabe existiert in diesem Portal noch nicht - die Pauschale bleibt deshalb
+           bis auf Weiteres für jede Forderungsgruppe automatisch bei 0 EUR (Prüffall).</p>
       </fieldset>
       <button type="submit">Als Entwurf speichern</button>
       </form>

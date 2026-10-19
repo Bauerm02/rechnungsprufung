@@ -25,7 +25,7 @@ from mietinkasso.auth.service import AuthContext, require_gesellschaft_access
 from mietinkasso.domain.enums import OPTyp, Rolle
 from mietinkasso.domain.exceptions import CrossTenantError
 from mietinkasso.infrastructure.db.tables import MahnkostenGebuehrTable
-from mietinkasso.mahnwesen.kosten import bestimme_zinssatz, snapshot_aus_json, snapshot_zu_json
+from mietinkasso.mahnwesen.kosten import bestimme_zinssatz, forderungsgruppe_schluessel, snapshot_aus_json, snapshot_zu_json
 from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
 from mietinkasso.mahnwesen.kosten_service import MahnkostenService
 
@@ -1789,55 +1789,127 @@ def test_buche_bei_versand_verweigert_zugriff_ohne_gesellschaftsscope(
         )
 
 
-# -- Mahnkostenpauschale §1333 Abs 2 ABGB (Auftrag HV-20261019-MAHNKOSTEN) --
-# Kanal-unabhängig (E-Mail UND Brief), NUR bei belegter Rechtsgrundlage/
-# Aufwand/Verschulden/Erforderlichkeit/Verhältnismäßigkeit (gebündelt über
-# `mahnpauschale_geprueft` + `verzugsverantwortung_geprueft`), je
-# tatsächlich versendetem Mahnschreiben (nicht je Entgeltforderung).
+
+# -- Mahnkostenpauschale §1333 Abs 2 ABGB (Auftrag HV-20261019-MAHNKOSTEN,
+# ZWEITE Nachbesserung Codex-Rückprüfung 20.10.2026) ------------------------
+# Kritischer Gate-Mangel der VORHERIGEN Fassung: ein statisches Vertrags-
+# profil-Flag (`mahnpauschale_geprueft`) + eine rein mechanische Deckelung
+# gegen die Hauptforderung (`mahnpauschale_cent <= hauptforderung_cent`)
+# beweisen WEDER gesetzliche Angemessenheit (20 EUR auf 25 EUR Haupt-
+# forderung = 80 % wäre durchgegangen) NOCH ein konkretes Verschulden
+# DIESES Rückstands (`verzugsverantwortung_geprueft` am Profil sagt nichts
+# über z. B. einen Bank-/SEPA-Fehler dieser einen Zahlung). Die Pauschale
+# ist deshalb jetzt AUSSCHLIESSLICH über eine dokumentierte, JE KONKRETER
+# FORDERUNGSGRUPPE erteilte `MahnpauschaleFreigabeTable`-Zeile buchbar
+# (Erforderlichkeit/tatsächlicher Aufwand/Schuldhaftigkeit/
+# Verhältnismäßigkeit), niemals mehr über ein Profil-Flag allein - ohne
+# Freigabe bleibt sie IMMER automatisch bei 0 EUR (Prüffall). Das
+# Zinsprofil liefert nur noch einen unverbindlichen Vorschlagswert.
 
 
-def test_mahnpauschale_wird_kanalunabhaengig_angesetzt_wenn_vollstaendig_geprueft(
+def _freigabe_fuer(
+    kosten_repo, op_service, kosten_service, *, vertrag_id, stufe, konto_id, heute,
+    betrag_cent=2000, freigegeben_von="codex-test", nur_op_position_ids=None,
+):
+    """Testhelfer: ermittelt die AKTUELLE Forderungsgruppe über eine
+    ungefreigebene Vorschau und legt dafür eine vollständig dokumentierte
+    Einzelfallfreigabe an - genau der Weg, den ein künftiger Backoffice-
+    Workflow gehen würde (Vorschau zeigt Gruppe -> Mensch entscheidet ->
+    Freigabe -> erneute Vorschau zeigt die Pauschale)."""
+
+    vorschau_vorher = kosten_service.vorschau(
+        vertrag_id=vertrag_id, stufe=stufe, heute=heute, nur_op_position_ids=nur_op_position_ids,
+    )
+    schluessel = forderungsgruppe_schluessel(vorschau_vorher.forderung_op_position_ids)
+    return kosten_repo.mahnpauschale_freigabe_anlegen(
+        vertrag_id=vertrag_id, stufe=stufe, forderungsgruppe_schluessel=schluessel, betrag_cent=betrag_cent,
+        erforderlichkeit_begruendung="Zwei erfolglose Zahlungserinnerungen vorausgegangen, Mahnung fallbezogen erforderlich.",
+        tatsaechlicher_aufwand_cent=betrag_cent, tatsaechlicher_aufwand_beleg="Portal-Zeiterfassung Sachbearbeitung + Druck/Versand.",
+        schuldhaftigkeit_begruendung="Keine Bank-/SEPA-Störung erkennbar; Zahlung schlicht unterblieben, Mieter verantwortlich.",
+        verhaeltnismaessigkeit_begruendung="Pauschale liegt deutlich unter der aktuellen Hauptforderung dieser Gruppe.",
+        freigegeben_von=freigegeben_von, erstellt_von=freigegeben_von,
+    )
+
+
+def test_mahnpauschale_ohne_dokumentierte_einzelfallfreigabe_bleibt_automatisch_gesperrt(
     op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
 ):
+    """Der vom Eigentümer genannte Grenzfall: 20 EUR Profil-Vorschlagswert
+    auf 25 EUR Hauptforderung (80 % - laut Codex evident unangemessen) UND
+    ganz ohne jede Freigabe - beides muss automatisch 0 EUR ergeben, auch
+    wenn die alte, rein mechanische Deckelung (<=hauptforderung) das hier
+    technisch durchgelassen hätte."""
+
     vertrag, konto = basis_vertrag
     _profil_geprueft(
         kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
         verzugsverantwortung_geprueft=True, mahnpauschale_geprueft=True,
-        mahnpauschale_kostenbasis_cent=2000, mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7, verhältnismäßig geprüft",
+        mahnpauschale_kostenbasis_cent=2000, mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
     )
     op_service.buchen(
-        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=2500,
         belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
-        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+        faelligkeit=date(2026, 1, 5), beleg_referenz="Restforderung Jänner",
     )
 
-    vorschau_email = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1), kanal="EMAIL")
-    vorschau_brief = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=2, heute=date(2026, 2, 1), kanal="BRIEF")
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1))
 
-    assert vorschau_email.mahnpauschale_cent == 2000
-    assert "§1333 Abs 2 ABGB" in vorschau_email.mahnpauschale_rechtsgrundlage
-    assert vorschau_email.gebuehr_cent is None  # keine zusätzliche/doppelte Gebühr
-    assert vorschau_brief.mahnpauschale_cent == 2000
-    assert vorschau_brief.gebuehr_cent is None  # ersetzt die reine Brief-Versandkosten-Ersatzfähigkeit
+    assert vorschau.hauptforderung_cent == 2500
+    assert vorschau.mahnpauschale_cent is None  # KEINE Automatik ohne Freigabe, trotz 20 EUR <= 25 EUR
+    assert any(
+        "keine dokumentierte Einzelfallfreigabe" in hinweis and "20.00 EUR" in hinweis
+        for hinweis in vorschau.hinweise
+    ), vorschau.hinweise
+
+    gebucht = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1),
+        versandnachweis_referenz="mahnung:ohne-freigabe", akteur="test",
+    )
+    pauschale_zeilen = [
+        p for p in op_service.berechne_saldo(konto.id, stichtag=date(2026, 2, 1)).positionen
+        if p.aenderungsgrund == "Mahnkosten - Mahnkostenpauschale"
+    ]
+    assert not pauschale_zeilen  # 0 EUR tatsächlich gebucht
 
 
-def test_mahnpauschale_ersetzt_briefversandkosten_ersatz_statt_zu_stapeln(
+def test_mahnpauschale_mit_dokumentierter_einzelfallfreigabe_wird_kanalunabhaengig_gebucht(
     op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
 ):
     vertrag, konto = basis_vertrag
-    # Versandkosten-Ersatzfähigkeit ZUSÄTZLICH geprüft - die Mahnpauschale
-    # muss trotzdem exklusiv gelten (keine doppelte Entschädigung für
-    # denselben Brief).
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+    _freigabe_fuer(
+        kosten_repo, op_service, kosten_service, vertrag_id=vertrag.id, stufe=1,
+        konto_id=konto.id, heute=date(2026, 2, 1), betrag_cent=2000,
+    )
+
+    vorschau_email = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1), kanal="EMAIL")
+    assert vorschau_email.mahnpauschale_cent == 2000
+    assert "dokumentierte Einzelfallfreigabe" in vorschau_email.mahnpauschale_rechtsgrundlage
+    assert vorschau_email.gebuehr_cent is None
+
+
+def test_mahnpauschale_freigabe_ersetzt_briefversandkosten_ersatz_statt_zu_stapeln(
+    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
+):
+    vertrag, konto = basis_vertrag
+    # Versandkosten-Ersatzfähigkeit ZUSÄTZLICH geprüft - die Freigabe muss
+    # trotzdem exklusiv gelten (keine doppelte Entschädigung).
     _profil_geprueft(
         kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
         verzugsverantwortung_geprueft=True, versandkosten_ersatzfaehig_geprueft=True,
-        mahnpauschale_geprueft=True, mahnpauschale_kostenbasis_cent=2000,
-        mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
     )
     op_service.buchen(
         ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
         belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
         faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+    _freigabe_fuer(
+        kosten_repo, op_service, kosten_service, vertrag_id=vertrag.id, stufe=1,
+        konto_id=konto.id, heute=date(2026, 2, 1), betrag_cent=2000,
     )
 
     vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1), kanal="BRIEF")
@@ -1847,62 +1919,104 @@ def test_mahnpauschale_ersetzt_briefversandkosten_ersatz_statt_zu_stapeln(
     assert vorschau.versandkosten_anbieteraufwand_cent is None  # der alte Zweig wurde nie betreten
 
 
-def test_mahnpauschale_ohne_geprueftes_verschulden_wird_nicht_angesetzt(
+def test_mahnpauschale_freigabe_ohne_fallige_entgeltforderung_wirkt_nicht(
     op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
 ):
     vertrag, konto = basis_vertrag
-    _profil_geprueft(
-        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
-        verzugsverantwortung_geprueft=False,  # Verschulden NICHT geprüft
-        mahnpauschale_geprueft=True, mahnpauschale_kostenbasis_cent=2000,
-        mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
-    )
-    op_service.buchen(
-        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
-        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
-        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
-    )
-
-    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1))
-
-    assert vorschau.mahnpauschale_cent is None
-    assert any("Verzugsverantwortung" in hinweis for hinweis in vorschau.hinweise)
-
-
-def test_mahnpauschale_ohne_faellige_entgeltforderung_wird_nicht_angesetzt(
-    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
-):
-    vertrag, konto = basis_vertrag
-    _profil_geprueft(
-        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
-        verzugsverantwortung_geprueft=True, mahnpauschale_geprueft=True,
-        mahnpauschale_kostenbasis_cent=2000, mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
-    )
-    # Fälligkeit liegt NACH "heute" - (noch) keine fällige Entgeltforderung.
+    # Fälligkeit liegt NACH "heute" - (noch) keine fällige Entgeltforderung,
+    # eine Freigabe für diese Gruppe kann sich also gar nicht ergeben, weil
+    # schon `berechne_mahnkosten_vorschau`s eigener Entgeltforderungs-Filter
+    # keine qualifizierte Forderung liefert. Reine Regressionssicherung.
     op_service.buchen(
         ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
         belegdatum=date(2026, 2, 1), buchungsdatum=date(2026, 2, 1),
         faelligkeit=date(2026, 2, 5), beleg_referenz="HMZ Februar",
     )
-
     vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 1, 15))
+    assert vorschau.mahnpauschale_cent is None
+
+
+def test_mahnpauschale_freigabe_mit_zu_hohem_betrag_bleibt_unverhaeltnismaessig_blockiert(
+    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
+):
+    """Defense in Depth: selbst eine MENSCHLICH dokumentierte Freigabe wird
+    mechanisch gegen die aktuelle Hauptforderung gedeckelt - ein
+    Eingabefehler (z. B. versehentlich 20 EUR auf einen nur noch
+    14,31 EUR betragenden Rückstand freigegeben) bucht trotzdem nicht
+    automatisch."""
+
+    vertrag, konto = basis_vertrag
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=1431,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="Restforderung Jänner",
+    )
+    _freigabe_fuer(
+        kosten_repo, op_service, kosten_service, vertrag_id=vertrag.id, stufe=1,
+        konto_id=konto.id, heute=date(2026, 2, 1), betrag_cent=2000,
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1))
 
     assert vorschau.mahnpauschale_cent is None
+    assert any(
+        "unverhältnismäßig" in hinweis and "14.31" in hinweis for hinweis in vorschau.hinweise
+    ), vorschau.hinweise
+
+
+def test_mahnpauschale_freigabe_wirkt_nicht_auf_spaetere_neue_forderungsgruppe_fort(
+    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
+):
+    """Der zentrale, vom Eigentümer verlangte Punkt: eine Freigabe gilt
+    AUSSCHLIESSLICH für die exakte, zum Freigabezeitpunkt eingefrorene
+    Forderungsgruppe - kommt eine neue fällige Forderung dazu (eine echt
+    neue Mahnung derselben Stufe, aber einer anderen, größeren Gruppe),
+    braucht es zwingend eine NEUE, eigene Freigabe. Die alte wirkt NICHT
+    fort, selbst wenn der freigegebene Betrag für die neue, größere
+    Hauptforderung rein mechanisch verhältnismäßig wäre."""
+
+    vertrag, konto = basis_vertrag
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+    _freigabe_fuer(
+        kosten_repo, op_service, kosten_service, vertrag_id=vertrag.id, stufe=1,
+        konto_id=konto.id, heute=date(2026, 2, 1), betrag_cent=2000,
+    )
+    vorschau_alte_gruppe = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1))
+    assert vorschau_alte_gruppe.mahnpauschale_cent == 2000  # Gegenprobe: Freigabe wirkt für IHRE Gruppe
+
+    # Neue, genuin zusätzliche fällige Forderung derselben Stufe - verändert
+    # die Forderungsgruppe (anderer Hash) und macht die freigegebene
+    # Pauschale rein rechnerisch sogar NOCH verhältnismäßiger.
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 3, 1), buchungsdatum=date(2026, 3, 1),
+        faelligkeit=date(2026, 3, 5), beleg_referenz="HMZ März",
+    )
+    vorschau_neue_gruppe = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 4, 1))
+
+    assert vorschau_neue_gruppe.hauptforderung_cent == 50_000 + 60_000
+    assert vorschau_neue_gruppe.mahnpauschale_cent is None  # die ALTE Freigabe wirkt NICHT fort
+    assert any(
+        "keine dokumentierte Einzelfallfreigabe" in hinweis for hinweis in vorschau_neue_gruppe.hinweise
+    ), vorschau_neue_gruppe.hinweise
 
 
 def test_mahnpauschale_wird_gebucht_und_doppellauf_bucht_nicht_doppelt(
     op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
 ):
     vertrag, konto = basis_vertrag
-    _profil_geprueft(
-        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
-        verzugsverantwortung_geprueft=True, mahnpauschale_geprueft=True,
-        mahnpauschale_kostenbasis_cent=2000, mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
-    )
     op_service.buchen(
         ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
         belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
         faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+    _freigabe_fuer(
+        kosten_repo, op_service, kosten_service, vertrag_id=vertrag.id, stufe=1,
+        konto_id=konto.id, heute=date(2026, 2, 1), betrag_cent=2000,
     )
 
     erste = kosten_service.buche_bei_versand(
@@ -1929,111 +2043,16 @@ def test_mahnpauschale_wird_gebucht_und_doppellauf_bucht_nicht_doppelt(
     assert pauschale_zeilen[0].betrag_cent == 2000
 
 
-# -- Nachbesserung Codex-Rückprüfung Commit 8fc9f78, 20.10.2026 -------------
-# Kritischer Gate-Mangel: `mahnpauschale_geprueft`/`verzugsverantwortung_
-# geprueft` sind statische Vertragsprofil-Flags - ein einmal hinterlegtes
-# 20-EUR-Profil darf NICHT automatisch gebucht werden, wenn die aktuelle,
-# konkrete Hauptforderung dieses Mahnlaufs (z. B. ein Rückstand von nur
-# 14,31 EUR) die Pauschale unverhältnismäßig macht. Die Prüfung muss JE
-# MAHNLAUF gegen die aktuelle Hauptforderung erfolgen, nicht nur einmal
-# am Profil. Zusätzlich: Idempotenz darf nicht ausschließlich an
-# Stufe+Forderungs-IDs hängen, sondern auch am tatsächlichen
-# Versandnachweis (keine mehrfachen Gebühren für Retry).
-
-
-def test_mahnpauschale_wird_bei_geringem_rueckstand_als_unverhaeltnismaessig_blockiert(
-    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
-):
-    """Der konkrete, vom Eigentümer genannte Grenzfall: ein Profil mit
-    geprüfter 20-EUR-Pauschale, aber ein tatsächlicher Rückstand von nur
-    14,31 EUR - die Pauschale würde den Rückstand selbst übersteigen und
-    bleibt deshalb automatisch blockiert (Prüffall), unabhängig davon,
-    dass das Profil selbst als geprüft markiert ist."""
-
-    vertrag, konto = basis_vertrag
-    _profil_geprueft(
-        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
-        verzugsverantwortung_geprueft=True, mahnpauschale_geprueft=True,
-        mahnpauschale_kostenbasis_cent=2000, mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
-    )
-    op_service.buchen(
-        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=1431,
-        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
-        faelligkeit=date(2026, 1, 5), beleg_referenz="Restforderung Jänner",
-    )
-
-    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1))
-
-    assert vorschau.hauptforderung_cent == 1431
-    assert vorschau.mahnpauschale_cent is None  # NICHT automatisch gebucht
-    assert any(
-        "unverhältnismäßig" in hinweis and "14.31" in hinweis for hinweis in vorschau.hinweise
-    ), vorschau.hinweise
-
-    gebucht = kosten_service.buche_bei_versand(
-        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1),
-        versandnachweis_referenz="mahnung:rueckstand-klein", akteur="test",
-    )
-    pauschale_zeilen = [
-        p for p in op_service.berechne_saldo(konto.id, stichtag=date(2026, 2, 1)).positionen
-        if p.aenderungsgrund == "Mahnkosten - Mahnkostenpauschale"
-    ]
-    assert not pauschale_zeilen  # 0 EUR tatsächlich gebucht, kein Automatismus
-
-
-def test_mahnpauschale_wird_bei_neuer_mahnung_anderer_periode_mit_ausreichender_hauptforderung_gebucht(
-    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
-):
-    """Dieselbe Pauschale/dasselbe Profil wird bei einer SPÄTEREN, neuen
-    Mahnung einer ANDEREN Periode mit einer ausreichend hohen aktuellen
-    Hauptforderung korrekt gebucht - die Verhältnismäßigkeitsprüfung läuft
-    JE Mahnlauf frisch, blockiert also nicht dauerhaft, sondern nur dort,
-    wo die konkrete Hauptforderung es tatsächlich unverhältnismäßig macht."""
-
-    vertrag, konto = basis_vertrag
-    _profil_geprueft(
-        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
-        verzugsverantwortung_geprueft=True, mahnpauschale_geprueft=True,
-        mahnpauschale_kostenbasis_cent=2000, mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
-    )
-    # Erste Periode: geringer Rückstand - wie oben blockiert.
-    op_service.buchen(
-        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=1431,
-        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
-        faelligkeit=date(2026, 1, 5), beleg_referenz="Restforderung Jänner",
-    )
-    vorschau_klein = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1))
-    assert vorschau_klein.mahnpauschale_cent is None
-
-    # Zweite, GENUIN NEUE Mahnung einer anderen Periode mit einem deutlich
-    # höheren offenen Rückstand - jetzt ist die Pauschale verhältnismäßig.
-    op_service.buchen(
-        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
-        belegdatum=date(2026, 3, 1), buchungsdatum=date(2026, 3, 1),
-        faelligkeit=date(2026, 3, 5), beleg_referenz="HMZ März",
-    )
-    vorschau_gross = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 4, 1))
-
-    assert vorschau_gross.hauptforderung_cent == 60_000 + 1431
-    assert vorschau_gross.mahnpauschale_cent == 2000  # jetzt verhältnismäßig, korrekt angesetzt
-
-
 def test_mahnpauschale_idempotent_ueber_versandnachweis_trotz_abweichendem_mahnlauf_schluessel(
     op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
 ):
     """Härtung gegen Retry: selbst wenn zwei Aufrufe für DENSELBEN
     tatsächlichen Versandnachweis aus irgendeinem Grund zwei
-    UNTERSCHIEDLICHE Forderungsgruppen (und damit unterschiedliche
-    `mahnlauf_schluessel`) berechnen, darf die Pauschale NICHT zweimal für
-    denselben Versandnachweis gebucht werden - Idempotenz hängt nicht nur
-    an Stufe+Forderungs-IDs, sondern zusätzlich am Versandnachweis selbst."""
+    UNTERSCHIEDLICHE (je für sich freigegebene) Forderungsgruppen und
+    damit unterschiedliche `mahnlauf_schluessel` berechnen, darf die
+    Pauschale NICHT zweimal für denselben Versandnachweis gebucht werden."""
 
     vertrag, konto = basis_vertrag
-    _profil_geprueft(
-        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
-        verzugsverantwortung_geprueft=True, mahnpauschale_geprueft=True,
-        mahnpauschale_kostenbasis_cent=2000, mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
-    )
     op_a = op_service.buchen(
         ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
         belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
@@ -2045,6 +2064,14 @@ def test_mahnpauschale_idempotent_ueber_versandnachweis_trotz_abweichendem_mahnl
         faelligkeit=date(2026, 2, 5), beleg_referenz="HMZ Februar",
     )
     heute = date(2026, 3, 1)
+    _freigabe_fuer(
+        kosten_repo, op_service, kosten_service, vertrag_id=vertrag.id, stufe=1,
+        konto_id=konto.id, heute=heute, betrag_cent=2000, nur_op_position_ids=frozenset({op_a.id}),
+    )
+    _freigabe_fuer(
+        kosten_repo, op_service, kosten_service, vertrag_id=vertrag.id, stufe=1,
+        konto_id=konto.id, heute=heute, betrag_cent=2000, nur_op_position_ids=frozenset({op_b.id}),
+    )
     vorschau_a = kosten_service.vorschau(
         vertrag_id=vertrag.id, stufe=1, heute=heute, nur_op_position_ids=frozenset({op_a.id}),
     )
@@ -2071,3 +2098,25 @@ def test_mahnpauschale_idempotent_ueber_versandnachweis_trotz_abweichendem_mahnl
         if p.aenderungsgrund == "Mahnkosten - Mahnkostenpauschale"
     ]
     assert len(pauschale_zeilen) == 1 and pauschale_zeilen[0].betrag_cent == 2000
+
+
+def test_mahnpauschale_freigabe_anlegen_verlangt_vollstaendige_begruendungen(kosten_repo):
+    with pytest.raises(ValueError):
+        kosten_repo.mahnpauschale_freigabe_anlegen(
+            vertrag_id="V-601-3", stufe=1, forderungsgruppe_schluessel="irgendein-hash", betrag_cent=2000,
+            erforderlichkeit_begruendung="", tatsaechlicher_aufwand_cent=2000,
+            tatsaechlicher_aufwand_beleg="Beleg", schuldhaftigkeit_begruendung="Begründung",
+            verhaeltnismaessigkeit_begruendung="Begründung", freigegeben_von="test", erstellt_von="test",
+        )
+
+
+def test_mahnpauschale_freigabe_fuer_dieselbe_gruppe_zweimal_schlaegt_fehl(kosten_repo):
+    kwargs = dict(
+        vertrag_id="V-601-3", stufe=1, forderungsgruppe_schluessel="derselbe-hash", betrag_cent=2000,
+        erforderlichkeit_begruendung="Begründung", tatsaechlicher_aufwand_cent=2000,
+        tatsaechlicher_aufwand_beleg="Beleg", schuldhaftigkeit_begruendung="Begründung",
+        verhaeltnismaessigkeit_begruendung="Begründung", freigegeben_von="test", erstellt_von="test",
+    )
+    kosten_repo.mahnpauschale_freigabe_anlegen(**kwargs)
+    with pytest.raises(Exception):
+        kosten_repo.mahnpauschale_freigabe_anlegen(**kwargs)
