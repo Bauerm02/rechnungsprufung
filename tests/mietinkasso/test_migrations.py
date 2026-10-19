@@ -703,8 +703,10 @@ def test_ensure_additive_columns_zieht_debitoren_telefon_nach_und_ist_idempotent
 def test_ensure_additive_columns_zieht_ruecklastschriftkosten_nachtraeglich_spalten_nach(tmp_path: Path):
     """Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS: `ruecklastschriftkosten`
     existiert produktiv OHNE die drei `nachtraeglich_zurechenbar_*`-Spalten
-    (Zweischritt bei zunächst unklarer Zurechenbarkeit). Additiv/nullable
-    nachgezogen, eine Bestandszeile bleibt unverändert."""
+    (Zweischritt bei zunächst unklarer Zurechenbarkeit) UND OHNE
+    `bank_transaktion_id` (vollständige Bankzuordnung bei nativer
+    Rücklastschrift+Bankentgelt-Zuordnung). Additiv/nullable nachgezogen,
+    eine Bestandszeile bleibt unverändert."""
 
     from mietinkasso.infrastructure.db.tables import RuecklastschriftkostenTable
 
@@ -738,14 +740,15 @@ def test_ensure_additive_columns_zieht_ruecklastschriftkosten_nachtraeglich_spal
 
         ausgefuehrt = ensure_additive_columns(engine)
         neue_spalten = {"nachtraeglich_zurechenbar_begruendung", "nachtraeglich_zurechenbar_erklaert_von",
-                        "nachtraeglich_zurechenbar_erklaert_am"}
+                        "nachtraeglich_zurechenbar_erklaert_am", "bank_transaktion_id"}
         assert {s["name"] for s in sa.inspect(engine).get_columns("ruecklastschriftkosten")} >= neue_spalten
-        assert len(ausgefuehrt) == 3
+        assert len(ausgefuehrt) == 4
 
         with engine.begin() as conn:
             zeile = conn.execute(sa.text("SELECT * FROM ruecklastschriftkosten WHERE id = 1")).mappings().one()
         assert zeile["bankentgelt_cent"] == 1250 and zeile["zurechenbarkeit_begruendung"] == "Noch ungeklärt."
         assert zeile["nachtraeglich_zurechenbar_begruendung"] is None
+        assert zeile["bank_transaktion_id"] is None
 
         assert ensure_additive_columns(engine) == []  # idempotent
 
@@ -753,6 +756,7 @@ def test_ensure_additive_columns_zieht_ruecklastschriftkosten_nachtraeglich_spal
         with session_factory() as session:
             row = session.get(RuecklastschriftkostenTable, 1)
             assert row.nachtraeglich_zurechenbar_begruendung is None
+            assert row.bank_transaktion_id is None
     finally:
         engine.dispose()
 

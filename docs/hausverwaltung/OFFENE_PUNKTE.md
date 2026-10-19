@@ -4773,17 +4773,16 @@ dem bereits produktiven `e7b621c`-Stand durch.
 ## Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS (19.10.2026)
 
 Drei Teilaufträge (offene Punkte abarbeiten, Gebühren/Zinsen korrekt
-nachbuchen, automatischen Mail-/Briefversand fertigstellen). In dieser
-Runde abgeschlossen: Teil 2 (MailOps-Audit) vollständig, Teil 1 teilweise
-(Bankentgelt-Zweischritt), Teil 3 teilweise (Layout-Freihaltebereiche).
-**Noch NICHT begonnen** und ausdrücklich für die nächste Runde offen:
-die atomare Zuordnung einer nativen negativen Banktransaktion zu einer
-bankgebundenen ZAHLUNG samt Kapital-/Bankentgelt-Split in EINER
-Transaktion und dem dafür angefragten einfachen Portalformular (Teil 1,
-Hauptmechanismus) sowie der SFTP-Anbindungsadapter und die Archiv-Hash-/
-Status-/Konflikterweiterung für den physischen Briefkanal (Teil 3,
-Hauptmechanismus - Spezifikation bereits vom Nutzer übermittelt, siehe
-unten).
+nachbuchen, automatischen Mail-/Briefversand fertigstellen). Stand nach
+dieser Runde: Teil 2 (MailOps-Audit) vollständig abgeschlossen, Teil 1
+VOLLSTÄNDIG abgeschlossen (Bankentgelt-Zweischritt UND die atomare
+native Rücklastschrift+Bankentgelt-Zuordnung samt Portalformular - siehe
+eigener Abschnitt unten), Teil 3 teilweise (Layout-Freihaltebereiche
+abgeschlossen, SFTP-Adapter weiterhin offen). **Noch NICHT begonnen** und
+ausdrücklich für die nächste Runde offen: der SFTP-Anbindungsadapter und
+die Archiv-Hash-/Status-/Konflikterweiterung für den physischen
+Briefkanal (Teil 3, Hauptmechanismus - Spezifikation bereits vom Nutzer
+übermittelt, siehe unten).
 
 ### Teil 2 — MailOps-EMAIL-Audit (abgeschlossen)
 
@@ -4852,23 +4851,79 @@ behoben (synthetische Tests in `test_ruecklastschriftkosten.py`):
    ursprünglichen Zwischenstand von `mahnpauschale_freigabe_anlegen` vor
    dessen eigenem Formular.
 
-**Noch offen (Teil 1, Hauptmechanismus):** die eigentlich angefragte
-atomare Zuordnung EINER nativen negativen Banktransaktion zu einer
-bereits bankgebundenen ZAHLUNG (Kapitalrestaurierung über
-`bank/service.py::verarbeite_ruecklastschrift` + Bankentgelt-Split in
-EINER DB-Transaktion, inkl. "vollständige Bankzuordnung" - der
-verbleibende Banktransaktionsbetrag muss nach Abzug des dokumentierten
-Bankentgelts auf 0 sinken) sowie das dafür angefragte einfache
-Portalformular für eine vorhandene Bankzeile (`/backoffice/bank/
-{transaktion_id}/...`) wurden in dieser Runde NICHT begonnen. Aktuell
-gibt es in `routes/bank.py` für eine negative Transaktion
-(`_klaerfall_zeile`) ausdrücklich KEIN Zuordnungsformular ("Prüffall,
-kein Zuordnungsformular"). Analyse/Design (Session-Teilen zwischen
-`BankImportService.verarbeite_ruecklastschrift` und
-`RuecklastschriftkostenService.erfasse_und_buche` über einen optionalen
-`session`-Parameter, Kapital-/Bankentgelt-Split aus dem Transaktions-
-Restbetrag) liegt bereits vor, Umsetzung + Tests (Teilrückgabe/
-Überrückgabe/Bankkonto-Kreuzung/Rollback) stehen noch aus.
+### Teil 1 — Hauptmechanismus: atomare native Rücklastschrift + Bankentgelt (abgeschlossen)
+
+Neue Methode `BankImportService.verarbeite_ruecklastschrift_mit_bankentgelt`
+ordnet EINE vorhandene native negative Banktransaktion atomar einer
+bereits bankgebundenen ZAHLUNG zu. Dafür wurden `verarbeite_
+ruecklastschrift` und `RuecklastschriftkostenService.erfasse_und_buche`
+um einen optionalen `session`-Parameter erweitert (Idiom wie überall
+sonst in diesem Modul: ohne `session` unverändertes Verhalten inkl.
+eigener Transaktion, mit `session` Teil einer größeren, fremdverwalteten
+Transaktion - KEIN `session.expunge` mehr auf dem Retry-Pfad, da das den
+anschließenden `session.refresh` des Transaktionsinhabers gebrochen
+hätte).
+
+- **Split, nie 1:1-Gesamtbelastung:** `kapital_cent = min(verbleibende
+  Rückbuchungsgrenze der Ursprungszahlung, verfügbarer Belastungsbetrag
+  der Transaktion)`; ein verbleibender Rest (> 0) ist das belegte
+  Bankentgelt - der reale Banktransaktionsbetrag selbst ist der Beleg,
+  kein geschätzter/pauschaler Wert.
+- **Vollständige Bankzuordnung:** `RuecklastschriftkostenTable` hat eine
+  neue additive Spalte `bank_transaktion_id` (lose Referenz, kein FK,
+  wie `ruecklastschrift_op_position_id`); `BankRepository.verwendeter_
+  betrag_rueckbuchung` zählt jetzt BEIDE Anteile (gebuchte
+  Kapitalrestaurierung UND dokumentiertes Bankentgelt, unabhängig davon,
+  ob daraus eine Forderung gebucht wurde) - eine Transaktion mit Kapital
+  + Bankentgelt verschwindet dadurch vollständig aus `/backoffice/bank/
+  unzugeordnet`, statt einen nie erklärbaren Restbetrag zu zeigen.
+- **Keine Fachregel verletzt:** keine automatische Mieter-
+  Kostenerstattung ohne Zurechenbarkeit (unverändert über `erfasse_und_
+  buche`), keine neue SOLL als Ersatz, keine erfundenen BankIDs (nur
+  reale `transaktion.id`/`import_id`-Ableitungen), reiner
+  Bankentgelt-Rest ohne verbleibenden Kapitalanteil wird kontrolliert
+  abgelehnt statt eine Rücklastschrift-OP zu erfinden.
+- **Idempotenz:** ein wiederholter Aufruf für dasselbe Transaktion+
+  Ursprungszahlung-Paar erkennt die bereits vorhandene Kapitalbuchung
+  (deterministische `import_id`) VOR jeder Split-Neuberechnung und
+  übernimmt deren damals entschiedenen Split unverändert - sonst hätte
+  die inzwischen "verbrauchte" Verfügbarkeit einen echten Retry
+  fälschlich abgelehnt.
+- **Portalformular:** `GET/POST /backoffice/bank/{transaktion_id}/
+  ruecklastschrift` (`routes/bank.py`) - einfaches Formular analog zu
+  `/verknuepfen` (manuelle OP-ID/Konto-ID-Eingabe, kein Bankentgelt-Feld,
+  da der reale Transaktionsbetrag selbst der Beleg ist), verlinkt aus der
+  Rücklastschriften/Klärfälle-Tabelle in `/backoffice/bank/unzugeordnet`
+  für jeden echten negativen Rest.
+
+Gezielte Tests (`test_bank.py`, 8 neue): reine Kapitalrückbuchung ohne
+Bankentgelt, Kapital+Bankentgelt in einer Transaktion, ohne
+Zurechenbarkeit rein dokumentarisch, Teilrückgabe (Rest bleibt für
+später offen), reiner Bankentgelt-Rest ohne verbleibendes Kapital wird
+abgelehnt, Bankkonto-Kreuzung wird wie bisher abgelehnt, idempotenter
+Wiederholungsaufruf, Rollback bei fehlgeschlagenem Bankentgelt-Schritt
+(Kapitalbuchung läuft NICHT unkontrolliert weiter). Dazu 2 neue
+Backoffice-HTTP-Tests (Formular+Absenden End-to-End, CSRF-Schutz) und
+ein additiver Migrationstest für `bank_transaktion_id`. HTTP-
+Vertragstest (`backoffice_http_contract.json`) um die zwei neuen Routen
+erweitert (rein additiv, alle bestehenden Routen/Status unverändert).
+
+**Unabhängiges Review (Commit f68b1ae) zur davor committeten
+Bankentgelt-Zweischritt-Methode `uebernimm_zurechenbarkeit_
+nachtraeglich`, noch vor Beginn dieses Hauptmechanismus behoben (Commit
+2568185):** die Methode prüfte nur Zugriff auf das übergebene `konto`,
+nie ob die über `ruecklastschrift_op_position_id` gefundene Kostenzeile
+überhaupt zu DIESEM Konto gehört (ein eigenes, erlaubtes Konto mit einer
+fremden Rücklastschrift-OP-ID hätte deren Bankentgelt auf das falsche
+Konto/Vertrag gebucht), und Idempotenz-/Konfliktprüfung liefen vor der
+Schreibtransaktion (TOCTOU-Fenster für konkurrierende abweichende
+Begründungen). Jetzt wie `verarbeite_ruecklastschrift`: eine
+schreibgesperrte Session lädt Konto/Kostenzeile/Rücklastschrift-OP
+frisch, prüft die Bindung explizit und führt Idempotenz-/Konfliktprüfung
+sowie Buchung in EINER Transaktion aus - mit 3 neuen gezielten Tests
+(fremde RLS-OP auf erlaubtem Konto, manipuliertes Konto-Objekt, echte
+nebenläufige abweichende Begründungen über zwei Threads auf
+Datei-SQLite).
 
 ### Teil 3 — Brief: Layout-Freihaltebereiche (abgeschlossen), SFTP-Adapter (offen)
 

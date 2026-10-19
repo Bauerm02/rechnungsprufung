@@ -37,6 +37,14 @@ def bank_repo(session_factory) -> BankRepository:
     return BankRepository(session_factory)
 
 
+@pytest.fixture
+def rls_kosten_service(session_factory, stammdaten_repo):
+    from mietinkasso.bank.ruecklastschriftkosten_service import RuecklastschriftkostenService
+
+    op_service = OPService(OPRepository(session_factory), stammdaten_repo)
+    return RuecklastschriftkostenService(session_factory=session_factory, op_service=op_service)
+
+
 CAMT_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
   <BkToCstmrStmt>
@@ -1515,6 +1523,322 @@ def test_ruecklastschrift_verfuegbarer_belastungsbetrag_der_transaktion(bank_ser
     bank_service.verarbeite_ruecklastschrift(
         ctx=ctx, transaktion=sammel_rueck, original_op_position=op_b, konto=konto_b, betrag_cent=100_00,
     )
+
+
+# -- Atomare native Rücklastschrift + Bankentgelt-Split ----------------------
+# -- (Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS, 19.10.2026)
+
+
+def test_mit_bankentgelt_reine_kapitalrueckbuchung_ohne_bankentgelt(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    """Native Transaktion deckt EXAKT das Originalkapital ab - kein
+    Bankentgelt-Anteil, `kosten_zeile` bleibt `None`."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text=f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+
+    rueck = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-600.00,2026-04-10,RUECKLASTSCHRIFT\n",
+        mapping=mapping,
+    )[0]
+
+    kapital_op, kosten_zeile = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+        ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+        ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Mangels Deckung",
+        dem_zahlungspflichtigen_zurechenbar=True, zurechenbarkeit_begruendung="Vom Mieter zu vertreten.",
+        beleg_referenz="Bankbeleg RLS-600", heute=date(2026, 4, 11), akteur="codex-test",
+    )
+    assert kapital_op is not None and kapital_op.typ == OPTyp.RUECKLASTSCHRIFT.value
+    assert kapital_op.betrag_cent == 600_00
+    assert kosten_zeile is None
+    assert bank_repo.list_unzugeordnet(bank_konto.id) == []  # Transaktion vollständig erklärt
+
+
+def test_mit_bankentgelt_kapital_plus_bankentgelt_in_einer_transaktion(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    """Native Transaktion enthält Originalkapital (600,00) PLUS ein von
+    der Bank zusätzlich einbehaltenes Entgelt (12,50) - GENAU EINE
+    Transaktion bucht Kapitalrestaurierung UND Bankaufwanddokumentation,
+    keine 1:1-Gesamtbelastung (612,50) als Mietkapital."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text=f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+
+    rueck = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-612.50,2026-04-10,RUECKLASTSCHRIFT MS03\n",
+        mapping=mapping,
+    )[0]
+
+    kapital_op, kosten_zeile = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+        ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+        ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Mangels Deckung",
+        dem_zahlungspflichtigen_zurechenbar=True,
+        zurechenbarkeit_begruendung="Dauerhaft fehlende Kontodeckung, vom Mieter zu vertreten.",
+        beleg_referenz="Bankbeleg RLS-612", heute=date(2026, 4, 11), akteur="codex-test",
+    )
+    assert kapital_op.betrag_cent == 600_00  # NIE 612,50 - keine 1:1-Gesamtbelastung als Mietkapital
+    assert kosten_zeile is not None
+    assert kosten_zeile.bankentgelt_cent == 1250
+    assert kosten_zeile.kosten_op_position_id is not None
+
+    saldo = bank_service._op_service.berechne_saldo(konto.id)
+    assert saldo.saldo_cent == 1250  # Kapital gleicht sich aus (+600/-600), nur das Bankentgelt bleibt offen
+    assert bank_repo.list_unzugeordnet(bank_konto.id) == []  # vollständige Bankzuordnung
+
+
+def test_mit_bankentgelt_ohne_zurechenbarkeit_bleibt_bankentgelt_rein_dokumentarisch(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text=f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+    rueck = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-612.50,2026-04-10,RUECKLASTSCHRIFT MS03\n",
+        mapping=mapping,
+    )[0]
+
+    kapital_op, kosten_zeile = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+        ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+        ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Bankseitiger Fehler lt. Bankauskunft",
+        dem_zahlungspflichtigen_zurechenbar=False,
+        zurechenbarkeit_begruendung="Bank bestätigt eigenen Verarbeitungsfehler, Mieter trifft kein Verschulden.",
+        beleg_referenz="Bankbeleg RLS-612b", heute=date(2026, 4, 11), akteur="codex-test",
+    )
+    assert kosten_zeile.kosten_op_position_id is None  # keine Forderung ohne belegte Zurechenbarkeit
+    saldo = bank_service._op_service.berechne_saldo(konto.id)
+    assert saldo.saldo_cent == 0  # keine automatische Mieter-Kostenerstattung ohne Zurechenbarkeit
+
+
+def test_mit_bankentgelt_teilrueckgabe_ohne_bankentgelt_laesst_rest_fuer_spaeter(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    """Teilrückgabe: die native Transaktion deckt NUR einen Teil des
+    Originalkapitals ab - kein Bankentgelt in DIESER Transaktion, der
+    Rest der Rückbuchungsgrenze bleibt für eine SPÄTERE Transaktion
+    offen."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text=f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+    rueck_teil = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-400.00,2026-04-10,TEIL-RUECKLASTSCHRIFT\n",
+        mapping=mapping,
+    )[0]
+
+    kapital_op, kosten_zeile = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+        ctx=ctx, transaktion=rueck_teil, original_op_position=zahlung_op, konto=konto,
+        ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Teilrückbuchung lt. Bank",
+        dem_zahlungspflichtigen_zurechenbar=True, zurechenbarkeit_begruendung="Vom Mieter zu vertreten.",
+        beleg_referenz="Bankbeleg RLS-TEIL", heute=date(2026, 4, 11), akteur="codex-test",
+    )
+    assert kapital_op.betrag_cent == 400_00
+    assert kosten_zeile is None  # kein Bankentgelt-Rest in DIESER Transaktion
+
+    bereits_zurueckgebucht = bank_repo.kumulativ_zurueckgebucht(zahlung_op.id)
+    assert bereits_zurueckgebucht == 400_00  # 200,00 Rückbuchungsgrenze bleiben für eine spätere Transaktion offen
+
+
+def test_mit_bankentgelt_reiner_bankentgelt_rest_ohne_verbleibendes_kapital_wird_abgelehnt(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    """Überrückgabe im Extremfall: die Ursprungszahlung ist durch eine
+    FRÜHERE Transaktion bereits vollständig zurückgebucht - eine weitere
+    (reine Bankentgelt-)Transaktion ohne jeden verbleibenden Kapitalanteil
+    wird kontrolliert abgelehnt statt eine Rücklastschrift-OP zu erfinden."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text=f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+
+    rueck_voll = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-600.00,2026-04-10,VOLLE-RUECKLASTSCHRIFT\n",
+        mapping=mapping,
+    )[0]
+    bank_service.verarbeite_ruecklastschrift(ctx=ctx, transaktion=rueck_voll, original_op_position=zahlung_op, konto=konto)
+
+    rueck_gebuehr = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-12.50,2026-04-12,NACHTRAEGLICHE BANKGEBUEHR\n",
+        mapping=mapping,
+    )[0]
+    with pytest.raises(ZuordnungUngueltigError):
+        bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+            ctx=ctx, transaktion=rueck_gebuehr, original_op_position=zahlung_op, konto=konto,
+            ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Nachträgliche Bankgebühr",
+            dem_zahlungspflichtigen_zurechenbar=True, zurechenbarkeit_begruendung="x",
+            beleg_referenz="Bankbeleg RLS-GEB", heute=date(2026, 4, 12), akteur="codex-test",
+        )
+
+
+def test_mit_bankentgelt_bankkonto_kreuzung_wird_wie_bisher_abgelehnt(
+    bank_service, bank_repo, stammdaten_repo, ctx_factory, rls_kosten_service,
+):
+    """Die native Rücklastschrift-Transaktion muss auf DEMSELBEN
+    Bankkonto liegen wie die Ursprungszahlung - unverändert von
+    `verarbeite_ruecklastschrift` geprüft, auch über den kombinierten
+    Weg."""
+
+    ctx = ctx_factory("7DI")
+    stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
+    stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")
+    stammdaten_repo.upsert_einheit(id="601-TOPX", objekt_id="601", bezeichnung="Top X", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten_repo.upsert_debitor(id="DEB-X", name="Mieterin X")
+    stammdaten_repo.upsert_vertrag(
+        id="V-601-X", einheit_id="601-TOPX", debitor_id="DEB-X", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    vertrag = stammdaten_repo.get_vertrag("V-601-X")
+    konto = stammdaten_repo.get_or_create_konto(vertrag=vertrag)
+
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="Konto 1")
+    bank_repo.upsert_bank_konto(id="BK-7DI-2", gesellschaft_id="7DI", iban="AT111111111111111111", bezeichnung="Konto 2")
+    bank_konto_1 = bank_repo.get_bank_konto("BK-7DI-1")
+    bank_konto_2 = bank_repo.get_bank_konto("BK-7DI-2")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto_1, text=f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+
+    rueck_falsches_konto = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto_2, text="betrag,datum,referenz\n-612.50,2026-04-10,RUECKLASTSCHRIFT\n",
+        mapping=mapping,
+    )[0]
+    with pytest.raises(ZuordnungUngueltigError):
+        bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+            ctx=ctx, transaktion=rueck_falsches_konto, original_op_position=zahlung_op, konto=konto,
+            ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Mangels Deckung",
+            dem_zahlungspflichtigen_zurechenbar=True, zurechenbarkeit_begruendung="x",
+            beleg_referenz="Bankbeleg", heute=date(2026, 4, 11), akteur="codex-test",
+        )
+    # Keine Teilbuchung durchgerutscht - Transaktion bleibt vollständig unverarbeitet.
+    assert bank_repo.verwendeter_betrag_rueckbuchung(rueck_falsches_konto.id) == 0
+
+
+def test_mit_bankentgelt_idempotent_bei_wiederholtem_identischem_aufruf(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text=f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+    rueck = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-612.50,2026-04-10,RUECKLASTSCHRIFT\n",
+        mapping=mapping,
+    )[0]
+
+    kwargs = dict(
+        ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+        ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Mangels Deckung",
+        dem_zahlungspflichtigen_zurechenbar=True, zurechenbarkeit_begruendung="Vom Mieter zu vertreten.",
+        beleg_referenz="Bankbeleg RLS-IDEMP", heute=date(2026, 4, 11), akteur="codex-test",
+    )
+    kapital_1, kosten_1 = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(**kwargs)
+    kapital_2, kosten_2 = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(**kwargs)
+
+    assert kapital_1.id == kapital_2.id
+    assert kosten_1.id == kosten_2.id
+    saldo = bank_service._op_service.berechne_saldo(konto.id)
+    assert saldo.saldo_cent == 1250  # kein zweiter Ansatz durch den wiederholten Aufruf
+
+
+def test_mit_bankentgelt_fehler_im_bankentgelt_schritt_rollt_kapitalbuchung_mit_zurueck(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    """Rollback-Test: scheitert der Bankentgelt-Schritt (hier: leere
+    Zurechenbarkeits-Begründung), darf NICHT trotzdem die Kapitalbuchung
+    stehen bleiben - beide laufen in EINER Transaktion."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text=f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+    rueck = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-612.50,2026-04-10,RUECKLASTSCHRIFT\n",
+        mapping=mapping,
+    )[0]
+
+    with pytest.raises(ValueError):
+        bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+            ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+            ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Mangels Deckung",
+            dem_zahlungspflichtigen_zurechenbar=True, zurechenbarkeit_begruendung="   ",  # leer -> ValueError
+            beleg_referenz="Bankbeleg RLS-ROLLBACK", heute=date(2026, 4, 11), akteur="codex-test",
+        )
+    # Kein Rollback-Leck: weder Kapital- noch Bankentgelt-Buchung bestehen -
+    # Saldo unverändert wie unmittelbar nach der ursprünglichen Zahlung
+    # (ZAHLUNG allein = Guthaben, hier -600,00).
+    saldo = bank_service._op_service.berechne_saldo(konto.id)
+    assert saldo.saldo_cent == -600_00
+    assert bank_repo.verwendeter_betrag_rueckbuchung(rueck.id) == 0
+    assert bank_repo.kumulativ_zurueckgebucht(zahlung_op.id) == 0
 
 
 def test_vorgang_id_unterscheidet_retry_von_unabhaengiger_teilzuordnung(bank_service, bank_repo, basis_vertrag, ctx_factory):

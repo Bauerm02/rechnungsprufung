@@ -20,6 +20,7 @@ from mietinkasso.infrastructure.db.tables import (
     BankTransaktionTable,
     KontoTable,
     OPPositionTable,
+    RuecklastschriftkostenTable,
     ZuordnungTable,
 )
 
@@ -188,20 +189,35 @@ class BankRepository:
             return _query(owned_session)
 
     def verwendeter_betrag_rueckbuchung(self, bank_transaktion_id: int, *, session: Session | None = None) -> int:
-        """Summe der bereits als RUECKLASTSCHRIFT verbuchten Beträge, die
-        sich auf diese (negative) Transaktion berufen - begrenzt, wie viel
-        von ihrem eigenen Betrag noch für weitere Rückbuchungen verfügbar
-        ist (eine Sammel-Rücklastschrift kann mehrere Ursprungszahlungen
-        abdecken, aber nie mehr als ihren eigenen Betrag)."""
+        """Summe des bereits "erklärten" (verwendeten) Betrags dieser
+        (negativen) Transaktion - begrenzt, wie viel von ihrem eigenen
+        Betrag noch für weitere Rückbuchungen verfügbar ist (eine Sammel-
+        Rücklastschrift kann mehrere Ursprungszahlungen abdecken, aber nie
+        mehr als ihren eigenen Betrag). Zwei Anteile zählen dazu
+        (vollständige Bankzuordnung, Auftrag HV-20261019-VERSAND-KOSTEN-
+        ABSCHLUSS): die bereits als RUECKLASTSCHRIFT verbuchte
+        Kapitalrestaurierung UND ein separat dokumentiertes Bankentgelt
+        (`RuecklastschriftkostenTable.bankentgelt_cent`, GENAU dann an
+        diese Transaktion gebunden, wenn es aus ihr über `bank/service.py
+        ::verarbeite_ruecklastschrift_mit_bankentgelt` entstand) - letzteres
+        zählt UNABHÄNGIG davon, ob daraus eine Forderung gebucht wurde
+        (zurechenbar) oder die Zeile rein dokumentarisch blieb (nicht
+        zurechenbar): in beiden Fällen ist der tatsächliche Bankbetrag
+        damit bereits vollständig erklärt, nicht nur die ggf. gebuchte
+        Forderung."""
 
         def _query(active_session: Session) -> int:
-            summe = active_session.execute(
+            rueckbuchung_summe = active_session.execute(
                 select(func.coalesce(func.sum(OPPositionTable.betrag_cent), 0))
                 .where(OPPositionTable.bank_transaktion_id == bank_transaktion_id)
                 .where(OPPositionTable.typ == "RUECKLASTSCHRIFT")
                 .where(OPPositionTable.status == "AKTIV")
             ).scalar_one()
-            return int(summe)
+            bankentgelt_summe = active_session.execute(
+                select(func.coalesce(func.sum(RuecklastschriftkostenTable.bankentgelt_cent), 0))
+                .where(RuecklastschriftkostenTable.bank_transaktion_id == bank_transaktion_id)
+            ).scalar_one()
+            return int(rueckbuchung_summe) + int(bankentgelt_summe)
 
         if session is not None:
             return _query(session)

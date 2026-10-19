@@ -1923,6 +1923,16 @@ class RuecklastschriftkostenTable(Base):
     # verweist auf die bereits bestehende `OPPositionTable`-Zeile vom Typ
     # RUECKLASTSCHRIFT, deren tatsächliches Bankentgelt hier erfasst wird.
     ruecklastschrift_op_position_id: Mapped[int] = mapped_column(Integer)
+    # Additiv (19.10.2026), lose Referenz ohne FK, NUR gesetzt, wenn diese
+    # Zeile über `bank/service.py::verarbeite_ruecklastschrift_mit_
+    # bankentgelt` aus EINER nativen Banktransaktion entstand (NULL bei
+    # der älteren, rein manuellen Erfassung ohne Transaktionsbezug) -
+    # erlaubt `BankRepository.verwendeter_betrag_rueckbuchung`, auch den
+    # Bankentgelt-Anteil als "an dieser Transaktion bereits erklärt" zu
+    # zählen (vollständige Bankzuordnung), unabhängig davon, ob daraus
+    # eine Forderung gebucht wurde oder die Zeile rein dokumentarisch
+    # blieb.
+    bank_transaktion_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     bankentgelt_cent: Mapped[int] = mapped_column(Integer)
     rueckgabeursache: Mapped[str] = mapped_column(String(128))
     dem_zahlungspflichtigen_zurechenbar: Mapped[bool] = mapped_column(Boolean)

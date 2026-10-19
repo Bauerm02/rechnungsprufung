@@ -133,6 +133,30 @@
       ]
     },
     {
+      "path": "/backoffice/bank/{transaktion_id}/ruecklastschrift",
+      "method": "GET",
+      "endpoint": "bank_ruecklastschrift_formular",
+      "resolved_endpoint": "bank_ruecklastschrift_formular",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/bank/{transaktion_id}/ruecklastschrift",
+      "method": "POST",
+      "endpoint": "bank_ruecklastschrift_absenden",
+      "resolved_endpoint": "bank_ruecklastschrift_absenden",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
       "path": "/backoffice/bank/{transaktion_id}/verknuepfen",
       "method": "GET",
       "endpoint": "bank_verknuepfen_formular",
@@ -1325,6 +1349,20 @@
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
     },
     {
+      "path": "/backoffice/bank/{transaktion_id}/ruecklastschrift",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/bank/{transaktion_id}/ruecklastschrift",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
       "path": "/backoffice/bank/{transaktion_id}/verknuepfen",
       "method": "get",
       "status": 503,
@@ -1984,5 +2022,5 @@
     }
   ],
   "session_dependency_count": 1,
-  "baseline_commit": "e095c73fa148f2a6ce8b8e0b8e9ab7735a8120d0 + HV-20261001-BK-AUTOMATIK + HV-20261019-MAHNKOSTEN (additiv: Rücklastschriftkosten-/Mahnpauschale-Freigabe-Routen)"
+  "baseline_commit": "e095c73fa148f2a6ce8b8e0b8e9ab7735a8120d0 + HV-20261001-BK-AUTOMATIK + HV-20261019-MAHNKOSTEN + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS (additiv: native Rücklastschrift+Bankentgelt-Route)"
 }

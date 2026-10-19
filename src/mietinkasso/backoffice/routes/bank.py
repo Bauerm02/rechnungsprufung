@@ -331,9 +331,12 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
                 </tr>"""
 
             def _klaerfall_zeile(tx: object, begruendung: str) -> str:
-                # Bewusst KEIN normales Zuordnungsformular/Vorschlag bei
-                # negativen (oder Null-)Beträgen - nur ein Prüffall-Hinweis,
-                # keine neue Rücklastschrift-Buchung wird hier implementiert.
+                # KEIN normales Zuordnungsformular/Vorschlag wie bei
+                # positiven Eingängen - nur ein Prüffall-Hinweis PLUS (für
+                # einen echten negativen Rest) der Link zur dedizierten
+                # Rücklastschrift-Erfassung (Auftrag HV-20261019-VERSAND-
+                # KOSTEN-ABSCHLUSS, siehe `bank_ruecklastschrift_formular`
+                # unten) - eine Nullbewegung bleibt weiterhin ohne Aktion.
                 # Codex-Rückprüfung db3755a: der ursprüngliche Bankbetrag
                 # allein reichte nicht - bereits verarbeitete Teil-
                 # Rücklastschriften und der verbleibende Prüfrest müssen
@@ -347,13 +350,22 @@ def bank_unzugeordnet(request: Request, bank_konto_id: str | None = None, sessio
                         f'<p class="muted">verarbeitet {eur(verarbeitet)} &middot; Prüfrest {eur(rest)} '
                         f'(von {eur(urspruenglich)})</p>'
                     )
+                # Rücklastschrift-Erfassung (Kapital + ggf. Bankentgelt in
+                # EINER Transaktion) nur für einen ECHTEN negativen Rest -
+                # eine Nullbewegung bleibt bewusst ohne Aktion (siehe
+                # Codex-Rückprüfung db3755a oben).
+                aktion_html = (
+                    f'<a class="btn-verknuepfen" href="/backoffice/bank/{tx.id}/ruecklastschrift">'
+                    "Rücklastschrift erfassen</a>"
+                    if tx.betrag_cent < 0 and rest > 0 else ""
+                )
                 return f"""
                 <tr>
                   <td class="nowrap">{eur(tx.betrag_cent)}</td><td class="nowrap">{tx.buchungsdatum.isoformat()}</td>
                   <td class="tx-referenz">{h(tx.referenz or '')}</td>
                   <td>{h(begruendung)}</td>
                   <td>{status_html}</td>
-                  <td>{_bank_tx_details_html(tx)}</td>
+                  <td>{aktion_html}{_bank_tx_details_html(tx)}</td>
                 </tr>"""
 
             def _sonstige_zeile(tx: object, begruendung: str, *, manuelle_optionen: bool) -> str:
@@ -626,3 +638,109 @@ def bank_verknuepfen(
     except (MietinkassoError, ValueError) as exc:
         return _fehlerseite(session, "Verknüpfung", str(exc), f"/backoffice/bank/unzugeordnet?bank_konto_id={transaktion.bank_konto_id}")
     return RedirectResponse(url=f"/backoffice/bank/unzugeordnet?bank_konto_id={transaktion.bank_konto_id}&zugeordnet=1", status_code=303)
+
+
+# -- Native Rücklastschrift + Bankentgelt (Auftrag HV-20261019-VERSAND- ------
+# -- KOSTEN-ABSCHLUSS, 19.10.2026) -------------------------------------------
+
+
+@router.get("/bank/{transaktion_id}/ruecklastschrift", response_class=HTMLResponse)
+def bank_ruecklastschrift_formular(request: Request, transaktion_id: int, session=Depends(_current_session)) -> HTMLResponse:
+    transaktion = deps._bank_repo.get_transaktion(transaktion_id)
+    if transaktion is None:
+        return _fehlerseite(session, "Rücklastschrift", f"Unbekannte Transaktion {transaktion_id}.", "/backoffice/bank/unzugeordnet")
+    if transaktion.betrag_cent >= 0:
+        return _fehlerseite(
+            session, "Rücklastschrift",
+            f"Transaktion {transaktion_id} ist kein negativer Bankeingang (Betrag {eur(transaktion.betrag_cent)}).",
+            "/backoffice/bank/unzugeordnet",
+        )
+    verfuegbar = abs(transaktion.betrag_cent) - deps._bank_repo.verwendeter_betrag_rueckbuchung(transaktion_id)
+    inhalt = f"""
+    <div class="card" style="max-width:640px;">
+      <h1>Rücklastschrift erfassen — Transaktion #{transaktion_id}</h1>
+      <table>
+        <tr><th>Betrag (Bankbeleg)</th><td>{eur(transaktion.betrag_cent)}</td></tr>
+        <tr><th>Datum</th><td>{transaktion.buchungsdatum.isoformat()}</td></tr>
+        <tr><th>Referenz</th><td>{h(transaktion.referenz or '')}</td></tr>
+        <tr><th>Noch verfügbar (nicht bereits verwendet)</th><td>{eur(verfuegbar)}</td></tr>
+      </table>
+      <p class="muted">Ordnet diese native, negative Banktransaktion EINER bereits bankgebundenen
+         ZAHLUNG zu. Enthält der Betrag MEHR als die Ursprungszahlung (z. B. zusätzliches
+         Bankentgelt), wird das Originalkapital restauriert und der Rest getrennt als
+         Bankentgelt dokumentiert - in EINER Buchung, keine 1:1-Gesamtbelastung als Mietkapital.
+         Das Bankentgelt wird NIE geschätzt, sondern ist genau der nach der Kapitalrestaurierung
+         verbleibende, tatsächliche Rest dieser Transaktion.</p>
+      <form method="post" action="/backoffice/bank/{transaktion_id}/ruecklastschrift">
+        {csrf_feld(session.csrf_token)}
+        <label>Bestehende ZAHLUNG-OP-ID (aus dem Kontoauszug, Spalte &quot;#&quot;)</label>
+        <input type="number" name="op_position_id" required>
+        <label>Konto-ID (zur Bestätigung/Mandantenprüfung)</label>
+        <input type="text" name="konto_id" required>
+        <label>Rückgabeursache (Pflicht, laut Bankbeleg)</label>
+        <input type="text" name="rueckgabeursache" required placeholder="z. B. Mangels Deckung" value="{h(transaktion.referenz or '')}">
+        <label><input type="checkbox" name="dem_zahlungspflichtigen_zurechenbar" value="1">
+          Ein etwaiges Bankentgelt ist dem Zahlungspflichtigen zurechenbar (z. B. KEIN Bank-/SEPA-Fehler) -
+          nur dann wird daraus eine Forderung gebucht</label>
+        <label>Begründung Zurechenbarkeit (Pflicht, auch wenn NICHT zurechenbar - z. B. Bankfehler)</label>
+        <textarea name="zurechenbarkeit_begruendung" rows="3" required></textarea>
+        <label>Beleg-Referenz (Pflicht, z. B. Bankauszugs-/Belegnummer)</label>
+        <input type="text" name="beleg_referenz" required value="Banktransaktion #{transaktion_id} vom {transaktion.buchungsdatum.isoformat()}">
+        <button type="submit">Rücklastschrift erfassen</button>
+      </form>
+    </div>"""
+    return _layout(request, session, "Rücklastschrift", inhalt)
+
+
+@router.post("/bank/{transaktion_id}/ruecklastschrift")
+def bank_ruecklastschrift_absenden(
+    request: Request,
+    transaktion_id: int,
+    op_position_id: int = Form(...),
+    konto_id: str = Form(...),
+    rueckgabeursache: str = Form(...),
+    dem_zahlungspflichtigen_zurechenbar: str = Form(""),
+    zurechenbarkeit_begruendung: str = Form(...),
+    beleg_referenz: str = Form(...),
+    csrf_token: str = Form(...),
+    session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    transaktion = deps._bank_repo.get_transaktion(transaktion_id)
+    if transaktion is None:
+        return _fehlerseite(session, "Rücklastschrift", f"Unbekannte Transaktion {transaktion_id}.", "/backoffice/bank/unzugeordnet")
+    konto = deps._stammdaten_repo.get_konto(konto_id)
+    if konto is None:
+        return _fehlerseite(session, "Rücklastschrift", f"Unbekanntes Konto {konto_id}.", f"/backoffice/bank/{transaktion_id}/ruecklastschrift")
+    original_op_position = deps._op_service.get_position(op_position_id)
+    if original_op_position is None:
+        return _fehlerseite(
+            session, "Rücklastschrift", f"Unbekannte OP-Position {op_position_id}.",
+            f"/backoffice/bank/{transaktion_id}/ruecklastschrift",
+        )
+    try:
+        kapital_op, kosten_zeile = deps._bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+            ctx=_ctx(session), transaktion=transaktion, original_op_position=original_op_position, konto=konto,
+            ruecklastschriftkosten_service=deps._ruecklastschriftkosten_service,
+            rueckgabeursache=rueckgabeursache,
+            dem_zahlungspflichtigen_zurechenbar=(dem_zahlungspflichtigen_zurechenbar == "1"),
+            zurechenbarkeit_begruendung=zurechenbarkeit_begruendung, beleg_referenz=beleg_referenz,
+            heute=date.today(), akteur=session.user_id,
+        )
+        deps._audit_service.log(
+            entity_typ="bank_ruecklastschrift", entity_id=str(transaktion_id), akteur=session.user_id,
+            aktion="ruecklastschrift_mit_bankentgelt_erfasst",
+            payload={
+                "transaktion_id": transaktion_id, "op_position_id": op_position_id,
+                "kapital_op_id": kapital_op.id if kapital_op is not None else None,
+                "kosten_zeile_id": kosten_zeile.id if kosten_zeile is not None else None,
+            },
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(
+            session, "Rücklastschrift", str(exc), f"/backoffice/bank/{transaktion_id}/ruecklastschrift",
+        )
+    return RedirectResponse(
+        url=f"/backoffice/bank/unzugeordnet?bank_konto_id={transaktion.bank_konto_id}&ruecklastschrift_erfasst=1",
+        status_code=303,
+    )

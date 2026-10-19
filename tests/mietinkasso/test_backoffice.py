@@ -1457,6 +1457,102 @@ def test_bank_verknuepfen_bindet_rohtransaktion_an_bestehende_zahlung_ohne_neue_
     assert "Link-Duplikat" in konflikt.text
 
 
+def test_bank_ruecklastschrift_formular_und_absenden_bucht_kapital_und_bankentgelt_atomar(backoffice_client):
+    """Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS: einfaches
+    Portalformular für eine vorhandene negative Bankzeile - ordnet sie
+    atomar einer bestehenden ZAHLUNG zu und bucht Kapitalrestaurierung
+    PLUS Bankentgelt in EINER Anfrage."""
+
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-RLSBANK", objekt_id="601", bezeichnung="Top RLS-Bank", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-RLSBANK", einheit_id="601-TOP-RLSBANK", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-RLSBANK"))
+    # Vorab (vor dem Bankfeed) gebuchte Zahlung, ERST über "Bestehende
+    # Zahlung verknüpfen" bankgebunden - `verarbeite_ruecklastschrift`
+    # verlangt eine echte `ZuordnungTable`-Zeile (keine Rücklastschrift
+    # ohne belegte Ursprungszahlung).
+    zahlung = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=60_000,
+        belegdatum=date(2026, 4, 1), buchungsdatum=date(2026, 4, 1), faelligkeit=None,
+        beleg_referenz="Vorab erfasste Zahlung (vor Bankfeed)",
+    )
+    eingang_text = _bank_datei_importieren(client, csrf, bank_konto_id="BK-TEST-RLSBANK", betrag_text="600.00")
+    treffer_eingang = re.search(r"/backoffice/bank/(\d+)/verknuepfen", eingang_text)
+    assert treffer_eingang is not None
+    eingang_transaktion_id = treffer_eingang.group(1)
+    verknuepft = client.post(
+        f"/backoffice/bank/{eingang_transaktion_id}/verknuepfen",
+        data={
+            "op_position_id": str(zahlung.id), "konto_id": konto.id, "betrag": "600,00",
+            "vorgangs_id": "VERKNUEPFT-RLSBANK-1", "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert verknuepft.status_code == 303
+
+    seiten_text = _bank_datei_importieren(
+        client, csrf, bank_konto_id="BK-TEST-RLSBANK", betrag_text="-612.50", referenz="RUECKLASTSCHRIFT MS03",
+    )
+    treffer_tx = re.search(r"/backoffice/bank/(\d+)/ruecklastschrift", seiten_text)
+    assert treffer_tx is not None
+    transaktion_id = treffer_tx.group(1)
+
+    formular = client.get(f"/backoffice/bank/{transaktion_id}/ruecklastschrift")
+    assert formular.status_code == 200
+    assert "612,50" in formular.text
+
+    abgesendet = client.post(
+        f"/backoffice/bank/{transaktion_id}/ruecklastschrift",
+        data={
+            "op_position_id": str(zahlung.id), "konto_id": konto.id,
+            "rueckgabeursache": "Mangels Deckung", "dem_zahlungspflichtigen_zurechenbar": "1",
+            "zurechenbarkeit_begruendung": "Dauerhaft fehlende Kontodeckung, vom Mieter zu vertreten.",
+            "beleg_referenz": "Bankbeleg RLS-BANK-1", "csrf_token": csrf,
+        },
+        follow_redirects=False,
+    )
+    assert abgesendet.status_code == 303
+
+    saldo = op_service.berechne_saldo(konto.id)
+    assert saldo.saldo_cent == 1250  # Kapital gleicht sich aus, nur das Bankentgelt bleibt offen
+
+    unzugeordnet = client.get("/backoffice/bank/unzugeordnet", params={"bank_konto_id": "BK-TEST-RLSBANK"})
+    assert f"/backoffice/bank/{transaktion_id}/ruecklastschrift" not in unzugeordnet.text  # vollständig erklärt
+
+
+def test_bank_ruecklastschrift_absenden_ohne_csrf_wird_abgelehnt(backoffice_client):
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    seiten_text = _bank_datei_importieren(client, csrf, bank_konto_id="BK-TEST-RLSBANK-CSRF", betrag_text="-50.00")
+    treffer_tx = re.search(r"/backoffice/bank/(\d+)/ruecklastschrift", seiten_text)
+    assert treffer_tx is not None
+    transaktion_id = treffer_tx.group(1)
+
+    antwort = client.post(
+        f"/backoffice/bank/{transaktion_id}/ruecklastschrift",
+        data={
+            "op_position_id": "1", "konto_id": "KTO-IRGENDWAS", "rueckgabeursache": "x",
+            "dem_zahlungspflichtigen_zurechenbar": "", "zurechenbarkeit_begruendung": "x",
+            "beleg_referenz": "x", "csrf_token": "voellig-falsch",
+        },
+    )
+    assert antwort.status_code == 403
+
+
 def test_automatische_bankzuordnung_route_ist_ausserhalb_bekannter_demo_umgebungen_gesperrt(backoffice_client, monkeypatch):
     """Codex-Rückprüfung (Paket A/B): eine ausgeblendete Schaltfläche
     allein ist kein Schutz - die POST-Route selbst muss außerhalb

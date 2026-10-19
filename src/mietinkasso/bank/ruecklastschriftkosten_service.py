@@ -55,6 +55,7 @@ from mietinkasso.op.service import OPService
 def _wiederholung_stimmt_ueberein(
     bestehend: RuecklastschriftkostenTable, *, bankentgelt_cent: int, rueckgabeursache: str,
     dem_zahlungspflichtigen_zurechenbar: bool, zurechenbarkeit_begruendung: str, beleg_referenz: str,
+    bank_transaktion_id: int | None = None,
 ) -> bool:
     return (
         bestehend.bankentgelt_cent == bankentgelt_cent
@@ -62,6 +63,7 @@ def _wiederholung_stimmt_ueberein(
         and bestehend.dem_zahlungspflichtigen_zurechenbar == dem_zahlungspflichtigen_zurechenbar
         and bestehend.zurechenbarkeit_begruendung == zurechenbarkeit_begruendung
         and bestehend.beleg_referenz == beleg_referenz
+        and bestehend.bank_transaktion_id == bank_transaktion_id
     )
 
 
@@ -89,9 +91,11 @@ class RuecklastschriftkostenRepository:
         self, *, vertrag_id: str, ruecklastschrift_op_position_id: int, bankentgelt_cent: int,
         rueckgabeursache: str, dem_zahlungspflichtigen_zurechenbar: bool, zurechenbarkeit_begruendung: str,
         beleg_referenz: str, kosten_op_position_id: int | None, erstellt_von: str, session: Session,
+        bank_transaktion_id: int | None = None,
     ) -> RuecklastschriftkostenTable:
         row = RuecklastschriftkostenTable(
             vertrag_id=vertrag_id, ruecklastschrift_op_position_id=ruecklastschrift_op_position_id,
+            bank_transaktion_id=bank_transaktion_id,
             bankentgelt_cent=bankentgelt_cent, rueckgabeursache=rueckgabeursache,
             dem_zahlungspflichtigen_zurechenbar=dem_zahlungspflichtigen_zurechenbar,
             zurechenbarkeit_begruendung=zurechenbarkeit_begruendung, beleg_referenz=beleg_referenz,
@@ -129,6 +133,18 @@ class RuecklastschriftkostenService:
         self._op_service = op_service
         self._repository = repository or RuecklastschriftkostenRepository(session_factory)
 
+    def vorhandene_erfassung(
+        self, ruecklastschrift_op_position_id: int, *, session: Session | None = None,
+    ) -> RuecklastschriftkostenTable | None:
+        """Öffentlicher Lesezugriff auf eine ggf. bereits bestehende
+        Erfassung - für Aufrufer (z. B. `bank/service.py::verarbeite_
+        ruecklastschrift_mit_bankentgelt`), die VOR einer eigenen
+        Split-/Verfügbarkeitsberechnung wissen müssen, ob (und mit
+        welchem Bankentgelt) diese Rücklastschrift-OP bereits erfasst
+        wurde, ohne dafür das `_repository`-Attribut anzufassen."""
+
+        return self._repository.fuer_ruecklastschrift(ruecklastschrift_op_position_id, session=session)
+
     def erfasse_und_buche(
         self,
         *,
@@ -143,16 +159,25 @@ class RuecklastschriftkostenService:
         beleg_referenz: str,
         heute: date,
         akteur: str,
+        session: Session | None = None,
+        bank_transaktion_id: int | None = None,
     ) -> RuecklastschriftkostenTable:
         """Erfasst das tatsächliche Bankentgelt EINER bereits verbuchten
         Rücklastschrift und bucht es - NUR bei belegter Zurechenbarkeit -
         als eigene SOLL-Position gegen den Zahlungspflichtigen. Ein
         wiederholter Aufruf für DIESELBE `ruecklastschrift_op_position`
         liefert die bereits bestehende Erfassung zurück (keine
-        Doppelbuchung, siehe Moduldoc)."""
+        Doppelbuchung, siehe Moduldoc).
 
-        require_gesellschaft_access(ctx, konto.gesellschaft_id)
-        require_schreibrecht(ctx)
+        `session` (Codex-Rückmeldung 19.10.2026, analog zu `op_service.
+        buchen`/`bank/service.py::verarbeite_ruecklastschrift`): mit
+        übergebener Session wird NICHT committet/zurückgerollt und die
+        Idempotenz-/Konfliktprüfung liest ÜBER DIESELBE (bereits
+        gesperrte) Session - der Aufrufer (`bank/service.py::
+        verarbeite_ruecklastschrift_mit_bankentgelt`) führt diese Buchung
+        als Teil einer größeren, gemeinsamen Transaktion aus. Ohne
+        übergebene Session unverändert wie bisher: eigene kurzlebige
+        Session, committet/rollt selbst zurück."""
 
         if OPTyp(ruecklastschrift_op_position.typ) is not OPTyp.RUECKLASTSCHRIFT:
             raise ValueError(
@@ -166,12 +191,50 @@ class RuecklastschriftkostenService:
         if not zurechenbarkeit_begruendung.strip():
             raise ValueError("Zurechenbarkeit (Verschulden) muss fallbezogen begründet werden.")
 
+        if session is not None:
+            require_gesellschaft_access(ctx, konto.gesellschaft_id)
+            require_schreibrecht(ctx)
+            bestehend = self._repository.fuer_ruecklastschrift(
+                ruecklastschrift_op_position.id, with_for_update=True, session=session,
+            )
+            if bestehend is not None:
+                if _wiederholung_stimmt_ueberein(
+                    bestehend, bankentgelt_cent=bankentgelt_cent, rueckgabeursache=rueckgabeursache,
+                    dem_zahlungspflichtigen_zurechenbar=dem_zahlungspflichtigen_zurechenbar,
+                    zurechenbarkeit_begruendung=zurechenbarkeit_begruendung, beleg_referenz=beleg_referenz,
+                    bank_transaktion_id=bank_transaktion_id,
+                ):
+                    # KEIN `session.expunge` hier: der Aufrufer (`bank/
+                    # service.py::verarbeite_ruecklastschrift_mit_
+                    # bankentgelt`) hält die Transaktion und
+                    # committet/refresht selbst - ein hier expungtes
+                    # Objekt wäre für dessen `session.refresh(...)` nicht
+                    # mehr persistent.
+                    return bestehend  # echter Retry, No-Op
+                raise VorgangIdKonfliktError(
+                    f"Rücklastschriftkosten für OPPosition {ruecklastschrift_op_position.id} wurden bereits "
+                    f"MIT ABWEICHENDEN Werten erfasst (Bankentgelt {bestehend.bankentgelt_cent}, zurechenbar "
+                    f"{bestehend.dem_zahlungspflichtigen_zurechenbar}); angefordert wurden Bankentgelt "
+                    f"{bankentgelt_cent}, zurechenbar {dem_zahlungspflichtigen_zurechenbar}."
+                )
+            return self._buchen_in_session(
+                session, ctx=ctx, ruecklastschrift_op_position=ruecklastschrift_op_position, vertrag_id=vertrag_id,
+                konto=konto, bankentgelt_cent=bankentgelt_cent, rueckgabeursache=rueckgabeursache,
+                dem_zahlungspflichtigen_zurechenbar=dem_zahlungspflichtigen_zurechenbar,
+                zurechenbarkeit_begruendung=zurechenbarkeit_begruendung, beleg_referenz=beleg_referenz,
+                heute=heute, akteur=akteur, bank_transaktion_id=bank_transaktion_id,
+            )
+
+        require_gesellschaft_access(ctx, konto.gesellschaft_id)
+        require_schreibrecht(ctx)
+
         bestehend = self._repository.fuer_ruecklastschrift(ruecklastschrift_op_position.id)
         if bestehend is not None:
             if _wiederholung_stimmt_ueberein(
                 bestehend, bankentgelt_cent=bankentgelt_cent, rueckgabeursache=rueckgabeursache,
                 dem_zahlungspflichtigen_zurechenbar=dem_zahlungspflichtigen_zurechenbar,
                 zurechenbarkeit_begruendung=zurechenbarkeit_begruendung, beleg_referenz=beleg_referenz,
+                bank_transaktion_id=bank_transaktion_id,
             ):
                 return bestehend  # echter Retry, No-Op
             raise VorgangIdKonfliktError(
@@ -183,36 +246,17 @@ class RuecklastschriftkostenService:
                 "zweiten, unabhängigen Vorgang ist keine zweite Erfassung je Rücklastschrift-OP vorgesehen."
             )
 
-        with self._session_factory() as session:
+        with self._session_factory() as eigene_session:
             try:
-                kosten_position_id = None
-                if dem_zahlungspflichtigen_zurechenbar:
-                    # KEINE `bezieht_sich_auf_id` auf die Rücklastschrift: eine
-                    # explizite OP-Bindung ist laut `op/validierung.py::pruefe_bezug`
-                    # nur für ZAHLUNG/GUTSCHRIFT (-> Forderung) und RUECKLASTSCHRIFT
-                    # (-> Zahlung) definiert, NICHT für SOLL. Die Rückverfolgbarkeit
-                    # läuft stattdessen über `RuecklastschriftkostenTable.
-                    # ruecklastschrift_op_position_id`/`kosten_op_position_id` (siehe
-                    # `anlegen` unten) sowie `import_id`/`beleg_referenz` dieser Position.
-                    kosten_position = self._op_service.buchen(
-                        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=bankentgelt_cent,
-                        belegdatum=heute, buchungsdatum=heute, faelligkeit=None,
-                        beleg_referenz=beleg_referenz,
-                        aenderungsgrund="Rücklastschriftkosten - tatsächliches Originalbankentgelt",
-                        import_id=f"RUECKLASTSCHRIFTKOSTEN:{ruecklastschrift_op_position.id}",
-                        quelle_system="ruecklastschriftkosten",
-                        session=session,
-                    )
-                    kosten_position_id = kosten_position.id
-
-                row = self._repository.anlegen(
-                    vertrag_id=vertrag_id, ruecklastschrift_op_position_id=ruecklastschrift_op_position.id,
-                    bankentgelt_cent=bankentgelt_cent, rueckgabeursache=rueckgabeursache,
+                row = self._buchen_in_session(
+                    eigene_session, ctx=ctx, ruecklastschrift_op_position=ruecklastschrift_op_position,
+                    vertrag_id=vertrag_id, konto=konto, bankentgelt_cent=bankentgelt_cent,
+                    rueckgabeursache=rueckgabeursache,
                     dem_zahlungspflichtigen_zurechenbar=dem_zahlungspflichtigen_zurechenbar,
                     zurechenbarkeit_begruendung=zurechenbarkeit_begruendung, beleg_referenz=beleg_referenz,
-                    kosten_op_position_id=kosten_position_id, erstellt_von=akteur, session=session,
+                    heute=heute, akteur=akteur, bank_transaktion_id=bank_transaktion_id,
                 )
-                session.commit()
+                eigene_session.commit()
                 return row
             except IntegrityError:
                 # Ein gleichzeitiger zweiter Versuch für DIESELBE
@@ -221,7 +265,7 @@ class RuecklastschriftkostenService:
                 # Fall (siehe Moduldoc). Findet sich KEINE eigene Zeile
                 # oder weicht sie ab, war die IntegrityError ein echter,
                 # ungeklärter Konflikt.
-                session.rollback()
+                eigene_session.rollback()
                 bestehend = self._repository.fuer_ruecklastschrift(ruecklastschrift_op_position.id)
                 if bestehend is None:
                     raise RuntimeError(
@@ -233,12 +277,59 @@ class RuecklastschriftkostenService:
                     bestehend, bankentgelt_cent=bankentgelt_cent, rueckgabeursache=rueckgabeursache,
                     dem_zahlungspflichtigen_zurechenbar=dem_zahlungspflichtigen_zurechenbar,
                     zurechenbarkeit_begruendung=zurechenbarkeit_begruendung, beleg_referenz=beleg_referenz,
+                    bank_transaktion_id=bank_transaktion_id,
                 ):
                     raise VorgangIdKonfliktError(
                         f"Rücklastschriftkosten für OPPosition {ruecklastschrift_op_position.id} wurden "
                         "gleichzeitig MIT ABWEICHENDEN Werten erfasst."
                     ) from None
                 return bestehend
+
+    def _buchen_in_session(
+        self,
+        session: Session,
+        *,
+        ctx: AuthContext,
+        ruecklastschrift_op_position: OPPositionTable,
+        vertrag_id: str,
+        konto: KontoTable,
+        bankentgelt_cent: int,
+        rueckgabeursache: str,
+        dem_zahlungspflichtigen_zurechenbar: bool,
+        zurechenbarkeit_begruendung: str,
+        beleg_referenz: str,
+        heute: date,
+        akteur: str,
+        bank_transaktion_id: int | None = None,
+    ) -> RuecklastschriftkostenTable:
+        kosten_position_id = None
+        if dem_zahlungspflichtigen_zurechenbar:
+            # KEINE `bezieht_sich_auf_id` auf die Rücklastschrift: eine
+            # explizite OP-Bindung ist laut `op/validierung.py::pruefe_bezug`
+            # nur für ZAHLUNG/GUTSCHRIFT (-> Forderung) und RUECKLASTSCHRIFT
+            # (-> Zahlung) definiert, NICHT für SOLL. Die Rückverfolgbarkeit
+            # läuft stattdessen über `RuecklastschriftkostenTable.
+            # ruecklastschrift_op_position_id`/`kosten_op_position_id` (siehe
+            # `anlegen` unten) sowie `import_id`/`beleg_referenz` dieser Position.
+            kosten_position = self._op_service.buchen(
+                ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=bankentgelt_cent,
+                belegdatum=heute, buchungsdatum=heute, faelligkeit=None,
+                beleg_referenz=beleg_referenz,
+                aenderungsgrund="Rücklastschriftkosten - tatsächliches Originalbankentgelt",
+                import_id=f"RUECKLASTSCHRIFTKOSTEN:{ruecklastschrift_op_position.id}",
+                quelle_system="ruecklastschriftkosten",
+                session=session,
+            )
+            kosten_position_id = kosten_position.id
+
+        return self._repository.anlegen(
+            vertrag_id=vertrag_id, ruecklastschrift_op_position_id=ruecklastschrift_op_position.id,
+            bank_transaktion_id=bank_transaktion_id,
+            bankentgelt_cent=bankentgelt_cent, rueckgabeursache=rueckgabeursache,
+            dem_zahlungspflichtigen_zurechenbar=dem_zahlungspflichtigen_zurechenbar,
+            zurechenbarkeit_begruendung=zurechenbarkeit_begruendung, beleg_referenz=beleg_referenz,
+            kosten_op_position_id=kosten_position_id, erstellt_von=akteur, session=session,
+        )
 
     def uebernimm_zurechenbarkeit_nachtraeglich(
         self,
