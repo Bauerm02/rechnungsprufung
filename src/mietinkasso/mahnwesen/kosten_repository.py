@@ -98,7 +98,9 @@ class MahnkostenRepository:
         vereinbarter_zinssatz_prozent=None, vereinbarung_geprueft: bool = False, vereinbarung_beleg: str | None = None,
         mahngebuehr_kostenbasis_cent: int | None = None, mahngebuehr_kostenbasis_beleg: str | None = None,
         gueltig_ab: date | None = None, verzugsverantwortung_geprueft: bool = False,
-        versandkosten_ersatzfaehig_geprueft: bool = False, erstellt_von: str,
+        versandkosten_ersatzfaehig_geprueft: bool = False,
+        mahnpauschale_kostenbasis_cent: int | None = None, mahnpauschale_kostenbasis_beleg: str | None = None,
+        mahnpauschale_geprueft: bool = False, erstellt_von: str,
     ) -> ZinsprofilTable:
         # §458 UGB deckelt die Mahnspesen-Pauschale gesetzlich auf 40 EUR
         # (unabhängige Rückprüfung Codex 14.09.2026, echter Bug: das
@@ -111,6 +113,16 @@ class MahnkostenRepository:
             raise ValueError(
                 f"Mahngebühr-Kostenbasis {mahngebuehr_kostenbasis_cent} Cent liegt außerhalb des gesetzlichen "
                 f"§458-UGB-Rahmens (0 bis {S458_UGB_HOECHSTBETRAG_CENT} Cent = 40,00 EUR)."
+            )
+        # Auftrag HV-20261019-MAHNKOSTEN: anders als §458 UGB kennt §1333
+        # Abs 2 ABGB keinen gesetzlichen Höchstbetrag (die Pauschale ist
+        # bereits durch die fallbezogene Verhältnismäßigkeitsprüfung
+        # begrenzt, siehe `ZinsprofilTable.mahnpauschale_kostenbasis_cent`-
+        # Docstring) - hier nur ein defensiver Mindestwert (keine negative/
+        # Null-Kostenbasis), analog zum bestehenden §458-Guard.
+        if mahnpauschale_kostenbasis_cent is not None and mahnpauschale_kostenbasis_cent <= 0:
+            raise ValueError(
+                f"Mahnpauschale-Kostenbasis {mahnpauschale_kostenbasis_cent} Cent muss größer als 0 sein."
             )
         with self._session_factory() as session:
             bisherige_version = session.execute(
@@ -125,7 +137,10 @@ class MahnkostenRepository:
                 vereinbarter_zinssatz_prozent=vereinbarter_zinssatz_prozent,
                 vereinbarung_geprueft=vereinbarung_geprueft, vereinbarung_beleg=vereinbarung_beleg,
                 mahngebuehr_kostenbasis_cent=mahngebuehr_kostenbasis_cent,
-                mahngebuehr_kostenbasis_beleg=mahngebuehr_kostenbasis_beleg, erstellt_von=erstellt_von,
+                mahngebuehr_kostenbasis_beleg=mahngebuehr_kostenbasis_beleg,
+                mahnpauschale_kostenbasis_cent=mahnpauschale_kostenbasis_cent,
+                mahnpauschale_kostenbasis_beleg=mahnpauschale_kostenbasis_beleg,
+                mahnpauschale_geprueft=mahnpauschale_geprueft, erstellt_von=erstellt_von,
             )
             session.add(row)
             session.commit()
@@ -473,6 +488,8 @@ class MahnkostenRepository:
         zinsen_cent: int, gebuehr_cent: int | None, rechtsgrundlage_gebuehr: str | None,
         versandnachweis_referenz: str, zinsen_op_position_id: int | None, gebuehr_op_position_id: int | None,
         erstellt_von: str, zins_segmente_json: str = "[]", zinsen_delta_je_op_json: str = "{}",
+        mahnpauschale_cent: int | None = None, rechtsgrundlage_mahnpauschale: str | None = None,
+        mahnpauschale_op_position_id: int | None = None,
         session: Session | None = None,
     ) -> MahnkostenBuchungTable:
         """`session`: siehe `stammdaten/repository.py::upsert_gesellschaft` -
@@ -499,6 +516,8 @@ class MahnkostenRepository:
                 rechtsgrundlage_gebuehr=rechtsgrundlage_gebuehr, versandnachweis_referenz=versandnachweis_referenz,
                 zinsen_op_position_id=zinsen_op_position_id, gebuehr_op_position_id=gebuehr_op_position_id,
                 zins_segmente_json=zins_segmente_json, zinsen_delta_je_op_json=zinsen_delta_je_op_json,
+                mahnpauschale_cent=mahnpauschale_cent, rechtsgrundlage_mahnpauschale=rechtsgrundlage_mahnpauschale,
+                mahnpauschale_op_position_id=mahnpauschale_op_position_id,
                 erstellt_von=erstellt_von,
             )
             active_session.add(row)

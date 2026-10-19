@@ -177,7 +177,20 @@ def ensure_mahnkosten_lauf_unique_key(engine: Engine) -> bool:
         # wird dabei NIE umbenannt, also schreibt SQLite auch NIE eine
         # Kindtabellen-Fremdschlüsseldefinition um - sie verweist die
         # ganze Zeit unverändert auf den Namen "mahnkosten_buchungen".
-        spaltennamen = ", ".join(c.name for c in zieltabelle.columns)
+        # Auftrag HV-20261019-MAHNKOSTEN, echter Bug (reproduziert über
+        # `test_migrations.py`-Altschema-Fixture): NICHT blind ALLE
+        # Spalten des AKTUELLEN ORM-Modells kopieren - eine ECHTE,
+        # produktive Altdatenbank, die diesen Rebuild VOR einem späteren
+        # additiven Spalten-Zuwachs auf `mahnkosten_buchungen` durchläuft
+        # (z. B. die drei neuen `mahnpauschale_*`-Spalten dieses
+        # Auftrags), hat diese Spalten zum Rebuild-Zeitpunkt noch gar
+        # nicht (erst `ensure_additive_columns` zieht sie nach). Nur der
+        # SCHNITT aus Modell- und tatsächlich vorhandenen Spalten wird
+        # kopiert; fehlende additive Spalten der neuen Tabelle bleiben
+        # dabei einfach bei ihrem Modell-Default/NULL, statt das
+        # `INSERT...SELECT` mit "no such column" scheitern zu lassen.
+        vorhandene_spalten_quelle = {s["name"] for s in inspector.get_columns("mahnkosten_buchungen")}
+        spaltennamen = ", ".join(c.name for c in zieltabelle.columns if c.name in vorhandene_spalten_quelle)
         temp_name = "mahnkosten_buchungen__migriert_neu"
         # `to_metadata` MUSS auf `Base.metadata` selbst zielen (nicht auf
         # eine leere `MetaData()`) - `zieltabelle` trägt einen echten

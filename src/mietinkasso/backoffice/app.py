@@ -2345,8 +2345,16 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
             zahlungsfrist_bis=heute_datum + timedelta(days=vertrag.zahlungsfrist_tage),
             forderungszeilen=forderungszeilen, bereits_offene_mahnkosten_cent=vorschau.bereits_offene_mahnkosten_cent,
             neue_zinsen_delta_cent=vorschau.neue_zinsen_delta_cent, zins_segmente=zins_segmente,
-            zinssatz_einheitlich_text=zinssatz_einheitlich_text, neue_gebuehr_cent=(vorschau.gebuehr_cent or 0),
-            gebuehr_rechtsgrundlage=vorschau.gebuehr_rechtsgrundlage, gesamtbetrag_cent=gesamtbetrag_cent,
+            zinssatz_einheitlich_text=zinssatz_einheitlich_text,
+            # `gebuehr_cent` (§458 UGB / Brief-Versandkosten-Ersatz) und
+            # `mahnpauschale_cent` (§1333 Abs 2 ABGB Mahnkostenpauschale)
+            # schließen sich in `kosten.py::berechne_mahnkosten_vorschau`
+            # GEGENSEITIG aus (nie gleichzeitig gesetzt) - die Summe hier
+            # ist daher nie eine Doppelerfassung, nur die Darstellung
+            # EINER der beiden möglichen Rechtsgrundlagen.
+            neue_gebuehr_cent=(vorschau.gebuehr_cent or 0) + (vorschau.mahnpauschale_cent or 0),
+            gebuehr_rechtsgrundlage=vorschau.gebuehr_rechtsgrundlage or vorschau.mahnpauschale_rechtsgrundlage,
+            gesamtbetrag_cent=gesamtbetrag_cent,
         )
     except _BriefAdressfehlerError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -2355,6 +2363,7 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
         "vertrag_id": vertrag_id, "stufe": stufe, "empfaenger_name": debitor.name, "empfaenger_adresse": debitor.adresse,
         "hauptforderung_cent": vorschau.hauptforderung_cent, "bereits_offene_mahnkosten_cent": vorschau.bereits_offene_mahnkosten_cent,
         "zusaetzlicher_betrag_cent": vorschau.zusaetzlicher_betrag_cent, "gebuehr_rechtsgrundlage": vorschau.gebuehr_rechtsgrundlage,
+        "mahnpauschale_cent": vorschau.mahnpauschale_cent, "mahnpauschale_rechtsgrundlage": vorschau.mahnpauschale_rechtsgrundlage,
         "forderungszeilen": [(f.bezeichnung, str(f.faelligkeit), f.betrag_cent) for f in forderungszeilen],
         "zins_segmente": [(str(s.von), str(s.bis), str(s.satz_prozent), s.zinsen_cent) for s in zins_segmente],
     })[:12]

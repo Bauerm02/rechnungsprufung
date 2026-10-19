@@ -28,6 +28,7 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -1667,6 +1668,32 @@ class ZinsprofilTable(Base):
     vereinbarung_beleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
     mahngebuehr_kostenbasis_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mahngebuehr_kostenbasis_beleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Auftrag HV-20261019-MAHNKOSTEN: generische, KANAL-UNABHÄNGIGE
+    # Mahnkostenpauschale nach §1333 Abs 2 ABGB - GETRENNT von
+    # `mahngebuehr_kostenbasis_cent` (das bleibt AUSSCHLIESSLICH die
+    # §458-UGB-Pauschale, B2B-only, verschuldensunabhängig). Diese
+    # Pauschale gilt auch für einen Verbraucher-Mieter (`ist_b2b=False`)
+    # und für BEIDE Mahnstufen (E-Mail wie Brief), setzt aber - anders
+    # als §458 - eine belegte Verzugsverantwortung voraus
+    # (`verzugsverantwortung_geprueft`, §1333 Abs 2 ist
+    # verschuldensabhängig) UND wird NUR je tatsächlich versendetem/
+    # nachgewiesenem Mahnschreiben (nicht je Entgeltforderung) angesetzt
+    # (siehe `mahnwesen/kosten.py::berechne_mahnkosten_vorschau`). Eine
+    # vertraglich genannte Zahl (z. B. "20 EUR je Mahnung") ist NIE
+    # automatisch dieser Wert - ein Mensch prüft/reduziert sie fallbezogen
+    # auf tatsächlichen Aufwand/Verhältnismäßigkeit und trägt ERST DANN
+    # den endgültigen, belegten Betrag hier ein (exakt dieselbe
+    # Nie-ungeprüft-übernehmen-Disziplin wie bei `mahngebuehr_
+    # kostenbasis_cent`/`vereinbarter_zinssatz_prozent`).
+    mahnpauschale_kostenbasis_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mahnpauschale_kostenbasis_beleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Bündelt die fallbezogene Prüfung ALLER FÜNF Voraussetzungen (konkrete
+    # Vertrags-/Rechtsgrundlage, tatsächlicher Aufwand, Erforderlichkeit,
+    # Verhältnismäßigkeit - Verschulden separat über `verzugsverantwortung_
+    # geprueft`) - ein bloß befüllter `mahnpauschale_kostenbasis_cent` OHNE
+    # dieses Flag bleibt wirkungslos (analog `versandkosten_
+    # ersatzfaehig_geprueft`: "ein bloß vorhandenes Profil reicht nicht").
+    mahnpauschale_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
     erstellt_von: Mapped[str] = mapped_column(String(128))
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     geprueft_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -1750,6 +1777,16 @@ class MahnkostenBuchungTable(Base):
     versandnachweis_referenz: Mapped[str] = mapped_column(String(256))
     zinsen_op_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     gebuehr_op_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Auftrag HV-20261019-MAHNKOSTEN: die generische, kanal-unabhängige
+    # §1333-Abs-2-ABGB-Mahnkostenpauschale (siehe `ZinsprofilTable.
+    # mahnpauschale_kostenbasis_cent`) - GETRENNT von `gebuehr_cent` (§458
+    # UGB, B2B-only) und NIEMALS gemeinsam mit diesem für denselben
+    # Mahnlauf gebucht (siehe `mahnwesen/kosten.py`: die beiden Zweige
+    # schließen sich gegenseitig aus). Je tatsächlich versendetem/
+    # nachgewiesenem Mahnschreiben höchstens einmal angesetzt.
+    mahnpauschale_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rechtsgrundlage_mahnpauschale: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    mahnpauschale_op_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Vollständiges Zinssegment-Bild (Halbjahres-/Basiszinssatz-Teilperioden,
     # siehe `mahnwesen/kosten.py::ZinsSegment`) ZUM ZEITPUNKT dieser Buchung -
     # rein deskriptiv/Audit, NICHT auf das an diesem Tag NEU gebuchte Delta
@@ -1827,4 +1864,75 @@ class MahnkostenGebuehrTable(Base):
     # FK-Spalten-Sonderfall aus dieser rein additiven Erweiterung heraus.
     reserviert_fuer_mahnlauf_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     erhoben_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+
+
+class RuecklastschriftkostenTable(Base):
+    """Auftrag HV-20261019-MAHNKOSTEN: Weiterverrechnung des tatsächlichen
+    Bankentgelts für EINE bereits verbuchte Rücklastschrift (`OPTyp.
+    RUECKLASTSCHRIFT`, siehe `op_positionen.py`/`bank/service.py::
+    verarbeite_ruecklastschrift`) - STRUKTURELL GETRENNT von der
+    Rückbuchung selbst: diese Zeile entsteht NIE automatisch mit der
+    Rücklastschrift-OP-Position, sondern ausschließlich über eine
+    eigene, nachgewiesene Erfassung des Originalbankentgelts (keine
+    geschätzte/pauschale Zahl).
+
+    `dem_zahlungspflichtigen_zurechenbar=False` (z. B. Bankfehler, vom
+    Mieter nicht zu vertretende Rückgabeursache) lässt diese Zeile zwar
+    ZU DOKUMENTATIONSZWECKEN anlegen, aber NIE eine Forderung/OP-Position
+    erzeugen (`kosten_op_position_id` bleibt dann `None`) - Weitergabe an
+    den Zahlungspflichtigen setzt eine belegte Zurechenbarkeit voraus.
+
+    `uq_ruecklastschriftkosten_je_rls` verhindert eine zweite Buchung für
+    dieselbe Rücklastschrift-OP-Position (keine Doppelbuchung, auch bei
+    wiederholtem Lauf)."""
+
+    __tablename__ = "ruecklastschriftkosten"
+    __table_args__ = (
+        UniqueConstraint("ruecklastschrift_op_position_id", name="uq_ruecklastschriftkosten_je_rls"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    # Lose Referenz ohne FK (Präzedenzfall `gebuehr_op_position_id` oben) -
+    # verweist auf die bereits bestehende `OPPositionTable`-Zeile vom Typ
+    # RUECKLASTSCHRIFT, deren tatsächliches Bankentgelt hier erfasst wird.
+    ruecklastschrift_op_position_id: Mapped[int] = mapped_column(Integer)
+    bankentgelt_cent: Mapped[int] = mapped_column(Integer)
+    rueckgabeursache: Mapped[str] = mapped_column(String(128))
+    dem_zahlungspflichtigen_zurechenbar: Mapped[bool] = mapped_column(Boolean)
+    zurechenbarkeit_begruendung: Mapped[str] = mapped_column(Text)
+    beleg_referenz: Mapped[str] = mapped_column(String(256))
+    kosten_op_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gebucht_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+
+
+class MahnbriefArchivTable(Base):
+    """Auftrag HV-20261019-MAHNKOSTEN: Archiviert das tatsächlich
+    versendete PDF EINES Mahnschreibens (Kanal BRIEF) - der bestehende
+    `/vertrag/{id}/mahnbrief.pdf`-Endpunkt (`backoffice/app.py`) ist eine
+    reine On-Demand-VORSCHAU und schreibt nichts weg; EMAIL-Versandbelege
+    sind bereits generisch über `AuditEventTable`
+    (`indexautomatik/mailnachweis.py::versand_belegen`) archiviert.
+
+    `uq_mahnbriefarchiv_lauf` bindet die Eindeutigkeit - wie bei
+    `MahnkostenBuchungTable` - an den eingefrorenen `mahnlauf_schluessel`,
+    NICHT an ein Datum: nur EIN archiviertes PDF je tatsächlich
+    abgeschlossenem Mahnlauf-Vorgang (Vertrag+Stufe), ein wiederholter
+    Lauf überschreibt oder verdoppelt das Archiv nicht."""
+
+    __tablename__ = "mahnbrief_archiv"
+    __table_args__ = (
+        UniqueConstraint("vertrag_id", "stufe", "mahnlauf_schluessel", name="uq_mahnbriefarchiv_lauf"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    stufe: Mapped[int] = mapped_column(Integer)
+    mahnlauf_schluessel: Mapped[str] = mapped_column(String(128))
+    pdf_bytes: Mapped[bytes] = mapped_column(LargeBinary)
+    pdf_sha256: Mapped[str] = mapped_column(String(64))
+    versandnachweis_referenz: Mapped[str] = mapped_column(String(256))
+    archiviert_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     erstellt_von: Mapped[str] = mapped_column(String(128))

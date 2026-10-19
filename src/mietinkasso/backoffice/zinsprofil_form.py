@@ -22,6 +22,10 @@ def zinsprofil_formular(vertrag, profile, csrf):
         )
         verzug_text = "geprüft" if p.verzugsverantwortung_geprueft else "NICHT geprüft - §456-Zinssatz fällt auf 4 % zurück"
         versandkosten_text = "geprüft" if p.versandkosten_ersatzfaehig_geprueft else "NICHT geprüft - keine Versandkosten-Weiterverrechnung"
+        mahnpauschale_text = (
+            (eur(p.mahnpauschale_kostenbasis_cent) if p.mahnpauschale_kostenbasis_cent is not None else "ungeklärt")
+            if p.mahnpauschale_geprueft else "NICHT geprüft - keine Mahnkostenpauschale"
+        )
         historien.append(
             f'<tr><td>{p.version}</td><td>{h(p.status)}</td><td>{"B2B" if p.ist_b2b else "Privat/Verbraucher"}</td>'
             f'<td>{p.vertragsdatum.isoformat() if p.vertragsdatum else "unbekannt"}</td>'
@@ -30,8 +34,10 @@ def zinsprofil_formular(vertrag, profile, csrf):
             f'<td>{h(verzug_text)}</td>'
             f'<td>{eur(p.mahngebuehr_kostenbasis_cent) if p.mahngebuehr_kostenbasis_cent is not None else "ungeklärt"}</td>'
             f'<td>{h(versandkosten_text)}</td>'
+            f'<td>{h(mahnpauschale_text)}</td>'
             f'<td><details><summary>Belege</summary>'
-            f'<pre>Zins: {h(p.vereinbarung_beleg or "")}\nGebühr: {h(p.mahngebuehr_kostenbasis_beleg or "")}</pre>'
+            f'<pre>Zins: {h(p.vereinbarung_beleg or "")}\nGebühr: {h(p.mahngebuehr_kostenbasis_beleg or "")}'
+            f'\nMahnpauschale: {h(p.mahnpauschale_kostenbasis_beleg or "")}</pre>'
             f'</details>{aktion}</td></tr>'
         )
     return f'''
@@ -47,8 +53,9 @@ def zinsprofil_formular(vertrag, profile, csrf):
       <table>
         <tr><th>Version</th><th>Status</th><th>B2B/Privat</th><th>Vertragsdatum</th><th>Gültig ab</th>
             <th>Vereinbarter Zinssatz</th><th>Verzugsverantwortung (§456)</th>
-            <th>§458-Pauschale</th><th>Versandkosten ersatzfähig (§1333)</th><th></th></tr>
-        {''.join(historien) if historien else '<tr><td colspan=10 class="muted">Noch kein Zinsprofil erfasst - es gilt die gesetzliche Basis.</td></tr>'}
+            <th>§458-Pauschale</th><th>Versandkosten ersatzfähig (§1333)</th>
+            <th>Mahnkostenpauschale (§1333 Abs 2)</th><th></th></tr>
+        {''.join(historien) if historien else '<tr><td colspan=11 class="muted">Noch kein Zinsprofil erfasst - es gilt die gesetzliche Basis.</td></tr>'}
       </table>
     </div>
     <div class="card"><h2>Neues Zinsprofil</h2>
@@ -96,6 +103,19 @@ def zinsprofil_formular(vertrag, profile, csrf):
            ein bloß vorhandenes Anbieter-Tarifprofil (Druck/Kuvert/Porto) reicht dafür NICHT aus. Der konkrete,
            ggf. gedeckelte Betrag stammt aus dem separat gepflegten Brief-Anbieterprofil, nicht aus diesem Formular.</p>
       </fieldset>
+      <fieldset><legend>Mahnkostenpauschale (§1333 Abs 2 ABGB, kanal-unabhängig - E-Mail UND Brief)</legend>
+        <label><input type="checkbox" name="mahnpauschale_geprueft" value="1">
+          Rechtsgrundlage, tatsächlicher Aufwand, Erforderlichkeit und Verhältnismäßigkeit dieser Pauschale sind
+          fallbezogen geprüft (Verschulden separat über die Verzugsverantwortung oben)</label>
+        <label>Pauschalbetrag je tatsächlich versendetem/nachgewiesenem Mahnschreiben in EUR</label>
+        <input name="mahnpauschale_kostenbasis_cent" placeholder="z. B. 20,00 - NUR der bereits verhältnismäßig geprüfte/ggf. reduzierte Betrag">
+        <label>Beleg/Begründung (Vertragsklausel, tatsächlicher Aufwand, Verhältnismäßigkeits-Abwägung)</label>
+        <textarea name="mahnpauschale_kostenbasis_beleg" rows="3"></textarea>
+        <p class="muted">Eine vertraglich genannte Zahl (z. B. "20 EUR je Mahnung") ist NIE automatisch dieser Wert -
+           erst nach fallbezogener Prüfung/ggf. Reduktion auf das Verhältnismäßige einträgen. Gilt für BEIDE
+           Mahnstufen (E-Mail wie Brief) und ERSETZT bei aktivierter Prüfung die Versandkosten-Ersatzfähigkeit
+           oben für denselben Versand (keine doppelte Entschädigung). Ohne diese Prüfung: keine Pauschale.</p>
+      </fieldset>
       <button type="submit">Als Entwurf speichern</button>
       </form>
     </div>'''
@@ -138,6 +158,9 @@ def zinsprofil_form_werte(form) -> dict:
         "mahngebuehr_kostenbasis_cent": _eur_cent_oder_none("mahngebuehr_kostenbasis_cent"),
         "mahngebuehr_kostenbasis_beleg": str(form.get("mahngebuehr_kostenbasis_beleg", "") or "").strip() or None,
         "versandkosten_ersatzfaehig_geprueft": str(form.get("versandkosten_ersatzfaehig_geprueft", "")) == "1",
+        "mahnpauschale_kostenbasis_cent": _eur_cent_oder_none("mahnpauschale_kostenbasis_cent"),
+        "mahnpauschale_kostenbasis_beleg": str(form.get("mahnpauschale_kostenbasis_beleg", "") or "").strip() or None,
+        "mahnpauschale_geprueft": str(form.get("mahnpauschale_geprueft", "")) == "1",
     }
 
 

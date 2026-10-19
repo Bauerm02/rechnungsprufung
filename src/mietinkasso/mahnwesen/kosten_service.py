@@ -254,7 +254,8 @@ class MahnkostenService:
         # fakturierten Zinstage) natürlich <= 0/leer.
         neu_anzusetzende_zinsen = vorschau.neue_zinsen_delta_cent
         gebuehr_betrag_gesamt = sum(s.betrag_cent for s in vorschau.gebuehr_segmente)
-        if neu_anzusetzende_zinsen <= 0 and gebuehr_betrag_gesamt <= 0:
+        mahnpauschale_betrag = vorschau.mahnpauschale_cent or 0
+        if neu_anzusetzende_zinsen <= 0 and gebuehr_betrag_gesamt <= 0 and mahnpauschale_betrag <= 0:
             return None  # nichts Neues zu buchen (u.a. der Idempotenz-Fall)
 
         stufe = vorschau.stufe
@@ -290,6 +291,18 @@ class MahnkostenService:
                     )
                     gebuehr_position_id = gebuehr_position.id
 
+                mahnpauschale_position_id = None
+                if mahnpauschale_betrag > 0:
+                    mahnpauschale_position = self._op_service.buchen(
+                        ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=mahnpauschale_betrag,
+                        belegdatum=heute, buchungsdatum=heute, faelligkeit=None,
+                        beleg_referenz=vorschau.mahnpauschale_rechtsgrundlage or "Mahnkostenpauschale §1333 Abs 2 ABGB",
+                        aenderungsgrund="Mahnkosten - Mahnkostenpauschale",
+                        import_id=f"MAHNKOSTEN-PAUSCHALE:{vertrag_id}:{stufe}:{mahnlauf_schluessel}",
+                        quelle_system="mahnkosten", session=session,
+                    )
+                    mahnpauschale_position_id = mahnpauschale_position.id
+
                 ledger = self._repository.buchung_anlegen(
                     vertrag_id=vertrag_id, stufe=stufe, mahnlauf_schluessel=mahnlauf_schluessel,
                     forderung_op_position_ids=list(vorschau.forderung_op_position_ids),
@@ -300,6 +313,9 @@ class MahnkostenService:
                     versandnachweis_referenz=versandnachweis_referenz, zinsen_op_position_id=zinsen_position_id,
                     gebuehr_op_position_id=gebuehr_position_id, zins_segmente_json=_segmente_als_json(vorschau),
                     zinsen_delta_je_op_json=json.dumps(vorschau.neue_zinsen_delta_je_op_position),
+                    mahnpauschale_cent=(mahnpauschale_betrag or None),
+                    rechtsgrundlage_mahnpauschale=vorschau.mahnpauschale_rechtsgrundlage,
+                    mahnpauschale_op_position_id=mahnpauschale_position_id,
                     erstellt_von=akteur, session=session,
                 )
 

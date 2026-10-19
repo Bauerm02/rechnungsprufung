@@ -4195,3 +4195,142 @@ konkreten Codex-Zahlenbeispiele (original 50000/aktuell 55000/Gesamt
 75000 → 80000, NICHT 85000; unverändert 50000/Gesamt 200000 → 210000)
 und der Fail-closed-/Unter-Schwelle-/Persistenz-nach-Versand-Fälle.
 1058/1058 grün im `tests/mietinkasso`-Gesamtlauf.
+
+## Auftrag HV-20261019-MAHNKOSTEN (Mahnkosten-/Zinslogik)
+
+Ergänzt die bereits bestehende Mahnkosten-/Zinslogik (`mahnwesen/kosten.py`,
+`kosten_service.py`, `kosten_repository.py`) um drei zuvor fehlende
+Bausteine; die bereits vorhandenen Fachregeln (Mahnstufen 1=E-Mail/
+2=Brief, §1000/§1333/§456/§458-Gates, taggenaue Verzugszinsen ohne
+Zinseszinsen, Prüffall-/Sperren-Blockade bei Ratenplan/RA/Streit/
+unklarem Abgleich, idempotente nachweisbasierte Buchung, automatischer
+Lauf) waren bereits vollständig gebaut und wurden NICHT verändert.
+Synthetische Testdaten ausschließlich, keine echte Buchung/kein echter
+Versand, keine Änderung an `src/invoice_automation/`.
+
+### Priorität A — generische, kanal-unabhängige Mahnkostenpauschale (§1333 Abs 2 ABGB)
+
+Bisher gab es nur die B2B-only §458-UGB-Pauschale und eine auf den
+Briefkanal beschränkte, rein tatsächliche-Portokosten-basierte §1333-
+Versandkosten-Ersatzfähigkeit - keine der beiden deckt "20 EUR je
+tatsächlich versendetem Mahnschreiben, nach fallbezogener Prüfung von
+Rechtsgrundlage/Aufwand/Verschulden/Erforderlichkeit/Verhältnismäßigkeit,
+für BEIDE Kanäle" ab.
+
+- **Neue, additive Zinsprofil-Felder** (`ZinsprofilTable.
+  mahnpauschale_kostenbasis_cent`/`_beleg`/`mahnpauschale_geprueft`):
+  derselbe Nie-ungeprüft-übernehmen-Mechanismus wie bei der §458-Pauschale
+  - ein Mensch trägt NUR den bereits verhältnismäßig geprüften/ggf.
+  reduzierten Betrag ein (eine vertraglich genannte Zahl wie "20 EUR je
+  Mahnung" ist NIE automatisch dieser Wert). `mahnpauschale_geprueft`
+  bündelt Rechtsgrundlage/Aufwand/Erforderlichkeit/Verhältnismäßigkeit;
+  Verschulden läuft weiterhin separat über das bereits bestehende
+  `verzugsverantwortung_geprueft`.
+- **Neuer Berechnungszweig** in `kosten.py::berechne_mahnkosten_vorschau`
+  (zwischen dem §458-Zweig und dem alten Brief-only-Fallback): gilt für
+  BEIDE Mahnstufen (E-Mail wie Brief), NUR bei vollständig erfüllten
+  Voraussetzungen (geprüft + belegte Kostenbasis > 0 + Verschulden + mind.
+  eine fällige Entgeltforderung). **Ersetzt** (nicht zusätzlich zu) die
+  ältere Brief-only-Versandkosten-Ersatzfähigkeit für denselben Vertrag,
+  sobald freigegeben - keine doppelte Entschädigung für denselben
+  Schreibaufwand. Neue `MahnkostenVorschau`-Felder
+  `mahnpauschale_cent`/`mahnpauschale_rechtsgrundlage` (additiv im
+  Snapshot-Round-Trip, ein vor diesem Auftrag persistierter Snapshot
+  bleibt lesbar).
+- **Buchung** als dritter, eigenständiger Kostentyp in
+  `kosten_service.py::buche_vorschau` (eigene SOLL-OP-Position,
+  `MahnkostenBuchungTable.mahnpauschale_cent`/
+  `rechtsgrundlage_mahnpauschale`/`mahnpauschale_op_position_id`) -
+  Idempotenz läuft über dieselbe `uq_mahnkosten_lauf`-Eindeutigkeit wie
+  Zinsen/§458-Gebühr (ein Mahnlauf, eine Buchung je Kostenart), KEINE
+  zusätzliche Entgeltforderungs-Exklusivitätstabelle nötig, weil die
+  Pauschale je VERSAND (Mahnlauf), nicht je Entgeltforderung gilt.
+- **Portal**: Zinsprofil-Formular/-Übersicht (`backoffice/
+  zinsprofil_form.py`) um das neue Feldset/die neue Spalte ergänzt;
+  Mahnbrief-PDF-Vorschau und E-Mail-/Brieftext (`backoffice/app.py`,
+  `indexautomatik/mailversand_service.py`) zeigen die Pauschale als
+  eigene Zeile, bevor sie gebucht wird.
+- **Live-Gate**: für die tatsächlich im Repository bekannten realen
+  Verträge (Leitner/Piller, Garber/Wirth - NUR zur Kalibrierung genannt,
+  KEINE echten Namen/Daten in diesem Repo) ist noch KEIN Zinsprofil
+  angelegt/freigegeben - Codex muss je Vertrag entscheiden, ob/in
+  welcher (ggf. reduzierten) Höhe `mahnpauschale_kostenbasis_cent`
+  gesetzt wird, bevor die erste echte Mahnung mit dieser Pauschale
+  versendet wird.
+
+### Priorität B — Rücklastschriftkosten (strukturell getrennt)
+
+Neues, eigenständiges Modul `bank/ruecklastschriftkosten_service.py`
+(`RuecklastschriftkostenRepository`/`RuecklastschriftkostenService`) +
+neue Tabelle `RuecklastschriftkostenTable` - bewusst GETRENNT von
+`bank/service.py::verarbeite_ruecklastschrift` (das bucht weiterhin NUR
+die Rückbuchung selbst, leitet NIE automatisch ein Bankentgelt ab/
+schätzt eines).
+
+- Erfasst AUSSCHLIESSLICH das tatsächliche, belegte Bankentgelt (kein
+  geschätzter/pauschaler Betrag) je Rücklastschrift-OP-Position, inkl.
+  Rückgabeursache und fallbezogener Zurechenbarkeits-Begründung.
+- Eine Forderung gegen den Zahlungspflichtigen wird NUR bei
+  `dem_zahlungspflichtigen_zurechenbar=True` gebucht - ohne Zurechenbarkeit
+  bleibt die Zeile rein dokumentarisch (`kosten_op_position_id=None`).
+- `uq_ruecklastschriftkosten_je_rls`-Eindeutigkeit verhindert eine
+  doppelte Erfassung/Buchung für DIESELBE Rücklastschrift (getestet:
+  doppelter Aufruf liefert dieselbe Zeile, keine zweite Buchung).
+- **Live-Gate**: KEIN Backoffice-Formular für die manuelle Erfassung
+  dieser Kosten wurde gebaut (nur Service+Repository+Tests) - Codex/
+  Markus muss entscheiden, ob/wie diese Erfassung im Portal angeboten
+  wird, bevor sie im Echtbetrieb genutzt wird.
+
+### Priorität C — Archivierung des tatsächlich versendeten Mahnbrief-PDF
+
+Neue Tabelle `MahnbriefArchivTable` + neues, eigenständiges Modul
+`mahnwesen/mahnbrief_archiv.py` (`MahnbriefArchivRepository.
+archivieren`/`fuer_mahnlauf`) - nimmt bereits gerenderte PDF-Bytes
+entgegen, speichert sie samt SHA-256-Hash idempotent je
+(vertrag_id, stufe, mahnlauf_schluessel).
+
+- EMAIL-Versandbelege sind bereits generisch über `AuditEventTable`
+  (`indexautomatik/mailnachweis.py::versand_belegen`) archiviert - das
+  war schon vor diesem Auftrag erledigt.
+- **Live-Gate, bewusst NICHT verdrahtet**: `HVMailversandService` wird
+  aktuell mit `brief_transport_verfuegbar=False` konstruiert - es gibt
+  noch KEINEN echten Brief-Versandweg, dessen tatsächlich an den
+  Provider übergebenes PDF hier archiviert werden könnte. Eine Wiring in
+  `mahnwesen/service.py::_vervollstaendige_bestaetigten_mahnlauf` wäre an
+  dieser Stelle eine ungetestete Vorwegnahme eines noch nicht
+  existierenden Live-Pfads; `mahnbrief_archiv.py` ist fertig gebaut und
+  getestet, aber bewusst OHNE Aufrufer im Live-Pfad. Sobald EinfachBrief/
+  ein anderer Brief-Provider live geschaltet wird, MUSS Codex an GENAU
+  der Stelle, an der die tatsächlich übergebenen PDF-Bytes entstehen,
+  `MahnbriefArchivRepository.archivieren(...)` aufrufen.
+
+### Priorität D — automatischer monatlicher Lauf: bereits erfüllt, keine neue Komponente nötig
+
+`HVMailversandService.mahnlauf()` (`indexautomatik/
+mailversand_service.py`) ist bereits vollständig gebaut und über den
+bestehenden täglichen Pflege-Job (`scripts/indexautomatik_taegliche_pflege.py`)
+automatisch verdrahtet - ein täglicher Lauf ist eine Obermenge eines
+monatlichen Laufs. Es wurde deshalb KEIN neues Skript/kein neuer
+Cron-Eintrag ergänzt; Codex sollte dies bei der Abnahme nicht erwarten.
+
+### Tests
+
+21 neue synthetische Tests: 5 in `tests/mietinkasso/
+test_mahnwesen_kosten.py` (Mahnpauschale - kanal-unabhängig, Ersatz statt
+Stapelung mit der Brief-Versandkosten-Ersatzfähigkeit, fehlendes
+Verschulden, keine fällige Entgeltforderung, Buchung inkl. doppeltem
+Lauf), 4 in `tests/mietinkasso/test_ruecklastschriftkosten.py`
+(zurechenbar/nicht zurechenbar, Doppelbuchungsschutz, Validierung), 3 in
+`tests/mietinkasso/test_mahnbrief_archiv.py` (Speichern, Idempotenz,
+getrennte Mahnläufe). Zusätzlich ein unabhängig vom fachlichen Auftrag
+gefundener, echter Migrationsbug behoben: `ensure_mahnkosten_lauf_unique_key`s
+SQLite-Rebuild kopierte bisher blind ALLE Spalten des aktuellen
+ORM-Modells - eine echte, produktive Altdatenbank, die diesen Rebuild VOR
+einem späteren additiven Spaltenzuwachs auf `mahnkosten_buchungen`
+durchläuft (hier: die drei neuen `mahnpauschale_*`-Spalten), hätte daran
+mit "no such column" scheitern können. Jetzt wird nur der Schnitt aus
+Modell- und tatsächlich vorhandenen Spalten kopiert (`tests/mietinkasso/
+test_migrations.py`, bereits bestehende Altschema-Fixtures, eine davon
+musste wegen der dadurch nun abweichenden, aber weiterhin eine echte
+Inkompatibilität korrekt meldenden Fehlerart - `IntegrityError` statt
+`OperationalError` - angepasst werden).

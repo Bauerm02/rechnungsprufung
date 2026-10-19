@@ -1787,3 +1787,143 @@ def test_buche_bei_versand_verweigert_zugriff_ohne_gesellschaftsscope(
             ctx=fremder_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1),
             versandnachweis_referenz="mahnung:fremd", akteur="fremd",
         )
+
+
+# -- Mahnkostenpauschale §1333 Abs 2 ABGB (Auftrag HV-20261019-MAHNKOSTEN) --
+# Kanal-unabhängig (E-Mail UND Brief), NUR bei belegter Rechtsgrundlage/
+# Aufwand/Verschulden/Erforderlichkeit/Verhältnismäßigkeit (gebündelt über
+# `mahnpauschale_geprueft` + `verzugsverantwortung_geprueft`), je
+# tatsächlich versendetem Mahnschreiben (nicht je Entgeltforderung).
+
+
+def test_mahnpauschale_wird_kanalunabhaengig_angesetzt_wenn_vollstaendig_geprueft(
+    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
+):
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
+        verzugsverantwortung_geprueft=True, mahnpauschale_geprueft=True,
+        mahnpauschale_kostenbasis_cent=2000, mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7, verhältnismäßig geprüft",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+
+    vorschau_email = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1), kanal="EMAIL")
+    vorschau_brief = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=2, heute=date(2026, 2, 1), kanal="BRIEF")
+
+    assert vorschau_email.mahnpauschale_cent == 2000
+    assert "§1333 Abs 2 ABGB" in vorschau_email.mahnpauschale_rechtsgrundlage
+    assert vorschau_email.gebuehr_cent is None  # keine zusätzliche/doppelte Gebühr
+    assert vorschau_brief.mahnpauschale_cent == 2000
+    assert vorschau_brief.gebuehr_cent is None  # ersetzt die reine Brief-Versandkosten-Ersatzfähigkeit
+
+
+def test_mahnpauschale_ersetzt_briefversandkosten_ersatz_statt_zu_stapeln(
+    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
+):
+    vertrag, konto = basis_vertrag
+    # Versandkosten-Ersatzfähigkeit ZUSÄTZLICH geprüft - die Mahnpauschale
+    # muss trotzdem exklusiv gelten (keine doppelte Entschädigung für
+    # denselben Brief).
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
+        verzugsverantwortung_geprueft=True, versandkosten_ersatzfaehig_geprueft=True,
+        mahnpauschale_geprueft=True, mahnpauschale_kostenbasis_cent=2000,
+        mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1), kanal="BRIEF")
+
+    assert vorschau.mahnpauschale_cent == 2000
+    assert vorschau.gebuehr_cent is None
+    assert vorschau.versandkosten_anbieteraufwand_cent is None  # der alte Zweig wurde nie betreten
+
+
+def test_mahnpauschale_ohne_geprueftes_verschulden_wird_nicht_angesetzt(
+    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
+):
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
+        verzugsverantwortung_geprueft=False,  # Verschulden NICHT geprüft
+        mahnpauschale_geprueft=True, mahnpauschale_kostenbasis_cent=2000,
+        mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1))
+
+    assert vorschau.mahnpauschale_cent is None
+    assert any("Verzugsverantwortung" in hinweis for hinweis in vorschau.hinweise)
+
+
+def test_mahnpauschale_ohne_faellige_entgeltforderung_wird_nicht_angesetzt(
+    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
+):
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
+        verzugsverantwortung_geprueft=True, mahnpauschale_geprueft=True,
+        mahnpauschale_kostenbasis_cent=2000, mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
+    )
+    # Fälligkeit liegt NACH "heute" - (noch) keine fällige Entgeltforderung.
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 2, 1), buchungsdatum=date(2026, 2, 1),
+        faelligkeit=date(2026, 2, 5), beleg_referenz="HMZ Februar",
+    )
+
+    vorschau = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 1, 15))
+
+    assert vorschau.mahnpauschale_cent is None
+
+
+def test_mahnpauschale_wird_gebucht_und_doppellauf_bucht_nicht_doppelt(
+    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
+):
+    vertrag, konto = basis_vertrag
+    _profil_geprueft(
+        kosten_repo, vertrag_id=vertrag.id, ist_b2b=False, vertragsdatum=date(2020, 1, 1),
+        verzugsverantwortung_geprueft=True, mahnpauschale_geprueft=True,
+        mahnpauschale_kostenbasis_cent=2000, mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
+    )
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+
+    erste = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1),
+        versandnachweis_referenz="mahnung:test-1", akteur="test",
+    )
+    assert erste is not None
+    assert erste.mahnpauschale_cent == 2000
+    assert erste.mahnpauschale_op_position_id is not None
+
+    # Doppelter Lauf (z. B. ein wiederholter Cron-Tick am selben Tag ohne
+    # neue Zahlung) darf die Pauschale NICHT ein zweites Mal buchen.
+    zweite = kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1),
+        versandnachweis_referenz="mahnung:test-2", akteur="test",
+    )
+    assert zweite is None or zweite.id == erste.id
+
+    pauschale_zeilen = [
+        p for p in op_service.berechne_saldo(konto.id, stichtag=date(2026, 2, 1)).positionen
+        if p.aenderungsgrund == "Mahnkosten - Mahnkostenpauschale"
+    ]
+    assert len(pauschale_zeilen) == 1
+    assert pauschale_zeilen[0].betrag_cent == 2000

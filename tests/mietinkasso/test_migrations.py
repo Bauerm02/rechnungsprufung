@@ -371,7 +371,17 @@ def test_ensure_mahnkosten_lauf_unique_key_rebuild_ist_atomar_bei_fehler(mahnkos
     mit ihrer ursprünglichen Zeile unverändert erhalten."""
 
     engine = mahnkosten_altschema_engine_inkompatibel
-    with pytest.raises(sa.exc.OperationalError):
+    # Auftrag HV-20261019-MAHNKOSTEN: `ensure_mahnkosten_lauf_unique_key`
+    # kopiert seither NUR den Schnitt aus Modell- und tatsächlich in der
+    # Quelltabelle vorhandenen Spalten (siehe dortiger Docstring) - eine
+    # komplett FEHLENDE, vom Modell als NOT NULL erwartete Spalte
+    # (`erstellt_von`, hier absichtlich für diesen Test entfernt) scheitert
+    # deshalb nicht mehr an einem SQLite-"no such column"
+    # (`OperationalError`), sondern erst an der NOT-NULL-Constraint der
+    # neuen Zieltabelle (`IntegrityError`) - der hier eigentlich geprüfte
+    # Punkt (atomarer Rollback, kein verwaister Tabellenrest) gilt für
+    # BEIDE Fehlerarten gleichermaßen.
+    with pytest.raises(sa.exc.DBAPIError):
         ensure_mahnkosten_lauf_unique_key(engine)
 
     inspector = sa.inspect(engine)

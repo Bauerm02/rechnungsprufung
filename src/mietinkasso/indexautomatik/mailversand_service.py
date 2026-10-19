@@ -94,6 +94,11 @@ def _mahnkosten_text_baustein(vorschau) -> str:
             f"Neue Mahnspesen ({vorschau.gebuehr_rechtsgrundlage}): {_eur_text(gebuehr_gesamt)} EUR "
             f"für {len(vorschau.gebuehr_segmente)} bislang noch nicht bepauschalte Forderung(en)."
         )
+    if vorschau.mahnpauschale_cent:
+        zeilen.append(
+            f"Mahnkostenpauschale ({vorschau.mahnpauschale_rechtsgrundlage}): "
+            f"{_eur_text(vorschau.mahnpauschale_cent)} EUR für dieses Mahnschreiben."
+        )
     if not zeilen:
         return ""
     return "\n".join(zeilen) + "\n\n"

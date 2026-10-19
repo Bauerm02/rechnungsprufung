@@ -523,7 +523,16 @@ class MahnkostenVorschau:
     gebuehr_segmente: tuple[GebuehrSegment, ...]
     gebuehr_cent: int | None  # Summe von gebuehr_segmente, None wenn leer
     gebuehr_rechtsgrundlage: str | None  # Rechtsgrundlage des ERSTEN Segments (informativ)
-    forderung_op_position_ids: tuple[int, ...]
+    # Auftrag HV-20261019-MAHNKOSTEN: generische, KANAL-UNABHÄNGIGE
+    # Mahnkostenpauschale §1333 Abs 2 ABGB (siehe `ZinsprofilTable.
+    # mahnpauschale_kostenbasis_cent`-Docstring) - STRUKTURELL GETRENNT
+    # von `gebuehr_cent` (§458 UGB / Brief-Versandkosten-Ersatz, je
+    # Entgeltforderung EINMALIG), weil diese Pauschale je tatsächlich
+    # versendetem/nachgewiesenem Mahnschreiben (nicht je Entgeltforderung)
+    # angesetzt wird - siehe `berechne_mahnkosten_vorschau`.
+    mahnpauschale_cent: int | None = None
+    mahnpauschale_rechtsgrundlage: str | None = None
+    forderung_op_position_ids: tuple[int, ...] = ()
     ausgeschlossene_forderungen_hinweis: tuple[str, ...] = field(default_factory=tuple)
     hinweise: tuple[str, ...] = field(default_factory=tuple)
     # Reiner Transparenzwert (Auftrag Markus 14.09.2026, Brief-Kostenpaket):
@@ -560,6 +569,8 @@ class MahnkostenVorschau:
         zusatz = self.neue_zinsen_delta_cent
         if self.gebuehr_cent is not None:
             zusatz += self.gebuehr_cent
+        if self.mahnpauschale_cent is not None:
+            zusatz += self.mahnpauschale_cent
         return zusatz
 
 
@@ -593,6 +604,8 @@ def _vorschau_zu_dict(vorschau: MahnkostenVorschau) -> dict:
             for g in vorschau.gebuehr_segmente
         ],
         "gebuehr_cent": vorschau.gebuehr_cent, "gebuehr_rechtsgrundlage": vorschau.gebuehr_rechtsgrundlage,
+        "mahnpauschale_cent": vorschau.mahnpauschale_cent,
+        "mahnpauschale_rechtsgrundlage": vorschau.mahnpauschale_rechtsgrundlage,
         "forderung_op_position_ids": list(vorschau.forderung_op_position_ids),
         "ausgeschlossene_forderungen_hinweis": list(vorschau.ausgeschlossene_forderungen_hinweis),
         "hinweise": list(vorschau.hinweise),
@@ -624,6 +637,10 @@ def _vorschau_aus_dict(data: dict) -> MahnkostenVorschau:
             for g in data["gebuehr_segmente"]
         ),
         gebuehr_cent=data["gebuehr_cent"], gebuehr_rechtsgrundlage=data["gebuehr_rechtsgrundlage"],
+        # `.get(...)`: ein VOR diesem Auftrag persistierter Snapshot kennt
+        # die Mahnpauschale noch nicht - additiv-sicher statt KeyError.
+        mahnpauschale_cent=data.get("mahnpauschale_cent"),
+        mahnpauschale_rechtsgrundlage=data.get("mahnpauschale_rechtsgrundlage"),
         forderung_op_position_ids=tuple(data["forderung_op_position_ids"]),
         ausgeschlossene_forderungen_hinweis=tuple(data["ausgeschlossene_forderungen_hinweis"]),
         hinweise=tuple(data["hinweise"]),
@@ -680,6 +697,7 @@ def vorschau_bei_ledger_inkonsistenz(
         neue_zinsen_cent=0, bereits_gebuchte_zinsen_cent=0, neue_zinsen_delta_cent=0,
         neue_zinsen_delta_je_op_position={}, zins_segmente=(), zins_teilweise_ungeklaert=True,
         gebuehr_segmente=(), gebuehr_cent=None, gebuehr_rechtsgrundlage=None,
+        mahnpauschale_cent=None, mahnpauschale_rechtsgrundlage=None,
         forderung_op_position_ids=tuple(f.op_position_id for f in forderungen_kern),
         hinweise=(f"Zinsledger widersprüchlich, Zinsen/Gebühr bleiben blockiert: {grund}",),
         bereits_offene_mahnkosten_cent=bereits_offene_mahnkosten_cent,
@@ -868,6 +886,8 @@ def berechne_mahnkosten_vorschau(
 
     gebuehr_segmente: list[GebuehrSegment] = []
     versandkosten_anbieteraufwand_cent: int | None = None
+    mahnpauschale_cent: int | None = None
+    mahnpauschale_rechtsgrundlage: str | None = None
     if aktuell_unberechenbar:
         hinweise.append("§458 UGB: keine Mahngebühr, solange die Zinsprofil-Historie unberechenbar ist.")
     elif ugb_scope:
@@ -905,6 +925,42 @@ def berechne_mahnkosten_vorschau(
                 )
             else:
                 hinweise.append("§458 UGB: keine neue Pauschale - alle fälligen Entgeltforderungen wurden bereits einmalig bepauschalt.")
+    elif aktuelles_profil is not None and aktuelles_profil.status == "GEPRUEFT" and aktuelles_profil.mahnpauschale_geprueft:
+        # Auftrag HV-20261019-MAHNKOSTEN: generische, KANAL-UNABHÄNGIGE
+        # Mahnkostenpauschale §1333 Abs 2 ABGB (siehe `ZinsprofilTable.
+        # mahnpauschale_kostenbasis_cent`-Docstring) - gilt für BEIDE
+        # Mahnstufen (E-Mail wie Brief), NICHT nur Kanal BRIEF. Sobald ein
+        # Mensch diese Pauschale für den Vertrag freigegeben hat
+        # (`mahnpauschale_geprueft`), ERSETZT sie die ältere, NUR Brief-/
+        # tatsächliche-Porto-basierte §1333-Versandkosten-Ersatzfähigkeit
+        # unten (`kanal == "BRIEF"`-Zweig) für diesen Vertrag vollständig -
+        # beide Rechtsgrundlagen für denselben Versand anzusetzen wäre
+        # eine doppelte Entschädigung für denselben Schreibaufwand.
+        if aktuelles_profil.mahnpauschale_kostenbasis_cent is None or aktuelles_profil.mahnpauschale_kostenbasis_cent <= 0:
+            hinweise.append(
+                "§1333 Abs 2 ABGB (Mahnkostenpauschale): als geprüft markiert, aber keine gültige, belegte "
+                "Kostenbasis hinterlegt - keine Pauschale angesetzt."
+            )
+        elif not aktuelles_profil.verzugsverantwortung_geprueft:
+            hinweise.append(
+                "§1333 Abs 2 ABGB (Mahnkostenpauschale): Verzugsverantwortung (Verschulden) für diesen Vertrag "
+                "nicht geprüft - keine Pauschale angesetzt."
+            )
+        elif not _faellige_entgeltforderungs_schluessel(forderungen_kern, heute):
+            hinweise.append(
+                "§1333 Abs 2 ABGB (Mahnkostenpauschale): keine fällige Entgeltforderung - keine Pauschale angesetzt."
+            )
+        else:
+            mahnpauschale_cent = aktuelles_profil.mahnpauschale_kostenbasis_cent
+            mahnpauschale_rechtsgrundlage = (
+                "§1333 Abs 2 ABGB - geprüfte Mahnkostenpauschale je versendetem Mahnschreiben "
+                f"({aktuelles_profil.mahnpauschale_kostenbasis_beleg or 'ohne Belegangabe'})"
+            )
+            hinweise.append(
+                f"§1333 Abs 2 ABGB: Mahnkostenpauschale ({mahnpauschale_cent / 100:.2f} EUR) für dieses tatsächlich "
+                "versendete Mahnschreiben angesetzt - Rechtsgrundlage, tatsächlicher Aufwand, Verschulden, "
+                "Erforderlichkeit und Verhältnismäßigkeit laut geprüftem Zinsprofil fallbezogen belegt."
+            )
     elif kanal == "BRIEF":
         # §1333 Abs 2 ABGB - Versandkosten-Ersatz gilt NUR für den
         # Briefkanal bei einem NICHT-B2B-Vertrag (Verbraucher-Mieter
@@ -979,6 +1035,7 @@ def berechne_mahnkosten_vorschau(
         neue_zinsen_delta_je_op_position=neue_zinsen_delta_je_op,
         zins_segmente=tuple(alle_segmente), zins_teilweise_ungeklaert=zins_teilweise_ungeklaert,
         gebuehr_segmente=tuple(gebuehr_segmente), gebuehr_cent=gebuehr_cent, gebuehr_rechtsgrundlage=gebuehr_rechtsgrundlage,
+        mahnpauschale_cent=mahnpauschale_cent, mahnpauschale_rechtsgrundlage=mahnpauschale_rechtsgrundlage,
         # NUR die echten Miet-/BK-Forderungen (siehe Funktions-Docstring/
         # `forderungen_kern` oben) - eine bereits gebuchte, noch offene
         # Mahnkosten-Zeile ist keine vom Mahnlauf verfolgte "Forderung"
