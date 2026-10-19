@@ -572,7 +572,8 @@ class MahnkostenRepository:
             ).scalar_one_or_none()
 
     def mahnpauschale_freigabe_anlegen(
-        self, *, vertrag_id: str, stufe: int, forderungsgruppe_schluessel: str, betrag_cent: int,
+        self, *, vertrag_id: str, stufe: int, forderungsgruppe_schluessel: str, hauptforderung_cent: int,
+        betrag_cent: int,
         erforderlichkeit_begruendung: str, tatsaechlicher_aufwand_cent: int, tatsaechlicher_aufwand_beleg: str,
         schuldhaftigkeit_begruendung: str, verhaeltnismaessigkeit_begruendung: str, freigegeben_von: str,
         erstellt_von: str,
@@ -583,10 +584,17 @@ class MahnkostenRepository:
         verhindert eine zweite, widersprüchliche Freigabe für dieselbe
         Gruppe (ein zweiter Versuch scheitert mit `IntegrityError`, statt
         eine bestehende Freigabe stillschweigend zu überschreiben - jede
-        Korrektur verlangt eine bewusste, eigene Fachentscheidung)."""
+        Korrektur verlangt eine bewusste, eigene Fachentscheidung).
+
+        `hauptforderung_cent`: IMMER die GERADE frisch berechnete
+        Hauptforderung übergeben (niemals ein Aufrufer-geschätzter Wert) -
+        siehe `MahnpauschaleFreigabeTable`-Moduldoc, dritte Nachbesserung:
+        eine Teilzahlung verändert die OP-ID-Menge NICHT, nur dieser Wert
+        macht eine spätere Saldenänderung erkennbar."""
 
         for feld, wert in (
             ("betrag_cent", betrag_cent), ("tatsaechlicher_aufwand_cent", tatsaechlicher_aufwand_cent),
+            ("hauptforderung_cent", hauptforderung_cent),
         ):
             if wert <= 0:
                 raise ValueError(f"Mahnpauschale-Freigabe: {feld} muss größer als 0 sein (war {wert}).")
@@ -602,6 +610,7 @@ class MahnkostenRepository:
         with self._session_factory() as session:
             row = MahnpauschaleFreigabeTable(
                 vertrag_id=vertrag_id, stufe=stufe, forderungsgruppe_schluessel=forderungsgruppe_schluessel,
+                hauptforderung_cent=hauptforderung_cent,
                 betrag_cent=betrag_cent, erforderlichkeit_begruendung=erforderlichkeit_begruendung,
                 tatsaechlicher_aufwand_cent=tatsaechlicher_aufwand_cent,
                 tatsaechlicher_aufwand_beleg=tatsaechlicher_aufwand_beleg,

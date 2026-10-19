@@ -1004,6 +1004,28 @@ def berechne_mahnkosten_vorschau(
                 f"vorhanden - Pauschale bleibt automatisch gesperrt (0 EUR, Prüffall){vorschlag_hinweis}. Eine "
                 "Freigabe einer anderen Forderungsgruppe wirkt nicht fort."
             )
+        elif freigabe.hauptforderung_cent != hauptforderung_cent:
+            # Unabhängige Rückprüfung Codex 20.10.2026, echter Bug:
+            # `forderungsgruppe_schluessel` hasht NUR die OP-IDs, NICHT
+            # deren Restbeträge - eine bloße TEILZAHLUNG verändert die
+            # OP-ID-Menge NICHT (dieselbe Forderung bleibt offen, nur mit
+            # kleinerem Rest). Ohne diesen zusätzlichen Vergleich hätte
+            # eine für z. B. 500 EUR Hauptforderung erteilte 20-EUR-
+            # Freigabe nach einer Teilzahlung auf nur noch 25 EUR
+            # weiterhin als "dieselbe Gruppe" gegolten und wäre
+            # unverändert durchgegangen (siehe `MahnpauschaleFreigabeTable`
+            # -Moduldoc). Ein veränderter Saldo erbt NIE eine bestehende
+            # Freigabe, unabhängig davon, ob er gestiegen oder gesunken
+            # ist - in BEIDEN Fällen ist die ursprüngliche Verhältnis-
+            # mäßigkeits-/Aufwandsabwägung nicht mehr für den aktuellen
+            # Stand belegt.
+            hinweise.append(
+                "§1333 Abs 2 ABGB (Mahnkostenpauschale): die bestehende Freigabe wurde für eine ANDERE "
+                f"Hauptforderung erteilt (damals {freigabe.hauptforderung_cent / 100:.2f} EUR, aktuell "
+                f"{hauptforderung_cent / 100:.2f} EUR) - der Saldo dieser Forderungsgruppe hat sich seither "
+                "verändert (z. B. durch eine Teilzahlung), die Freigabe ist für den neuen Stand UNGÜLTIG. "
+                "Keine Pauschale angesetzt (Prüffall), eine neue Einzelfallfreigabe ist erforderlich."
+            )
         elif freigabe.betrag_cent > hauptforderung_cent:
             hinweise.append(
                 f"§1333 Abs 2 ABGB (Mahnkostenpauschale): die freigegebene Pauschale "

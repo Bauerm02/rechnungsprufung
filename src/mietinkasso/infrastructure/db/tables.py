@@ -1974,13 +1974,23 @@ class MahnpauschaleFreigabeTable(Base):
 
     `forderungsgruppe_schluessel` ist exakt dieselbe Hash-Formel wie
     `kosten_service.py::_mahnlauf_schluessel`/`kosten.py::
-    forderungsgruppe_schluessel` (Content-Hash über die sortierten
-    `forderung_op_position_ids`) - eine Freigabe gilt AUSSCHLIESSLICH für
-    GENAU diese eingefrorene Forderungsmenge. Jede abweichende Gruppe
-    (eine neue fällige Periode, eine Teilzahlung, die die Gruppe
-    verändert) hat zwangsläufig einen ANDEREN Schlüssel und damit KEINE
-    Freigabe - "Freigabe darf nicht auf spätere neue Forderungen
-    fortwirken" ist dadurch strukturell erzwungen, nicht nur Konvention.
+    forderungsgruppe_schluessel` (Content-Hash NUR über die sortierten
+    `forderung_op_position_ids`, NICHT über deren Restbeträge) - eine
+    Freigabe gilt für GENAU diese Menge an OP-IDs. Eine GENUIN NEUE
+    fällige Periode (neue OP-ID) hat zwangsläufig einen ANDEREN Schlüssel
+    und damit KEINE Freigabe.
+    ACHTUNG, unabhängige Rückprüfung Codex 20.10.2026, echter Bug: eine
+    bloße TEILZAHLUNG verändert die OP-ID-Menge NICHT (dieselbe Forderung
+    bleibt offen, nur mit kleinerem Restbetrag) - ein Hash NUR über OP-IDs
+    hätte eine für 500 EUR Hauptforderung erteilte 20-EUR-Freigabe nach
+    einer Teilzahlung auf nur noch 25 EUR offenen Rest WEITERHIN als
+    "dieselbe Gruppe" erkannt und die Pauschale fälschlich unverändert
+    durchgelassen. Deshalb zusätzlich `hauptforderung_cent`: die ZUM
+    FREIGABEZEITPUNKT tatsächlich bewilligte Hauptforderung dieser Gruppe.
+    `berechne_mahnkosten_vorschau` vergleicht sie bei JEDER Vorschau gegen
+    die GERADE aktuell berechnete Hauptforderung - weicht sie ab (auch bei
+    identischen OP-IDs), gilt die Freigabe als NICHT gefunden (0 EUR,
+    Prüffall) - ein veränderter Saldo erbt NIE eine bestehende Freigabe.
 
     Vier Pflichtfelder dokumentieren GENAU die vier verlangten Kriterien
     für DIESEN konkreten Fall (nicht pauschal am Vertrag):
@@ -2010,6 +2020,12 @@ class MahnpauschaleFreigabeTable(Base):
     vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
     stufe: Mapped[int] = mapped_column(Integer)
     forderungsgruppe_schluessel: Mapped[str] = mapped_column(String(128))
+    # Auftrag HV-20261019-MAHNKOSTEN, dritte Nachbesserung (Codex-
+    # Rückprüfung 20.10.2026, echter Bug): die ZUM FREIGABEZEITPUNKT
+    # tatsächlich bewilligte Hauptforderung - siehe Moduldoc oben
+    # ("Teilzahlung ändert die OP-ID-Menge nicht"). Wird bei jeder
+    # Vorschau gegen die aktuelle Hauptforderung verglichen.
+    hauptforderung_cent: Mapped[int] = mapped_column(Integer)
     betrag_cent: Mapped[int] = mapped_column(Integer)
     erforderlichkeit_begruendung: Mapped[str] = mapped_column(Text)
     tatsaechlicher_aufwand_cent: Mapped[int] = mapped_column(Integer)

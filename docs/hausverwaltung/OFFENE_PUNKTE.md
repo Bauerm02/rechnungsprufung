@@ -4449,3 +4449,30 @@ nachweis-Idempotenz bei abweichendem `mahnlauf_schluessel`, sowie zwei
 Repository-Validierungstests (fehlende Begründung, doppelte Freigabe für
 dieselbe Gruppe). 1075/1075 Tests grün im Gesamtlauf. Keine Live-
 Buchung, kein Versand, kein Deployment.
+
+### Dritte Codex-Rückprüfung (20.10.2026, vor Fertigstellung des Freigabeformulars) — behoben
+
+Codex hat einen weiteren echten Bug in der Zwischenstufe benannt, bevor
+das Backoffice-Formular gebaut wurde: `forderungsgruppe_schluessel`
+hasht NUR die sortierten OP-IDs, NICHT deren Restbeträge. Eine bloße
+TEILZAHLUNG verändert dieselbe Forderung (dieselbe OP-ID) nicht, nur
+ihren Restbetrag - eine für z. B. 500 EUR Hauptforderung erteilte
+20-EUR-Freigabe hätte nach einer Teilzahlung auf nur noch 25 EUR offenen
+Rest WEITERHIN als "dieselbe Gruppe" gegolten und wäre unverändert
+durchgegangen, obwohl sich der Verhältnismäßigkeitsmaßstab fundamental
+geändert hat.
+
+**Behoben:** `MahnpauschaleFreigabeTable` trägt jetzt zusätzlich
+`hauptforderung_cent` - die zum Freigabezeitpunkt tatsächlich bewilligte
+Hauptforderung. `berechne_mahnkosten_vorschau` vergleicht sie bei JEDER
+Vorschau gegen die gerade aktuell berechnete Hauptforderung; weicht sie
+ab (auch bei identischen OP-IDs, in BEIDE Richtungen - gestiegen oder
+gesunken), gilt die Freigabe als NICHT gefunden (0 EUR, Prüffall, mit
+explizitem Hinweis auf die veränderte Hauptforderung). Ein veränderter
+Saldo erbt dadurch strukturell NIE eine bestehende Freigabe.
+
+Neuer Pflichttest `test_mahnpauschale_freigabe_wirkt_nicht_nach_
+teilzahlung_mit_unveraenderten_op_ids` (`tests/mietinkasso/
+test_mahnwesen_kosten.py`): belegt am konkreten 500/25-EUR-Fall mit
+UNVERÄNDERTEN OP-IDs, dass eine bestehende Freigabe nach einer großen
+Teilzahlung nicht mehr greift. 1076/1076 Tests grün im Gesamtlauf.

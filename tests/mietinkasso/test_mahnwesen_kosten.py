@@ -1822,7 +1822,8 @@ def _freigabe_fuer(
     )
     schluessel = forderungsgruppe_schluessel(vorschau_vorher.forderung_op_position_ids)
     return kosten_repo.mahnpauschale_freigabe_anlegen(
-        vertrag_id=vertrag_id, stufe=stufe, forderungsgruppe_schluessel=schluessel, betrag_cent=betrag_cent,
+        vertrag_id=vertrag_id, stufe=stufe, forderungsgruppe_schluessel=schluessel,
+        hauptforderung_cent=vorschau_vorher.hauptforderung_cent, betrag_cent=betrag_cent,
         erforderlichkeit_begruendung="Zwei erfolglose Zahlungserinnerungen vorausgegangen, Mahnung fallbezogen erforderlich.",
         tatsaechlicher_aufwand_cent=betrag_cent, tatsaechlicher_aufwand_beleg="Portal-Zeiterfassung Sachbearbeitung + Druck/Versand.",
         schuldhaftigkeit_begruendung="Keine Bank-/SEPA-Störung erkennbar; Zahlung schlicht unterblieben, Mieter verantwortlich.",
@@ -1964,6 +1965,48 @@ def test_mahnpauschale_freigabe_mit_zu_hohem_betrag_bleibt_unverhaeltnismaessig_
     ), vorschau.hinweise
 
 
+def test_mahnpauschale_freigabe_wirkt_nicht_nach_teilzahlung_mit_unveraenderten_op_ids(
+    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
+):
+    """DRITTE Nachbesserung (Codex-Rückprüfung 20.10.2026, echter Bug):
+    `forderungsgruppe_schluessel` hasht NUR die OP-IDs - eine Teilzahlung
+    verändert dieselben OP-IDs NICHT, nur deren Restbetrag. Ohne den
+    zusätzlichen `hauptforderung_cent`-Abgleich hätte eine für 500 EUR
+    Hauptforderung erteilte 20-EUR-Freigabe nach einer Teilzahlung auf
+    nur noch 25 EUR offenen Rest (DIESELBE OP-ID, DERSELBE Hash) weiterhin
+    gegriffen - genau der vom Eigentümer benannte Fall."""
+
+    vertrag, konto = basis_vertrag
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+    _freigabe_fuer(
+        kosten_repo, op_service, kosten_service, vertrag_id=vertrag.id, stufe=1,
+        konto_id=konto.id, heute=date(2026, 2, 1), betrag_cent=2000,
+    )
+    vorschau_vor_teilzahlung = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1))
+    assert vorschau_vor_teilzahlung.mahnpauschale_cent == 2000  # Gegenprobe: Freigabe wirkt zunächst
+
+    # Große Teilzahlung - DIESELBE Forderung (dieselbe OP-ID) bleibt
+    # offen, nur mit stark reduziertem Restbetrag von 475 EUR auf 25 EUR.
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=47_500,
+        belegdatum=date(2026, 2, 10), buchungsdatum=date(2026, 2, 10),
+        faelligkeit=None, beleg_referenz="Teilzahlung Mieter",
+    )
+    vorschau_nach_teilzahlung = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1))
+
+    assert vorschau_nach_teilzahlung.hauptforderung_cent == 2500  # nur noch 25 EUR offen
+    assert vorschau_nach_teilzahlung.forderung_op_position_ids == vorschau_vor_teilzahlung.forderung_op_position_ids
+    assert vorschau_nach_teilzahlung.mahnpauschale_cent is None  # die ALTE Freigabe erbt NICHT den neuen Saldo
+    assert any(
+        "ANDERE" in hinweis and "Hauptforderung" in hinweis and "Teilzahlung" in hinweis
+        for hinweis in vorschau_nach_teilzahlung.hinweise
+    ), vorschau_nach_teilzahlung.hinweise
+
+
 def test_mahnpauschale_freigabe_wirkt_nicht_auf_spaetere_neue_forderungsgruppe_fort(
     op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
 ):
@@ -2103,7 +2146,8 @@ def test_mahnpauschale_idempotent_ueber_versandnachweis_trotz_abweichendem_mahnl
 def test_mahnpauschale_freigabe_anlegen_verlangt_vollstaendige_begruendungen(kosten_repo):
     with pytest.raises(ValueError):
         kosten_repo.mahnpauschale_freigabe_anlegen(
-            vertrag_id="V-601-3", stufe=1, forderungsgruppe_schluessel="irgendein-hash", betrag_cent=2000,
+            vertrag_id="V-601-3", stufe=1, forderungsgruppe_schluessel="irgendein-hash",
+            hauptforderung_cent=5000, betrag_cent=2000,
             erforderlichkeit_begruendung="", tatsaechlicher_aufwand_cent=2000,
             tatsaechlicher_aufwand_beleg="Beleg", schuldhaftigkeit_begruendung="Begründung",
             verhaeltnismaessigkeit_begruendung="Begründung", freigegeben_von="test", erstellt_von="test",
@@ -2112,7 +2156,8 @@ def test_mahnpauschale_freigabe_anlegen_verlangt_vollstaendige_begruendungen(kos
 
 def test_mahnpauschale_freigabe_fuer_dieselbe_gruppe_zweimal_schlaegt_fehl(kosten_repo):
     kwargs = dict(
-        vertrag_id="V-601-3", stufe=1, forderungsgruppe_schluessel="derselbe-hash", betrag_cent=2000,
+        vertrag_id="V-601-3", stufe=1, forderungsgruppe_schluessel="derselbe-hash",
+        hauptforderung_cent=5000, betrag_cent=2000,
         erforderlichkeit_begruendung="Begründung", tatsaechlicher_aufwand_cent=2000,
         tatsaechlicher_aufwand_beleg="Beleg", schuldhaftigkeit_begruendung="Begründung",
         verhaeltnismaessigkeit_begruendung="Begründung", freigegeben_von="test", erstellt_von="test",
