@@ -140,8 +140,9 @@ class MahnkostenService:
             # der dort final feststehenden Forderungsgruppe berechnet
             # (`kosten.py::forderungsgruppe_schluessel`), deshalb ein
             # Callback statt eines hier vorab berechneten Werts.
-            mahnpauschale_freigabe_lookup=lambda schluessel: self._repository.mahnpauschale_freigabe_fuer_gruppe(
+            mahnpauschale_freigabe_lookup=lambda schluessel, hauptforderung_cent: self._repository.mahnpauschale_freigabe_fuer_gruppe(
                 vertrag_id=vertrag_id, stufe=stufe, forderungsgruppe_schluessel=schluessel,
+                hauptforderung_cent=hauptforderung_cent,
             ),
         )
 

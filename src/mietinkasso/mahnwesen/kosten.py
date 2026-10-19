@@ -985,9 +985,23 @@ def berechne_mahnkosten_vorschau(
         # tatsächlich mit Daten befüllt, bleibt die Pauschale im
         # produktiven Betrieb deshalb KONSERVATIV IMMER gesperrt, bis
         # dieser Workflow nachgezogen ist.
+        # Der Lookup filtert IMMER auf `(forderungsgruppe_schluessel,
+        # hauptforderung_cent)` GEMEINSAM (siehe `MahnpauschaleRepository.
+        # mahnpauschale_freigabe_fuer_gruppe`) - unabhängige Rückprüfung
+        # Codex 20.10.2026, echter Bug: `forderungsgruppe_schluessel`
+        # hasht NUR die OP-IDs, NICHT deren Restbeträge. Eine bloße
+        # TEILZAHLUNG verändert die OP-ID-Menge NICHT (dieselbe Forderung
+        # bleibt offen, nur mit kleinerem Rest) - ein Lookup NUR über den
+        # Schlüssel hätte eine für z. B. 500 EUR Hauptforderung erteilte
+        # 20-EUR-Freigabe nach einer Teilzahlung auf nur noch 25 EUR
+        # weiterhin als "dieselbe Gruppe" gefunden und unverändert
+        # durchgelassen. Ein veränderter Saldo (in BEIDE Richtungen)
+        # findet deshalb strukturell KEINE bestehende Freigabe mehr - sie
+        # bleibt als Historie bestehen (siehe `MahnpauschaleFreigabeTable`
+        # -Moduldoc), wirkt aber nicht auf den neuen Stand fort.
         freigabe = (
             mahnpauschale_freigabe_lookup(
-                forderungsgruppe_schluessel([f.op_position_id for f in forderungen_kern])
+                forderungsgruppe_schluessel([f.op_position_id for f in forderungen_kern]), hauptforderung_cent,
             )
             if mahnpauschale_freigabe_lookup is not None else None
         )
@@ -1000,31 +1014,10 @@ def berechne_mahnkosten_vorschau(
                 )
             hinweise.append(
                 "§1333 Abs 2 ABGB (Mahnkostenpauschale): keine dokumentierte Einzelfallfreigabe (Erforderlichkeit, "
-                "tatsächlicher Aufwand, Schuldhaftigkeit, Verhältnismäßigkeit) für GENAU diese Forderungsgruppe "
-                f"vorhanden - Pauschale bleibt automatisch gesperrt (0 EUR, Prüffall){vorschlag_hinweis}. Eine "
-                "Freigabe einer anderen Forderungsgruppe wirkt nicht fort."
-            )
-        elif freigabe.hauptforderung_cent != hauptforderung_cent:
-            # Unabhängige Rückprüfung Codex 20.10.2026, echter Bug:
-            # `forderungsgruppe_schluessel` hasht NUR die OP-IDs, NICHT
-            # deren Restbeträge - eine bloße TEILZAHLUNG verändert die
-            # OP-ID-Menge NICHT (dieselbe Forderung bleibt offen, nur mit
-            # kleinerem Rest). Ohne diesen zusätzlichen Vergleich hätte
-            # eine für z. B. 500 EUR Hauptforderung erteilte 20-EUR-
-            # Freigabe nach einer Teilzahlung auf nur noch 25 EUR
-            # weiterhin als "dieselbe Gruppe" gegolten und wäre
-            # unverändert durchgegangen (siehe `MahnpauschaleFreigabeTable`
-            # -Moduldoc). Ein veränderter Saldo erbt NIE eine bestehende
-            # Freigabe, unabhängig davon, ob er gestiegen oder gesunken
-            # ist - in BEIDEN Fällen ist die ursprüngliche Verhältnis-
-            # mäßigkeits-/Aufwandsabwägung nicht mehr für den aktuellen
-            # Stand belegt.
-            hinweise.append(
-                "§1333 Abs 2 ABGB (Mahnkostenpauschale): die bestehende Freigabe wurde für eine ANDERE "
-                f"Hauptforderung erteilt (damals {freigabe.hauptforderung_cent / 100:.2f} EUR, aktuell "
-                f"{hauptforderung_cent / 100:.2f} EUR) - der Saldo dieser Forderungsgruppe hat sich seither "
-                "verändert (z. B. durch eine Teilzahlung), die Freigabe ist für den neuen Stand UNGÜLTIG. "
-                "Keine Pauschale angesetzt (Prüffall), eine neue Einzelfallfreigabe ist erforderlich."
+                "tatsächlicher Aufwand, Schuldhaftigkeit, Verhältnismäßigkeit) für GENAU diese Forderungsgruppe UND "
+                f"GENAU diesen Saldo ({hauptforderung_cent / 100:.2f} EUR) vorhanden - Pauschale bleibt automatisch "
+                f"gesperrt (0 EUR, Prüffall){vorschlag_hinweis}. Eine Freigabe einer anderen Forderungsgruppe oder "
+                "eines inzwischen durch eine Teilzahlung veränderten Saldos wirkt nicht fort."
             )
         elif freigabe.betrag_cent > hauptforderung_cent:
             hinweise.append(

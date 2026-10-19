@@ -4476,3 +4476,34 @@ teilzahlung_mit_unveraenderten_op_ids` (`tests/mietinkasso/
 test_mahnwesen_kosten.py`): belegt am konkreten 500/25-EUR-Fall mit
 UNVERÄNDERTEN OP-IDs, dass eine bestehende Freigabe nach einer großen
 Teilzahlung nicht mehr greift. 1076/1076 Tests grün im Gesamtlauf.
+
+### Vierte Codex-Rückprüfung (20.10.2026, Schema-Randfall zur Teilzahlung) — behoben
+
+Direkter Folgefund zur dritten Nachbesserung: solange die Eindeutigkeit
+von `MahnpauschaleFreigabeTable` NUR auf `(vertrag_id, stufe,
+forderungsgruppe_schluessel)` lag, blockierte eine bestehende Freigabe
+nach einer Teilzahlung zwar korrekt (siehe oben), aber eine NEUE,
+für den jetzt reduzierten Rest erteilte Freigabe für DIESELBEN OP-IDs
+hätte dabei an derselben Unique-Constraint gescheitert (`IntegrityError`)
+- ein legitimer Korrektur-Workflow nach einer Teilzahlung wäre dadurch
+versperrt gewesen.
+
+**Behoben:** `hauptforderung_cent` ist jetzt Teil der Eindeutigkeit
+selbst (`UniqueConstraint(vertrag_id, stufe, forderungsgruppe_schluessel,
+hauptforderung_cent)`), nicht nur ein Vergleichsfeld. Der Lookup für die
+Buchungsentscheidung (`MahnkostenRepository.mahnpauschale_freigabe_
+fuer_gruppe`) filtert jetzt direkt auf BEIDE Werte gemeinsam (statt eine
+gefundene Zeile erst nachträglich zu vergleichen); eine neue, für den
+reduzierten Saldo erteilte Freigabe ist dadurch strukturell möglich,
+ohne die alte (jetzt nur noch historische) Zeile zu verdrängen oder eine
+IntegrityError zu provozieren. Neue, rein für die Backoffice-Anzeige
+gedachte Methode `mahnpauschale_freigaben_historie` listet alle Zeilen
+unabhängig vom Hauptforderungsbetrag (zeigt z. B. eine durch Teilzahlung
+ungültig gewordene ältere Freigabe als Historie).
+
+Test erweitert (`test_mahnpauschale_freigabe_wirkt_nicht_nach_
+teilzahlung_mit_unveraenderten_op_ids`): nach der Teilzahlung zunächst
+0 EUR (unverändert), DANACH eine neue, ausdrückliche Freigabe für den
+reduzierten Betrag (1000 statt 2000 Cent) genau einmal zulässig und
+korrekt wirksam - keine automatische Fortwirkung der alten Freigabe.
+1076/1076 Tests grün im Gesamtlauf.

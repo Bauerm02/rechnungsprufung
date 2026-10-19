@@ -1986,11 +1986,19 @@ class MahnpauschaleFreigabeTable(Base):
     einer Teilzahlung auf nur noch 25 EUR offenen Rest WEITERHIN als
     "dieselbe Gruppe" erkannt und die Pauschale fälschlich unverändert
     durchgelassen. Deshalb zusätzlich `hauptforderung_cent`: die ZUM
-    FREIGABEZEITPUNKT tatsächlich bewilligte Hauptforderung dieser Gruppe.
-    `berechne_mahnkosten_vorschau` vergleicht sie bei JEDER Vorschau gegen
-    die GERADE aktuell berechnete Hauptforderung - weicht sie ab (auch bei
-    identischen OP-IDs), gilt die Freigabe als NICHT gefunden (0 EUR,
-    Prüffall) - ein veränderter Saldo erbt NIE eine bestehende Freigabe.
+    FREIGABEZEITPUNKT tatsächlich bewilligte Hauptforderung dieser Gruppe
+    - TEIL der Eindeutigkeit (siehe `__table_args__`), NICHT nur ein
+    Vergleichsfeld. `berechne_mahnkosten_vorschau`s Lookup filtert IMMER
+    auf `(vertrag_id, stufe, forderungsgruppe_schluessel, aktuelle
+    Hauptforderung)` gemeinsam - eine Zeile mit abweichender
+    `hauptforderung_cent` wird dabei schlicht NICHT gefunden (0 EUR,
+    Prüffall), unabhängig davon, ob der Saldo gestiegen oder gesunken
+    ist. Weil `hauptforderung_cent` Teil der Eindeutigkeit ist (nicht nur
+    `forderungsgruppe_schluessel` allein), bleibt nach einer Teilzahlung
+    eine NEUE, für den jetzt aktuellen Saldo erteilte Freigabe weiterhin
+    möglich - die alte Zeile bleibt als Historie für ihren damaligen
+    Stand erhalten, verdrängt aber nichts und blockiert auch keine neue
+    Freigabe.
 
     Vier Pflichtfelder dokumentieren GENAU die vier verlangten Kriterien
     für DIESEN konkreten Fall (nicht pauschal am Vertrag):
@@ -2011,8 +2019,16 @@ class MahnpauschaleFreigabeTable(Base):
 
     __tablename__ = "mahnpauschale_freigaben"
     __table_args__ = (
+        # `hauptforderung_cent` ist BEWUSST Teil der Eindeutigkeit (nicht
+        # nur `vertrag_id, stufe, forderungsgruppe_schluessel`): nach
+        # einer Teilzahlung mit UNVERÄNDERTEN OP-IDs (siehe Moduldoc) muss
+        # eine NEUE, für den jetzt aktuellen Saldo erteilte Freigabe
+        # möglich sein, OHNE die alte (jetzt nur noch historische,
+        # dauerhaft für ihren damaligen Saldo gültig bleibende) Zeile zu
+        # verdrängen oder eine IntegrityError zu provozieren.
         UniqueConstraint(
-            "vertrag_id", "stufe", "forderungsgruppe_schluessel", name="uq_mahnpauschale_freigabe_gruppe"
+            "vertrag_id", "stufe", "forderungsgruppe_schluessel", "hauptforderung_cent",
+            name="uq_mahnpauschale_freigabe_gruppe",
         ),
     )
 

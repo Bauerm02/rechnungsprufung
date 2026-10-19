@@ -556,12 +556,16 @@ class MahnkostenRepository:
     # zweite Nachbesserung 20.10.2026) -----------------------------------
 
     def mahnpauschale_freigabe_fuer_gruppe(
-        self, *, vertrag_id: str, stufe: int, forderungsgruppe_schluessel: str,
+        self, *, vertrag_id: str, stufe: int, forderungsgruppe_schluessel: str, hauptforderung_cent: int,
     ) -> MahnpauschaleFreigabeTable | None:
         """Lookup-Funktion für `kosten.py::berechne_mahnkosten_vorschau`s
         `mahnpauschale_freigabe_lookup`-Callback - siehe
         `MahnpauschaleFreigabeTable`-Moduldoc: eine Freigabe gilt
-        AUSSCHLIESSLICH für GENAU diese eingefrorene Forderungsgruppe."""
+        AUSSCHLIESSLICH für GENAU diese eingefrorene Forderungsgruppe UND
+        GENAU den damals bewilligten Hauptforderungsbetrag. Eine Zeile mit
+        abweichendem `hauptforderung_cent` (z. B. nach einer Teilzahlung,
+        bei unveränderten OP-IDs) wird hier bewusst NICHT gefunden - siehe
+        Moduldoc, dritte Nachbesserung."""
 
         with self._session_factory() as session:
             return session.execute(
@@ -569,7 +573,27 @@ class MahnkostenRepository:
                 .where(MahnpauschaleFreigabeTable.vertrag_id == vertrag_id)
                 .where(MahnpauschaleFreigabeTable.stufe == stufe)
                 .where(MahnpauschaleFreigabeTable.forderungsgruppe_schluessel == forderungsgruppe_schluessel)
+                .where(MahnpauschaleFreigabeTable.hauptforderung_cent == hauptforderung_cent)
             ).scalar_one_or_none()
+
+    def mahnpauschale_freigaben_historie(
+        self, *, vertrag_id: str, stufe: int, forderungsgruppe_schluessel: str,
+    ) -> list[MahnpauschaleFreigabeTable]:
+        """ALLE Freigabe-Zeilen für diese Forderungsgruppe, unabhängig vom
+        bewilligten Hauptforderungsbetrag - NUR für die Backoffice-Anzeige
+        (zeigt z. B. eine inzwischen durch eine Teilzahlung ungültig
+        gewordene ältere Freigabe als Historie), NIE für die
+        Buchungsentscheidung selbst (dafür ausschließlich
+        `mahnpauschale_freigabe_fuer_gruppe`, exakter Treffer)."""
+
+        with self._session_factory() as session:
+            return list(session.execute(
+                select(MahnpauschaleFreigabeTable)
+                .where(MahnpauschaleFreigabeTable.vertrag_id == vertrag_id)
+                .where(MahnpauschaleFreigabeTable.stufe == stufe)
+                .where(MahnpauschaleFreigabeTable.forderungsgruppe_schluessel == forderungsgruppe_schluessel)
+                .order_by(MahnpauschaleFreigabeTable.freigegeben_am.desc())
+            ).scalars().all())
 
     def mahnpauschale_freigabe_anlegen(
         self, *, vertrag_id: str, stufe: int, forderungsgruppe_schluessel: str, hauptforderung_cent: int,

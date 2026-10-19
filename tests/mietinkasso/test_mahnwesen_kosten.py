@@ -2002,9 +2002,19 @@ def test_mahnpauschale_freigabe_wirkt_nicht_nach_teilzahlung_mit_unveraenderten_
     assert vorschau_nach_teilzahlung.forderung_op_position_ids == vorschau_vor_teilzahlung.forderung_op_position_ids
     assert vorschau_nach_teilzahlung.mahnpauschale_cent is None  # die ALTE Freigabe erbt NICHT den neuen Saldo
     assert any(
-        "ANDERE" in hinweis and "Hauptforderung" in hinweis and "Teilzahlung" in hinweis
-        for hinweis in vorschau_nach_teilzahlung.hinweise
+        "Teilzahlung" in hinweis and "Saldo" in hinweis for hinweis in vorschau_nach_teilzahlung.hinweise
     ), vorschau_nach_teilzahlung.hinweise
+
+    # Gegenprobe: eine NEUE Freigabe für den jetzt aktuellen (niedrigeren)
+    # Saldo bleibt trotz der bestehenden alten Zeile möglich (dieselben
+    # OP-IDs, aber andere `hauptforderung_cent` - siehe `uq_mahnpauschale_
+    # freigabe_gruppe`) und wirkt dann korrekt für den neuen Stand.
+    _freigabe_fuer(
+        kosten_repo, op_service, kosten_service, vertrag_id=vertrag.id, stufe=1,
+        konto_id=konto.id, heute=date(2026, 3, 1), betrag_cent=1000,
+    )
+    vorschau_mit_neuer_freigabe = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1))
+    assert vorschau_mit_neuer_freigabe.mahnpauschale_cent == 1000
 
 
 def test_mahnpauschale_freigabe_wirkt_nicht_auf_spaetere_neue_forderungsgruppe_fort(
