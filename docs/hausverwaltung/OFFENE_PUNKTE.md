@@ -4769,3 +4769,164 @@ weiterhin 1).
 HTTP-Vertragstests. Keine Livezugriffe, keine Buchung/Mail/Deployment.
 Codex führt im Anschluss die unabhängige Datenkopie-/Live-Abnahme auf
 dem bereits produktiven `e7b621c`-Stand durch.
+
+## Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS (19.10.2026)
+
+Drei Teilaufträge (offene Punkte abarbeiten, Gebühren/Zinsen korrekt
+nachbuchen, automatischen Mail-/Briefversand fertigstellen). In dieser
+Runde abgeschlossen: Teil 2 (MailOps-Audit) vollständig, Teil 1 teilweise
+(Bankentgelt-Zweischritt), Teil 3 teilweise (Layout-Freihaltebereiche).
+**Noch NICHT begonnen** und ausdrücklich für die nächste Runde offen:
+die atomare Zuordnung einer nativen negativen Banktransaktion zu einer
+bankgebundenen ZAHLUNG samt Kapital-/Bankentgelt-Split in EINER
+Transaktion und dem dafür angefragten einfachen Portalformular (Teil 1,
+Hauptmechanismus) sowie der SFTP-Anbindungsadapter und die Archiv-Hash-/
+Status-/Konflikterweiterung für den physischen Briefkanal (Teil 3,
+Hauptmechanismus - Spezifikation bereits vom Nutzer übermittelt, siehe
+unten).
+
+### Teil 2 — MailOps-EMAIL-Audit (abgeschlossen)
+
+Audit bestätigt: die EMAIL-Versandreife-Gates sind real und mehrstufig
+(`send_enabled` + `hv_mail_allowlist_bestaetigt` + Transport-Client,
+Bankvollständigkeit, Policy-Freigabe, E-Mail-Adresse, Stufenabstand,
+Kanalregel-Auflösung) - keine Platzhalter, keine automatische Freigabe
+von ungeklärten Forderungen, keine Umgehung fehlender
+Bankvollständigkeit (unverändert, nur geprüft, nicht angetastet). Der
+tägliche Worker (`scripts/indexautomatik_taegliche_pflege.py`) bleibt
+unverändert der alleinige Erzeuger, kein neuer Scheduler.
+
+Zwei konkrete Lücken behoben:
+
+- `/backoffice/mailversand` zeigte bisher nur einen groben, global
+  aggregierten "aktiv"/"gesperrt"-Status je Versandart - keine Diagnose,
+  WARUM. Neue Karte "Betriebsstatus Kanalwege" (`routes/mailversand.py::
+  _betriebsstatus_mahnversand_html`) zeigt jetzt die TATSÄCHLICHE
+  Kanalregel-Freigabe (oder deren Fehlen -> Standard EMAIL für beide
+  Stufen) sowie - falls ein Kanal auf BRIEF aufgelöst wird - das
+  Brief-Anbieterprofil und den `brief_transport_verfuegbar`-Status, über
+  dieselben Repository-Instanzen, die `deps._hv_mail.mahn_service`
+  tatsächlich verwendet. Reine Anzeige, verändert kein Gate.
+- Veralteter Zinsprofil-Hilfetext (`backoffice/zinsprofil_form.py`):
+  behauptete noch, das Mahnpauschale-Freigabeformular existiere "in
+  diesem Portal noch nicht" - das Formular wurde aber bereits in der
+  vorigen Runde gebaut (`/vertrag/{id}/mahnpauschale-freigabe`). Text auf
+  den tatsächlichen Stand korrigiert (0-EUR-Default-Verhalten ohne
+  Freigabe unverändert beschrieben).
+
+### Teil 1 — Bankentgelt-Zweischritt bei zunächst unklarer Zurechenbarkeit (abgeschlossen)
+
+Zwei fachliche Lücken in `bank/ruecklastschriftkosten_service.py`
+behoben (synthetische Tests in `test_ruecklastschriftkosten.py`):
+
+1. **Stiller Erfolg bei abweichendem Wiederholungsversuch.**
+   `erfasse_und_buche` gab bei einem zweiten Aufruf für DIESELBE
+   Rücklastschrift-OP bisher IMMER die bestehende Zeile zurück, auch
+   wenn die neu übergebenen Werte (Bankentgelt, Zurechenbarkeit,
+   Begründung, Beleg) davon abwichen - ein später korrigierter Betrag
+   wäre unbemerkt verschluckt worden. Jetzt: identische Wiederholung
+   bleibt No-Op, abweichende Wiederholung wirft `VorgangIdKonfliktError`
+   (gilt auch im IntegrityError-Race-Pfad).
+2. **Nachträgliche Zurechenbarkeit nicht nachziehbar.** War die
+   Zurechenbarkeit bei Ersterfassung offen/verneint (rein dokumentarisch,
+   `kosten_op_position_id=None`), gab es bisher KEINEN Weg, denselben,
+   bereits erfassten Bankaufwand nachträglich als Forderung zu
+   übernehmen, sobald ein Bank-/Rechtsnachweis die Zurechenbarkeit DOCH
+   belegt - ein erneuter `erfasse_und_buche`-Aufruf hätte (nach Fix 1)
+   nur einen Konflikt geworfen. Neue Methode
+   `uebernimm_zurechenbarkeit_nachtraeglich`: bucht GENAU EINMAL eine
+   SOLL-Position für den UNVERÄNDERTEN, bereits dokumentierten
+   `bankentgelt_cent` (kein neu eingegebener Betrag, keine zweite
+   Bankrückgabe/Kapitalbuchung), verlangt eine eigene, separat belegte
+   Begründung (KEINE automatische Verursachungsvermutung aus einem
+   bloßen Bank-Rückgabegrund-Code wie SEPA "MS03"), ist idempotent bei
+   identischer Begründung und lehnt sowohl eine abweichende
+   Zweitbegründung als auch eine bereits von Anfang an zurechenbare Zeile
+   mit `VorgangIdKonfliktError` ab. Die Ursprungsbegründung
+   (`zurechenbarkeit_begruendung`) bleibt dabei UNVERÄNDERT als
+   Historie erhalten; die neue Begründung landet in drei additiven,
+   nullablen Spalten (`nachtraeglich_zurechenbar_begruendung`/
+   `_erklaert_von`/`_erklaert_am`, migrationsgetestet in
+   `test_migrations.py`). Noch KEIN Backoffice-Formular für diesen
+   nachträglichen Weg - bislang nur Service-Methode, analog zum
+   ursprünglichen Zwischenstand von `mahnpauschale_freigabe_anlegen` vor
+   dessen eigenem Formular.
+
+**Noch offen (Teil 1, Hauptmechanismus):** die eigentlich angefragte
+atomare Zuordnung EINER nativen negativen Banktransaktion zu einer
+bereits bankgebundenen ZAHLUNG (Kapitalrestaurierung über
+`bank/service.py::verarbeite_ruecklastschrift` + Bankentgelt-Split in
+EINER DB-Transaktion, inkl. "vollständige Bankzuordnung" - der
+verbleibende Banktransaktionsbetrag muss nach Abzug des dokumentierten
+Bankentgelts auf 0 sinken) sowie das dafür angefragte einfache
+Portalformular für eine vorhandene Bankzeile (`/backoffice/bank/
+{transaktion_id}/...`) wurden in dieser Runde NICHT begonnen. Aktuell
+gibt es in `routes/bank.py` für eine negative Transaktion
+(`_klaerfall_zeile`) ausdrücklich KEIN Zuordnungsformular ("Prüffall,
+kein Zuordnungsformular"). Analyse/Design (Session-Teilen zwischen
+`BankImportService.verarbeite_ruecklastschrift` und
+`RuecklastschriftkostenService.erfasse_und_buche` über einen optionalen
+`session`-Parameter, Kapital-/Bankentgelt-Split aus dem Transaktions-
+Restbetrag) liegt bereits vor, Umsetzung + Tests (Teilrückgabe/
+Überrückgabe/Bankkonto-Kreuzung/Rollback) stehen noch aus.
+
+### Teil 3 — Brief: Layout-Freihaltebereiche (abgeschlossen), SFTP-Adapter (offen)
+
+**Layout-Freihaltebereiche (abgeschlossen):** visuelle Prüfung des
+Original-Anhangs "EinfachBrief-Freihaltebereiche.pdf" ergab einen
+oben-links-Sperrbereich (52x60 mm, umlaufend 5 mm Schutzabstand), in dem
+Logo (x=20/y=12/w=32) und Absenderzeile (x=20/y=16 bzw. y=53) bislang
+lagen. Behoben in `mahnwesen/brief_pdf.py`: Logo UND Absenderzeile stehen
+jetzt rechtsbündig (`_LOGO_X`/`_SPERRBEREICH_BREITE`, neue Konstanten),
+ebenso der laufende Folgeseitenkopf (`_MahnbriefPDF.header`), vorsorglich
+auf jeder Seite. Zusätzlich behoben: `infrastructure/config.py::
+brief_fenster_oben_mm` stand noch auf der alten DIN-5008-Position
+(45 mm), während `brief_pdf.py::Absender.fenster_oben_mm` bereits korrekt
+62 mm (tatsächliche EinfachBrief-Spezifikation) trug - da der
+Settings-Wert beim tatsächlichen Aufruf (`routes/mahnwesen.py::
+mahnbrief_pdf`) IMMER explizit übergeben wird, überschrieb er den
+richtigen Dataclass-Default still; jetzt einheitlich 62 mm. Der separat
+genannte Freihaltebereich "links 18 mm bis 160 mm Höhe" sowie der äußere
+5-mm-Rand waren bereits durch den bestehenden Inhaltsrand (`_RAND`
+= 20 mm) erfüllt, ohne Codeänderung - geometrisch in `test_brief_pdf.py`
+festgeschrieben (inkl. eines erzwungen mehrseitigen Briefs für den
+Folgeseitenkopf). Keine Aussage "Formatprüfung bestanden" wird dabei
+bloß aufgrund eines Metadaten-/Label-Flags getroffen (PDF/A-2B bleibt
+über `fpdf2`s echte `enforce_compliance`-Prüfung erzwungen, Layout-
+Freihaltebereiche werden separat von Codex visuell geprüft).
+
+**SFTP-Anbindungsadapter (offen, Spezifikation liegt vor):** Nutzer hat
+eine dokumentierte Post-SFTP-Spezifikation übermittelt (Host
+`transfer.post-business-solutions.at`, Port 22, Upload nach
+`/bulk_tp/`, Dateiname `<15 Ziffern>-<A-Za-z0-9_->.pdf` mit 1-basierten
+Parameterpositionen 3/4/5/7/9 für Farbmodus/Duplex/Prio-Eco/
+Zustellart/E-Brief-Sperre, Budget bis 588 EUR inkl. USt freigegeben,
+Beauftragung durch Codex). Ausdrücklich gefordert: dokumentierter
+Adapter statt nur abstraktem Interface, aber weiterhin GESCHLOSSEN ohne
+reale Konfiguration (Hostkey-Pinning Pflicht, Credentials NUR in
+privaten Serverdateien außerhalb dieses Repos, kein produktiver
+Upload/Testbrief), ehrlicher Abgleichstatus (Upload bestenfalls
+"übertragen/angenommen", KEIN Postaufgabe-/Zustellnachweis, da der
+Provider nur eine manuell einsehbare Portal-Auftragsliste bietet, keine
+maschinelle Status-API) mit dokumentiertem, originalbeleggebundenem
+manuellem Nachweisimport (Kostenbuchung/Mahnstufe NIE allein durch den
+Upload ausgelöst), eindeutige dauerhaft reservierte Dateinamen (NIE
+Überschreiben, nie automatisches Neu-Hochladen nach Timeout), sowie eine
+Erweiterung von `MahnbriefArchivTable` um einen Empfänger-/
+Forderungssnapshot-Hash und ehrliche Status-Werte (vorbereitet/
+übertragen/angenommen/postaufgegeben/zugestellt) mit Konflikt statt
+stillem Erfolg bei gleicher ID + abweichendem PDF/Beleg (aktuell gibt
+`MahnbriefArchivRepository.archivieren` bei vorhandenem Schlüssel die
+alte Zeile zurück, OHNE das neu übergebene PDF zu vergleichen - das ist
+die konkrete, noch zu schließende Lücke). Dieser gesamte Mechanismus
+wurde in dieser Runde bewusst NICHT begonnen (Umfang/Sorgfalt,
+sicherheitsrelevanter Transport-Code) und ist für die nächste Runde
+vorgesehen.
+
+**Ergebnis dieser Runde:** gezielte Tests grün (`test_ruecklastschriftkosten.py`
+10/10, `test_brief_pdf.py` 23/23 + 6 neue, `test_config.py` 7/7,
+`test_migrations.py` 14/14, `test_backoffice.py`/`test_bank.py`/
+`test_backoffice_contract.py` unverändert grün, 267 Tests insgesamt in
+den betroffenen Dateien). Kein Volltest wiederholt (reine Zusatzänderung
+ohne Berührung der übrigen Module). Keine Livezugriffe, keine
+Buchung/Mail/Deployment, `SEND_ENABLED` unverändert `false`.

@@ -16,13 +16,29 @@ dokumentarisch (`kosten_op_position_id` bleibt `None`, keine SOLL-Zeile).
 
 `RuecklastschriftkostenTable.uq_ruecklastschriftkosten_je_rls` ist das
 fachliche Gate gegen eine doppelte Erfassung für DIESELBE Rücklastschrift
--OP-Position (auch bei wiederholtem Lauf) - ein zweiter Versuch für
-dieselbe Rücklastschrift liefert die bereits bestehende Zeile zurück,
-statt erneut zu buchen."""
+-OP-Position (auch bei wiederholtem Lauf) - ein ECHTER Retry (identische
+Parameter) liefert die bereits bestehende Zeile zurück, statt erneut zu
+buchen; ein zweiter Versuch mit ABWEICHENDEN Parametern (z. B. anderes
+Bankentgelt) ist dagegen ein Konflikt und wird abgelehnt (siehe
+`erfasse_und_buche`, Codex-Rückmeldung 19.10.2026 - vorher gab ein
+zweiter Versuch mit abweichenden Werten still die alte Zeile zurück).
+
+Zweischritt bei zunächst UNKLARER Zurechenbarkeit (Codex-Rückmeldung
+19.10.2026): `erfasse_und_buche(dem_zahlungspflichtigen_zurechenbar=
+False)` legt die Zeile dokumentarisch an (KEINE SOLL-Buchung). Kommt
+SPÄTER ein Bank-/Rechtsnachweis, der die Zurechenbarkeit DOCH belegt,
+übernimmt `uebernimm_zurechenbarkeit_nachtraeglich(...)` GENAU EINMAL den
+bereits dokumentierten, UNVERÄNDERTEN `bankentgelt_cent` als
+Erstattungsforderung - keine zweite Bankrückgabe/Kapitalbuchung, kein neu
+eingegebener Betrag, keine automatische Verursachungsvermutung aus einem
+bloßen Bank-Rückgabegrund-Code (z. B. SEPA-Reaktionscode "MS03" o. ä.).
+Die ursprüngliche Begründung (`zurechenbarkeit_begruendung`) bleibt dabei
+UNVERÄNDERT als Ursprungshistorie erhalten; die neue, separat belegte
+Begründung landet in eigenen `nachtraeglich_zurechenbar_*`-Spalten."""
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -30,8 +46,22 @@ from sqlalchemy.orm import Session
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
 from mietinkasso.domain.enums import OPTyp
+from mietinkasso.domain.exceptions import VorgangIdKonfliktError
 from mietinkasso.infrastructure.db.tables import KontoTable, OPPositionTable, RuecklastschriftkostenTable
 from mietinkasso.op.service import OPService
+
+
+def _wiederholung_stimmt_ueberein(
+    bestehend: RuecklastschriftkostenTable, *, bankentgelt_cent: int, rueckgabeursache: str,
+    dem_zahlungspflichtigen_zurechenbar: bool, zurechenbarkeit_begruendung: str, beleg_referenz: str,
+) -> bool:
+    return (
+        bestehend.bankentgelt_cent == bankentgelt_cent
+        and bestehend.rueckgabeursache == rueckgabeursache
+        and bestehend.dem_zahlungspflichtigen_zurechenbar == dem_zahlungspflichtigen_zurechenbar
+        and bestehend.zurechenbarkeit_begruendung == zurechenbarkeit_begruendung
+        and bestehend.beleg_referenz == beleg_referenz
+    )
 
 
 class RuecklastschriftkostenRepository:
@@ -66,6 +96,25 @@ class RuecklastschriftkostenRepository:
             kosten_op_position_id=kosten_op_position_id, erstellt_von=erstellt_von,
         )
         session.add(row)
+        session.flush()
+        return row
+
+    def uebernimm_zurechenbarkeit_nachtraeglich(
+        self, *, row_id: int, kosten_op_position_id: int, begruendung: str, erklaert_von: str, session: Session,
+    ) -> RuecklastschriftkostenTable:
+        """Aktualisiert NUR die nachträglichen Zurechenbarkeits-Spalten
+        und `kosten_op_position_id` - `bankentgelt_cent`/
+        `rueckgabeursache`/`zurechenbarkeit_begruendung` (Ursprungs-
+        historie) bleiben dabei UNVERÄNDERT."""
+
+        row = session.get(RuecklastschriftkostenTable, row_id)
+        if row is None:
+            raise ValueError(f"Unbekannte Rücklastschriftkosten-Zeile {row_id}.")
+        row.dem_zahlungspflichtigen_zurechenbar = True
+        row.kosten_op_position_id = kosten_op_position_id
+        row.nachtraeglich_zurechenbar_begruendung = begruendung
+        row.nachtraeglich_zurechenbar_erklaert_von = erklaert_von
+        row.nachtraeglich_zurechenbar_erklaert_am = datetime.now(timezone.utc)
         session.flush()
         return row
 
@@ -117,7 +166,20 @@ class RuecklastschriftkostenService:
 
         bestehend = self._repository.fuer_ruecklastschrift(ruecklastschrift_op_position.id)
         if bestehend is not None:
-            return bestehend
+            if _wiederholung_stimmt_ueberein(
+                bestehend, bankentgelt_cent=bankentgelt_cent, rueckgabeursache=rueckgabeursache,
+                dem_zahlungspflichtigen_zurechenbar=dem_zahlungspflichtigen_zurechenbar,
+                zurechenbarkeit_begruendung=zurechenbarkeit_begruendung, beleg_referenz=beleg_referenz,
+            ):
+                return bestehend  # echter Retry, No-Op
+            raise VorgangIdKonfliktError(
+                f"Rücklastschriftkosten für OPPosition {ruecklastschrift_op_position.id} wurden bereits MIT "
+                f"ABWEICHENDEN Werten erfasst (Bankentgelt {bestehend.bankentgelt_cent}, zurechenbar "
+                f"{bestehend.dem_zahlungspflichtigen_zurechenbar}); angefordert wurden Bankentgelt "
+                f"{bankentgelt_cent}, zurechenbar {dem_zahlungspflichtigen_zurechenbar}. Für eine nachträglich "
+                "belegte Zurechenbarkeit siehe `uebernimm_zurechenbarkeit_nachtraeglich`, für einen echten "
+                "zweiten, unabhängigen Vorgang ist keine zweite Erfassung je Rücklastschrift-OP vorgesehen."
+            )
 
         with self._session_factory() as session:
             try:
@@ -152,10 +214,11 @@ class RuecklastschriftkostenService:
                 return row
             except IntegrityError:
                 # Ein gleichzeitiger zweiter Versuch für DIESELBE
-                # Rücklastschrift (`uq_ruecklastschriftkosten_je_rls`) -
-                # kein Fehler, sondern der Idempotenz-Fall (siehe
-                # Moduldoc). Findet sich KEINE eigene Zeile, war die
-                # IntegrityError ein echter, ungeklärter Konflikt.
+                # Rücklastschrift (`uq_ruecklastschriftkosten_je_rls`) MIT
+                # DENSELBEN Werten - kein Fehler, sondern der Idempotenz-
+                # Fall (siehe Moduldoc). Findet sich KEINE eigene Zeile
+                # oder weicht sie ab, war die IntegrityError ein echter,
+                # ungeklärter Konflikt.
                 session.rollback()
                 bestehend = self._repository.fuer_ruecklastschrift(ruecklastschrift_op_position.id)
                 if bestehend is None:
@@ -164,4 +227,73 @@ class RuecklastschriftkostenService:
                         "ist an einer IntegrityError gescheitert, aber es existiert KEINE eigene Zeile - "
                         "manuelle Klärung erforderlich."
                     ) from None
+                if not _wiederholung_stimmt_ueberein(
+                    bestehend, bankentgelt_cent=bankentgelt_cent, rueckgabeursache=rueckgabeursache,
+                    dem_zahlungspflichtigen_zurechenbar=dem_zahlungspflichtigen_zurechenbar,
+                    zurechenbarkeit_begruendung=zurechenbarkeit_begruendung, beleg_referenz=beleg_referenz,
+                ):
+                    raise VorgangIdKonfliktError(
+                        f"Rücklastschriftkosten für OPPosition {ruecklastschrift_op_position.id} wurden "
+                        "gleichzeitig MIT ABWEICHENDEN Werten erfasst."
+                    ) from None
                 return bestehend
+
+    def uebernimm_zurechenbarkeit_nachtraeglich(
+        self,
+        *,
+        ctx: AuthContext,
+        ruecklastschrift_op_position_id: int,
+        konto: KontoTable,
+        begruendung: str,
+        heute: date,
+        akteur: str,
+    ) -> RuecklastschriftkostenTable:
+        """Übernimmt NACHTRÄGLICH den bereits dokumentierten, UNVERÄNDERTEN
+        Bankaufwand als Erstattungsforderung, wenn zuerst keine/unklare
+        Zurechenbarkeit vorlag und ERST SPÄTER ein Bank-/Rechtsnachweis
+        die Zurechenbarkeit belegt - siehe Moduldoc. Bucht GENAU EINMAL
+        eine neue SOLL-Position für den unveränderten `bankentgelt_cent`
+        (kein neu eingegebener Betrag, keine zweite Bankrückgabe/
+        Kapitalbuchung)."""
+
+        require_gesellschaft_access(ctx, konto.gesellschaft_id)
+        require_schreibrecht(ctx)
+        if not begruendung.strip():
+            raise ValueError("Begründung für die nachträgliche Zurechenbarkeit muss belegt angegeben werden.")
+
+        bestehend = self._repository.fuer_ruecklastschrift(ruecklastschrift_op_position_id)
+        if bestehend is None:
+            raise ValueError(
+                f"Für Rücklastschrift-OP {ruecklastschrift_op_position_id} liegt noch keine Bankentgelt-"
+                "Erfassung vor; eine nachträgliche Zurechenbarkeit setzt eine bestehende, dokumentarische "
+                "Erfassung voraus."
+            )
+        if bestehend.dem_zahlungspflichtigen_zurechenbar:
+            if bestehend.nachtraeglich_zurechenbar_begruendung == begruendung:
+                return bestehend  # echter Retry, No-Op
+            raise VorgangIdKonfliktError(
+                f"Rücklastschriftkosten für OP {ruecklastschrift_op_position_id} sind bereits zurechenbar "
+                "(entweder von Anfang an oder bereits nachträglich übernommen, mit einer ABWEICHENDEN "
+                "Begründung) - eine zweite SOLL-Buchung für denselben Aufwand ist nicht zulässig."
+            )
+
+        with self._session_factory() as session:
+            try:
+                kosten_position = self._op_service.buchen(
+                    ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=bestehend.bankentgelt_cent,
+                    belegdatum=heute, buchungsdatum=heute, faelligkeit=None,
+                    beleg_referenz=bestehend.beleg_referenz,
+                    aenderungsgrund="Rücklastschriftkosten - nachträglich übernommene Zurechenbarkeit",
+                    import_id=f"RUECKLASTSCHRIFTKOSTEN-NACHTRAEGLICH:{bestehend.id}",
+                    quelle_system="ruecklastschriftkosten",
+                    session=session,
+                )
+                aktualisiert = self._repository.uebernimm_zurechenbarkeit_nachtraeglich(
+                    row_id=bestehend.id, kosten_op_position_id=kosten_position.id,
+                    begruendung=begruendung, erklaert_von=akteur, session=session,
+                )
+                session.commit()
+                return aktualisiert
+            except Exception:
+                session.rollback()
+                raise

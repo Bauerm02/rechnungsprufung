@@ -117,9 +117,10 @@ def zinsprofil_formular(vertrag, profile, csrf):
            (Erforderlichkeit, tatsächlicher Aufwand, Schuldhaftigkeit DIESES Rückstands, Verhältnismäßigkeit zur
            aktuellen Hauptforderung) - ein statisches Profil-Flag beweist weder gesetzliche Angemessenheit noch
            konkretes Verschulden eines einzelnen Rückstands (z. B. eines Bank-/SEPA-Fehlers). Ein Vertragstext
-           wie "20 EUR je Mahnung" ist NIE automatisch dieser Wert. Live-Gate: das Formular zur Erteilung einer
-           solchen Einzelfallfreigabe existiert in diesem Portal noch nicht - die Pauschale bleibt deshalb
-           bis auf Weiteres für jede Forderungsgruppe automatisch bei 0 EUR (Prüffall).</p>
+           wie "20 EUR je Mahnung" ist NIE automatisch dieser Wert. Live-Gate: die Einzelfallfreigabe wird im
+           Mahnkosten-Block der Mahnvorschau je konkretem Mahnlauf/Forderungsgruppe erteilt
+           (<code>/vertrag/{id}/mahnpauschale-freigabe</code>) - ohne eine für den AKTUELLEN Saldo gültige
+           Freigabe bleibt die Pauschale für jede Forderungsgruppe automatisch bei 0 EUR (Prüffall).</p>
       </fieldset>
       <button type="submit">Als Entwurf speichern</button>
       </form>

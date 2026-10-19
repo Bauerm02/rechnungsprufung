@@ -700,6 +700,63 @@ def test_ensure_additive_columns_zieht_debitoren_telefon_nach_und_ist_idempotent
         engine.dispose()
 
 
+def test_ensure_additive_columns_zieht_ruecklastschriftkosten_nachtraeglich_spalten_nach(tmp_path: Path):
+    """Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS: `ruecklastschriftkosten`
+    existiert produktiv OHNE die drei `nachtraeglich_zurechenbar_*`-Spalten
+    (Zweischritt bei zunächst unklarer Zurechenbarkeit). Additiv/nullable
+    nachgezogen, eine Bestandszeile bleibt unverändert."""
+
+    from mietinkasso.infrastructure.db.tables import RuecklastschriftkostenTable
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'ruecklastschriftkosten-alt.db'}", future=True)
+    meta = sa.MetaData()
+    ruecklastschriftkosten_alt = sa.Table(
+        "ruecklastschriftkosten",
+        meta,
+        sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+        sa.Column("vertrag_id", sa.String(64), nullable=False),
+        sa.Column("ruecklastschrift_op_position_id", sa.Integer, nullable=False),
+        sa.Column("bankentgelt_cent", sa.Integer, nullable=False),
+        sa.Column("rueckgabeursache", sa.String(128), nullable=False),
+        sa.Column("dem_zahlungspflichtigen_zurechenbar", sa.Boolean, nullable=False),
+        sa.Column("zurechenbarkeit_begruendung", sa.Text, nullable=False),
+        sa.Column("beleg_referenz", sa.String(256), nullable=False),
+        sa.Column("kosten_op_position_id", sa.Integer, nullable=True),
+        sa.Column("gebucht_am", sa.DateTime(timezone=True)),
+        sa.Column("erstellt_von", sa.String(128), nullable=False),
+        # nachtraeglich_zurechenbar_*: NEU, bewusst NICHT hier.
+    )
+    try:
+        meta.create_all(engine)
+        with engine.begin() as conn:
+            conn.execute(ruecklastschriftkosten_alt.insert().values(
+                id=1, vertrag_id="V-ALT-1", ruecklastschrift_op_position_id=1, bankentgelt_cent=1250,
+                rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=False,
+                zurechenbarkeit_begruendung="Noch ungeklärt.", beleg_referenz="Bankbeleg ALT-1",
+                erstellt_von="alt-test",
+            ))
+
+        ausgefuehrt = ensure_additive_columns(engine)
+        neue_spalten = {"nachtraeglich_zurechenbar_begruendung", "nachtraeglich_zurechenbar_erklaert_von",
+                        "nachtraeglich_zurechenbar_erklaert_am"}
+        assert {s["name"] for s in sa.inspect(engine).get_columns("ruecklastschriftkosten")} >= neue_spalten
+        assert len(ausgefuehrt) == 3
+
+        with engine.begin() as conn:
+            zeile = conn.execute(sa.text("SELECT * FROM ruecklastschriftkosten WHERE id = 1")).mappings().one()
+        assert zeile["bankentgelt_cent"] == 1250 and zeile["zurechenbarkeit_begruendung"] == "Noch ungeklärt."
+        assert zeile["nachtraeglich_zurechenbar_begruendung"] is None
+
+        assert ensure_additive_columns(engine) == []  # idempotent
+
+        session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False, class_=Session)
+        with session_factory() as session:
+            row = session.get(RuecklastschriftkostenTable, 1)
+            assert row.nachtraeglich_zurechenbar_begruendung is None
+    finally:
+        engine.dispose()
+
+
 def test_ensure_additive_columns_bei_frischer_db_no_op():
     """Eine frisch über `Base.metadata.create_all()` angelegte DB hat
     bereits alle Spalten - hier gibt es nichts nachzuziehen (reine

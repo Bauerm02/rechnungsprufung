@@ -174,11 +174,17 @@ class Settings(BaseSettings):
     # Betreffzeile auf den normalen Fett-Font zurück (unverändertes
     # Verhalten).
     brief_font_headline_pfad: str | None = None
-    # DIN-5008-Standardposition für ein Fensterkuvert - Codex kann sie
-    # bei Bedarf auf die tatsächliche EinfachBrief-Fensterspezifikation
-    # nachjustieren, ohne Codeänderung.
+    # Tatsächliche EinfachBrief-Fensterspezifikation (20/62 mm, siehe
+    # `mahnwesen/brief_pdf.py`-Moduldoc) - war hier bis 19.10.2026 noch
+    # auf der alten DIN-5008-Standardposition (45 mm) stehengeblieben,
+    # während `brief_pdf.py::Absender.fenster_oben_mm` bereits korrekt 62
+    # mm als Default trug; da dieser Settings-Wert beim tatsächlichen
+    # Aufruf (`routes/mahnwesen.py::mahnbrief_pdf`) IMMER explizit
+    # übergeben wird, überschrieb er still den richtigen Dataclass-
+    # Default. Codex kann den Wert bei Bedarf weiter nachjustieren, ohne
+    # Codeänderung.
     brief_fenster_links_mm: float = 20.0
-    brief_fenster_oben_mm: float = 45.0
+    brief_fenster_oben_mm: float = 62.0
     brief_fenster_breite_mm: float = 90.0
     brief_fenster_hoehe_mm: float = 45.0
 

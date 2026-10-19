@@ -12,6 +12,18 @@ Schutzzone ringsum, Empfänger 11pt linksbündig, max. 6 Zeilen - eine zu
 lange/fehlende Adresse wird über `AdressfehlerError` kontrolliert
 abgelehnt statt als Platzhalter in einen druckfertigen Brief zu geraten.
 
+Freihaltebereiche (visuelle Prüfung des Original-Anhangs
+"EinfachBrief-Freihaltebereiche.pdf", Codex-Rückmeldung 19.10.2026): auf
+der Vorderseite oben links ein 52x60-mm-Rechteck, umlaufend 5 mm
+Schutzabstand (`_SPERRBEREICH_BREITE`/`_SPERRBEREICH_HOEHE` unten) - dort
+darf NICHTS gedruckt werden. Logo, Absenderzeile UND der laufende
+Folgeseitenkopf stehen deshalb rechtsbündig (nicht mehr bei x=20),
+niemals im Sperrbereich, auch wenn kein Logo konfiguriert ist. Der
+bestehende linke Rand (`_RAND` = 20 mm) und der bestehende äußere
+Seitenrand erfüllen den separat genannten Freihaltebereich "links 18 mm
+bis 160 mm Höhe" sowie den äußeren 5-mm-Rand bereits unverändert (siehe
+geometrische Tests in `test_brief_pdf.py`).
+
 Schrift/Logo sind konfigurierbare Dateipfade (siehe
 `infrastructure/config.py`): ohne sie fällt die Schrift auf eine immer
 vorhandene, offen lizenzierte TTF zurück und es wird KEIN Logo gezeichnet."""
@@ -34,6 +46,15 @@ _SEITE_BREITE = 210.0
 _RAND = 20.0
 _INHALT_RECHTS = _SEITE_BREITE - _RAND  # 190
 _BETRAG_SPALTE_BREITE = 35.0
+
+# EinfachBrief-Freihaltebereich oben links: 52 mm Breite x 60 mm Höhe,
+# umlaufend 5 mm Schutzabstand -> nichts darf links von
+# `_SPERRBEREICH_BREITE` beginnen, solange y < `_SPERRBEREICH_HOEHE` ist.
+_SPERRBEREICH_BREITE = 57.0  # 52 + 5
+_SPERRBEREICH_HOEHE = 65.0  # 60 + 5
+_LOGO_BREITE = 32.0
+_LOGO_X = _INHALT_RECHTS - _LOGO_BREITE  # rechtsbündig, sicher außerhalb des Sperrbereichs
+_LOGO_Y = 12.0
 _MAX_EMPFAENGER_ZEILEN = 6
 
 
@@ -121,12 +142,15 @@ class _MahnbriefPDF(FPDF):
     def header(self):
         if self.page_no() == 1:
             return
+        # Rechtsbündig ab `_SPERRBEREICH_BREITE` statt ab `_RAND` (20 mm):
+        # derselbe oben-links-Sperrbereich wie auf der Vorderseite gilt
+        # vorsorglich für jede Seite (Codex-Rückmeldung 19.10.2026).
         self.set_font(self.fett_familie, "", 8)
         self.set_text_color(*self.farbe_anthrazit)
-        self.set_xy(_RAND, 10)
-        self.cell(0, 5, self.kopf_text, new_x="LMARGIN", new_y="NEXT")
+        self.set_xy(_SPERRBEREICH_BREITE, 10)
+        self.cell(_INHALT_RECHTS - _SPERRBEREICH_BREITE, 5, self.kopf_text, new_x="LMARGIN", new_y="NEXT")
         self.set_draw_color(*self.farbe_gold)
-        self.line(_RAND, 16, _INHALT_RECHTS, 16)
+        self.line(_SPERRBEREICH_BREITE, 16, _INHALT_RECHTS, 16)
         self.set_y(20)
 
     def footer(self):
@@ -237,19 +261,25 @@ def erzeuge_mahnbrief_pdf(
         )
 
     fenster_unten = absender.fenster_oben_mm + absender.fenster_hoehe_mm
-    logo_unten = 12.0
+    # Logo UND Absenderzeile rechtsbündig (`_LOGO_X` >= `_SPERRBEREICH_
+    # BREITE`), NIE im oben-links-Sperrbereich - auch ohne konfiguriertes
+    # Logo bleibt die Absenderzeile dort, nicht bei x=`_RAND`.
+    logo_unten = _LOGO_Y
     if absender.logo_pfad and Path(absender.logo_pfad).is_file():
-        info = pdf.image(absender.logo_pfad, x=_RAND, y=12, w=32)
-        logo_unten = 12.0 + info.rendered_height
+        info = pdf.image(absender.logo_pfad, x=_LOGO_X, y=_LOGO_Y, w=_LOGO_BREITE)
+        logo_unten = _LOGO_Y + info.rendered_height
 
     # Absenderzeile (Retouradresse) sauber vom Logo getrennt UND
     # sichtbar außerhalb der 5-mm-Schutzzone über dem Fenster (Fenster
     # beginnt bei `fenster_oben_mm`).
     absender_y = min(logo_unten + 4, absender.fenster_oben_mm - 5 - 4)
-    pdf.set_xy(_RAND, absender_y)
+    pdf.set_xy(_SPERRBEREICH_BREITE, absender_y)
     pdf.set_font("Brief", "", 8)
     pdf.set_text_color(*anthrazit)
-    pdf.cell(0, 4, f"{absender.name} · {absender.adresse}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(
+        _INHALT_RECHTS - _SPERRBEREICH_BREITE, 4, f"{absender.name} · {absender.adresse}",
+        align="R", new_x="LMARGIN", new_y="NEXT",
+    )
 
     # Empfänger AUSSCHLIESSLICH innerhalb des Fensters, linksbündig
     # (kein Blocksatz - je Zeile eigene `cell()`, kein `multi_cell`

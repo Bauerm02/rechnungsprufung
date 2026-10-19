@@ -1931,6 +1931,15 @@ class RuecklastschriftkostenTable(Base):
     kosten_op_position_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     gebucht_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     erstellt_von: Mapped[str] = mapped_column(String(128))
+    # Zweischritt bei zunächst unklarer Zurechenbarkeit (Codex-Rückmeldung
+    # 19.10.2026, additiv): bleiben NULL, solange die Zeile entweder von
+    # Anfang an zurechenbar war oder weiterhin rein dokumentarisch ist.
+    # `zurechenbarkeit_begruendung` oben bleibt dabei UNVERÄNDERT die
+    # Ursprungshistorie - siehe `ruecklastschriftkosten_service.py::
+    # RuecklastschriftkostenService.uebernimm_zurechenbarkeit_nachtraeglich`.
+    nachtraeglich_zurechenbar_begruendung: Mapped[str | None] = mapped_column(Text, nullable=True)
+    nachtraeglich_zurechenbar_erklaert_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    nachtraeglich_zurechenbar_erklaert_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class MahnbriefArchivTable(Base):

@@ -34,6 +34,25 @@ def test_send_enabled_in_production_wird_abgelehnt():
         pruefe_produktionskonfiguration(_settings(send_enabled=True))
 
 
+def test_brief_fenster_oben_mm_entspricht_der_einfachbrief_spezifikation():
+    """Codex-Rückmeldung 19.10.2026: dieser Settings-Default war auf der
+    alten DIN-5008-Position (45 mm) stehengeblieben, obwohl
+    `brief_pdf.py::Absender.fenster_oben_mm` (die tatsächliche
+    EinfachBrief-Spezifikation) bereits 62 mm trug - und wird beim
+    tatsächlichen Aufruf (`routes/mahnwesen.py::mahnbrief_pdf`) IMMER an
+    die `Absender`-Instanz übergeben, überschreibt deren richtigen
+    Default also still. Beide Werte müssen identisch bleiben."""
+
+    from mietinkasso.mahnwesen.brief_pdf import Absender
+
+    einstellungen = Settings()
+    referenz_absender = Absender(
+        name="x", adresse="x", fn="x", uid="x", telefon="x", website="x", email="x",
+        farbe_anthrazit="#000", farbe_gold="#000",
+    )
+    assert einstellungen.brief_fenster_oben_mm == referenz_absender.fenster_oben_mm == 62.0
+
+
 def test_fehlender_passwort_hash_in_production_wird_abgelehnt():
     with pytest.raises(ProduktionskonfigurationUngueltigError, match="PASSWORD_HASH"):
         pruefe_produktionskonfiguration(_settings(backoffice_password_hash=None))

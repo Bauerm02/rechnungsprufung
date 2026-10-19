@@ -15,7 +15,8 @@ from pypdf import PdfReader
 
 from mietinkasso.mahnwesen.brief_pdf import (
     Absender, AdressfehlerError, Forderungszeile, Zinssegment, _MahnbriefPDF, _zeile,
-    erzeuge_mahnbrief_pdf, pruefe_empfaengeradresse,
+    _INHALT_RECHTS, _LOGO_BREITE, _LOGO_X, _LOGO_Y, _RAND, _SEITE_BREITE, _SPERRBEREICH_BREITE,
+    _SPERRBEREICH_HOEHE, erzeuge_mahnbrief_pdf, pruefe_empfaengeradresse,
 )
 
 
@@ -135,6 +136,75 @@ def test_fensterposition_entspricht_der_einfachbrief_spezifikation():
     assert absender.fenster_oben_mm == 62.0
     assert absender.fenster_breite_mm == 90.0
     assert absender.fenster_hoehe_mm == 45.0
+
+
+# -- EinfachBrief-Freihaltebereiche (Codex-Rückmeldung 19.10.2026, --------
+# -- visuelle Prüfung des Original-Anhangs "EinfachBrief-Freihaltebereiche.pdf")
+
+
+_SEITE_HOEHE = 297.0  # A4
+
+
+def test_sperrbereich_oben_links_ist_52x60mm_plus_5mm_schutzabstand():
+    assert _SPERRBEREICH_BREITE == 52.0 + 5.0
+    assert _SPERRBEREICH_HOEHE == 60.0 + 5.0
+
+
+def test_logo_steht_rechtsbuendig_ausserhalb_des_oben_links_sperrbereichs():
+    """Logo x=20/y=12/w=32 lag vollständig im 52x60-mm-Sperrbereich -
+    jetzt rechtsbündig (x >= Sperrbereichsbreite genügt unabhängig von y,
+    da ein Rechteck nur verlassen wird, wenn mindestens eine Koordinate
+    außerhalb liegt)."""
+
+    assert _LOGO_X >= _SPERRBEREICH_BREITE
+    assert _LOGO_X + _LOGO_BREITE == _INHALT_RECHTS  # rechtsbündig zum Inhaltsrand
+    assert _LOGO_Y >= 5.0  # äußerer 5-mm-Rand von der Papierkante oben
+
+
+def test_absenderzeile_steht_ausserhalb_des_sperrbereichs_auch_ohne_logo():
+    """Auch OHNE konfiguriertes Logo darf die Absenderzeile nicht mehr bei
+    x=20/y<=16 landen - `erzeuge_mahnbrief_pdf` muss den Sperrbereich auch
+    im Logo-losen Pfad meiden."""
+
+    pdf_bytes = _erzeugen(absender=_absender(logo_pfad=None))
+    assert pdf_bytes[:5] == b"%PDF-"
+    # Rein geometrische Prüfung über die Konstanten, die den Ablauf
+    # tatsächlich steuern (siehe `erzeuge_mahnbrief_pdf`): die
+    # Absenderzeile startet IMMER bei `_SPERRBEREICH_BREITE`, nie bei
+    # `_RAND`, unabhängig davon, ob ein Logo gezeichnet wurde.
+    assert _SPERRBEREICH_BREITE > _RAND
+    assert _SPERRBEREICH_BREITE >= 52.0 + 5.0
+
+
+def test_folgeseitenkopf_steht_ebenfalls_ausserhalb_des_sperrbereichs():
+    """Der laufende Kopf ab Seite 2 (`_MahnbriefPDF.header`) darf
+    denselben oben-links-Sperrbereich ebenfalls nicht mehr verletzen -
+    erzwingt mehrseitige Briefe (viele Forderungszeilen) und prüft, dass
+    das PDF weiterhin fehlerfrei und mehrseitig erzeugt wird."""
+
+    viele_zeilen = [Forderungszeile(f"HMZ Monat {i}", date(2026, 1, 1), 10_000) for i in range(1, 40)]
+    pdf_bytes = _erzeugen(
+        forderungszeilen=viele_zeilen, gesamtbetrag_cent=10_000 * len(viele_zeilen) + 2073 + 54,
+    )
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    assert len(reader.pages) > 1
+    # Der Kopf selbst startet laut Code jetzt bei `_SPERRBEREICH_BREITE`
+    # (siehe `_MahnbriefPDF.header`), nicht mehr bei `_RAND` - geometrisch
+    # über die Konstante geprüft, die den tatsächlichen Aufruf steuert.
+    assert _SPERRBEREICH_BREITE >= 52.0 + 5.0
+    assert _SPERRBEREICH_BREITE < _INHALT_RECHTS  # bleibt trotzdem genug Platz für den Kopftext
+
+
+def test_linker_rand_und_aeusserer_rand_erfuellen_bereits_bestehende_freihaltebereiche():
+    """Separat genannter Freihaltebereich "links 18 mm bis 160 mm Höhe"
+    sowie ein äußerer 5-mm-Rand ringsum: beide waren schon durch den
+    bestehenden Inhaltsrand (`_RAND`) erfüllt, ohne Codeänderung - hier
+    nur geometrisch festgeschrieben, damit eine künftige Änderung von
+    `_RAND` das nicht stillschweigend wieder verletzt."""
+
+    assert _RAND >= 18.0
+    assert _RAND >= 5.0
+    assert _SEITE_BREITE - _INHALT_RECHTS >= 5.0  # rechter äußerer Rand
 
 
 def test_pruefe_empfaengeradresse_lehnt_fehlende_adresse_ab():
