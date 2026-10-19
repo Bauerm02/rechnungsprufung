@@ -3885,6 +3885,84 @@ def test_mahnpauschale_freigabe_ohne_csrf_wird_abgelehnt(backoffice_client):
     assert antwort.status_code == 403
 
 
+def test_mahnpauschale_freigabe_erfassen_ignoriert_simuliertes_heute_aus_formular(backoffice_client):
+    """Unabhängige Rückprüfung Codex 20.10.2026, echter Bug: die Freigabe
+    selbst darf NIE an ein vom Formular mitgesendetes, ggf. simuliertes
+    Datum gebunden werden - ein manipuliertes/veraltetes `heute` hätte
+    eine Freigabe für einen fiktiven Vergangenheits-/Zukunftsstand
+    ermöglicht. Ein völlig unparsbarer Wert (kein ISO-Datum) im `heute`-
+    Feld beweist das direkt: würde der Server ihn verarbeiten, schlüge
+    dieser Request fehl statt sauber durchzugehen."""
+
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-TOP-PAUSCHALE-SIM", objekt_id="601", bezeichnung="Top Pauschale Sim", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id="V-601-PAUSCHALE-SIM", einheit_id="601-TOP-PAUSCHALE-SIM", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-PAUSCHALE-SIM"))
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2024, 1, 1), buchungsdatum=date(2024, 1, 1), faelligkeit=date(2024, 1, 5),
+        beleg_referenz="HMZ Jänner",
+    )
+
+    antwort = client.post(
+        "/backoffice/vertrag/V-601-PAUSCHALE-SIM/mahnpauschale-freigabe/erfassen",
+        data={
+            "csrf_token": csrf, "stufe": "1", "heute": "offensichtlich-kein-datum-2099-irgendwas",
+            "betrag_cent": "20,00", "erforderlichkeit_begruendung": "x", "tatsaechlicher_aufwand_cent": "20,00",
+            "tatsaechlicher_aufwand_beleg": "x", "schuldhaftigkeit_begruendung": "x",
+            "verhaeltnismaessigkeit_begruendung": "x",
+        },
+        follow_redirects=False,
+    )
+    assert antwort.status_code == 303  # unparsbares 'heute' wird NIE serverseitig verarbeitet
+
+    from mietinkasso.mahnwesen.kosten import forderungsgruppe_schluessel
+    from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    sf = build_session_factory(get_settings().database_url)
+    kosten_repo = MahnkostenRepository(sf)
+    frischer_op_service = OPService(OPRepository(sf), stammdaten)
+    offene_heute = frischer_op_service.offene_forderungen(konto.id, heute=date.today())
+    schluessel_heute = forderungsgruppe_schluessel([f.op_position_id for f in offene_heute])
+    hauptforderung_heute = sum(f.rest_cent for f in offene_heute)
+
+    gespeicherte_freigabe = kosten_repo.mahnpauschale_freigabe_fuer_gruppe(
+        vertrag_id="V-601-PAUSCHALE-SIM", stufe=1, forderungsgruppe_schluessel=schluessel_heute,
+        hauptforderung_cent=hauptforderung_heute,
+    )
+    assert gespeicherte_freigabe is not None  # an das ECHTE Tagesdatum gebunden, nicht an die Formular-Simulation
+
+
+def test_mahnpauschale_freigabe_erfassen_lehnt_ungueltige_stufe_ab(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    antwort = client.post(
+        "/backoffice/vertrag/V-601-1/mahnpauschale-freigabe/erfassen",
+        data={
+            "csrf_token": csrf, "stufe": "3", "heute": date.today().isoformat(),
+            "betrag_cent": "20,00", "erforderlichkeit_begruendung": "x", "tatsaechlicher_aufwand_cent": "20,00",
+            "tatsaechlicher_aufwand_beleg": "x", "schuldhaftigkeit_begruendung": "x",
+            "verhaeltnismaessigkeit_begruendung": "x",
+        },
+    )
+    assert antwort.status_code == 400
+
+
 def test_ruecklastschriftkosten_formular_erfasst_zurechenbare_kosten(backoffice_client):
     from mietinkasso.domain.enums import OPTyp
     from mietinkasso.infrastructure.config import get_settings

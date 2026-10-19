@@ -2488,16 +2488,24 @@ def mahnpauschale_freigabe_formular(
         </div>"""
         return _layout(request, session, "Mahnpauschale-Freigabe", inhalt)
 
+    simulations_hinweis = ""
+    if heute_datum != date.today():
+        simulations_hinweis = (
+            f'<p class="warn">Diese Ansicht zeigt eine SIMULATION für {heute_datum.isoformat()} - rein lesend. '
+            f"Eine tatsächliche Freigabe wird IMMER für das echte Tagesdatum ({date.today().isoformat()}) "
+            "serverseitig neu berechnet, unabhängig von diesem Simulationsdatum.</p>"
+        )
     formular = f"""
     <div class="card">
       <h2>Neue Einzelfallfreigabe für den aktuellen Saldo erteilen</h2>
+      {simulations_hinweis}
       <p class="muted">Ohne diese vollständig begründete Freigabe bleibt die Pauschale automatisch bei 0 EUR
          (Prüffall) - ein Profil-Vorschlagswert bindet nichts automatisch.</p>
       <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/mahnpauschale-freigabe/erfassen">
         {csrf_feld(session.csrf_token)}
         <input type="hidden" name="stufe" value="{stufe}">
-        <input type="hidden" name="heute" value="{heute_datum.isoformat()}">
-        <label>Freigegebener Betrag in EUR (Pflicht - nicht notwendig identisch mit dem Vorschlagswert)</label>
+        <label>Freigegebener Betrag in EUR (Pflicht - nicht notwendig identisch mit dem Vorschlagswert, darf den
+               tatsächlichen Aufwand NIE übersteigen)</label>
         <input name="betrag_cent" required value="{(f'{vorschlag_cent/100:.2f}'.replace('.', ',') if vorschlag_cent else '')}">
         <label>Erforderlichkeit (Pflicht - warum ist eine Mahnung in diesem Fall erforderlich)</label>
         <textarea name="erforderlichkeit_begruendung" rows="2" required></textarea>
@@ -2531,11 +2539,16 @@ async def mahnpauschale_freigabe_absenden(request: Request, vertrag_id: str, ses
         stufe = int(str(form.get("stufe", "1")))
     except ValueError:
         return _fehlerseite(session, "Mahnpauschale-Freigabe", "Ungültige Stufe.")
-    heute_roh = str(form.get("heute", "")).strip()
-    try:
-        heute_datum = date.fromisoformat(heute_roh) if heute_roh else date.today()
-    except ValueError:
-        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Ungültiges Datum.")
+    if stufe not in (1, 2):
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Stufe muss 1 oder 2 sein.")
+    # Unabhängige Rückprüfung Codex 20.10.2026, echter Bug: die Freigabe
+    # selbst darf NIE auf ein vom Formular mitgesendetes, ggf. simuliertes
+    # Datum erteilt werden - ein manipuliertes/veraltetes `heute` aus dem
+    # verborgenen Feld hätte eine Freigabe für einen fiktiven Vergangen-
+    # heits-/Zukunftsstand ermöglicht. Die Simulation (GET, `?heute=...`)
+    # bleibt rein lesend; die tatsächliche Freigabe-Entscheidung bindet
+    # IMMER an das echte Tagesdatum des Servers.
+    heute_datum = date.today()
 
     # IMMER frisch aus dem aktuellen Server-Stand neu berechnet - NIE ein
     # vom Formular mitgesendeter Schlüssel/Hauptforderungsbetrag (der

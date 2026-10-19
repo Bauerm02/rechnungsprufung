@@ -622,6 +622,18 @@ class MahnkostenRepository:
         ):
             if wert <= 0:
                 raise ValueError(f"Mahnpauschale-Freigabe: {feld} muss größer als 0 sein (war {wert}).")
+        # Unabhängige Rückprüfung Codex 20.10.2026, echter Bug: §1333 Abs 2
+        # ABGB erlaubt NUR den tatsächlichen, notwendigen Aufwand als
+        # Forderung - ein freigegebener Betrag ÜBER dem dokumentierten
+        # tatsächlichen Aufwand (z. B. 20 EUR Forderung bei nur 1 EUR
+        # belegtem Aufwand) ist evident unzulässig und wird NIE
+        # automatisch durchgelassen, unabhängig davon, wie die übrigen
+        # Begründungsfelder lauten.
+        if betrag_cent > tatsaechlicher_aufwand_cent:
+            raise ValueError(
+                f"Mahnpauschale-Freigabe: freigegebener Betrag ({betrag_cent} Cent) übersteigt den dokumentierten "
+                f"tatsächlichen Aufwand ({tatsaechlicher_aufwand_cent} Cent) - nach §1333 Abs 2 ABGB unzulässig."
+            )
         for feld, text in (
             ("erforderlichkeit_begruendung", erforderlichkeit_begruendung),
             ("tatsaechlicher_aufwand_beleg", tatsaechlicher_aufwand_beleg),

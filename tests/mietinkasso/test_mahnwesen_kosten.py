@@ -2164,6 +2164,22 @@ def test_mahnpauschale_freigabe_anlegen_verlangt_vollstaendige_begruendungen(kos
         )
 
 
+def test_mahnpauschale_freigabe_anlegen_verweigert_betrag_ueber_tatsaechlichem_aufwand(kosten_repo):
+    """Unabhängige Rückprüfung Codex 20.10.2026, echter Bug: §1333 Abs 2
+    ABGB erlaubt NUR den tatsächlichen, notwendigen Aufwand als Forderung
+    - 20 EUR freigegebener Betrag bei nur 1 EUR dokumentiertem Aufwand ist
+    evident unzulässig und darf NIE durchgehen."""
+
+    with pytest.raises(ValueError):
+        kosten_repo.mahnpauschale_freigabe_anlegen(
+            vertrag_id="V-601-3", stufe=1, forderungsgruppe_schluessel="irgendein-hash",
+            hauptforderung_cent=5000, betrag_cent=2000,
+            erforderlichkeit_begruendung="Begründung", tatsaechlicher_aufwand_cent=100,
+            tatsaechlicher_aufwand_beleg="Beleg", schuldhaftigkeit_begruendung="Begründung",
+            verhaeltnismaessigkeit_begruendung="Begründung", freigegeben_von="test", erstellt_von="test",
+        )
+
+
 def test_mahnpauschale_freigabe_fuer_dieselbe_gruppe_zweimal_schlaegt_fehl(kosten_repo):
     kwargs = dict(
         vertrag_id="V-601-3", stufe=1, forderungsgruppe_schluessel="derselbe-hash",

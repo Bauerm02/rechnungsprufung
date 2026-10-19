@@ -4574,3 +4574,36 @@ Möglichkeit, eine Freigabe nachträglich zu ändern/zurückzunehmen (nur
 neu anzulegen) - entspricht der bestehenden Konvention dieses Moduls
 (z. B. Zinsprofil-Versionierung), keine zusätzliche Korrekturfunktion
 wurde angefragt oder gebaut.
+
+### Fünfte Codex-Rückprüfung (20.10.2026, Abnahme des UI-Commits a3bab69) — behoben
+
+Drei serverseitige Gates vor Livefreigabe nachgezogen:
+
+1. **Betrag über tatsächlichem Aufwand war möglich.**
+   `MahnkostenRepository.mahnpauschale_freigabe_anlegen` akzeptierte
+   bisher z. B. 20 EUR freigegebenen Betrag bei nur 1 EUR dokumentiertem
+   tatsächlichen Aufwand - nach §1333 Abs 2 ABGB (nur der tatsächliche,
+   notwendige Aufwand ist ersatzfähig) evident unzulässig. Neue
+   Validierung: `betrag_cent > tatsaechlicher_aufwand_cent` wird jetzt
+   hart abgelehnt (`ValueError`), unabhängig von den übrigen
+   Begründungsfeldern.
+2. **Freigabe konnte an ein simuliertes Datum gebunden werden.** Die
+   POST-Route `/mahnpauschale-freigabe/erfassen` übernahm `heute` aus
+   einem verborgenen Formularfeld und hätte damit eine Freigabe für
+   einen fiktiven Vergangenheits-/Zukunftsstand ermöglichen können. Die
+   Simulation (`?heute=...` in der GET-Ansicht) bleibt jetzt AUSSCHLIESSLICH
+   lesend; die POST-Route verlangt serverseitig IMMER `date.today()`,
+   unabhängig davon, was das Formular mitsendet (der Test schickt
+   bewusst einen völlig unparsbaren Wert im `heute`-Feld, um zu
+   beweisen, dass der Server ihn nie verarbeitet). Das verborgene Feld
+   wurde aus dem Formular entfernt; die GET-Ansicht zeigt stattdessen
+   einen Hinweis, wenn ein Simulationsdatum von heute abweicht.
+3. **Stufe im POST wurde nicht validiert.** `stufe` muss jetzt explizit
+   1 oder 2 sein, sonst Fehlerseite (400) statt einer stillschweigend
+   akzeptierten anderen Zahl.
+
+3 neue Tests: Repository lehnt Betrag über Aufwand ab, POST ignoriert
+ein unparsbares/simuliertes `heute` und bindet die gespeicherte Freigabe
+nachweislich an das echte Tagesdatum, POST lehnt Stufe 3 ab. 1085/1085
+Tests grün im Gesamtlauf. Keine Live-Buchung/kein Versand/kein
+Deployment.
