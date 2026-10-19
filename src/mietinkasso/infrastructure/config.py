@@ -191,20 +191,22 @@ class Settings(BaseSettings):
     # Post-SFTP-Bulkversand (Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS,
     # Teil 3, siehe `mahnwesen/brief_sftp.py`): GESCHLOSSEN per Default -
     # `brief_sftp.konfiguration_aus_settings` liefert erst dann eine
-    # Konfiguration, wenn Host/Username/Hostkey-Fingerprint gesetzt UND
-    # die Passwortdatei tatsächlich lesbar ist. Credentials kommen
-    # AUSSCHLIESSLICH aus privaten Serverdateien bei Codex - hier steht
-    # NIE ein echter Wert, nur sichere, leere Defaults. Das Passwort wird
-    # bewusst NICHT als Klartext-Settings-Wert gehalten (Codex-Abnahme
-    # 19.10.2026: "keine echten Werte/Passwortrepräsentation im Git/Log"),
-    # sondern wie `hv_mail_token_file` aus einer privaten Datei gelesen
-    # (`brief_sftp_password_datei`). `brief_sftp_pfad` ist RELATIV zum
-    # SFTP-Login-Verzeichnis (Codex-Abnahme: das Anbieteroriginal verlangt
-    # einen relativen Pfad, kein führendes "/").
+    # Konfiguration, wenn Host/Hostkey-Fingerprint gesetzt UND BEIDE
+    # Dateien (Username, Passwort) tatsächlich lesbar sind. Credentials
+    # kommen AUSSCHLIESSLICH aus privaten Serverdateien bei Codex - hier
+    # steht NIE ein echter Wert, nur sichere, leere Defaults. Username
+    # UND Passwort werden bewusst NICHT als Klartext-Settings-Werte
+    # gehalten (Codex-Abnahme 19.10.2026: "keine Secrets in
+    # Settings/Env"), sondern wie `hv_mail_token_file` je aus einer
+    # eigenen privaten Datei gelesen (`brief_sftp_username_datei`/
+    # `brief_sftp_password_datei`). `brief_sftp_pfad` ist RELATIV zum
+    # SFTP-Login-Verzeichnis - `in/bulk_tp/` ist der vom Anbieter
+    # EXAKT genannte Pfad (Codex-Abnahme 19.10.2026, zweite Korrektur:
+    # nicht bloß "bulk_tp/").
     brief_sftp_host: str | None = None
     brief_sftp_port: int = 22
-    brief_sftp_pfad: str = "bulk_tp/"
-    brief_sftp_username: str | None = None
+    brief_sftp_pfad: str = "in/bulk_tp/"
+    brief_sftp_username_datei: str | None = None
     brief_sftp_password_datei: str | None = None
     brief_sftp_host_key_fingerprint: str | None = None
 

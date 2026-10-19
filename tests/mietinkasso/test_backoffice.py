@@ -4587,6 +4587,154 @@ def test_ruecklastschriftkosten_ohne_csrf_wird_abgelehnt(backoffice_client):
     assert antwort.status_code == 403
 
 
+def test_mahnbrief_archiv_liste_zeigt_download_und_belegimport_formular(backoffice_client):
+    """Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS, Teil 3 (Backoffice-UI):
+    die Archiv-Seite zeigt den geschützten Original-PDF-Download UND,
+    solange noch kein Beleg importiert wurde, das Belegimport-Formular."""
+
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+
+    backoffice_deps._hv_mail.mahnbrief_archiv_repo.archivieren(
+        vertrag_id="V-601-1", stufe=1, mahnlauf_schluessel="GRUPPE-BACKOFFICE-ARCHIV-1",
+        pdf_bytes=b"%PDF-1.4 synthetischer Mahnbrief", versandnachweis_referenz="mahnungslauf:test-archiv-1",
+        empfaenger_name="Test Mieterin", empfaenger_adresse="Musterstraße 1\n1010 Wien",
+        erstellt_von="codex-test",
+    )
+
+    seite = client.get("/backoffice/vertrag/V-601-1/mahnbrief-archiv")
+    assert seite.status_code == 200
+    assert "GRUPPE-BACKOFFICE-ARCHIV-1" in seite.text
+    assert "/mahnbrief-archiv/" in seite.text and "/original.pdf" in seite.text
+    assert "Anbieterbeleg" in seite.text and 'name="beleg_datei"' in seite.text
+
+
+def test_mahnbrief_archiv_original_pdf_download_geschuetzt_gegen_fremden_vertrag(backoffice_client):
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+
+    client, *_ = backoffice_client
+    _login(client)
+
+    archiv = backoffice_deps._hv_mail.mahnbrief_archiv_repo.archivieren(
+        vertrag_id="V-601-1", stufe=1, mahnlauf_schluessel="GRUPPE-BACKOFFICE-ARCHIV-DOWNLOAD",
+        pdf_bytes=b"%PDF-1.4 Original-Mahnbrief-Inhalt", versandnachweis_referenz="mahnungslauf:test-archiv-download",
+        empfaenger_name="Test Mieterin", empfaenger_adresse="Musterstraße 1\n1010 Wien",
+        erstellt_von="codex-test",
+    )
+
+    echt = client.get(f"/backoffice/vertrag/V-601-1/mahnbrief-archiv/{archiv.id}/original.pdf")
+    assert echt.status_code == 200
+    assert echt.content == b"%PDF-1.4 Original-Mahnbrief-Inhalt"
+
+    # Dieselbe Archivzeile unter einem FREMDEN Vertrags-Pfad angefragt -
+    # 404 statt die Datei trotzdem auszuliefern.
+    fremd = client.get(f"/backoffice/vertrag/V-107-1/mahnbrief-archiv/{archiv.id}/original.pdf")
+    assert fremd.status_code == 404
+
+    unbekannt = client.get("/backoffice/vertrag/V-601-1/mahnbrief-archiv/999999/original.pdf")
+    assert unbekannt.status_code == 404
+
+    # Objekt 107 ist ausgeschlossen - auch mit korrekter Archiv-ID keine Daten.
+    fehlt_kein_beleg = client.get(f"/backoffice/vertrag/V-601-1/mahnbrief-archiv/{archiv.id}/anbieterbeleg.pdf")
+    assert fehlt_kein_beleg.status_code == 404
+
+
+def test_mahnbrief_archiv_beleg_import_ohne_csrf_wird_abgelehnt(backoffice_client):
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+
+    client, *_ = backoffice_client
+    _login(client)
+
+    archiv = backoffice_deps._hv_mail.mahnbrief_archiv_repo.archivieren(
+        vertrag_id="V-601-1", stufe=1, mahnlauf_schluessel="GRUPPE-BACKOFFICE-ARCHIV-CSRF",
+        pdf_bytes=b"%PDF-1.4 x", versandnachweis_referenz="mahnungslauf:test-archiv-csrf",
+        empfaenger_name="Test Mieterin", empfaenger_adresse="Musterstraße 1\n1010 Wien",
+        erstellt_von="codex-test",
+    )
+    antwort = client.post(
+        f"/backoffice/vertrag/V-601-1/mahnbrief-archiv/{archiv.id}/beleg",
+        data={
+            "csrf_token": "voellig-falsch", "anbieterbeleg_referenz": "PORTAL-X",
+            "postaufgabe_datum": date.today().isoformat(),
+        },
+        files={"beleg_datei": ("beleg.pdf", b"%PDF-1.4 beleg", "application/pdf")},
+    )
+    assert antwort.status_code == 403
+
+
+def test_mahnbrief_archiv_beleg_import_objekt_107_ausgeschlossen(backoffice_client):
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    archiv = backoffice_deps._hv_mail.mahnbrief_archiv_repo.archivieren(
+        vertrag_id="V-107-1", stufe=1, mahnlauf_schluessel="GRUPPE-BACKOFFICE-ARCHIV-107",
+        pdf_bytes=b"%PDF-1.4 x", versandnachweis_referenz="mahnungslauf:test-archiv-107",
+        empfaenger_name="Ausgeschlossen", empfaenger_adresse="Musterstraße 1\n1010 Wien",
+        erstellt_von="codex-test",
+    )
+    antwort = client.post(
+        f"/backoffice/vertrag/V-107-1/mahnbrief-archiv/{archiv.id}/beleg",
+        data={
+            "csrf_token": csrf, "anbieterbeleg_referenz": "PORTAL-107",
+            "postaufgabe_datum": date.today().isoformat(),
+        },
+        files={"beleg_datei": ("beleg.pdf", b"%PDF-1.4 beleg", "application/pdf")},
+    )
+    assert antwort.status_code == 400  # _fehlerseite - Objekt ist von der Pilotphase ausgeschlossen
+    assert backoffice_deps._hv_mail.mahnbrief_archiv_repo.get(archiv.id).anbieterbeleg_referenz is None
+
+
+def test_mahnbrief_archiv_beleg_import_vervollstaendigt_mahnlauf(backoffice_client):
+    """Ende-zu-Ende über die tatsächliche Route: Formular-Upload des
+    Anbieterbelegs vervollständigt den (hier minimal direkt als UNSICHER
+    angelegten) Mahnlauf - derselbe Service-Aufruf wie in
+    `test_hv_mailversand.py`, hier nur die Routen-/Formularverdrahtung
+    (CSRF, Gesellschaft, Schreibrecht) geprüft."""
+
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    mahnlauf = backoffice_deps._hv_mail.mahnlauf_repo.get_or_create(
+        outbox_key="GRUPPE-BACKOFFICE-ARCHIV-BELEG", vertrag_id="V-601-1", gesellschaft_id="7DI",
+        stufe=1, mitglieder_mahnfall_ids="[]", kanal="BRIEF", status="UNSICHER",
+    )
+    archiv = backoffice_deps._hv_mail.mahnbrief_archiv_repo.archivieren(
+        vertrag_id="V-601-1", stufe=1, mahnlauf_schluessel=mahnlauf.outbox_key,
+        pdf_bytes=b"%PDF-1.4 Original-Mahnbrief", versandnachweis_referenz="mahnungslauf:" + mahnlauf.outbox_key,
+        empfaenger_name="Test Mieterin", empfaenger_adresse="Musterstraße 1\n1010 Wien",
+        erstellt_von="codex-test",
+    )
+
+    antwort = client.post(
+        f"/backoffice/vertrag/V-601-1/mahnbrief-archiv/{archiv.id}/beleg",
+        data={
+            "csrf_token": csrf, "anbieterbeleg_referenz": "PORTAL-BACKOFFICE-BELEG",
+            "postaufgabe_datum": date.today().isoformat(),
+        },
+        files={"beleg_datei": ("beleg.pdf", b"%PDF-1.4 Original-Postaufgabebeleg", "application/pdf")},
+        follow_redirects=False,
+    )
+    assert antwort.status_code == 303
+
+    aktualisiert = backoffice_deps._hv_mail.mahnbrief_archiv_repo.get(archiv.id)
+    assert aktualisiert.anbieterbeleg_referenz == "PORTAL-BACKOFFICE-BELEG"
+    assert aktualisiert.anbieterbeleg_pdf_bytes == b"%PDF-1.4 Original-Postaufgabebeleg"
+    mahnlauf_danach = backoffice_deps._hv_mail.mahnlauf_repo.get(mahnlauf.id)
+    assert mahnlauf_danach.status == "GESENDET"
+
+    beleg_download = client.get(f"/backoffice/vertrag/V-601-1/mahnbrief-archiv/{archiv.id}/anbieterbeleg.pdf")
+    assert beleg_download.status_code == 200
+    assert beleg_download.content == b"%PDF-1.4 Original-Postaufgabebeleg"
+
+
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
     unten) - der Login-Ratelimiter ist ein globaler, prozessweiter

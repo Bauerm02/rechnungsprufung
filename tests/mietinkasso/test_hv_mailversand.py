@@ -1,7 +1,7 @@
 """Real business services and HTTP protocol, exclusively synthetic in-memory data."""
 import hashlib
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
@@ -719,12 +719,95 @@ def test_brief_upload_uebermittelt_aber_laesst_gebuehren_mahnstatus_offen(hv, ba
     assert evidence == []
 
 
-def test_echter_anbieterbeleg_vervollstaendigt_mahnlauf_genau_einmal(hv, basis_vertrag, admin_ctx, session_factory):
+def test_echter_beleg_bucht_exakt_den_freigegebenen_kostensnapshot_einmal(hv, basis_vertrag, admin_ctx, session_factory):
+    """Belegt tatsächliche Zahlenrichtigkeit statt nur Zählergleichheit
+    (Codex-Abnahme 19.10.2026): ein freigegebenes 20-EUR-Gebührenprofil
+    PLUS ein vereinbarter, geprüfter Zinssatz liefern einen POSITIVEN
+    Zinsdelta UND eine Gebühr von exakt 2000 Cent - der Upload selbst
+    bucht NICHTS, der echte Beleg bucht GENAU EINMAL exakt diesen
+    Snapshot, ein identischer zweiter Import bucht nichts mehr (kein
+    zweiter Upload, keine zweite Ledger-Zeile). Ausschließlich
+    synthetische Vertrags-/Kostendaten, keine Produktivbuchung."""
+
     service, _ = hv
     contract, account = basis_vertrag
-    _seed_debt(hv, contract, account, admin_ctx)
+    heute = date.today()
+    _seed_debt(hv, contract, account, admin_ctx, day=heute)
+
+    profil = service.mahnkosten_repo.zinsprofil_anlegen(
+        # ist_b2b=True ist Pflicht für die §458-UGB-Mahngebühr (sonst bleibt
+        # gebuehr_cent trotz gesetzter Kostenbasis None/0, siehe Hinweis-
+        # text "§458 UGB gilt nur bei beiderseits unternehmensbezogenem
+        # Geschäft").
+        vertrag_id=contract.id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
+        vereinbarter_zinssatz_prozent=Decimal("5.0"), vereinbarung_geprueft=True,
+        vereinbarung_beleg="SYNTHETISCHER Mietvertrag Pkt. 12 (Verzugszinsen)",
+        mahngebuehr_kostenbasis_cent=2000, mahngebuehr_kostenbasis_beleg="SYNTHETISCHER Portokosten-Nachweis",
+        erstellt_von="codex-test",
+    )
+    service.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="codex-test")
+
     _richte_brief_kanal_ein(service, contract, account)
-    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    service.mahnlauf(ctx=admin_ctx, heute=heute)
+
+    row = service.mahn_repo.list_fuer_vertrag(contract.id)[0]
+    assert row.status == "UNSICHER"  # Upload selbst bucht NICHTS
+
+    with session_factory() as s:
+        mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.vertrag_id == contract.id)).scalars().one()
+        gebuehren_vor_beleg = list(s.execute(select(MahnkostenBuchungTable).where(
+            MahnkostenBuchungTable.vertrag_id == contract.id)).scalars())
+    assert gebuehren_vor_beleg == []  # kein Buchungsversuch durch den bloßen Upload
+
+    archiv = service.mahnbrief_archiv_repo.fuer_mahnlauf(
+        vertrag_id=contract.id, stufe=1, mahnlauf_schluessel=mahnlauf_row.outbox_key,
+    )
+    beleg_pdf = b"%PDF-1.4 Original-Postaufgabebeleg"
+
+    service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
+        ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=beleg_pdf,
+        anbieterbeleg_referenz="PORTAL-AUFTRAG-ECHT-20EUR", postaufgabe_datum=heute,
+        importiert_von="codex-test", heute=heute,
+    )
+
+    with session_factory() as s:
+        buchungen = list(s.execute(select(MahnkostenBuchungTable).where(
+            MahnkostenBuchungTable.vertrag_id == contract.id)).scalars())
+    assert len(buchungen) == 1
+    buchung = buchungen[0]
+    assert buchung.gebuehr_cent == 2000  # exakt der freigegebene 20-EUR-Snapshot
+    assert buchung.zinsen_cent > 0  # echtes positives Zinsdelta, keine bloße 0-Platzhalterzahl
+
+    # Identischer Import: bucht NICHTS mehr - kein zweiter SFTP-Upload,
+    # keine zweite Ledger-Zeile.
+    service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
+        ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=beleg_pdf,
+        anbieterbeleg_referenz="PORTAL-AUFTRAG-ECHT-20EUR", postaufgabe_datum=heute,
+        importiert_von="codex-test", heute=heute,
+    )
+    with session_factory() as s:
+        buchungen_erneut = list(s.execute(select(MahnkostenBuchungTable).where(
+            MahnkostenBuchungTable.vertrag_id == contract.id)).scalars())
+    assert len(buchungen_erneut) == 1
+    assert buchungen_erneut[0].id == buchung.id
+    assert buchungen_erneut[0].gebuehr_cent == 2000
+    assert buchungen_erneut[0].zinsen_cent == buchung.zinsen_cent
+
+
+def test_echter_anbieterbeleg_vervollstaendigt_mahnlauf_genau_einmal(hv, basis_vertrag, admin_ctx, session_factory):
+    """`archiv.archiviert_am` ist ein ECHTER Wanduhr-Zeitstempel
+    (`server_default=func.now()`) - `heute`/`postaufgabe_datum` werden
+    deshalb bewusst am tatsächlichen `date.today()` verankert (nicht an
+    den sonst in diesem Modul üblichen, weit zurückliegenden
+    September-2026-Werten), damit der "Postaufgabedatum nicht vor
+    Archivierung"-Schutz nicht fälschlich anschlägt."""
+
+    service, _ = hv
+    contract, account = basis_vertrag
+    heute = date.today()
+    _seed_debt(hv, contract, account, admin_ctx, day=heute)
+    _richte_brief_kanal_ein(service, contract, account)
+    service.mahnlauf(ctx=admin_ctx, heute=heute)
 
     with session_factory() as s:
         mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.vertrag_id == contract.id)).scalars().one()
@@ -735,8 +818,8 @@ def test_echter_anbieterbeleg_vervollstaendigt_mahnlauf_genau_einmal(hv, basis_v
 
     service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
         ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=beleg_pdf,
-        anbieterbeleg_referenz="PORTAL-AUFTRAG-4711", postaufgabe_datum=date(2026, 9, 15),
-        importiert_von="codex-test",
+        anbieterbeleg_referenz="PORTAL-AUFTRAG-4711", postaufgabe_datum=heute,
+        importiert_von="codex-test", heute=heute,
     )
 
     row = service.mahn_repo.list_fuer_vertrag(contract.id)[0]
@@ -744,7 +827,7 @@ def test_echter_anbieterbeleg_vervollstaendigt_mahnlauf_genau_einmal(hv, basis_v
     with session_factory() as s:
         mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.id == mahnlauf_row.id)).scalars().one()
     assert mahnlauf_row.status == "GESENDET"
-    assert mahnlauf_row.gesendet_am.date().isoformat() == "2026-09-15"  # ECHTES Postaufgabedatum, nicht der Uploadtag
+    assert mahnlauf_row.gesendet_am.date().isoformat() == heute.isoformat()  # ECHTES Postaufgabedatum, nicht der Uploadtag
     assert mahnlauf_row.mahnkosten_verarbeitet_am is not None
 
     with session_factory() as s:
@@ -758,8 +841,8 @@ def test_echter_anbieterbeleg_vervollstaendigt_mahnlauf_genau_einmal(hv, basis_v
     # genau einmal - keine zweite Buchung, keine zweite Audit-Zeile.
     service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
         ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=beleg_pdf,
-        anbieterbeleg_referenz="PORTAL-AUFTRAG-4711", postaufgabe_datum=date(2026, 9, 15),
-        importiert_von="codex-test",
+        anbieterbeleg_referenz="PORTAL-AUFTRAG-4711", postaufgabe_datum=heute,
+        importiert_von="codex-test", heute=heute,
     )
     with session_factory() as s:
         evidence_erneut = list(s.execute(select(AuditEventTable).where(
@@ -773,9 +856,10 @@ def test_echter_anbieterbeleg_vervollstaendigt_mahnlauf_genau_einmal(hv, basis_v
 def test_fehlender_oder_vertauschter_beleg_bleibt_offen_kein_fehlerhafter_abschluss(hv, basis_vertrag, admin_ctx, session_factory):
     service, _ = hv
     contract, account = basis_vertrag
-    _seed_debt(hv, contract, account, admin_ctx)
+    heute = date.today()
+    _seed_debt(hv, contract, account, admin_ctx, day=heute)
     _richte_brief_kanal_ein(service, contract, account)
-    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    service.mahnlauf(ctx=admin_ctx, heute=heute)
 
     with session_factory() as s:
         mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.vertrag_id == contract.id)).scalars().one()
@@ -787,27 +871,73 @@ def test_fehlender_oder_vertauschter_beleg_bleibt_offen_kein_fehlerhafter_abschl
     with pytest.raises(ValueError):
         service.mahnbrief_archiv_repo.importiere_anbieterbeleg(
             archiv_id=archiv.id, anbieterbeleg_pdf_bytes=b"", anbieterbeleg_referenz="PORTAL-AUFTRAG-1",
-            postaufgabe_datum=date(2026, 9, 15), importiert_von="codex-test",
+            postaufgabe_datum=heute, importiert_von="codex-test",
         )
 
     service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
         ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 echter Beleg",
-        anbieterbeleg_referenz="PORTAL-AUFTRAG-ECHT", postaufgabe_datum=date(2026, 9, 15),
-        importiert_von="codex-test",
+        anbieterbeleg_referenz="PORTAL-AUFTRAG-ECHT", postaufgabe_datum=heute,
+        importiert_von="codex-test", heute=heute,
     )
     # Ein vertauschter/abweichender Beleg für DIESELBE Zeile wird abgelehnt,
     # der bereits bestätigte Mahnlauf bleibt unangetastet GESENDET.
     with pytest.raises(VorgangIdKonfliktError):
         service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
             ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 ANDERER Beleg",
-            anbieterbeleg_referenz="PORTAL-AUFTRAG-ANDERS", postaufgabe_datum=date(2026, 9, 16),
-            importiert_von="codex-test",
+            anbieterbeleg_referenz="PORTAL-AUFTRAG-ANDERS", postaufgabe_datum=heute,
+            importiert_von="codex-test", heute=heute,
         )
     row = service.mahn_repo.list_fuer_vertrag(contract.id)[0]
     assert row.status == "GESENDET"
     with session_factory() as s:
         mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.id == mahnlauf_row.id)).scalars().one()
-    assert mahnlauf_row.gesendet_am.date().isoformat() == "2026-09-15"  # unverändert, keine Überschreibung
+    assert mahnlauf_row.gesendet_am.date().isoformat() == heute.isoformat()  # unverändert, keine Überschreibung
+
+
+def test_vervollstaendigung_lehnt_zukuenftiges_postaufgabedatum_ab(hv, basis_vertrag, admin_ctx, session_factory):
+    service, _ = hv
+    contract, account = basis_vertrag
+    heute = date.today()
+    _seed_debt(hv, contract, account, admin_ctx, day=heute)
+    _richte_brief_kanal_ein(service, contract, account)
+    service.mahnlauf(ctx=admin_ctx, heute=heute)
+
+    with session_factory() as s:
+        mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.vertrag_id == contract.id)).scalars().one()
+    archiv = service.mahnbrief_archiv_repo.fuer_mahnlauf(
+        vertrag_id=contract.id, stufe=1, mahnlauf_schluessel=mahnlauf_row.outbox_key,
+    )
+    with pytest.raises(ValueError):
+        service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
+            ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 Beleg",
+            anbieterbeleg_referenz="PORTAL-ZUKUNFT", postaufgabe_datum=heute + timedelta(days=1),
+            importiert_von="codex-test", heute=heute,
+        )
+    row = service.mahn_repo.list_fuer_vertrag(contract.id)[0]
+    assert row.status == "UNSICHER"  # unverändert, kein Abschluss
+
+
+def test_vervollstaendigung_lehnt_postaufgabedatum_vor_archivierung_ab(hv, basis_vertrag, admin_ctx, session_factory):
+    service, _ = hv
+    contract, account = basis_vertrag
+    heute = date.today()
+    _seed_debt(hv, contract, account, admin_ctx, day=heute)
+    _richte_brief_kanal_ein(service, contract, account)
+    service.mahnlauf(ctx=admin_ctx, heute=heute)
+
+    with session_factory() as s:
+        mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.vertrag_id == contract.id)).scalars().one()
+    archiv = service.mahnbrief_archiv_repo.fuer_mahnlauf(
+        vertrag_id=contract.id, stufe=1, mahnlauf_schluessel=mahnlauf_row.outbox_key,
+    )
+    with pytest.raises(ValueError):
+        service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
+            ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 Beleg",
+            anbieterbeleg_referenz="PORTAL-VERGANGENHEIT", postaufgabe_datum=heute - timedelta(days=2),
+            importiert_von="codex-test", heute=heute,
+        )
+    row = service.mahn_repo.list_fuer_vertrag(contract.id)[0]
+    assert row.status == "UNSICHER"  # unverändert, kein Abschluss
 
 
 def test_fehler_nach_upload_fuehrt_zu_unsicher_nie_zu_blockiert_oder_retry(hv, basis_vertrag, admin_ctx, session_factory):

@@ -5190,3 +5190,109 @@ GESENDET-Übergang, ausschließlich mit injiziertem Fake). Vollständiger
 `tests/mietinkasso`-Lauf nach allen Änderungen grün. Keine Livezugriffe,
 kein echter Upload/Testbrief, keine Produktivbuchung, `SEND_ENABLED`
 unverändert `false`.
+
+## HV-20261019-VERSAND-KOSTEN-ABSCHLUSS, Teil 3 (Runde 2 Korrekturen + Belegimport-UI)
+
+Zwei unabhängige Abnahmerunden auf den Commits `2fb2274` und `2a94355`
+haben insgesamt 10 konkrete Befunde erbracht; alle sind in diesem Commit
+behoben. Zusammenfassung je Befund (Details siehe Code-Kommentare/
+Docstrings an den jeweiligen Stellen):
+
+1. **Pfad-Korrektur**: `_BULK_PFAD_DEFAULT` war erst `"bulk_tp/"`, dann
+   korrekt auf `"in/bulk_tp/"` gesetzt (relativ, kein führendes `/`) -
+   in `brief_sftp.py`, `infrastructure/config.py` und allen betroffenen
+   Tests in `test_brief_sftp.py` konsistent nachgezogen.
+2. **Paramiko-Exklusivöffnung**: `put_exclusive` öffnet jetzt mit
+   `"wxb"` (nicht nur `"xb"`), da paramikos SFTPClient `"x"` allein nicht
+   als Schreib-Flag interpretiert. Durch einen echten, aber vollständig
+   gefakten paramiko-Verbindungsaufbau (`_FakeTransport`/
+   `_FakeSftpClient`) gezielt getestet, kein echter Netzwerkzugriff.
+3. **Verbindungs-Timeouts vollständig**: `banner_timeout` UND
+   `auth_timeout` auf dem `Transport`, zusätzlich `.get_channel().
+   settimeout(...)` auf dem SFTP-Kanal selbst vor dem eigentlichen
+   Schreibvorgang. Konstruktionsfehler (Socket/Transport/`start_client`)
+   schließen jetzt bereits angelegte Ressourcen über `try/except:
+   self.close(); raise` im `__init__`; `close()` selbst nutzt `try/
+   finally`, damit ein SFTP-Close-Fehler den Transport-/Socket-Close
+   nicht blockiert.
+4. **Keine Secrets im Klartext/Repr**: `SftpKonfiguration.username` UND
+   `.password` kommen jetzt beide aus privaten Dateien
+   (`brief_sftp_username_datei`/`brief_sftp_password_datei`, analog
+   zueinander), nicht mehr aus Settings-Klartext; beide Felder sind
+   `field(repr=False)`, erscheinen also nie in einem `repr()`/Log.
+5. **Struktureller Schutz vor Status-Verwechslung**: `BriefSftpErgebnis.
+   status` ist jetzt selbst wörtlich `"UEBERMITTELT"` (nicht mehr
+   `"GESENDET"` mit bloßer Kommentar-/Caller-Disziplin als einzigem
+   Schutz) - selbst ein künftiger Programmierfehler, der dieses Ergebnis
+   versehentlich direkt an `nachweis_daten()` durchreicht, wird dadurch
+   automatisch abgewiesen (dort wird exakt `"GESENDET"` verlangt).
+   `_sende_brief` gibt weiterhin IMMER `None` zurück, egal was der
+   Adapter liefert.
+6. **Schreibreihenfolge in `vervollstaendige_mahnlauf_aus_anbieterbeleg`
+   korrigiert**: Lesen (Archiv/Vertrag/Mahnlauf) und ALLE
+   Berechtigungs-/Fachprüfungen (Gesellschaftszugriff, Schreibrecht,
+   Objekt-107-Ausschluss, Mahnlauf-Status, Belegdatum nicht in der
+   Zukunft, Belegdatum nicht vor der Archivierung) laufen jetzt VOR dem
+   eigentlichen `importiere_anbieterbeleg`-Schreibvorgang, nicht mehr
+   danach. Das Belegdatum wird als reines Datum (Mitternacht UTC) ohne
+   erfundene Uhrzeit gespeichert.
+7. **Race-sichere Beleg-Referenz-Prüfung**: der fremdreferenz-Vergleich
+   in `importiere_anbieterbeleg` läuft jetzt innerhalb von
+   `schreibgesperrte_session` (echtes `BEGIN IMMEDIATE`-Schreib-Lock für
+   datei-basiertes SQLite), verifiziert durch einen neuen Test mit zwei
+   echten `threading.Thread`s auf einer echten Datei-SQLite-DB.
+8. **`versandnachweis_referenz` jetzt auch im Konfliktvergleich**:
+   `_pruefe_identisch_oder_konflikt` lehnt eine Wiederholung mit
+   abweichender Versandnachweis-Referenz jetzt ebenfalls als
+   `VorgangIdKonfliktError` ab (vorher nur PDF-Hash/Empfänger-Hash
+   verglichen).
+9. **Rigoroser Kostenbuchungs-Test statt reinem Zählervergleich**: neuer
+   Test `test_echter_beleg_bucht_exakt_den_freigegebenen_kostensnapshot_
+   einmal` mit einem tatsächlich freigegebenen, vollständig
+   synthetischen Zinsprofil (§458-UGB-Mahngebühr 20,00 EUR,
+   `ist_b2b=True`, vereinbarter Zinssatz 5%, geprüft/belegt) belegt:
+   Upload bucht 0, der echte Beleg bucht genau einmal Gebühr=2000 Cent
+   und ein positives Zinsdelta, ein zweiter identischer Beleg-Import
+   bucht nichts mehr nach. Der vorherige Test verglich nur die
+   Zeilenanzahl vor/nach (0==0), was auch ohne jede echte Buchung
+   bestanden hätte - dieser Rigor-Nachweis war ein expliziter
+   Abnahmepunkt.
+10. **Backoffice-Belegimport-UI tatsächlich fertiggestellt** (nicht nur
+    Service-Methode): in `backoffice/routes/mahnwesen.py` vier neue
+    Routen - Archivliste je Vertrag, geschützter Original-PDF-Download,
+    geschützter Anbieterbeleg-PDF-Download, sowie das eigentliche
+    Upload-Formular (`multipart/form-data`, größenbegrenztes Streaming-
+    Lesen über `_lese_beleg_begrenzt`, CSRF-Prüfung, Gesellschafts-/
+    Schreibrecht-/107-Ausschluss-Prüfung, Fehlerseite bei
+    `MietinkassoError`/`ValueError`). Verlinkt von der Mieterakte
+    (`vertragsanlage.py`). 5 neue HTTP-Ebenen-Tests in
+    `test_backoffice.py` (Formular-Anzeige, geschützter Download gegen
+    fremden Vertrag, CSRF-Ablehnung, 107-Ausschluss, vollständiger
+    Vervollständigungs-Durchlauf inkl. `GESENDET`-Übergang). Die
+    checked-in `fixtures/backoffice_http_contract.json`-Momentaufnahme
+    wurde für die 4 neuen (weiterhin standardmäßig geschlossenen, HTTP
+    503) Routen neu generiert.
+
+**Verbleibend offen** (unverändert aus Teil 2, hier erneut benannt,
+nicht in dieser Runde behoben, da außerhalb des beauftragten Umfangs):
+
+- Die oben unter "Live-Dispatch-Anschluss" bereits dokumentierte
+  Notwendigkeit einer ECHTEN Verifikation des Post-SFTP-Servers
+  (SFTP-Open-Modus-Verhalten der konkret eingesetzten paramiko-Version
+  gegen den echten Server, tatsächliches Fingerprint-Format) bleibt
+  bestehen - weiterhin nie gegen den echten Server getestet, nur gegen
+  Fakes.
+- `brief_sftp_username_datei`/`brief_sftp_password_datei`/
+  `brief_sftp_host`/`brief_sftp_host_key_fingerprint` sind in dieser
+  Entwicklungsumgebung nie gesetzt - der Brief-Transport bleibt daher
+  IMMER geschlossen (`brief_transport_verfuegbar=False`), bis Codex
+  diese vier Werte auf dem Server konfiguriert.
+- Für den Briefkanal gibt es weiterhin KEINE automatische
+  Status-Abfrage-API; ein `UNSICHERER` Brief-Mahnlauf bleibt bis zur
+  manuellen Beleg-Erfassung über die jetzt fertiggestellte Backoffice-
+  UI offen - das ist beabsichtigtes Verhalten, kein Defekt.
+- Vollständiger `tests/mietinkasso`-Lauf nach allen Änderungen dieser
+  Runde: 1387 passed. `test_backoffice_contract.py` (3 Tests)
+  gesondert erneut grün. Keine Livezugriffe, kein echter
+  Upload/Testbrief, keine Produktivbuchung, `SEND_ENABLED` unverändert
+  `false`.

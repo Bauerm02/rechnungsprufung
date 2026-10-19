@@ -49,6 +49,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from mietinkasso.domain.exceptions import VorgangIdKonfliktError
+from mietinkasso.infrastructure.db.sqlite_write_lock import schreibgesperrte_session
 from mietinkasso.infrastructure.db.tables import MahnbriefArchivTable
 
 _STATUS_REIHENFOLGE = ("VORBEREITET", "UEBERMITTELT")
@@ -60,13 +61,23 @@ def _empfaenger_hash(empfaenger_name: str, empfaenger_adresse: str) -> str:
 
 
 def _pruefe_identisch_oder_konflikt(
-    bestehend: MahnbriefArchivTable, *, pdf_sha256: str, empfaenger_hash: str,
+    bestehend: MahnbriefArchivTable, *, pdf_sha256: str, empfaenger_hash: str, versandnachweis_referenz: str,
 ) -> MahnbriefArchivTable:
-    if bestehend.pdf_sha256 != pdf_sha256 or bestehend.empfaenger_hash != empfaenger_hash:
+    if (
+        bestehend.pdf_sha256 != pdf_sha256
+        or bestehend.empfaenger_hash != empfaenger_hash
+        # Codex-Abnahme 19.10.2026, zweite Korrektur: `versandnachweis_
+        # referenz` wurde bislang NICHT verglichen - ein Retry mit
+        # abweichender Referenz (z. B. ein anderer `mahnlauf.outbox_key`-
+        # Verweis) wäre bisher still mit der ALTEN Referenz akzeptiert
+        # worden. Jetzt ebenso Teil der unveränderlichen Identität.
+        or bestehend.versandnachweis_referenz != versandnachweis_referenz
+    ):
         raise VorgangIdKonfliktError(
             f"Mahnbrief-Archiv für Vertrag {bestehend.vertrag_id} Stufe {bestehend.stufe} "
             f"(Mahnlauf-Schlüssel {bestehend.mahnlauf_schluessel!r}) existiert bereits mit abweichendem "
-            "PDF-Inhalt und/oder Empfänger - kein stiller Erfolg bei einem abweichenden Versuch."
+            "PDF-Inhalt, Empfänger und/oder Versandnachweis-Referenz - kein stiller Erfolg bei einem "
+            "abweichenden Versuch."
         )
     return bestehend
 
@@ -122,7 +133,10 @@ class MahnbriefArchivRepository:
 
         bestehend = self.fuer_mahnlauf(vertrag_id=vertrag_id, stufe=stufe, mahnlauf_schluessel=mahnlauf_schluessel)
         if bestehend is not None:
-            return _pruefe_identisch_oder_konflikt(bestehend, pdf_sha256=pdf_sha256, empfaenger_hash=empfaenger_hash)
+            return _pruefe_identisch_oder_konflikt(
+                bestehend, pdf_sha256=pdf_sha256, empfaenger_hash=empfaenger_hash,
+                versandnachweis_referenz=versandnachweis_referenz,
+            )
 
         with self._session_factory() as session:
             try:
@@ -149,7 +163,10 @@ class MahnbriefArchivRepository:
                         f"(Mahnlauf-Schlüssel {mahnlauf_schluessel}) ist an einer IntegrityError gescheitert, "
                         "aber es existiert KEINE eigene Archivzeile - manuelle Klärung erforderlich."
                     ) from None
-                return _pruefe_identisch_oder_konflikt(bestehend, pdf_sha256=pdf_sha256, empfaenger_hash=empfaenger_hash)
+                return _pruefe_identisch_oder_konflikt(
+                    bestehend, pdf_sha256=pdf_sha256, empfaenger_hash=empfaenger_hash,
+                    versandnachweis_referenz=versandnachweis_referenz,
+                )
 
     def aktualisiere_status(
         self, *, archiv_id: int, neuer_status: str, beleg_referenz: str, erfasst_von: str,
@@ -271,7 +288,13 @@ class MahnbriefArchivRepository:
 
         if session is not None:
             return _importieren(session)
-        with self._session_factory() as owned_session:
+        # Schreibgesperrt (Codex-Abnahme 19.10.2026, zweite Korrektur):
+        # die Mehrfachverwendungsprüfung oben ist ein "lesen, dann
+        # entscheiden, dann schreiben"-Ablauf - ohne echten Schreib-Lock
+        # könnten zwei gleichzeitige Importe mit DERSELBEN Belegreferenz
+        # für ZWEI verschiedene Archivzeilen beide die Prüfung passieren,
+        # bevor einer von beiden committet (siehe `sqlite_write_lock.py`).
+        with schreibgesperrte_session(self._session_factory) as owned_session:
             ergebnis = _importieren(owned_session)
             owned_session.commit()
             owned_session.refresh(ergebnis)

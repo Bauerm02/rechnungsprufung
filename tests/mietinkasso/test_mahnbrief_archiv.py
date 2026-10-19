@@ -95,6 +95,26 @@ def test_abweichender_empfaenger_bei_wiederholung_ist_ebenfalls_ein_konflikt(arc
         )
 
 
+def test_abweichende_versandnachweis_referenz_bei_wiederholung_ist_ebenfalls_ein_konflikt(archiv_repo):
+    """Codex-Abnahme 19.10.2026, zweite Korrektur: `versandnachweis_
+    referenz` wurde bislang NICHT in den Konfliktvergleich einbezogen -
+    ein Retry mit abweichender Referenz wäre still akzeptiert worden."""
+
+    archiv_repo.archivieren(
+        vertrag_id="V-601-3", stufe=1, mahnlauf_schluessel="GRUPPE-REF",
+        pdf_bytes=b"dasselbe PDF", versandnachweis_referenz="mahnungslauf:test-1",
+        empfaenger_name="Max Mustermieter", empfaenger_adresse="Musterstraße 1\n1010 Wien",
+        erstellt_von="codex-test",
+    )
+    with pytest.raises(VorgangIdKonfliktError):
+        archiv_repo.archivieren(
+            vertrag_id="V-601-3", stufe=1, mahnlauf_schluessel="GRUPPE-REF",
+            pdf_bytes=b"dasselbe PDF", versandnachweis_referenz="mahnungslauf:ABWEICHEND",
+            empfaenger_name="Max Mustermieter", empfaenger_adresse="Musterstraße 1\n1010 Wien",
+            erstellt_von="codex-test",
+        )
+
+
 def test_unterschiedliche_mahnlaeufe_desselben_vertrags_werden_getrennt_archiviert(archiv_repo):
     stufe1 = archiv_repo.archivieren(
         vertrag_id="V-601-3", stufe=1, mahnlauf_schluessel="GRUPPE-C",
@@ -266,3 +286,71 @@ def test_importiere_anbieterbeleg_lehnt_fremde_mehrfach_genutzte_referenz_ab(arc
         )
     # Die zweite Zeile bleibt unberührt (kein Beleg importiert).
     assert archiv_repo.get(zweite_zeile.id).anbieterbeleg_referenz is None
+
+
+def test_importiere_anbieterbeleg_mehrfachverwendung_ist_race_sicher_echte_threads_datei_sqlite(tmp_path):
+    """Codex-Abnahme 19.10.2026, zweite Korrektur: die Mehrfachverwendungs-
+    prüfung ist ein "lesen, dann entscheiden, dann schreiben"-Ablauf -
+    ohne echten Schreib-Lock (`schreibgesperrte_session`) könnten zwei
+    ECHT gleichzeitige Importe derselben Belegreferenz für ZWEI
+    verschiedene Archivzeilen beide die Prüfung passieren, bevor einer
+    von beiden committet. Reproduktion mit zwei echten Threads auf eine
+    echte Datei-SQLite-DB (derselbe Grundsatz wie
+    `test_ruecklastschriftkosten.py::
+    test_nachtraegliche_zurechenbarkeit_datei_sqlite_konkurrierende_abweichende_begruendung_ist_konflikt`)."""
+
+    import threading
+
+    from mietinkasso.infrastructure.db.base import Base
+    from mietinkasso.infrastructure.db.session import build_engine, build_session_factory
+
+    db_pfad = tmp_path / "mahnbrief-archiv-nebenlaeufig.db"
+    engine = build_engine(f"sqlite:///{db_pfad}")
+    Base.metadata.create_all(engine)
+    engine.dispose()
+    session_factory = build_session_factory(f"sqlite:///{db_pfad}")
+    repo = MahnbriefArchivRepository(session_factory)
+
+    # Zwei UNABHÄNGIGE Archivzeilen (verschiedene Mahnlauf-Schlüssel) -
+    # beide "wollen" gleich darauf dieselbe Belegreferenz übernehmen.
+    zeile_a = repo.archivieren(
+        vertrag_id="V-601-3", stufe=1, mahnlauf_schluessel="GRUPPE-RACE-A",
+        pdf_bytes=b"%PDF-1.4 A", versandnachweis_referenz="mahnungslauf:a",
+        empfaenger_name="Max Mustermieter", empfaenger_adresse="Musterstraße 1\n1010 Wien",
+        erstellt_von="codex-test",
+    )
+    zeile_b = repo.archivieren(
+        vertrag_id="V-601-3", stufe=2, mahnlauf_schluessel="GRUPPE-RACE-B",
+        pdf_bytes=b"%PDF-1.4 B", versandnachweis_referenz="mahnungslauf:b",
+        empfaenger_name="Max Mustermieter", empfaenger_adresse="Musterstraße 1\n1010 Wien",
+        erstellt_von="codex-test",
+    )
+
+    barrier = threading.Barrier(2)
+    ergebnisse: dict[str, tuple[str, object]] = {}
+
+    def _importieren(schluessel: str, archiv_id: int, akteur: str):
+        barrier.wait(timeout=5)
+        try:
+            zeile = repo.importiere_anbieterbeleg(
+                archiv_id=archiv_id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 geteilter Beleg",
+                anbieterbeleg_referenz="PORTAL-AUFTRAG-GETEILT-RACE", postaufgabe_datum=date(2026, 10, 20),
+                importiert_von=akteur,
+            )
+            ergebnisse[schluessel] = ("ok", zeile)
+        except Exception as exc:  # noqa: BLE001 - Ergebnis wird unten geprüft, nicht verschluckt
+            ergebnisse[schluessel] = ("fehler", exc)
+
+    thread_a = threading.Thread(target=_importieren, args=("a", zeile_a.id, "codex-a"))
+    thread_b = threading.Thread(target=_importieren, args=("b", zeile_b.id, "codex-b"))
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=15)
+    thread_b.join(timeout=15)
+
+    assert set(ergebnisse) == {"a", "b"}  # beide Threads sind tatsächlich fertig geworden, kein Hänger
+    erfolgreiche = [k for k, (status, _) in ergebnisse.items() if status == "ok"]
+    fehlgeschlagene = [(k, exc) for k, (status, exc) in ergebnisse.items() if status == "fehler"]
+    assert len(erfolgreiche) == 1  # GENAU EINER der beiden gewinnt
+    assert len(fehlgeschlagene) == 1
+    assert isinstance(fehlgeschlagene[0][1], VorgangIdKonfliktError)

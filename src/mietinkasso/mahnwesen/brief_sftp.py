@@ -6,26 +6,30 @@ Produktivbetrieb, siehe `docs/hausverwaltung/OFFENE_PUNKTE.md`).
 
 Vorgabe Markus 19.10.2026 (offizieller Anbieterspezifikation): Host
 `transfer.post-business-solutions.at`, Port 22, Zielpfad RELATIV
-`bulk_tp/` (Codex-Abnahme 19.10.2026: das Anbieteroriginal verlangt
-einen relativen Pfad - ein absoluter `/bulk_tp/` hätte bei einem
-chroot-/Home-Verzeichnis-basierten SFTP-Konto am echten Server
-fälschlich außerhalb des zulässigen Bereichs gesucht), ein PDF/A je
-Brief. Dateiname: ein 15-stelliger, 1-basiert positionierter
-Parameterblock (Position 3 Farbmodus, 4 Duplex, 5 Tempo, 7 Produkt, 9
-E-Brief - IMMER 0, kein E-Brief-Versuch - alle übrigen Positionen fest
-"0") + Bindestrich + der permanent in der DB reservierte, opake
-Sende-Schlüssel (UUID, siehe `mahnbrief_archiv.py::archivieren`) +
-".pdf" - siehe `SendeParameter`/`baue_dateiname`.
+`in/bulk_tp/` (Codex-Abnahme 19.10.2026, zweite Korrektur: das
+Anbieteroriginal nennt EXAKT diesen Pfad, nicht bloß `bulk_tp/` - ein
+absoluter `/bulk_tp/` hätte bei einem chroot-/Home-Verzeichnis-basierten
+SFTP-Konto am echten Server ohnehin fälschlich außerhalb des
+zulässigen Bereichs gesucht), ein PDF/A je Brief. Dateiname: ein
+15-stelliger, 1-basiert positionierter Parameterblock (Position 3
+Farbmodus, 4 Duplex, 5 Tempo, 7 Produkt, 9 E-Brief - IMMER 0, kein
+E-Brief-Versuch - alle übrigen Positionen fest "0") + Bindestrich + der
+permanent in der DB reservierte, opake Sende-Schlüssel (UUID, siehe
+`mahnbrief_archiv.py::archivieren`) + ".pdf" - siehe
+`SendeParameter`/`baue_dateiname`.
 
 Geschlossen per Default (`konfiguration_aus_settings`): ohne
-VOLLSTÄNDIGE Konfiguration (Host+Username+Passwort+gepinnter
-Hostkey-Fingerprint, ausschließlich aus `Settings`/privaten
+VOLLSTÄNDIGE Konfiguration (Host+Username-DATEI+Passwort-DATEI+
+gepinnter Hostkey-Fingerprint, ausschließlich aus `Settings`/privaten
 Serverdateien - NIE ein hier hinterlegter echter Wert) findet
-GARANTIERT kein Netzzugriff statt. Das Passwort wird NIE als Klartext-
-Settings-Wert gehalten, sondern aus einer privaten Datei gelesen
-(`brief_sftp_password_datei`, analog `hv_mail_token_file`) - taucht
-dadurch nie in einer `.env`/einem Prozess-Environment-Dump auf. Der
-gepinnte Hostkey wird VOR jeder Authentifizierung geprüft
+GARANTIERT kein Netzzugriff statt. Username UND Passwort werden NIE als
+Klartext-Settings-Wert gehalten, sondern je aus einer eigenen privaten
+Datei gelesen (`brief_sftp_username_datei`/`brief_sftp_password_datei`,
+analog `hv_mail_token_file`) - tauchen dadurch nie in einer `.env`/einem
+Prozess-Environment-Dump auf; `SftpKonfiguration.password` trägt
+zusätzlich `repr=False`, damit ein versehentliches Logging/Debuggen des
+Konfigurationsobjekts selbst das Passwort nicht ausgibt. Der gepinnte
+Hostkey wird VOR jeder Authentifizierung geprüft
 (`PostSftpHostkeyFehlerError` bei Abweichung). Remote-exklusives UND
 SCHREIBENDES Anlegen (`"wxb"` - Codex-Abnahme 19.10.2026: `"xb"` allein
 setzt in paramikos `SFTPClient.open`-Flag-Übersetzung kein Schreib-Flag,
@@ -35,26 +39,34 @@ Erfolg und NIE ein automatischer Neuversuch unter neuem Namen. Jede
 sonstige Verbindungsstörung (einschließlich eines fehlschlagenden
 Verbindungsaufbaus selbst) ist IMMER ungewiss
 (`TransportFehlerUngewissError`, kein automatischer Retry - derselbe
-Grundsatz wie `indexautomatik/transport.py`). Verbindungsaufbau UND
-Authentifizierung laufen mit demselben begrenzten Socket-Timeout
-(`_VERBINDUNGSTIMEOUT_SEKUNDEN`).
+Grundsatz wie `indexautomatik/transport.py`). Verbindungsaufbau,
+Kanalverhandlung UND Authentifizierung laufen mit demselben begrenzten
+Timeout (`_VERBINDUNGSTIMEOUT_SEKUNDEN`: Socket-Connect, `banner_timeout`,
+`auth_timeout`, UND der tatsächliche SFTP-Kanal selbst via
+`channel.settimeout`) - ein hängender Verbindungsaufbau/eine hängende
+Authentifizierung/ein hängender Schreibvorgang kann den Versandlauf
+NIE unbegrenzt blockieren. Scheitert Verbindungsaufbau/Kanalverhandlung
+bereits in der Konstruktion, wird die bis dahin geöffnete
+Socket/Transport-Ressource trotzdem geschlossen (keine Ressourcen-Leaks
+bei einem gescheiterten Verbindungsversuch).
 
 Ein erfolgreicher Upload ist AUSSCHLIESSLICH ein ÜBERMITTELT-Nachweis
 gegenüber dem SFTP-Server - KEIN Postaufgabe-/Zustellnachweis.
-**Kritisch (Codex-Abnahme 19.10.2026, zentraler Befund):** auch wenn
-`BriefSftpErgebnis.status == "GESENDET"` (= dieselbe Form wie
-`MailOpsErgebnis`/`VersandBestaetigung` trägt), darf dieses Ergebnis
-NIEMALS direkt als `versand_fn`-Rückgabe an
-`MahnwesenService.versende_mahnlauf` durchgereicht werden - dessen
-`nachweis_daten`/`versand_belegen`-Mechanismus würde daraus SOFORT
-einen abgeschlossenen Versand samt Kostenbuchung ableiten. Der
-tatsächliche Dispatch-Code (`indexautomatik/mailversand_service.py::
-HVMailversandService._sende_brief`) verwendet dieses Ergebnis deshalb
-NUR, um den Archivstatus auf `UEBERMITTELT` zu setzen, und gibt dem
-Aufrufer explizit `None` zurück - der Mahnlauf bleibt dadurch UNSICHER
-(keine Kostenbuchung, kein automatischer Neuversand), bis ein
-authentischer Anbieterbeleg (`mahnbrief_archiv.py::
-importiere_anbieterbeleg` + Vervollständigung) vorliegt.
+**Kritisch (Codex-Abnahme 19.10.2026):** `BriefSftpErgebnis.status`
+trägt deshalb SELBST den Wert `"UEBERMITTELT"`, NICHT `"GESENDET"` -
+eine strukturelle Absicherung, nicht nur ein Aufrufer-Hinweis: selbst
+wenn dieses Ergebnis versehentlich direkt als `versand_fn`-Rückgabe an
+`MahnwesenService.versende_mahnlauf` durchgereicht würde, lehnt dessen
+`nachweis_daten` (das zwingend `status == "GESENDET"` verlangt) es
+automatisch ab, statt daraus einen abgeschlossenen Versand samt
+Kostenbuchung abzuleiten. Der tatsächliche Dispatch-Code
+(`indexautomatik/mailversand_service.py::HVMailversandService.
+_sende_brief`) verwendet dieses Ergebnis NUR, um den Archivstatus auf
+`UEBERMITTELT` zu setzen, und gibt dem Aufrufer explizit `None` zurück -
+der Mahnlauf bleibt dadurch UNSICHER (keine Kostenbuchung, kein
+automatischer Neuversand), bis ein authentischer Anbieterbeleg
+(`mahnbrief_archiv.py::importiere_anbieterbeleg` + Vervollständigung)
+vorliegt.
 
 Alle definitiven (nicht-ungewissen) Fehler dieses Moduls sind bewusst
 `ValueError`-Subklassen - `MahnwesenService.versende_mahnlauf` fängt
@@ -73,7 +85,7 @@ import hashlib
 import io
 import re
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Protocol
 
@@ -82,7 +94,7 @@ from pypdf import PdfReader
 from mietinkasso.domain.exceptions import TransportFehlerUngewissError
 
 MAX_SIMPLEX_SEITEN = 14
-_BULK_PFAD_DEFAULT = "bulk_tp/"
+_BULK_PFAD_DEFAULT = "in/bulk_tp/"
 _VERBINDUNGSTIMEOUT_SEKUNDEN = 20
 _SENDE_SCHLUESSEL_MUSTER = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
@@ -183,33 +195,39 @@ class SftpKonfiguration:
     host: str
     port: int
     pfad: str
-    username: str
-    password: str
+    username: str = field(repr=False)
+    password: str = field(repr=False)
     host_key_fingerprint: str
+
+
+def _lies_private_datei(pfad: str) -> str | None:
+    from pathlib import Path
+
+    if not pfad:
+        return None
+    try:
+        inhalt = Path(pfad).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return inhalt or None
 
 
 def konfiguration_aus_settings(settings) -> SftpKonfiguration | None:
     """Geschlossen, solange NICHT ALLE vier sicherheitsrelevanten Werte
-    (Host, Username, Passwort-DATEI, gepinnter Hostkey-Fingerprint)
-    explizit konfiguriert sind UND die Passwortdatei tatsächlich lesbar
-    ist - Credentials kommen AUSSCHLIESSLICH aus privaten
-    Serverdateien/Umgebungsvariablen außerhalb dieses Repos (Codex),
-    niemals aus einem hier hinterlegten Default. Das Passwort wird NIE
-    als Settings-Klartextwert gehalten (siehe Moduldoc)."""
+    (Host, Username-DATEI, Passwort-DATEI, gepinnter Hostkey-
+    Fingerprint) explizit konfiguriert sind UND beide Dateien
+    tatsächlich lesbar sind - Credentials kommen AUSSCHLIESSLICH aus
+    privaten Serverdateien außerhalb dieses Repos (Codex), niemals aus
+    einem hier hinterlegten Default oder einem Klartext-Settings-Wert
+    (siehe Moduldoc)."""
 
     host = (settings.brief_sftp_host or "").strip()
-    username = (settings.brief_sftp_username or "").strip()
     fingerprint = (settings.brief_sftp_host_key_fingerprint or "").strip()
-    passwort_datei = (settings.brief_sftp_password_datei or "").strip()
-    if not host or not username or not fingerprint or not passwort_datei:
+    if not host or not fingerprint:
         return None
-    try:
-        from pathlib import Path
-
-        password = Path(passwort_datei).read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    if not password:
+    username = _lies_private_datei((settings.brief_sftp_username_datei or "").strip())
+    password = _lies_private_datei((settings.brief_sftp_password_datei or "").strip())
+    if not username or not password:
         return None
     return SftpKonfiguration(
         host=host, port=settings.brief_sftp_port, pfad=settings.brief_sftp_pfad or _BULK_PFAD_DEFAULT,
@@ -229,13 +247,17 @@ def _remote_pfad(pfad: str, dateiname: str) -> str:
 
 @dataclass(frozen=True)
 class BriefSftpErgebnis:
-    """Dieselbe Form wie `indexautomatik.mailops_client.MailOpsErgebnis`/
-    `indexautomatik.transport.VersandBestaetigung` - rein strukturell.
-    `status` ist IMMER "GESENDET" (= an den Post-SFTP-Server
-    ÜBERMITTELT, NIE ein Zustellungs-/Postaufgabenachweis) - **dieses
-    Objekt darf TROTZDEM niemals direkt als `versand_fn`-Rückgabe an
-    `MahnwesenService.versende_mahnlauf` weitergereicht werden** (siehe
-    Moduldoc, zentraler Codex-Befund 19.10.2026)."""
+    """Strukturell ÄHNLICH zu `indexautomatik.mailops_client.
+    MailOpsErgebnis`/`indexautomatik.transport.VersandBestaetigung`
+    (dieselben vier Felder), aber BEWUSST ein eigener Statuswert:
+    `status` ist IMMER `"UEBERMITTELT"`, NIE `"GESENDET"` (Codex-Abnahme
+    19.10.2026) - ein erfolgreicher SFTP-Upload ist AUSSCHLIESSLICH ein
+    Transport-Nachweis gegenüber dem Server, NIE ein Zustellungs-/
+    Postaufgabenachweis. Da `nachweis_daten`/`versand_belegen` zwingend
+    `status == "GESENDET"` verlangen, lehnen sie dieses Objekt SELBST
+    dann ab, wenn es versehentlich direkt als `versand_fn`-Rückgabe
+    durchgereicht würde - eine strukturelle statt nur eine Aufrufer-
+    seitige Absicherung (siehe Moduldoc)."""
 
     status: str
     externe_referenz: str  # der permanent reservierte Dateiname
@@ -268,16 +290,30 @@ class _ParamikoVerbindung:
 
         self._konfiguration = konfiguration
         self._sftp_client_cls = sftp_client_cls or paramiko.SFTPClient
-        if transport_factory is not None:
-            self._transport = transport_factory()
-        else:
-            sock = socket.create_connection(
-                (konfiguration.host, konfiguration.port), timeout=_VERBINDUNGSTIMEOUT_SEKUNDEN
-            )
-            self._transport = paramiko.Transport(sock)
-            self._transport.banner_timeout = _VERBINDUNGSTIMEOUT_SEKUNDEN
-            self._transport.start_client(timeout=_VERBINDUNGSTIMEOUT_SEKUNDEN)
+        self._sock = None
+        self._transport = None
         self._sftp = None
+        try:
+            if transport_factory is not None:
+                self._transport = transport_factory()
+            else:
+                self._sock = socket.create_connection(
+                    (konfiguration.host, konfiguration.port), timeout=_VERBINDUNGSTIMEOUT_SEKUNDEN
+                )
+                self._transport = paramiko.Transport(self._sock)
+                # Begrenzt Verbindungsaufbau (`banner_timeout`) UND
+                # Authentifizierung (`auth_timeout`) - ein hängender
+                # Server kann den Versandlauf dadurch nie unbegrenzt
+                # blockieren (Codex-Abnahme 19.10.2026).
+                self._transport.banner_timeout = _VERBINDUNGSTIMEOUT_SEKUNDEN
+                self._transport.auth_timeout = _VERBINDUNGSTIMEOUT_SEKUNDEN
+                self._transport.start_client(timeout=_VERBINDUNGSTIMEOUT_SEKUNDEN)
+        except Exception:
+            # Scheitert Konstruktion/`start_client` selbst, bleibt KEINE
+            # offene Socket-/Transport-Ressource zurück (Codex-Abnahme
+            # 19.10.2026).
+            self.close()
+            raise
 
     def hostkey_fingerprint(self) -> str:
         schluessel = self._transport.get_remote_server_key()
@@ -288,6 +324,12 @@ class _ParamikoVerbindung:
         if self._sftp is None:
             self._transport.auth_password(self._konfiguration.username, self._konfiguration.password)
             self._sftp = self._sftp_client_cls.from_transport(self._transport)
+            # Begrenzt auch den tatsächlichen SFTP-Kanal selbst (nicht
+            # nur Verbindungsaufbau/Authentifizierung) - ein hängender
+            # exklusiver Schreibvorgang wird dadurch ebenfalls begrenzt.
+            kanal = self._sftp.get_channel()
+            if kanal is not None:
+                kanal.settimeout(_VERBINDUNGSTIMEOUT_SEKUNDEN)
         # "wxb" (nicht "xb" allein - Codex-Abnahme 19.10.2026): paramikos
         # `SFTPClient.open`-Modusübersetzung setzt bei einem bloßen "xb"
         # KEIN Schreib-Flag, die Datei würde exklusiv angelegt, aber nie
@@ -296,9 +338,16 @@ class _ParamikoVerbindung:
             datei.write(data)
 
     def close(self) -> None:
-        if self._sftp is not None:
-            self._sftp.close()
-        self._transport.close()
+        # Ein Fehler beim SFTP-Close darf das Schließen von
+        # Transport/Socket NIE verhindern (Codex-Abnahme 19.10.2026).
+        try:
+            if self._sftp is not None:
+                self._sftp.close()
+        finally:
+            if self._transport is not None:
+                self._transport.close()
+            elif self._sock is not None:
+                self._sock.close()
 
 
 def _echte_verbindung(konfiguration: SftpKonfiguration) -> _SftpVerbindung:
@@ -368,7 +417,7 @@ class PostSftpTransportadapter:
                     pass
 
         return BriefSftpErgebnis(
-            status="GESENDET", externe_referenz=dateiname,
+            status="UEBERMITTELT", externe_referenz=dateiname,
             provider_referenz=f"sftp:{self._konfiguration.host}:{remote_pfad}",
             versendet_am=datetime.now(timezone.utc),
         )

@@ -326,6 +326,14 @@ def vertragsanlage_detail(
         mahnlaeufe=mahnlaeufe, erhoehungsschreiben=erhoehungsschreiben,
         vertragsende_erinnerungen=vertragsende_erinnerungen, von_objekt=von_objekt,
     )
+    # Mahnbrief-Archiv + Anbieterbeleg-Import (Auftrag HV-20261019-
+    # VERSAND-KOSTEN-ABSCHLUSS, Teil 3) - eigene, separate Seite statt
+    # hier mitgerendert, nur ein Verweis aus der Mieterakte heraus.
+    inhalt += (
+        f'<div class="card"><h3>Mahnbrief-Archiv (Briefkanal)</h3>'
+        f'<p><a href="/backoffice/vertrag/{vertrag_id}/mahnbrief-archiv">Archivierte Mahnbriefe, '
+        "Original-PDF-Download und Anbieterbeleg-Import ansehen</a></p></div>"
+    )
     return _layout(request, session, f"Mieterakte {debitor.name}", inhalt)
 
 

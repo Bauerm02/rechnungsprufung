@@ -994,6 +994,54 @@
       ]
     },
     {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnbrief-archiv",
+      "method": "GET",
+      "endpoint": "mahnbrief_archiv_liste",
+      "resolved_endpoint": "mahnbrief_archiv_liste",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnbrief-archiv/{archiv_id}/anbieterbeleg.pdf",
+      "method": "GET",
+      "endpoint": "mahnbrief_archiv_anbieterbeleg_pdf",
+      "resolved_endpoint": "mahnbrief_archiv_anbieterbeleg_pdf",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnbrief-archiv/{archiv_id}/beleg",
+      "method": "POST",
+      "endpoint": "mahnbrief_archiv_beleg_importieren",
+      "resolved_endpoint": "mahnbrief_archiv_beleg_importieren",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnbrief-archiv/{archiv_id}/original.pdf",
+      "method": "GET",
+      "endpoint": "mahnbrief_archiv_original_pdf",
+      "resolved_endpoint": "mahnbrief_archiv_original_pdf",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
       "path": "/backoffice/vertrag/{vertrag_id}/mahnbrief.pdf",
       "method": "GET",
       "endpoint": "mahnbrief_pdf",
@@ -1860,6 +1908,34 @@
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
     },
     {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnbrief-archiv",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnbrief-archiv/{archiv_id}/anbieterbeleg.pdf",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnbrief-archiv/{archiv_id}/beleg",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnbrief-archiv/{archiv_id}/original.pdf",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
       "path": "/backoffice/vertrag/{vertrag_id}/mahnbrief.pdf",
       "method": "get",
       "status": 503,
@@ -2022,5 +2098,5 @@
     }
   ],
   "session_dependency_count": 1,
-  "baseline_commit": "e095c73fa148f2a6ce8b8e0b8e9ab7735a8120d0 + HV-20261001-BK-AUTOMATIK + HV-20261019-MAHNKOSTEN + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS (additiv: native Rücklastschrift+Bankentgelt-Route)"
+  "baseline_commit": "e095c73fa148f2a6ce8b8e0b8e9ab7735a8120d0 + HV-20261001-BK-AUTOMATIK + HV-20261019-MAHNKOSTEN + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS (additiv: native Rücklastschrift+Bankentgelt-Route) + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS Teil 3 (additiv: Mahnbrief-Archiv-/Anbieterbeleg-Routen)"
 }

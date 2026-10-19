@@ -440,23 +440,36 @@ class HVMailversandService:
 
     def vervollstaendige_mahnlauf_aus_anbieterbeleg(
         self, *, ctx, archiv_id: int, anbieterbeleg_pdf_bytes: bytes, anbieterbeleg_referenz: str,
-        postaufgabe_datum: date, importiert_von: str,
+        postaufgabe_datum: date, importiert_von: str, heute: date,
     ) -> None:
         """Backoffice-Einstiegspunkt (Auftrag HV-20261019-VERSAND-KOSTEN-
-        ABSCHLUSS, Teil 3, Codex-Abnahme 19.10.2026): importiert den
-        authentischen Anbieterbeleg idempotent/konfliktgeprüft
+        ABSCHLUSS, Teil 3, Codex-Abnahme 19.10.2026, zweite Korrektur):
+        prüft ERST Berechtigung (Gesellschaft+Schreibrecht+107-Ausschluss)
+        UND Plausibilität, BEVOR überhaupt irgendein Belegdatum
+        geschrieben wird - die vorherige Fassung importierte den Beleg
+        bereits VOR jeder Berechtigungsprüfung. Lehnt einen Abschluss für
+        einen noch nie übertragenen/neu geplanten Lauf ab (nur `UNSICHER`
+        - tatsächlich ein Übermittlungsversuch war - oder `GESENDET` -
+        bereits bestätigt, idempotenter Retry - sind zulässig) sowie ein
+        Postaufgabedatum in der Zukunft oder vor der eigenen Archivierung.
+        Importiert ERST DANACH idempotent/konfliktgeprüft
         (`mahnbrief_archiv_repo.importiere_anbieterbeleg` - ein bloßer
         Referenztext allein wird dort bereits abgelehnt) und
-        vervollständigt ERST DANACH - niemals beim bloßen SFTP-Upload -
-        den eingefrorenen Mahnlauf samt Kostensnapshot anhand des
-        TATSÄCHLICHEN Postaufgabedatums, niemals erneut sendend
-        (`MahnwesenService.vervollstaendige_mahnlauf_aus_echtem_beleg`)."""
+        vervollständigt den eingefrorenen Mahnlauf samt Kostensnapshot
+        anhand des TATSÄCHLICHEN Postaufgabedatums, niemals erneut
+        sendend (`MahnwesenService.vervollstaendige_mahnlauf_aus_
+        echtem_beleg`)."""
 
-        archiv = self.mahnbrief_archiv_repo.importiere_anbieterbeleg(
-            archiv_id=archiv_id, anbieterbeleg_pdf_bytes=anbieterbeleg_pdf_bytes,
-            anbieterbeleg_referenz=anbieterbeleg_referenz, postaufgabe_datum=postaufgabe_datum,
-            importiert_von=importiert_von,
-        )
+        archiv = self.mahnbrief_archiv_repo.get(archiv_id)
+        if archiv is None:
+            raise ValueError(f"Unbekannte Mahnbrief-Archivzeile {archiv_id}.")
+        vertrag = self.bundle.stammdaten_repository.get_vertrag(archiv.vertrag_id)
+        if vertrag is None:
+            raise ValueError(f"Unbekannter Vertrag {archiv.vertrag_id} zu Archivzeile {archiv_id}.")
+        require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
+        require_schreibrecht(ctx)
+        self.bundle.stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
+
         with self.sf() as session:
             mahnlauf = session.execute(select(MahnLaufTable).where(
                 MahnLaufTable.vertrag_id == archiv.vertrag_id, MahnLaufTable.stufe == archiv.stufe,
@@ -464,13 +477,36 @@ class HVMailversandService:
             )).scalar_one_or_none()
         if mahnlauf is None:
             raise ValueError(f"Kein Mahnlauf zu Archivzeile {archiv_id} gefunden.")
+        if mahnlauf.status not in ("UNSICHER", "GESENDET"):
+            raise ValueError(
+                f"Mahnlauf {mahnlauf.id} hat Status {mahnlauf.status!r} - eine Vervollständigung aus einem "
+                "Anbieterbeleg ist nur für einen tatsächlich übermittelten (UNSICHER) oder bereits "
+                "bestätigten (GESENDET, idempotenter Retry) Versandversuch vorgesehen, nie für einen noch "
+                "nie übertragenen/neu geplanten Lauf."
+            )
+        if postaufgabe_datum > heute:
+            raise ValueError(f"Postaufgabedatum {postaufgabe_datum} liegt in der Zukunft.")
+        archiviert_am_datum = archiv.archiviert_am.date() if archiv.archiviert_am is not None else None
+        if archiviert_am_datum is not None and postaufgabe_datum < archiviert_am_datum:
+            raise ValueError(
+                f"Postaufgabedatum {postaufgabe_datum} liegt vor der Archivierung/Übermittlung "
+                f"({archiviert_am_datum}) - ein Postaufgabebeleg kann nicht vor dem eigenen Versandversuch liegen."
+            )
 
-        # `versendet_am` trägt das TATSÄCHLICHE Postaufgabedatum (nie den
-        # bloßen SFTP-Uploadzeitpunkt) - genau dieses Datum wird weiter
-        # unten (`MahnwesenService._vervollstaendige_bestaetigten_
-        # mahnlauf`) als Buchungsdatum für Zinsen/Gebühr verwendet.
+        archiv = self.mahnbrief_archiv_repo.importiere_anbieterbeleg(
+            archiv_id=archiv_id, anbieterbeleg_pdf_bytes=anbieterbeleg_pdf_bytes,
+            anbieterbeleg_referenz=anbieterbeleg_referenz, postaufgabe_datum=postaufgabe_datum,
+            importiert_von=importiert_von,
+        )
+
+        # `versendet_am` trägt NUR das TATSÄCHLICHE Postaufgabedatum -
+        # Mitternacht UTC ist dabei ein reiner Speicher-Platzhalter
+        # (DB-Spalte verlangt einen Zeitstempel), KEINE behauptete
+        # tatsächliche Uhrzeit (Codex-Abnahme 19.10.2026: "eine
+        # datumsgenaue Angabe nicht als erfundene tatsächliche Uhrzeit
+        # ausgeben") - nur das Datum selbst ist authentisch.
         beleg = RekonstruierterBeleg(
-            status="GESENDET", versendet_am=datetime.combine(postaufgabe_datum, time(12, 0), tzinfo=timezone.utc),
+            status="GESENDET", versendet_am=datetime.combine(postaufgabe_datum, time.min, tzinfo=timezone.utc),
             externe_referenz=anbieterbeleg_referenz, provider_referenz=f"post-anbieterbeleg:{anbieterbeleg_referenz}",
         )
         self.mahn_service.vervollstaendige_mahnlauf_aus_echtem_beleg(

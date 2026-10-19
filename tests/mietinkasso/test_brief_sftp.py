@@ -37,7 +37,7 @@ def _echtes_pdf(seiten: int = 1) -> bytes:
 
 def _konfiguration(**overrides) -> SftpKonfiguration:
     werte = dict(
-        host="transfer.post-business-solutions.at", port=22, pfad="bulk_tp/",
+        host="transfer.post-business-solutions.at", port=22, pfad="in/bulk_tp/",
         username="jlb-test", password="synthetisches-test-passwort", host_key_fingerprint=_FINGERPRINT,
     )
     werte.update(overrides)
@@ -48,8 +48,8 @@ class _FakeSettings:
     def __init__(self, **overrides):
         self.brief_sftp_host = overrides.get("brief_sftp_host")
         self.brief_sftp_port = overrides.get("brief_sftp_port", 22)
-        self.brief_sftp_pfad = overrides.get("brief_sftp_pfad", "bulk_tp/")
-        self.brief_sftp_username = overrides.get("brief_sftp_username")
+        self.brief_sftp_pfad = overrides.get("brief_sftp_pfad", "in/bulk_tp/")
+        self.brief_sftp_username_datei = overrides.get("brief_sftp_username_datei")
         self.brief_sftp_password_datei = overrides.get("brief_sftp_password_datei")
         self.brief_sftp_host_key_fingerprint = overrides.get("brief_sftp_host_key_fingerprint")
 
@@ -153,30 +153,41 @@ def test_pruefe_sendevoraussetzungen_ignoriert_seitenlimit_bei_duplex():
 def test_konfiguration_aus_settings_ist_ohne_vollstaendige_werte_geschlossen(tmp_path):
     passwort_datei = tmp_path / "sftp-passwort.txt"
     passwort_datei.write_text("synthetisches-test-passwort", encoding="utf-8")
+    username_datei = tmp_path / "sftp-username.txt"
+    username_datei.write_text("jlb-test", encoding="utf-8")
 
     assert konfiguration_aus_settings(_FakeSettings()) is None
     assert konfiguration_aus_settings(_FakeSettings(brief_sftp_host="h")) is None
     assert konfiguration_aus_settings(_FakeSettings(
-        brief_sftp_host="h", brief_sftp_username="u", brief_sftp_password_datei=str(passwort_datei),
+        brief_sftp_host="h", brief_sftp_username_datei=str(username_datei),
+        brief_sftp_password_datei=str(passwort_datei),
     )) is None  # Hostkey-Fingerprint fehlt
     assert konfiguration_aus_settings(_FakeSettings(
-        brief_sftp_host="h", brief_sftp_username="u", brief_sftp_host_key_fingerprint=_FINGERPRINT,
+        brief_sftp_host="h", brief_sftp_username_datei=str(username_datei),
+        brief_sftp_host_key_fingerprint=_FINGERPRINT,
         brief_sftp_password_datei=str(tmp_path / "existiert-nicht.txt"),
     )) is None  # Passwortdatei nicht lesbar
+    assert konfiguration_aus_settings(_FakeSettings(
+        brief_sftp_host="h", brief_sftp_username_datei=str(tmp_path / "existiert-nicht.txt"),
+        brief_sftp_host_key_fingerprint=_FINGERPRINT, brief_sftp_password_datei=str(passwort_datei),
+    )) is None  # Usernamedatei nicht lesbar
 
 
 def test_konfiguration_aus_settings_liefert_konfiguration_bei_vollstaendigen_werten(tmp_path):
     passwort_datei = tmp_path / "sftp-passwort.txt"
     passwort_datei.write_text("synthetisches-test-passwort\n", encoding="utf-8")
+    username_datei = tmp_path / "sftp-username.txt"
+    username_datei.write_text("jlb-test\n", encoding="utf-8")
 
     konfiguration = konfiguration_aus_settings(_FakeSettings(
-        brief_sftp_host="transfer.post-business-solutions.at", brief_sftp_username="u",
+        brief_sftp_host="transfer.post-business-solutions.at", brief_sftp_username_datei=str(username_datei),
         brief_sftp_password_datei=str(passwort_datei), brief_sftp_host_key_fingerprint=_FINGERPRINT,
     ))
     assert konfiguration is not None
     assert konfiguration.host == "transfer.post-business-solutions.at"
     assert konfiguration.port == 22
-    assert konfiguration.pfad == "bulk_tp/"
+    assert konfiguration.pfad == "in/bulk_tp/"
+    assert konfiguration.username == "jlb-test"  # Zeilenumbruch abgeschnitten
     assert konfiguration.password == "synthetisches-test-passwort"  # Zeilenumbruch abgeschnitten
 
 
@@ -206,10 +217,10 @@ def test_adapter_erfolgreicher_versand_liefert_ehrliches_uebermittelt_ergebnis()
     pdf_bytes = _echtes_pdf()
     ergebnis = adapter.sende(pdf_bytes=pdf_bytes, dateiname="DATEI-1.pdf")
     assert isinstance(ergebnis, BriefSftpErgebnis)
-    assert ergebnis.status == "GESENDET"  # == an den SFTP-Server übermittelt, KEIN Zustellnachweis
+    assert ergebnis.status == "UEBERMITTELT"  # NICHT "GESENDET" - struktureller Schutz, siehe Moduldoc
     assert ergebnis.externe_referenz == "DATEI-1.pdf"
-    assert "bulk_tp/DATEI-1.pdf" in ergebnis.provider_referenz
-    assert fake.geschriebene_dateien == {"bulk_tp/DATEI-1.pdf": pdf_bytes}
+    assert "in/bulk_tp/DATEI-1.pdf" in ergebnis.provider_referenz
+    assert fake.geschriebene_dateien == {"in/bulk_tp/DATEI-1.pdf": pdf_bytes}
 
 
 def test_adapter_lehnt_ueberschreiben_als_konflikt_ab_remote_exklusives_anlegen():
@@ -219,7 +230,7 @@ def test_adapter_lehnt_ueberschreiben_als_konflikt_ab_remote_exklusives_anlegen(
     adapter.sende(pdf_bytes=erstes_pdf, dateiname="DATEI-2.pdf")
     with pytest.raises(PostSftpDateiKonfliktError):
         adapter.sende(pdf_bytes=_echtes_pdf(seiten=2), dateiname="DATEI-2.pdf")
-    assert fake.geschriebene_dateien["bulk_tp/DATEI-2.pdf"] == erstes_pdf  # unverändert
+    assert fake.geschriebene_dateien["in/bulk_tp/DATEI-2.pdf"] == erstes_pdf  # unverändert
 
 
 def test_adapter_verbindungsstoerung_ist_immer_ungewiss_kein_automatischer_retry():
@@ -275,16 +286,28 @@ class _FakeSftpFile:
         return False
 
 
+class _FakeKanal:
+    def __init__(self):
+        self.timeout_aufrufe: list[float] = []
+
+    def settimeout(self, sekunden: float) -> None:
+        self.timeout_aufrufe.append(sekunden)
+
+
 class _FakeSftpClient:
     def __init__(self):
         self.open_aufrufe: list[tuple[str, str]] = []
         self.geschriebene_dateien: dict[str, bytes] = {}
         self._datei = _FakeSftpFile()
+        self.kanal = _FakeKanal()
 
     def open(self, remote_pfad: str, modus: str):
         self.open_aufrufe.append((remote_pfad, modus))
         self.geschriebene_dateien[remote_pfad] = b""
         return self._datei
+
+    def get_channel(self):
+        return self.kanal
 
     def close(self) -> None:
         pass
@@ -331,11 +354,69 @@ def test_paramiko_verbindung_oeffnet_exklusiv_und_schreibend_wxb():
     verbindung = _ParamikoVerbindung(
         konfiguration, transport_factory=lambda: fake_transport, sftp_client_cls=_FakeSftpClientCls,
     )
-    verbindung.put_exclusive("bulk_tp/DATEI-1.pdf", b"%PDF-1.4 Inhalt")
+    verbindung.put_exclusive("in/bulk_tp/DATEI-1.pdf", b"%PDF-1.4 Inhalt")
 
-    assert fake_sftp_client.open_aufrufe == [("bulk_tp/DATEI-1.pdf", "wxb")]
+    assert fake_sftp_client.open_aufrufe == [("in/bulk_tp/DATEI-1.pdf", "wxb")]
     assert fake_sftp_client._datei.geschrieben == b"%PDF-1.4 Inhalt"
     assert fake_transport.auth_aufrufe == [(konfiguration.username, konfiguration.password)]
+    # Der tatsächliche SFTP-Kanal selbst wird ebenfalls begrenzt (nicht nur
+    # Verbindungsaufbau/Authentifizierung) - Codex-Abnahme 19.10.2026.
+    from mietinkasso.mahnwesen.brief_sftp import _VERBINDUNGSTIMEOUT_SEKUNDEN
+    assert fake_sftp_client.kanal.timeout_aufrufe == [_VERBINDUNGSTIMEOUT_SEKUNDEN]
+
+
+def test_paramiko_verbindung_setzt_banner_und_auth_timeout_bei_echtem_verbindungsaufbau(monkeypatch):
+    """Codex-Abnahme 19.10.2026: `_ParamikoVerbindung` begrenzt beim
+    ECHTEN Verbindungsaufbau (kein `transport_factory` injiziert) sowohl
+    `banner_timeout` als auch `auth_timeout` - nicht nur den Socket-
+    Connect. Ersetzt `socket.create_connection`/`paramiko.Transport`
+    durch Fakes, damit kein echter Netzwerkzugriff stattfindet."""
+
+    import paramiko
+
+    from mietinkasso.mahnwesen import brief_sftp as brief_sftp_modul
+
+    fake_transport = _FakeTransport()
+    aufgerufene_adressen = []
+
+    def _fake_create_connection(adresse, timeout):
+        aufgerufene_adressen.append((adresse, timeout))
+        return object()
+
+    def _fake_transport_cls(sock):
+        return fake_transport
+
+    monkeypatch.setattr(brief_sftp_modul.socket, "create_connection", _fake_create_connection)
+    monkeypatch.setattr(paramiko, "Transport", _fake_transport_cls)
+    fake_transport.start_client = lambda timeout: None
+
+    verbindung = _ParamikoVerbindung(_konfiguration())
+    assert aufgerufene_adressen == [((_konfiguration().host, _konfiguration().port), 20)]
+    assert fake_transport.banner_timeout == 20
+    assert fake_transport.auth_timeout == 20
+
+
+def test_paramiko_verbindung_schliesst_transport_bei_fehlschlagendem_start_client(monkeypatch):
+    """Codex-Abnahme 19.10.2026: scheitert `start_client` beim ECHTEN
+    Verbindungsaufbau, bleibt KEINE offene Transport-/Socket-Ressource
+    zurück - `close()` wird auch dann aufgerufen. Kein echter
+    Netzwerkzugriff (Socket-Connect/`paramiko.Transport` gefakt)."""
+
+    import paramiko
+
+    from mietinkasso.mahnwesen import brief_sftp as brief_sftp_modul
+
+    class _FehlschlagenderTransport(_FakeTransport):
+        def start_client(self, timeout):
+            raise RuntimeError("Fake-Kanalverhandlung fehlgeschlagen (Test).")
+
+    fake_transport = _FehlschlagenderTransport()
+    monkeypatch.setattr(brief_sftp_modul.socket, "create_connection", lambda adresse, timeout: object())
+    monkeypatch.setattr(paramiko, "Transport", lambda sock: fake_transport)
+
+    with pytest.raises(RuntimeError):
+        _ParamikoVerbindung(_konfiguration())
+    assert fake_transport.geschlossen
 
 
 def test_paramiko_verbindung_hostkey_fingerprint_ist_sha256_base64():
@@ -365,6 +446,6 @@ def test_paramiko_verbindung_close_schliesst_transport():
     verbindung = _ParamikoVerbindung(
         _konfiguration(), transport_factory=lambda: fake_transport, sftp_client_cls=_FakeSftpClientCls,
     )
-    verbindung.put_exclusive("bulk_tp/DATEI-1.pdf", b"%PDF-1.4 x")
+    verbindung.put_exclusive("in/bulk_tp/DATEI-1.pdf", b"%PDF-1.4 x")
     verbindung.close()
     assert fake_transport.geschlossen

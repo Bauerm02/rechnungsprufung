@@ -11,7 +11,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from html import escape as h
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy.exc import IntegrityError
 
@@ -627,6 +627,168 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
         content=pdf_bytes, media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{dateiname}"'},
     )
+
+
+# -- Mahnbrief-Archiv + Anbieterbeleg-Import (Auftrag HV-20261019- ---------
+# -- VERSAND-KOSTEN-ABSCHLUSS, Teil 3) --------------------------------------
+#
+# Zeigt JEDE tatsächlich archivierte (= bereits über den Briefkanal
+# versandversuchte) Mahnbrief-PDF-Zeile eines Vertrags, bietet den
+# geschützten Original-PDF-Download UND - solange noch kein Beleg
+# importiert wurde - das Formular für den echten Anbieterbeleg
+# (Original-PDF + Referenz + tatsächliches Postaufgabedatum). Ein
+# erfolgreicher Import vervollständigt darüber den eingefrorenen
+# Mahnlauf idempotent (siehe `HVMailversandService.
+# vervollstaendige_mahnlauf_aus_anbieterbeleg`) - NIE ein erneuter Versand.
+
+_MAX_ANBIETERBELEG_UPLOAD_BYTES = 15 * 1024 * 1024
+
+
+async def _lese_beleg_begrenzt(upload_file: UploadFile, max_bytes: int = _MAX_ANBIETERBELEG_UPLOAD_BYTES) -> bytes:
+    stueck_groesse = 1024 * 1024
+    gelesen = bytearray()
+    while True:
+        stueck = await upload_file.read(stueck_groesse)
+        if not stueck:
+            break
+        gelesen += stueck
+        if len(gelesen) > max_bytes:
+            raise ValueError(f"Belegdatei überschreitet die zulässige Größe ({max_bytes // (1024 * 1024)} MB).")
+    return bytes(gelesen)
+
+
+def _mahnbrief_archiv_zeile_html(vertrag_id: str, zeile, csrf_token: str) -> str:
+    status_html = (
+        f"<p>Status: <strong>{h(zeile.status)}</strong>"
+        + (f" (übermittelt am {h(zeile.status_aktualisiert_am.isoformat())})" if zeile.status_aktualisiert_am else "")
+        + "</p>"
+    )
+    download_original = (
+        f'<p><a href="/backoffice/vertrag/{h(vertrag_id)}/mahnbrief-archiv/{zeile.id}/original.pdf">'
+        "Original-Mahnbrief-PDF herunterladen</a></p>"
+    )
+    if zeile.anbieterbeleg_referenz:
+        beleg_html = f"""
+        <p><strong>Anbieterbeleg vorhanden:</strong> {h(zeile.anbieterbeleg_referenz)},
+           tatsächliches Postaufgabedatum {h(zeile.anbieterbeleg_postaufgabe_datum.isoformat())},
+           importiert von {h(zeile.anbieterbeleg_importiert_von or '')}
+           am {h(zeile.anbieterbeleg_importiert_am.isoformat() if zeile.anbieterbeleg_importiert_am else '')}.</p>
+        <p><a href="/backoffice/vertrag/{h(vertrag_id)}/mahnbrief-archiv/{zeile.id}/anbieterbeleg.pdf">
+           Anbieterbeleg (Original-PDF) herunterladen</a></p>"""
+    else:
+        beleg_html = f"""
+        <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/mahnbrief-archiv/{zeile.id}/beleg"
+              enctype="multipart/form-data">
+          {csrf_feld(csrf_token)}
+          <label>Anbieterbeleg (das tatsächliche Original-PDF aus der Post-Portal-Auftragsliste - ein
+                 Referenztext allein ist KEIN Beleg, Pflicht)</label>
+          <input type="file" name="beleg_datei" accept="application/pdf" required>
+          <label>Belegreferenz (Pflicht, eindeutig - gehört zu GENAU dieser einen Sendung)</label>
+          <input name="anbieterbeleg_referenz" required>
+          <label>Tatsächliches Postaufgabedatum laut Beleg (Pflicht - nicht der Uploadtag)</label>
+          <input type="date" name="postaufgabe_datum" required>
+          <button type="submit">Beleg importieren und Mahnlauf vervollständigen</button>
+        </form>"""
+    return f"""
+    <div class="card">
+      <h3>Stufe {zeile.stufe} - Mahnlauf {h(zeile.mahnlauf_schluessel)}</h3>
+      <p class="muted">Archiviert am {h(zeile.archiviert_am.isoformat() if zeile.archiviert_am else '')}.</p>
+      {status_html}
+      {download_original}
+      {beleg_html}
+    </div>"""
+
+
+@router.get("/vertrag/{vertrag_id}/mahnbrief-archiv", response_class=HTMLResponse)
+def mahnbrief_archiv_liste(request: Request, vertrag_id: str, session=Depends(_current_session)) -> HTMLResponse:
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Mahnbrief-Archiv", "Vertrag nicht verfügbar.", "/backoffice/vertraege")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+
+    zeilen = deps._hv_mail.mahnbrief_archiv_repo.list_fuer_vertrag(vertrag_id)
+    if not zeilen:
+        inhalt = "<p>Für diesen Vertrag ist noch kein Mahnbrief archiviert.</p>"
+    else:
+        inhalt = "".join(_mahnbrief_archiv_zeile_html(vertrag_id, zeile, session.csrf_token) for zeile in zeilen)
+    rueck = f'<p><a href="/backoffice/vertrag/{h(vertrag_id)}">&larr; zurück zur Mieterakte</a></p>'
+    return _layout(request, session, "Mahnbrief-Archiv", rueck + inhalt)
+
+
+@router.get("/vertrag/{vertrag_id}/mahnbrief-archiv/{archiv_id}/original.pdf")
+def mahnbrief_archiv_original_pdf(vertrag_id: str, archiv_id: int, session=Depends(_current_session)):
+    """Geschützter Download des tatsächlich archivierten, unveränderlichen
+    Original-PDFs (NICHT die On-Demand-Vorschau) - dieselben Zugriffs-
+    prüfungen wie jede andere Mieterakte-Ansicht."""
+
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        raise HTTPException(status_code=404, detail="Vertrag nicht verfügbar.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    zeile = deps._hv_mail.mahnbrief_archiv_repo.get(archiv_id)
+    if zeile is None or zeile.vertrag_id != vertrag_id:
+        raise HTTPException(status_code=404, detail="Unbekannte Archivzeile.")
+    return Response(
+        content=zeile.pdf_bytes, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="Mahnbrief-Archiv-{archiv_id}.pdf"'},
+    )
+
+
+@router.get("/vertrag/{vertrag_id}/mahnbrief-archiv/{archiv_id}/anbieterbeleg.pdf")
+def mahnbrief_archiv_anbieterbeleg_pdf(vertrag_id: str, archiv_id: int, session=Depends(_current_session)):
+    """Geschützter Download des tatsächlich importierten Anbieterbelegs
+    (das Originaldokument selbst, nicht nur die Referenz)."""
+
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        raise HTTPException(status_code=404, detail="Vertrag nicht verfügbar.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    zeile = deps._hv_mail.mahnbrief_archiv_repo.get(archiv_id)
+    if zeile is None or zeile.vertrag_id != vertrag_id or zeile.anbieterbeleg_pdf_bytes is None:
+        raise HTTPException(status_code=404, detail="Kein Anbieterbeleg vorhanden.")
+    return Response(
+        content=zeile.anbieterbeleg_pdf_bytes, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="Anbieterbeleg-{archiv_id}.pdf"'},
+    )
+
+
+@router.post("/vertrag/{vertrag_id}/mahnbrief-archiv/{archiv_id}/beleg")
+async def mahnbrief_archiv_beleg_importieren(
+    request: Request, vertrag_id: str, archiv_id: int,
+    csrf_token: str = Form(...), anbieterbeleg_referenz: str = Form(...), postaufgabe_datum: str = Form(...),
+    beleg_datei: UploadFile = File(...), session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Mahnbrief-Archiv", "Vertrag nicht verfügbar.", "/backoffice/vertraege")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    require_schreibrecht(_ctx(session))
+
+    rueck_href = f"/backoffice/vertrag/{vertrag_id}/mahnbrief-archiv"
+    try:
+        postaufgabe_datum_wert = date.fromisoformat(postaufgabe_datum.strip())
+    except ValueError:
+        return _fehlerseite(session, "Mahnbrief-Archiv", "Ungültiges Postaufgabedatum (Format YYYY-MM-DD erwartet).", rueck_href)
+    try:
+        beleg_pdf_bytes = await _lese_beleg_begrenzt(beleg_datei)
+    except ValueError as exc:
+        return _fehlerseite(session, "Mahnbrief-Archiv", str(exc), rueck_href)
+
+    try:
+        deps._hv_mail.vervollstaendige_mahnlauf_aus_anbieterbeleg(
+            ctx=_ctx(session), archiv_id=archiv_id, anbieterbeleg_pdf_bytes=beleg_pdf_bytes,
+            anbieterbeleg_referenz=anbieterbeleg_referenz.strip(), postaufgabe_datum=postaufgabe_datum_wert,
+            importiert_von=session.user_id, heute=date.today(),
+        )
+        deps._audit_service.log(
+            entity_typ="mahnbrief_archiv", entity_id=str(archiv_id), akteur=session.user_id,
+            aktion="ANBIETERBELEG_IMPORTIERT",
+            payload={"vertrag_id": vertrag_id, "anbieterbeleg_referenz": anbieterbeleg_referenz.strip()},
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Mahnbrief-Archiv", str(exc), rueck_href)
+    return RedirectResponse(url=rueck_href, status_code=303)
 
 
 @router.post("/mahnfall/{mahnfall_id}/sendebereitschaft", response_class=HTMLResponse)
