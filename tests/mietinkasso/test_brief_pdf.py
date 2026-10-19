@@ -161,19 +161,56 @@ def test_logo_steht_rechtsbuendig_ausserhalb_des_oben_links_sperrbereichs():
     assert _LOGO_Y >= 5.0  # äußerer 5-mm-Rand von der Papierkante oben
 
 
-def test_absenderzeile_steht_ausserhalb_des_sperrbereichs_auch_ohne_logo():
-    """Auch OHNE konfiguriertes Logo darf die Absenderzeile nicht mehr bei
-    x=20/y<=16 landen - `erzeuge_mahnbrief_pdf` muss den Sperrbereich auch
-    im Logo-losen Pfad meiden."""
+def test_absenderzeile_steht_als_oberste_zeile_innerhalb_des_empfaengerfensters():
+    """Konkreter, offiziell belegter Layoutnachweis (https://www.einfach-
+    brief.at/fe/vorlagen + Original-DOCX-Einschreibenvorlage, Codex-
+    Rückmeldung 19.10.2026): die Post verlangt die kurze Absenderzeile
+    NICHT mehr außerhalb, sondern als oberste Zeile INNERHALB des
+    Empfängerfensters (x=`fenster_links_mm`/y=`fenster_oben_mm`), 8pt,
+    linksbündig, mit einer Leerzeile Abstand zur darunterstehenden
+    Empfängeradresse - unabhängig davon, ob ein Logo konfiguriert ist
+    (das Logo bleibt unverändert rechtsbündig oben, siehe
+    `test_logo_steht_rechtsbuendig_ausserhalb_des_oben_links_sperrbereichs`).
+    Es gibt dabei bewusst nur EINE Absenderzeile, keine zweite beim Logo."""
 
-    pdf_bytes = _erzeugen(absender=_absender(logo_pfad=None))
+    absender = _absender(logo_pfad=None)
+    pdf_bytes = _erzeugen(absender=absender)
     assert pdf_bytes[:5] == b"%PDF-"
-    # Rein geometrische Prüfung über die Konstanten, die den Ablauf
-    # tatsächlich steuern (siehe `erzeuge_mahnbrief_pdf`): die
-    # Absenderzeile startet IMMER bei `_SPERRBEREICH_BREITE`, nie bei
-    # `_RAND`, unabhängig davon, ob ein Logo gezeichnet wurde.
-    assert _SPERRBEREICH_BREITE > _RAND
-    assert _SPERRBEREICH_BREITE >= 52.0 + 5.0
+    text = PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text()
+    absenderzeile = f"{absender.name} · {absender.adresse}"
+    assert absenderzeile in text
+    assert "Max Mustermieter" in text
+    # Textflussreihenfolge: die Absenderzeile (oberste Fensterzeile) steht
+    # VOR der Empfängeradresse darunter.
+    assert text.index(absenderzeile) < text.index("Max Mustermieter")
+
+    # Geometrische Prüfung über den tatsächlich steuernden Code: die
+    # Absenderzeile wird bei (`fenster_links_mm`/`fenster_oben_mm`)
+    # linksbündig gesetzt, nicht mehr rechtsbündig bei `_SPERRBEREICH_BREITE`.
+    import inspect
+    quelltext = inspect.getsource(erzeuge_mahnbrief_pdf)
+    absender_abschnitt = quelltext.split("Kurze Absenderzeile")[1].split("Empfänger AUSSCHLIESSLICH")[0]
+    assert "pdf.set_xy(absender.fenster_links_mm, absender.fenster_oben_mm)" in absender_abschnitt
+    assert 'align="L"' in absender_abschnitt
+    assert "_SPERRBEREICH_BREITE" not in absender_abschnitt
+
+
+def test_absenderzeile_hat_mit_logo_dieselbe_fensterposition():
+    """Dieselbe Geometrie gilt unverändert auch MIT konfiguriertem Logo -
+    das Logo bleibt unabhängig rechtsbündig oben; es wird (anders als vor
+    dieser Korrektur) nur noch EIN `pdf.cell(...)`-Aufruf für die
+    Absenderzeile ausgeführt, nicht mehr ein zweiter, konkurrierender
+    beim Logo."""
+
+    absender = _absender(logo_pfad="/pfad/existiert/nicht.png")  # Pfad existiert nicht -> kein Logo gezeichnet
+    pdf_bytes = _erzeugen(absender=absender)
+    text = PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text()
+    assert f"{absender.name} · {absender.adresse}" in text
+
+    import inspect
+    quelltext = inspect.getsource(erzeuge_mahnbrief_pdf)
+    logo_bis_fliesstext = quelltext.split("if absender.logo_pfad")[1].split("Fließtext beginnt")[0]
+    assert logo_bis_fliesstext.count(f'pdf.cell(absender.fenster_breite_mm, 4, f"{{absender.name}}') == 1
 
 
 def test_folgeseitenkopf_steht_ebenfalls_ausserhalb_des_sperrbereichs():

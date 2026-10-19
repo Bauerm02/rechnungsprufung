@@ -16,13 +16,27 @@ Freihaltebereiche (visuelle Prüfung des Original-Anhangs
 "EinfachBrief-Freihaltebereiche.pdf", Codex-Rückmeldung 19.10.2026): auf
 der Vorderseite oben links ein 52x60-mm-Rechteck, umlaufend 5 mm
 Schutzabstand (`_SPERRBEREICH_BREITE`/`_SPERRBEREICH_HOEHE` unten) - dort
-darf NICHTS gedruckt werden. Logo, Absenderzeile UND der laufende
-Folgeseitenkopf stehen deshalb rechtsbündig (nicht mehr bei x=20),
-niemals im Sperrbereich, auch wenn kein Logo konfiguriert ist. Der
-bestehende linke Rand (`_RAND` = 20 mm) und der bestehende äußere
-Seitenrand erfüllen den separat genannten Freihaltebereich "links 18 mm
-bis 160 mm Höhe" sowie den äußeren 5-mm-Rand bereits unverändert (siehe
-geometrische Tests in `test_brief_pdf.py`).
+darf NICHTS gedruckt werden. Logo UND der laufende Folgeseitenkopf stehen
+deshalb rechtsbündig (nicht bei x=20), niemals im Sperrbereich, auch wenn
+kein Logo konfiguriert ist. Der bestehende linke Rand (`_RAND` = 20 mm)
+und der bestehende äußere Seitenrand erfüllen den separat genannten
+Freihaltebereich "links 18 mm bis 160 mm Höhe" sowie den äußeren
+5-mm-Rand bereits unverändert (siehe geometrische Tests in
+`test_brief_pdf.py`).
+
+Absenderzeile (zusätzlicher, konkreter Layoutnachweis, offizielle
+Vorlage https://www.einfach-brief.at/fe/vorlagen + Original-DOCX-
+Einschreibenvorlage, Codex-Rückmeldung 19.10.2026): die Post verlangt für
+Rückläufer eine kurze, einzeilige 8pt-Retouradresse INNERHALB des
+Empfängerfensters, in dessen oberster Zeile, mit einer Leerzeile Abstand
+zur Empfängeradresse darunter - das überlappt zahlenmäßig mit dem oben
+genannten Sperrbereich (das Fenster beginnt bei x=20/y=62, der
+Sperrbereich bei x<57/y<65), ist aber eine eigene, später und
+spezifischer belegte Vorgabe GENAU für diese eine Zeile im Fenster und
+ersetzt dort NICHT den allgemeinen Sperrbereich für Logo/Folgeseitenkopf
+(die bleiben wie oben beschrieben rechtsbündig außerhalb). Es gibt
+dadurch bewusst NUR EINE Absenderzeile (im Fenster), keine zweite,
+konkurrierende Retouradresse beim Logo.
 
 Schrift/Logo sind konfigurierbare Dateipfade (siehe
 `infrastructure/config.py`): ohne sie fällt die Schrift auf eine immer
@@ -261,32 +275,30 @@ def erzeuge_mahnbrief_pdf(
         )
 
     fenster_unten = absender.fenster_oben_mm + absender.fenster_hoehe_mm
-    # Logo UND Absenderzeile rechtsbündig (`_LOGO_X` >= `_SPERRBEREICH_
-    # BREITE`), NIE im oben-links-Sperrbereich - auch ohne konfiguriertes
-    # Logo bleibt die Absenderzeile dort, nicht bei x=`_RAND`.
-    logo_unten = _LOGO_Y
+    # Logo bleibt rechtsbündig (`_LOGO_X` >= `_SPERRBEREICH_BREITE`), NIE
+    # im oben-links-Sperrbereich.
     if absender.logo_pfad and Path(absender.logo_pfad).is_file():
-        info = pdf.image(absender.logo_pfad, x=_LOGO_X, y=_LOGO_Y, w=_LOGO_BREITE)
-        logo_unten = _LOGO_Y + info.rendered_height
+        pdf.image(absender.logo_pfad, x=_LOGO_X, y=_LOGO_Y, w=_LOGO_BREITE)
 
-    # Absenderzeile (Retouradresse) sauber vom Logo getrennt UND
-    # sichtbar außerhalb der 5-mm-Schutzzone über dem Fenster (Fenster
-    # beginnt bei `fenster_oben_mm`).
-    absender_y = min(logo_unten + 4, absender.fenster_oben_mm - 5 - 4)
-    pdf.set_xy(_SPERRBEREICH_BREITE, absender_y)
+    # Kurze Absenderzeile (Retouradresse) als EINZIGE Absenderangabe
+    # (keine zweite, konkurrierende Zeile beim Logo): laut Post-Vorgabe
+    # für Fensterkuvert-Rückläufer einzeilig 8pt INNERHALB des
+    # Empfängerfensters, in dessen oberster Zeile, linksbündig bei
+    # (`fenster_links_mm`/`fenster_oben_mm`) - NICHT mehr außerhalb des
+    # Fensters (offizielle Vorlage https://www.einfach-brief.at/fe/vorlagen,
+    # Original-DOCX-Einschreibenvorlage, Codex-Rückmeldung 19.10.2026).
+    pdf.set_xy(absender.fenster_links_mm, absender.fenster_oben_mm)
     pdf.set_font("Brief", "", 8)
     pdf.set_text_color(*anthrazit)
-    pdf.cell(
-        _INHALT_RECHTS - _SPERRBEREICH_BREITE, 4, f"{absender.name} · {absender.adresse}",
-        align="R", new_x="LMARGIN", new_y="NEXT",
-    )
+    pdf.cell(absender.fenster_breite_mm, 4, f"{absender.name} · {absender.adresse}", align="L")
 
     # Empfänger AUSSCHLIESSLICH innerhalb des Fensters, linksbündig
     # (kein Blocksatz - je Zeile eigene `cell()`, kein `multi_cell`
-    # mit eingebetteten Zeilenumbrüchen).
+    # mit eingebetteten Zeilenumbrüchen), eine Leerzeile unter der
+    # Absenderzeile (Post-Vorgabe für die Rückläufer-Erkennung).
     pdf.set_text_color(0, 0, 0)
     pdf.set_font("Brief", "", 11)
-    y = absender.fenster_oben_mm
+    y = absender.fenster_oben_mm + 4 + 4  # Absenderzeile (4mm) + eine Leerzeile (4mm)
     for zeile in empfaenger_render_zeilen:
         pdf.set_xy(absender.fenster_links_mm, y)
         pdf.cell(absender.fenster_breite_mm, 5, zeile, align="L")
