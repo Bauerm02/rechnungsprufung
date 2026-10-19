@@ -1555,7 +1555,8 @@ def test_mit_bankentgelt_reine_kapitalrueckbuchung_ohne_bankentgelt(
 
     kapital_op, kosten_zeile = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
         ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
-        ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Mangels Deckung",
+        ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=0,
+        rueckgabeursache="Mangels Deckung",
         dem_zahlungspflichtigen_zurechenbar=True, zurechenbarkeit_begruendung="Vom Mieter zu vertreten.",
         beleg_referenz="Bankbeleg RLS-600", heute=date(2026, 4, 11), akteur="codex-test",
     )
@@ -1593,7 +1594,8 @@ def test_mit_bankentgelt_kapital_plus_bankentgelt_in_einer_transaktion(
 
     kapital_op, kosten_zeile = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
         ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
-        ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Mangels Deckung",
+        ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=1250,
+        rueckgabeursache="Mangels Deckung",
         dem_zahlungspflichtigen_zurechenbar=True,
         zurechenbarkeit_begruendung="Dauerhaft fehlende Kontodeckung, vom Mieter zu vertreten.",
         beleg_referenz="Bankbeleg RLS-612", heute=date(2026, 4, 11), akteur="codex-test",
@@ -1630,7 +1632,8 @@ def test_mit_bankentgelt_ohne_zurechenbarkeit_bleibt_bankentgelt_rein_dokumentar
 
     kapital_op, kosten_zeile = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
         ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
-        ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Bankseitiger Fehler lt. Bankauskunft",
+        ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=1250,
+        rueckgabeursache="Bankseitiger Fehler lt. Bankauskunft",
         dem_zahlungspflichtigen_zurechenbar=False,
         zurechenbarkeit_begruendung="Bank bestätigt eigenen Verarbeitungsfehler, Mieter trifft kein Verschulden.",
         beleg_referenz="Bankbeleg RLS-612b", heute=date(2026, 4, 11), akteur="codex-test",
@@ -1667,7 +1670,8 @@ def test_mit_bankentgelt_teilrueckgabe_ohne_bankentgelt_laesst_rest_fuer_spaeter
 
     kapital_op, kosten_zeile = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
         ctx=ctx, transaktion=rueck_teil, original_op_position=zahlung_op, konto=konto,
-        ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Teilrückbuchung lt. Bank",
+        ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=0,
+        rueckgabeursache="Teilrückbuchung lt. Bank",
         dem_zahlungspflichtigen_zurechenbar=True, zurechenbarkeit_begruendung="Vom Mieter zu vertreten.",
         beleg_referenz="Bankbeleg RLS-TEIL", heute=date(2026, 4, 11), akteur="codex-test",
     )
@@ -1712,7 +1716,8 @@ def test_mit_bankentgelt_reiner_bankentgelt_rest_ohne_verbleibendes_kapital_wird
     with pytest.raises(ZuordnungUngueltigError):
         bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
             ctx=ctx, transaktion=rueck_gebuehr, original_op_position=zahlung_op, konto=konto,
-            ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Nachträgliche Bankgebühr",
+            ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=1250,
+            rueckgabeursache="Nachträgliche Bankgebühr",
             dem_zahlungspflichtigen_zurechenbar=True, zurechenbarkeit_begruendung="x",
             beleg_referenz="Bankbeleg RLS-GEB", heute=date(2026, 4, 12), akteur="codex-test",
         )
@@ -1758,7 +1763,8 @@ def test_mit_bankentgelt_bankkonto_kreuzung_wird_wie_bisher_abgelehnt(
     with pytest.raises(ZuordnungUngueltigError):
         bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
             ctx=ctx, transaktion=rueck_falsches_konto, original_op_position=zahlung_op, konto=konto,
-            ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Mangels Deckung",
+            ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=1250,
+            rueckgabeursache="Mangels Deckung",
             dem_zahlungspflichtigen_zurechenbar=True, zurechenbarkeit_begruendung="x",
             beleg_referenz="Bankbeleg", heute=date(2026, 4, 11), akteur="codex-test",
         )
@@ -1788,7 +1794,8 @@ def test_mit_bankentgelt_idempotent_bei_wiederholtem_identischem_aufruf(
 
     kwargs = dict(
         ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
-        ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Mangels Deckung",
+        ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=1250,
+        rueckgabeursache="Mangels Deckung",
         dem_zahlungspflichtigen_zurechenbar=True, zurechenbarkeit_begruendung="Vom Mieter zu vertreten.",
         beleg_referenz="Bankbeleg RLS-IDEMP", heute=date(2026, 4, 11), akteur="codex-test",
     )
@@ -1828,7 +1835,8 @@ def test_mit_bankentgelt_fehler_im_bankentgelt_schritt_rollt_kapitalbuchung_mit_
     with pytest.raises(ValueError):
         bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
             ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
-            ruecklastschriftkosten_service=rls_kosten_service, rueckgabeursache="Mangels Deckung",
+            ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=1250,
+            rueckgabeursache="Mangels Deckung",
             dem_zahlungspflichtigen_zurechenbar=True, zurechenbarkeit_begruendung="   ",  # leer -> ValueError
             beleg_referenz="Bankbeleg RLS-ROLLBACK", heute=date(2026, 4, 11), akteur="codex-test",
         )
@@ -1839,6 +1847,130 @@ def test_mit_bankentgelt_fehler_im_bankentgelt_schritt_rollt_kapitalbuchung_mit_
     assert saldo.saldo_cent == -600_00
     assert bank_repo.verwendeter_betrag_rueckbuchung(rueck.id) == 0
     assert bank_repo.kumulativ_zurueckgebucht(zahlung_op.id) == 0
+
+
+def test_mit_bankentgelt_originalbelegter_fall_wird_korrekt_gesplittet(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    """Codex-Rückmeldung 19.10.2026 (materieller Buchungsfehler vor dieser
+    Korrektur): das Bankentgelt darf NIE aus der Differenz "Transaktions-
+    betrag minus Kapital" abgeleitet werden, sondern muss ein explizit am
+    Originalbeleg bestätigter Wert sein. Originalbelegter Fall: Bank
+    -1.214,90 (121490 Cent), Ursprungszahlung 1.207,90 (120790 Cent),
+    Entgelt exakt 7,00 (700 Cent, belegt), Zurechenbarkeit unbekannt/false."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text=f"betrag,datum,referenz\n1207.90,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+    rueck = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-1214.90,2026-04-10,RUECKLASTSCHRIFT\n",
+        mapping=mapping,
+    )[0]
+
+    kapital_op, kosten_zeile = bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+        ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+        ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=700,
+        rueckgabeursache="Mangels Deckung lt. Bankbeleg",
+        dem_zahlungspflichtigen_zurechenbar=False,
+        zurechenbarkeit_begruendung="Zurechenbarkeit zum Zeitpunkt der Erfassung unbekannt.",
+        beleg_referenz="Bankbeleg RLS-121490", heute=date(2026, 4, 11), akteur="codex-test",
+    )
+    assert kapital_op.betrag_cent == 120_790
+    assert kosten_zeile.bankentgelt_cent == 700
+    assert kosten_zeile.kosten_op_position_id is None  # Zurechenbarkeit unbekannt/false -> keine Forderung
+    assert bank_repo.list_unzugeordnet(bank_konto.id) == []  # vollständige Bankzuordnung
+
+
+def test_mit_bankentgelt_sammel_differenzfall_ohne_entgeltbeleg_wird_abgelehnt(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    """Derselbe Fall wie oben (Bank -1.214,90, Ursprungszahlung 1.207,90),
+    aber OHNE belegtes Entgelt (`bankentgelt_cent=0`): die Differenz
+    (700 Cent) darf NICHT automatisch als Kapital durchgewunken werden
+    (das wäre bei einer Sammelrückgabe oder falsch gewählten
+    Ursprungszahlung ein beliebiger Rechenrest) - der zugeordnete Betrag
+    (voller Transaktionsbetrag, mangels Angabe) überschreitet dadurch die
+    Rückbuchungsgrenze der Ursprungszahlung und wird kontrolliert
+    abgelehnt, statt als Aufwand zu verschwinden."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text=f"betrag,datum,referenz\n1207.90,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+    rueck = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-1214.90,2026-04-10,SAMMELRUECKGABE\n",
+        mapping=mapping,
+    )[0]
+
+    with pytest.raises(ZuordnungUngueltigError):
+        bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+            ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+            ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=0,
+            rueckgabeursache="Ursache unklar - kein Entgelt belegt",
+            dem_zahlungspflichtigen_zurechenbar=False, zurechenbarkeit_begruendung="Unklar.",
+            beleg_referenz="Bankbeleg RLS-SAMMEL", heute=date(2026, 4, 11), akteur="codex-test",
+        )
+    # Nichts wurde gebucht - der gesamte Transaktionsbetrag bleibt offen/unzugeordnet.
+    assert bank_repo.verwendeter_betrag_rueckbuchung(rueck.id) == 0
+    assert bank_repo.kumulativ_zurueckgebucht(zahlung_op.id) == 0
+
+
+def test_mit_bankentgelt_retry_mit_abweichendem_entgelt_wird_abgelehnt(
+    bank_service, bank_repo, basis_vertrag, ctx_factory, rls_kosten_service,
+):
+    """Codex-Rückmeldung 19.10.2026: ein Retry MUSS einen abweichenden
+    Entgeltwert ablehnen, statt ihn still zu übernehmen oder die alte
+    Erfassung stillschweigend zurückzugeben."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    bank_repo.upsert_bank_konto(id="BK-7DI-1", gesellschaft_id="7DI", iban="AT000000000000000000", bezeichnung="7DI")
+    bank_konto = bank_repo.get_bank_konto("BK-7DI-1")
+    mapping = CsvSpaltenMapping(betrag="betrag", buchungsdatum="datum", referenz="referenz")
+
+    zahlung = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text=f"betrag,datum,referenz\n600.00,2026-04-06,VERTRAG:{vertrag.id}\n",
+        mapping=mapping,
+    )[0]
+    ergebnis = bank_service.automatisch_zuordnen(ctx=ctx, transaktion=zahlung)
+    zahlung_op = bank_service._op_service._op_repository.get(ergebnis.op_position_id)
+    rueck = bank_service.importiere_csv(
+        ctx=ctx, bank_konto=bank_konto, text="betrag,datum,referenz\n-612.50,2026-04-10,RUECKLASTSCHRIFT\n",
+        mapping=mapping,
+    )[0]
+
+    bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+        ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+        ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=1250,
+        rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=True,
+        zurechenbarkeit_begruendung="Vom Mieter zu vertreten.",
+        beleg_referenz="Bankbeleg RLS-RETRY", heute=date(2026, 4, 11), akteur="codex-test",
+    )
+    with pytest.raises(VorgangIdKonfliktError):
+        bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
+            ctx=ctx, transaktion=rueck, original_op_position=zahlung_op, konto=konto,
+            ruecklastschriftkosten_service=rls_kosten_service, bankentgelt_cent=1000,  # abweichend
+            rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=True,
+            zurechenbarkeit_begruendung="Vom Mieter zu vertreten.",
+            beleg_referenz="Bankbeleg RLS-RETRY", heute=date(2026, 4, 11), akteur="codex-test",
+        )
 
 
 def test_vorgang_id_unterscheidet_retry_von_unabhaengiger_teilzuordnung(bank_service, bank_repo, basis_vertrag, ctx_factory):

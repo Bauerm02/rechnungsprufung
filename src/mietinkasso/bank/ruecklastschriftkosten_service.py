@@ -133,18 +133,6 @@ class RuecklastschriftkostenService:
         self._op_service = op_service
         self._repository = repository or RuecklastschriftkostenRepository(session_factory)
 
-    def vorhandene_erfassung(
-        self, ruecklastschrift_op_position_id: int, *, session: Session | None = None,
-    ) -> RuecklastschriftkostenTable | None:
-        """Öffentlicher Lesezugriff auf eine ggf. bereits bestehende
-        Erfassung - für Aufrufer (z. B. `bank/service.py::verarbeite_
-        ruecklastschrift_mit_bankentgelt`), die VOR einer eigenen
-        Split-/Verfügbarkeitsberechnung wissen müssen, ob (und mit
-        welchem Bankentgelt) diese Rücklastschrift-OP bereits erfasst
-        wurde, ohne dafür das `_repository`-Attribut anzufassen."""
-
-        return self._repository.fuer_ruecklastschrift(ruecklastschrift_op_position_id, session=session)
-
     def erfasse_und_buche(
         self,
         *,

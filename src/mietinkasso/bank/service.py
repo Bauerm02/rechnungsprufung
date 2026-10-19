@@ -1167,12 +1167,14 @@ class BankImportService:
         original_op_position: OPPositionTable,
         konto: KontoTable,
         ruecklastschriftkosten_service,
+        bankentgelt_cent: int,
         rueckgabeursache: str,
         dem_zahlungspflichtigen_zurechenbar: bool,
         zurechenbarkeit_begruendung: str,
         beleg_referenz: str,
         heute: date,
         akteur: str,
+        zuordnungsbetrag_cent: int | None = None,
     ) -> tuple[OPPositionTable | None, object | None]:
         """Ordnet EINE vorhandene native negative Banktransaktion atomar
         einer bereits bankgebundenen ZAHLUNG zu (Auftrag
@@ -1185,14 +1187,31 @@ class BankImportService:
         (`RuecklastschriftkostenService.erfasse_und_buche`) laufen dazu
         in EINER gemeinsamen gesperrten DB-Transaktion.
 
-        Split (NIE eine 1:1-Gesamtbelastung des Transaktionsbetrags als
-        Mietkapital): `kapital_cent` ist auf die Rückbuchungsgrenze der
-        Ursprungszahlung UND den verfügbaren Belastungsbetrag dieser
-        Transaktion begrenzt - der nach dieser Kapitalrestaurierung noch
-        verbleibende Rest der Transaktion (sofern > 0) ist das belegte
-        Bankentgelt, das NUR über `erfasse_und_buche` (eigene Pflicht-
-        felder: Rückgabeursache, Zurechenbarkeit+Begründung, Beleg)
-        weiterverrechnet wird - NIE automatisch, NIE als neue SOLL ohne
+        `bankentgelt_cent` (Codex-Rückmeldung 19.10.2026, materieller
+        Buchungsfehler vor dieser Korrektur): VERPFLICHTEND und
+        AUSSCHLIESSLICH der am Originalbeleg bestätigte, tatsächliche
+        Bankentgelt-Betrag (0, wenn kein Entgelt angefallen ist) - wird
+        NIE aus der Differenz "Transaktionsbetrag minus Kapital"
+        abgeleitet. Eine solche Differenz wäre bei einer Sammelrückgabe
+        (eine Transaktion deckt mehrere Ursprungszahlungen ab) oder einer
+        falsch gewählten Ursprungszahlung ein beliebiger Rechenrest, kein
+        belegtes Entgelt - genau wie `RuecklastschriftkostenService.
+        erfasse_und_buche` selbst nie einen geschätzten/pauschalen Betrag
+        akzeptiert. `zuordnungsbetrag_cent` ist der bestätigte, dieser
+        EINEN Ursprungszahlung zugeordnete Anteil des Transaktionsbetrags
+        - ohne Angabe (Normalfall: vollständige Einzelrückgabe, keine
+        Sammelrückgabe) der gesamte noch verfügbare Transaktionsbetrag.
+        `kapital_cent = zuordnungsbetrag_cent - bankentgelt_cent`, bleibt
+        unverändert auf die Rückbuchungsgrenze der Ursprungszahlung UND
+        den verfügbaren Belastungsbetrag der Transaktion begrenzt (geprüft
+        innerhalb von `verarbeite_ruecklastschrift`) - ein mehrdeutiger
+        Sammel-/Differenzrest OHNE explizit bestätigtes Entgelt führt
+        dadurch zu einem kontrollierten Fehler (Kapitalanteil überschreitet
+        die Rückbuchungsgrenze), statt als "Aufwand" zu verschwinden.
+
+        Das Bankentgelt wird NUR über `erfasse_und_buche` (eigene
+        Pflichtfelder: Rückgabeursache, Zurechenbarkeit+Begründung,
+        Beleg) weiterverrechnet - NIE automatisch, NIE als neue SOLL ohne
         belegte Zurechenbarkeit, NIE als zweite Rückbuchung/Kapital-
         buchung. `ruecklastschriftkosten_service` wird als Parameter
         übergeben (nicht als Konstruktor-Abhängigkeit), um den
@@ -1201,24 +1220,26 @@ class BankImportService:
 
         Gibt `(kapital_op, kosten_zeile)` zurück - `kapital_op` ist
         `None`, wenn kein Kapitalanteil mehr zu restaurieren war (siehe
-        unten), `kosten_zeile` ist `None`, wenn kein Bankentgelt-Anteil
-        verblieb (reine Kapitalrückbuchung ohne Bankentgelt).
+        unten), `kosten_zeile` ist `None`, wenn `bankentgelt_cent == 0`.
 
         Idempotenz: ein wiederholter Aufruf für DASSELBE Transaktion+
         Ursprungszahlung-Paar erkennt die bereits vorhandene
         Kapitalbuchung (über deren deterministische `import_id`) VOR
         jeder Split-/Verfügbarkeitsberechnung und übernimmt deren DAMALS
-        entschiedenen Split unverändert - eine Neuberechnung würde den
-        inzwischen durch die eigene vorherige Buchung "verbrauchten"
-        Betrag sonst fälschlich als nicht mehr verfügbar werten und einen
-        echten Retry mit identischen Werten ablehnen. Ob der Retry
-        tatsächlich identisch ist (statt ein echter, abweichender
-        Konflikt), entscheiden weiterhin ausschließlich `verarbeite_
-        ruecklastschrift`/`erfasse_und_buche` selbst."""
+        entschiedenen Kapitalbetrag unverändert (eine Neuberechnung würde
+        den inzwischen durch die eigene vorherige Buchung "verbrauchten"
+        Betrag sonst fälschlich als nicht mehr verfügbar werten); das
+        DIESMAL übergebene `bankentgelt_cent` wird dabei unverändert an
+        `erfasse_und_buche` weitergereicht - DESSEN Konfliktprüfung lehnt
+        einen davon abweichenden Wert gegenüber der bereits gespeicherten
+        Erfassung ab, ein identischer Wert bleibt ein echter Retry/No-Op."""
 
         transaktion_id = transaktion.id
         original_op_position_id = original_op_position.id
         konto_id = konto.id
+
+        if bankentgelt_cent < 0:
+            raise ValueError("Bankentgelt muss belegt angegeben werden (0, wenn kein Bankentgelt angefallen ist).")
 
         with schreibgesperrte_session(self._session_factory) as session:
             kapital_op: OPPositionTable | None = None
@@ -1252,13 +1273,15 @@ class BankImportService:
                 # Idempotenz-Kurzschluss (VOR jeder Split-/Verfügbarkeits-
                 # berechnung): wurde GENAU dieses Transaktion+Ursprungs-
                 # zahlung-Paar bereits einmal orchestriert verarbeitet,
-                # gilt der DAMALS entschiedene Split unverändert weiter -
-                # eine Neuberechnung würde den inzwischen (durch die
-                # eigene vorherige Buchung) "verbrauchten" Betrag fälschlich
-                # als nicht mehr verfügbar sehen und einen echten Retry
-                # mit identischen Werten failen lassen. `verarbeite_
-                # ruecklastschrift`/`erfasse_und_buche` bleiben trotzdem
-                # die alleinige Quelle für "identisch vs. abweichend".
+                # gilt der DAMALS entschiedene Kapitalbetrag unverändert
+                # weiter - eine Neuberechnung würde den inzwischen (durch
+                # die eigene vorherige Buchung) "verbrauchten" Betrag
+                # fälschlich als nicht mehr verfügbar sehen und einen
+                # echten Retry mit identischen Werten failen lassen.
+                # `verarbeite_ruecklastschrift`/`erfasse_und_buche` bleiben
+                # trotzdem die alleinige Quelle für "identisch vs.
+                # abweichend" (inkl. eines diesmal abweichenden
+                # `bankentgelt_cent`).
                 import_id = f"RUECKLASTSCHRIFT-{transaktion_id}-{original_op_position_id}"
                 bereits_verarbeiteter_kapital_op = session.execute(
                     select(OPPositionTable).where(OPPositionTable.import_id == import_id)
@@ -1266,17 +1289,14 @@ class BankImportService:
 
                 if bereits_verarbeiteter_kapital_op is not None:
                     kapital_cent = bereits_verarbeiteter_kapital_op.betrag_cent
-                    vorhandene_kosten = ruecklastschriftkosten_service.vorhandene_erfassung(
-                        bereits_verarbeiteter_kapital_op.id, session=session,
-                    )
-                    bankentgelt_cent = vorhandene_kosten.bankentgelt_cent if vorhandene_kosten is not None else 0
                 else:
-                    # Split VOR der eigentlichen Buchung bestimmen - dafür
-                    # genügen dieselben beiden Grenzen, die `verarbeite_
-                    # ruecklastschrift` ohnehin (erneut) prüft: die
-                    # kumulative Rückbuchungsgrenze der Ursprungszahlung
-                    # und der verfügbare Belastungsbetrag DIESER
-                    # Transaktion.
+                    # Split VOR der eigentlichen Buchung bestimmen - der
+                    # ZUGEORDNETE Betrag ist entweder explizit bestätigt
+                    # (Sammel-/Teilfall) oder (Normalfall: vollständige
+                    # Einzelrückgabe) der gesamte noch verfügbare
+                    # Transaktionsbetrag; das Bankentgelt ist IMMER das
+                    # vom Aufrufer belegte `bankentgelt_cent`, NIE eine
+                    # Differenz.
                     ursprungsbetrag = abs(frisches_original_op.betrag_cent)
                     bereits_zurueckgebucht = self._repository.kumulativ_zurueckgebucht(
                         original_op_position_id, session=session
@@ -1291,8 +1311,29 @@ class BankImportService:
                             f"Transaktion {transaktion_id} ist bereits vollständig verarbeitet/verwendet "
                             f"({bereits_verwendet} von {abs(frische_transaktion.betrag_cent)})."
                         )
-                    kapital_cent = min(verbleibende_ruecklastgrenze, verfuegbar_auf_transaktion)
-                    bankentgelt_cent = verfuegbar_auf_transaktion - kapital_cent
+
+                    effektiver_zuordnungsbetrag = (
+                        zuordnungsbetrag_cent if zuordnungsbetrag_cent is not None else verfuegbar_auf_transaktion
+                    )
+                    if effektiver_zuordnungsbetrag <= 0:
+                        raise ValueError("Zugeordneter Betrag muss positiv sein.")
+                    if effektiver_zuordnungsbetrag > verfuegbar_auf_transaktion:
+                        raise ZuordnungUngueltigError(
+                            f"Zugeordneter Betrag {effektiver_zuordnungsbetrag} überschreitet den verfügbaren "
+                            f"Belastungsbetrag der Transaktion {transaktion_id} ({verfuegbar_auf_transaktion})."
+                        )
+                    if bankentgelt_cent > effektiver_zuordnungsbetrag:
+                        raise ValueError(
+                            f"Bankentgelt {bankentgelt_cent} darf den zugeordneten Betrag "
+                            f"{effektiver_zuordnungsbetrag} nicht übersteigen."
+                        )
+                    kapital_cent = effektiver_zuordnungsbetrag - bankentgelt_cent
+                    # Keine stille Kappung auf `verbleibende_ruecklastgrenze`:
+                    # ein zu hoher Kapitalanteil (z. B. weil der Rest einer
+                    # Sammelrückgabe fälschlich dieser Ursprungszahlung
+                    # zugeordnet wurde) MUSS unten in `verarbeite_
+                    # ruecklastschrift` als Fehler auffallen, nicht
+                    # stillschweigend gekappt werden.
 
                 if kapital_cent > 0:
                     kapital_op = self.verarbeite_ruecklastschrift(

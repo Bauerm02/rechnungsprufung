@@ -668,15 +668,18 @@ def bank_ruecklastschrift_formular(request: Request, transaktion_id: int, sessio
       <p class="muted">Ordnet diese native, negative Banktransaktion EINER bereits bankgebundenen
          ZAHLUNG zu. Enthält der Betrag MEHR als die Ursprungszahlung (z. B. zusätzliches
          Bankentgelt), wird das Originalkapital restauriert und der Rest getrennt als
-         Bankentgelt dokumentiert - in EINER Buchung, keine 1:1-Gesamtbelastung als Mietkapital.
-         Das Bankentgelt wird NIE geschätzt, sondern ist genau der nach der Kapitalrestaurierung
-         verbleibende, tatsächliche Rest dieser Transaktion.</p>
+         Bankentgelt dokumentiert - in EINER Buchung, keine 1:1-Gesamtbelastung als Mietkapital.</p>
       <form method="post" action="/backoffice/bank/{transaktion_id}/ruecklastschrift">
         {csrf_feld(session.csrf_token)}
         <label>Bestehende ZAHLUNG-OP-ID (aus dem Kontoauszug, Spalte &quot;#&quot;)</label>
         <input type="number" name="op_position_id" required>
         <label>Konto-ID (zur Bestätigung/Mandantenprüfung)</label>
         <input type="text" name="konto_id" required>
+        <label>Tatsächliches Bankentgelt in EUR (Pflicht - NUR der echte, am Bankbeleg bestätigte
+               Betrag, 0,00 wenn kein Entgelt angefallen ist; NIE geschätzt oder aus der Differenz
+               hergeleitet - bei einer Sammelrückgabe/mehreren Ursprungszahlungen in dieser
+               Transaktion bleibt ein nicht belegter Rest bewusst offen/unzugeordnet)</label>
+        <input type="text" name="bankentgelt_cent" required placeholder="z. B. 0,00 oder 12,50">
         <label>Rückgabeursache (Pflicht, laut Bankbeleg)</label>
         <input type="text" name="rueckgabeursache" required placeholder="z. B. Mangels Deckung" value="{h(transaktion.referenz or '')}">
         <label><input type="checkbox" name="dem_zahlungspflichtigen_zurechenbar" value="1">
@@ -698,6 +701,7 @@ def bank_ruecklastschrift_absenden(
     transaktion_id: int,
     op_position_id: int = Form(...),
     konto_id: str = Form(...),
+    bankentgelt_cent: str = Form(...),
     rueckgabeursache: str = Form(...),
     dem_zahlungspflichtigen_zurechenbar: str = Form(""),
     zurechenbarkeit_begruendung: str = Form(...),
@@ -719,9 +723,11 @@ def bank_ruecklastschrift_absenden(
             f"/backoffice/bank/{transaktion_id}/ruecklastschrift",
         )
     try:
+        bankentgelt_cent_wert = parse_eur_betrag(bankentgelt_cent)
         kapital_op, kosten_zeile = deps._bank_service.verarbeite_ruecklastschrift_mit_bankentgelt(
             ctx=_ctx(session), transaktion=transaktion, original_op_position=original_op_position, konto=konto,
             ruecklastschriftkosten_service=deps._ruecklastschriftkosten_service,
+            bankentgelt_cent=bankentgelt_cent_wert,
             rueckgabeursache=rueckgabeursache,
             dem_zahlungspflichtigen_zurechenbar=(dem_zahlungspflichtigen_zurechenbar == "1"),
             zurechenbarkeit_begruendung=zurechenbarkeit_begruendung, beleg_referenz=beleg_referenz,

@@ -4864,11 +4864,19 @@ Transaktion - KEIN `session.expunge` mehr auf dem Retry-Pfad, da das den
 anschließenden `session.refresh` des Transaktionsinhabers gebrochen
 hätte).
 
-- **Split, nie 1:1-Gesamtbelastung:** `kapital_cent = min(verbleibende
-  Rückbuchungsgrenze der Ursprungszahlung, verfügbarer Belastungsbetrag
-  der Transaktion)`; ein verbleibender Rest (> 0) ist das belegte
-  Bankentgelt - der reale Banktransaktionsbetrag selbst ist der Beleg,
-  kein geschätzter/pauschaler Wert.
+- **Split, nie 1:1-Gesamtbelastung, Bankentgelt NIE aus der Differenz
+  abgeleitet:** `bankentgelt_cent` ist ein VERPFLICHTENDER, am
+  Originalbeleg bestätigter Parameter (0, wenn kein Entgelt angefallen
+  ist) - Portal-Pflichtfeld, niemals aus "Transaktionsbetrag minus
+  Kapital" hergeleitet (siehe unabhängiges Review unten, Commit
+  7610271). `zuordnungsbetrag_cent` (optional, Default: gesamter
+  verfügbarer Transaktionsbetrag) ist der dieser EINEN Ursprungszahlung
+  bestätigte Anteil; `kapital_cent = zuordnungsbetrag_cent -
+  bankentgelt_cent`, bleibt unverändert durch die Rückbuchungsgrenze der
+  Ursprungszahlung UND den verfügbaren Belastungsbetrag der Transaktion
+  begrenzt (geprüft in `verarbeite_ruecklastschrift`) - ein mehrdeutiger
+  Sammel-/Differenzrest OHNE bestätigtes Entgelt führt dadurch zu einem
+  kontrollierten Fehler, statt als Aufwand zu verschwinden.
 - **Vollständige Bankzuordnung:** `RuecklastschriftkostenTable` hat eine
   neue additive Spalte `bank_transaktion_id` (lose Referenz, kein FK,
   wie `ruecklastschrift_op_position_id`); `BankRepository.verwendeter_
@@ -4886,27 +4894,47 @@ hätte).
 - **Idempotenz:** ein wiederholter Aufruf für dasselbe Transaktion+
   Ursprungszahlung-Paar erkennt die bereits vorhandene Kapitalbuchung
   (deterministische `import_id`) VOR jeder Split-Neuberechnung und
-  übernimmt deren damals entschiedenen Split unverändert - sonst hätte
-  die inzwischen "verbrauchte" Verfügbarkeit einen echten Retry
-  fälschlich abgelehnt.
+  übernimmt deren damals entschiedenen Kapitalbetrag unverändert - sonst
+  hätte die inzwischen "verbrauchte" Verfügbarkeit einen echten Retry
+  fälschlich abgelehnt; ein diesmal ABWEICHENDES `bankentgelt_cent` wird
+  trotzdem abgelehnt (Konfliktprüfung in `erfasse_und_buche`).
 - **Portalformular:** `GET/POST /backoffice/bank/{transaktion_id}/
   ruecklastschrift` (`routes/bank.py`) - einfaches Formular analog zu
-  `/verknuepfen` (manuelle OP-ID/Konto-ID-Eingabe, kein Bankentgelt-Feld,
-  da der reale Transaktionsbetrag selbst der Beleg ist), verlinkt aus der
+  `/verknuepfen` (manuelle OP-ID/Konto-ID-Eingabe) PLUS eigenes
+  Pflichtfeld "Tatsächliches Bankentgelt in EUR", verlinkt aus der
   Rücklastschriften/Klärfälle-Tabelle in `/backoffice/bank/unzugeordnet`
   für jeden echten negativen Rest.
 
-Gezielte Tests (`test_bank.py`, 8 neue): reine Kapitalrückbuchung ohne
+**Unabhängiges Review (Commit 7610271), noch vor Abnahme behoben (Commit
+folgt diesem Eintrag):** materieller Buchungsfehler - die erste Fassung
+leitete `bankentgelt_cent` als Differenz "verfügbarer Transaktionsbetrag
+minus Kapital" ab. Bei einer Sammelrückgabe (eine Transaktion deckt
+mehrere Ursprungszahlungen ab) oder einer falsch gewählten
+Ursprungszahlung wäre diese Differenz ein beliebiger Rechenrest gewesen,
+kein belegtes Entgelt - und wäre trotzdem als Forderung gebucht worden.
+Originalbelegter Testfall (Bank -1.214,90/121490 Cent, Ursprungszahlung
+1.207,90/120790 Cent, Entgelt exakt 7,00/700 Cent, Zurechenbarkeit
+unbekannt/false) bestätigt die KORREKTE Zahlenlage; der eigentliche
+Fehler lag darin, dass das Entgelt NIE explizit bestätigt werden musste.
+Behoben wie oben beschrieben (`bankentgelt_cent` verpflichtend,
+`zuordnungsbetrag_cent` optional) - 3 neue gezielte Tests: originalbelegter
+Fall wird korrekt gesplittet, Sammel-/Differenzfall OHNE Entgeltbeleg wird
+abgelehnt (die 700 Cent "verschwinden" NICHT als Aufwand, sondern bleiben
+unzugeordnet), Retry mit abweichendem Entgeltwert wird abgelehnt.
+
+Gezielte Tests (`test_bank.py`, 11 neue): reine Kapitalrückbuchung ohne
 Bankentgelt, Kapital+Bankentgelt in einer Transaktion, ohne
 Zurechenbarkeit rein dokumentarisch, Teilrückgabe (Rest bleibt für
 später offen), reiner Bankentgelt-Rest ohne verbleibendes Kapital wird
 abgelehnt, Bankkonto-Kreuzung wird wie bisher abgelehnt, idempotenter
 Wiederholungsaufruf, Rollback bei fehlgeschlagenem Bankentgelt-Schritt
-(Kapitalbuchung läuft NICHT unkontrolliert weiter). Dazu 2 neue
-Backoffice-HTTP-Tests (Formular+Absenden End-to-End, CSRF-Schutz) und
-ein additiver Migrationstest für `bank_transaktion_id`. HTTP-
-Vertragstest (`backoffice_http_contract.json`) um die zwei neuen Routen
-erweitert (rein additiv, alle bestehenden Routen/Status unverändert).
+(Kapitalbuchung läuft NICHT unkontrolliert weiter), originalbelegter
+Fall, Sammel-/Differenzfall ohne Entgeltbeleg, Retry mit abweichendem
+Entgelt. Dazu 2 neue Backoffice-HTTP-Tests (Formular+Absenden
+End-to-End, CSRF-Schutz) und ein additiver Migrationstest für
+`bank_transaktion_id`. HTTP-Vertragstest (`backoffice_http_contract.json`)
+um die zwei neuen Routen erweitert (rein additiv, alle bestehenden
+Routen/Status unverändert).
 
 **Unabhängiges Review (Commit f68b1ae) zur davor committeten
 Bankentgelt-Zweischritt-Methode `uebernimm_zurechenbarkeit_

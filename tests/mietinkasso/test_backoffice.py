@@ -1516,7 +1516,7 @@ def test_bank_ruecklastschrift_formular_und_absenden_bucht_kapital_und_bankentge
     abgesendet = client.post(
         f"/backoffice/bank/{transaktion_id}/ruecklastschrift",
         data={
-            "op_position_id": str(zahlung.id), "konto_id": konto.id,
+            "op_position_id": str(zahlung.id), "konto_id": konto.id, "bankentgelt_cent": "12,50",
             "rueckgabeursache": "Mangels Deckung", "dem_zahlungspflichtigen_zurechenbar": "1",
             "zurechenbarkeit_begruendung": "Dauerhaft fehlende Kontodeckung, vom Mieter zu vertreten.",
             "beleg_referenz": "Bankbeleg RLS-BANK-1", "csrf_token": csrf,
@@ -1545,7 +1545,8 @@ def test_bank_ruecklastschrift_absenden_ohne_csrf_wird_abgelehnt(backoffice_clie
     antwort = client.post(
         f"/backoffice/bank/{transaktion_id}/ruecklastschrift",
         data={
-            "op_position_id": "1", "konto_id": "KTO-IRGENDWAS", "rueckgabeursache": "x",
+            "op_position_id": "1", "konto_id": "KTO-IRGENDWAS", "bankentgelt_cent": "0,00",
+            "rueckgabeursache": "x",
             "dem_zahlungspflichtigen_zurechenbar": "", "zurechenbarkeit_begruendung": "x",
             "beleg_referenz": "x", "csrf_token": "voellig-falsch",
         },
