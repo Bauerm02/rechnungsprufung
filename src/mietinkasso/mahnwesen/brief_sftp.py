@@ -427,10 +427,19 @@ class _ParamikoVerbindung:
             if self._sftp is not None:
                 self._sftp.close()
         finally:
-            if self._transport is not None:
-                self._transport.close()
-            elif self._sock is not None:
-                self._sock.close()
+            try:
+                if self._transport is not None:
+                    self._transport.close()
+            finally:
+                # Codex-Abnahme 19.10.2026, vierte Korrektur: `sock.close()`
+                # muss UNABHÄNGIG davon laufen, ob `transport.close()`
+                # scheitert - das bisherige `elif` ließ den rohen Socket
+                # offen, wenn ein Transport existierte UND dessen `close()`
+                # eine Exception warf. `socket.close()` ist idempotent, ein
+                # bereits (erfolgreich) vom Transport geschlossener Socket
+                # wird dadurch nicht erneut fehlerhaft.
+                if self._sock is not None:
+                    self._sock.close()
 
 
 def _echte_verbindung(konfiguration: SftpKonfiguration) -> _SftpVerbindung:

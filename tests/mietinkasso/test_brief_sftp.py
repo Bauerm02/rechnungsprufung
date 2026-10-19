@@ -418,12 +418,57 @@ def test_paramiko_verbindung_schliesst_transport_bei_fehlschlagendem_start_clien
             raise RuntimeError("Fake-Kanalverhandlung fehlgeschlagen (Test).")
 
     fake_transport = _FehlschlagenderTransport()
-    monkeypatch.setattr(brief_sftp_modul.socket, "create_connection", lambda adresse, timeout: object())
+    # Ein ECHTER Socket hat immer ein `close()` - `object()` allein (wie
+    # zuvor hier verwendet) verdeckte bis zur vierten Korrektur, dass
+    # `close()` den rohen Socket bei vorhandenem Transport gar nicht
+    # erst anfasste (siehe `test_close_schliesst_socket_auch_wenn_
+    # transport_close_scheitert` unten).
+    monkeypatch.setattr(brief_sftp_modul.socket, "create_connection", lambda adresse, timeout: _FakeSock())
     monkeypatch.setattr(paramiko, "Transport", lambda sock: fake_transport)
 
     with pytest.raises(RuntimeError):
         _ParamikoVerbindung(_konfiguration())
     assert fake_transport.geschlossen
+
+
+class _FakeSock:
+    """Minimaler Fake-Socket - nur `close()` mit Aufrufzählung, kein
+    echter Netzwerkzugriff."""
+
+    def __init__(self):
+        self.geschlossen = False
+
+    def close(self) -> None:
+        self.geschlossen = True
+
+
+def test_close_schliesst_socket_auch_wenn_transport_close_scheitert(monkeypatch):
+    """Codex-Abnahme 19.10.2026, vierte Korrektur: `close()` prüfte den
+    rohen Socket bisher nur im `elif`-Zweig (`if transport: transport.
+    close() elif sock: sock.close()`) - scheiterte `transport.close()`
+    mit einer Exception, blieb der zugrunde liegende Socket offen, da der
+    `elif`-Zweig dann gar nicht erst erreicht wurde. `sock.close()` muss
+    UNABHÄNGIG vom Erfolg des Transport-Closes laufen. Kein echter
+    Netzwerkzugriff (Socket-Connect/`paramiko.Transport` gefakt)."""
+
+    import paramiko
+
+    from mietinkasso.mahnwesen import brief_sftp as brief_sftp_modul
+
+    class _TransportMitFehlschlagendemClose(_FakeTransport):
+        def close(self) -> None:
+            raise RuntimeError("Fake-Transport-Close fehlgeschlagen (Test).")
+
+    fake_sock = _FakeSock()
+    fake_transport = _TransportMitFehlschlagendemClose()
+    fake_transport.start_client = lambda timeout: None
+    monkeypatch.setattr(brief_sftp_modul.socket, "create_connection", lambda adresse, timeout: fake_sock)
+    monkeypatch.setattr(paramiko, "Transport", lambda sock: fake_transport)
+
+    verbindung = _ParamikoVerbindung(_konfiguration())
+    with pytest.raises(RuntimeError):
+        verbindung.close()
+    assert fake_sock.geschlossen
 
 
 class _HaengenderTransport(_FakeTransport):
