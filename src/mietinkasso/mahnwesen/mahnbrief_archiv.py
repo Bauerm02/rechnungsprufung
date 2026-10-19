@@ -12,32 +12,37 @@ Absender-/Settings-/Stammdaten - das bleibt `brief_pdf.py`/den
 jeweiligen Aufrufern vorbehalten).
 
 `archivieren` bindet PDF-Inhalt UND Empfänger dauerhaft an den
-eingefrorenen Mahnlauf (`vertrag_id`+`stufe`+`mahnlauf_schluessel`):
-ein echter Retry mit IDENTISCHEM PDF-Hash und IDENTISCHEM Empfänger
-bleibt ein sicherer No-Op (liefert die bestehende Zeile zurück), ein
-Versuch mit ABWEICHENDEM PDF-Inhalt ODER Empfänger ist dagegen ein
-Konflikt (`VorgangIdKonfliktError`) - NIE ein stiller Erfolg mit dem
-ALTEN Inhalt (Codex-Rückmeldung 19.10.2026, vorher wurde ein
-abweichender Wiederholungsversuch stillschweigend mit der ersten Zeile
-beantwortet). Der Forderungssnapshot selbst ist bereits über
-`MahnLaufTable.mahnkosten_snapshot_json` durabel eingefroren (siehe
-`mahnwesen/service.py::versende_mahnlauf`) - kein zweiter, redundanter
-Hash dafür hier.
+eingefrorenen Mahnlauf (`vertrag_id`+`stufe`+`mahnlauf_schluessel`) UND
+reserviert dabei (Codex-Abnahme 19.10.2026) einen PERMANENTEN, opaken
+`sende_schluessel` (UUID) - VOR jedem Netzkontakt, nicht erst beim
+tatsächlichen Versand: ein echter Retry mit IDENTISCHEM PDF-Hash und
+IDENTISCHEM Empfänger bleibt ein sicherer No-Op (liefert dieselbe Zeile
+samt demselben `sende_schluessel` zurück), ein Versuch mit ABWEICHENDEM
+PDF-Inhalt ODER Empfänger ist dagegen ein Konflikt
+(`VorgangIdKonfliktError`) - NIE ein stiller Erfolg mit dem ALTEN Inhalt.
+Der Forderungssnapshot selbst ist bereits über `MahnLaufTable.
+mahnkosten_snapshot_json` durabel eingefroren (siehe `mahnwesen/
+service.py::versende_mahnlauf`) - kein zweiter, redundanter Hash dafür
+hier.
 
 `status` bildet NUR den einen maschinell ehrlich erreichbaren Zustand
 ab (`VORBEREITET` -> `UEBERMITTELT` = erfolgreich an den Post-SFTP-
 Server übertragen, siehe `brief_sftp.py`) - es gibt KEINE maschinelle
 Status-API für Postaufgabe/Zustellung. `importiere_anbieterbeleg`
 erfasst separat den MENSCHLICH/prozessual aus der Post-Portal-
-Auftragsliste entnommenen, tatsächlichen Anbieterbeleg - Kosten-/
-Mahnstatusfolgen (Codex, außerhalb dieses Repos) dürfen sich
-AUSSCHLIESSLICH auf dieses Feld stützen, NIE auf den bloßen
-UEBERMITTELT-Uploadstatus."""
+Auftragsliste entnommenen, tatsächlichen Anbieterbeleg - ein bloßer
+Referenztext ist dabei KEIN Beleg, es wird IMMER das tatsächlich
+hochgeladene Belegdokument (PDF-Bytes + Hash) verlangt. Kosten-/
+Mahnstatusfolgen (siehe `indexautomatik/mailversand_service.py::
+HVMailversandService.vervollstaendige_mahnlauf_aus_anbieterbeleg`)
+dürfen sich AUSSCHLIESSLICH auf dieses Feld stützen, NIE auf den
+bloßen UEBERMITTELT-Uploadstatus."""
 
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+import uuid
+from datetime import date, datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -70,6 +75,20 @@ class MahnbriefArchivRepository:
     def __init__(self, session_factory):
         self._session_factory = session_factory
 
+    def get(self, archiv_id: int, *, session: Session | None = None) -> MahnbriefArchivTable | None:
+        if session is not None:
+            return session.get(MahnbriefArchivTable, archiv_id)
+        with self._session_factory() as owned_session:
+            return owned_session.get(MahnbriefArchivTable, archiv_id)
+
+    def list_fuer_vertrag(self, vertrag_id: str) -> list[MahnbriefArchivTable]:
+        with self._session_factory() as session:
+            return list(session.execute(
+                select(MahnbriefArchivTable)
+                .where(MahnbriefArchivTable.vertrag_id == vertrag_id)
+                .order_by(MahnbriefArchivTable.archiviert_am.desc())
+            ).scalars())
+
     def fuer_mahnlauf(
         self, *, vertrag_id: str, stufe: int, mahnlauf_schluessel: str, session: Session | None = None,
     ) -> MahnbriefArchivTable | None:
@@ -93,7 +112,10 @@ class MahnbriefArchivRepository:
     ) -> MahnbriefArchivTable:
         """Idempotent je (vertrag_id, stufe, mahnlauf_schluessel) - siehe
         `MahnbriefArchivTable.uq_mahnbriefarchiv_lauf`-Docstring UND
-        Moduldoc für die Konfliktprüfung gegen PDF-Inhalt/Empfänger."""
+        Moduldoc für die Konfliktprüfung gegen PDF-Inhalt/Empfänger.
+        Vergibt bei NEUER Anlage einen permanenten `sende_schluessel`
+        (UUID4-Hex) - VOR jedem Netzkontakt, eine unveränderte
+        Wiederholung behält denselben Schlüssel."""
 
         pdf_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
         empfaenger_hash = _empfaenger_hash(empfaenger_name, empfaenger_adresse)
@@ -108,7 +130,7 @@ class MahnbriefArchivRepository:
                     vertrag_id=vertrag_id, stufe=stufe, mahnlauf_schluessel=mahnlauf_schluessel,
                     pdf_bytes=pdf_bytes, pdf_sha256=pdf_sha256, empfaenger_hash=empfaenger_hash,
                     versandnachweis_referenz=versandnachweis_referenz, erstellt_von=erstellt_von,
-                    status="VORBEREITET",
+                    status="VORBEREITET", sende_schluessel=uuid.uuid4().hex,
                 )
                 session.add(row)
                 session.commit()
@@ -180,32 +202,68 @@ class MahnbriefArchivRepository:
             return ergebnis
 
     def importiere_anbieterbeleg(
-        self, *, archiv_id: int, anbieterbeleg_referenz: str, importiert_von: str, session: Session | None = None,
+        self, *, archiv_id: int, anbieterbeleg_pdf_bytes: bytes, anbieterbeleg_referenz: str,
+        postaufgabe_datum: date, importiert_von: str, session: Session | None = None,
     ) -> MahnbriefArchivTable:
         """Menschlich/prozessual erfasster NACHWEIS aus der echten
         Portal-Auftragsliste des Post-Anbieters (KEINE maschinelle
-        Status-API) - bindet sich an eine einmal importierte Referenz:
-        ein echter Retry mit identischer Referenz bleibt ein No-Op, ein
-        zweiter Import mit ABWEICHENDER Referenz ist ein Konflikt.
-        Kosten-/Mahnstatusfolgen dürfen sich NUR auf dieses Feld
-        stützen, nie auf den bloßen `status=="UEBERMITTELT"`."""
+        Status-API) - ein bloßer Referenztext ist KEIN Beleg, verlangt
+        wird IMMER das tatsächlich hochgeladene Belegdokument (PDF-
+        Bytes) samt dem TATSÄCHLICHEN Postaufgabedatum. Bindet sich an
+        eine einmal importierte Kombination: ein echter Retry mit
+        IDENTISCHEM Beleg-Hash/Referenz/Datum bleibt ein No-Op, ein
+        zweiter Import mit ABWEICHENDEM Beleg für DIESELBE Archivzeile
+        ist ein Konflikt. Eine Belegreferenz, die bereits einer ANDEREN
+        Archivzeile zugeordnet ist, wird ebenfalls als Konflikt
+        abgelehnt (fremde/mehrfach genutzte Belegreferenz) - jeder
+        tatsächliche Postaufgabebeleg gehört zu GENAU EINER Sendung."""
 
         if not anbieterbeleg_referenz or not anbieterbeleg_referenz.strip():
             raise ValueError("Ein Anbieterbeleg-Import verlangt eine explizite, nicht-leere Referenz.")
+        if not anbieterbeleg_pdf_bytes or anbieterbeleg_pdf_bytes[:5] != b"%PDF-":
+            raise ValueError("Ein Anbieterbeleg-Import verlangt das tatsächliche Belegdokument (PDF) - ein Referenztext allein ist kein Beleg.")
+        if postaufgabe_datum is None:
+            raise ValueError("Ein Anbieterbeleg-Import verlangt das tatsächliche Postaufgabedatum.")
+
+        beleg_sha256 = hashlib.sha256(anbieterbeleg_pdf_bytes).hexdigest()
 
         def _importieren(active_session: Session) -> MahnbriefArchivTable:
             row = active_session.get(MahnbriefArchivTable, archiv_id, with_for_update=True)
             if row is None:
                 raise ValueError(f"Unbekannte Mahnbrief-Archivzeile {archiv_id}.")
+
+            fremde_zeile = active_session.execute(
+                select(MahnbriefArchivTable).where(
+                    MahnbriefArchivTable.anbieterbeleg_referenz == anbieterbeleg_referenz,
+                    MahnbriefArchivTable.id != archiv_id,
+                )
+            ).scalar_one_or_none()
+            if fremde_zeile is not None:
+                raise VorgangIdKonfliktError(
+                    f"Belegreferenz {anbieterbeleg_referenz!r} ist bereits Archivzeile {fremde_zeile.id} "
+                    f"zugeordnet - eine Belegreferenz gehört zu GENAU EINER Sendung, kein Mehrfachimport "
+                    f"für Zeile {archiv_id}."
+                )
+
             if row.anbieterbeleg_referenz is not None:
-                if row.anbieterbeleg_referenz != anbieterbeleg_referenz:
+                identisch = (
+                    row.anbieterbeleg_referenz == anbieterbeleg_referenz
+                    and row.anbieterbeleg_pdf_sha256 == beleg_sha256
+                    and row.anbieterbeleg_postaufgabe_datum == postaufgabe_datum
+                )
+                if not identisch:
                     raise VorgangIdKonfliktError(
                         f"Archivzeile {archiv_id} hat bereits einen Anbieterbeleg "
-                        f"({row.anbieterbeleg_referenz!r}) - abweichender Import ({anbieterbeleg_referenz!r}) "
+                        f"({row.anbieterbeleg_referenz!r}, {row.anbieterbeleg_postaufgabe_datum}) - ein "
+                        "abweichender Import (anderes Dokument, andere Referenz oder anderes Postaufgabedatum) "
                         "wird abgelehnt statt den bestehenden Nachweis stillschweigend zu ersetzen."
                     )
                 return row  # echter Retry, No-Op
+
             row.anbieterbeleg_referenz = anbieterbeleg_referenz
+            row.anbieterbeleg_pdf_bytes = anbieterbeleg_pdf_bytes
+            row.anbieterbeleg_pdf_sha256 = beleg_sha256
+            row.anbieterbeleg_postaufgabe_datum = postaufgabe_datum
             row.anbieterbeleg_importiert_von = importiert_von
             row.anbieterbeleg_importiert_am = datetime.now(timezone.utc)
             active_session.flush()

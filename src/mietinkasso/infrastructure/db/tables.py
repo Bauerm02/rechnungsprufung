@@ -2000,7 +2000,24 @@ class MahnbriefArchivTable(Base):
     status_aktualisiert_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status_beleg_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
     status_erfasst_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Codex-Abnahme 19.10.2026: permanent in der DB reservierter, opaker
+    # Sende-Schlüssel (UUID) - wird VOR jedem Netzkontakt bei `archivieren`
+    # vergeben und als SFTP-Dateiname verwendet (`brief_sftp.baue_
+    # dateiname`), NIE die bloß wiederverwendbare autoincrement-`id`
+    # selbst. Additiv/nullable (kein DB-Unique-Index über die einfache
+    # additive Spaltenmigration hinaus - Kollisionen sind bei `uuid4()`
+    # praktisch ausgeschlossen, die anwendungsseitige Prüfung reicht).
+    sende_schluessel: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Authentischer Anbieterbeleg (Codex-Abnahme 19.10.2026): NIE nur ein
+    # Referenztext - das tatsächlich hochgeladene Belegdokument (Original-
+    # PDF aus der Post-Portal-Auftragsliste) wird samt Hash und dem
+    # TATSÄCHLICHEN Postaufgabedatum gespeichert; NUR dieses Datum (nie
+    # das bloße `status_aktualisiert_am` des SFTP-Uploads) darf als
+    # Buchungsdatum für Kosten-/Mahnstatusfolgen verwendet werden.
     anbieterbeleg_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    anbieterbeleg_pdf_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    anbieterbeleg_pdf_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    anbieterbeleg_postaufgabe_datum: Mapped[date | None] = mapped_column(Date, nullable=True)
     anbieterbeleg_importiert_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     anbieterbeleg_importiert_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
 

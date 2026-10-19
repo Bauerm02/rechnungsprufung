@@ -798,8 +798,9 @@ def test_ensure_additive_columns_zieht_mahnbriefarchiv_status_spalten_nach(tmp_p
         ausgefuehrt = ensure_additive_columns(engine)
         neue_spalten = {
             "empfaenger_hash", "status", "status_aktualisiert_am", "status_beleg_referenz",
-            "status_erfasst_von", "anbieterbeleg_referenz", "anbieterbeleg_importiert_am",
-            "anbieterbeleg_importiert_von",
+            "status_erfasst_von", "sende_schluessel", "anbieterbeleg_referenz",
+            "anbieterbeleg_pdf_bytes", "anbieterbeleg_pdf_sha256", "anbieterbeleg_postaufgabe_datum",
+            "anbieterbeleg_importiert_am", "anbieterbeleg_importiert_von",
         }
         assert {s["name"] for s in sa.inspect(engine).get_columns("mahnbrief_archiv")} >= neue_spalten
         assert len(ausgefuehrt) == len(neue_spalten)

@@ -1039,6 +1039,33 @@ class MahnwesenService:
         # DESSELBEN eingefrorenen Snapshots sicher nachgeholt.
         self._mahnlauf_repository.markiere_mahnkosten_verarbeitet(mahnlauf.id)
 
+    def vervollstaendige_mahnlauf_aus_echtem_beleg(
+        self, *, ctx: AuthContext, mahnlauf_id: int, beleg, akteur: str,
+    ) -> None:
+        """Öffentlicher Einstiegspunkt für eine Vervollständigung aus
+        einem AUSSERHALB dieser Klasse bereits geprüften, authentischen
+        Beleg (Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS, Teil 3:
+        `indexautomatik/mailversand_service.py::HVMailversandService.
+        vervollstaendige_mahnlauf_aus_anbieterbeleg` nach erfolgreichem
+        `mahnbrief_archiv.py::importiere_anbieterbeleg`). Lädt den
+        Mahnlauf+seine Mitglieder frisch und delegiert an
+        `_vervollstaendige_bestaetigten_mahnlauf` - sicher wiederholbar
+        (siehe dortige Docstring): ein zweiter Aufruf für denselben,
+        bereits abgeschlossenen Mahnlauf ändert nichts, bucht nie doppelt."""
+
+        if self._mahnlauf_repository is None:
+            raise ValueError("Kein MahnLaufRepository konfiguriert.")
+        mahnlauf = self._mahnlauf_repository.get(mahnlauf_id)
+        if mahnlauf is None:
+            raise ValueError(f"Unbekannter MahnLauf {mahnlauf_id}.")
+        require_gesellschaft_access(ctx, mahnlauf.gesellschaft_id)
+        require_schreibrecht(ctx)
+        mitglieder_ids = MahnLaufRepository.mitglieder_ids(mahnlauf)
+        mitglieder = [m for m in (self._repository.get(i) for i in mitglieder_ids) if m is not None]
+        self._vervollstaendige_bestaetigten_mahnlauf(
+            mahnlauf=mahnlauf, mitglieder=mitglieder, beleg=beleg, ctx=ctx, akteur=akteur,
+        )
+
     def vervollstaendige_gesendete_mahnlaeufe(
         self, *, ctx: AuthContext, akteur: str,
     ) -> list[MahnLaufTable]:
@@ -1118,12 +1145,25 @@ class MahnwesenService:
         sie (`TransportFehlerUngewissError`/`ValueError`), bleibt der
         Mahnlauf unverändert UNSICHER - kein Fehler, nur noch nicht
         geklärt. Ein Vertrag, auf den `ctx` keinen Zugriff hat, wird
-        übersprungen (nicht abgebrochen)."""
+        übersprungen (nicht abgebrochen).
+
+        `status_abfragen_fn` ist IMMER die EMAIL-Provider-Abfrage (siehe
+        Aufrufer `indexautomatik/mailversand_service.py::
+        HVMailversandService.status_abgleichen`) - ein BRIEF-Mahnlauf wird
+        deshalb HIER NIE abgefragt (Codex-Abnahme 19.10.2026: "BRIEF-
+        Statusabgleich niemals an MailOps schicken" - es gibt für den
+        Briefkanal keine maschinelle Status-API). Ein UNSICHERER
+        BRIEF-Mahnlauf bleibt bewusst UNSICHER bis zur manuellen
+        Vervollständigung über einen echten Anbieterbeleg
+        (`HVMailversandService.vervollstaendige_mahnlauf_aus_
+        anbieterbeleg`)."""
 
         if self._mahnlauf_repository is None:
             return []
         abgeschlossen: list[MahnLaufTable] = []
         for lauf in self._mahnlauf_repository.list_fuer_status("UNSICHER"):
+            if lauf.kanal != "EMAIL":
+                continue  # kein maschineller Statusabgleich für den Briefkanal
             if not ctx.has_zugriff(lauf.gesellschaft_id):
                 continue  # KEINE Status-Abfrage für nicht zuständige Gesellschaften auslösen
             try:

@@ -1,5 +1,5 @@
 """Deterministic daily MailOps wiring for existing business outboxes."""
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 from sqlalchemy import select
 
@@ -9,11 +9,11 @@ from mietinkasso.bank.service import BankImportService
 from mietinkasso.domain.exceptions import (
     BindungInkonsistentError, ObjektAusgeschlossenError, TransportFehlerUngewissError, VorgangIdKonfliktError,
 )
-from mietinkasso.indexautomatik.mailnachweis import nachweis_daten, versand_belegen
+from mietinkasso.indexautomatik.mailnachweis import RekonstruierterBeleg, nachweis_daten, versand_belegen
 from mietinkasso.indexautomatik.mailops_client import MailOpsAuftrag, MailOpsClient
 from mietinkasso.indexautomatik.mailops_transport import MailOpsTransportadapter
 from mietinkasso.infrastructure.db.tables import (
-    AuditEventTable, ErhoehungsschreibenTable, MahnFallTable, VertragsendeErinnerungTable,
+    AuditEventTable, ErhoehungsschreibenTable, MahnFallTable, MahnLaufTable, VertragsendeErinnerungTable,
 )
 from mietinkasso.mahnwesen import brief_sftp
 from mietinkasso.mahnwesen.brief_pdf import Absender as BriefAbsender
@@ -283,30 +283,50 @@ class HVMailversandService:
             versand_fn=versand_fn, mahnkosten_vorschau_slot=vorschau_slot,
         )
 
-    def _sende_brief(self, *, mahnlauf, mitglieder, heute, vorschau_slot) -> brief_sftp.BriefSftpErgebnis:
+    def _sende_brief(self, *, mahnlauf, mitglieder, heute, vorschau_slot) -> None:
         """Kanal-BRIEF-Gegenstück zu `_dispatch_mahnlauf`s E-Mail-
         `versand_fn` (Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS, Teil 3)
         - erzeugt GENAU dasselbe Mahnbrief-PDF wie die bestehende
         On-Demand-Vorschau (`backoffice/routes/mahnwesen.py::
         mahnbrief_pdf`, dieselbe `vorschau()`/Forderungszeilen-Komposition),
         archiviert es dauerhaft/konfliktgeprüft (`mahnbrief_archiv_repo.
-        archivieren`, reserviert damit die EINE permanente Sendereferenz
-        für die SFTP-Dateinamensbildung) und überträgt es erst DANACH über
-        `brief_sftp_adapter`. Ein erfolgreicher Upload ist NUR ein
-        ÜBERMITTELT-Nachweis (`aktualisiere_status`) - das vom Aufrufer
-        (`MahnwesenService.versende_mahnlauf`) erwartete `status==
-        "GESENDET"` bedeutet hier wie überall sonst in diesem Modul
-        ausschließlich "an den Transport/Provider übergeben", NIE eine
-        Zustellbestätigung (`versand_belegen`s `zugang_bestaetigt=False`
-        gilt kanalübergreifend unverändert).
+        archivieren`, reserviert damit den EINEN permanenten Sende-
+        Schlüssel für die SFTP-Dateinamensbildung) und überträgt es erst
+        DANACH über `brief_sftp_adapter`.
 
-        `VorgangIdKonfliktError`/`BindungInkonsistentError` aus der
-        Archivierung sind praktisch unerreichbar (derselbe Mahnlauf wird
-        dank des atomaren Claims in `versende_mahnlauf` nie zweimal mit
-        abweichendem Inhalt hierher geraten) - werden aber trotzdem
-        kontrolliert in `ValueError` übersetzt, damit ein dennoch
-        auftretender Fall den Mahnlauf BLOCKIERT statt den gesamten
-        nächtlichen Versandlauf (`mahnlauf()`) abstürzen zu lassen."""
+        **Zentral (Codex-Abnahme 19.10.2026):** gibt IMMER `None` zurück,
+        NIE das `BriefSftpErgebnis` des erfolgreichen Uploads selbst - ein
+        erfolgreicher SFTP-Upload ist AUSSCHLIESSLICH ein ÜBERMITTELT-
+        Nachweis gegenüber dem Server (`aktualisiere_status`), NIEMALS ein
+        abgeschlossener Versand im Sinne von `MahnwesenService.
+        versende_mahnlauf`s `nachweis_daten`/`versand_belegen` - dessen
+        Mechanismus würde aus einem direkt durchgereichten `status==
+        "GESENDET"` sofort Kostenbuchung (Gebühren/Zinsen) UND den
+        GESENDET-Übergang ableiten, lange bevor ein echter
+        Postaufgabebeleg vorliegt. `None` lässt `versende_mahnlauf`
+        stattdessen den etablierten "noch kein tatsächlicher
+        Versandnachweis"-Pfad nehmen: der Mahnlauf bleibt UNSICHER
+        (Reservierungen bleiben erhalten, keine Buchung, kein
+        automatischer Neuversand) - exakt das gewünschte Verhalten, bis
+        `HVMailversandService.vervollstaendige_mahnlauf_aus_anbieterbeleg`
+        mit einem authentischen Anbieterbeleg vervollständigt.
+
+        Fehlerbehandlung NACH einem möglichen Netzkontakt ist bewusst
+        NIE `ValueError`/BLOCKIERT (das würde Mitglieder für eine neue
+        Planung freigeben und einen zweiten, unabhängigen Versandversuch
+        ermöglichen, obwohl bereits Bytes unterwegs gewesen sein könnten):
+        - `brief_sftp.PostSftpDateiKonfliktError` (die reservierte Datei
+          existiert am Server bereits - könnte ein früherer, unbestätigter
+          Versuch gewesen sein) -> bleibt ungewiss, `None`.
+        - Jeder Fehler beim nachgelagerten `aktualisiere_status` (DB-
+          Fehler, Konflikt) NACH erfolgreich gemeldetem Upload -> wird
+          verschluckt, bleibt ungewiss, `None` (die Archivzeile bleibt
+          dabei ggf. bei `VORBEREITET` stehen und ist über den
+          permanenten `sende_schluessel` jederzeit manuell nachvollziehbar).
+        Nur Fehler VOR jedem Netzkontakt (fehlende Postadresse, fehlende
+        Konfiguration, Archivkonflikt, ungültige Sendevoraussetzungen)
+        bleiben `ValueError`/BLOCKIERT - dort ist sicher, dass nichts
+        gesendet wurde."""
 
         if self.brief_sftp_adapter is None:
             raise ValueError("Brief-SFTP-Transport ist nicht eingerichtet.")
@@ -398,16 +418,64 @@ class HVMailversandService:
         except (VorgangIdKonfliktError, BindungInkonsistentError) as exc:
             raise ValueError(f"Mahnbrief-Archivierung inkonsistent: {exc}") from exc
 
-        dateiname = brief_sftp.baue_dateiname(archiv_id=archiv_zeile.id)
-        ergebnis = self.brief_sftp_adapter.sende(pdf_bytes=archiv_zeile.pdf_bytes, dateiname=dateiname)
+        dateiname = brief_sftp.baue_dateiname(sende_schluessel=archiv_zeile.sende_schluessel)
+        try:
+            ergebnis = self.brief_sftp_adapter.sende(pdf_bytes=archiv_zeile.pdf_bytes, dateiname=dateiname)
+        except brief_sftp.PostSftpDateiKonfliktError:
+            # Siehe Docstring: ein Dateikonflikt unter dem permanent
+            # reservierten Schlüssel ist NICHT "sauber nichts gesendet" -
+            # bleibt ungewiss statt BLOCKIERT/freigegeben für Neuversand.
+            return None
+
+        # Ab hier gilt der Upload als erfolgreich gemeldet (Bytes wurden
+        # übertragen) - JEDE weitere Störung bleibt ungewiss, NIE BLOCKIERT.
         try:
             self.mahnbrief_archiv_repo.aktualisiere_status(
                 archiv_id=archiv_zeile.id, neuer_status="UEBERMITTELT",
                 beleg_referenz=ergebnis.externe_referenz, erfasst_von="hv-mailversand",
             )
-        except VorgangIdKonfliktError as exc:
-            raise ValueError(f"Mahnbrief-Archivstatus inkonsistent: {exc}") from exc
-        return ergebnis
+        except Exception:
+            pass  # Archivstatus bleibt ggf. bei VORBEREITET stehen, über sende_schluessel manuell nachvollziehbar
+        return None
+
+    def vervollstaendige_mahnlauf_aus_anbieterbeleg(
+        self, *, ctx, archiv_id: int, anbieterbeleg_pdf_bytes: bytes, anbieterbeleg_referenz: str,
+        postaufgabe_datum: date, importiert_von: str,
+    ) -> None:
+        """Backoffice-Einstiegspunkt (Auftrag HV-20261019-VERSAND-KOSTEN-
+        ABSCHLUSS, Teil 3, Codex-Abnahme 19.10.2026): importiert den
+        authentischen Anbieterbeleg idempotent/konfliktgeprüft
+        (`mahnbrief_archiv_repo.importiere_anbieterbeleg` - ein bloßer
+        Referenztext allein wird dort bereits abgelehnt) und
+        vervollständigt ERST DANACH - niemals beim bloßen SFTP-Upload -
+        den eingefrorenen Mahnlauf samt Kostensnapshot anhand des
+        TATSÄCHLICHEN Postaufgabedatums, niemals erneut sendend
+        (`MahnwesenService.vervollstaendige_mahnlauf_aus_echtem_beleg`)."""
+
+        archiv = self.mahnbrief_archiv_repo.importiere_anbieterbeleg(
+            archiv_id=archiv_id, anbieterbeleg_pdf_bytes=anbieterbeleg_pdf_bytes,
+            anbieterbeleg_referenz=anbieterbeleg_referenz, postaufgabe_datum=postaufgabe_datum,
+            importiert_von=importiert_von,
+        )
+        with self.sf() as session:
+            mahnlauf = session.execute(select(MahnLaufTable).where(
+                MahnLaufTable.vertrag_id == archiv.vertrag_id, MahnLaufTable.stufe == archiv.stufe,
+                MahnLaufTable.outbox_key == archiv.mahnlauf_schluessel,
+            )).scalar_one_or_none()
+        if mahnlauf is None:
+            raise ValueError(f"Kein Mahnlauf zu Archivzeile {archiv_id} gefunden.")
+
+        # `versendet_am` trägt das TATSÄCHLICHE Postaufgabedatum (nie den
+        # bloßen SFTP-Uploadzeitpunkt) - genau dieses Datum wird weiter
+        # unten (`MahnwesenService._vervollstaendige_bestaetigten_
+        # mahnlauf`) als Buchungsdatum für Zinsen/Gebühr verwendet.
+        beleg = RekonstruierterBeleg(
+            status="GESENDET", versendet_am=datetime.combine(postaufgabe_datum, time(12, 0), tzinfo=timezone.utc),
+            externe_referenz=anbieterbeleg_referenz, provider_referenz=f"post-anbieterbeleg:{anbieterbeleg_referenz}",
+        )
+        self.mahn_service.vervollstaendige_mahnlauf_aus_echtem_beleg(
+            ctx=ctx, mahnlauf_id=mahnlauf.id, beleg=beleg, akteur=importiert_von,
+        )
 
     def mahnung_senden(self, *, ctx, row_id, heute):
         """Sendet GENAU EIN Schreiben je Vertrag+Mahnstufe (Rückprüfung

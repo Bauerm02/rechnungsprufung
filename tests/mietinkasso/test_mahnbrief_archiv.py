@@ -4,6 +4,8 @@ strukturell (nimmt bereits gerenderte Bytes entgegen)."""
 
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from mietinkasso.domain.exceptions import VorgangIdKonfliktError
@@ -27,6 +29,9 @@ def test_archivierung_speichert_pdf_und_hash(archiv_repo):
     assert len(row.pdf_sha256) == 64
     assert len(row.empfaenger_hash) == 64
     assert row.status == "VORBEREITET"
+    # Codex-Abnahme 19.10.2026: permanenter, opaker Sende-Schlüssel wird
+    # bereits BEI DER ARCHIVIERUNG reserviert, nicht erst beim Versand.
+    assert row.sende_schluessel and len(row.sende_schluessel) >= 16
 
     gelesen = archiv_repo.fuer_mahnlauf(vertrag_id="V-601-3", stufe=2, mahnlauf_schluessel="GRUPPE-A")
     assert gelesen is not None and gelesen.id == row.id
@@ -46,6 +51,9 @@ def test_identischer_retry_liefert_dieselbe_zeile_zurueck(archiv_repo):
     zweite = archiv_repo.archivieren(**kwargs)
     assert erste.id == zweite.id
     assert zweite.pdf_bytes == b"%PDF-1.4 identisch"
+    # Derselbe permanente Sende-Schlüssel bei einer unveränderten
+    # Wiederholung (Codex-Abnahme 19.10.2026).
+    assert zweite.sende_schluessel == erste.sende_schluessel
 
 
 def test_abweichendes_pdf_bei_wiederholung_ist_ein_konflikt_kein_stiller_erfolg(archiv_repo):
@@ -167,25 +175,94 @@ def test_aktualisiere_status_lehnt_rueckschritt_ab(archiv_repo):
         )
 
 
-def test_importiere_anbieterbeleg_ist_idempotent_und_lehnt_abweichende_referenz_ab(archiv_repo):
-    row = archiv_repo.archivieren(
-        vertrag_id="V-601-3", stufe=1, mahnlauf_schluessel="GRUPPE-BELEG",
-        pdf_bytes=b"%PDF-1.4 beleg", versandnachweis_referenz="mahnungslauf:beleg-1",
+def _archiviere_fuer_beleg(archiv_repo, mahnlauf_schluessel: str):
+    return archiv_repo.archivieren(
+        vertrag_id="V-601-3", stufe=1, mahnlauf_schluessel=mahnlauf_schluessel,
+        pdf_bytes=b"%PDF-1.4 beleg", versandnachweis_referenz=f"mahnungslauf:{mahnlauf_schluessel}",
         empfaenger_name="Max Mustermieter", empfaenger_adresse="Musterstraße 1\n1010 Wien",
         erstellt_von="codex-test",
     )
+
+
+def test_importiere_anbieterbeleg_verlangt_tatsaechliches_pdf_kein_bloszer_referenztext(archiv_repo):
+    row = _archiviere_fuer_beleg(archiv_repo, "GRUPPE-BELEG-OHNE-PDF")
+    with pytest.raises(ValueError):
+        archiv_repo.importiere_anbieterbeleg(
+            archiv_id=row.id, anbieterbeleg_pdf_bytes=b"", anbieterbeleg_referenz="PORTAL-AUFTRAG-1",
+            postaufgabe_datum=date(2026, 10, 20), importiert_von="codex-test",
+        )
+    with pytest.raises(ValueError):
+        archiv_repo.importiere_anbieterbeleg(
+            archiv_id=row.id, anbieterbeleg_pdf_bytes=b"kein pdf", anbieterbeleg_referenz="PORTAL-AUFTRAG-1",
+            postaufgabe_datum=date(2026, 10, 20), importiert_von="codex-test",
+        )
+
+
+def test_importiere_anbieterbeleg_ist_idempotent_und_lehnt_abweichenden_beleg_ab(archiv_repo):
+    row = _archiviere_fuer_beleg(archiv_repo, "GRUPPE-BELEG")
+    beleg_pdf = b"%PDF-1.4 Original-Postaufgabebeleg"
+
     erster_import = archiv_repo.importiere_anbieterbeleg(
-        archiv_id=row.id, anbieterbeleg_referenz="PORTAL-AUFTRAG-4711", importiert_von="codex-test",
+        archiv_id=row.id, anbieterbeleg_pdf_bytes=beleg_pdf, anbieterbeleg_referenz="PORTAL-AUFTRAG-4711",
+        postaufgabe_datum=date(2026, 10, 20), importiert_von="codex-test",
     )
     assert erster_import.anbieterbeleg_referenz == "PORTAL-AUFTRAG-4711"
+    assert erster_import.anbieterbeleg_pdf_bytes == beleg_pdf
+    assert len(erster_import.anbieterbeleg_pdf_sha256) == 64
+    assert erster_import.anbieterbeleg_postaufgabe_datum == date(2026, 10, 20)
     assert erster_import.anbieterbeleg_importiert_am is not None
 
+    # Echter Retry mit identischem Beleg/Referenz/Datum: sicherer No-Op.
     retry = archiv_repo.importiere_anbieterbeleg(
-        archiv_id=row.id, anbieterbeleg_referenz="PORTAL-AUFTRAG-4711", importiert_von="codex-test",
+        archiv_id=row.id, anbieterbeleg_pdf_bytes=beleg_pdf, anbieterbeleg_referenz="PORTAL-AUFTRAG-4711",
+        postaufgabe_datum=date(2026, 10, 20), importiert_von="codex-test",
     )
     assert retry.anbieterbeleg_referenz == "PORTAL-AUFTRAG-4711"
 
+    # Abweichende Referenz für DIESELBE Zeile -> Konflikt.
     with pytest.raises(VorgangIdKonfliktError):
         archiv_repo.importiere_anbieterbeleg(
-            archiv_id=row.id, anbieterbeleg_referenz="PORTAL-AUFTRAG-ABWEICHEND", importiert_von="codex-test",
+            archiv_id=row.id, anbieterbeleg_pdf_bytes=beleg_pdf, anbieterbeleg_referenz="PORTAL-AUFTRAG-ABWEICHEND",
+            postaufgabe_datum=date(2026, 10, 20), importiert_von="codex-test",
         )
+    # Abweichendes Dokument für DIESELBE Referenz -> ebenfalls Konflikt.
+    with pytest.raises(VorgangIdKonfliktError):
+        archiv_repo.importiere_anbieterbeleg(
+            archiv_id=row.id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 ein anderes Dokument",
+            anbieterbeleg_referenz="PORTAL-AUFTRAG-4711", postaufgabe_datum=date(2026, 10, 20),
+            importiert_von="codex-test",
+        )
+    # Abweichendes Postaufgabedatum -> ebenfalls Konflikt.
+    with pytest.raises(VorgangIdKonfliktError):
+        archiv_repo.importiere_anbieterbeleg(
+            archiv_id=row.id, anbieterbeleg_pdf_bytes=beleg_pdf, anbieterbeleg_referenz="PORTAL-AUFTRAG-4711",
+            postaufgabe_datum=date(2026, 10, 21), importiert_von="codex-test",
+        )
+    # Keine Mutation durch die abgelehnten Versuche - Original bleibt unverändert.
+    unveraendert = archiv_repo.get(row.id)
+    assert unveraendert.anbieterbeleg_pdf_bytes == beleg_pdf
+    assert unveraendert.anbieterbeleg_postaufgabe_datum == date(2026, 10, 20)
+
+
+def test_importiere_anbieterbeleg_lehnt_fremde_mehrfach_genutzte_referenz_ab(archiv_repo):
+    """Codex-Abnahme 19.10.2026: eine Belegreferenz, die bereits einer
+    ANDEREN Archivzeile zugeordnet ist, darf nicht für eine zweite Zeile
+    übernommen werden - jeder echte Postaufgabebeleg gehört zu GENAU
+    EINER Sendung."""
+
+    erste_zeile = _archiviere_fuer_beleg(archiv_repo, "GRUPPE-BELEG-A")
+    zweite_zeile = _archiviere_fuer_beleg(archiv_repo, "GRUPPE-BELEG-B")
+    beleg_pdf = b"%PDF-1.4 Original-Postaufgabebeleg"
+
+    archiv_repo.importiere_anbieterbeleg(
+        archiv_id=erste_zeile.id, anbieterbeleg_pdf_bytes=beleg_pdf, anbieterbeleg_referenz="PORTAL-AUFTRAG-GETEILT",
+        postaufgabe_datum=date(2026, 10, 20), importiert_von="codex-test",
+    )
+    with pytest.raises(VorgangIdKonfliktError):
+        archiv_repo.importiere_anbieterbeleg(
+            archiv_id=zweite_zeile.id, anbieterbeleg_pdf_bytes=beleg_pdf,
+            anbieterbeleg_referenz="PORTAL-AUFTRAG-GETEILT", postaufgabe_datum=date(2026, 10, 20),
+            importiert_von="codex-test",
+        )
+    # Die zweite Zeile bleibt unberührt (kein Beleg importiert).
+    assert archiv_repo.get(zweite_zeile.id).anbieterbeleg_referenz is None

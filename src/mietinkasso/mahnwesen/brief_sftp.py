@@ -4,39 +4,75 @@ minimaler Anschlusspunkt, KEINE behauptete Live-Anbindung (Codex
 verifiziert diese Datei gegen den tatsächlichen Post-Server vor
 Produktivbetrieb, siehe `docs/hausverwaltung/OFFENE_PUNKTE.md`).
 
-Vorgabe Markus 19.10.2026 (offizieller Anbieterspezifikation, keine
-weitere Recherche nötig): Host `transfer.post-business-solutions.at`,
-Port 22, Zielpfad `/bulk_tp/`, ein PDF/A je Brief. Dateiname: ein
-15-stelliger, 1-basiert positionierter Parameterblock (Position 3
-Farbmodus, 4 Duplex, 5 Tempo, 7 Produkt, 9 E-Brief-Versuch, alle übrigen
-Positionen fest "0") + Bindestrich + die dauerhaft reservierte,
-niemals wiederverwendete Archiv-Zeilen-ID + ".pdf" - siehe
-`SendeParameter`/`baue_dateiname`.
+Vorgabe Markus 19.10.2026 (offizieller Anbieterspezifikation): Host
+`transfer.post-business-solutions.at`, Port 22, Zielpfad RELATIV
+`bulk_tp/` (Codex-Abnahme 19.10.2026: das Anbieteroriginal verlangt
+einen relativen Pfad - ein absoluter `/bulk_tp/` hätte bei einem
+chroot-/Home-Verzeichnis-basierten SFTP-Konto am echten Server
+fälschlich außerhalb des zulässigen Bereichs gesucht), ein PDF/A je
+Brief. Dateiname: ein 15-stelliger, 1-basiert positionierter
+Parameterblock (Position 3 Farbmodus, 4 Duplex, 5 Tempo, 7 Produkt, 9
+E-Brief - IMMER 0, kein E-Brief-Versuch - alle übrigen Positionen fest
+"0") + Bindestrich + der permanent in der DB reservierte, opake
+Sende-Schlüssel (UUID, siehe `mahnbrief_archiv.py::archivieren`) +
+".pdf" - siehe `SendeParameter`/`baue_dateiname`.
 
 Geschlossen per Default (`konfiguration_aus_settings`): ohne
 VOLLSTÄNDIGE Konfiguration (Host+Username+Passwort+gepinnter
-Hostkey-Fingerprint, ausschließlich aus `Settings`/Umgebungsvariablen -
-NIE ein hier hinterlegter echter Wert) findet GARANTIERT kein
-Netzzugriff statt. Der gepinnte Hostkey wird VOR jeder Authentifizierung
-geprüft (`PostSftpHostkeyFehlerError` bei Abweichung). Remote-exklusives
-Anlegen (niemals Überschreiben) - existiert die Datei bereits, ist das
-ein `PostSftpDateiKonfliktError`, NIE ein stiller Erfolg und NIE ein
-automatischer Neuversuch unter neuem Namen. Jede sonstige
-Verbindungsstörung ist IMMER ungewiss (`TransportFehlerUngewissError`,
-kein automatischer Retry - derselbe Grundsatz wie
-`indexautomatik/transport.py`). Ein erfolgreicher Upload ist
-AUSSCHLIESSLICH ein ÜBERMITTELT-Nachweis gegenüber dem SFTP-Server -
-KEIN Postaufgabe-/Zustellnachweis (siehe `BriefSftpErgebnis`-Docstring
-und `mahnbrief_archiv.py` für die honeste Statusabbildung).
+Hostkey-Fingerprint, ausschließlich aus `Settings`/privaten
+Serverdateien - NIE ein hier hinterlegter echter Wert) findet
+GARANTIERT kein Netzzugriff statt. Das Passwort wird NIE als Klartext-
+Settings-Wert gehalten, sondern aus einer privaten Datei gelesen
+(`brief_sftp_password_datei`, analog `hv_mail_token_file`) - taucht
+dadurch nie in einer `.env`/einem Prozess-Environment-Dump auf. Der
+gepinnte Hostkey wird VOR jeder Authentifizierung geprüft
+(`PostSftpHostkeyFehlerError` bei Abweichung). Remote-exklusives UND
+SCHREIBENDES Anlegen (`"wxb"` - Codex-Abnahme 19.10.2026: `"xb"` allein
+setzt in paramikos `SFTPClient.open`-Flag-Übersetzung kein Schreib-Flag,
+die Datei würde nie tatsächlich beschrieben) - existiert die Datei
+bereits, ist das ein `PostSftpDateiKonfliktError`, NIE ein stiller
+Erfolg und NIE ein automatischer Neuversuch unter neuem Namen. Jede
+sonstige Verbindungsstörung (einschließlich eines fehlschlagenden
+Verbindungsaufbaus selbst) ist IMMER ungewiss
+(`TransportFehlerUngewissError`, kein automatischer Retry - derselbe
+Grundsatz wie `indexautomatik/transport.py`). Verbindungsaufbau UND
+Authentifizierung laufen mit demselben begrenzten Socket-Timeout
+(`_VERBINDUNGSTIMEOUT_SEKUNDEN`).
+
+Ein erfolgreicher Upload ist AUSSCHLIESSLICH ein ÜBERMITTELT-Nachweis
+gegenüber dem SFTP-Server - KEIN Postaufgabe-/Zustellnachweis.
+**Kritisch (Codex-Abnahme 19.10.2026, zentraler Befund):** auch wenn
+`BriefSftpErgebnis.status == "GESENDET"` (= dieselbe Form wie
+`MailOpsErgebnis`/`VersandBestaetigung` trägt), darf dieses Ergebnis
+NIEMALS direkt als `versand_fn`-Rückgabe an
+`MahnwesenService.versende_mahnlauf` durchgereicht werden - dessen
+`nachweis_daten`/`versand_belegen`-Mechanismus würde daraus SOFORT
+einen abgeschlossenen Versand samt Kostenbuchung ableiten. Der
+tatsächliche Dispatch-Code (`indexautomatik/mailversand_service.py::
+HVMailversandService._sende_brief`) verwendet dieses Ergebnis deshalb
+NUR, um den Archivstatus auf `UEBERMITTELT` zu setzen, und gibt dem
+Aufrufer explizit `None` zurück - der Mahnlauf bleibt dadurch UNSICHER
+(keine Kostenbuchung, kein automatischer Neuversand), bis ein
+authentischer Anbieterbeleg (`mahnbrief_archiv.py::
+importiere_anbieterbeleg` + Vervollständigung) vorliegt.
 
 Alle definitiven (nicht-ungewissen) Fehler dieses Moduls sind bewusst
 `ValueError`-Subklassen - `MahnwesenService.versende_mahnlauf` fängt
 GENAU diese Klasse ab und blockiert den Mahnlauf kontrolliert, statt
-den gesamten nächtlichen Versandlauf abstürzen zu lassen."""
+den gesamten nächtlichen Versandlauf abstürzen zu lassen. `_sende_brief`
+behandelt `PostSftpDateiKonfliktError` davon abweichend NICHT als
+BLOCKIERT-fähig (siehe dortige Docstring) - ein Dateikonflikt unter
+einem permanent reservierten, nie wiederverwendeten Schlüssel könnte
+bedeuten, dass ein früherer, unbestätigter Versuch bereits erfolgreich
+war."""
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import io
+import re
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Protocol
@@ -46,7 +82,9 @@ from pypdf import PdfReader
 from mietinkasso.domain.exceptions import TransportFehlerUngewissError
 
 MAX_SIMPLEX_SEITEN = 14
-_BULK_PFAD_DEFAULT = "/bulk_tp/"
+_BULK_PFAD_DEFAULT = "bulk_tp/"
+_VERBINDUNGSTIMEOUT_SEKUNDEN = 20
+_SENDE_SCHLUESSEL_MUSTER = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
 class PostSftpKonfigurationFehltError(ValueError):
@@ -69,7 +107,10 @@ class PostSendevoraussetzungError(ValueError):
 class PostSftpDateiKonfliktError(ValueError):
     """Unter der permanent reservierten Dateireferenz liegt am Server
     bereits eine Datei - niemals überschreiben (remote exklusives
-    Anlegen), niemals automatisch unter neuem Namen erneut versuchen."""
+    Anlegen), niemals automatisch unter neuem Namen erneut versuchen.
+    **Aufrufer-Hinweis:** dies ist NICHT dasselbe wie "von vornherein
+    nichts gesendet" - der Aufruf-Code darf hieraus NIE ein
+    BLOCKIERT/Freigabe-zum-Neuversand ableiten (siehe Moduldoc)."""
 
 
 @dataclass(frozen=True)
@@ -77,9 +118,11 @@ class SendeParameter:
     """1-basierte Ziffernpositionen im 15-stelligen Post-Parameterblock
     (offiziell bestätigte Vorgabe): Position 3 Farbmodus (0=Schwarz-
     Weiß), 4 Duplex (0=Simplex), 5 Tempo (0=PRIO), 7 Produkt (1=Inland
-    Einschreiben Einwurf), 9 E-Brief (0=kein Versuch); alle übrigen
-    Positionen fest 0. Defaults bilden den vereinbarten
-    Standardversand für Mahnbriefe ab."""
+    Einschreiben Einwurf), 9 E-Brief; alle übrigen Positionen fest 0.
+    `ebrief` ist ZWINGEND 0 (Codex-Abnahme 19.10.2026: kein E-Brief-
+    Versuch, kein alternativer Zustellkanal ohne eigene Freigabe) -
+    jeder andere Wert wird kontrolliert abgelehnt, nicht stillschweigend
+    übernommen."""
 
     farbmodus: int = 0
     duplex: int = 0
@@ -94,6 +137,8 @@ class SendeParameter:
         ):
             if not isinstance(wert, int) or isinstance(wert, bool) or not 0 <= wert <= 9:
                 raise ValueError(f"SendeParameter.{feld} muss eine einzelne Ziffer (0-9) sein, nicht {wert!r}.")
+        if self.ebrief != 0:
+            raise ValueError("SendeParameter.ebrief ist zwingend 0 - kein E-Brief-Versuch ohne eigene Freigabe.")
 
     def parameterblock(self) -> str:
         ziffern = ["0"] * 15
@@ -105,19 +150,22 @@ class SendeParameter:
         return "".join(ziffern)
 
 
-def baue_dateiname(*, archiv_id: int, parameter: SendeParameter | None = None) -> str:
+def baue_dateiname(*, sende_schluessel: str, parameter: SendeParameter | None = None) -> str:
     """Opaquer, dauerhaft eindeutiger Dateiname: 15-stelliger
-    Parameterblock, Bindestrich, die DAUERHAFT reservierte, niemals
-    wiederverwendete `MahnbriefArchivTable`-Zeilen-ID (12-stellig
-    zero-padded) - die Eindeutigkeit kommt ausschließlich aus dieser
-    autoincrement-ID, niemals aus Inhalt oder Zeitstempel."""
+    Parameterblock, Bindestrich, der PERMANENT in der DB reservierte,
+    niemals wiederverwendete `sende_schluessel` (siehe
+    `mahnbrief_archiv.py::archivieren` - eine unveränderte Wiederholung
+    behält denselben Schlüssel und damit denselben Dateinamen), `.pdf`.
+    Validiert ein sicheres, dateinamenstaugliches Format (kein Pfad-
+    Trennzeichen, keine Steuerzeichen) statt jeden beliebigen String
+    ungeprüft in einen Remote-Pfad einzusetzen."""
 
-    if not isinstance(archiv_id, int) or isinstance(archiv_id, bool) or archiv_id <= 0:
-        raise ValueError("archiv_id muss eine positive, bereits reservierte Archiv-Zeilen-ID sein.")
-    if archiv_id > 10**12 - 1:
-        raise ValueError(f"archiv_id {archiv_id} überschreitet die zwölfstellige Dateinamenskapazität.")
+    if not isinstance(sende_schluessel, str) or not _SENDE_SCHLUESSEL_MUSTER.fullmatch(sende_schluessel):
+        raise ValueError(
+            f"sende_schluessel {sende_schluessel!r} ist kein gültiger, bereits reservierter Sende-Schlüssel."
+        )
     block = (parameter or SendeParameter()).parameterblock()
-    return f"{block}-{archiv_id:012d}.pdf"
+    return f"{block}-{sende_schluessel}.pdf"
 
 
 def pruefe_sendevoraussetzungen(pdf_bytes: bytes, *, duplex: int) -> None:
@@ -142,16 +190,26 @@ class SftpKonfiguration:
 
 def konfiguration_aus_settings(settings) -> SftpKonfiguration | None:
     """Geschlossen, solange NICHT ALLE vier sicherheitsrelevanten Werte
-    (Host, Username, Passwort, gepinnter Hostkey-Fingerprint) explizit
-    konfiguriert sind - Credentials kommen AUSSCHLIESSLICH aus privaten
+    (Host, Username, Passwort-DATEI, gepinnter Hostkey-Fingerprint)
+    explizit konfiguriert sind UND die Passwortdatei tatsächlich lesbar
+    ist - Credentials kommen AUSSCHLIESSLICH aus privaten
     Serverdateien/Umgebungsvariablen außerhalb dieses Repos (Codex),
-    niemals aus einem hier hinterlegten Default."""
+    niemals aus einem hier hinterlegten Default. Das Passwort wird NIE
+    als Settings-Klartextwert gehalten (siehe Moduldoc)."""
 
     host = (settings.brief_sftp_host or "").strip()
     username = (settings.brief_sftp_username or "").strip()
-    password = settings.brief_sftp_password or ""
     fingerprint = (settings.brief_sftp_host_key_fingerprint or "").strip()
-    if not host or not username or not password or not fingerprint:
+    passwort_datei = (settings.brief_sftp_password_datei or "").strip()
+    if not host or not username or not fingerprint or not passwort_datei:
+        return None
+    try:
+        from pathlib import Path
+
+        password = Path(passwort_datei).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not password:
         return None
     return SftpKonfiguration(
         host=host, port=settings.brief_sftp_port, pfad=settings.brief_sftp_pfad or _BULK_PFAD_DEFAULT,
@@ -159,18 +217,28 @@ def konfiguration_aus_settings(settings) -> SftpKonfiguration | None:
     )
 
 
+def _remote_pfad(pfad: str, dateiname: str) -> str:
+    """Baut den Remote-Pfad RELATIV zum SFTP-Login-Verzeichnis (kein
+    führender `/`) - `pfad` selbst darf mit oder ohne Schrägstriche
+    konfiguriert sein, das Ergebnis trägt nie einen doppelten oder
+    führenden Schrägstrich."""
+
+    bereinigt = pfad.strip("/")
+    return f"{bereinigt}/{dateiname}" if bereinigt else dateiname
+
+
 @dataclass(frozen=True)
 class BriefSftpErgebnis:
     """Dieselbe Form wie `indexautomatik.mailops_client.MailOpsErgebnis`/
-    `indexautomatik.transport.VersandBestaetigung`, damit
-    `MahnwesenService.versende_mahnlauf`s bestehender `nachweis_daten`/
-    `versand_belegen`-Mechanismus UNVERÄNDERT greift - kein separater
-    Statuscode-Vertrag je Kanal. `status` ist IMMER "GESENDET" (= an den
-    Post-SFTP-Server ÜBERMITTELT); jede andere Möglichkeit ist eine
-    Exception, NIE ein erfundener Zustellungs-/Postaufgabenachweis."""
+    `indexautomatik.transport.VersandBestaetigung` - rein strukturell.
+    `status` ist IMMER "GESENDET" (= an den Post-SFTP-Server
+    ÜBERMITTELT, NIE ein Zustellungs-/Postaufgabenachweis) - **dieses
+    Objekt darf TROTZDEM niemals direkt als `versand_fn`-Rückgabe an
+    `MahnwesenService.versende_mahnlauf` weitergereicht werden** (siehe
+    Moduldoc, zentraler Codex-Befund 19.10.2026)."""
 
     status: str
-    externe_referenz: str  # der dauerhaft reservierte Dateiname
+    externe_referenz: str  # der permanent reservierte Dateiname
     provider_referenz: str
     versendet_am: datetime
 
@@ -181,43 +249,60 @@ class _SftpVerbindung(Protocol):
     def close(self) -> None: ...
 
 
+class _ParamikoVerbindung:
+    """Echte paramiko-SFTP-Verbindung - wird in dieser Entwicklungs-
+    umgebung NIE mit ihrem Standard-Verbindungsaufbau aufgerufen (kein
+    echter Host/Credentials vorhanden, siehe `konfiguration_aus_
+    settings`). `transport_factory`/`sftp_client_cls` sind injizierbar,
+    damit ein gezielter Test die TATSÄCHLICHEN Open-Flags/den
+    TATSÄCHLICHEN Verbindungsaufbau dieser Klasse mit einem Fake
+    `Transport`/`SFTPClient` prüft, ohne echtes Netz (siehe
+    `test_brief_sftp.py`). Codex verifiziert den Standardpfad gegen den
+    echten Post-Server vor Produktivbetrieb."""
+
+    def __init__(
+        self, konfiguration: SftpKonfiguration, *,
+        transport_factory: Callable[[], object] | None = None, sftp_client_cls: type | None = None,
+    ) -> None:
+        import paramiko
+
+        self._konfiguration = konfiguration
+        self._sftp_client_cls = sftp_client_cls or paramiko.SFTPClient
+        if transport_factory is not None:
+            self._transport = transport_factory()
+        else:
+            sock = socket.create_connection(
+                (konfiguration.host, konfiguration.port), timeout=_VERBINDUNGSTIMEOUT_SEKUNDEN
+            )
+            self._transport = paramiko.Transport(sock)
+            self._transport.banner_timeout = _VERBINDUNGSTIMEOUT_SEKUNDEN
+            self._transport.start_client(timeout=_VERBINDUNGSTIMEOUT_SEKUNDEN)
+        self._sftp = None
+
+    def hostkey_fingerprint(self) -> str:
+        schluessel = self._transport.get_remote_server_key()
+        digest = hashlib.sha256(schluessel.asbytes()).digest()
+        return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+
+    def put_exclusive(self, remote_pfad: str, data: bytes) -> None:
+        if self._sftp is None:
+            self._transport.auth_password(self._konfiguration.username, self._konfiguration.password)
+            self._sftp = self._sftp_client_cls.from_transport(self._transport)
+        # "wxb" (nicht "xb" allein - Codex-Abnahme 19.10.2026): paramikos
+        # `SFTPClient.open`-Modusübersetzung setzt bei einem bloßen "xb"
+        # KEIN Schreib-Flag, die Datei würde exklusiv angelegt, aber nie
+        # tatsächlich beschrieben.
+        with self._sftp.open(remote_pfad, "wxb") as datei:
+            datei.write(data)
+
+    def close(self) -> None:
+        if self._sftp is not None:
+            self._sftp.close()
+        self._transport.close()
+
+
 def _echte_verbindung(konfiguration: SftpKonfiguration) -> _SftpVerbindung:
-    """Echte paramiko-Verbindung - wird in dieser Entwicklungsumgebung
-    NIE aufgerufen (kein echter Host/Credentials vorhanden, siehe
-    `konfiguration_aus_settings`); Tests injizieren ausschließlich ein
-    Fake über `verbindung_factory`. Codex verifiziert diese Funktion
-    gegen den tatsächlichen Post-Server vor Produktivbetrieb (siehe
-    `docs/hausverwaltung/OFFENE_PUNKTE.md`)."""
-
-    import paramiko
-
-    class _ParamikoVerbindung:
-        def __init__(self) -> None:
-            self._transport = paramiko.Transport((konfiguration.host, konfiguration.port))
-            self._transport.start_client(timeout=20)
-            self._sftp = None
-
-        def hostkey_fingerprint(self) -> str:
-            import base64
-            import hashlib
-
-            schluessel = self._transport.get_remote_server_key()
-            digest = hashlib.sha256(schluessel.asbytes()).digest()
-            return "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
-
-        def put_exclusive(self, remote_pfad: str, data: bytes) -> None:
-            if self._sftp is None:
-                self._transport.auth_password(konfiguration.username, konfiguration.password)
-                self._sftp = paramiko.SFTPClient.from_transport(self._transport)
-            with self._sftp.open(remote_pfad, "xb") as datei:
-                datei.write(data)
-
-        def close(self) -> None:
-            if self._sftp is not None:
-                self._sftp.close()
-            self._transport.close()
-
-    return _ParamikoVerbindung()
+    return _ParamikoVerbindung(konfiguration)
 
 
 class PostSftpTransportadapter:
@@ -245,10 +330,15 @@ class PostSftpTransportadapter:
             )
         parameter = parameter or SendeParameter()
         pruefe_sendevoraussetzungen(pdf_bytes, duplex=parameter.duplex)
-        remote_pfad = self._konfiguration.pfad.rstrip("/") + "/" + dateiname
+        remote_pfad = _remote_pfad(self._konfiguration.pfad, dateiname)
 
-        verbindung = self._verbindung_factory(self._konfiguration)
+        verbindung: _SftpVerbindung | None = None
         try:
+            # Der Verbindungsaufbau selbst (Factory-Aufruf) ist bereits
+            # Teil des Netzkontakts - ein Fehler hier (Verbindungsaufbau/
+            # Kanalverhandlung) ist ebenso ungewiss wie ein späterer
+            # Schreibfehler, NIE ein sauberes "nichts gesendet".
+            verbindung = self._verbindung_factory(self._konfiguration)
             tatsaechlicher_fingerprint = verbindung.hostkey_fingerprint()
             if tatsaechlicher_fingerprint != self._konfiguration.host_key_fingerprint:
                 raise PostSftpHostkeyFehlerError(
@@ -271,10 +361,11 @@ class PostSftpTransportadapter:
                 "möglicherweise dennoch übertragen, kein automatischer Retry."
             ) from exc
         finally:
-            try:
-                verbindung.close()
-            except Exception:
-                pass
+            if verbindung is not None:
+                try:
+                    verbindung.close()
+                except Exception:
+                    pass
 
         return BriefSftpErgebnis(
             status="GESENDET", externe_referenz=dateiname,

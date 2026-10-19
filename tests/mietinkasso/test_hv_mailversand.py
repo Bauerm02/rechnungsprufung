@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from mietinkasso.domain.enums import OPTyp, MahnStatus
+from mietinkasso.domain.exceptions import VorgangIdKonfliktError
 from mietinkasso.indexautomatik.bootstrap import bauen
 from mietinkasso.indexautomatik.mailops_client import MailOpsClient, MailOpsErgebnis
 from mietinkasso.indexautomatik.mailversand_service import HVMailversandService
@@ -649,19 +650,7 @@ class _FakeSftpVerbindung:
         pass
 
 
-def test_brief_kanal_wird_archiviert_konfliktfrei_und_per_sftp_uebermittelt(hv, basis_vertrag, admin_ctx, session_factory):
-    """Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS Teil 3: Ende-zu-Ende-
-    Nachweis des realen BRIEF-Dispatchpfads (`HVMailversandService.
-    _sende_brief`) - GENAU EIN echtes Mahnbrief-PDF wird erzeugt, dauerhaft
-    archiviert (konfliktgeprüft) und über den injizierten SFTP-Adapter
-    übermittelt; der Mahnfall/Mahnlauf wird dabei exakt wie beim
-    EMAIL-Kanal auf GESENDET nachgezogen (= "an den Transport übergeben",
-    KEIN Zustellnachweis). Kein echter Netzwerkzugriff (`_FakeSftpVerbindung`)."""
-
-    service, _ = hv
-    contract, account = basis_vertrag
-    _seed_debt(hv, contract, account, admin_ctx)
-
+def _richte_brief_kanal_ein(service, contract, account):
     regel = service.kanalregel_repo.anlegen(stufe1_kanal="BRIEF", stufe2_kanal="BRIEF", erstellt_von="test")
     service.kanalregel_repo.freigeben(regel.id, freigegeben_von="test")
     profil = service.brief_anbieterprofil_repo.anlegen(
@@ -676,7 +665,7 @@ def test_brief_kanal_wird_archiviert_konfliktfrei_und_per_sftp_uebermittelt(hv, 
     fingerprint = "SHA256:test-fingerprint"
     fake_verbindung = _FakeSftpVerbindung(fingerprint)
     konfiguration = SftpKonfiguration(
-        host="transfer.post-business-solutions.at", port=22, pfad="/bulk_tp/",
+        host="transfer.post-business-solutions.at", port=22, pfad="bulk_tp/",
         username="jlb-test", password="synthetisches-test-passwort", host_key_fingerprint=fingerprint,
     )
     # Dieselbe Injektionsstelle wie in `test_brief_sftp.py` - niemals ein
@@ -685,33 +674,173 @@ def test_brief_kanal_wird_archiviert_konfliktfrei_und_per_sftp_uebermittelt(hv, 
     # nur dann wahr, wenn Codex echte Settings-Werte konfiguriert).
     service.brief_sftp_adapter = PostSftpTransportadapter(konfiguration, verbindung_factory=lambda k: fake_verbindung)
     service.mahn_service._brief_transport_verfuegbar = True
+    return fake_verbindung
 
-    result = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
-    assert result["gesendet"] == 1
+
+def test_brief_upload_uebermittelt_aber_laesst_gebuehren_mahnstatus_offen(hv, basis_vertrag, admin_ctx, session_factory):
+    """Zentraler Codex-Befund 19.10.2026: ein erfolgreicher SFTP-Upload
+    ist AUSSCHLIESSLICH ein ÜBERMITTELT-Nachweis gegenüber dem Server -
+    der Mahnlauf/Mahnfall bleibt UNSICHER, KEINE Kostenbuchung, KEIN
+    GESENDET-Übergang, bis ein authentischer Anbieterbeleg vorliegt."""
+
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake_verbindung = _richte_brief_kanal_ein(service, contract, account)
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
 
     row = service.mahn_repo.list_fuer_vertrag(contract.id)[0]
-    assert row.status == "GESENDET"
+    assert row.status == "UNSICHER"  # NICHT GESENDET
 
     with session_factory() as s:
         mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.vertrag_id == contract.id)).scalars().one()
-    assert mahnlauf_row.kanal == "BRIEF" and mahnlauf_row.status == "GESENDET"
+    assert mahnlauf_row.kanal == "BRIEF" and mahnlauf_row.status == "UNSICHER"
+    assert mahnlauf_row.mahnkosten_verarbeitet_am is None
 
     archiv = service.mahnbrief_archiv_repo.fuer_mahnlauf(
         vertrag_id=contract.id, stufe=1, mahnlauf_schluessel=mahnlauf_row.outbox_key,
     )
     assert archiv is not None
     assert archiv.pdf_bytes[:5] == b"%PDF-"
-    assert archiv.status == "UEBERMITTELT"
+    assert archiv.status == "UEBERMITTELT"  # Transport-Nachweis, KEIN Versandabschluss
     assert archiv.status_beleg_referenz is not None
+    assert archiv.sende_schluessel  # permanent reserviert
 
-    dateiname = brief_sftp.baue_dateiname(archiv_id=archiv.id)
-    assert fake_verbindung.geschriebene_dateien == {f"/bulk_tp/{dateiname}": archiv.pdf_bytes}
+    dateiname = brief_sftp.baue_dateiname(sende_schluessel=archiv.sende_schluessel)
+    assert fake_verbindung.geschriebene_dateien == {f"bulk_tp/{dateiname}": archiv.pdf_bytes}
 
-    # Keine echte Zustellbestätigung - derselbe Grundsatz wie beim
-    # EMAIL-Kanal: der Audit-Nachweis belegt ausdrücklich NUR die
-    # Übergabe an den Transport, nie den Zugang/die Zustellung.
+    # Keine Kostenbuchung/kein Versandbeleg - der generische EMAIL-Audit-
+    # Mechanismus wurde für diesen Mahnfall NIE ausgelöst.
     with session_factory() as s:
         evidence = list(s.execute(select(AuditEventTable).where(
             AuditEventTable.aktion == "MAILVERSAND_BESTAETIGT", AuditEventTable.entity_typ == "mahn_faelle",
         )).scalars())
-    assert evidence and all(e.payload["zugang_bestaetigt"] is False for e in evidence)
+    assert evidence == []
+
+
+def test_echter_anbieterbeleg_vervollstaendigt_mahnlauf_genau_einmal(hv, basis_vertrag, admin_ctx, session_factory):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    _richte_brief_kanal_ein(service, contract, account)
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+
+    with session_factory() as s:
+        mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.vertrag_id == contract.id)).scalars().one()
+    archiv = service.mahnbrief_archiv_repo.fuer_mahnlauf(
+        vertrag_id=contract.id, stufe=1, mahnlauf_schluessel=mahnlauf_row.outbox_key,
+    )
+    beleg_pdf = b"%PDF-1.4 Original-Postaufgabebeleg aus dem Post-Portal"
+
+    service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
+        ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=beleg_pdf,
+        anbieterbeleg_referenz="PORTAL-AUFTRAG-4711", postaufgabe_datum=date(2026, 9, 15),
+        importiert_von="codex-test",
+    )
+
+    row = service.mahn_repo.list_fuer_vertrag(contract.id)[0]
+    assert row.status == "GESENDET"
+    with session_factory() as s:
+        mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.id == mahnlauf_row.id)).scalars().one()
+    assert mahnlauf_row.status == "GESENDET"
+    assert mahnlauf_row.gesendet_am.date().isoformat() == "2026-09-15"  # ECHTES Postaufgabedatum, nicht der Uploadtag
+    assert mahnlauf_row.mahnkosten_verarbeitet_am is not None
+
+    with session_factory() as s:
+        gebuehren = list(s.execute(select(MahnkostenGebuehrTable).where(
+            MahnkostenGebuehrTable.vertrag_id == contract.id)).scalars())
+        evidence = list(s.execute(select(AuditEventTable).where(
+            AuditEventTable.aktion == "MAILVERSAND_BESTAETIGT")).scalars())
+    assert all(e.payload["zugang_bestaetigt"] is False for e in evidence)  # kein erfundener Zustellnachweis
+
+    # Idempotent: ein zweiter Import mit IDENTISCHEM Beleg vervollständigt
+    # genau einmal - keine zweite Buchung, keine zweite Audit-Zeile.
+    service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
+        ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=beleg_pdf,
+        anbieterbeleg_referenz="PORTAL-AUFTRAG-4711", postaufgabe_datum=date(2026, 9, 15),
+        importiert_von="codex-test",
+    )
+    with session_factory() as s:
+        evidence_erneut = list(s.execute(select(AuditEventTable).where(
+            AuditEventTable.aktion == "MAILVERSAND_BESTAETIGT")).scalars())
+        gebuehren_erneut = list(s.execute(select(MahnkostenGebuehrTable).where(
+            MahnkostenGebuehrTable.vertrag_id == contract.id)).scalars())
+    assert len(evidence_erneut) == len(evidence)
+    assert len(gebuehren_erneut) == len(gebuehren)
+
+
+def test_fehlender_oder_vertauschter_beleg_bleibt_offen_kein_fehlerhafter_abschluss(hv, basis_vertrag, admin_ctx, session_factory):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    _richte_brief_kanal_ein(service, contract, account)
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+
+    with session_factory() as s:
+        mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.vertrag_id == contract.id)).scalars().one()
+    archiv = service.mahnbrief_archiv_repo.fuer_mahnlauf(
+        vertrag_id=contract.id, stufe=1, mahnlauf_schluessel=mahnlauf_row.outbox_key,
+    )
+
+    # Referenztext allein ist KEIN Beleg - kein PDF mitgegeben.
+    with pytest.raises(ValueError):
+        service.mahnbrief_archiv_repo.importiere_anbieterbeleg(
+            archiv_id=archiv.id, anbieterbeleg_pdf_bytes=b"", anbieterbeleg_referenz="PORTAL-AUFTRAG-1",
+            postaufgabe_datum=date(2026, 9, 15), importiert_von="codex-test",
+        )
+
+    service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
+        ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 echter Beleg",
+        anbieterbeleg_referenz="PORTAL-AUFTRAG-ECHT", postaufgabe_datum=date(2026, 9, 15),
+        importiert_von="codex-test",
+    )
+    # Ein vertauschter/abweichender Beleg für DIESELBE Zeile wird abgelehnt,
+    # der bereits bestätigte Mahnlauf bleibt unangetastet GESENDET.
+    with pytest.raises(VorgangIdKonfliktError):
+        service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
+            ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=b"%PDF-1.4 ANDERER Beleg",
+            anbieterbeleg_referenz="PORTAL-AUFTRAG-ANDERS", postaufgabe_datum=date(2026, 9, 16),
+            importiert_von="codex-test",
+        )
+    row = service.mahn_repo.list_fuer_vertrag(contract.id)[0]
+    assert row.status == "GESENDET"
+    with session_factory() as s:
+        mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.id == mahnlauf_row.id)).scalars().one()
+    assert mahnlauf_row.gesendet_am.date().isoformat() == "2026-09-15"  # unverändert, keine Überschreibung
+
+
+def test_fehler_nach_upload_fuehrt_zu_unsicher_nie_zu_blockiert_oder_retry(hv, basis_vertrag, admin_ctx, session_factory):
+    """Codex-Abnahme 19.10.2026: ein Fehler NACH möglichem Upload (hier:
+    eine fehlgeschlagene Archivstatus-Aktualisierung) darf NIE als
+    BLOCKIERT durchgereicht werden - das würde die Mitglieder für einen
+    zweiten, unabhängigen Versandversuch freigeben."""
+
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    _richte_brief_kanal_ein(service, contract, account)
+
+    orig = service.mahnbrief_archiv_repo.aktualisiere_status
+
+    def _schlaegt_fehl(*args, **kwargs):
+        raise RuntimeError("Fake-DB-Fehler NACH dem Upload (Test).")
+
+    service.mahnbrief_archiv_repo.aktualisiere_status = _schlaegt_fehl
+    try:
+        service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    finally:
+        service.mahnbrief_archiv_repo.aktualisiere_status = orig
+
+    row = service.mahn_repo.list_fuer_vertrag(contract.id)[0]
+    assert row.status == "UNSICHER"  # NIE "BLOCKIERT" trotz Fehler nach dem Upload
+    with session_factory() as s:
+        mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.vertrag_id == contract.id)).scalars().one()
+    assert mahnlauf_row.status == "UNSICHER"
+
+    # Die Bytes wurden trotzdem tatsächlich übertragen (Archivzeile existiert).
+    archiv = service.mahnbrief_archiv_repo.fuer_mahnlauf(
+        vertrag_id=contract.id, stufe=1, mahnlauf_schluessel=mahnlauf_row.outbox_key,
+    )
+    assert archiv is not None
+    assert archiv.pdf_bytes[:5] == b"%PDF-"
