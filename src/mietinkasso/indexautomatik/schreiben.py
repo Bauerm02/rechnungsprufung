@@ -1,34 +1,4 @@
-"""Deterministischer Textgenerator für ein Erhöhungsschreiben (Auftrag
-13.09.) - reine, überprüfbare String-Zusammensetzung aus bereits
-berechneten/persistierten Werten, KEIN KI-Aufruf.
-
-"Qualifiziert" heißt hier fachlich-inhaltlich vollständig und korrekt
-(Gesellschaft, Adresse/Top/Mieter, Klausel, Basis-/Vergleichswerte,
-Rechenweg, Positionen, USt/Gesamtsumme, Termine, Belege/Version) - AUSDRÜCKLICH
-KEINE pauschale Pflicht zur qualifizierten elektronischen Signatur (siehe
-Fachlicher Nachtrag 13.09.: "'qualifiziert richtig' heißt fachlich
-korrektes Schreiben, NICHT pauschal QES-Pflicht"). Die tatsächliche
-Zustellform (Einschreiben/Übergabe/E-Mail mit Lesebestätigung/...) wird
-separat je Fall im Outbox-Datensatz (`ErhoehungsschreibenTable.zugangsform`)
-gepflegt, nicht hier textlich vorweggenommen.
-
-ZWEI getrennte Textfunktionen (Modellreview 13.09.: "§16(9) gilt im
-Schreiben nicht pauschal für MRG-Teil; Geschäftsraum benötigt eigenes
-Schreiben"): `erhoehungsschreiben_text_mieweg` zitiert MieWeG + § 16
-Abs 9 MRG (nur für den geprüften Wohnungsrechner-Fall);
-`erhoehungsschreiben_text_klausel` (Geschäftsraum/generischer
-Klausel-Pfad) zitiert AUSSCHLIESSLICH die vertragliche Klausel und
-verweist auf die im Einzelfall zu prüfenden gesetzlichen Bestimmungen,
-OHNE § 16 Abs 9 pauschal zu behaupten.
-
-Beide Funktionen verlangen zwingend `unveraenderte_komponenten` (alle
-sonstigen aktiven Positionen, z. B. BK/HK/Wasser/Strom) und weisen den
-NEUEN MONATLICHEN GESAMTBETRAG als Summe aus geänderten UND
-unveränderten Positionen aus - "keine irreführende Gesamtsumme nur aus
-HMZ ohne unveränderte BK". Netto/USt/Brutto wird für JEDE betroffene
-Position einzeln ausgewiesen, korrekt aus `ust_satz_promille` skaliert
-(10000 Promille = 10 %, NICHT Division durch 10 - das hätte 1000 %
-ausgegeben)."""
+"""Gemeinsame Daten und Betragsdarstellung für die versionierte JLB-Vorlage in begehren.py."""
 
 from __future__ import annotations
 
@@ -82,6 +52,8 @@ class SchreibenKontext:
     vertraglich_zulaessiger_betrag_cent: int | None = None
     vertraglicher_quellenbeleg: str | None = None
     erstellt_am: date = field(default_factory=date.today)
+    gesetzliche_basis_cent: int | None = None
+    gesetzliche_grenze_cent: int | None = None
 
 
 def _eur(cent: int) -> str:
@@ -162,98 +134,3 @@ def _abschluss(kontext: SchreibenKontext) -> list[str]:
     zeilen.append("")
     zeilen.append(kontext.jlb_signatur)
     return zeilen
-
-
-def erhoehungsschreiben_text_mieweg(kontext: SchreibenKontext) -> str:
-    """Zitiert § 16 Abs 9 MRG NUR bei MRG-Vollanwendung mit
-    Zuversicht - bei MRG-Teilanwendung (unabhängiger Review,
-    fd8c2b2-Folgereview: "MRG-Teil im Wohnungstext NICHT pauschal
-    § 16(9) behaupten") wird eine qualifizierte, nicht pauschal
-    behauptende Formulierung verwendet, da die genaue Anwendbarkeit
-    dieser Verfahrensvorschrift bei Teilanwendung nicht unabhängig
-    verifiziert wurde."""
-
-    zeilen = _kopf_und_positionen(kontext, betreff_zusatz="Anhebung des Hauptmietzinses nach MieWeG 2026")
-    if kontext.rechtsordnung == "OESTERREICH_MRG_VOLL":
-        zeilen.append(
-            "hiermit teilen wir Ihnen gemäß § 1 MieWeG 2026 in Verbindung mit § 16 Abs 9 MRG die Anhebung "
-            f"des wertgesicherten Hauptmietzinses für {kontext.einheit_bezeichnung} mit."
-        )
-    else:
-        zeilen.append(
-            "hiermit teilen wir Ihnen gemäß § 1 MieWeG 2026 die Anhebung des wertgesicherten "
-            f"Hauptmietzinses für {kontext.einheit_bezeichnung} mit. Die für Ihren Vertrag konkret "
-            "anwendbaren Zustellungs-/Fristenbestimmungen (ggf. § 16 Abs 9 MRG) sind gesondert zu prüfen."
-        )
-    zeilen.append("")
-    zeilen.append(
-        f"Vertragliche Grundlage: {kontext.klausel_referenz or '(keine gesonderte Klauselreferenz erfasst)'}; "
-        f"Vertragsbeleg: {kontext.vertrag_beleg_referenz}."
-    )
-    zeilen.append(
-        f"Rechtsordnung/Anwendbarkeit: {kontext.rechtsordnung} (geprüfter Wohnungsrechner-Fall), "
-        f"Bezugszeitraum {kontext.bezugsjahr}-{kontext.bezugsmonat:02d} bis Ziel-Bewertungsjahr "
-        f"{kontext.ziel_bewertungsjahr}."
-    )
-    zeilen.append("")
-    if kontext.jahresschritte:
-        zeilen.append("Rechenweg (VPI-Jahresdurchschnitte, jeweils amtlich veröffentlicht):")
-        for schritt in kontext.jahresschritte:
-            zeilen.append(
-                f"  {schritt.jahr}: VPI {schritt.vpi_vorjahr} -> {schritt.vpi_jahr}, "
-                f"rohe Veränderung {schritt.rohe_veraenderung}, gedämpft {schritt.gedaempfte_veraenderung}, "
-                f"angewandt {schritt.angewandte_veraenderung}"
-            )
-        zeilen.append("")
-    if kontext.vertraglich_zulaessiger_betrag_cent is not None:
-        zeilen.append(
-            f"Vertragliche Obergrenze laut {kontext.vertraglicher_quellenbeleg or '(kein Beleg erfasst)'}: "
-            f"{_eur(kontext.vertraglich_zulaessiger_betrag_cent)}"
-        )
-        zeilen.append("")
-    zeilen.append(
-        f"Wirksamkeitstermin der gesetzlichen/vertraglichen Höchstgrenze: {kontext.massgeblicher_termin.isoformat()} "
-        "(1. April des Ziel-Bewertungsjahres)."
-    )
-    if kontext.rechtsordnung == "OESTERREICH_MRG_VOLL":
-        zeilen.append(
-            "Ihre tatsächliche Zahlungspflicht für den erhöhten Betrag beginnt gemäß § 16 Abs 9 MRG erst mit dem "
-            "nächsten Zinstermin, der mindestens 14 Tage NACH dem nachgewiesenen Zugang dieses Schreibens bei "
-            "Ihnen liegt - nicht rückwirkend und nicht automatisch zum oben genannten Wirksamkeitstermin."
-        )
-    else:
-        zeilen.append(
-            "Ihre tatsächliche Zahlungspflicht für den erhöhten Betrag beginnt erst mit einem späteren "
-            "Zinstermin nach nachgewiesenem Zugang dieses Schreibens - nicht rückwirkend und nicht "
-            "automatisch zum oben genannten Wirksamkeitstermin. Die konkrete Frist ist für Ihren Vertrag "
-            "gesondert zu prüfen."
-        )
-    zeilen.append("")
-    zeilen.extend(_abschluss(kontext))
-    return "\n".join(zeilen)
-
-
-def erhoehungsschreiben_text_klausel(kontext: SchreibenKontext) -> str:
-    """Geschäftsraum-/generischer-Klausel-Pfad - zitiert BEWUSST NICHT
-    pauschal § 16 Abs 9 MRG (dessen Anwendbarkeit auf diesen konkreten
-    Vertrag wurde in dieser Sitzung nicht unabhängig verifiziert), nur
-    die vertragliche Klausel selbst; Zustellform/Fristen bleiben ein
-    ausdrücklich zu prüfender Einzelfall."""
-
-    zeilen = _kopf_und_positionen(kontext, betreff_zusatz="Anhebung des Mietzinses laut Vertragsklausel")
-    zeilen.append(
-        f"hiermit teilen wir Ihnen aufgrund der vertraglich vereinbarten Wertsicherungsklausel "
-        f"({kontext.klausel_referenz or 'siehe Vertragsbeleg'}) die Anhebung des Mietzinses für "
-        f"{kontext.einheit_bezeichnung} mit."
-    )
-    zeilen.append("")
-    zeilen.append(
-        f"Vertragsbeleg: {kontext.vertrag_beleg_referenz}. Rechtsordnung: {kontext.rechtsordnung}. Die genaue "
-        "Zustellform und Fristenlage für diesen Vertrag ist im Einzelfall zu prüfen; dieses Schreiben "
-        "behauptet insbesondere KEINE pauschale Anwendung von § 16 Abs 9 MRG."
-    )
-    zeilen.append("")
-    zeilen.append(f"Wirksamkeitstermin laut Klauselberechnung: {kontext.massgeblicher_termin.isoformat()}.")
-    zeilen.append("")
-    zeilen.extend(_abschluss(kontext))
-    return "\n".join(zeilen)

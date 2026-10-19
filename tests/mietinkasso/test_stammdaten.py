@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 
 from mietinkasso.domain.enums import Nutzungsstatus, OPTyp
 from mietinkasso.stammdaten.service import ObjektAusgeschlossenError, StammdatenService
+from mietinkasso.stammdaten.telefon import TelefonUngueltigError, tel_href
 
 
 def test_upsert_debitor_setzt_postadresse_geprueft_bei_echter_adressaenderung_zurueck(stammdaten_repo):
@@ -55,6 +56,74 @@ def test_upsert_debitor_erhaelt_postadresse_geprueft_bei_reinem_email_update(sta
         adresse="Immergleiche Gasse 3, 1030 Wien", postadresse_geprueft=False,
     )
     assert stammdaten_repo.get_debitor("DEB-ADR-2").postadresse_geprueft is False
+
+
+def test_upsert_debitor_ohne_telefon_erhaelt_gespeicherte_nummer_und_loescht_nur_ausdruecklich(stammdaten_repo):
+    """Auftrag HV-20260930-PORTAL-LISTEN: ein Upsert, der `telefon` gar
+    nicht übergibt (jeder ältere Aufrufer/Import), darf eine gespeicherte
+    Nummer nie löschen - nur ein ausdrückliches `None` tut das."""
+
+    stammdaten_repo.upsert_debitor(id="DEB-TEL-1", name="Synthetische Mieterin", email="tel@example.at")
+    assert stammdaten_repo.get_debitor("DEB-TEL-1").telefon is None  # fehlend bleibt fehlend
+
+    stammdaten_repo.upsert_debitor(
+        id="DEB-TEL-1", name="Synthetische Mieterin", email="tel@example.at", telefon="  +43 1  000 00 00 ",
+    )
+    assert stammdaten_repo.get_debitor("DEB-TEL-1").telefon == "+43 1 000 00 00"
+
+    # Routine-Upsert OHNE Telefon (z. B. korrigierte E-Mail/Adresse): Nummer bleibt.
+    stammdaten_repo.upsert_debitor(
+        id="DEB-TEL-1", name="Synthetische Mieterin", email="neu@example.at", adresse="Testgasse 1, 1010 Wien",
+    )
+    debitor = stammdaten_repo.get_debitor("DEB-TEL-1")
+    assert (debitor.email, debitor.adresse, debitor.telefon) == ("neu@example.at", "Testgasse 1, 1010 Wien", "+43 1 000 00 00")
+
+    # Ausdrückliches None löscht - und nur das.
+    stammdaten_repo.upsert_debitor(
+        id="DEB-TEL-1", name="Synthetische Mieterin", email="neu@example.at", adresse="Testgasse 1, 1010 Wien",
+        telefon=None,
+    )
+    assert stammdaten_repo.get_debitor("DEB-TEL-1").telefon is None
+
+
+@pytest.mark.parametrize("ungueltig", ["0" * 41, "<script>alert(1)</script>", "Tel. 123456", "12", "javascript:1234"])
+def test_upsert_debitor_lehnt_ungueltiges_telefon_ab_ohne_etwas_zu_schreiben(stammdaten_repo, ungueltig):
+    stammdaten_repo.upsert_debitor(id="DEB-TEL-2", name="Vorher", telefon="0660 000 000")
+    with pytest.raises(TelefonUngueltigError):
+        stammdaten_repo.upsert_debitor(id="DEB-TEL-2", name="Nachher", telefon=ungueltig)
+    with pytest.raises(TelefonUngueltigError):
+        stammdaten_repo.set_debitor_telefon(debitor_id="DEB-TEL-2", telefon=ungueltig)
+    debitor = stammdaten_repo.get_debitor("DEB-TEL-2")
+    assert (debitor.name, debitor.telefon) == ("Vorher", "0660 000 000")
+
+
+def test_set_debitor_telefon_aendert_ausschliesslich_das_telefon(stammdaten_repo):
+    stammdaten_repo.upsert_debitor(
+        id="DEB-TEL-3", name="Synthetischer Mieter", email="drei@example.at", adresse="Prüfgasse 3, 1030 Wien",
+        postadresse_geprueft=True,
+    )
+    stammdaten_repo.upsert_debitor(id="DEB-TEL-4", name="Unbeteiligter Mieter", telefon="0660 111 111")
+
+    assert stammdaten_repo.set_debitor_telefon(debitor_id="DEB-TEL-3", telefon="01/000 00-0") is True
+    assert stammdaten_repo.set_debitor_telefon(debitor_id="DEB-TEL-3", telefon="01/000 00-0") is False  # unverändert
+    debitor = stammdaten_repo.get_debitor("DEB-TEL-3")
+    assert debitor.telefon == "01/000 00-0"
+    assert (debitor.name, debitor.email, debitor.adresse) == ("Synthetischer Mieter", "drei@example.at", "Prüfgasse 3, 1030 Wien")
+    assert debitor.postadresse_geprueft is True  # Adressprüfung bleibt unberührt
+    assert stammdaten_repo.get_debitor("DEB-TEL-4").telefon == "0660 111 111"  # fremder Kontakt unberührt
+
+    assert stammdaten_repo.set_debitor_telefon(debitor_id="DEB-TEL-3", telefon="   ") is True  # ausdrücklich löschen
+    assert stammdaten_repo.get_debitor("DEB-TEL-3").telefon is None
+    with pytest.raises(ValueError):
+        stammdaten_repo.set_debitor_telefon(debitor_id="GIBT-ES-NICHT", telefon="0660 000 000")
+
+
+def test_tel_href_nur_bei_eindeutig_waehlbarer_nummer():
+    assert tel_href("+43 660 000 00 00") == "tel:+436600000000"
+    assert tel_href("01/000 00-0") == "tel:01000000"
+    assert tel_href("+43 (0) 660 000 000") is None  # "(0)" würde zu einer falschen Wählfolge
+    assert tel_href("01 000+12") is None
+    assert tel_href(None) is None and tel_href("") is None
 
 
 def test_kaution_ist_strukturell_von_op_getrennt(stammdaten_repo, op_service, basis_vertrag, ctx_factory):

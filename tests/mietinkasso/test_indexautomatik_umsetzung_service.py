@@ -138,7 +138,7 @@ def _profil_und_komponente(
         bezugsjahr=bezugsjahr, bezugsmonat=bezugsmonat, letzte_basis_war_jahresdurchschnitt=letzte_basis_war_jahresdurchschnitt,
         basis_komponenten_ids=[komponente_id],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
-        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz=None,
+        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz="Punkt 5 Wertsicherung",
         erstellt_von="markus",
     )
     return rechtsprofil_service.freigeben(entwurf.id, ctx=admin_ctx, freigegeben_von="markus")
@@ -463,7 +463,7 @@ def test_umsetzen_mehrkomponenten_historisiert_alle_betroffenen_komponenten(
         bezugsjahr=2024, bezugsmonat=1, letzte_basis_war_jahresdurchschnitt=False,
         basis_komponenten_ids=["K-1", "K-2"],
         vertraglich_zulaessiger_betrag_cent=200_000, vertraglicher_quellenbeleg="Punkt 5",
-        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz=None,
+        vertraglicher_fruehestmoeglicher_termin=date(2026, 4, 1), vertrag_beleg_referenz="Vertrag", klausel_referenz="Punkt 5 Wertsicherung",
         erstellt_von="markus",
     )
     profil = rechtsprofil_service.freigeben(entwurf.id, ctx=admin_ctx, freigegeben_von="markus")
@@ -910,6 +910,7 @@ def test_umsetzen_end_to_end_ueber_echten_versand_und_zugang_und_vorschreibung(
             rechtsprofil_version=profil.version, status="BEREIT", massgeblicher_termin=date(2026, 3, 1),
             erhoehung_cent=1_000, schreiben_text="Testschreiben", idempotenzschluessel=f"{vertrag.id}:mieweg:2026",
             empfaenger_snapshot={
+                'begehren': dict(version='JLB-INDEX-20260930-1',fehler=[],erstellt_am='2026-03-01',zugang_spaetestens='2026-03-22',zahlungstermin='2026-04-05',frist_tage=14,faelligkeit_tag=5,text_sha256=__import__('hashlib').sha256(b'Testschreiben').hexdigest()),
                 "debitor_id": vertrag.debitor_id, "name": debitor.name, "adresse": "Corsogasse 1/3, 1010 Wien",
                 "email": debitor.email, "vertrag_gueltig_bis": None, "vertrag_rechtsordnung": vertrag.rechtsordnung,
                 "komponenten_snapshot": [

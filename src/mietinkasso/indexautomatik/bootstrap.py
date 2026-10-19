@@ -68,6 +68,7 @@ def bauen(session_factory: sessionmaker[Session], settings: Settings) -> Indexau
     outbox_service = ErhoehungsschreibenOutboxService(
         outbox_repository, stammdaten_repository, rechtsprofil_repository, rechtsprofil_service,
         jlb_signatur="" if settings.hv_mail_socket_path else settings.indexautomatik_jlb_signatur,
+        index_repository=index_repository,
     )
     index_automatik_service = IndexautomatikService(
         stammdaten_repository=stammdaten_repository,

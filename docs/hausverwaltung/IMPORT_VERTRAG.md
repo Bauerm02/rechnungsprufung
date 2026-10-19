@@ -145,6 +145,19 @@ Enum-Werte sind exakt wie in `domain/enums.py` (Großschreibung).
 | `name` | str | ja | |
 | `email` | str\|null | nein | fehlt sie: Vertrag bleibt anlegbar, aber laut bestehendem `mahnwesen/service.py` nie automatisch mahnfähig — im Plan als Hinweiszähler sichtbar |
 | `adresse` | str\|null | nein | |
+| `telefon` | str\|null | nein | höchstens 40 Zeichen, nur Ziffern, Leerzeichen und `+ ( ) / - .`, mindestens 3 Ziffern; sonst wird die Datei abgelehnt |
+
+**`telefon` — fehlt ≠ `null` (Ergänzung 30.09.2026):** Fehlt das Feld
+(oder ist es ein leerer Text bzw. eine leere/fehlende CSV-Zelle), gilt
+es als nicht angegeben: eine bereits gespeicherte Nummer bleibt
+unverändert, der Debitor ist `UNVERAENDERT`, und der Paket-Hash ist
+derselbe wie vor Einführung des Felds. Eine ausdrücklich angegebene,
+von der gespeicherten abweichende Nummer ist bei sonst identischem
+Debitor kein Konflikt, sondern eine sichtbare `AKTUALISIERUNG`
+(Plantext ohne die Nummer). Nur ein ausdrückliches JSON-`null` löscht
+die Nummer; im CSV-Bündel gibt es kein `null`, dort kann eine Nummer
+gesetzt, aber nicht gelöscht werden. Weichen Name, E-Mail oder Adresse
+ab, bleibt es wie bisher ein Konflikt.
 
 ### `vertraege[]`
 | Feld | Typ | Pflicht | Hinweis |

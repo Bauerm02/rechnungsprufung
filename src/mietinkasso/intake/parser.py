@@ -29,6 +29,7 @@ from mietinkasso.intake.schema import (
     SperreZeile,
     VertragZeile,
 )
+from mietinkasso.stammdaten.telefon import TelefonUngueltigError, normalisiere_telefon
 
 #: Erwartete Dateinamen eines CSV-Bündels (siehe IMPORT_VERTRAG.md).
 CSV_BUENDEL_DATEINAMEN = (
@@ -167,12 +168,33 @@ def _einheit_aus_dict(zeile: dict) -> EinheitZeile:
     )
 
 
-def _debitor_aus_dict(zeile: dict) -> DebitorZeile:
+def _debitor_aus_dict(zeile: dict, *, null_loescht_telefon: bool) -> DebitorZeile:
+    """`telefon`: fehlt das Feld (oder ist es ein leerer Text/eine leere
+    CSV-Zelle), gilt es als NICHT angegeben - eine gespeicherte Nummer
+    bleibt erhalten. Nur ein ausdrückliches JSON-`null`
+    (`null_loescht_telefon`) löscht; im CSV-Bündel gibt es kein `null`,
+    dort kann eine Nummer also nur gesetzt, nie gelöscht werden."""
+
+    kontext = f"Debitor '{zeile.get('id')}'"
+    telefon: str | None = None
+    telefon_angegeben = False
+    if "telefon" in zeile:
+        roh = zeile["telefon"]
+        if roh is None:
+            telefon_angegeben = null_loescht_telefon
+        else:
+            try:
+                telefon = normalisiere_telefon(roh)
+            except TelefonUngueltigError as exc:
+                raise IntakeFormatFehlerError(f"{kontext}: Feld 'telefon' ungültig - {exc}") from exc
+            telefon_angegeben = telefon is not None
     return DebitorZeile(
         id=_pflicht_str(zeile, "id", "Debitor"),
-        name=_pflicht_str(zeile, "name", f"Debitor '{zeile.get('id')}'"),
+        name=_pflicht_str(zeile, "name", kontext),
         email=_optional_str(zeile, "email"),
         adresse=_optional_str(zeile, "adresse"),
+        telefon=telefon,
+        telefon_angegeben=telefon_angegeben,
     )
 
 
@@ -317,7 +339,7 @@ def parse_json_paket(text: str) -> IntakePaket:
         gesellschaften=tuple(_gesellschaft_aus_dict(z) for z in rohdaten.get("gesellschaften", [])),
         objekte=tuple(_objekt_aus_dict(z) for z in rohdaten.get("objekte", [])),
         einheiten=tuple(_einheit_aus_dict(z) for z in rohdaten.get("einheiten", [])),
-        debitoren=tuple(_debitor_aus_dict(z) for z in rohdaten.get("debitoren", [])),
+        debitoren=tuple(_debitor_aus_dict(z, null_loescht_telefon=True) for z in rohdaten.get("debitoren", [])),
         vertraege=tuple(_vertrag_aus_dict(z) for z in rohdaten.get("vertraege", [])),
         eroeffnungen=tuple(_eroeffnung_aus_dict(z) for z in rohdaten.get("eroeffnungen", [])),
         nachbuchungen=tuple(_nachbuchung_aus_dict(z) for z in rohdaten.get("nachbuchungen", [])),
@@ -355,7 +377,7 @@ def parse_csv_buendel(*, quelle: str, dateien: dict[str, str]) -> IntakePaket:
         gesellschaften=tuple(_gesellschaft_aus_dict(z) for z in _zeilen("gesellschaften")),
         objekte=tuple(_objekt_aus_dict(z) for z in _zeilen("objekte")),
         einheiten=tuple(_einheit_aus_dict(z) for z in _zeilen("einheiten")),
-        debitoren=tuple(_debitor_aus_dict(z) for z in _zeilen("debitoren")),
+        debitoren=tuple(_debitor_aus_dict(z, null_loescht_telefon=False) for z in _zeilen("debitoren")),
         vertraege=tuple(_vertrag_aus_dict(z) for z in _zeilen("vertraege")),
         eroeffnungen=tuple(_eroeffnung_aus_dict(z) for z in _zeilen("eroeffnungen")),
         nachbuchungen=tuple(_nachbuchung_aus_dict(z) for z in _zeilen("nachbuchungen")),

@@ -44,10 +44,16 @@ class EinheitZeile:
 
 @dataclass(frozen=True)
 class DebitorZeile:
+    """`telefon_angegeben` unterscheidet "Feld fehlt in der Quelle"
+    (`False`: eine gespeicherte Nummer bleibt unverändert) von einer
+    ausdrücklichen Angabe (`True`: `telefon` wird gesetzt, `None` löscht)."""
+
     id: str
     name: str
     email: str | None = None
     adresse: str | None = None
+    telefon: str | None = None
+    telefon_angegeben: bool = False
 
 
 @dataclass(frozen=True)
@@ -224,8 +230,15 @@ def paket_hash(paket: IntakePaket) -> str:
     ob das Paket aus JSON oder einem CSV-Bündel geparst wurde. `apply()`
     verlangt genau diesen Hash aus dem vorherigen `plan()`-Lauf als
     Bestätigung ("bindet sich an identischen Inhalt"); ändert sich auch
-    nur ein Feld einer einzigen Zeile, ändert sich dieser Hash."""
+    nur ein Feld einer einzigen Zeile, ändert sich dieser Hash.
+
+    Ein Debitor OHNE Telefonangabe wird exakt wie vor Einführung des
+    Felds gehasht - ein Paket, das `telefon` nicht kennt, behält seinen
+    bisherigen Hash."""
 
     rohdaten = dataclasses.asdict(paket)
+    for debitor in rohdaten["debitoren"]:
+        if not debitor["telefon_angegeben"]:
+            del debitor["telefon"], debitor["telefon_angegeben"]
     kanonisch = json.dumps(rohdaten, sort_keys=True, default=str, ensure_ascii=False)
     return hashlib.sha256(kanonisch.encode("utf-8")).hexdigest()

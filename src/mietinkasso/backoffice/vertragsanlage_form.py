@@ -13,6 +13,7 @@ from html import escape as h
 
 from mietinkasso.backoffice.views import csrf_feld, eur, option, parse_eur_betrag, sperrgrund_label
 from mietinkasso.domain.money import cents_to_decimal, zerlege_brutto_cent
+from mietinkasso.stammdaten.telefon import TELEFON_MAX_LAENGE, normalisiere_telefon, tel_href
 
 NUTZUNGSARTEN = ["UNGEKLAERT", "WOHNUNG", "BUERO", "GESCHAEFTSLOKAL", "SONSTIGE"]
 RECHTSORDNUNGEN = [
@@ -46,6 +47,18 @@ def _beleg_hinweis(vorschlaege: dict, feld: str) -> str:
         f'<p class="muted">Vorschlag aus Dokument, Seite {v.seite}: '
         f'&bdquo;&hellip;{h(v.auszug)}&hellip;&ldquo; — bitte prüfen.</p>'
     )
+
+
+def telefon_html(telefon: str | None) -> str:
+    """Telefonnummer eines Debitors für Mieterakte und Mieterliste:
+    escaped, als `tel:`-Link nur bei eindeutig wählbarer Schreibweise,
+    sonst reiner Text; fehlend = „Nicht hinterlegt“ (nie ergänzt)."""
+
+    text = (telefon or "").strip()
+    if not text:
+        return '<span class="muted">Nicht hinterlegt</span>'
+    href = tel_href(text)
+    return f'<a href="{h(href)}">{h(text)}</a>' if href else h(text)
 
 
 def einheit_label(objekt, einheit) -> str:
@@ -151,6 +164,8 @@ def neu_kontext_formular(*, einheiten_mit_objekt: list[tuple], debitoren: list, 
           <label>Name</label><input name="neuer_debitor_name">
           <label>E-Mail</label><input name="neuer_debitor_email" type="email">
           <label>Adresse</label><input name="neuer_debitor_adresse">
+          <label for="neuer-debitor-telefon">Telefon (optional)</label>
+          <input id="neuer-debitor-telefon" name="neuer_debitor_telefon" type="tel" maxlength="{TELEFON_MAX_LAENGE}">
         </fieldset>
         <fieldset><legend>Mietbestandteile (optional, geprüfte Komponenten - keine historische Sollbuchung)</legend>
           <p class="muted">Werden als aktive Vertragskomponenten ab Vertragsbeginn angelegt, lösen aber KEINE
@@ -191,6 +206,7 @@ def neu_kontext_werte(form) -> dict:
             id=neuer_debitor_id, name=neuer_debitor_name,
             email=str(form.get("neuer_debitor_email", "")).strip() or None,
             adresse=str(form.get("neuer_debitor_adresse", "")).strip() or None,
+            telefon=normalisiere_telefon(form.get("neuer_debitor_telefon", "")),
         )
         debitor_id = neuer_debitor_id
     else:
@@ -1010,6 +1026,16 @@ def detail_ansicht(
       <table>
         <tr><th>Mieter</th><td>{h(debitor.name)}{' — ' + h(debitor.email) if debitor.email else ''}</td></tr>
         <tr><th>Kontakt</th><td>{h(debitor.adresse) if debitor.adresse else 'nicht hinterlegt'}</td></tr>
+        <tr><th>Telefon</th><td>{telefon_html(debitor.telefon)}
+            <details><summary>Telefon ändern</summary>
+              <form method="post" action="/backoffice/vertrag/{h(vertrag.id)}/telefon" style="max-width:320px;">
+                {csrf_feld(csrf)}
+                <label for="debitor-telefon">Telefon (leer speichern = Nummer löschen)</label>
+                <input id="debitor-telefon" name="telefon" type="tel" maxlength="{TELEFON_MAX_LAENGE}" value="{h(debitor.telefon or '')}">
+                <button type="submit" class="secondary">Telefon speichern</button>
+              </form>
+              <p class="muted">Gilt für diesen Mieter in allen seinen Verträgen. Name, E-Mail und Adresse bleiben unverändert.</p>
+            </details></td></tr>
         <tr><th>Vermieter-Gesellschaft</th><td>{h(gesellschaft.name)}</td></tr>
         <tr><th>Verwaltung</th><td>{h(profil.verwaltung_bezeichnung) if profil and profil.verwaltung_bezeichnung else '—'}
             {_status_badge('bereit' if (profil and profil.verwaltung_bezeichnung) else 'Angabe fehlt')}</td></tr>

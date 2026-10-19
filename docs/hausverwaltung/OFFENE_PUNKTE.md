@@ -1,5 +1,62 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## OP-Korrekturen und Ablaufprüfung 20.09.2026 — HV-20260920-OP-ABLAEUFE
+
+Die beiden OP-Befunde des Fachreviews sind auf `codex/hv-op-ablaeufe-20260920`
+behoben; die nachfolgende ältere Offenmeldung ist damit für diesen Branch
+abgelöst. Noch keine Produktivübernahme.
+
+- Gemeinsame Betrags- und Bezugsprüfung für neue Buchung und Korrektur;
+  ausdrückliche Forderungsbindung und Leistungsperiode bleiben erhalten.
+- Korrektur liest Konto/Original frisch unter Schreibsperre. Identischer
+  Vorgang bleibt wirkungslos, abweichender Vorgang wird abgelehnt. Storno
+  und Ersatz werden gemeinsam zurückgerollt; auch Eröffnungskorrekturen
+  beachten die Einmaligkeitsregel in der richtigen Reihenfolge.
+- Bankgebundene oder von aktiven Buchungen referenzierte Positionen können
+  über die allgemeine OP-Korrektur nicht mehr verändert werden. Die
+  vorhandenen Verknüpfungen bleiben erhalten; eine fachlich abgestimmte
+  Änderung der Bankzuordnung ist ein separater, hier nicht implementierter
+  Ablauf. Keine automatische Umhängung historischer Buchungen.
+- Identische Rücklastschrift-Wiederholung liefert die bestehende Zeile
+  erst nach sämtlichen Zugriffs-/Bindungsprüfungen zurück. Abweichungen
+  bleiben Konflikte; Betragsgrenzen für neue Rücklastschriften bleiben bestehen.
+- Synthetische Ablaufprüfung: Vorschreibung, Teilzahlung, Korrektur,
+  Bankverknüpfung, Rücklastschrift und Mahnvorschau, einschließlich
+  mehrfacher Ausführung, Commitfehler und konkurrierender Korrekturen.
+
+Abnahme und Grenzen: führende CEO-Zentrale,
+`02_Ergebnisse/HV-20260920-OP-ABLAEUFE/Ergebnis.md`.
+Keine nachträgliche Reparatur historischer Produktivdaten und kein Versand.
+
+## Codeprüfung 20.09.2026 — HV-20260920-FACHREVIEW
+
+Auf dem Qualitätsbranch sind zwei Bankreferenzfehler behoben: mehrere
+unterschiedliche VERTRAG-Kennungen werden nicht mehr als eindeutig verbucht;
+eine längere ID wie V-601-3-NACHFOLGER blockiert nicht mehr V-601-3.
+Gemeinsamer Parser für Vorschau, Zuordnung und Mahnrelevanz; synthetische Tests.
+Diese Änderung ist noch nicht produktiv übernommen.
+
+Zwei weitere reproduzierte Fehler bleiben ausdrücklich **offen** in
+`op/service.py::storniere_und_korrigiere`:
+
+- Der Korrekturweg übernimmt `original.typ`, prüft den Ersatzbetrag aber
+  nicht mit `_pruefe_betrag_positiv`. Damit kann eine SOLL-Korrektur einen
+  negativen Betrag speichern, obwohl die normale Buchung diesen ablehnt.
+- Eine Zahlungskorrektur übernimmt die ausdrückliche Forderungsbindung
+  `bezieht_sich_auf_id` nicht. Eine unverändert hohe Korrektur kann dadurch
+  statt der bestimmten Forderung eine ältere Forderung tilgen. Im
+  synthetischen Beispiel wechselt der offene 100-Euro-Posten von August auf
+  September, obwohl sich der Gesamtsaldo nicht ändert.
+
+Für die Korrektur müssen zusammenhängende Bankzuordnungen, Rücklastschriften,
+Stornierung der Zielforderung, Betragsprüfung und Wiederholung gemeinsam
+abgesichert werden; keine bloße Feldkopie als vollständige Lösung ausgeben.
+Unabhängige Reproduktionen und Bericht liegen im führenden CEO-Projekt unter
+`02_Ergebnisse/HV-20260920-FACHREVIEW` und
+`01_Arbeit/HV-20260920-FACHREVIEW/offene_reviewtests`.
+Keine Gesamtfehlerfreiheit behauptet; keine produktiven Buchungen oder Mails.
+
+
 Stand: lokaler synthetischer Backoffice-Pilot, 11.09.2026; keine Produktionsfreigabe.
 Alles hier ist bewusst offen gelassen bzw. bewusst konservativ gebaut —
 keine stillschweigend übersprungenen Punkte.
@@ -137,7 +194,7 @@ davon (folgen erst nach Rückmeldung des Nutzers).
   GEPRUEFT, Sperren-Aufhebung mit/ohne Begründung, Index-Prüfbedarf,
   Bank-Verknüpfung inkl. Replay/Link-Duplikat, sowie der route-seitige
   403-Block der automatischen Zuordnung außerhalb bekannter
-  Demo-Umgebungen über `monkeypatch` auf `backoffice/app.py::_DEMO_UMGEBUNG`
+  Demo-Umgebungen über `monkeypatch` auf `backoffice/dependencies.py::_DEMO_UMGEBUNG`
   — ein direkter End-to-End-Test mit echtem
   `MIETINKASSO_ENVIRONMENT=production`-Prozessstart ist wegen der
   bereits in Paket A dokumentierten Modul-Import-Einmaligkeit von
@@ -4196,6 +4253,30 @@ konkreten Codex-Zahlenbeispiele (original 50000/aktuell 55000/Gesamt
 und der Fail-closed-/Unter-Schwelle-/Persistenz-nach-Versand-Fälle.
 1058/1058 grün im `tests/mietinkasso`-Gesamtlauf.
 
+## 20.09.2026 – Mietbeginn und Indexbasis
+
+Siehe INDEXSTART_20260920.md: technische Übernahme und ursprünglicher Mietbeginn getrennt. Keine pauschale Indexfreigabe aus Datumsübernahme; fehlende Vertrags-/Historiennachweise und globale Versand-/Soll-Aktivierung bleiben gesondert zu erledigen.
+
+
+## 22.09.2026 – Selfstorage-Fortschreibung
+Deterministischer lokaler XLSX-Prüfer `scripts/selfstorage_fortschreibung.py`; keine KI zur Laufzeit. Portal zeigt Rechenergebnisse unter `/backoffice/selfstorage-pruefung`, Zahlungseingänge separat in der Monatsabrechnung. Bekannte Dateien werden per SHA-256 dem ausdrücklich bestätigten Leistungsmonat zugeordnet. Neue/inhaltlich geänderte Dateien brauchen eine belastbare Monatszuordnung, geänderte Formeln bleiben Prüffälle. Keine automatische Nettofreigabe, Rechnungserzeugung, OP-Buchung oder Zahlungszuordnung aus bloßer Betragsgleichheit. Quelle/zeitliche Verfügbarkeit des lokalen Rechners bleiben im Betrieb relevant. Claude-CLI wurde organisationsseitig abgewiesen; Codex führte die Implementierung und Tests durch, keine erfolgreiche Claude-Gegenprüfung behauptet. Native Mahnstufen-Fortschreibung bleibt ein gesonderter offener Vorgang.
+
+## 30.09.2026 – Automatische Online-Listen (HV-20260930-PORTAL-LISTEN)
+
+Drei rein lesende Seiten `/backoffice/mieterliste`, `/backoffice/zinsliste`, `/backoffice/salden`; Beschreibung und Grenzen in `PORTAL_LISTEN.md`. Drei neue GET-Routen, deshalb ist `tests/mietinkasso/fixtures/backoffice_http_contract.json` um genau diese drei Einträge ergänzt. Code und Tests wurden von Claude ohne Testlauf geliefert (nur Dateiwerkzeuge); `pytest` läuft bei Codex.
+
+Offen bzw. bewusst nicht geliefert:
+
+- **Telefon (Nachtrag, vom Auftraggeber ausdrücklich verlangt):** einzige Schemaänderung dieses Auftrags ist die additive, nullable Spalte `debitoren.telefon`; sie wird beim Start über das bestehende `ensure_additive_columns` idempotent nachgezogen, Bestandszeilen bleiben NULL („Nicht hinterlegt"). Pflege in der Mieterakte (`POST /backoffice/vertrag/{vertrag_id}/telefon`, deshalb ein weiterer Eintrag im HTTP-Vertrag), bei der Neuanlage eines Mieters und optional im Intake (`debitoren[].telefon`). Ein Upsert/Import ohne das Feld lässt eine gespeicherte Nummer stehen; gelöscht wird nur ausdrücklich (leeres Feld in der Akte, JSON-`null` im Intake). Im CSV-Bündel lässt sich eine Nummer setzen, aber nicht löschen. Bestandsnummern sind nicht eingespielt – es gibt keine Quelle dafür in diesem Auftrag. Auch dieser Nachtrag wurde ohne Testlauf geliefert.
+- **Netto/USt in der Zinsliste:** nur bei vollständiger Netto-Mietanteil-Freigabe aller Mietkomponenten einer Zeile; sonst „Aufteilung unbekannt". Für BK/Sonstige gibt es keine geprüfte Netto-Basis, also auch keine Netto-Gesamtsumme.
+- **Nutzungsstatus ohne Historie:** Die Zinsliste zeigt für jeden Monat den heute gepflegten Nutzungsstatus. Ein beendeter Vertrag bei weiterhin „vermieteter" Einheit wird als „prüfen" ausgewiesen, nicht als Leerstand; die Klärung ist eine manuelle Stammdatenpflege.
+- **Keine Aliquotierung:** Beginnt ein Vertrag im Monat, bleibt der Betrag unbekannt; endet er im Monat, steht der volle Monatsbetrag mit Hinweis. Beginnt oder endet Vertrag bzw. Komponente innerhalb des Monats, ist die Zeile als „Stand Monatserster" markiert und in der Summe getrennt ausgewiesen; der tatsächlich geschuldete Monatsbetrag bleibt eine manuelle Klärung.
+- **Index:** Nicht umgesetzte oder blockierte Indexanpassungen sind nicht in der Zinsliste enthalten; maßgeblich ist die gespeicherte Komponente.
+- **Bank:** kein automatischer Abruf. Die Saldenliste zeigt den bestätigten/eingespielten Bankstand je Bankkonto der Gesellschaft; eine Zuordnung Bankkonto → Objekt/Mietkonto gibt es im Datenmodell nicht.
+- **Variable Erlöse:** Die Zinsliste nennt nur den Status des Monatsberichts und verlinkt ihn; Beträge stehen weiterhin ausschließlich in der variablen Monatsabrechnung.
+- **Mehrbenutzer:** Das Backoffice kennt weiterhin einen ADMIN-Operator; die Gesellschaftsfilterung für eingeschränkte Rollen ist auf Service-Ebene getestet, über HTTP aber nicht auslösbar.
+- **Umfang:** keine Paginierung und kein Export; jede Liste wird vollständig je Aufruf berechnet (mehrere Lesezugriffe je Vertrag). Für den Pilotbestand unkritisch, bei deutlich größerem Bestand zu messen.
+
 ## Auftrag HV-20261019-MAHNKOSTEN (Mahnkosten-/Zinslogik)
 
 Ergänzt die bereits bestehende Mahnkosten-/Zinslogik (`mahnwesen/kosten.py`,
@@ -4610,3 +4691,81 @@ ein unparsbares/simuliertes `heute` und bindet die gespeicherte Freigabe
 nachweislich an das echte Tagesdatum, POST lehnt Stufe 3 ab. 1085/1085
 Tests grün im Gesamtlauf. Keine Live-Buchung/kein Versand/kein
 Deployment.
+
+### Release-Integration mit der produktiven e7b621c-Linie (19.10.2026)
+
+Codex hat a37a9d1 unabhängig gelesen (201 synthetische Windows-Tests
+grün) und parallel die produktive `e7b621c`-Linie
+(`origin/codex/ceo-codeaudit-20261010`, 15 eigene Commits ab Mergebase
+`4467674`, u. a. den vollständigen Backoffice-Router-Refactor
+`16af422` sowie den neuen OP-Bindungsgate `62757c3`) auf dem
+bestehenden Hetzner-Server produktiv genommen. Auftrag: beide Linien in
+`claude/bold-volta-7xovjq` zusammenführen, OHNE eine der 15 produktiven
+Verbesserungen zurückzusetzen und OHNE neue Fachfunktionen - reine
+Integrations-/Portierungsarbeit, echter Merge-Commit (kein Force-Push,
+kein Rebase).
+
+**Konfliktauflösung:**
+
+- `backoffice/app.py` war durch `16af422` von einer ~5635-Zeilen-
+  Monolith-Datei zu einer ~58-Zeilen-Komposition-Root geworden
+  (`routes/*.py`, `dependencies.py`, `auth.py`, siehe
+  `BACKOFFICE_ARCHITEKTUR.md`). Die fünf Mahnkosten-Commits wurden NICHT
+  textuell gemerged, sondern strukturell in die neue Ordnung portiert:
+  neue Service-Singletons (`RuecklastschriftkostenRepository`/
+  `-Service`) in `dependencies.py`, die Mahnpauschale-Freigabe-Zeile und
+  beide neuen Mahnpauschale-Freigabe-Routen in `routes/mahnwesen.py`,
+  der RUECKLASTSCHRIFT-Link und die beiden Rücklastschriftkosten-Routen
+  in `routes/konten.py` - jeweils im bereits etablierten `deps.`/`_ctx`/
+  `_fehlerseite`/`_layout`-Idiom des Refactors, keine abweichende
+  Struktur eingeführt.
+- `docs/hausverwaltung/OFFENE_PUNKTE.md`: reiner Append-Konflikt
+  (produktive Abschnitte 20.09./22.09./30.09. vor dem hiesigen
+  HV-20261019-Abschnitt einsortiert), kein inhaltlicher Widerspruch.
+- `tests/mietinkasso/test_backoffice.py`: zwei reine Append-Konflikte
+  (Mahnkosten-Tests und das produktive Portal-Listen-Testmodul wurden
+  beide vollständig erhalten, nur die Reihenfolge sortiert).
+- Produktions-Migration `debitoren.telefon` (additiv, `ensure_additive_
+  columns`, siehe `test_migrations.py`) sowie zwei neue produktive
+  Modell-Importe in `tables.py` (`eigentuemerzahlungen`,
+  `abgleichstatus`) wurden von git automatisch konfliktfrei übernommen.
+
+**Fachliche Anpassung durch das neue OP-Bindungsgate (`62757c3`,
+`op/validierung.py::pruefe_bezug`):** eine explizite `bezieht_sich_auf_
+id`-Bindung ist seit dieser produktiven Änderung NUR für ZAHLUNG/
+GUTSCHRIFT (→ Forderung) und RUECKLASTSCHRIFT (→ Zahlung) definiert,
+NICHT für SOLL. `RuecklastschriftkostenService.erfasse_und_buche`
+setzte diese Bindung bisher auf die neu gebuchte SOLL-Kostenforderung
+und scheiterte dadurch nach dem Merge mit
+`ZahlungsbindungInkonsistentError`. Behoben: die SOLL-Buchung bindet
+sich NICHT mehr an die Rücklastschrift-OP; die Rückverfolgbarkeit läuft
+stattdessen ausschließlich über
+`RuecklastschriftkostenTable.ruecklastschrift_op_position_id`/
+`kosten_op_position_id` (bereits vorher die primäre, eindeutige
+Verknüpfung). `test_ruecklastschriftkosten.py` entsprechend angepasst
+(`bezieht_sich_auf_id is None`, Verknüpfung stattdessen über
+`row.ruecklastschrift_op_position_id`).
+
+**Nutzerpräzisierung (19.10.2026) zum Mahnpauschale-Vorschlagswert:**
+ist im Zinsprofil kein belegter `mahnpauschale_kostenbasis_cent`
+hinterlegt, schlägt die Freigabemaske jetzt ausdrücklich 20,00 EUR als
+unverbindlichen Eigentümer-Prüfwert vor (Konstante
+`_UNVERBINDLICHER_PRUEFWERT_CENT` in `routes/mahnwesen.py`) - klar als
+solcher beschriftet ("kein Profilwert hinterlegt - unverbindlicher
+Eigentümer-Prüfwert, kein Beleg"), nur als Vorbelegung des Betragsfelds
+und der Verhältnisanzeige. Bindet NICHTS automatisch: alle vier
+Nachweisfelder bleiben Pflicht, die Vertragsquelle (Profil-Beleg) und
+der tatsächliche Aufwand werden NIE mit diesem Prüfwert vorbelegt
+(bleiben leer/„–"), keine automatische Freigabe oder Kostenbuchung.
+
+**HTTP-Vertragstest:** `tests/mietinkasso/fixtures/
+backoffice_http_contract.json` (produktives Lock-in aus `16af422`) um
+die vier neuen Routen erweitert (rein additiv - alle 101 vorher
+gesperrten/aufgelösten Routen unverändert, `session_dependency_count`
+weiterhin 1).
+
+**Ergebnis:** 1307/1307 synthetische Tests grün
+(`python -m pytest tests/mietinkasso`), inkl. Migrations- und
+HTTP-Vertragstests. Keine Livezugriffe, keine Buchung/Mail/Deployment.
+Codex führt im Anschluss die unabhängige Datenkopie-/Live-Abnahme auf
+dem bereits produktiven `e7b621c`-Stand durch.

@@ -123,6 +123,13 @@ class RuecklastschriftkostenService:
             try:
                 kosten_position_id = None
                 if dem_zahlungspflichtigen_zurechenbar:
+                    # KEINE `bezieht_sich_auf_id` auf die Rücklastschrift: eine
+                    # explizite OP-Bindung ist laut `op/validierung.py::pruefe_bezug`
+                    # nur für ZAHLUNG/GUTSCHRIFT (-> Forderung) und RUECKLASTSCHRIFT
+                    # (-> Zahlung) definiert, NICHT für SOLL. Die Rückverfolgbarkeit
+                    # läuft stattdessen über `RuecklastschriftkostenTable.
+                    # ruecklastschrift_op_position_id`/`kosten_op_position_id` (siehe
+                    # `anlegen` unten) sowie `import_id`/`beleg_referenz` dieser Position.
                     kosten_position = self._op_service.buchen(
                         ctx=ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=bankentgelt_cent,
                         belegdatum=heute, buchungsdatum=heute, faelligkeit=None,
@@ -130,7 +137,6 @@ class RuecklastschriftkostenService:
                         aenderungsgrund="Rücklastschriftkosten - tatsächliches Originalbankentgelt",
                         import_id=f"RUECKLASTSCHRIFTKOSTEN:{ruecklastschrift_op_position.id}",
                         quelle_system="ruecklastschriftkosten",
-                        bezieht_sich_auf_id=ruecklastschrift_op_position.id,
                         session=session,
                     )
                     kosten_position_id = kosten_position.id

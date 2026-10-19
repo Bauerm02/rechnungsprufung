@@ -57,6 +57,10 @@ def baue_paket_json(
             "id": neuer_debitor["id"], "name": neuer_debitor["name"],
             "email": neuer_debitor.get("email"), "adresse": neuer_debitor.get("adresse"),
         }]
+        # Nur bei tatsächlicher Eingabe - ein fehlendes Feld heißt im
+        # Intake "unverändert", ein `null` dagegen "löschen".
+        if neuer_debitor.get("telefon"):
+            paket["debitoren"][0]["telefon"] = neuer_debitor["telefon"]
 
     profil_eintrag: dict = {"vertrag_id": vertrag_id, "quelle_typ": quelle_typ}
     for feld in _PROFIL_FELDER:

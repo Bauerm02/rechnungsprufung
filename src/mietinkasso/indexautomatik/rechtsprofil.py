@@ -336,7 +336,10 @@ class RechtsprofilService:
                     "wartefrist_monate_nach_indexereignis": klausel.wartefrist_monate_nach_indexereignis,
                     "wartefrist_bezug": klausel.wartefrist_bezug,
                 }
+        mietprofil = self._stammdaten_repository.neuestes_mietvertragsprofil(vertrag.id, session=session)
+        mietbeginn = mietprofil.urspruenglicher_mietbeginn if mietprofil else None
         return {
+            "vertrag_urspruenglicher_mietbeginn": mietbeginn.isoformat() if mietbeginn else None,
             "vertrag_rechtsordnung": vertrag.rechtsordnung,
             "vertrag_gueltig_von": vertrag.gueltig_von.isoformat(),
             "vertrag_gueltig_bis": vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else None,

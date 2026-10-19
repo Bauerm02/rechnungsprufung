@@ -1097,7 +1097,7 @@ def test_mahnvorschau_unterscheidet_planbar_von_tatsaechlich_geplant(backoffice_
     ausdrücklichen POST auf den neuen Planen-Endpunkt erscheint "GEPLANT"
     mit Sendebereitschafts-Aktion."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
     from mietinkasso.domain.enums import OPTyp
     from mietinkasso.infrastructure.config import get_settings
     from mietinkasso.infrastructure.db.session import build_session_factory
@@ -1158,7 +1158,7 @@ def test_mahnvorschau_unterscheidet_planbar_von_tatsaechlich_geplant(backoffice_
 
     # Wiederholte GETs legen weiterhin NICHTS an.
     client.get("/backoffice/vertrag/V-601-PLANBAR/mahnvorschau", params={"heute": heute})
-    assert backoffice_app._mahn_fall_repo.list_fuer_vertrag("V-601-PLANBAR") == []
+    assert backoffice_deps._mahn_fall_repo.list_fuer_vertrag("V-601-PLANBAR") == []
 
     forderung = op_service.offene_forderungen(konto.id, heute=date(2026, 1, 20))[0]
     geplant = client.post(
@@ -1463,13 +1463,13 @@ def test_automatische_bankzuordnung_route_ist_ausserhalb_bekannter_demo_umgebung
     bekannter Demo-Umgebungen (also im Echtbetrieb) die Ausführung
     verweigern, unabhängig von der angefragten Transaktions-ID."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
 
     client, *_ = backoffice_client
     _login(client)
     csrf = _csrf_token(client)
 
-    monkeypatch.setattr(backoffice_app, "_DEMO_UMGEBUNG", False)
+    monkeypatch.setattr(backoffice_deps, "_DEMO_UMGEBUNG", False)
     gesperrt = client.post("/backoffice/bank/999999/automatisch-zuordnen", data={"csrf_token": csrf})
     assert gesperrt.status_code == 403
 
@@ -1480,7 +1480,7 @@ def test_bankseite_zeigt_keine_automatik_schaltflaeche_ausserhalb_der_demo_umgeb
     für die automatische Zuordnung erscheinen, nur der Hinweis auf die
     zurückgestellte automatische Bankzuordnung."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
 
     client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
     _login(client)
@@ -1491,7 +1491,7 @@ def test_bankseite_zeigt_keine_automatik_schaltflaeche_ausserhalb_der_demo_umgeb
     )
     assert re.search(r"/backoffice/bank/\d+/automatisch-zuordnen", seiten_text_in_demo) is not None
 
-    monkeypatch.setattr(backoffice_app, "_DEMO_UMGEBUNG", False)
+    monkeypatch.setattr(backoffice_deps, "_DEMO_UMGEBUNG", False)
     seite_ohne_demo = client.get("/backoffice/bank/unzugeordnet", params={"bank_konto_id": "BK-TEST-GATING"})
     assert seite_ohne_demo.status_code == 200
     assert "automatisch-zuordnen" not in seite_ohne_demo.text
@@ -1720,7 +1720,7 @@ def test_bankuebersicht_teilrueckbuchung_zeigt_verarbeitet_und_pruefrest(backoff
     verbleibenden Prüfrest zeigen, nicht nur den ursprünglichen
     Bankbetrag."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
 
     client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
     _login(client)
@@ -1769,9 +1769,9 @@ def test_bankuebersicht_teilrueckbuchung_zeigt_verarbeitet_und_pruefrest(backoff
     assert treffer_id is not None
     ruecklast_transaktion_id = int(treffer_id.group(1))
 
-    frische_transaktion = backoffice_app._bank_repo.get_transaktion(ruecklast_transaktion_id)
+    frische_transaktion = backoffice_deps._bank_repo.get_transaktion(ruecklast_transaktion_id)
     assert frische_transaktion is not None
-    backoffice_app._bank_service.verarbeite_ruecklastschrift(
+    backoffice_deps._bank_service.verarbeite_ruecklastschrift(
         ctx=_ctx_admin(), transaktion=frische_transaktion, original_op_position=zahlung, konto=konto,
         betrag_cent=40_000,  # bewusst TEILWEISE - Rest muss offen bleiben (900 - 400 = 500)
     )
@@ -2151,6 +2151,33 @@ def test_vpi_veroeffentlichungsbeleg_aendert_keinen_indexwert(backoffice_client)
     row = repo.get_monatswert("VPI20C18", 2026, 1)
     assert row.wert == Decimal("130.0") and row.veroeffentlicht_am == date(2026, 2, 15)
     assert row.veroeffentlichung_quelle == "Synthetischer Beleg"
+
+
+def test_erhoehungsbegehren_druckansicht_auth_scope_escape(backoffice_client, monkeypatch):
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+    from mietinkasso.backoffice import dependencies as deps
+    from mietinkasso.api.app import app
+    def row(identifier, contract):
+        return SimpleNamespace(id=identifier,vertrag_id=contract,ziel_bewertungsjahr=2026,index_anpassung_id=None,
+            erhoehung_cent=1000,massgeblicher_termin=date(2026,4,1),status='BLOCKIERT',blockiert_gruende=[],
+            zahlungspflicht_ab=None,schreiben_text='<script>evil()</script> 1.160,00 €')
+    examples={100001:row(100001,'V-601-1'),100002:row(100002,'V-107-1')}
+    monkeypatch.setattr(deps._indexautomatik.outbox_repository,'get',lambda id: examples.get(id))
+    monkeypatch.setattr(deps._indexautomatik.outbox_repository,'liste_alle',lambda: list(examples.values()))
+    with TestClient(app) as anonymous:
+        assert anonymous.get('/backoffice/indexautomatik/outbox/100001/schreiben',follow_redirects=False).status_code==303
+    client,*_=backoffice_client
+    _login(client)
+    page=client.get('/backoffice/indexautomatik/outbox/100001/schreiben')
+    assert page.status_code==200 and 'ENTWURF' in page.text
+    assert '<script>evil' not in page.text and '&lt;script&gt;' in page.text
+    assert page.headers['cache-control']=='no-store'
+    assert client.get('/backoffice/indexautomatik/outbox/100002/schreiben').status_code==403
+    assert client.get('/backoffice/indexautomatik/outbox/100003/schreiben').status_code==404
+    overview=client.get('/backoffice/indexautomatik/outbox').text
+    assert '/100001/schreiben' in overview and '/100002/schreiben' not in overview
+    assert client.post('/backoffice/indexautomatik/outbox/100001/vorlage-erneuern',data={}).status_code==422
 
 
 def test_indexautomatik_outbox_und_vertragsende_seiten_erreichbar(backoffice_client):
@@ -3262,7 +3289,8 @@ def test_debitoren_filterung_zeigt_nur_gesellschaftsscope_erlaubte_debitoren(bac
     from mietinkasso.infrastructure.config import get_settings
     from mietinkasso.infrastructure.db.session import build_session_factory
     from mietinkasso.stammdaten.repository import StammdatenRepository
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+    from mietinkasso.backoffice.routes import vertragsanlage as backoffice_vertragsanlage
 
     client, *_ = backoffice_client
     stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
@@ -3276,9 +3304,9 @@ def test_debitoren_filterung_zeigt_nur_gesellschaftsscope_erlaubte_debitoren(bac
     )
 
     scoped_ctx = ctx_factory("7DI")
-    alle_vertraege = backoffice_app._stammdaten_repo.list_alle_vertraege()
-    erlaubte_ids = {v.debitor_id for v in alle_vertraege if backoffice_app._hat_gesellschaft_zugriff(scoped_ctx, v.gesellschaft_id)}
-    sichtbare_debitoren = {d.id for d in backoffice_app._stammdaten_repo.list_alle_debitoren() if d.id in erlaubte_ids}
+    alle_vertraege = backoffice_deps._stammdaten_repo.list_alle_vertraege()
+    erlaubte_ids = {v.debitor_id for v in alle_vertraege if backoffice_vertragsanlage._hat_gesellschaft_zugriff(scoped_ctx, v.gesellschaft_id)}
+    sichtbare_debitoren = {d.id for d in backoffice_deps._stammdaten_repo.list_alle_debitoren() if d.id in erlaubte_ids}
     assert "DEB-1" in sichtbare_debitoren  # 7DI-Mieter bleibt sichtbar
     assert "DEB-FREMD" not in sichtbare_debitoren  # fremder Mieter ausgeschlossen
 
@@ -3479,16 +3507,16 @@ def test_mahnvorschau_get_legt_nie_einen_mahnfall_an(backoffice_client):
     tatsächliche Anlegen läuft ausschließlich über den separaten,
     CSRF-geschützten POST `/vertrag/{id}/forderung/{op_id}/planen`."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
 
     client, *_ = backoffice_client
     _login(client)
 
-    vorher = len(backoffice_app._mahn_fall_repo.list_fuer_vertrag("V-601-1"))
+    vorher = len(backoffice_deps._mahn_fall_repo.list_fuer_vertrag("V-601-1"))
     for heute in (date.today().isoformat(), (date.today() + timedelta(days=200)).isoformat()):
         antwort = client.get("/backoffice/vertrag/V-601-1/mahnvorschau", params={"heute": heute})
         assert antwort.status_code == 200
-    nachher = len(backoffice_app._mahn_fall_repo.list_fuer_vertrag("V-601-1"))
+    nachher = len(backoffice_deps._mahn_fall_repo.list_fuer_vertrag("V-601-1"))
     assert nachher == vorher
 
     # Ein POST ohne gültiges CSRF-Token wird abgelehnt (wie bei jedem
@@ -3498,7 +3526,7 @@ def test_mahnvorschau_get_legt_nie_einen_mahnfall_an(backoffice_client):
         data={"csrf_token": "ungueltig"},
     )
     assert abgelehnt.status_code in (400, 403)
-    assert len(backoffice_app._mahn_fall_repo.list_fuer_vertrag("V-601-1")) == vorher
+    assert len(backoffice_deps._mahn_fall_repo.list_fuer_vertrag("V-601-1")) == vorher
 
 
 def test_basiszinssatz_erfassen_und_duplikat_wird_abgelehnt(backoffice_client):
@@ -3538,7 +3566,7 @@ def test_mahnvorschau_zeigt_zinssegmente_bei_halbjahreswechsel(backoffice_client
     14.09.2026): eine Verzugszinsenperiode über einen Halbjahreswechsel
     muss ohne Renderfehler mit mehreren Zeilen angezeigt werden."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
     from mietinkasso.domain.enums import OPTyp
     from datetime import date as _date
     from decimal import Decimal as _Decimal
@@ -3575,16 +3603,16 @@ def test_mahnvorschau_zeigt_zinssegmente_bei_halbjahreswechsel(backoffice_client
         belegdatum=_date(2027, 6, 1), buchungsdatum=_date(2027, 6, 1), faelligkeit=_date(2027, 6, 5),
         beleg_referenz="TEST HMZ Juni (Segmenttest)",
     )
-    profil = backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_anlegen(
+    profil = backoffice_deps._hv_mail.mahnkosten_repo.zinsprofil_anlegen(
         vertrag_id=konto.vertrag_id, ist_b2b=True, vertragsdatum=_date(2020, 1, 1),
         verzugsverantwortung_geprueft=True, erstellt_von="test",
     )
-    backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
-    backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+    backoffice_deps._hv_mail.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
+    backoffice_deps._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
         id="TEST-2027-1", gueltig_von=_date(2027, 1, 1), gueltig_bis=_date(2027, 6, 30),
         basiszinssatz_prozent=_Decimal("1.530"), erfasst_von="test", quelle_referenz="Test",
     )
-    backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+    backoffice_deps._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
         id="TEST-2027-2", gueltig_von=_date(2027, 7, 1), gueltig_bis=_date(2027, 12, 31),
         basiszinssatz_prozent=_Decimal("2.000"), erfasst_von="test", quelle_referenz="Test",
     )
@@ -3602,16 +3630,16 @@ def test_ueberlappende_basiszinssaetze_werden_beim_erfassen_abgelehnt(backoffice
     `MultipleResultsFound` abstürzen, statt bereits beim fehlerhaften
     Erfassen klar abgelehnt zu werden."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
     from datetime import date as _date
     from decimal import Decimal as _Decimal
 
-    backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+    backoffice_deps._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
         id="TEST-UEBERLAPP-1", gueltig_von=_date(2028, 1, 1), gueltig_bis=_date(2028, 6, 30),
         basiszinssatz_prozent=_Decimal("1.0"), erfasst_von="test", quelle_referenz="Test",
     )
     with pytest.raises(ValueError, match="überschneidet"):
-        backoffice_app._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
+        backoffice_deps._hv_mail.mahnkosten_repo.basiszinssatz_erfassen(
             id="TEST-UEBERLAPP-2", gueltig_von=_date(2028, 6, 1), gueltig_bis=_date(2028, 12, 31),
             basiszinssatz_prozent=_Decimal("2.0"), erfasst_von="test", quelle_referenz="Test",
         )
@@ -3626,7 +3654,7 @@ def test_mahnvorschau_zaehlt_bereits_gebuchte_mahnkosten_nicht_doppelt_zur_haupt
     Berechnung: 870,82 € statt 830,00 €) - sie erscheinen stattdessen in
     einer eigenen, sichtbaren Zeile."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
     from mietinkasso.domain.enums import OPTyp
     from mietinkasso.infrastructure.config import get_settings
     from mietinkasso.infrastructure.db.session import build_session_factory
@@ -3656,13 +3684,13 @@ def test_mahnvorschau_zaehlt_bereits_gebuchte_mahnkosten_nicht_doppelt_zur_haupt
         belegdatum=date(2026, 8, 1), buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5),
         leistungsperiode="2026-08", beleg_referenz="HMZ August (Doppelzählung-Test)",
     )
-    profil = backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_anlegen(
+    profil = backoffice_deps._hv_mail.mahnkosten_repo.zinsprofil_anlegen(
         vertrag_id=konto.vertrag_id, ist_b2b=True, vertragsdatum=date(2020, 1, 1),
         mahngebuehr_kostenbasis_cent=4000, mahngebuehr_kostenbasis_beleg="Portokosten-Nachweis", erstellt_von="test",
     )
-    backoffice_app._hv_mail.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
+    backoffice_deps._hv_mail.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
 
-    gebucht = backoffice_app._hv_mail.mahnkosten_service.buche_bei_versand(
+    gebucht = backoffice_deps._hv_mail.mahnkosten_service.buche_bei_versand(
         ctx=_ctx_admin(), vertrag_id=konto.vertrag_id, stufe=1, heute=date(2026, 9, 14),
         versandnachweis_referenz="mahnung:test-doppelzaehlung", akteur="test",
     )
@@ -3756,7 +3784,7 @@ def test_mahnvorschau_zeigt_brief_wartet_auf_anbindung_und_pdf_link_bei_kanal_br
     und trotzdem die Vorbereitung/den Download des Brief-PDFs erlauben
     (eine Kostenvorschau ist noch kein erzeugter Brief)."""
 
-    import mietinkasso.backoffice.app as backoffice_app
+    import mietinkasso.backoffice.dependencies as backoffice_deps
     from mietinkasso.infrastructure.config import get_settings
     from mietinkasso.infrastructure.db.session import build_session_factory
     from mietinkasso.mahnwesen.repository import MahnPolicyRepository
@@ -3771,9 +3799,9 @@ def test_mahnvorschau_zeigt_brief_wartet_auf_anbindung_und_pdf_link_bei_kanal_br
         )
         mahn_policy_repo.freigeben(policy.id)
 
-    if backoffice_app._mahn_kanalregel_repo.aktuelle_freigegebene() is None:
-        regel = backoffice_app._mahn_kanalregel_repo.anlegen(erstellt_von="test")
-        backoffice_app._mahn_kanalregel_repo.freigeben(regel.id, freigegeben_von="test")
+    if backoffice_deps._mahn_kanalregel_repo.aktuelle_freigegebene() is None:
+        regel = backoffice_deps._mahn_kanalregel_repo.anlegen(erstellt_von="test")
+        backoffice_deps._mahn_kanalregel_repo.freigeben(regel.id, freigegeben_von="test")
 
     antwort = client.get("/backoffice/vertrag/V-601-1/mahnvorschau", params={"heute": "2026-09-01"})
     assert antwort.status_code == 200
@@ -3783,6 +3811,376 @@ def test_mahnvorschau_zeigt_brief_wartet_auf_anbindung_und_pdf_link_bei_kanal_br
     assert "/backoffice/vertrag/V-601-1/mahnbrief.pdf?stufe=2" in antwort.text
 
 
+# -- Automatische Online-Listen (Auftrag HV-20260930-PORTAL-LISTEN) ----------
+# Eigene synthetische Gesellschaft "PLG"/Objekt "PL1", damit die Zahlen
+# nicht vom übrigen, modulweit geteilten Testbestand abhängen. Die
+# Fachlogik (Scope für eingeschränkte Rollen, Fälligkeitsklassen,
+# Monatsgültigkeit) ist in `test_portallisten_service.py` abgedeckt - hier
+# geht es um Login, Verlinkung, Anzeige und den seiteneffektfreien GET.
+
+_PORTAL_LISTEN = ("/backoffice/mieterliste", "/backoffice/zinsliste", "/backoffice/salden")
+_PORTAL_BESTAND_ANGELEGT = False
+
+
+def _portal_listen_bestand(op_service) -> None:
+    global _PORTAL_BESTAND_ANGELEGT
+    if _PORTAL_BESTAND_ANGELEGT:
+        return
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+    from mietinkasso.domain.enums import OPTyp
+
+    repo = backoffice_deps._stammdaten_repo
+    repo.upsert_gesellschaft(id="PLG", name="Portal Listen GmbH (Test)")
+    repo.upsert_objekt(id="PL1", gesellschaft_id="PLG", bezeichnung="Listenhaus (Test)", adresse="Listenweg 1, 1010 Wien")
+    for einheit_id, bezeichnung, nutzung in (
+        ("PL1-TOP1", "Top 1", "DAUERVERMIETUNG"), ("PL1-TOP2", "Top 2", "DAUERVERMIETUNG"),
+        ("PL1-TOP3", "Top 3", "DAUERVERMIETUNG"), ("PL1-TOP4", "Top 4", "DAUERVERMIETUNG"),
+        ("PL1-LEER", "Top L", "LEERSTAND"), ("PL1-KURZ", "Top K", "KURZZEITVERMIETUNG"),
+        ("PL1-SELF", "Top S", "SELFSTORAGE"),
+    ):
+        repo.upsert_einheit(id=einheit_id, objekt_id="PL1", bezeichnung=bezeichnung, nutzungsstatus=nutzung)
+    repo.upsert_debitor(id="DEB-PL-1", name="Portal Aktiv", email="portal-aktiv@example.at", adresse="Postweg 9, 1010 Wien")
+    repo.upsert_debitor(id="DEB-PL-2", name="Portal Ohnekontakt <script>alert(1)</script>")
+    repo.upsert_debitor(id="DEB-PL-3", name="Portal Endend")
+    repo.upsert_debitor(id="DEB-PL-4", name="Portal Ehemalig", email="portal-ehemalig@example.at")
+    for vertrag_id, einheit_id, debitor_id, von, bis in (
+        ("V-PL1-1", "PL1-TOP1", "DEB-PL-1", date(2024, 1, 1), None),
+        ("V-PL1-2", "PL1-TOP2", "DEB-PL-2", date(2024, 1, 1), None),
+        ("V-PL1-ENDE", "PL1-TOP3", "DEB-PL-3", date(2024, 1, 1), date(2026, 9, 15)),
+        ("V-PL1-ALT", "PL1-TOP4", "DEB-PL-4", date(2020, 1, 1), date(2025, 12, 31)),
+    ):
+        repo.upsert_vertrag(
+            id=vertrag_id, einheit_id=einheit_id, debitor_id=debitor_id, gesellschaft_id="PLG",
+            rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=von, gueltig_bis=bis,
+        )
+    for komponente_id, vertrag_id, art, betrag_cent in (
+        ("K-PL1-1-HMZ", "V-PL1-1", "HMZ", 61_100), ("K-PL1-1-BK", "V-PL1-1", "BK_VORAUSZAHLUNG", 12_200),
+        ("K-PL1-ENDE-HMZ", "V-PL1-ENDE", "HMZ", 33_300),
+    ):
+        repo.add_komponente(
+            id=komponente_id, vertrag_id=vertrag_id, art=art, bezeichnung=f"{art} (Test)", betrag_cent=betrag_cent,
+            gueltig_von=date(2024, 1, 1),
+        )
+    konto_1 = repo.get_or_create_konto(vertrag=repo.get_vertrag("V-PL1-1"))
+    konto_2 = repo.get_or_create_konto(vertrag=repo.get_vertrag("V-PL1-2"))
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto_1, typ=OPTyp.SOLL, betrag_cent=50_000, belegdatum=date(2026, 8, 1),
+        buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 5), beleg_referenz="Portal-Listen Miete August",
+    )
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto_2, typ=OPTyp.ZAHLUNG, betrag_cent=12_345, belegdatum=date(2026, 8, 2),
+        buchungsdatum=date(2026, 8, 2), faelligkeit=None, beleg_referenz="Portal-Listen Überzahlung",
+    )
+    _PORTAL_BESTAND_ANGELEGT = True
+
+
+def _portal_db_abbild() -> dict:
+    from sqlalchemy import select
+
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+    from mietinkasso.infrastructure.db.base import Base
+
+    with backoffice_deps._session_factory() as session:
+        return {
+            tabelle.name: [tuple(zeile) for zeile in session.execute(select(tabelle)).all()]
+            for tabelle in Base.metadata.sorted_tables
+        }
+
+
+def test_portal_listen_ohne_login_werden_auf_login_umgeleitet(backoffice_client):
+    client, *_ = backoffice_client
+    client.cookies.clear()
+    for pfad in _PORTAL_LISTEN:
+        antwort = client.get(pfad, params={"objekt_id": "601"}, follow_redirects=False)
+        assert antwort.status_code == 303, pfad
+        assert antwort.headers["location"] == "/backoffice/login"
+        assert "Mieter" not in antwort.text
+
+
+def test_portal_listen_sind_von_uebersicht_und_bereichen_verlinkt(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+
+    dashboard = client.get("/backoffice/")
+    for pfad in _PORTAL_LISTEN:
+        assert f'href="{pfad}"' in dashboard.text, f"{pfad} fehlt auf der Übersicht"
+    gefiltert = client.get("/backoffice/", params={"objekt_id": "601"})
+    assert 'href="/backoffice/salden?objekt_id=601"' in gefiltert.text  # Objektfilter wird mitgenommen
+
+    assert 'href="/backoffice/mieterliste"' in client.get("/backoffice/vertraege").text
+    assert 'href="/backoffice/salden"' in client.get("/backoffice/zahlungen").text
+    assert 'href="/backoffice/zinsliste"' in client.get("/backoffice/abrechnungen").text
+
+    erwartete_navigation = {
+        "/backoffice/mieterliste": '<a href="/backoffice/vertraege" class="aktiv">',
+        "/backoffice/zinsliste": '<a href="/backoffice/abrechnungen" class="aktiv">',
+        "/backoffice/salden": '<a href="/backoffice/zahlungen" class="aktiv">',
+    }
+    for pfad, aktiver_bereich in erwartete_navigation.items():
+        seite = client.get(pfad)
+        assert seite.status_code == 200, pfad
+        assert aktiver_bereich in seite.text
+        for anderer in _PORTAL_LISTEN:
+            assert f'href="{anderer}"' in seite.text  # Wechsel zwischen den drei Listen
+        # Anzeigezeit getrennt beschriftet, Aktualisierung nur bei sichtbarer Seite.
+        assert "Berechnet/angezeigt:" in seite.text
+        assert "visibilitychange" in seite.text and "60000" in seite.text
+
+
+def test_portal_listen_lehnen_ausgeschlossenes_und_unbekanntes_objekt_wie_die_uebersicht_ab(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    for objekt_id in ("107", "GIBT-ES-NICHT"):
+        referenz = client.get("/backoffice/", params={"objekt_id": objekt_id})
+        assert referenz.status_code == 400
+        meldung = f"Objekt {objekt_id} ist unbekannt, gehört zu keiner zugänglichen Gesellschaft, oder ist ausgeschlossen."
+        assert meldung in referenz.text
+        for pfad in _PORTAL_LISTEN:
+            antwort = client.get(pfad, params={"objekt_id": objekt_id})
+            assert antwort.status_code == 400, (pfad, objekt_id)
+            assert meldung in antwort.text
+
+    # Auch ohne Objektfilter taucht vom ausgeschlossenen Objekt 107 nichts auf.
+    for pfad, parameter in (
+        ("/backoffice/mieterliste", {"status": "alle"}), ("/backoffice/zinsliste", {}), ("/backoffice/salden", {}),
+    ):
+        seite = client.get(pfad, params=parameter)
+        assert seite.status_code == 200
+        assert "V-107-1" not in seite.text
+        assert "Sieben Dörfer" not in seite.text
+
+
+def test_portal_mieterliste_zeigt_kontakte_fehlende_angaben_und_ehemalige_nur_auf_wunsch(backoffice_client):
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    _portal_listen_bestand(op_service)
+
+    aktiv = client.get("/backoffice/mieterliste", params={"objekt_id": "PL1"})
+    assert aktiv.status_code == 200
+    assert "Portal Aktiv" in aktiv.text
+    assert 'href="mailto:portal-aktiv@example.at"' in aktiv.text
+    assert "Postweg 9, 1010 Wien" in aktiv.text and "Listenweg 1, 1010 Wien" in aktiv.text
+    assert "Korrespondenzadresse" in aktiv.text and "Objektadresse:" in aktiv.text
+    assert "Nicht hinterlegt" in aktiv.text  # fehlende Kontaktdaten (Telefon, E-Mail, Adresse)
+    # Kompakte Filterzeile mit fest verbundenen Beschriftungen; Erklärtext eingeklappt, Tabelle danach.
+    assert 'class="listen-filter"' in aktiv.text
+    for feld_id in ("filter-objekt", "filter-status", "filter-q"):
+        assert f'<label for="{feld_id}">' in aktiv.text and f'id="{feld_id}"' in aktiv.text
+    assert "<summary>Was zeigt diese Liste?</summary>" in aktiv.text
+    assert "Laufende und künftige" in aktiv.text and "Aktive Mietverhältnisse" not in aktiv.text
+    assert 'href="/backoffice/vertrag/V-PL1-1?von_objekt=PL1"' in aktiv.text
+    assert "Portal Ehemalig" not in aktiv.text  # ehemaliger Mieter nicht unter den aktiven Kontakten
+    assert "<script>alert(1)</script>" not in aktiv.text
+    assert "Portal Ohnekontakt &lt;script&gt;" in aktiv.text
+    assert '<option value="PL1" selected>' in aktiv.text  # Filter bleibt im Formular erhalten
+
+    alle = client.get("/backoffice/mieterliste", params={"objekt_id": "PL1", "status": "alle"})
+    assert "Portal Ehemalig" in alle.text and "beendet am 2025-12-31" in alle.text
+    assert "(ehemaliger Mieter)" in alle.text
+
+    beendet = client.get("/backoffice/mieterliste", params={"objekt_id": "PL1", "status": "beendet"})
+    assert "Portal Ehemalig" in beendet.text and "Portal Aktiv" not in beendet.text
+
+    suche = client.get("/backoffice/mieterliste", params={"q": "portal-aktiv@"})
+    assert "Portal Aktiv" in suche.text and "Portal Ohnekontakt" not in suche.text
+    assert 'value="portal-aktiv@"' in suche.text
+
+    assert client.get("/backoffice/mieterliste", params={"status": "unsinn"}).status_code == 400
+
+
+def test_portal_telefon_wird_in_der_akte_gepflegt_und_in_der_mieterliste_gezeigt(backoffice_client):
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    _portal_listen_bestand(op_service)
+    repo = backoffice_deps._stammdaten_repo
+    csrf = _csrf_token(client)
+    ziel = "/backoffice/vertrag/V-PL1-1/telefon"
+
+    akte = client.get("/backoffice/vertrag/V-PL1-1")
+    assert akte.status_code == 200
+    assert f'action="{ziel}"' in akte.text
+    assert '<label for="debitor-telefon">' in akte.text and 'id="debitor-telefon"' in akte.text
+    assert "Nicht hinterlegt" in akte.text and 'href="tel:' not in akte.text
+
+    # Ungültige Eingabe: abgelehnt, nichts gespeichert, nichts ungeschützt zurückgegeben.
+    for ungueltig in ("<script>alert(1)</script>", "9" * 41, "bitte abends"):
+        abgelehnt = client.post(ziel, data={"csrf_token": csrf, "telefon": ungueltig}, follow_redirects=False)
+        assert abgelehnt.status_code == 400
+        assert "<script>alert(1)</script>" not in abgelehnt.text
+    assert repo.get_debitor("DEB-PL-1").telefon is None
+
+    gespeichert = client.post(ziel, data={"csrf_token": csrf, "telefon": " +43 660 000 00 09 "}, follow_redirects=False)
+    assert gespeichert.status_code == 303 and gespeichert.headers["location"] == "/backoffice/vertrag/V-PL1-1"
+    debitor = repo.get_debitor("DEB-PL-1")
+    assert debitor.telefon == "+43 660 000 00 09"
+    # Nur das Telefon dieses einen Mieters - alle anderen Kontaktdaten bleiben, wie sie waren.
+    assert (debitor.name, debitor.email, debitor.adresse) == ("Portal Aktiv", "portal-aktiv@example.at", "Postweg 9, 1010 Wien")
+    assert repo.get_debitor("DEB-PL-2").telefon is None and repo.get_debitor("DEB-PL-4").telefon is None
+
+    akte = client.get("/backoffice/vertrag/V-PL1-1")
+    assert '<a href="tel:+436600000009">+43 660 000 00 09</a>' in akte.text
+    assert 'value="+43 660 000 00 09"' in akte.text
+    liste = client.get("/backoffice/mieterliste", params={"objekt_id": "PL1"})
+    assert '<a href="tel:+436600000009">+43 660 000 00 09</a>' in liste.text
+    assert "Nicht hinterlegt" in liste.text  # die übrigen Mieter ohne Nummer
+    assert "Portal Aktiv" in client.get("/backoffice/mieterliste", params={"q": "660 000 00 09"}).text
+
+    # Ein späterer Upsert ohne Telefon (Altimport, Adresskorrektur) lässt die Nummer stehen.
+    repo.upsert_debitor(id="DEB-PL-1", name="Portal Aktiv", email="portal-aktiv@example.at", adresse="Postweg 9, 1010 Wien")
+    assert repo.get_debitor("DEB-PL-1").telefon == "+43 660 000 00 09"
+
+    # Schreibweise mit "(0)" ist nicht eindeutig wählbar: reiner Text statt eines falschen Links.
+    assert client.post(ziel, data={"csrf_token": csrf, "telefon": "+43 (0) 660 000 009"}, follow_redirects=False).status_code == 303
+    liste = client.get("/backoffice/mieterliste", params={"objekt_id": "PL1"})
+    assert "+43 (0) 660 000 009" in liste.text and 'href="tel:' not in liste.text
+
+    # Leer speichern löscht ausdrücklich.
+    assert client.post(ziel, data={"csrf_token": csrf, "telefon": ""}, follow_redirects=False).status_code == 303
+    assert repo.get_debitor("DEB-PL-1").telefon is None
+
+    # Ausgeschlossenes Objekt und unbekannter Vertrag: keine Änderung.
+    for pfad in ("/backoffice/vertrag/V-107-1/telefon", "/backoffice/vertrag/GIBT-ES-NICHT/telefon"):
+        assert client.post(pfad, data={"csrf_token": csrf, "telefon": "0660 000 000"}, follow_redirects=False).status_code == 400
+    assert repo.get_debitor("DEB-1").telefon is None
+    client.cookies.clear()
+    ohne_login = client.post(ziel, data={"csrf_token": csrf, "telefon": "0660 000 000"}, follow_redirects=False)
+    assert ohne_login.status_code in (303, 401, 403)
+    assert repo.get_debitor("DEB-PL-1").telefon is None
+
+
+def test_portal_zinsliste_monat_nutzung_betraege_und_summe_ohne_erfundene_null(backoffice_client):
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+    from mietinkasso.indexautomatik.zeit import heute_wien
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    _portal_listen_bestand(op_service)
+
+    september = client.get("/backoffice/zinsliste", params={"objekt_id": "PL1", "monat": "2026-09"})
+    assert september.status_code == 200
+    assert "Zinsliste 2026-09" in september.text and 'value="2026-09"' in september.text
+    for erwartet in ("611,00 €", "122,00 €", "733,00 €", "333,00 €"):
+        assert erwartet in september.text
+    assert "1.066,00 €" in september.text  # 733,00 + 333,00 - nur Zeilen mit Betrag
+    assert "Betrag unbekannt" in september.text  # V-PL1-2 ohne Komponenten: nie 0
+    assert "Leerstand" in september.text and "Kurzzeitvermietung" in september.text and "Selfstorage" in september.text
+    assert 'href="/backoffice/variable-abrechnung?monat=2026-09"' in september.text
+    assert "endet am 2026-09-15" in september.text
+    # Vertragsende im Monat: Betrag bleibt stehen, aber ausdrücklich nur als Stand am Monatsersten.
+    assert "Stand Monatserster - Änderung im Monat, nicht anteilig" in september.text
+    assert "1 davon mit Änderung im Monat (333,00 €, Stand Monatserster)" in september.text
+    for feld_id in ("filter-monat", "filter-objekt", "filter-q"):
+        assert f'<label for="{feld_id}">' in september.text and f'id="{feld_id}"' in september.text
+    assert 'class="listen-filter"' in september.text and 'class="kpi-grid"' not in september.text
+    assert 'href="/backoffice/vertrag/V-PL1-1?von_objekt=PL1"' in september.text
+    assert 'href="/backoffice/zinsliste?monat=2026-08&amp;objekt_id=PL1"' in september.text
+    assert 'href="/backoffice/zinsliste?monat=2026-10&amp;objekt_id=PL1"' in september.text
+    assert "Aufteilung unbekannt" in september.text  # keine geprüfte Netto-Freigabe
+
+    oktober = client.get("/backoffice/zinsliste", params={"objekt_id": "PL1", "monat": "2026-10"})
+    assert "beweist keinen Leerstand" in oktober.text  # beendeter Vertrag, Einheit weiterhin "vermietet"
+    assert "1.066,00 €" not in oktober.text and "733,00 €" in oktober.text
+    assert "Stand Monatserster - Änderung im Monat" not in oktober.text and "davon mit Änderung im Monat" not in oktober.text
+
+    heute = heute_wien()
+    standard = client.get("/backoffice/zinsliste")
+    assert standard.status_code == 200
+    assert f"Zinsliste {heute.year:04d}-{heute.month:02d}" in standard.text
+
+    for ungueltig in ("2026-13", "September", "2026-09-01"):
+        assert client.get("/backoffice/zinsliste", params={"monat": ungueltig}).status_code == 400
+
+    # Die Zinsliste erzeugt keine Vorschreibung.
+    assert backoffice_deps._vorschreibung_repo.get("V-PL1-1", "2026-09") is None
+    assert backoffice_deps._vorschreibung_repo.get("V-PL1-1", "2026-10") is None
+
+
+def test_portal_salden_trennt_guthaben_rueckstand_kein_konto_und_zeigt_bankstand(backoffice_client):
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    _portal_listen_bestand(op_service)
+
+    seite = client.get("/backoffice/salden", params={"objekt_id": "PL1"})
+    assert seite.status_code == 200
+    assert "500,00 €" in seite.text and "123,45 €" in seite.text
+    assert "376,55 €" not in seite.text  # Guthaben wird nie gegen den Rückstand eines anderen verrechnet
+    assert "Rückstand fällig" in seite.text
+    assert "Kein Mietkonto - Saldo unbekannt</span>" in seite.text  # V-PL1-ENDE/V-PL1-ALT: unbekannt, nicht ausgeglichen
+    assert 'href="/backoffice/vertrag/V-PL1-1?von_objekt=PL1"' in seite.text
+    assert "Bankdatenstand" in seite.text and "Kein Bankkonto hinterlegt" in seite.text
+    # Kurze Bankwarnung sichtbar; die Mietertabelle steht VOR der eingeklappten Banktabelle.
+    assert '<span class="warn">kein Bankkonto hinterlegt</span>' in seite.text
+    assert seite.text.index("Kontosaldo offen</th>") < seite.text.index("<summary>Bankdatenstand je Bankkonto</summary>")
+    assert seite.text.index("Bank: ") < seite.text.index("Kontosaldo offen</th>")
+    # "Fällig" ist eine eigene Summe der Einzelposten, kein "davon" des Kontosaldos.
+    assert "Fällige Einzelposten" in seite.text and "Davon fällig" not in seite.text
+    for feld_id in ("filter-objekt", "filter-status"):
+        assert f'<label for="{feld_id}">' in seite.text and f'id="{feld_id}"' in seite.text
+    assert 'class="listen-filter"' in seite.text and 'class="kpi-grid"' not in seite.text
+
+    backoffice_deps._bank_repo.upsert_bank_konto(
+        id="BK-PLG", gesellschaft_id="PLG", iban="AT00PORTALLISTENTEST", bezeichnung="Portal-Listen Testkonto",
+    )
+    nie_bestaetigt = client.get("/backoffice/salden", params={"objekt_id": "PL1"})
+    assert "BK-PLG" in nie_bestaetigt.text and "nie bestätigt" in nie_bestaetigt.text
+    assert "Kontoauszüge nie als lückenlos bestätigt" in nie_bestaetigt.text
+    assert "keine Bankzeile importiert" in nie_bestaetigt.text  # Importstand getrennt von der Bestätigung
+    assert "AT00PORTALLISTENTEST" not in nie_bestaetigt.text  # keine IBAN in der Liste
+    backoffice_deps._bank_service.bestaetige_bankvollstaendigkeit(
+        bank_konto_id="BK-PLG", bestaetigt_bis=date(2026, 8, 31), bestaetigt_von="test",
+    )
+    bestaetigt = client.get("/backoffice/salden", params={"objekt_id": "PL1"})
+    assert "Kontoauszüge lückenlos bestätigt bis <strong>2026-08-31</strong>" in bestaetigt.text
+    assert "Kontoauszüge nie als lückenlos bestätigt" not in bestaetigt.text
+    # Bestätigung ersetzt keinen Import: der fehlende Importstand bleibt eigens ausgewiesen.
+    assert "keine Bankzeile importiert" in bestaetigt.text
+    assert "Berechnet/angezeigt:" in bestaetigt.text and "Buchungen bis " in bestaetigt.text
+
+    guthaben = client.get("/backoffice/salden", params={"objekt_id": "PL1", "status": "guthaben"})
+    assert "Portal Ohnekontakt" in guthaben.text and "Portal Aktiv" not in guthaben.text
+    assert '<option value="guthaben" selected>' in guthaben.text
+    ausgeglichen = client.get("/backoffice/salden", params={"objekt_id": "PL1", "status": "ausgeglichen"})
+    assert "Portal Aktiv" not in ausgeglichen.text and "Portal Endend" not in ausgeglichen.text
+    assert "Kein Mietkonto - Saldo unbekannt</span>" not in ausgeglichen.text
+    assert client.get("/backoffice/salden", params={"status": "bezahlt"}).status_code == 400
+
+    # Eine Mahnsperre bleibt sichtbar - die Seite selbst plant keinen Mahnfall.
+    backoffice_deps._stammdaten_repo.sperre_setzen(vertrag_id="V-PL1-1", grund="RATENPLAN")
+    gesperrt = client.get("/backoffice/salden", params={"objekt_id": "PL1", "status": "offen"})
+    assert "Mahnung gesperrt (Ratenplan vereinbart)" in gesperrt.text
+    assert "Portal Aktiv" in gesperrt.text and "Portal Ohnekontakt" not in gesperrt.text
+    assert backoffice_deps._mahn_fall_repo.list_fuer_vertrag("V-PL1-1") == []
+
+
+def test_portal_listen_get_veraendert_die_datenbank_nicht(backoffice_client):
+    """Kein GET dieser drei Seiten darf irgendeine Tabelle verändern -
+    weder OP/Vorschreibung/Mahnfall noch Audit oder Job-Protokoll."""
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+    _portal_listen_bestand(op_service)
+
+    vorher = _portal_db_abbild()
+    assert vorher["op_positionen"] and vorher["vertraege"]
+    aufrufe = (
+        ("/backoffice/mieterliste", {}), ("/backoffice/mieterliste", {"objekt_id": "PL1", "status": "alle", "q": "portal"}),
+        ("/backoffice/zinsliste", {}), ("/backoffice/zinsliste", {"objekt_id": "PL1", "monat": "2026-09", "q": "top"}),
+        ("/backoffice/zinsliste", {"monat": "2026-10"}),
+        ("/backoffice/salden", {}), ("/backoffice/salden", {"objekt_id": "PL1", "status": "offen"}),
+        ("/backoffice/salden", {"objekt_id": "601"}),
+    )
+    for _ in range(2):
+        for pfad, parameter in aufrufe:
+            assert client.get(pfad, params=parameter).status_code == 200, (pfad, parameter)
+    for pfad in _PORTAL_LISTEN:
+        assert client.get(pfad, params={"objekt_id": "107"}).status_code == 400
+    assert client.get("/backoffice/zinsliste", params={"monat": "kaputt"}).status_code == 400
+
+    assert _portal_db_abbild() == vorher
 # -- Mahnkostenpauschale-Freigabe & Rücklastschriftkosten (einfache UI) ------
 # Auftrag HV-20261019-MAHNKOSTEN, Backoffice-Prüfliste/Freigabemaske.
 
@@ -3817,6 +4215,15 @@ def test_mahnpauschale_freigabe_formular_zeigt_hauptforderung_und_erteilt_freiga
     assert formular.status_code == 200
     assert "500,00" in formular.text  # Hauptforderung sichtbar
     assert "Neue Einzelfallfreigabe" in formular.text
+    # Kein Zinsprofil mit belegtem mahnpauschale_kostenbasis_cent für
+    # V-601-PAUSCHALE1 hinterlegt -> nur der unverbindliche
+    # Eigentümer-Prüfwert (20 EUR), ausdrücklich als solcher gekennzeichnet,
+    # NIE als Beleg oder automatische Freigabe.
+    assert "unverbindlicher Eigentümer-Prüfwert" in formular.text
+    assert "kein Beleg" in formular.text
+    assert 'value="20,00"' in formular.text
+    # Vertragsquelle (Profil-Beleg) bleibt unbelegt - der Prüfwert wird NIE als Beleg vorbelegt.
+    assert "Vertragsquelle (Profil-Beleg)</th><td>–</td>" in formular.text
 
     freigabe_antwort = client.post(
         "/backoffice/vertrag/V-601-PAUSCHALE1/mahnpauschale-freigabe/erfassen",
@@ -4114,6 +4521,3 @@ def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
 
 # -- Variable Monatsabrechnung (KURZZEITVERMIETUNG/SELFSTORAGE) --------------
 # Auftrag 13.09., HV-20260913-DASHBOARD.
-
-
-

@@ -72,7 +72,13 @@ def test_zurechenbare_ruecklastschriftkosten_werden_als_forderung_gebucht(
     gebuchte_position = bank_service._op_service._op_repository.get(row.kosten_op_position_id)
     assert gebuchte_position.typ == OPTyp.SOLL.value
     assert gebuchte_position.betrag_cent == 1250
-    assert gebuchte_position.bezieht_sich_auf_id == rls_op.id
+    # KEINE `bezieht_sich_auf_id` auf die Rücklastschrift: eine explizite
+    # OP-Bindung ist laut `op/validierung.py::pruefe_bezug` nur für
+    # ZAHLUNG/GUTSCHRIFT (-> Forderung) und RUECKLASTSCHRIFT (-> Zahlung)
+    # definiert, NICHT für SOLL. Die Rückverfolgbarkeit läuft stattdessen
+    # über `row.kosten_op_position_id`/`row.ruecklastschrift_op_position_id`.
+    assert gebuchte_position.bezieht_sich_auf_id is None
+    assert row.ruecklastschrift_op_position_id == rls_op.id
 
 
 def test_nicht_zurechenbare_ruecklastschriftkosten_bleiben_rein_dokumentarisch(

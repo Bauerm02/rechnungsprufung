@@ -6,10 +6,18 @@ from mietinkasso.indexautomatik.schreiben import (
     SchreibenJahresschritt,
     SchreibenKomponente,
     SchreibenKontext,
-    erhoehungsschreiben_text_klausel,
-    erhoehungsschreiben_text_mieweg,
+
+
 )
 
+
+from types import SimpleNamespace
+from mietinkasso.indexautomatik.begehren import vorbereiten
+
+def _render(kontext):
+    profil=SimpleNamespace(rechtsordnung=kontext.rechtsordnung, ist_wohnungsnutzung=True,
+        frist_tage_zugang_bis_wirksamkeit=14, frist_quellenbeleg="Vertrag Punkt 8")
+    return vorbereiten(kontext, profil=profil, faelligkeit_tag=5, heute=date(2026,9,20))[0]
 
 def _basis_kontext(**overrides) -> SchreibenKontext:
     basis = dict(
@@ -47,7 +55,7 @@ def _basis_kontext(**overrides) -> SchreibenKontext:
                 gedaempfte_veraenderung="2%", angewandte_veraenderung="2%",
             )
         ],
-        vertraglich_zulaessiger_betrag_cent=101_000,
+        vertraglich_zulaessiger_betrag_cent=101_000, gesetzliche_basis_cent=100_000, gesetzliche_grenze_cent=101_000,
         vertraglicher_quellenbeleg="Mietvertrag Punkt 5",
     )
     basis.update(overrides)
@@ -58,7 +66,7 @@ def test_ust_prozentsatz_wird_korrekt_skaliert_nicht_als_1000_prozent():
     """Bugfund Zwischenreview 3cec004: `ust_satz_promille / 10` hätte für
     10000 Promille (=10%) fälschlich "1000%" ausgegeben."""
 
-    text = erhoehungsschreiben_text_mieweg(_basis_kontext())
+    text = _render(_basis_kontext())
     assert "10,0% USt" in text
     assert "1000" not in text.replace("1.000", "").replace("101.000", "").replace("100.000", "")
 
@@ -68,20 +76,20 @@ def test_neuer_gesamtbetrag_enthaelt_unveraenderte_bk_nicht_nur_hmz():
     BK" - der neue Gesamtbetrag muss HMZ-neu (1.010,00) PLUS
     unveränderte BK (150,00) = 1.160,00 sein, nicht nur 1.010,00."""
 
-    text = erhoehungsschreiben_text_mieweg(_basis_kontext())
+    text = _render(_basis_kontext())
     assert "Neuer monatlicher Gesamtbetrag (brutto, alle Positionen): 1.160,00 €" in text
     assert "Bisheriger monatlicher Gesamtbetrag (brutto, alle Positionen): 1.150,00 €" in text
 
 
 def test_unveraenderte_position_wird_als_unveraendert_ausgewiesen():
-    text = erhoehungsschreiben_text_mieweg(_basis_kontext())
-    assert "Betriebskosten (BK_VORAUSZAHLUNG): 150,00 € brutto" in text
+    text = _render(_basis_kontext())
+    assert "Betriebskosten: 150,00 € brutto" in text
     assert "unverändert" in text
 
 
 def test_mieweg_schreiben_zitiert_par16_abs9():
-    text = erhoehungsschreiben_text_mieweg(_basis_kontext())
-    assert "§ 16 Abs 9 MRG" in text
+    text = _render(_basis_kontext())
+    assert "§ 16 Abs. 9 MRG" in text
 
 
 def test_klausel_schreiben_behauptet_par16_abs9_nicht_pauschal():
@@ -89,10 +97,6 @@ def test_klausel_schreiben_behauptet_par16_abs9_nicht_pauschal():
     MRG-Teil; Geschäftsraum benötigt eigenes Schreiben"."""
 
     kontext = _basis_kontext(rechtsordnung="OESTERREICH_MRG_TEIL")
-    text = erhoehungsschreiben_text_klausel(kontext)
-    # § 16 Abs 9 taucht NUR in der ausdrücklichen Nicht-Behauptung auf,
-    # nirgends als Rechtsgrundlage für Wirksamkeit/Zahlungspflicht (wie
-    # im MieWeG-Schreiben).
-    assert "KEINE pauschale Anwendung von § 16 Abs 9 MRG" in text
-    assert "gemäß § 16 Abs 9 MRG" not in text
-    assert "Zahlungspflicht" not in text
+    text = _render(kontext)
+    assert "§ 16 Abs. 9 MRG" not in text
+    assert "gesondert zu prüfen" not in text

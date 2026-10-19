@@ -21,7 +21,8 @@ gespeicherte `komponenten_verteilung` trägt deshalb IMMER eine Liste
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from dataclasses import replace
 from decimal import ROUND_FLOOR, Decimal
 from zoneinfo import ZoneInfo
 
@@ -34,12 +35,14 @@ from mietinkasso.indexautomatik.schreiben import (
     SchreibenJahresschritt,
     SchreibenKomponente,
     SchreibenKontext,
-    erhoehungsschreiben_text_klausel,
-    erhoehungsschreiben_text_mieweg,
+
+
 )
 from mietinkasso.indexautomatik.transport import Transportadapter, VersandAuftrag
 from mietinkasso.indexautomatik.mailnachweis import nachweis_daten, versand_belegen
 from mietinkasso.indexautomatik.zeit import naechster_zinstermin_ab
+from mietinkasso.indexautomatik.zeit import heute_wien
+from mietinkasso.indexautomatik import begehren
 from mietinkasso.infrastructure.db.tables import ErhoehungsschreibenTable, MieWegVorschauTable, RechtsprofilTable, VertragTable
 from mietinkasso.stammdaten.repository import StammdatenRepository
 
@@ -114,12 +117,88 @@ class ErhoehungsschreibenOutboxService:
         rechtsprofil_service: RechtsprofilService,
         *,
         jlb_signatur: str,
+        index_repository=None,
     ):
         self._repository = repository
         self._stammdaten_repository = stammdaten_repository
         self._jlb_signatur = jlb_signatur
         self._rechtsprofil_repository = rechtsprofil_repository
         self._rechtsprofil_service = rechtsprofil_service
+        self._index_repository = index_repository
+
+    def _berechnung_fuer(self, row):
+        if row.index_anpassung_id is None or self._index_repository is None:
+            return None
+        a = self._index_repository.get_anpassung(row.index_anpassung_id)
+        if a is None:
+            return None
+        k = self._index_repository.get_klausel(a.index_klausel_id)
+        snapshot = a.berechnungs_snapshot or {}
+        if (k is None or a.vertrag_id != row.vertrag_id or k.vertrag_id != row.vertrag_id
+                or k.version != a.index_klausel_version or k.basis_wert != a.alter_wert
+                or not a.vpi_jahr or not a.vpi_monat or not a.quelle_referenz
+                or not snapshot.get('indexierbare_basis_cent') or a.erhoehung_cent != row.erhoehung_cent):
+            return None
+        return dict(reihe=k.basis_reihe, basis_monat=k.basis_monat, alter_wert=str(a.alter_wert),
+                    vergleich_monat=f'{a.vpi_jahr}-{a.vpi_monat:02d}', neuer_wert=str(a.neuer_wert),
+                    prozent=str(a.veraenderung_prozent), basis_cent=snapshot['indexierbare_basis_cent'])
+
+    def _vorlage_setzen(self, row, kontext, profil, vertrag, *, heute=None):
+        heute = heute or heute_wien()
+        kontext = replace(kontext, erstellt_am=heute)
+        text, meta = begehren.vorbereiten(kontext, profil=profil, faelligkeit_tag=vertrag.faelligkeit_tag,
+                                        heute=heute, berechnung=self._berechnung_fuer(row))
+        if vertrag.gueltig_bis and meta.get('zahlungstermin') and date.fromisoformat(meta['zahlungstermin']) > vertrag.gueltig_bis:
+            meta['fehler'].append('Geplanter Zahlungstermin liegt nach Vertragsende.')
+        row.schreiben_text = text
+        row.empfaenger_snapshot = {**row.empfaenger_snapshot, 'begehren': meta}
+
+    def vorlage_erneuern(self, *, ctx, erhoehungsschreiben_id, heute):
+        row = self._repository.get(erhoehungsschreiben_id)
+        if row is None:
+            raise ValueError('Unbekanntes Erhöhungsschreiben.')
+        vertrag = self._stammdaten_repository.get_vertrag(row.vertrag_id)
+        require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
+        require_schreibrecht(ctx)
+        self._stammdaten_repository.pruefe_vertrag_nicht_ausgeschlossen(vertrag.id)
+        if row.status not in {'ENTWURF', 'BLOCKIERT', 'BEREIT'}:
+            raise ValueError('Ein bereits beanspruchtes oder versendetes Schreiben bleibt unverändert.')
+        profil = self._rechtsprofil_service.aktives_gueltiges_profil(vertrag.id, heute=heute)
+        if profil is None or (profil.id, profil.version) != (row.rechtsprofil_id, row.rechtsprofil_version):
+            raise ValueError('Rechtsprofil verändert oder nicht freigegeben: neue Berechnung erforderlich.')
+        meta = (row.empfaenger_snapshot or {}).get('begehren', {})
+        components = row.empfaenger_snapshot.get('komponenten_snapshot', [])
+        if not components or components != self._aktuelle_komponenten_snapshot(components):
+            raise ValueError('Vorschreibung verändert: neue Indexberechnung erforderlich.')
+        if self._empfaenger_snapshot(vertrag) != {k: v for k, v in row.empfaenger_snapshot.items() if k not in {'komponenten_snapshot', 'begehren'}}:
+            raise ValueError('Empfänger oder Vertragsdaten verändert: neue Prüfung erforderlich.')
+        if not meta.get('kontext'):
+            active = self._stammdaten_repository.list_aktive_komponenten(vertrag.id, heute)
+            if self._komponenten_snapshot(active) != components:
+                raise ValueError('Aktuelle Komponenten weichen vom ursprünglichen Schreiben ab: neue Berechnung erforderlich.')
+            ids = set(profil.basis_komponenten_ids)
+            refs = [k for k in active if k.id in ids]
+            unchanged = [k for k in active if k.id not in ids]
+            args = dict(ctx=ctx, vertrag=vertrag, profil=profil, massgeblicher_termin=row.massgeblicher_termin,
+                        erhoehung_cent=row.erhoehung_cent, referenzierte_komponenten=refs,
+                        unveraenderte_komponenten=unchanged, akteur=ctx.user_id, heute=heute, bestehende_id=row.id)
+            if row.mieweg_vorschau_id:
+                source = self._repository.mieweg_quelle(row.mieweg_vorschau_id)
+                if source is None or source.vertrag_id != vertrag.id:
+                    raise ValueError('Vollständiger ursprünglicher Rechennachweis fehlt.')
+                result = json.loads(source.ergebnis_json)
+                if (result.get('blockiert_grund') or result.get('massgeblicher_hoechstbetrag_cent') is None
+                        or not result.get('fruehester_termin_gesamt')
+                        or any(not note.startswith('Zustellnachweis fehlt') for note in result.get('offene_nachweise', []))):
+                    raise ValueError('Ursprüngliche Berechnung hat offene fachliche Nachweise; neue Prüfung erforderlich.')
+                return self.erstellen_aus_mieweg(**args, vorschau=source, ziel_bewertungsjahr=row.ziel_bewertungsjahr,
+                                                aktuell_verrechnet_cent=sum(k.betrag_cent for k in refs))
+            if row.index_anpassung_id:
+                return self.erstellen_aus_index_anpassung(**args, index_anpassung_id=row.index_anpassung_id)
+            raise ValueError('Ursprünglicher Rechennachweis fehlt: neue Berechnung erforderlich.')
+        kontext = replace(begehren.kontext_aus_snapshot(meta['kontext']), erstellt_am=heute)
+        self._vorlage_setzen(row, kontext, profil, vertrag, heute=heute)
+        return self._entwurf_speichern(row, bestehende_id=row.id)
 
     def _empfaenger_snapshot(self, vertrag: VertragTable) -> dict:
         debitor = self._stammdaten_repository.get_debitor(vertrag.debitor_id)
@@ -190,7 +269,7 @@ class ErhoehungsschreibenOutboxService:
         für eine Zeile im Status ENTWURF/BLOCKIERT übergeben wird -
         niemals für eine bereits GESENDETe."""
 
-        gruende: list[str] = []
+        gruende: list[str] = list((row.empfaenger_snapshot.get('begehren') or {}).get('fehler', []))
         empfaenger = row.empfaenger_snapshot
         if not (empfaenger.get("adresse") or "").strip():
             gruende.append("Kein gültige Postadresse für den Empfänger hinterlegt - kein Versand ohne Zustelladresse.")
@@ -232,6 +311,7 @@ class ErhoehungsschreibenOutboxService:
         unveraenderte_komponenten: list,
         akteur: str,
         bestehende_id: int | None = None,
+        heute=None,
     ) -> ErhoehungsschreibenTable:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
@@ -290,8 +370,10 @@ class ErhoehungsschreibenOutboxService:
             jahresschritte=jahresschritte,
             vertraglich_zulaessiger_betrag_cent=ergebnis.get("vertraglich_zulaessiger_betrag_cent"),
             vertraglicher_quellenbeleg=eingaben.get("vertraglicher_quellenbeleg"),
+            gesetzliche_basis_cent=eingaben.get('basis_betrag_cent'),
+            gesetzliche_grenze_cent=ergebnis.get('gesetzliche_hoechstgrenze_cent'),
         )
-        text = erhoehungsschreiben_text_mieweg(kontext)
+        text = ""  # The versioned notice is prepared below.
         row = ErhoehungsschreibenTable(
             vertrag_id=vertrag.id,
             ziel_bewertungsjahr=ziel_bewertungsjahr,
@@ -318,6 +400,7 @@ class ErhoehungsschreibenOutboxService:
                 ]
             },
         )
+        self._vorlage_setzen(row, kontext, profil, vertrag, heute=heute)
         return self._entwurf_speichern(row, bestehende_id=bestehende_id)
 
     def erstellen_aus_index_anpassung(
@@ -332,6 +415,8 @@ class ErhoehungsschreibenOutboxService:
         referenzierte_komponenten: list,
         unveraenderte_komponenten: list,
         akteur: str,
+        heute=None,
+        bestehende_id=None,
     ) -> ErhoehungsschreibenTable:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
@@ -375,7 +460,7 @@ class ErhoehungsschreibenOutboxService:
             rechtsprofil_version=profil.version,
             jlb_signatur=self._jlb_signatur,
         )
-        text = erhoehungsschreiben_text_klausel(kontext)
+        text = ""  # The versioned notice is prepared below.
         row = ErhoehungsschreibenTable(
             vertrag_id=vertrag.id,
             ziel_bewertungsjahr=None,
@@ -402,7 +487,8 @@ class ErhoehungsschreibenOutboxService:
                 ]
             },
         )
-        return self._entwurf_speichern(row)
+        self._vorlage_setzen(row, kontext, profil, vertrag, heute=heute)
+        return self._entwurf_speichern(row, bestehende_id=bestehende_id)
 
     def versenden(
         self,
@@ -496,7 +582,7 @@ class ErhoehungsschreibenOutboxService:
 
         aktueller_snapshot = self._empfaenger_snapshot(vertrag)
         gespeicherter_snapshot = schreiben.empfaenger_snapshot or {}
-        gespeicherter_empfaenger = {k: v for k, v in gespeicherter_snapshot.items() if k != "komponenten_snapshot"}
+        gespeicherter_empfaenger = {k: v for k, v in gespeicherter_snapshot.items() if k not in {"komponenten_snapshot", "begehren"}}
         if aktueller_snapshot != gespeicherter_empfaenger:
             grund = (
                 "Empfänger- oder Vertragsstatus hat sich seit der Entwurfserstellung geändert - neue "
@@ -532,6 +618,27 @@ class ErhoehungsschreibenOutboxService:
                 "Versand deaktiviert (SEND_ENABLED und/oder Mailbox-Allowlist-Bestätigung fehlen) - "
                 "nur Vorschau/Outbox, kein realer Versand.",
             )
+
+        vorlagenfehler = begehren.versandfehler(schreiben.schreiben_text, gespeicherter_snapshot.get('begehren'), heute=heute)
+        meta = gespeicherter_snapshot.get('begehren') or {}
+        if meta:
+            try:
+                if meta.get('frist_tage') != begehren.frist_tage(aktuelles_profil):
+                    vorlagenfehler.append('Zugangsfrist verändert: Schreiben neu erstellen.')
+                for stichtag in {heute, date.fromisoformat(meta['zahlungstermin'])}:
+                    aktive = self._komponenten_snapshot(self._stammdaten_repository.list_aktive_komponenten(vertrag.id, stichtag))
+                    if aktive != gespeicherte_komponenten:
+                        vorlagenfehler.append('Vorschreibungspositionen zum Versand-/Zahlungstermin verändert: neue Berechnung erforderlich.')
+                        break
+            except (ValueError, KeyError):
+                vorlagenfehler.append('Fristen-/Komponentennachweis ist unvollständig.')
+        if meta.get('faelligkeit_tag') != vertrag.faelligkeit_tag:
+            vorlagenfehler.append('Fälligkeitstag verändert: Schreiben neu erstellen.')
+        if vertrag.gueltig_bis and meta.get('zahlungstermin') and date.fromisoformat(meta['zahlungstermin']) > vertrag.gueltig_bis:
+            vorlagenfehler.append('Zahlungstermin liegt nach Vertragsende.')
+        if vorlagenfehler:
+            self._repository.set_status(schreiben.id, 'BLOCKIERT', blockiert_gruende=vorlagenfehler)
+            return VersandErgebnis('BLOCKIERT', '; '.join(vorlagenfehler))
 
         if not self._repository.claim_fuer_versand(schreiben.id):
             return VersandErgebnis("BEREITS_VERARBEITET", "Ein anderer Worker verarbeitet diesen Fall bereits.")
@@ -603,6 +710,8 @@ class ErhoehungsschreibenOutboxService:
             )
         if zugang_datum > heute:
             raise ValueError("Zugangsdatum darf nicht in der Zukunft liegen.")
+        if zugang_datum < schreiben.massgeblicher_termin:
+            raise ValueError('Zugangsdatum liegt vor Wirksamwerden der Indexänderung.')
         versandtag = None
         if schreiben.versendet_am is not None:
             sent = schreiben.versendet_am
@@ -650,6 +759,11 @@ class ErhoehungsschreibenOutboxService:
         wirksame_frist = max(gesetzliches_minimum, frist_tage or 0)
         fruehester = zugang_datum + timedelta(days=wirksame_frist)
         zahlungspflicht_ab = naechster_zinstermin_ab(fruehester, faelligkeit_tag=vertrag.faelligkeit_tag)
+        meta = (schreiben.empfaenger_snapshot or {}).get('begehren') or {}
+        if meta.get('zahlungstermin'):
+            zahlungspflicht_ab = max(zahlungspflicht_ab, date.fromisoformat(meta['zahlungstermin']))
+        if vertrag.gueltig_bis and zahlungspflicht_ab > vertrag.gueltig_bis:
+            raise ValueError('Zahlungstermin liegt nach Vertragsende; keine automatische Umsetzung.')
         return self._repository.set_status(
             schreiben.id,
             "ZUGANG_BESTAETIGT",

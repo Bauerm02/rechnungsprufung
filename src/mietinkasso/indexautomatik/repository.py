@@ -492,6 +492,11 @@ class ErhoehungsschreibenRepository:
         with self._session_factory() as session:
             return session.get(ErhoehungsschreibenTable, id)
 
+    def mieweg_quelle(self, id: int):
+        from mietinkasso.infrastructure.db.tables import MieWegVorschauTable
+        with self._session_factory() as session:
+            return session.get(MieWegVorschauTable, id)
+
     def get_by_ziel(self, vertrag_id: str, ziel_bewertungsjahr: int) -> ErhoehungsschreibenTable | None:
         with self._session_factory() as session:
             statement = select(ErhoehungsschreibenTable).where(
@@ -578,6 +583,15 @@ class ErhoehungsschreibenRepository:
         `service.py`)."""
 
         with self._session_factory() as session:
+            if any(key in felder for key in ('schreiben_text', 'empfaenger_snapshot', 'komponenten_verteilung')):
+                result = session.execute(update(ErhoehungsschreibenTable).where(
+                    ErhoehungsschreibenTable.id == id,
+                    ErhoehungsschreibenTable.status.in_(['ENTWURF', 'BLOCKIERT', 'BEREIT'])
+                ).values(**felder))
+                if result.rowcount != 1:
+                    raise ValueError('Schreiben ist inzwischen beansprucht oder versendet; keine Änderung.')
+                session.commit()
+                return session.get(ErhoehungsschreibenTable, id)
             row = session.get(ErhoehungsschreibenTable, id)
             if row is None:
                 raise ValueError(f"Unbekanntes Erhoehungsschreiben {id}")
