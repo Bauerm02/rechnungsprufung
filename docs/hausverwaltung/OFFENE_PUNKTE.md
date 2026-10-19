@@ -5013,3 +5013,180 @@ vorgesehen.
 den betroffenen Dateien). Kein Volltest wiederholt (reine Zusatzänderung
 ohne Berührung der übrigen Module). Keine Livezugriffe, keine
 Buchung/Mail/Deployment, `SEND_ENABLED` unverändert `false`.
+
+## Folgerunde: Retry-Guard Bankentgelt, Absenderzeile im Fenster, SFTP-Adapter + Archiv-/Statuserweiterung, Live-Dispatch-Anschluss (19.10.2026, Fortsetzung HV-20261019-VERSAND-KOSTEN-ABSCHLUSS)
+
+### Review-Fund Commit 27d90e9 (behoben)
+
+`verarbeite_ruecklastschrift_mit_bankentgelt`s Idempotenz-Kurzschluss
+(`bereits_verarbeiteter_kapital_op is not None`) übernahm zwar den
+damals entschiedenen Kapitalbetrag, prüfte das DIESMAL übergebene
+`bankentgelt_cent` aber NICHT gegen das damals tatsächlich gebuchte
+Entgelt. 0→700 hätte nachträglich ein neues Entgelt über den bereits
+vollständig verbrauchten Bankbetrag hinaus erfunden (`erfasse_und_buche`
+wird nur bei `bankentgelt_cent > 0` überhaupt aufgerufen); 700→0 hätte
+das bereits gebuchte Entgelt still verschwinden lassen (derselbe Zweig
+wird dann gar nicht mehr betreten, kein Fehler). Behoben in
+`bank/service.py`: ein Guard lädt die bestehende Kostenzeile
+(`RuecklastschriftkostenRepository.fuer_ruecklastschrift`, gesperrt) und
+vergleicht IMMER (auch bei 0) gegen das diesmal übergebene
+`bankentgelt_cent` sowie einen ggf. abweichenden `zuordnungsbetrag_cent`
+gegen Kapital+gespeichertes Entgelt - beides als
+`VorgangIdKonfliktError`. Zwei neue, gezielte Tests (0→700, 700→0, je
+ohne Mutation). Commit `f0d8344`.
+
+### Zusätzlicher Layoutnachweis: Absenderzeile INNERHALB des Empfängerfensters (behoben)
+
+Offizielle Vorlage https://www.einfach-brief.at/fe/vorlagen bestätigt die
+bisherigen Fensterkoordinaten (20/62, 90x45 mm) unverändert, verlangt
+aber laut Post ausdrücklich: eine optionale, kurze Absender-/
+Retouradresse muss EINZEILIG 8pt INNERHALB dieses Fensters stehen, als
+oberste Zeile, mit einer Leerzeile Abstand zur darunterstehenden
+Empfängeradresse (Rückläufer-Erkennung). Die bisher rechts oben
+AUSSERHALB des Fensters gesetzte Absenderzeile (Runde 11,
+Freihaltebereich-Korrektur) erfüllte das nicht. Behoben in
+`mahnwesen/brief_pdf.py`: die Absenderzeile steht jetzt linksbündig bei
+(`fenster_links_mm`/`fenster_oben_mm`), der Empfänger folgt ab +8mm
+darunter (weiterhin max. 6 Zeilen/90x45mm eingehalten); das Logo bleibt
+unverändert rechtsbündig oben, keine zweite/konkurrierende
+Retouradresse mehr. **Hinweis zur Zahlenlage:** die Fensterposition
+(x=20/y=62) überlappt zahlenmäßig mit dem in Runde 11 festgestellten
+oben-links-Sperrbereich (x<57/y<65) - das ist bewusst keine neue
+Widerlegung jener Prüfung, sondern eine separat und später belegte,
+spezifischere Vorgabe GENAU für diese eine Zeile im Empfängerfenster
+selbst (Logo/Folgeseitenkopf bleiben unverändert außerhalb). Zwei Tests
+in `test_brief_pdf.py` ersetzt/ergänzt (Positions-/Reihenfolgenachweis
+per `pypdf`-Textextraktion + Quelltextprüfung, Logo-Fall separat
+abgedeckt).
+
+### Mechanismus 2 — Post-SFTP-Adapter + Mahnbrief-Archiv-Erweiterung (fertiggestellt)
+
+Neues Modul `mahnwesen/brief_sftp.py` (Vorgabe Markus 19.10.2026,
+offizielle Anbieterspezifikation, keine weitere Recherche nötig):
+
+- `SendeParameter`/`baue_dateiname`: 15-stelliger, 1-basiert
+  positionierter Parameterblock (Position 3 Farbmodus=0/SW, 4
+  Duplex=0/Simplex, 5 Tempo=0/PRIO, 7 Produkt=1/Inland Einschreiben
+  Einwurf, 9 E-Brief=0/kein Versuch, alle übrigen Positionen fest "0")
+  + Bindestrich + die DAUERHAFT reservierte `MahnbriefArchivTable`-
+  Zeilen-ID (12-stellig zero-padded, NIE wiederverwendet) + `.pdf`.
+- `pruefe_sendevoraussetzungen`: nur echte PDF-Bytes, max. 14
+  Simplexseiten (Duplex-Fall ungeprüft).
+- `konfiguration_aus_settings`: GESCHLOSSEN per Default - liefert erst
+  dann eine Konfiguration, wenn Host+Username+Passwort+gepinnter
+  Hostkey-Fingerprint ALLE vier gesetzt sind (neue, leere/`None`-
+  Settings-Felder `brief_sftp_*` in `infrastructure/config.py`,
+  Credentials AUSSCHLIESSLICH aus privaten Serverdateien/
+  Umgebungsvariablen bei Codex).
+- `PostSftpTransportadapter`: Hostkey-Pinning VOR jeder Authentifizierung
+  (`PostSftpHostkeyFehlerError`), remote-exklusives Anlegen
+  (`put_exclusive`, niemals Überschreiben - `PostSftpDateiKonfliktError`
+  bei bereits vorhandener Datei), jede sonstige Verbindungsstörung
+  IMMER `TransportFehlerUngewissError` (kein automatischer Retry,
+  derselbe Grundsatz wie `indexautomatik/transport.py`). Alle
+  definitiven (nicht-ungewissen) Fehlerklassen sind bewusst
+  `ValueError`-Subklassen, damit `MahnwesenService.versende_mahnlauf`s
+  bestehende Fehlerbehandlung greift, statt den nächtlichen
+  Versandlauf abstürzen zu lassen. Eine echte paramiko-Verbindung
+  (`_echte_verbindung`) existiert als konkreter Anschlusspunkt, wird in
+  dieser Umgebung aber NIE aufgerufen (kein echter Host/Credentials
+  vorhanden) - **offener Punkt: Codex muss diese Funktion gegen den
+  tatsächlichen Post-Server verifizieren** (insbesondere: unterstützt
+  die konkret eingesetzte paramiko-Version den SFTP-Open-Modus `"xb"`
+  wirklich als `O_EXCL`, und entspricht das SHA256-Base64-
+  Fingerprint-Format dem vom Anbieter tatsächlich ausgegebenen Format -
+  beides wurde aus der Spezifikation abgeleitet, nie gegen den
+  echten Server getestet). `paramiko>=3.4,<6.0` neu in
+  `pyproject.toml` (installierte Version 5.1.0).
+
+`mahnwesen/mahnbrief_archiv.py` erweitert (additive Spalten, siehe
+Migrationstest in `test_migrations.py`):
+
+- `archivieren` bindet jetzt zusätzlich `empfaenger_hash` (SHA-256 über
+  Name+Adresse) und lehnt einen Wiederholungsversuch mit ABWEICHENDEM
+  PDF-Inhalt ODER Empfänger als `VorgangIdKonfliktError` ab (vorher:
+  stiller Erfolg mit der ersten Zeile - geschlossene Lücke aus Runde 11).
+  Der Forderungssnapshot selbst bleibt bewusst NICHT zusätzlich gehasht
+  - er ist bereits über `MahnLaufTable.mahnkosten_snapshot_json` durabel
+  eingefroren, ein zweiter redundanter Hash hätte nichts Neues geprüft.
+- `status` bildet NUR den einen maschinell ehrlich erreichbaren Zustand
+  ab (`VORBEREITET` → `UEBERMITTELT` = erfolgreich an den SFTP-Server
+  übertragen) - bewusst KEINE weiteren Werte wie "angenommen"/
+  "postaufgegeben"/"zugestellt", weil es dafür KEINE maschinelle
+  Status-API gibt (nur eine manuell einsehbare Portal-Auftragsliste).
+  `aktualisiere_status` ist forward-only, idempotent bei identischer
+  Belegreferenz, Konflikt bei abweichender.
+- NEU `importiere_anbieterbeleg`: separater, menschlich/prozessual aus
+  der echten Portal-Auftragsliste erfasster Nachweis
+  (`anbieterbeleg_referenz`/`_importiert_am`/`_importiert_von`,
+  idempotent/Konflikt wie überall sonst in diesem Modul). **Offener
+  Punkt: Kosten-/Mahnstatusfolgen außerhalb dieses Repos dürfen sich
+  AUSSCHLIESSLICH auf dieses Feld stützen, NIE auf den bloßen
+  `status=="UEBERMITTELT"`** - diese Methode selbst löst noch KEINE
+  Kostenbuchung/Mahnstufen-Fortschaltung aus (bewusst nicht im Umfang
+  dieser Runde, siehe Owner-Aufteilung AGENTS.md: "Claude nimmt keine
+  eigenständigen Fachentscheidungen zu Rechtsfragen vor").
+
+### Live-Dispatch-Anschluss (tatsächlich verdrahtet, nicht nur dokumentiert)
+
+Auf ausdrücklichen Wunsch ("in bestehende Kanalregel/bestehenden
+Versandworker einhängen, kein neuer Scheduler") ist der SFTP-Adapter
+TATSÄCHLICH in den bestehenden Mahnlauf-Versandworker eingebunden, nicht
+nur als isolierter Baustein dokumentiert:
+
+- `indexautomatik/mailversand_service.py::HVMailversandService.__init__`
+  berechnet `brief_transport_verfuegbar` jetzt ECHT aus
+  `brief_sftp.konfiguration_aus_settings(settings)` statt hartkodiert
+  `False` zu sein - bleibt aber in dieser Entwicklungsumgebung IMMER
+  `False`/geschlossen, weil nie echte Host/Credentials/Hostkey-Werte
+  gesetzt sind. Wirksam wird sie erst, sobald Codex diese vier
+  Settings-Werte auf dem Server setzt.
+- Neue Methode `HVMailversandService._sende_brief` (Kanal-BRIEF-
+  Gegenstück zur bestehenden `_dispatch_mahnlauf`-E-Mail-`versand_fn`):
+  erzeugt GENAU dasselbe Mahnbrief-PDF wie die bestehende On-Demand-
+  Vorschau (`backoffice/routes/mahnwesen.py::mahnbrief_pdf`, dieselbe
+  Forderungszeilen-/Absender-Komposition dort nachgebildet, NICHT neu
+  erfunden), archiviert es (reserviert damit die Sendereferenz), sendet
+  erst DANACH über `brief_sftp_adapter`, trägt den Status auf
+  `UEBERMITTELT` nach. Das zurückgegebene `BriefSftpErgebnis` hat
+  dieselbe Form wie `MailOpsErgebnis`/`VersandBestaetigung` - der
+  bestehende `nachweis_daten`/`versand_belegen`-Mechanismus in
+  `MahnwesenService.versende_mahnlauf` greift dadurch UNVERÄNDERT, kein
+  Eingriff in die atomare Claim-/Snapshot-/Recovery-Logik selbst nötig.
+  `status=="GESENDET"` bedeutet hier wie beim EMAIL-Kanal ausschließlich
+  "an den Transport übergeben" (`zugang_bestaetigt` bleibt serverseitig
+  immer `False`), NIE eine Zustellbestätigung.
+- **Offener Punkt, bewusst unverändert gelassen:** eine BRIEF-Gruppe, die
+  nach einem ungewissen SFTP-Fehler UNSICHER wird, bleibt UNSICHER bis
+  zur manuellen Klärung - `status_abgleichen`s automatische
+  `vervollstaendige_unsichere_mahnlaeufe`-Abfrage nutzt weiterhin
+  AUSSCHLIESSLICH `MailOpsClient.status_abfragen` (EMAIL), weil es für
+  den Briefkanal KEINE maschinelle Status-API gibt - das ist
+  beabsichtigt (keine automatische Wiederholung nach unklarem Versuch),
+  aber bedeutet: ein UNSICHERER Brief-Mahnlauf braucht IMMER eine
+  manuelle Rekonziliation (`mahnbrief_archiv.importiere_anbieterbeleg`
+  plus eine noch zu bauende Backoffice-Bedienoberfläche dafür - letztere
+  existiert noch nicht, nächste Runde).
+- `backoffice/dependencies.py`s EIGENE, separate `_mahn_service`-Instanz
+  (nur für die einzelfallbasierte, in Produktion nicht mehr verdrahtete
+  `versenden()`-Route genutzt, siehe dortiger Code-Kommentar) bleibt
+  bewusst UNVERÄNDERT bei `brief_transport_verfuegbar=False` - sie hat
+  keinen eigenen BRIEF-`versand_fn` und würde sonst eine Gruppe planen
+  können, die niemand tatsächlich verschickt.
+
+### Tests dieser Runde
+
+`test_bank.py` 2 neue (Retry-Guard 0→700/700→0), `test_brief_pdf.py`
+Absenderzeile-Tests ersetzt (29/29 insgesamt), `test_brief_sftp.py` NEU
+17/17 (Parameterblock, Dateiname, Sendevoraussetzungen,
+Konfigurationsgate, Hostkey-Pinning, Exklusivanlegen, ungewisse
+Verbindungsstörung - ausschließlich mit injiziertem Fake, kein echter
+Netzwerkzugriff), `test_mahnbrief_archiv.py` erweitert (Konflikt-/
+Status-/Anbieterbeleg-Tests, 11 insgesamt), `test_migrations.py` 1 neu
+(additive Spalten `mahnbrief_archiv`, 15 insgesamt), `test_config.py`
+unverändert grün, `test_hv_mailversand.py` 1 neu (Ende-zu-Ende-Nachweis
+des echten BRIEF-Dispatchpfads inkl. Archivierung+SFTP-Übermittlung+
+GESENDET-Übergang, ausschließlich mit injiziertem Fake). Vollständiger
+`tests/mietinkasso`-Lauf nach allen Änderungen grün. Keine Livezugriffe,
+kein echter Upload/Testbrief, keine Produktivbuchung, `SEND_ENABLED`
+unverändert `false`.

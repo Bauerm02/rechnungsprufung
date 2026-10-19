@@ -188,6 +188,21 @@ class Settings(BaseSettings):
     brief_fenster_breite_mm: float = 90.0
     brief_fenster_hoehe_mm: float = 45.0
 
+    # Post-SFTP-Bulkversand (Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS,
+    # Teil 3, siehe `mahnwesen/brief_sftp.py`): GESCHLOSSEN per Default -
+    # `brief_sftp.konfiguration_aus_settings` liefert erst dann eine
+    # Konfiguration, wenn ALLE VIER sicherheitsrelevanten Werte (Host,
+    # Username, Passwort, gepinnter Hostkey-Fingerprint) tatsächlich
+    # gesetzt sind. Credentials kommen AUSSCHLIESSLICH aus privaten
+    # Serverdateien/Umgebungsvariablen bei Codex - hier steht NIE ein
+    # echter Wert, nur sichere, leere Defaults.
+    brief_sftp_host: str | None = None
+    brief_sftp_port: int = 22
+    brief_sftp_pfad: str = "/bulk_tp/"
+    brief_sftp_username: str | None = None
+    brief_sftp_password: str | None = None
+    brief_sftp_host_key_fingerprint: str | None = None
+
 
 class ProduktionskonfigurationUngueltigError(RuntimeError):
     """Wird beim Prozessstart geworfen, wenn `environment == "production"`

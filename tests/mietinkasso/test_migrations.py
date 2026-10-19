@@ -761,6 +761,68 @@ def test_ensure_additive_columns_zieht_ruecklastschriftkosten_nachtraeglich_spal
         engine.dispose()
 
 
+def test_ensure_additive_columns_zieht_mahnbriefarchiv_status_spalten_nach(tmp_path: Path):
+    """Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS Teil 3: `mahnbrief_archiv`
+    existiert produktiv OHNE `empfaenger_hash`/`status`/`status_*`/
+    `anbieterbeleg_*` (Konfliktbindung + ehrliche Statusabbildung für den
+    SFTP-Versand). Additiv/nullable (bzw. `status` mit `server_default`)
+    nachgezogen, eine Bestandszeile bleibt unverändert."""
+
+    from mietinkasso.infrastructure.db.tables import MahnbriefArchivTable
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'mahnbriefarchiv-alt.db'}", future=True)
+    meta = sa.MetaData()
+    mahnbrief_archiv_alt = sa.Table(
+        "mahnbrief_archiv",
+        meta,
+        sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+        sa.Column("vertrag_id", sa.String(64), nullable=False),
+        sa.Column("stufe", sa.Integer, nullable=False),
+        sa.Column("mahnlauf_schluessel", sa.String(128), nullable=False),
+        sa.Column("pdf_bytes", sa.LargeBinary, nullable=False),
+        sa.Column("pdf_sha256", sa.String(64), nullable=False),
+        sa.Column("versandnachweis_referenz", sa.String(256), nullable=False),
+        sa.Column("archiviert_am", sa.DateTime(timezone=True)),
+        sa.Column("erstellt_von", sa.String(128), nullable=False),
+        # empfaenger_hash/status/status_*/anbieterbeleg_*: NEU, bewusst NICHT hier.
+    )
+    try:
+        meta.create_all(engine)
+        with engine.begin() as conn:
+            conn.execute(mahnbrief_archiv_alt.insert().values(
+                id=1, vertrag_id="V-ALT-1", stufe=1, mahnlauf_schluessel="GRUPPE-ALT",
+                pdf_bytes=b"%PDF-1.4 alt", pdf_sha256="x" * 64,
+                versandnachweis_referenz="mahnungslauf:alt-1", erstellt_von="alt-test",
+            ))
+
+        ausgefuehrt = ensure_additive_columns(engine)
+        neue_spalten = {
+            "empfaenger_hash", "status", "status_aktualisiert_am", "status_beleg_referenz",
+            "status_erfasst_von", "anbieterbeleg_referenz", "anbieterbeleg_importiert_am",
+            "anbieterbeleg_importiert_von",
+        }
+        assert {s["name"] for s in sa.inspect(engine).get_columns("mahnbrief_archiv")} >= neue_spalten
+        assert len(ausgefuehrt) == len(neue_spalten)
+
+        with engine.begin() as conn:
+            zeile = conn.execute(sa.text("SELECT * FROM mahnbrief_archiv WHERE id = 1")).mappings().one()
+        assert zeile["pdf_bytes"] == b"%PDF-1.4 alt" and zeile["erstellt_von"] == "alt-test"
+        assert zeile["empfaenger_hash"] is None
+        assert zeile["status"] == "VORBEREITET"  # server_default greift für die migrierte Bestandszeile
+        assert zeile["anbieterbeleg_referenz"] is None
+
+        assert ensure_additive_columns(engine) == []  # idempotent
+
+        session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False, class_=Session)
+        with session_factory() as session:
+            row = session.get(MahnbriefArchivTable, 1)
+            assert row.empfaenger_hash is None
+            assert row.status == "VORBEREITET"
+            assert row.anbieterbeleg_referenz is None
+    finally:
+        engine.dispose()
+
+
 def test_ensure_additive_columns_bei_frischer_db_no_op():
     """Eine frisch über `Base.metadata.create_all()` angelegte DB hat
     bereits alle Spalten - hier gibt es nichts nachzuziehen (reine

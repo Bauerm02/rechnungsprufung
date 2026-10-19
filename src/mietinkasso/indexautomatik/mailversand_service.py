@@ -6,16 +6,24 @@ from sqlalchemy import select
 from mietinkasso.auth.service import require_gesellschaft_access, require_schreibrecht
 from mietinkasso.bank.repository import BankRepository
 from mietinkasso.bank.service import BankImportService
-from mietinkasso.domain.exceptions import ObjektAusgeschlossenError, TransportFehlerUngewissError
+from mietinkasso.domain.exceptions import (
+    BindungInkonsistentError, ObjektAusgeschlossenError, TransportFehlerUngewissError, VorgangIdKonfliktError,
+)
 from mietinkasso.indexautomatik.mailnachweis import nachweis_daten, versand_belegen
 from mietinkasso.indexautomatik.mailops_client import MailOpsAuftrag, MailOpsClient
 from mietinkasso.indexautomatik.mailops_transport import MailOpsTransportadapter
 from mietinkasso.infrastructure.db.tables import (
     AuditEventTable, ErhoehungsschreibenTable, MahnFallTable, VertragsendeErinnerungTable,
 )
+from mietinkasso.mahnwesen import brief_sftp
+from mietinkasso.mahnwesen.brief_pdf import Absender as BriefAbsender
+from mietinkasso.mahnwesen.brief_pdf import Forderungszeile as BriefForderungszeile
+from mietinkasso.mahnwesen.brief_pdf import Zinssegment as BriefZinssegment
+from mietinkasso.mahnwesen.brief_pdf import erzeuge_mahnbrief_pdf
 from mietinkasso.mahnwesen.kosten import zins_bis_einschliesslich
 from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
 from mietinkasso.mahnwesen.kosten_service import MahnkostenService
+from mietinkasso.mahnwesen.mahnbrief_archiv import MahnbriefArchivRepository
 from mietinkasso.mahnwesen.repository import (
     BriefAnbieterProfilRepository, MahnFallRepository, MahnKanalregelRepository, MahnLaufRepository,
     MahnPolicyRepository,
@@ -119,12 +127,21 @@ class HVMailversandService:
         # BRIEF): Repositories bewusst IMMER verdrahtet - der Default-
         # Kanal bleibt trotzdem EMAIL für beide Stufen, solange Codex
         # keine Kanalregel freigibt (siehe `MahnwesenService._resolve_
-        # kanal`-Docstring), und `brief_transport_verfuegbar=False` hält
-        # den Briefkanal unabhängig davon vollständig blockiert - kein
-        # erfundener Live-Provider, EinfachBrief sFTP/API ist noch nicht
-        # freigeschaltet.
+        # kanal`-Docstring). `brief_transport_verfuegbar` ist jetzt (Teil 3,
+        # HV-20261019-VERSAND-KOSTEN-ABSCHLUSS) real an `brief_sftp.
+        # konfiguration_aus_settings` gekoppelt statt hartkodiert `False` -
+        # in dieser Entwicklungsumgebung bleibt sie trotzdem IMMER
+        # geschlossen, weil nie echte Host/Credentials/Hostkey-Werte
+        # gesetzt sind (kein erfundener Live-Provider); echt wirksam wird
+        # sie erst, sobald Codex diese vier Werte auf dem Server setzt.
         self.kanalregel_repo = MahnKanalregelRepository(session_factory)
         self.brief_anbieterprofil_repo = BriefAnbieterProfilRepository(session_factory)
+        self.mahnbrief_archiv_repo = MahnbriefArchivRepository(session_factory)
+        self._brief_sftp_konfiguration = brief_sftp.konfiguration_aus_settings(settings)
+        self.brief_sftp_adapter = (
+            brief_sftp.PostSftpTransportadapter(self._brief_sftp_konfiguration)
+            if self._brief_sftp_konfiguration is not None else None
+        )
         self.mahnkosten_service = MahnkostenService(
             self.mahnkosten_repo, self.op_service, bundle.stammdaten_repository,
             brief_anbieterprofil_repository=self.brief_anbieterprofil_repo,
@@ -133,7 +150,7 @@ class HVMailversandService:
             self.op_service, self.policy_repo, bank_stand_max_age_days=settings.bank_stand_max_age_days,
             mahnkosten_service=self.mahnkosten_service, mahnlauf_repository=self.mahnlauf_repo,
             kanalregel_repository=self.kanalregel_repo, brief_anbieterprofil_repository=self.brief_anbieterprofil_repo,
-            brief_transport_verfuegbar=False)
+            brief_transport_verfuegbar=self.brief_sftp_adapter is not None)
 
     def owner_senden(self, auftrag):
         if self.client is None or not self.settings.hv_mail_allowlist_bestaetigt:
@@ -183,6 +200,9 @@ class HVMailversandService:
         vorschau_slot: dict = {}
 
         def versand_fn(mitglieder):
+            if mahnlauf.kanal == "BRIEF":
+                return self._sende_brief(mahnlauf=mahnlauf, mitglieder=mitglieder, heute=heute, vorschau_slot=vorschau_slot)
+
             if self.client is None:
                 raise ValueError("Privater Mailweg ist nicht eingerichtet.")
 
@@ -262,6 +282,132 @@ class HVMailversandService:
             ungeklaerte_eingaenge_vorhanden=unclear, send_enabled=send_enabled,
             versand_fn=versand_fn, mahnkosten_vorschau_slot=vorschau_slot,
         )
+
+    def _sende_brief(self, *, mahnlauf, mitglieder, heute, vorschau_slot) -> brief_sftp.BriefSftpErgebnis:
+        """Kanal-BRIEF-Gegenstück zu `_dispatch_mahnlauf`s E-Mail-
+        `versand_fn` (Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS, Teil 3)
+        - erzeugt GENAU dasselbe Mahnbrief-PDF wie die bestehende
+        On-Demand-Vorschau (`backoffice/routes/mahnwesen.py::
+        mahnbrief_pdf`, dieselbe `vorschau()`/Forderungszeilen-Komposition),
+        archiviert es dauerhaft/konfliktgeprüft (`mahnbrief_archiv_repo.
+        archivieren`, reserviert damit die EINE permanente Sendereferenz
+        für die SFTP-Dateinamensbildung) und überträgt es erst DANACH über
+        `brief_sftp_adapter`. Ein erfolgreicher Upload ist NUR ein
+        ÜBERMITTELT-Nachweis (`aktualisiere_status`) - das vom Aufrufer
+        (`MahnwesenService.versende_mahnlauf`) erwartete `status==
+        "GESENDET"` bedeutet hier wie überall sonst in diesem Modul
+        ausschließlich "an den Transport/Provider übergeben", NIE eine
+        Zustellbestätigung (`versand_belegen`s `zugang_bestaetigt=False`
+        gilt kanalübergreifend unverändert).
+
+        `VorgangIdKonfliktError`/`BindungInkonsistentError` aus der
+        Archivierung sind praktisch unerreichbar (derselbe Mahnlauf wird
+        dank des atomaren Claims in `versende_mahnlauf` nie zweimal mit
+        abweichendem Inhalt hierher geraten) - werden aber trotzdem
+        kontrolliert in `ValueError` übersetzt, damit ein dennoch
+        auftretender Fall den Mahnlauf BLOCKIERT statt den gesamten
+        nächtlichen Versandlauf (`mahnlauf()`) abstürzen zu lassen."""
+
+        if self.brief_sftp_adapter is None:
+            raise ValueError("Brief-SFTP-Transport ist nicht eingerichtet.")
+
+        st = self.bundle.stammdaten_repository
+        contract = st.get_vertrag(mahnlauf.vertrag_id)
+        obj = st.objekt_fuer_vertrag(mahnlauf.vertrag_id)
+        unit = st.get_einheit(contract.einheit_id)
+        account = st.get_konto_by_vertrag(mahnlauf.vertrag_id)
+        debitor = st.get_debitor(account.debitor_id)
+        if debitor is None or not debitor.postadresse_geprueft or not (debitor.adresse or "").strip():
+            raise ValueError("Keine geprüfte Postadresse für den Briefkanal hinterlegt.")
+
+        offene = {f.op_position_id: f for f in self.op_service.offene_forderungen(account.id, heute=heute)}
+        gesamt_cent = 0
+        for mitglied in mitglieder:
+            debt = offene.get(mitglied.forderung_op_position_id)
+            if debt is None or debt.rest_cent != mitglied.snapshot["betrag_cent"] or debt.faelligkeit is None:
+                raise ValueError("Offene Forderung hat sich verändert.")
+            gesamt_cent += debt.rest_cent
+
+        if "vorschau" in vorschau_slot:
+            vorschau = vorschau_slot["vorschau"]
+        elif self.mahnkosten_service is not None:
+            vorschau = self.mahnkosten_service.vorschau(
+                vertrag_id=mahnlauf.vertrag_id, stufe=mahnlauf.stufe, heute=heute,
+                nur_op_position_ids=frozenset(m.forderung_op_position_id for m in mitglieder),
+                kanal=mahnlauf.kanal,
+            )
+            vorschau_slot["vorschau"] = vorschau
+        else:
+            vorschau = None
+
+        offene_ids = frozenset(vorschau.forderung_op_position_ids) if vorschau is not None else frozenset(
+            m.forderung_op_position_id for m in mitglieder
+        )
+        forderungszeilen = [
+            BriefForderungszeile(
+                bezeichnung=f.leistungsperiode or f.art,
+                faelligkeit=f.faelligkeit if f.faelligkeit_bekannt else None,
+                betrag_cent=f.rest_cent,
+            )
+            for f in offene.values() if f.op_position_id in offene_ids
+        ]
+        zins_segmente = [
+            BriefZinssegment(von=s.von, bis=s.bis, satz_prozent=s.satz_prozent, zinsen_cent=s.zinsen_cent)
+            for s in (vorschau.zins_segmente if vorschau is not None else ())
+        ]
+        gesamtbetrag_cent = gesamt_cent + (
+            (vorschau.bereits_offene_mahnkosten_cent + vorschau.zusaetzlicher_betrag_cent) if vorschau is not None else 0
+        )
+        zinssatz_einheitlich_text = (
+            f"{vorschau.zinssatz_prozent} % p.a." if vorschau is not None and vorschau.zinssatz_prozent is not None else None
+        )
+        deadline = heute + timedelta(days=contract.zahlungsfrist_tage)
+        anker = mitglieder[0]
+        empfaenger_name = anker.snapshot["empfaenger_name"]
+
+        absender = BriefAbsender(
+            name=self.settings.brief_absender_name, adresse=self.settings.brief_absender_adresse,
+            fn=self.settings.brief_absender_fn, uid=self.settings.brief_absender_uid,
+            telefon=self.settings.brief_absender_telefon, website=self.settings.brief_absender_website,
+            email=self.settings.brief_absender_email, farbe_anthrazit=self.settings.brief_farbe_anthrazit,
+            farbe_gold=self.settings.brief_farbe_gold, logo_pfad=self.settings.brief_logo_pfad,
+            font_regular_pfad=self.settings.brief_font_regular_pfad, font_bold_pfad=self.settings.brief_font_bold_pfad,
+            font_headline_pfad=self.settings.brief_font_headline_pfad,
+            fenster_links_mm=self.settings.brief_fenster_links_mm, fenster_oben_mm=self.settings.brief_fenster_oben_mm,
+            fenster_breite_mm=self.settings.brief_fenster_breite_mm, fenster_hoehe_mm=self.settings.brief_fenster_hoehe_mm,
+        )
+        pdf_bytes = erzeuge_mahnbrief_pdf(
+            absender=absender, empfaenger_name=empfaenger_name,
+            empfaenger_adresse=(debitor.adresse or "").replace(", ", "\n"),
+            objekt_bezeichnung=obj.bezeichnung, einheit_bezeichnung=unit.bezeichnung, stufe=mahnlauf.stufe,
+            heute=heute, zahlungsfrist_bis=deadline, forderungszeilen=forderungszeilen,
+            bereits_offene_mahnkosten_cent=(vorschau.bereits_offene_mahnkosten_cent if vorschau is not None else 0),
+            neue_zinsen_delta_cent=(vorschau.neue_zinsen_delta_cent if vorschau is not None else 0),
+            zins_segmente=zins_segmente, zinssatz_einheitlich_text=zinssatz_einheitlich_text,
+            neue_gebuehr_cent=((vorschau.gebuehr_cent or 0) if vorschau is not None else 0),
+            gebuehr_rechtsgrundlage=(vorschau.gebuehr_rechtsgrundlage if vorschau is not None else None),
+            gesamtbetrag_cent=gesamtbetrag_cent,
+        )
+
+        try:
+            archiv_zeile = self.mahnbrief_archiv_repo.archivieren(
+                vertrag_id=mahnlauf.vertrag_id, stufe=mahnlauf.stufe, mahnlauf_schluessel=mahnlauf.outbox_key,
+                pdf_bytes=pdf_bytes, versandnachweis_referenz="mahnungslauf:" + mahnlauf.outbox_key,
+                empfaenger_name=empfaenger_name, empfaenger_adresse=debitor.adresse, erstellt_von="hv-mailversand",
+            )
+        except (VorgangIdKonfliktError, BindungInkonsistentError) as exc:
+            raise ValueError(f"Mahnbrief-Archivierung inkonsistent: {exc}") from exc
+
+        dateiname = brief_sftp.baue_dateiname(archiv_id=archiv_zeile.id)
+        ergebnis = self.brief_sftp_adapter.sende(pdf_bytes=archiv_zeile.pdf_bytes, dateiname=dateiname)
+        try:
+            self.mahnbrief_archiv_repo.aktualisiere_status(
+                archiv_id=archiv_zeile.id, neuer_status="UEBERMITTELT",
+                beleg_referenz=ergebnis.externe_referenz, erfasst_von="hv-mailversand",
+            )
+        except VorgangIdKonfliktError as exc:
+            raise ValueError(f"Mahnbrief-Archivstatus inkonsistent: {exc}") from exc
+        return ergebnis
 
     def mahnung_senden(self, *, ctx, row_id, heute):
         """Sendet GENAU EIN Schreiben je Vertrag+Mahnstufe (Rückprüfung

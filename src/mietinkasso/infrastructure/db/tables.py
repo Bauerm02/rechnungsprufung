@@ -1980,6 +1980,29 @@ class MahnbriefArchivTable(Base):
     versandnachweis_referenz: Mapped[str] = mapped_column(String(256))
     archiviert_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     erstellt_von: Mapped[str] = mapped_column(String(128))
+    # Teil 3 (HV-20261019-VERSAND-KOSTEN-ABSCHLUSS, SFTP-/Statuserweiterung,
+    # additiv/nullable, siehe `ensure_additive_columns`): `empfaenger_hash`
+    # bindet den Empfänger (Name+Adresse) dauerhaft an diese Archivzeile -
+    # `mahnbrief_archiv.py::archivieren` lehnt einen Wiederholungsversuch
+    # mit abweichendem PDF-Inhalt ODER abweichendem Empfänger als Konflikt
+    # ab, statt still die erste Zeile zurückzugeben. `status` ist
+    # AUSSCHLIESSLICH "VORBEREITET" oder "UEBERMITTELT" (= erfolgreich an
+    # den Post-SFTP-Server übertragen, siehe `brief_sftp.py`) - das ist
+    # bewusst der EINZIGE maschinell erreichbare Zustand; es gibt KEINE
+    # maschinelle Status-API für Postaufgabe/Zustellung. Ein echter
+    # Nachweis darüber kommt AUSSCHLIESSLICH über `anbieterbeleg_*`
+    # (manuell/prozessual aus der Post-Portal-Auftragsliste importiert,
+    # `mahnbrief_archiv.py::importiere_anbieterbeleg`) - Kosten-/
+    # Mahnstatusfolgen dürfen sich NUR auf dieses Feld stützen, NIE auf
+    # den bloßen "UEBERMITTELT"-Uploadstatus.
+    empfaenger_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'VORBEREITET'"))
+    status_aktualisiert_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status_beleg_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    status_erfasst_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    anbieterbeleg_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    anbieterbeleg_importiert_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    anbieterbeleg_importiert_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class MahnpauschaleFreigabeTable(Base):

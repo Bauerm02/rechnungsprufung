@@ -16,6 +16,8 @@ from mietinkasso.infrastructure.config import Settings
 from mietinkasso.infrastructure.db.tables import (
     AuditEventTable, MahnFallTable, MahnkostenBuchungTable, MahnkostenGebuehrTable, MahnLaufTable,
 )
+from mietinkasso.mahnwesen import brief_sftp
+from mietinkasso.mahnwesen.brief_sftp import PostSftpTransportadapter, SftpKonfiguration
 
 
 @pytest.fixture
@@ -627,3 +629,89 @@ def test_index_real_mail_protocol_acceptance_is_not_sending_or_rent_change(hv, b
     assert confirmed.versendet_am.isoformat() == "2026-04-06T11:12:13"
     assert confirmed.zugang_bestaetigt_am is None and confirmed.status == "GESENDET"
     assert [r.method for r in state["calls"]] == ["POST", "GET"]
+
+
+class _FakeSftpVerbindung:
+    """Synthetisches Test-Double - niemals echter Netzwerkzugriff (siehe
+    `test_brief_sftp.py` für denselben Grundsatz)."""
+
+    def __init__(self, fingerprint: str):
+        self._fingerprint = fingerprint
+        self.geschriebene_dateien: dict[str, bytes] = {}
+
+    def hostkey_fingerprint(self) -> str:
+        return self._fingerprint
+
+    def put_exclusive(self, remote_pfad: str, data: bytes) -> None:
+        self.geschriebene_dateien[remote_pfad] = data
+
+    def close(self) -> None:
+        pass
+
+
+def test_brief_kanal_wird_archiviert_konfliktfrei_und_per_sftp_uebermittelt(hv, basis_vertrag, admin_ctx, session_factory):
+    """Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS Teil 3: Ende-zu-Ende-
+    Nachweis des realen BRIEF-Dispatchpfads (`HVMailversandService.
+    _sende_brief`) - GENAU EIN echtes Mahnbrief-PDF wird erzeugt, dauerhaft
+    archiviert (konfliktgeprüft) und über den injizierten SFTP-Adapter
+    übermittelt; der Mahnfall/Mahnlauf wird dabei exakt wie beim
+    EMAIL-Kanal auf GESENDET nachgezogen (= "an den Transport übergeben",
+    KEIN Zustellnachweis). Kein echter Netzwerkzugriff (`_FakeSftpVerbindung`)."""
+
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+
+    regel = service.kanalregel_repo.anlegen(stufe1_kanal="BRIEF", stufe2_kanal="BRIEF", erstellt_von="test")
+    service.kanalregel_repo.freigeben(regel.id, freigegeben_von="test")
+    profil = service.brief_anbieterprofil_repo.anlegen(
+        anbieter_name="EinfachBrief (Test)", quelle_beleg="Testtarif", erstellt_von="test",
+    )
+    service.brief_anbieterprofil_repo.freigeben(profil.id, freigegeben_von="test")
+    service.bundle.stammdaten_repository.upsert_debitor(
+        id=account.debitor_id, name="Max Mustermieter", email=None,
+        adresse="Musterstraße 1, 1010 Wien", postadresse_geprueft=True,
+    )
+
+    fingerprint = "SHA256:test-fingerprint"
+    fake_verbindung = _FakeSftpVerbindung(fingerprint)
+    konfiguration = SftpKonfiguration(
+        host="transfer.post-business-solutions.at", port=22, pfad="/bulk_tp/",
+        username="jlb-test", password="synthetisches-test-passwort", host_key_fingerprint=fingerprint,
+    )
+    # Dieselbe Injektionsstelle wie in `test_brief_sftp.py` - niemals ein
+    # echter Netzwerkzugriff, auch wenn `brief_transport_verfuegbar` hier
+    # für den Test manuell auf `True` gesetzt wird (produktiv bleibt das
+    # nur dann wahr, wenn Codex echte Settings-Werte konfiguriert).
+    service.brief_sftp_adapter = PostSftpTransportadapter(konfiguration, verbindung_factory=lambda k: fake_verbindung)
+    service.mahn_service._brief_transport_verfuegbar = True
+
+    result = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    assert result["gesendet"] == 1
+
+    row = service.mahn_repo.list_fuer_vertrag(contract.id)[0]
+    assert row.status == "GESENDET"
+
+    with session_factory() as s:
+        mahnlauf_row = s.execute(select(MahnLaufTable).where(MahnLaufTable.vertrag_id == contract.id)).scalars().one()
+    assert mahnlauf_row.kanal == "BRIEF" and mahnlauf_row.status == "GESENDET"
+
+    archiv = service.mahnbrief_archiv_repo.fuer_mahnlauf(
+        vertrag_id=contract.id, stufe=1, mahnlauf_schluessel=mahnlauf_row.outbox_key,
+    )
+    assert archiv is not None
+    assert archiv.pdf_bytes[:5] == b"%PDF-"
+    assert archiv.status == "UEBERMITTELT"
+    assert archiv.status_beleg_referenz is not None
+
+    dateiname = brief_sftp.baue_dateiname(archiv_id=archiv.id)
+    assert fake_verbindung.geschriebene_dateien == {f"/bulk_tp/{dateiname}": archiv.pdf_bytes}
+
+    # Keine echte Zustellbestätigung - derselbe Grundsatz wie beim
+    # EMAIL-Kanal: der Audit-Nachweis belegt ausdrücklich NUR die
+    # Übergabe an den Transport, nie den Zugang/die Zustellung.
+    with session_factory() as s:
+        evidence = list(s.execute(select(AuditEventTable).where(
+            AuditEventTable.aktion == "MAILVERSAND_BESTAETIGT", AuditEventTable.entity_typ == "mahn_faelle",
+        )).scalars())
+    assert evidence and all(e.payload["zugang_bestaetigt"] is False for e in evidence)
