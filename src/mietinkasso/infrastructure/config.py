@@ -188,6 +188,18 @@ class Settings(BaseSettings):
     brief_fenster_breite_mm: float = 90.0
     brief_fenster_hoehe_mm: float = 45.0
 
+    # Zahlungsziel für Mahnschreiben (Auftrag HV-20261020-VIER-MAHNSTUFEN,
+    # Abnahme-Folgefix Codex 20.10.2026: "Brief/Mailentwurf enthält noch
+    # keine geprüfte Ziel-IBAN/Kontoinhaber/Referenz"). Bewusst OPTIONAL
+    # (kein erfundener Platzhalter): ohne konfigurierte IBAN bleibt der
+    # bisherige allgemeine Hinweistext ("auf das Ihnen bekannt gegebene
+    # Konto") unverändert bestehen - siehe `mahnwesen/brief_pdf.py`/
+    # `indexautomatik/mailversand_service.py`. KEINE IBAN-Prüfsummen-
+    # validierung hier (bewusst keine neue Automatik erfunden) - die
+    # Korrektheit bleibt Aufgabe der Person, die den Wert konfiguriert.
+    brief_zahlungsziel_iban: str | None = None
+    brief_zahlungsziel_kontoinhaber: str | None = None
+
     # Post-SFTP-Bulkversand (Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS,
     # Teil 3, siehe `mahnwesen/brief_sftp.py`): GESCHLOSSEN per Default -
     # `brief_sftp.konfiguration_aus_settings` liefert erst dann eine

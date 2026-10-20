@@ -18,6 +18,7 @@ from mietinkasso.infrastructure.db.tables import (
 from mietinkasso.mahnwesen import brief_sftp
 from mietinkasso.mahnwesen.brief_pdf import Absender as BriefAbsender
 from mietinkasso.mahnwesen.brief_pdf import Forderungszeile as BriefForderungszeile
+from mietinkasso.mahnwesen.brief_pdf import Zahlungsziel as BriefZahlungsziel
 from mietinkasso.mahnwesen.brief_pdf import Zinssegment as BriefZinssegment
 from mietinkasso.mahnwesen.brief_pdf import erzeuge_mahnbrief_pdf
 from mietinkasso.mahnwesen.kosten import zins_bis_einschliesslich
@@ -53,6 +54,19 @@ def bank_freigabe_ableiten(bank_repo, bank_service, gesellschaft_id, vertrag_id)
 
 def _eur_text(cent: int) -> str:
     return f"{cent/100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def zahlungsziel_fuer_mahnung(settings, *, vertrag_id: str, stufe: int) -> BriefZahlungsziel:
+    """Baut das Zahlungsziel für Brief UND E-Mail aus genau EINER Quelle
+    (Abnahme-Folgefix Codex 20.10.2026) - `verwendungszweck` wird
+    deterministisch aus Vertrag/Stufe gebildet, NIE frei erfunden; ohne
+    konfigurierte IBAN/Kontoinhaber bleibt der jeweilige allgemeine
+    Hinweistext unverändert (siehe `brief_pdf.py`/Aufrufer unten)."""
+
+    return BriefZahlungsziel(
+        iban=settings.brief_zahlungsziel_iban, kontoinhaber=settings.brief_zahlungsziel_kontoinhaber,
+        verwendungszweck=f"Mahnung Stufe {stufe}, Vertrag {vertrag_id}",
+    )
 
 
 def _mahnkosten_text_baustein(vorschau) -> str:
@@ -250,7 +264,20 @@ class HVMailversandService:
                 if debt is None or debt.rest_cent != mitglied.snapshot["betrag_cent"] or debt.faelligkeit is None:
                     raise ValueError("Offene Forderung hat sich verändert.")
                 gesamt_cent += debt.rest_cent
-                posten_zeilen.append(f"- {_eur_text(debt.rest_cent)} EUR, fällig seit {debt.faelligkeit.strftime('%d.%m.%Y')}")
+                periode_text = f"{debt.leistungsperiode}: " if debt.leistungsperiode else ""
+                zeile = f"- {periode_text}{_eur_text(debt.rest_cent)} EUR, fällig seit {debt.faelligkeit.strftime('%d.%m.%Y')}"
+                # Abnahme-Folgefix (Codex 20.10.2026): "keine vollständige
+                # Periode/Position/Ursprungsbetrag/angerechnete Zahlungen/
+                # Rest-Tabelle" - bei einer bereits teilweise angerechneten
+                # Zahlung wird das HIER explizit genannt, statt nur den
+                # (für den Mieter sonst unerklärten) Restbetrag zu zeigen.
+                if debt.betrag_cent != debt.rest_cent:
+                    angerechnet = debt.betrag_cent - debt.rest_cent
+                    zeile += (
+                        f" (ursprünglich {_eur_text(debt.betrag_cent)} EUR, davon bereits angerechnet "
+                        f"{_eur_text(angerechnet)} EUR, Rest {_eur_text(debt.rest_cent)} EUR)"
+                    )
+                posten_zeilen.append(zeile)
 
             # `versende_mahnlauf` berechnet (und reserviert/kürzt, siehe
             # Rückprüfung Codex 14.09.2026) die Vorschau bereits VOR dem
@@ -296,6 +323,22 @@ class HVMailversandService:
             anker = mitglieder[0]
             empfaenger_name = anker.snapshot["empfaenger_name"]
             rechtlicher_absatz = f"\n\n{mahntext.rechtlicher_kern}" if mahntext.rechtlicher_kern else ""
+            # Abnahme-Folgefix (Codex 20.10.2026): "keine geprüfte Ziel-
+            # IBAN/Kontoinhaber/Referenz" - dieselbe `_zahlungsziel`-Quelle
+            # wie der PDF-Brief (siehe `_sende_brief` unten), damit Mail-
+            # und Brieftext nie auseinanderlaufen.
+            zahlungsziel = zahlungsziel_fuer_mahnung(self.settings, vertrag_id=mahnlauf.vertrag_id, stufe=mahnlauf.stufe)
+            if zahlungsziel.iban and zahlungsziel.kontoinhaber:
+                zahlungsziel_text = (
+                    "\n\nBitte überweisen Sie den Gesamtbetrag binnen 14 Tagen ab Zugang dieser Nachricht auf "
+                    f"folgendes Konto: IBAN {zahlungsziel.iban}, Kontoinhaber {zahlungsziel.kontoinhaber}, "
+                    f"Verwendungszweck: {zahlungsziel.verwendungszweck}."
+                )
+            else:
+                zahlungsziel_text = (
+                    "\n\nBitte begleichen Sie den Gesamtbetrag binnen 14 Tagen ab Zugang dieser Nachricht auf "
+                    "das Ihnen für dieses Mietverhältnis bekannt gegebene Konto."
+                )
             text = (
                 f"Guten Tag {empfaenger_name},\n\n"
                 f"{mahntext.einleitung} {mahntext.kerntext}\n\n"
@@ -305,7 +348,8 @@ class HVMailversandService:
                 + kosten_text +
                 f"Gesamtbetrag (Hauptforderung inkl. noch offener früherer Kosten und neuer zulässiger "
                 f"Zinsen/Gebühr): {_eur_text(gesamtbetrag_cent)} EUR."
-                + rechtlicher_absatz +
+                + rechtlicher_absatz
+                + zahlungsziel_text +
                 "\n\nBei einer inzwischen erfolgten Zahlung senden Sie uns bitte den Zahlungsbeleg. "
                 "Bei Fragen zur Forderung antworten Sie bitte auf diese Nachricht."
             )
@@ -408,6 +452,7 @@ class HVMailversandService:
                 bezeichnung=f.leistungsperiode or f.art,
                 faelligkeit=f.faelligkeit if f.faelligkeit_bekannt else None,
                 betrag_cent=f.rest_cent,
+                urspruenglicher_betrag_cent=f.betrag_cent,
             )
             for f in offene.values() if f.op_position_id in offene_ids
         ]
@@ -448,6 +493,7 @@ class HVMailversandService:
             neue_gebuehr_cent=((vorschau.gebuehr_cent or 0) if vorschau is not None else 0),
             gebuehr_rechtsgrundlage=(vorschau.gebuehr_rechtsgrundlage if vorschau is not None else None),
             gesamtbetrag_cent=gesamtbetrag_cent,
+            zahlungsziel=zahlungsziel_fuer_mahnung(self.settings, vertrag_id=mahnlauf.vertrag_id, stufe=mahnlauf.stufe),
         )
 
         try:
@@ -756,6 +802,26 @@ class HVMailversandService:
                             # Provider die Annahme schon bestätigt hat.
                             tatsaechlich_versucht = True
                 finally:
+                    # Korrektur nach unabhängiger Abnahme (Codex,
+                    # 20.10.2026, reproduzierter Fehler): `_dispatch_
+                    # mahnlauf` kann NACHWEISLICH gesendet und ERST DANACH
+                    # (vor Rückgabe des Ergebnisses) eine Exception werfen
+                    # - in diesem Fall bleibt `tatsaechlich_versucht` oben
+                    # fälschlich `False`, weil die Zeile, die es auf
+                    # `True` setzt, nie erreicht wird. Dasselbe konservative
+                    # Prinzip wie `freigeben_verwaiste`: VOR dem Freigeben
+                    # den tatsächlichen `MahnLaufTable`-Status nachschlagen
+                    # (bereits VOR jedem Versandversuch über `verknuepfe_
+                    # mahnlauf` oben mit dem Slot verknüpft) - `GESENDET`/
+                    # `UNSICHER` bedeutet ein Providerkontakt hat
+                    # tatsächlich stattgefunden oder ist ungewiss, der
+                    # Slot darf dann NIE als sicher unversandt freigegeben
+                    # werden. Nur wenn der Mahnlauf nachweislich nie über
+                    # die Planung hinauskam, bleibt es beim Freigeben.
+                    if not tatsaechlich_versucht and letzter_mahnlauf is not None:
+                        aktueller_mahnlauf = self.mahnlauf_repo.get(letzter_mahnlauf.id)
+                        if aktueller_mahnlauf is not None and aktueller_mahnlauf.status in ("GESENDET", "UNSICHER"):
+                            tatsaechlich_versucht = True
                     if tatsaechlich_versucht:
                         self.tageslauf_repo.markiere_versendet(
                             tageslauf.id, mahnlauf_id=(letzter_mahnlauf.id if letzter_mahnlauf is not None else None),

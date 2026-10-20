@@ -111,8 +111,8 @@ def _uebersicht_details_html(z: dict) -> str:
     return f"""
     <table>
       <tr><th>Vertrag</th><td><code>{h(vertrag.id)}</code></td></tr>
-      <tr><th>Laufzeit</th><td>{vertrag.gueltig_von.isoformat()} – {vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else 'unbefristet'}
-          ({h(profil.befristungsstatus)})</td></tr>
+      <tr><th>Laufzeit</th><td>{vertrag.gueltig_von.isoformat()} – {vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else 'kein Enddatum hinterlegt'}
+          · Befristungsstatus: {h(profil.befristungsstatus)}</td></tr>
       <tr><th>Indexbasis</th><td>{index_text}</td></tr>
       <tr><th>Kaution vereinbart</th><td>{eur(profil.vertragliche_kaution_cent) if profil.vertragliche_kaution_cent is not None else 'nicht erfasst'}</td></tr>
       <tr><th>Mahn-/Zinsregel (Staging)</th>
@@ -231,15 +231,20 @@ def neu_kontext_formular(*, einheiten_mit_objekt: list[tuple], debitoren: list, 
           <label>Vermieter-Gesellschaft</label><select name="gesellschaft_id" required>{gesellschaft_optionen}</select>
           <label>Rechtsordnung</label><select name="rechtsordnung" required>{rechtsordnung_optionen}</select>
           <label>Vertragsbeginn (technisch, Sollstellung/OP)</label><input type="date" name="gueltig_von" required>
-          <label>Vertragsende (leer lassen = unbefristet)</label><input type="date" name="gueltig_bis">
+          <label>Vertragsende (nur bei tatsächlich befristetem Vertrag - leer lassen bedeutet NICHT automatisch
+                 unbefristet, siehe Befristungsstatus im nächsten Schritt)</label>
+          <input type="date" name="gueltig_bis">
         </fieldset>
         <fieldset><legend>Mieter</legend>
           <label>Vorhandenen Mieter wählen</label><select name="debitor_id">{debitor_optionen}</select>
-          <p class="muted">ODER neu anlegen (wenn ausgefüllt, hat das Vorrang vor der Auswahl oben):</p>
+          <p class="muted">ODER neu anlegen (wenn eine ID eingetragen ist, hat das Vorrang vor der Auswahl oben).
+             Name/E-Mail/Telefon können HIER leer bleiben und im nächsten Schritt aus einem hochgeladenen PDF
+             übernommen und geprüft werden - nur die ID muss bereits feststehen.</p>
           <label>Neue Mieter-ID</label><input name="neuer_debitor_id" placeholder="z. B. DEB-NEU-1">
-          <label>Name</label><input name="neuer_debitor_name">
-          <label>E-Mail</label><input name="neuer_debitor_email" type="email">
-          <label>Adresse</label><input name="neuer_debitor_adresse">
+          <label>Name (optional - kann im nächsten Schritt aus dem PDF ergänzt werden)</label>
+          <input name="neuer_debitor_name">
+          <label>E-Mail (optional)</label><input name="neuer_debitor_email" type="email">
+          <label>Adresse (optional)</label><input name="neuer_debitor_adresse">
           <label for="neuer-debitor-telefon">Telefon (optional)</label>
           <input id="neuer-debitor-telefon" name="neuer_debitor_telefon" type="tel" maxlength="{TELEFON_MAX_LAENGE}">
         </fieldset>
@@ -272,10 +277,18 @@ def neu_kontext_werte(form) -> dict:
     if rechtsordnung not in RECHTSORDNUNGEN:
         raise ValueError("Ungültige Rechtsordnung.")
 
+    neuer_debitor_id = str(form.get("neuer_debitor_id", "")).strip()
     neuer_debitor_name = str(form.get("neuer_debitor_name", "")).strip()
     neuer_debitor: dict | None = None
-    if neuer_debitor_name:
-        neuer_debitor_id = str(form.get("neuer_debitor_id", "")).strip()
+    # Abnahme-Folgefix (Codex 20.10.2026): "Neuanlage verlangt Name/IDs/
+    # Termine VOR PDF, kein PDF-zuerst-Ablauf" - der NAME darf HIER noch
+    # leer bleiben (und im nächsten Schritt aus dem hochgeladenen PDF
+    # übernommen/editiert werden, siehe `routes/vertragsanlage.py::
+    # vertragsanlage_pdf_hochladen`) - NUR die ID muss bereits feststehen,
+    # weil sie die technische Debitor-Identität ist, die kein PDF liefern
+    # kann. Auslöser für "neuer Mieter" ist deshalb jetzt die ID, NICHT
+    # mehr zwingend der Name.
+    if neuer_debitor_id or neuer_debitor_name:
         if not neuer_debitor_id:
             raise ValueError("Neue Mieter-ID darf nicht leer sein.")
         neuer_debitor = dict(
@@ -453,6 +466,34 @@ def review_formular(
         aktuell = werte.get(name) or "UNGEKLAERT"
         return "".join(option(w, w, selected=aktuell == w) for w in werte_liste)
 
+    # Abnahme-Folgefix (Codex 20.10.2026): "richtige Mieterkontakte
+    # auslesen und editierbar prüfen" - Name/E-Mail/Telefon eines GERADE
+    # anzulegenden neuen Mieters sind jetzt sichtbare, editierbare Felder
+    # (vorbefüllt aus Schritt 1 UND/ODER PDF-Hinweis, siehe Route), NICHT
+    # mehr nur versteckt durchgereicht. Nur relevant, wenn in diesem
+    # Vorgang tatsächlich ein neuer Debitor entsteht (`neuer_debitor_id`
+    # in `kontext_hidden`) - ein bereits bestehender, ausgewählter
+    # Debitor wird hier NIE mitbearbeitet (siehe Eckdaten-Block oben für
+    # den reinen Vergleichshinweis in diesem Fall).
+    neuer_mieter_block = ""
+    if kontext_hidden.get("neuer_debitor_id"):
+        neuer_mieter_block = f"""
+        <fieldset><legend>Mieter (neu anzulegen, ID {h(str(kontext_hidden['neuer_debitor_id']))})</legend>
+          <p class="muted">Aus Schritt 1 übernommen und/oder aus dem PDF vorgeschlagen - jedes Feld bleibt
+             editierbar, nichts wird ungeprüft übernommen.</p>
+          <label>Name</label>
+          <input name="neuer_debitor_name" value="{h(str(werte.get('neuer_debitor_name') or ''))}">
+          {_beleg_hinweis(vorschlaege, "mieter_name_hinweis")}
+          <label>E-Mail</label>
+          <input name="neuer_debitor_email" type="email" value="{h(str(werte.get('neuer_debitor_email') or ''))}">
+          {_beleg_hinweis(vorschlaege, "mieter_email_hinweis")}
+          <label>Telefon</label>
+          <input name="neuer_debitor_telefon" type="tel" maxlength="{TELEFON_MAX_LAENGE}" value="{h(str(werte.get('neuer_debitor_telefon') or ''))}">
+          {_beleg_hinweis(vorschlaege, "mieter_telefon_hinweis")}
+          <label>Adresse</label>
+          <input name="neuer_debitor_adresse" value="{h(str(werte.get('neuer_debitor_adresse') or ''))}">
+        </fieldset>"""
+
     return f"""
     <div class="card">
       <h1>{'Neuen Mietvertrag prüfen' if ist_neu else 'Mietvertragsprofil aktualisieren'}</h1>
@@ -466,6 +507,7 @@ def review_formular(
       <form method="post" action="{h(aktion_url)}">
         {csrf_feld(csrf)}
         {hidden_felder}
+        {neuer_mieter_block}
         <fieldset><legend>Nutzung und Rechtsgrundlage</legend>
           <label>Nutzungsart (unabhängig von der Rechtsordnung)</label>
           <select name="nutzungsart">{nutzungsart_optionen}</select>
@@ -1415,7 +1457,9 @@ def detail_ansicht(
     <div class="card"><h2>Laufzeit</h2>
       <table>
         <tr><th>Vertragsbeginn (technisch, für Sollstellung/Buchung)</th><td>{vertrag.gueltig_von.isoformat()}</td></tr>
-        <tr><th>Vertragsende</th><td>{vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else 'unbefristet'}</td></tr>
+        <tr><th>Vertragsende</th>
+            <td>{vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else 'kein Enddatum hinterlegt'}
+            · Befristungsstatus: {h(profil.befristungsstatus) if profil else 'UNGEKLAERT'} {_status_badge(befristungsstatus_status)}</td></tr>
         <tr><th>Ursprünglicher tatsächlicher Mietbeginn</th>
             <td>{profil.urspruenglicher_mietbeginn.isoformat() if profil and profil.urspruenglicher_mietbeginn else 'nicht hinterlegt'}
             {_status_badge('bereit' if (profil and profil.urspruenglicher_mietbeginn) else 'Angabe fehlt')}</td></tr>

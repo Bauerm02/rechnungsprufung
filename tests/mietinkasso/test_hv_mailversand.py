@@ -40,6 +40,33 @@ def hv(session_factory, basis_vertrag, tmp_path):
     return HVMailversandService(session_factory, bundle, settings, client=client), state
 
 
+@pytest.fixture
+def hv_mit_zahlungsziel(session_factory, basis_vertrag, tmp_path):
+    """Wie `hv`, aber mit konfigurierter Ziel-IBAN/Kontoinhaber (Abnahme-
+    Folgefix Codex 20.10.2026)."""
+
+    token = tmp_path / "synthetic-token"
+    token.write_text("SYNTHETIC-TOKEN", encoding="utf-8")
+    state = {"status": "ANGENOMMEN", "calls": [], "sent": "2026-09-14T22:30:00Z"}
+
+    def provider(request):
+        state["calls"].append(request)
+        payload = json.loads(request.content) if request.method == "POST" else None
+        ref = payload["referenz"] if payload else request.url.params["referenz"]
+        external = "JLBHV-" + hashlib.sha256(json.dumps(ref, ensure_ascii=False).encode()).hexdigest()
+        return httpx.Response(200, json={"status": state["status"], "externe_referenz": external,
+            "provider_referenz": "SYNTHETIC-SENT-1", "versendet_am": state["sent"] if state["status"] == "GESENDET" else None})
+
+    client = MailOpsClient(token_file=token, transport_factory=lambda: httpx.MockTransport(provider))
+    settings = Settings(
+        owner_email="mb@jlb-immo.at", send_enabled=True, hv_mail_allowlist_bestaetigt=True,
+        indexautomatik_send_enabled=True, vertragsende_erinnerung_send_enabled=True,
+        brief_zahlungsziel_iban="AT611904300234573201", brief_zahlungsziel_kontoinhaber="JLB Projects GmbH",
+    )
+    bundle = bauen(session_factory, settings)
+    return HVMailversandService(session_factory, bundle, settings, client=client), state
+
+
 def _echter_beleg_pdf(text: str) -> bytes:
     """Ein TATSÄCHLICH mit `pypdf` lesbares, einseitiges synthetisches PDF
     (Codex-Abnahme 19.10.2026, dritte Korrektur: `importiere_anbieterbeleg`
@@ -125,6 +152,36 @@ def test_mahnung_acceptance_then_actual_sending_get_only_and_stage2_clock(hv, ba
     assert len(state["calls"]) == 3
     service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 30))
     assert len(state["calls"]) == 3
+
+
+def test_konfiguriertes_zahlungsziel_erscheint_im_mahntext_mit_periode_ursprung_und_rest(hv_mit_zahlungsziel, basis_vertrag, admin_ctx):
+    """Abnahme-Folgefix (Codex 20.10.2026): "Brief/Mailentwurf enthält
+    noch keine geprüfte Ziel-IBAN/Kontoinhaber/Referenz und keine
+    vollständige Periode/Position/Ursprungsbetrag/angerechnete
+    Zahlungen/Rest-Tabelle". Eine teilweise angerechnete Zahlung macht
+    Ursprungsbetrag/Rest im Mailtext sichtbar; die konfigurierte
+    Kontoverbindung erscheint konkret statt des vagen Hinweistextes."""
+
+    service, state = hv_mit_zahlungsziel
+    contract, account = basis_vertrag
+    _seed_debt(hv_mit_zahlungsziel, contract, account, admin_ctx)
+    # Teilzahlung auf die Septemberforderung - Ursprungsbetrag 830,00 EUR,
+    # davon 200,00 EUR bereits angerechnet, Rest 630,00 EUR.
+    service.op_service.buchen(
+        ctx=admin_ctx, konto=account, typ=OPTyp.ZAHLUNG, betrag_cent=20000,
+        belegdatum=date(2026, 9, 10), buchungsdatum=date(2026, 9, 10), faelligkeit=None,
+        beleg_referenz="Teilzahlung September",
+    )
+    result = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    assert result["gesendet"] == 0 and result["geplant"] == 1
+    body = json.loads(state["calls"][0].content)
+    text = body["text"]
+    assert "AT611904300234573201" in text
+    assert "JLB Projects GmbH" in text
+    assert "ursprünglich 830,00 EUR" in text
+    assert "bereits angerechnet 200,00 EUR" in text
+    assert "Rest 630,00 EUR" in text
+    assert "auf das Ihnen für dieses Mietverhältnis bekannt gegebene Konto" not in text
 
 
 @pytest.mark.parametrize("receipt", [None, MailOpsErgebnis("ANGENOMMEN", "TEST", "TEST")])

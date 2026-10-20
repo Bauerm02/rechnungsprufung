@@ -3096,6 +3096,160 @@ def test_neuanlage_mit_neuem_mieter_und_mietbestandteilen_end_to_end(backoffice_
     assert stammdaten.get_konto_by_vertrag("V-601-NEU2") is None
 
 
+def test_pdf_erster_ablauf_liest_mieterkontakte_und_indexbasis_editierbar_aus_und_uebernimmt_atomar(backoffice_client):
+    """Abnahme-Folgefix (Codex, Rückweisung von 534b131): fünf konkrete
+    Outcome-Tests anhand eines echten synthetischen PDFs.
+
+    1) Mieter-E-Mail wird extrahiert und ist editierbar (nicht nur
+       Hinweis).
+    2) Mieter-Telefon ebenso.
+    3) Index-Basismonat/-Basiswert werden extrahiert.
+    4) Die Neuanlage verlangt den Mieter-NAMEN nicht mehr VOR dem PDF -
+       nur die ID muss feststehen, der Name darf aus dem PDF folgen.
+    5) Vermieterkontakte werden NIE in ein editierbares/übernehmbares
+       Feld übernommen.
+
+    Zusätzlich: Mitmieter-Kontakt (Name/Telefon/E-Mail) bleibt reiner
+    Hinweis für die spätere manuelle "Partei hinzufügen"-Erfassung, wird
+    NICHT automatisch als Partei angelegt. Bestehende Verträge/OP
+    bleiben unberührt (reiner Stammdaten-Vorgang, keine Buchung)."""
+
+    from tests.mietinkasso._pdf_test_helpers import build_text_pdf
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-PDFERST", objekt_id="601", bezeichnung="PDF-Erstanlage", nutzungsstatus="LEERSTAND")
+
+    pdf = build_text_pdf([
+        "Vermieter: Synthetische Vermietung GmbH",
+        "Telefon Vermieter: +43 1 555 1000",
+        "E-Mail Vermieter: vermieter@example.invalid",
+        "Mieter: Erika Beispiel",
+        "Telefon Mieter: +43 660 555 2000",
+        "E-Mail Mieter: erika@example.invalid",
+        "Mitmieter: Alex Beispiel",
+        "Telefon Mitmieter: +43 660 555 3000",
+        "E-Mail Mitmieter: alex@example.invalid",
+        "Unterzeichnung am 01.06.2026",
+        "Mietbeginn: 01.12.2026",
+        "Basismonat Dezember 2026; Basiswert 130,5.",
+        "VPI 2020.",
+    ])
+
+    # Schritt 1 (Kontext): bewusst OHNE Name - nur die neue Debitor-ID
+    # steht bereits fest, siehe `neu_kontext_werte`-Korrektur.
+    hochgeladen = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "NEU", "csrf_token": csrf, "vertrag_id": "V-601-PDFERST",
+            "einheit_id": "601-PDFERST", "gesellschaft_id": "7DI", "rechtsordnung": "OESTERREICH_MRG_VOLL",
+            "gueltig_von": "2026-12-01", "gueltig_bis": "",
+            "neuer_debitor_id": "DEB-PDFERST",
+        },
+        files={"pdf_datei": ("vertrag.pdf", pdf, "application/pdf")},
+    )
+    assert hochgeladen.status_code == 200
+    # (4) Name wird NICHT vor dem PDF verlangt - der Upload gelingt ohne Name.
+    # (1)+(2) Mieter-E-Mail/-Telefon tatsächlich extrahiert UND editierbar
+    # (eigenes Formularfeld, nicht nur Fließtext-Hinweis).
+    assert 'name="neuer_debitor_name" value="Erika Beispiel"' in hochgeladen.text
+    assert 'name="neuer_debitor_email"' in hochgeladen.text and "erika@example.invalid" in hochgeladen.text
+    assert 'name="neuer_debitor_telefon"' in hochgeladen.text and "+43 660 555 2000" in hochgeladen.text
+    # (5) Vermieterkontakte werden NIE als Feldwert (value=...) in ein
+    # neuer_debitor_*-Feld übernommen - der Vermieter-Name/-Kontakt darf im
+    # reinen Belegauszug-Fließtext zur Einordnung weiterhin auftauchen.
+    assert 'value="vermieter@example.invalid"' not in hochgeladen.text
+    assert 'value="+43 1 555 1000"' not in hochgeladen.text
+    # (3) Index-Basismonat/-Basiswert extrahiert.
+    assert 'name="index_urspruenglicher_basismonat" value="2026-12"' in hochgeladen.text
+    assert "130,5" in hochgeladen.text
+    # Mitmieter bleibt reiner Hinweis, kein übernehmbares Profilfeld.
+    assert "Alex Beispiel" in hochgeladen.text
+    assert "Partei hinzufügen" in hochgeladen.text
+    assert 'name="mitmieter_name"' not in hochgeladen.text
+
+    marker = 'name="csrf_token" value="'
+    start = hochgeladen.text.index(marker) + len(marker)
+    ende = hochgeladen.text.index('"', start)
+    form_csrf = hochgeladen.text[start:ende]
+
+    vorschau = client.post(
+        "/backoffice/vertragsanlage/vorschau",
+        data={
+            "csrf_token": form_csrf, "modus": "NEU", "vertrag_id": "V-601-PDFERST",
+            "einheit_id": "601-PDFERST", "gesellschaft_id": "7DI", "rechtsordnung": "OESTERREICH_MRG_VOLL",
+            "gueltig_von": "2026-12-01", "gueltig_bis": "", "quelle_typ": "PDF_EXTRAKTION",
+            "neuer_debitor_id": "DEB-PDFERST", "neuer_debitor_name": "Erika Beispiel",
+            "neuer_debitor_email": "erika@example.invalid", "neuer_debitor_telefon": "+43 660 555 2000",
+            "nutzungsart": "UNGEKLAERT",
+            "index_reihe": "VPI 2020", "index_urspruenglicher_basismonat": "2026-12",
+            "index_urspruenglicher_basiswert": "130,5",
+        },
+    )
+    assert vorschau.status_code == 200
+
+    paket_marker = 'name="paket_json" hidden>'
+    p_start = vorschau.text.index(paket_marker) + len(paket_marker)
+    p_ende = vorschau.text.index("</textarea>", p_start)
+    import html as _html
+    paket_json_roh = _html.unescape(vorschau.text[p_start:p_ende])
+    assert "erika@example.invalid" in paket_json_roh
+
+    uebernommen = client.post(
+        "/backoffice/vertragsanlage/uebernehmen",
+        data={"csrf_token": form_csrf, "paket_json": paket_json_roh},
+        follow_redirects=False,
+    )
+    assert uebernommen.status_code == 303
+
+    debitor = stammdaten.get_debitor("DEB-PDFERST")
+    assert debitor is not None and debitor.name == "Erika Beispiel" and debitor.email == "erika@example.invalid"
+    vertrag = stammdaten.get_vertrag("V-601-PDFERST")
+    assert vertrag is not None and vertrag.debitor_id == "DEB-PDFERST"
+    profil = stammdaten.neuestes_mietvertragsprofil("V-601-PDFERST")
+    assert profil is not None
+    assert profil.index_urspruenglicher_basismonat == "2026-12"
+    from decimal import Decimal
+    assert profil.index_urspruenglicher_basiswert == Decimal("130.5000")
+    # Bestehende Verträge/OP bleiben unberührt (reiner Stammdaten-Vorgang).
+    assert stammdaten.get_konto_by_vertrag("V-601-PDFERST") is None
+
+
+def test_neue_mieter_id_ohne_namen_wird_beim_tatsaechlichen_uebernehmen_verlangt(backoffice_client):
+    """Der Name darf bis zur Vorschau offen bleiben (siehe PDF-Erstanlage-
+    Test oben), muss aber spätestens beim Übernahmeversuch feststehen -
+    kein Debitor ohne Namen."""
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-OHNENAME", objekt_id="601", bezeichnung="Ohne Namen", nutzungsstatus="LEERSTAND")
+
+    antwort = client.post(
+        "/backoffice/vertragsanlage/vorschau",
+        data={
+            "csrf_token": csrf, "modus": "NEU", "vertrag_id": "V-601-OHNENAME",
+            "einheit_id": "601-OHNENAME", "gesellschaft_id": "7DI", "rechtsordnung": "OESTERREICH_MRG_VOLL",
+            "gueltig_von": "2026-12-01", "gueltig_bis": "", "quelle_typ": "MANUELL",
+            "neuer_debitor_id": "DEB-OHNENAME", "nutzungsart": "UNGEKLAERT",
+        },
+    )
+    assert antwort.status_code == 400
+    assert "Name" in antwort.text
+
+
 def test_neuanlage_mit_fremdem_debitor_im_paket_wird_abgelehnt(backoffice_client):
     """Direkter Missbrauchsversuch gegen `pruefe_schmale_form`: ein Paket,
     das einen ANDEREN Debitor enthält als den im (neuen) Vertrag

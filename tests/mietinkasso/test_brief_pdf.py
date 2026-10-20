@@ -14,7 +14,7 @@ import pytest
 from pypdf import PdfReader
 
 from mietinkasso.mahnwesen.brief_pdf import (
-    Absender, AdressfehlerError, Forderungszeile, Zinssegment, _MahnbriefPDF, _zeile,
+    Absender, AdressfehlerError, Forderungszeile, Zahlungsziel, Zinssegment, _MahnbriefPDF, _zeile,
     _INHALT_RECHTS, _LOGO_BREITE, _LOGO_X, _LOGO_Y, _RAND, _SEITE_BREITE, _SPERRBEREICH_BREITE,
     _SPERRBEREICH_HOEHE, erzeuge_mahnbrief_pdf, pruefe_empfaengeradresse,
 )
@@ -59,6 +59,81 @@ def test_erzeugtes_pdf_ist_lesbar_und_zeigt_denselben_gesamtbetrag_wie_die_vorsc
     assert "20,73" in text  # bereits offene Mahnkosten
     assert "0,54" in text  # neue Zinsen
     assert "851,27" in text  # Gesamtbetrag - identisch zur Vorschau/E-Mail
+
+
+def _normalisiert(text: str) -> str:
+    """`multi_cell`-Blocksatz fügt variable doppelte Leerzeichen/Zeilen-
+    umbrüche mitten im Satz ein - für robuste Substring-Prüfungen wird
+    jede Lauflänge Whitespace auf genau ein Leerzeichen reduziert."""
+
+    return " ".join(text.split())
+
+
+def test_ohne_zahlungsziel_bleibt_bisheriger_allgemeiner_hinweistext():
+    pdf_bytes = _erzeugen()
+    text = _normalisiert(PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text())
+    assert "auf das Ihnen für dieses Mietverhältnis bekannt gegebene Konto" in text
+    assert "IBAN" not in text
+
+
+def test_konfiguriertes_zahlungsziel_nennt_iban_kontoinhaber_und_verwendungszweck():
+    """Abnahme-Folgefix (Codex 20.10.2026): "keine geprüfte Ziel-IBAN/
+    Kontoinhaber/Referenz" - ist ein Zahlungsziel übergeben, wird es
+    konkret im Brief genannt statt des vagen Hinweises."""
+
+    pdf_bytes = _erzeugen(
+        zahlungsziel=Zahlungsziel(
+            iban="AT611904300234573201", kontoinhaber="JLB Projects GmbH",
+            verwendungszweck="Mahnung Stufe 2, Vertrag V-601-1",
+        ),
+    )
+    text = " ".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages)
+    assert "AT611904300234573201" in text
+    assert "JLB Projects GmbH" in text
+    assert "V-601-1" in text
+    assert "auf das Ihnen für dieses Mietverhältnis bekannt gegebene Konto" not in text
+
+
+def test_zahlungsziel_ohne_vollstaendige_angaben_faellt_auf_allgemeinen_text_zurueck():
+    """Eine nur teilweise konfigurierte Kontoverbindung (z. B. IBAN ohne
+    Kontoinhaber) wird NIE unvollständig gedruckt - dann gilt weiterhin
+    der allgemeine Hinweistext (kein erfundener Kontoinhaber)."""
+
+    pdf_bytes = _erzeugen(zahlungsziel=Zahlungsziel(iban="AT611904300234573201", kontoinhaber=None, verwendungszweck="x"))
+    text = _normalisiert(PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text())
+    assert "auf das Ihnen für dieses Mietverhältnis bekannt gegebene Konto" in text
+    assert "AT611904300234573201" not in text
+
+
+def test_ursprungsbetrag_und_angerechnete_zahlung_werden_pro_position_ausgewiesen():
+    """Abnahme-Folgefix (Codex 20.10.2026): "keine vollständige Periode/
+    Position/Ursprungsbetrag/angerechnete Zahlungen/Rest-Tabelle"."""
+
+    pdf_bytes = _erzeugen(
+        forderungszeilen=[
+            Forderungszeile("HMZ August", date(2026, 8, 5), 60_000, urspruenglicher_betrag_cent=83_000),
+        ],
+        bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0, gesamtbetrag_cent=60_000,
+    )
+    text = PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text()
+    assert "Ursprünglich" in text
+    assert "830,00" in text  # Ursprungsbetrag
+    assert "230,00" in text  # bereits angerechnet (830,00 - 600,00)
+    assert "600,00" in text  # Rest
+
+
+def test_identischer_ursprungsbetrag_zeigt_keine_zusaetzliche_zeile():
+    """Keine unpassende Zusatzzeile, wenn keine Zahlung angerechnet wurde
+    (Ursprungsbetrag == Rest)."""
+
+    pdf_bytes = _erzeugen(
+        forderungszeilen=[
+            Forderungszeile("HMZ August", date(2026, 8, 5), 83_000, urspruenglicher_betrag_cent=83_000),
+        ],
+        bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0, gesamtbetrag_cent=83_000,
+    )
+    text = PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text()
+    assert "Ursprünglich" not in text
 
 
 def test_erste_stufe_heisst_zahlungserinnerung_nicht_mahnung():

@@ -107,6 +107,28 @@ class Forderungszeile:
     bezeichnung: str
     faelligkeit: date | None
     betrag_cent: int
+    # Abnahme-Folgefix (Codex 20.10.2026): "keine vollständige Periode/
+    # Position/Ursprungsbetrag/angerechnete Zahlungen/Rest-Tabelle" -
+    # optional, damit bestehende Aufrufer ohne diese Angabe unverändert
+    # funktionieren (reine Restbetrag-Zeile wie bisher). Ist
+    # `urspruenglicher_betrag_cent` gesetzt und weicht von `betrag_cent`
+    # (= Rest) ab, wird darunter eine zweite, eingezogene Zeile mit
+    # Ursprungsbetrag und bereits angerechneter Zahlung ausgewiesen.
+    urspruenglicher_betrag_cent: int | None = None
+
+
+@dataclass(frozen=True)
+class Zahlungsziel:
+    """Ziel-Kontoverbindung für die Zahlungsaufforderung im Mahnschreiben
+    (Abnahme-Folgefix Codex 20.10.2026). `iban`/`kontoinhaber` kommen aus
+    `infrastructure/config.py` (optional, kein erfundener Platzhalter) -
+    fehlen sie, bleibt der bisherige allgemeine Hinweistext bestehen.
+    `verwendungszweck` wird deterministisch aus Vertrag/Stufe gebildet,
+    NIE frei erfunden."""
+
+    iban: str | None
+    kontoinhaber: str | None
+    verwendungszweck: str
 
 
 @dataclass(frozen=True)
@@ -186,6 +208,17 @@ class _MahnbriefPDF(FPDF):
         self.cell(0, 4, f"{self.fuss_zeile2} · Seite {self.page_no()}/{{nb}}")
 
 
+def _notizzeile(pdf: FPDF, text: str, *, einzug: float = 6.0) -> None:
+    """Eine reine Hinweiszeile OHNE eigene Betragsspalte (z. B. die
+    Ursprungsbetrag-/angerechnet-Aufschlüsselung unter einer Forderungs-
+    zeile) - anders als `_zeile` wird hier KEIN (ggf. irreführend
+    doppelter) Betrag rechtsbündig mitgedruckt."""
+
+    pdf.set_font("Brief", "", 8.5)
+    pdf.set_x(_RAND + einzug)
+    pdf.multi_cell(_INHALT_RECHTS - _RAND - einzug, 4.5, text, align="L", new_x="LMARGIN", new_y="NEXT")
+
+
 def _zeile(pdf: FPDF, label: str, betrag_cent: int, *, einzug: float = 0.0, fett: bool = False) -> None:
     """Eine Kosten-/Forderungszeile mit variabler Zeilenhöhe für den
     Bezeichnungstext (Umbruch statt Überlauf in die Betragsspalte) und
@@ -230,6 +263,7 @@ def erzeuge_mahnbrief_pdf(
     neue_gebuehr_cent: int,
     gebuehr_rechtsgrundlage: str | None,
     gesamtbetrag_cent: int,
+    zahlungsziel: Zahlungsziel | None = None,
 ) -> bytes:
     empfaenger_zeilen = pruefe_empfaengeradresse(empfaenger_adresse)
     empfaenger_alle_zeilen = [empfaenger_name.strip(), *empfaenger_zeilen] if empfaenger_name.strip() else empfaenger_zeilen
@@ -343,6 +377,9 @@ def erzeuge_mahnbrief_pdf(
     for f in forderungszeilen:
         faelligkeit_text = f"fällig seit {f.faelligkeit.strftime('%d.%m.%Y')}" if f.faelligkeit else "Fälligkeit ungeklärt"
         _zeile(pdf, f"{f.bezeichnung}, {faelligkeit_text}", f.betrag_cent)
+        if f.urspruenglicher_betrag_cent is not None and f.urspruenglicher_betrag_cent != f.betrag_cent:
+            angerechnet_cent = f.urspruenglicher_betrag_cent - f.betrag_cent
+            _notizzeile(pdf, f"Ursprünglich {_eur(f.urspruenglicher_betrag_cent)}, davon bereits angerechnet {_eur(angerechnet_cent)}, Rest {_eur(f.betrag_cent)}.")
     _zeile(pdf, "Hauptforderung gesamt", hauptforderung_cent, fett=True)
 
     if bereits_offene_mahnkosten_cent:
@@ -377,14 +414,39 @@ def erzeuge_mahnbrief_pdf(
     # zum Versandzeitpunkt noch nicht bekannt, ein daraus abgeleitetes
     # "bis {datum}" wäre ein vorgetäuschtes Zugangsdatum (siehe
     # `mahntexte.py::text_fuer_stufe`-Docstring, dieselbe Korrektur).
+    # Abnahme-Folgefix (Codex 20.10.2026): "keine geprüfte Ziel-IBAN/
+    # Kontoinhaber/Referenz" - ist eine Zielkontoverbindung konfiguriert
+    # (siehe `infrastructure/config.py::brief_zahlungsziel_iban`), wird
+    # sie HIER KONKRET genannt statt des bisherigen vagen Verweises; ohne
+    # Konfiguration bleibt der bisherige Text unverändert (kein
+    # erfundener Platzhalter).
     pdf.set_font("Brief", "", 10)
-    pdf.multi_cell(
-        0, 5.5,
-        "Bitte begleichen Sie den Gesamtbetrag binnen 14 Tagen ab Zugang dieses Schreibens auf das "
-        "Ihnen für dieses Mietverhältnis bekannt gegebene Konto. Bei einer inzwischen erfolgten "
-        "Zahlung senden Sie uns bitte den Zahlungsbeleg. Bei Fragen zur Forderung wenden Sie sich "
-        "bitte an untenstehende Kontaktdaten.",
-    )
+    if zahlungsziel is not None and zahlungsziel.iban and zahlungsziel.kontoinhaber:
+        pdf.multi_cell(
+            0, 5.5,
+            "Bitte begleichen Sie den Gesamtbetrag binnen 14 Tagen ab Zugang dieses Schreibens auf "
+            "folgendes Konto:",
+        )
+        pdf.ln(1)
+        pdf.set_font("Brief", "B", 10)
+        pdf.cell(0, 5, f"IBAN: {zahlungsziel.iban}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 5, f"Kontoinhaber: {zahlungsziel.kontoinhaber}", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 5, f"Verwendungszweck: {zahlungsziel.verwendungszweck}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(2)
+        pdf.set_font("Brief", "", 10)
+        pdf.multi_cell(
+            0, 5.5,
+            "Bei einer inzwischen erfolgten Zahlung senden Sie uns bitte den Zahlungsbeleg. Bei Fragen "
+            "zur Forderung wenden Sie sich bitte an untenstehende Kontaktdaten.",
+        )
+    else:
+        pdf.multi_cell(
+            0, 5.5,
+            "Bitte begleichen Sie den Gesamtbetrag binnen 14 Tagen ab Zugang dieses Schreibens auf das "
+            "Ihnen für dieses Mietverhältnis bekannt gegebene Konto. Bei einer inzwischen erfolgten "
+            "Zahlung senden Sie uns bitte den Zahlungsbeleg. Bei Fragen zur Forderung wenden Sie sich "
+            "bitte an untenstehende Kontaktdaten.",
+        )
     if mahntext.rechtlicher_kern:
         pdf.ln(3)
         pdf.multi_cell(0, 5.5, mahntext.rechtlicher_kern)

@@ -832,7 +832,17 @@ class MahnTageslaufRepository:
         vollständig)."""
 
         with self._session_factory() as session:
-            row = MahnTageslaufTable(vertrag_id=vertrag_id, pruefdatum=pruefdatum, status="IN_BEARBEITUNG")
+            # Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026,
+            # reproduzierter Fehler): `aktualisiert_am` ist jetzt die
+            # EINZIGE Lease-/Claim-Zeit für `freigeben_verwaiste` unten -
+            # auch beim ERSTEN Claim (Neuanlage) bereits gesetzt, damit
+            # eine Zeile NIE allein wegen eines alten `erstellt_am`
+            # fälschlich als verwaist gilt, während ein Worker sie gerade
+            # frisch (neu oder per Re-Claim) in Bearbeitung hat.
+            row = MahnTageslaufTable(
+                vertrag_id=vertrag_id, pruefdatum=pruefdatum, status="IN_BEARBEITUNG",
+                aktualisiert_am=datetime.now(timezone.utc),
+            )
             session.add(row)
             try:
                 session.commit()
@@ -936,14 +946,27 @@ class MahnTageslaufRepository:
         tatsächlicher Providerkontakt), wird auf `KEIN_VERSAND`
         zurückgesetzt - ein späterer Aufruf prüft dann erneut, ob
         tatsächlich etwas fehlt, statt den Vertrag dauerhaft zu
-        blockieren."""
+        blockieren.
+
+        **Zweite Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026,
+        reproduzierter Fehler):** filterte bisher auf `erstellt_am` - das
+        ist die UNVERÄNDERLICHE Anlagezeit der Zeile, NICHT der Zeitpunkt
+        des letzten (Re-)Claims. Ein alter, früher einmal sicher
+        freigegebener Slot (`KEIN_VERSAND`), der GERADE EBEN frisch
+        reclaimt wurde (`claim()`, Status wieder `IN_BEARBEITUNG`), hatte
+        dadurch weiterhin sein ALTES `erstellt_am` - ein paralleler
+        Worker, der `freigeben_verwaiste` kurz danach aufrief, erklärte
+        ihn SOFORT wieder für verwaist, obwohl der claimende Worker noch
+        mitten in der Bearbeitung war. Filtert deshalb jetzt auf
+        `aktualisiert_am` (die eigentliche Lease-Zeit, von `claim()` bei
+        JEDEM Claim - auch dem allerersten - gesetzt, siehe dort)."""
 
         geloest = 0
         with self._session_factory() as session:
             verwaiste = list(session.execute(
                 select(MahnTageslaufTable)
                 .where(MahnTageslaufTable.status == "IN_BEARBEITUNG")
-                .where(MahnTageslaufTable.erstellt_am < aelter_als)
+                .where(MahnTageslaufTable.aktualisiert_am < aelter_als)
             ).scalars().all())
             for zeile in verwaiste:
                 neuer_status = "KEIN_VERSAND"

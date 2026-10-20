@@ -309,6 +309,112 @@ def test_tageslauf_slot_nach_bestaetigtem_providerkontakt_nicht_als_unversandt_f
     assert versendete_laeufe == 1  # KEIN zweiter tatsächlicher Versand
 
 
+def test_dispatch_mahnlauf_absturz_nach_erfolgreichem_versand_gibt_slot_nicht_frei(
+    hv, basis_vertrag, admin_ctx, session_factory, monkeypatch,
+):
+    """Abnahme-Folgefix (Codex 20.10.2026, reproduzierter Fehler):
+    `_dispatch_mahnlauf` sendet NACHWEISLICH (MahnLauf wird GESENDET),
+    wirft ANSCHLIESSEND - noch VOR Rückgabe des `VersandErgebnis` an
+    `mahnlauf()` - eine Exception. Der äußere `finally`-Zweig hatte
+    `tatsaechlich_versucht` dadurch bisher noch auf `False` stehen und
+    gab den Slot als `KEIN_VERSAND` frei - eine neue, zwischenzeitlich
+    fällige Forderung desselben Vertrags hätte dadurch sofort einen
+    ZWEITEN tatsächlichen Versand ausgelöst. Anders als der bereits
+    bestehende Test oben (der einen Absturz INNERHALB von
+    `markiere_versendet` selbst simuliert, wo `tatsaechlich_versucht`
+    schon `True` ist) crasht HIER der Aufrufer von `_dispatch_mahnlauf`
+    selbst, bevor dessen Ergebnis überhaupt ausgewertet wird."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx, vier_stufen=True, faelligkeit=date(2026, 9, 5))
+
+    echter_dispatch = service._dispatch_mahnlauf
+
+    def kaputter_dispatch(*args, **kwargs):
+        ergebnis = echter_dispatch(*args, **kwargs)
+        assert ergebnis.status == "GESENDET"  # der tatsächliche Versand ist bereits passiert
+        raise RuntimeError("simulierter Absturz NACH erfolgreichem Versand, VOR Rückgabe des Ergebnisses")
+
+    monkeypatch.setattr(service, "_dispatch_mahnlauf", kaputter_dispatch)
+
+    state["sent"] = "2026-09-25T08:00:00Z"
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="SYNTHETIC-BANK", bestaetigt_bis=date(2026, 9, 25), bestaetigt_von="SYNTHETIC-TEST")
+    with pytest.raises(RuntimeError, match="simulierter"):
+        service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 25))
+
+    with session_factory() as session:
+        mahnlauf_zeile = session.query(MahnLaufTable).order_by(MahnLaufTable.id.desc()).first()
+        assert mahnlauf_zeile.status == "GESENDET"
+        tageslauf_zeile = session.query(MahnTageslaufTable).filter(MahnTageslaufTable.vertrag_id == contract.id).one()
+        # Der Kern des Fixes: NICHT `KEIN_VERSAND`, obwohl `tatsaechlich_
+        # versucht` im Aufrufer wegen der Exception nie auf `True` gesetzt
+        # wurde - der `finally`-Zweig schlägt stattdessen den tatsächlichen
+        # Mahnlauf-Status nach.
+        assert tageslauf_zeile.status == "VERSENDET"
+
+    # Eine zwischenzeitlich neu fällige Forderung darf am selben Prüftag
+    # trotzdem NICHT zu einem zweiten tatsächlichen Versand führen.
+    service.op_service.buchen(
+        ctx=admin_ctx, konto=account, typ=OPTyp.SOLL, betrag_cent=83000, belegdatum=date(2026, 8, 1),
+        buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 1), beleg_referenz="SYNTHETIC Nachtrag",
+    )
+    ergebnis_zweiter_lauf = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 25))
+    assert ergebnis_zweiter_lauf["gesendet"] == 0
+    with session_factory() as session:
+        versendete_laeufe = session.query(MahnLaufTable).filter(MahnLaufTable.status == "GESENDET").count()
+    assert versendete_laeufe == 1  # KEIN zweiter tatsächlicher Versand
+
+
+def test_freigeben_verwaiste_prueft_lease_zeit_nicht_unveraenderliche_anlagezeit(
+    hv, basis_vertrag, admin_ctx, session_factory,
+):
+    """Abnahme-Folgefix (Codex 20.10.2026, reproduzierter Fehler):
+    `freigeben_verwaiste` filterte bisher auf `erstellt_am` (die
+    unveränderliche Anlagezeit der Zeile) statt auf `aktualisiert_am`
+    (den Zeitpunkt des tatsächlich LETZTEN Claims). Ein alter, sicher
+    freigegebener Slot (`KEIN_VERSAND`), der GERADE EBEN frisch
+    reclaimt wurde, hatte dadurch weiterhin sein altes `erstellt_am` -
+    ein paralleler Worker, der kurz danach `freigeben_verwaiste` aufrief,
+    erklärte ihn SOFORT wieder für verwaist, obwohl die Bearbeitung noch
+    lief."""
+
+    service, _ = hv
+    contract, _ = basis_vertrag
+
+    alt = datetime.now(timezone.utc) - timedelta(days=30)
+    # Alte Zeile, vor LANGER Zeit angelegt, aber (z. B. mangels
+    # Bankbestätigung) sicher freigegeben.
+    erster_claim = service.tageslauf_repo.claim(vertrag_id=contract.id, pruefdatum=date(2026, 9, 25))
+    service.tageslauf_repo.freigeben(erster_claim.id)
+    with session_factory() as session:
+        session.query(MahnTageslaufTable).filter(MahnTageslaufTable.id == erster_claim.id).update(
+            {"erstellt_am": alt, "aktualisiert_am": alt}
+        )
+        session.commit()
+
+    # Frischer Reclaim JETZT (z. B. ein paralleler Worker hat die neue
+    # Fälligkeit erkannt) - `aktualisiert_am` wird dabei aktuell gesetzt,
+    # `erstellt_am` bleibt bewusst unverändert (Anlagezeit der Zeile).
+    reclaimed = service.tageslauf_repo.claim(vertrag_id=contract.id, pruefdatum=date(2026, 9, 25))
+    assert reclaimed is not None
+    with session_factory() as session:
+        zeile = session.query(MahnTageslaufTable).filter(MahnTageslaufTable.id == reclaimed.id).one()
+        # SQLite liest `datetime` tz-naiv zurück - für den Vergleich wird
+        # deshalb einheitlich auf naiv normalisiert.
+        assert zeile.erstellt_am.replace(tzinfo=None) == alt.replace(tzinfo=None)  # unverändert
+        assert zeile.aktualisiert_am.replace(tzinfo=None) > alt.replace(tzinfo=None)  # frisch
+
+    # Ein anderer Worker ruft (kurz danach) die Recovery mit genau dem
+    # Zeitfenster auf, das das ALTE `erstellt_am` erfasst hätte, aber
+    # NICHT die frische Lease-Zeit.
+    geloest = service.tageslauf_repo.freigeben_verwaiste(aelter_als=datetime.now(timezone.utc) - timedelta(minutes=15))
+    assert geloest == 0
+    with session_factory() as session:
+        zeile = session.query(MahnTageslaufTable).filter(MahnTageslaufTable.id == reclaimed.id).one()
+        assert zeile.status == "IN_BEARBEITUNG"  # NICHT fälschlich wieder aufgelöst
+
+
 def test_freigeben_verwaiste_setzt_ohne_tatsaechlichen_providerkontakt_weiterhin_kein_versand(
     hv, basis_vertrag, admin_ctx, session_factory,
 ):

@@ -136,8 +136,19 @@ _MUSTER: dict[str, re.Pattern[str]] = {
         r"(?:Mahnspesen?|Mahngeb(?:ü|ue)hr(?:en)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE,
     ),
     "mahngebuehr_keine": re.compile(r"(keine Mahnspesen|keine Mahngeb(?:ü|ue)hr(?:en)?)", re.IGNORECASE),
-    "mieter_name": re.compile(r"Mieter\s*:?\s*\n?\s*([A-ZÄÖÜ][\wÄÖÜäöüß .,-]{2,70})", re.MULTILINE),
+    "mieter_name": re.compile(r"(?<!Mit)Mieter\s*:?\s*\n?\s*([A-ZÄÖÜ][\wÄÖÜäöüß .,-]{2,70})", re.MULTILINE),
     "vermieter_name": re.compile(r"Vermieter\s*:?\s*\n?\s*([A-ZÄÖÜ][\wÄÖÜäöüß .,-]{2,70})", re.MULTILINE),
+    # Abnahme-Folgefix (Codex 20.10.2026): "explizite Mieter-E-Mail/
+    # -Telefon werden gar nicht extrahiert" - Mieterkontakte werden,
+    # ANDERS als Vermieterkontakte, tatsächlich als editierbarer
+    # Formularvorschlag gebraucht (für eine neu anzulegende Debitor-
+    # Kontaktangabe) - Vermieterkontakte werden bewusst NIE extrahiert
+    # (Auftrag: "Vermieterkontakte niemals übernehmen" - es gibt deshalb
+    # absichtlich KEIN `vermieter_email`/`vermieter_telefon`-Muster).
+    # `(?<!Mit)` verhindert ein Fehltreffer auf "...Mitmieter" (das Wort
+    # "Mieter" ist eine Teilzeichenkette von "Mitmieter").
+    "mieter_email": re.compile(r"E-?Mail\s+(?<!Mit)Mieter\s*:?\s*([\w.+-]+@[\w.-]+\.\w+)", re.IGNORECASE),
+    "mieter_telefon": re.compile(r"Telefon\s+(?<!Mit)Mieter\s*:?\s*([0-9+()/ .-]{6,25})", re.IGNORECASE),
     # Auftrag HV-20261020-VERTRAGSDATENBASIS: Mitmieter/Vertreter sind
     # KEIN Debitor und werden NIE automatisch angelegt (siehe
     # `vorschlaege.py`/`backoffice/vertragsanlage_form.py::_parteien_html`)
@@ -148,10 +159,16 @@ _MUSTER: dict[str, re.Pattern[str]] = {
         r"([A-ZÄÖÜ][\wÄÖÜäöüß .,-]{2,70}?)(?=\s*(?:,|Tel(?:efon)?\.?\s*:|\n|$))",
         re.MULTILINE | re.IGNORECASE,
     ),
+    # Abnahme-Folgefix (Codex 20.10.2026): das Telefon/E-Mail steht in der
+    # Praxis oft NICHT in derselben Zeile wie der Name, sondern in einer
+    # eigenen Folgezeile ("Telefon Mitmieter: ..."/"E-Mail Mitmieter: ...")
+    # - zusätzlich zum bisherigen (Name+Tel in EINER Zeile)-Muster.
     "mitmieter_telefon": re.compile(
-        r"(?:Mitmieter(?:in)?|weitere[rn]?\s+Mieter(?:in)?)[^\n]{0,80}?(?:Tel(?:efon)?\.?\s*:?)\s*([0-9+()/ .-]{6,25})",
+        r"(?:Mitmieter(?:in)?|weitere[rn]?\s+Mieter(?:in)?)[^\n]{0,80}?(?:Tel(?:efon)?\.?\s*:?)\s*([0-9+()/ .-]{6,25})"
+        r"|Telefon\s+Mitmieter\s*:?\s*([0-9+()/ .-]{6,25})",
         re.IGNORECASE,
     ),
+    "mitmieter_email": re.compile(r"E-?Mail\s+Mitmieter\s*:?\s*([\w.+-]+@[\w.-]+\.\w+)", re.IGNORECASE),
     "mietbeginn": re.compile(
         r"(?:Mietbeginn|Beginn des Mietverh(?:ä|ae)ltnisses|Mietverh(?:ä|ae)ltnis beginnt am)"
         r"[^\d]{0,20}(\d{1,2}\.\d{1,2}\.\d{4})",
@@ -163,9 +180,21 @@ _MUSTER: dict[str, re.Pattern[str]] = {
     ),
     "index_reihe": re.compile(r"(Verbraucherpreisindex\s*\d{4}|VPI\s*\d{4})", re.IGNORECASE),
     "index_schwelle_prozent": re.compile(
-        r"(?:um mehr als|übersteigt um|Schwankung von)\s*([0-9]{1,2}(?:,[0-9]{1,2})?)\s*(?:%|Prozent)",
+        r"(?:um mehr als|übersteigt um|Schwankung von|Schwankung mehr als)\s*([0-9]{1,2}(?:,[0-9]{1,2})?)\s*(?:%|Prozent)",
         re.IGNORECASE,
     ),
+    # Abnahme-Folgefix (Codex 20.10.2026): "ausdrücklich genannter
+    # Indexbasiswert wird nicht extrahiert" - Basismonat als Rohstring
+    # (Monatsname+Jahr ODER MM/YYYY-Schreibweise), wird in `vorschlaege.py`
+    # in das kanonische `YYYY-MM`-Formularformat übersetzt; Basiswert als
+    # einfache Dezimalzahl wie `index_schwelle_prozent` oben.
+    "index_urspruenglicher_basismonat": re.compile(
+        r"Basismonat[^\d\wÄÖÜäöüß]{0,10}"
+        r"((?:J(?:ä|ae)nner|Januar|Februar|M(?:ä|ae)rz|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember)"
+        r"\s*\d{4}|\d{1,2}[./]\d{4})",
+        re.IGNORECASE,
+    ),
+    "index_urspruenglicher_basiswert": re.compile(r"Basiswert[^\d]{0,10}([0-9]+(?:[.,][0-9]+)?)", re.IGNORECASE),
     "nutzungsart_wohnung": re.compile(r"(Wohnungsmietvertrag|zu Wohnzwecken)", re.IGNORECASE),
     "nutzungsart_geschaeft": re.compile(r"(Gesch(?:ä|ae)ftsraummietvertrag|Gesch(?:ä|ae)ftslokal)", re.IGNORECASE),
     "nutzungsart_buero": re.compile(r"(B(?:ü|ue)romietvertrag|als B(?:ü|ue)ro vermietet)", re.IGNORECASE),

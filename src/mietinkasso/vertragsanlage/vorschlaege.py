@@ -40,6 +40,40 @@ def _mietbeginn_iso(ddmmyyyy: str) -> str | None:
         return None
 
 
+#: Abnahme-Folgefix (Codex 20.10.2026): "ausdrücklich genannter
+#: Indexbasiswert wird nicht extrahiert" - deutsche Monatsnamen (inkl.
+#: österreichischer Schreibweise "Jänner") für die Übersetzung eines im
+#: Vertrag genannten Basismonats in das vom `<input type="month">`
+#: erwartete `YYYY-MM`-Format.
+_MONATSNAMEN = {
+    "jänner": 1, "januar": 1, "februar": 2, "märz": 3, "april": 4, "mai": 5, "juni": 6,
+    "juli": 7, "august": 8, "september": 9, "oktober": 10, "november": 11, "dezember": 12,
+}
+
+
+def _basismonat_iso(roh: str) -> str | None:
+    """`roh` ist entweder "<Monatsname> <Jahr>" oder "MM/YYYY"/"MM.YYYY"
+    (siehe `pdf_extraktion.py::_MUSTER['index_urspruenglicher_basismonat']`).
+    Liefert `None` statt zu raten, wenn das Format nicht eindeutig ist."""
+
+    roh = roh.strip()
+    teile = roh.replace(".", "/").split("/") if ("/" in roh or "." in roh) else roh.split()
+    if len(teile) != 2:
+        return None
+    monat_teil, jahr_teil = teile
+    try:
+        jahr = int(jahr_teil)
+    except ValueError:
+        return None
+    if monat_teil.isdigit():
+        monat = int(monat_teil)
+    else:
+        monat = _MONATSNAMEN.get(monat_teil.lower())
+    if monat is None or not (1 <= monat <= 12):
+        return None
+    return f"{jahr:04d}-{monat:02d}"
+
+
 #: Direkte 1:1-Übernahmen von Extraktionsfeld -> Formularfeld (keine
 #: weitere Umformung nötig).
 #:
@@ -59,15 +93,28 @@ _DIREKTE_FELDER = {
     "parkplatz_cent": "parkplatz_cent",
     "index_reihe": "index_reihe",
     "index_schwelle_prozent": "index_schwelle_prozent",
+    "index_urspruenglicher_basiswert": "index_urspruenglicher_basiswert",
     "mieter_name": "mieter_name_hinweis",
     "vermieter_name": "vermieter_name_hinweis",
     "nettomiete_cent": "nettomiete_hinweis_cent",
+    # Abnahme-Folgefix (Codex 20.10.2026): "explizite Mieter-E-Mail/
+    # -Telefon werden gar nicht extrahiert" - ANDERS als beim bloßen
+    # Namensabgleich (`mieter_name_hinweis`, für einen BEREITS gewählten
+    # bestehenden Debitor) werden diese beiden Hinweise, wenn gerade ein
+    # NEUER Mieter angelegt wird, direkt zum editierbaren Formularvorschlag
+    # für dessen Kontaktfelder (siehe `routes/vertragsanlage.py::
+    # vertragsanlage_pdf_hochladen`) - niemals für Vermieterkontakte
+    # (die werden bewusst gar nicht erst extrahiert, siehe `pdf_extraktion.
+    # py`).
+    "mieter_email": "mieter_email_hinweis",
+    "mieter_telefon": "mieter_telefon_hinweis",
     # Auftrag HV-20261020-VERTRAGSDATENBASIS: Mitmieter/Vertreter sind KEIN
     # Mietvertragsprofil-Feld - reiner Anzeigehinweis für die manuelle
     # Erfassung über "Partei hinzufügen" (siehe `backoffice/
     # vertragsanlage_form.py::_eckdaten_block`), NIE automatisch angelegt.
     "mitmieter_name": "mitmieter_name_hinweis",
     "mitmieter_telefon": "mitmieter_telefon_hinweis",
+    "mitmieter_email": "mitmieter_email_hinweis",
 }
 
 
@@ -103,6 +150,12 @@ def vorschlaege_aus_extraktion(ergebnis: ExtraktionsErgebnis) -> dict[str, Vorsc
         iso = _mietbeginn_iso(tr.wert)
         if iso is not None:
             vorschlaege["uebergabe_am"] = Vorschlag(iso, tr.seite, tr.auszug)
+
+    if "index_urspruenglicher_basismonat" in t:
+        tr = t["index_urspruenglicher_basismonat"]
+        iso_monat = _basismonat_iso(tr.wert)
+        if iso_monat is not None:
+            vorschlaege["index_urspruenglicher_basismonat"] = Vorschlag(iso_monat, tr.seite, tr.auszug)
 
     # Tri-State wie `nutzungsart` oben: NUR bei GENAU EINEM der beiden
     # Hinweise ein Vorschlag - bei beiden/keinem bleibt das Feld
@@ -163,12 +216,19 @@ _FELD_LABELS = {
     "mahngebuehr_cent": "Mahngebühr",
     "index_reihe": "Indexreihe",
     "index_schwelle_prozent": "Index-Schwelle",
+    "index_urspruenglicher_basismonat": "Index-Basismonat",
+    "index_urspruenglicher_basiswert": "Index-Basiswert",
     "mietbeginn": "Mietbeginn",
     "mietende": "Mietende",
     "unterzeichnungsdatum": "Unterzeichnungsdatum",
     "uebergabe_am": "Übergabedatum",
     "mieter_name": "Mieter (Name laut Dokument)",
+    "mieter_email": "Mieter (E-Mail laut Dokument)",
+    "mieter_telefon": "Mieter (Telefon laut Dokument)",
     "vermieter_name": "Vermieter (Name laut Dokument)",
+    "mitmieter_name": "Mitmieter (Name laut Dokument)",
+    "mitmieter_telefon": "Mitmieter (Telefon laut Dokument)",
+    "mitmieter_email": "Mitmieter (E-Mail laut Dokument)",
 }
 
 

@@ -500,7 +500,18 @@ async def vertragsanlage_pdf_hochladen(
         if kontext["neuer_debitor"] is None and deps._stammdaten_repo.get_debitor(kontext["debitor_id"]) is None:
             return _fehlerseite(session, "Neuer Mietvertrag", "Unbekannter Mieter.", "/backoffice/vertraege/neu")
         require_gesellschaft_access(_ctx(session), kontext["gesellschaft_id"])
-        basis_werte: dict = {}
+        basis_werte = {}
+        if kontext["neuer_debitor"] is not None:
+            # Bereits in Schritt 1 eingegebene Kontaktangaben eines neuen
+            # Mieters bleiben führend - der PDF-Merge unten befüllt NUR
+            # noch leere Felder (siehe "bestehende Angaben nicht
+            # zurücksetzen").
+            basis_werte.update({
+                "neuer_debitor_name": kontext["neuer_debitor"]["name"],
+                "neuer_debitor_email": kontext["neuer_debitor"].get("email") or "",
+                "neuer_debitor_adresse": kontext["neuer_debitor"].get("adresse") or "",
+                "neuer_debitor_telefon": kontext["neuer_debitor"].get("telefon") or "",
+            })
         kaution_bereits_vorhanden = False
     else:
         vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
@@ -544,11 +555,34 @@ async def vertragsanlage_pdf_hochladen(
         quelle_referenz = f"pdf-sha256:{dokument.ablage_id}"
 
     werte = dict(basis_werte)
+    _REINE_HINWEISE = (
+        "mieter_name_hinweis", "mieter_email_hinweis", "mieter_telefon_hinweis",
+        "vermieter_name_hinweis", "mitmieter_name_hinweis", "mitmieter_telefon_hinweis", "mitmieter_email_hinweis",
+    )
     for feld, vorschlag in vorschlaege.items():
-        if feld in ("mieter_name_hinweis", "vermieter_name_hinweis", "mitmieter_name_hinweis", "mitmieter_telefon_hinweis"):
-            continue  # reine Hinweise, kein Mietvertragsprofil-Feld (Mitmieter-Hinweise siehe Eckdaten-Block/Parteien-Karte)
+        if feld in _REINE_HINWEISE:
+            continue  # reine Hinweise, kein Mietvertragsprofil-Feld (siehe Sonderbehandlung unten/Eckdaten-Block)
         if not werte.get(feld):
             werte[feld] = vorschlag.formularwert
+
+    # Abnahme-Folgefix (Codex 20.10.2026): "Name bleibt Hinweis" -
+    # richtige Mieterkontakte müssen tatsächlich editierbar geprüft
+    # werden können, nicht nur als Vergleichstext neben einem BEREITS
+    # gewählten bestehenden Debitor erscheinen. Wird GERADE ein NEUER
+    # Mieter angelegt (`kontext["neuer_debitor"]` gesetzt), werden Name/
+    # E-Mail/Telefon aus dem PDF deshalb DIREKT zu editierbaren
+    # Vorbelegungen von dessen Kontaktfeldern (nur wenn noch nicht
+    # manuell befüllt - Auftrag: "bestehende Angaben nicht zurücksetzen").
+    # Für einen BEREITS bestehenden, ausgewählten Debitor bleibt es beim
+    # reinen Vergleichshinweis (`mieter_name_hinweis` in der Eckdaten-
+    # Karte) - dessen Kontaktdaten werden hier NIE überschrieben.
+    if ist_neu and kontext["neuer_debitor"] is not None:
+        if not werte.get("neuer_debitor_name") and "mieter_name_hinweis" in vorschlaege:
+            werte["neuer_debitor_name"] = vorschlaege["mieter_name_hinweis"].formularwert
+        if not werte.get("neuer_debitor_email") and "mieter_email_hinweis" in vorschlaege:
+            werte["neuer_debitor_email"] = vorschlaege["mieter_email_hinweis"].formularwert
+        if not werte.get("neuer_debitor_telefon") and "mieter_telefon_hinweis" in vorschlaege:
+            werte["neuer_debitor_telefon"] = vorschlaege["mieter_telefon_hinweis"].formularwert
 
     kontext_hidden = {"modus": modus, "vertrag_id": vertrag_id, "quelle_typ": quelle_typ}
     if quelle_referenz:
@@ -562,13 +596,13 @@ async def vertragsanlage_pdf_hochladen(
         })
         kontext_hidden.update(komponenten_roh_felder)
         if kontext["neuer_debitor"] is not None:
-            kontext_hidden.update({
-                "neuer_debitor_id": kontext["neuer_debitor"]["id"], "neuer_debitor_name": kontext["neuer_debitor"]["name"],
-                "neuer_debitor_email": kontext["neuer_debitor"].get("email") or "",
-                "neuer_debitor_adresse": kontext["neuer_debitor"].get("adresse") or "",
-                "neuer_debitor_telefon": kontext["neuer_debitor"].get("telefon") or "",
-            })
-            mieter_anzeige = f"{kontext['neuer_debitor']['name']} (neu: {kontext['neuer_debitor']['id']})"
+            # Abnahme-Folgefix (Codex 20.10.2026): Name/E-Mail/Telefon
+            # sind jetzt SICHTBARE, editierbare Felder im Review (siehe
+            # `werte` oben, befüllt aus Schritt 1 UND/ODER PDF-Hinweis) -
+            # NUR die ID bleibt hier als technischer, in Schritt 1 bereits
+            # fixierter Identifikator versteckt.
+            kontext_hidden["neuer_debitor_id"] = kontext["neuer_debitor"]["id"]
+            mieter_anzeige = f"{werte.get('neuer_debitor_name') or '(Name folgt)'} (neu: {kontext['neuer_debitor']['id']})"
         else:
             bestehender_debitor = deps._stammdaten_repo.get_debitor(kontext["debitor_id"])
             mieter_anzeige = bestehender_debitor.name if bestehender_debitor else kontext["debitor_id"]
@@ -621,11 +655,20 @@ async def vertragsanlage_vorschau(request: Request, session=Depends(_current_ses
         if deps._stammdaten_repo.get_vertrag(vertrag_id) is not None:
             return _fehlerseite(session, "Vertragsanlage", f"Vertrag-ID '{vertrag_id}' existiert bereits.", "/backoffice/vertraege/neu")
 
+        # Abnahme-Folgefix (Codex 20.10.2026): Auslöser für "neuer Mieter"
+        # ist jetzt die ID (siehe `vertragsanlage_form.py::neu_kontext_
+        # werte`) - der NAME kann an DIESER Stelle (nach PDF-Prüfung/
+        # -Korrektur im Review) noch fehlen und wird dann erst HIER,
+        # beim tatsächlichen Übernahmeversuch, verbindlich verlangt.
+        neuer_debitor_id = str(form.get("neuer_debitor_id", "")).strip()
         neuer_debitor_name = str(form.get("neuer_debitor_name", "")).strip()
-        if neuer_debitor_name:
-            neuer_debitor_id = str(form.get("neuer_debitor_id", "")).strip()
-            if not neuer_debitor_id:
-                return _fehlerseite(session, "Vertragsanlage", "Neue Mieter-ID darf nicht leer sein.", "/backoffice/vertraege/neu")
+        if neuer_debitor_id:
+            if not neuer_debitor_name:
+                return _fehlerseite(
+                    session, "Vertragsanlage",
+                    "Name des neuen Mieters darf nicht leer sein - bitte prüfen/ergänzen (ggf. aus dem PDF).",
+                    "/backoffice/vertraege/neu",
+                )
             neuer_debitor = {
                 "id": neuer_debitor_id, "name": neuer_debitor_name,
                 "email": str(form.get("neuer_debitor_email", "")).strip() or None,

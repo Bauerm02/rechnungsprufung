@@ -1,5 +1,109 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## Abnahme-Folgefix nach Rückweisung von 534b131 (Codex, 20.10.2026) —
+## Kontaktextraktion, Indexbasis, PDF-zuerst für neuen Mieter, Wording,
+## zwei Mahn-Tageslauf-Bugs
+
+534b131 wurde ausdrücklich NICHT als Abschluss des Hauptauftrags
+akzeptiert: fünf konkrete, an einem echten synthetischen PDF
+reproduzierte Outcome-Tests waren rot. Diese Korrektur behebt sie:
+
+1. **Mieter-E-Mail/-Telefon werden jetzt extrahiert UND sind editierbar**
+   (`pdf_extraktion.py`: neue Muster `mieter_email`/`mieter_telefon`,
+   mit `(?<!Mit)`-Schutz gegen Fehltreffer auf "Mitmieter"/"Vermieter").
+   Anders als der bloße Namensabgleich bei einem BEREITS gewählten
+   bestehenden Debitor (`mieter_name_hinweis`) werden diese Hinweise,
+   wenn GERADE ein neuer Mieter angelegt wird, direkt zu editierbaren
+   Vorbelegungen von dessen Kontaktfeldern (`routes/vertragsanlage.py::
+   vertragsanlage_pdf_hochladen`, neues sichtbares Fieldset "Mieter (neu
+   anzulegen)" in `review_formular`). Vermieterkontakte werden weiterhin
+   NIE extrahiert/übernommen (kein `vermieter_email`/`vermieter_telefon`-
+   Muster) - das bleibt eine bewusste Entscheidung, keine Lücke.
+2. **Index-Basismonat/-Basiswert werden extrahiert** (neue Muster,
+   akzeptieren deutsche Monatsnamen inkl. "Jänner" sowie `MM/YYYY`;
+   `vorschlaege.py::_basismonat_iso` übersetzt in das vom Formular
+   erwartete `YYYY-MM`).
+3. **"PDF-zuerst" für den NEUEN Mieter**: `neu_kontext_werte()` verlangt
+   den Mieter-NAMEN nicht mehr VOR dem Upload - nur die neue Debitor-ID
+   muss in Schritt 1 feststehen (eine ID kann kein PDF liefern), der
+   Name darf aus dem PDF folgen und wird spätestens beim tatsächlichen
+   Übernahmeversuch (`vertragsanlage_vorschau`) verbindlich verlangt.
+   Einheit/Gesellschaft/Rechtsordnung/Vertragsbeginn bleiben bewusst
+   weiterhin VOR dem Upload nötig - das sind Verweise auf bereits
+   bestehende Stammdaten, die kein PDF ersetzen kann.
+4. **Wording-Korrekturen**: "Vertragsende (leer lassen = unbefristet)"
+   im Neuanlage-Formular ersetzt (impliziert nicht mehr automatisch
+   UNBEFRISTET); die zentrale Übersicht und die Mieterakte zeigen bei
+   fehlendem Enddatum jetzt "kein Enddatum hinterlegt" statt
+   "unbefristet" und weisen den tatsächlichen `Befristungsstatus`
+   (inkl. `UNGEKLAERT`) separat aus - kein widersprüchliches
+   "unbefristet (UNGEKLAERT)" mehr.
+5. **Mahn-Tageslauf, zwei weitere von Codex reproduzierte Bugs behoben**
+   (`mahnwesen/repository.py::MahnTageslaufRepository`,
+   `indexautomatik/mailversand_service.py::HVMailversandService.
+   mahnlauf`):
+   - `freigeben_verwaiste` filterte bisher auf `erstellt_am`
+     (unveränderliche Anlagezeit) statt auf `aktualisiert_am` (die
+     tatsächliche Lease-/Claim-Zeit) - ein gerade frisch reclaimter,
+     alter Slot konnte dadurch von einem parallelen Worker sofort wieder
+     als verwaist erklärt werden. `claim()` setzt `aktualisiert_am` jetzt
+     auch beim ALLERERSTEN Claim (nicht erst beim Re-Claim).
+   - `_dispatch_mahnlauf` kann nachweislich senden und ERST DANACH (vor
+     Rückgabe an `mahnlauf()`) eine Exception werfen - der äußere
+     `finally`-Zweig hatte `tatsaechlich_versucht` dadurch fälschlich auf
+     `False` und gab den Slot als `KEIN_VERSAND` frei. Schlägt jetzt
+     konservativ den tatsächlichen `MahnLaufTable`-Status nach (wie
+     bereits `freigeben_verwaiste`), bevor freigegeben wird.
+
+Zusätzlich im selben Commit abgeschlossen (Rest der zuvor offenen
+Mahn-Ergänzungen #31/teilweise #32):
+- **IBAN/Kontoinhaber/Referenz im Mahnschreiben**: neue, OPTIONALE
+  Settings `brief_zahlungsziel_iban`/`brief_zahlungsziel_kontoinhaber`
+  (`infrastructure/config.py`) - ist eine Kontoverbindung konfiguriert,
+  nennt sie Brief UND E-Mail KONKRET; ohne Konfiguration bleibt der
+  bisherige allgemeine Hinweistext unverändert (kein erfundener Wert).
+  `Verwendungszweck` wird deterministisch aus Vertrag-ID/Stufe gebildet.
+- **Vollständige Perioden-/Positions-Tabelle**: `Forderungszeile` (Brief)
+  und der E-Mail-Text zeigen jetzt zusätzlich zum Rest auch den
+  Ursprungsbetrag und die bereits angerechnete Zahlung je Position, wenn
+  eine Teilzahlung vorliegt - vorher war nur der Restbetrag sichtbar.
+- On-Demand-Mahnbrief-Vorschau (`routes/mahnwesen.py::mahnbrief_pdf`)
+  akzeptiert jetzt auch Stufe 3/4 (vorher hart auf 1/2 beschränkt - ein
+  Rest aus der Zeit vor dem Vier-Stufen-Profil).
+
+### Bewusst NICHT in dieser Korrektur (ehrlich offen, keine "Abschluss"-
+### Behauptung für diese Punkte)
+
+- **Netto/USt/brutto ist in der Neuanlage-Mietbestandteile-Erfassung
+  weiterhin NICHT verdrahtet.** Das Formular (`_KOMPONENTEN_FELDER`/
+  `komponenten_werte_aus_form`) nimmt je Komponente nur EINEN Brutto-
+  Betrag entgegen; jede Komponente erhält beim Speichern denselben
+  Default-USt-Satz (10 %, `MietvertragsprofilTable`/Intake-Schema-
+  Default), unabhängig vom tatsächlichen Satz laut Vertrag (BK/HK/
+  Parkplatz haben in der Praxis oft 20 %, nicht 10 %). Eine aus dem PDF
+  genannte NETTO-Angabe + separatem USt-Satz (wie im Abnahme-Beispiel:
+  "HMZ 1200 netto + 20 % USt") wird NICHT automatisch in den korrekten
+  Brutto-Betrag umgerechnet und auch NICHT mit einem editierbaren
+  USt-Satz-Feld je Komponente erfasst. Das erfordert eine echte
+  Erweiterung des Mietbestandteile-Formulars (zusätzliches USt-Satz-Feld
+  je Komponente + ggf. Netto-Eingabe-Option) - bewusst NICHT in dieser
+  Korrektur unter Zeitdruck nachgezogen, um keine halbfertige/fehlerhafte
+  Geldberechnung einzuführen.
+- **Keine echte (auch nur halbautomatische) Verbindung der bestätigten
+  Verzugszins-/Index-Quellfelder zu den wirksamen Freigabe-/
+  Rechendiensten.** Die Mieterakte verlinkt weiterhin nur auf die
+  bestehenden Verwaltungsseiten (`/rechtsprofil`, `/indexklauseln`,
+  `/pruefung`) - ein Mensch entscheidet dort weiterhin eigenständig über
+  die Übernahme. Es gibt keinen Mechanismus, der z. B. "Basismonat/
+  Basiswert aus dem Profil sind vollständig" automatisch als Vorschlag
+  in die Indexklausel-Anlage einspielt. Das wäre eine neue, bisher nicht
+  bestehende Automatik - laut ausdrücklicher Vorgabe ("keine
+  zusätzliche ... Automatik erfinden") nicht ohne gesonderten Auftrag
+  gebaut.
+- Diese beiden Punkte bleiben ausdrücklich ALS OFFEN benannt, nicht
+  stillschweigend weggelassen - keine erneute "Abschluss"-Benennung für
+  reine Zusatzfelder, bis sie tatsächlich bedienbar sind.
+
 ## HV-20261020-VERTRAGSDATENBASIS: vollständige Fertigstellung (Markus-Auftrag
 ## nach e953a58, 20.10.2026) — Backend, Formular, zentrale Übersicht, Parteien
 

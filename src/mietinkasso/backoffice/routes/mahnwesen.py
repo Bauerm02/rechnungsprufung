@@ -18,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from mietinkasso.auth.service import require_gesellschaft_access, require_schreibrecht
 from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, parse_eur_betrag
 from mietinkasso.domain.exceptions import MietinkassoError
-from mietinkasso.indexautomatik.mailversand_service import bank_freigabe_ableiten
+from mietinkasso.indexautomatik.mailversand_service import bank_freigabe_ableiten, zahlungsziel_fuer_mahnung
 from mietinkasso.indexautomatik.zeit import heute_wien
 from mietinkasso.mahnwesen.brief_pdf import (
     Absender as _BriefAbsender,
@@ -552,8 +552,8 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
     Hash über Kostenkomposition UND Empfängerdaten: nur ein in beidem
     unveränderter Stand liefert denselben Namen."""
 
-    if stufe not in (1, 2):
-        raise HTTPException(status_code=422, detail="stufe muss 1 oder 2 sein.")
+    if stufe not in (1, 2, 3, 4):
+        raise HTTPException(status_code=422, detail="stufe muss zwischen 1 und 4 liegen.")
     try:
         heute_datum = date.fromisoformat(heute) if heute else date.today()
     except ValueError:
@@ -582,6 +582,7 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
             bezeichnung=f.leistungsperiode or f.art,
             faelligkeit=f.faelligkeit if f.faelligkeit_bekannt else None,
             betrag_cent=f.rest_cent,
+            urspruenglicher_betrag_cent=f.betrag_cent,
         )
         for f in deps._op_service.offene_forderungen(konto.id, heute=heute_datum)
         if f.op_position_id in offene_ids
@@ -612,6 +613,7 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
             neue_zinsen_delta_cent=vorschau.neue_zinsen_delta_cent, zins_segmente=zins_segmente,
             zinssatz_einheitlich_text=zinssatz_einheitlich_text, neue_gebuehr_cent=(vorschau.gebuehr_cent or 0),
             gebuehr_rechtsgrundlage=vorschau.gebuehr_rechtsgrundlage, gesamtbetrag_cent=gesamtbetrag_cent,
+            zahlungsziel=zahlungsziel_fuer_mahnung(deps._settings, vertrag_id=vertrag_id, stufe=stufe),
         )
     except _BriefAdressfehlerError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
