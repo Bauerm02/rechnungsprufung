@@ -12,14 +12,17 @@ from datetime import date, datetime, timezone
 from html import escape as h
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from mietinkasso.auth.service import require_gesellschaft_access
 from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, parse_eur_betrag, sperrgrund_label
 from mietinkasso.domain.enums import OPTyp
 from mietinkasso.domain.exceptions import MietinkassoError
 from mietinkasso.index.service import UNTERSTUETZTE_BERECHNUNGSPROFILE
+from mietinkasso.mahnwesen.brief_pdf import Absender as _BriefAbsender
 from mietinkasso.op.eroeffnung_import import importiere_eroeffnung_csv_atomar, parse_eroeffnung_csv
+from mietinkasso.op.kontoauszug_pdf import erzeuge_kontoauszug_pdf
+from mietinkasso.op.kontoblatt import KATEGORIE_LABEL, lade_kontoblatt
 from mietinkasso.vorschreibung.service import faelligkeitsdatum
 
 from mietinkasso.backoffice import dependencies as deps
@@ -78,6 +81,92 @@ def _rechenweg_html(positionen) -> str:
     return formel
 
 
+def _kontoblatt_zeile_html(zeile, *, kategorie_spalte: bool) -> str:
+    p = zeile.position
+    rest_html = eur(zeile.rest_cent) if zeile.rest_cent is not None else '<span class="muted">—</span>'
+    kategorie_html = f"<td>{h(KATEGORIE_LABEL.get(zeile.kategorie, zeile.kategorie))}</td>" if kategorie_spalte else ""
+    return (
+        "<tr>"
+        f"<td>{p.belegdatum.isoformat()}</td><td>{h(p.typ)}</td>{kategorie_html}"
+        f"<td>{eur(p.betrag_cent)}</td><td>{rest_html}</td>"
+        f"<td>{h(p.beleg_referenz or p.aenderungsgrund or '')}</td>"
+        "</tr>"
+    )
+
+
+def _kontoblatt_html(kontoblatt, *, konto_id: str) -> str:
+    """Auftrag HV-20261020-KONTOBLATT-KOSTEN: getrennte Hauptforderung/
+    gebuchte Kosten/Zahlungs-Stornostand/Gesamtsaldo PLUS dokumentierte,
+    nicht belastete Bankaufwände und ausstehende (noch nicht
+    kostenverarbeitete) Mahnläufe - siehe `op/kontoblatt.py`-Moduldoc für
+    die fachliche Begründung (insbesondere: KEINE Verdopplung, der
+    Gesamtsaldo bleibt exakt `OPService.berechne_saldo(...).saldo_cent`)."""
+
+    hauptforderung_zeilen = "".join(_kontoblatt_zeile_html(z, kategorie_spalte=False) for z in kontoblatt.hauptforderung_zeilen)
+    kosten_zeilen = "".join(_kontoblatt_zeile_html(z, kategorie_spalte=True) for z in kontoblatt.kosten_zeilen)
+    zahlungen_zeilen = "".join(_kontoblatt_zeile_html(z, kategorie_spalte=False) for z in kontoblatt.zahlungen_zeilen)
+
+    bankaufwand_zeilen = "".join(
+        f"<tr><td>{b.row.gebucht_am.strftime('%Y-%m-%d') if b.row.gebucht_am else ''}</td>"
+        f"<td>{eur(b.row.bankentgelt_cent)}</td><td>{h(b.row.beleg_referenz)}</td>"
+        f"<td>RLS-OP #{b.row.ruecklastschrift_op_position_id}"
+        f"{' / Bank-Tx #' + str(b.row.bank_transaktion_id) if b.row.bank_transaktion_id is not None else ''}</td>"
+        f"<td><span class='warn'>{h(b.status_text)}</span></td></tr>"
+        for b in kontoblatt.dokumentierte_bankaufwaende
+    )
+    bankaufwand_karte = ""
+    if kontoblatt.dokumentierte_bankaufwaende:
+        bankaufwand_summe = sum(b.row.bankentgelt_cent for b in kontoblatt.dokumentierte_bankaufwaende)
+        bankaufwand_karte = f"""
+        <div class="card"><h3>Dokumentierte, (noch) nicht belastete Bankaufwände</h3>
+          <p class="muted">Erfasst, aber NICHT als Forderung gebucht - NICHT im Gesamtsaldo enthalten. Summe:
+             <strong>{eur(bankaufwand_summe)}</strong></p>
+          <table><tr><th>Rückgabe</th><th>Bankentgelt</th><th>Beleg</th><th>Bezug</th><th>Status</th></tr>
+          {bankaufwand_zeilen}</table>
+        </div>"""
+
+    mahnlauf_zeilen = "".join(
+        f"<tr><td>{m.geplant_am.strftime('%Y-%m-%d') if m.geplant_am else ''}</td><td>{m.stufe}</td>"
+        f"<td>{h(m.kanal)}</td><td>{h(m.status)}</td></tr>"
+        for m in kontoblatt.ausstehende_mahnlaeufe
+    )
+    ausstehend_karte = ""
+    if kontoblatt.ausstehende_mahnlaeufe:
+        ausstehend_karte = f"""
+        <div class="card"><h3>Ausstehende Mahnläufe (Kosten noch nicht gebucht)</h3>
+          <p class="warn">Die Kostenverarbeitung ist für diese Mahnläufe noch NICHT abgeschlossen - das
+             bedeutet "nicht gebucht", NICHT "nichts offen".</p>
+          <table><tr><th>Geplant am</th><th>Stufe</th><th>Kanal</th><th>Status</th></tr>
+          {mahnlauf_zeilen}</table>
+        </div>"""
+
+    return f"""
+    <div class="card"><h2>Kostenübersicht</h2>
+      <p>Hauptforderung: <strong>{eur(kontoblatt.hauptforderung_cent)}</strong> &nbsp;|&nbsp;
+         Gebuchte Kosten: <strong>{eur(kontoblatt.kosten_cent)}</strong> &nbsp;|&nbsp;
+         Zahlungs-/Stornostand: <strong>{eur(kontoblatt.zahlungen_saldo_cent)}</strong> &nbsp;|&nbsp;
+         Gesamtsaldo: <strong>{eur(kontoblatt.saldo_cent)}</strong></p>
+      <p><a href="/backoffice/konto/{h(konto_id)}/kontoauszug.pdf">PDF-Kontoauszug herunterladen</a></p>
+      <details open><summary>Hauptforderung ({len(kontoblatt.hauptforderung_zeilen)})</summary>
+        <table><tr><th>Datum</th><th>Typ</th><th>Betrag</th><th>Offener Rest</th><th>Beleg/Grund</th></tr>
+        {hauptforderung_zeilen if kontoblatt.hauptforderung_zeilen else '<tr><td colspan=5 class="muted">Keine Hauptforderungszeilen.</td></tr>'}
+        </table>
+      </details>
+      <details open><summary>Tatsächlich gebuchte Kosten ({len(kontoblatt.kosten_zeilen)}) - bereits im Gesamtsaldo enthalten</summary>
+        <table><tr><th>Datum</th><th>Typ</th><th>Kategorie</th><th>Betrag</th><th>Offener Rest</th><th>Beleg/Grund</th></tr>
+        {kosten_zeilen if kontoblatt.kosten_zeilen else '<tr><td colspan=6 class="muted">Keine gebuchten Mahngebühren/-pauschale, Verzugszinsen oder Rücklastschriftkosten.</td></tr>'}
+        </table>
+      </details>
+      <details><summary>Zahlungen / Rücklastschriften - Stornostand ({len(kontoblatt.zahlungen_zeilen)})</summary>
+        <table><tr><th>Datum</th><th>Typ</th><th>Betrag</th><th>Offener Rest</th><th>Beleg/Grund</th></tr>
+        {zahlungen_zeilen if kontoblatt.zahlungen_zeilen else '<tr><td colspan=5 class="muted">Keine Zahlungen/Rücklastschriften.</td></tr>'}
+        </table>
+      </details>
+    </div>
+    {bankaufwand_karte}
+    {ausstehend_karte}"""
+
+
 @router.get("/konto/{konto_id}", response_class=HTMLResponse)
 def kontoauszug(request: Request, konto_id: str, session=Depends(_current_session)) -> HTMLResponse:
     konto = deps._stammdaten_repo.get_konto(konto_id)
@@ -108,6 +197,21 @@ def kontoauszug(request: Request, konto_id: str, session=Depends(_current_sessio
             {'zum ' + konto.eroeffnung_stichtag.isoformat() if konto.eroeffnung_stichtag else ''}</td></tr>
       </table>
     </div>"""
+
+    # Auftrag HV-20261020-KONTOBLATT-KOSTEN: dieselbe Fachregel wie in der
+    # Mieterakte - ein von der Pilotphase ausgeschlossenes Objekt zeigt
+    # KEINE Kosten-/Saldoaufschlüsselung (die bestehende, historisch
+    # laxere reine OP-Tabelle unten bleibt dabei bewusst unverändert,
+    # siehe `vertragsanlage.py::vertragsanlage_detail`-Kommentar - "das
+    # ändert dieser Auftrag nicht").
+    kontoblatt_karte = ""
+    if not gesperrt and vertrag is not None:
+        kontoblatt = lade_kontoblatt(
+            konto_id=konto_id, vertrag_id=vertrag.id, op_service=deps._op_service,
+            mahnkosten_repo=deps._hv_mail.mahnkosten_repo, ruecklastschriftkosten_repo=deps._ruecklastschriftkosten_repo,
+            mahnlauf_repo=deps._hv_mail.mahnlauf_repo,
+        )
+        kontoblatt_karte = _kontoblatt_html(kontoblatt, konto_id=konto_id)
 
     sperren_zeilen = "".join(
         f"<tr><td>{h(sperrgrund_label(s.grund))} <span class='muted'>({h(s.grund)})</span></td>"
@@ -158,7 +262,58 @@ def kontoauszug(request: Request, konto_id: str, session=Depends(_current_sessio
           <a href="/backoffice/vertrag/{h(vertrag.id)}/komponenten-freigabe">Netto-Mietanteil-Freigabe</a>
         </p>"""
 
-    return _layout(request, session, f"Kontoauszug {konto_id}", banner + stammdaten_karte + sperren_karte + op_tabelle + links)
+    return _layout(
+        request, session, f"Kontoauszug {konto_id}",
+        banner + stammdaten_karte + sperren_karte + kontoblatt_karte + op_tabelle + links,
+    )
+
+
+@router.get("/konto/{konto_id}/kontoauszug.pdf")
+def kontoauszug_pdf(konto_id: str, session=Depends(_current_session)):
+    """Druckfähiger JLB-PDF-Kontoauszug (Auftrag HV-20261020-KONTOBLATT-
+    KOSTEN) - GENAU dieselben Daten wie die Kostenübersicht oben
+    (`lade_kontoblatt`), reiner GET: liest nur, bucht/sendet/verändert
+    nichts. Für ein von der Pilotphase ausgeschlossenes Objekt (Objekt
+    107) gibt es KEINEN PDF-Kontoauszug - dieselbe Fachregel wie überall
+    sonst in diesem Modul."""
+
+    konto = deps._stammdaten_repo.get_konto(konto_id)
+    if konto is None:
+        return _fehlerseite(session, "Kontoauszug", f"Unbekanntes Konto {konto_id}.")
+    vertrag = deps._stammdaten_repo.get_vertrag(konto.vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Kontoauszug", "Stammdaten unvollständig.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    if _objekt_fuer_vertrag_gesperrt(konto.vertrag_id):
+        return _fehlerseite(session, "Kontoauszug", "Objekt ist von der Pilotphase ausgeschlossen - kein PDF-Kontoauszug.")
+
+    einheit = deps._stammdaten_repo.get_einheit(vertrag.einheit_id)
+    objekt = deps._stammdaten_repo.objekt_fuer_vertrag(vertrag.id)
+    debitor = deps._stammdaten_repo.get_debitor(konto.debitor_id)
+    if einheit is None or objekt is None or debitor is None:
+        return _fehlerseite(session, "Kontoauszug", "Stammdaten unvollständig.")
+
+    kontoblatt = lade_kontoblatt(
+        konto_id=konto_id, vertrag_id=vertrag.id, op_service=deps._op_service,
+        mahnkosten_repo=deps._hv_mail.mahnkosten_repo, ruecklastschriftkosten_repo=deps._ruecklastschriftkosten_repo,
+        mahnlauf_repo=deps._hv_mail.mahnlauf_repo,
+    )
+    absender = _BriefAbsender(
+        name=deps._settings.brief_absender_name, adresse=deps._settings.brief_absender_adresse, fn=deps._settings.brief_absender_fn,
+        uid=deps._settings.brief_absender_uid, telefon=deps._settings.brief_absender_telefon, website=deps._settings.brief_absender_website,
+        email=deps._settings.brief_absender_email, farbe_anthrazit=deps._settings.brief_farbe_anthrazit, farbe_gold=deps._settings.brief_farbe_gold,
+        logo_pfad=deps._settings.brief_logo_pfad, font_regular_pfad=deps._settings.brief_font_regular_pfad, font_bold_pfad=deps._settings.brief_font_bold_pfad,
+        font_headline_pfad=deps._settings.brief_font_headline_pfad,
+    )
+    pdf_bytes = erzeuge_kontoauszug_pdf(
+        absender=absender, objekt_bezeichnung=objekt.bezeichnung, einheit_bezeichnung=einheit.bezeichnung,
+        debitor_name=debitor.name, vertrag_id=vertrag.id, konto_id=konto_id, heute=date.today(), kontoblatt=kontoblatt,
+    )
+    dateiname = f"Kontoauszug_{konto_id}_{date.today().isoformat()}.pdf"
+    return Response(
+        content=pdf_bytes, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{dateiname}"'},
+    )
 
 
 # -- Nachbuchung ----------------------------------------------------------------

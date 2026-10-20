@@ -501,6 +501,24 @@ class MahnkostenRepository:
                 .where(MahnkostenBuchungTable.versandnachweis_referenz == versandnachweis_referenz)
             ).scalar_one_or_none()
 
+    def liste_buchungen_fuer_vertrag(self, vertrag_id: str) -> list[MahnkostenBuchungTable]:
+        """Reiner Read, jüngste Zeile zuerst - für das Kontoblatt-
+        Kostenmodell (Auftrag HV-20261020-KONTOBLATT-KOSTEN): liefert
+        JEDE tatsächlich abgeschlossene Kostenbuchung dieses Vertrags
+        (über alle Stufen/Mahnläufe hinweg), damit die zugehörigen
+        OP-Zeilen (`zinsen_op_position_id`/`gebuehr_op_position_id`/
+        `mahnpauschale_op_position_id`) eindeutig ihrer Kategorie
+        (Verzugszinsen/Mahnspesen/Mahnkostenpauschale) zugeordnet werden
+        können - keine neue Berechnung, keine neue Buchung."""
+
+        with self._session_factory() as session:
+            statement = (
+                select(MahnkostenBuchungTable)
+                .where(MahnkostenBuchungTable.vertrag_id == vertrag_id)
+                .order_by(MahnkostenBuchungTable.gebucht_am.desc())
+            )
+            return list(session.execute(statement).scalars().all())
+
     def buchung_anlegen(
         self, *, vertrag_id: str, stufe: int, mahnlauf_schluessel: str, forderung_op_position_ids: list[int],
         hauptforderung_cent: int, zinsbasis: str, zinssatz_prozent, zins_von: date, zins_bis: date,

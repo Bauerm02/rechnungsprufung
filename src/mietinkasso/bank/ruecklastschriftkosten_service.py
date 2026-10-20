@@ -87,6 +87,21 @@ class RuecklastschriftkostenRepository:
         with self._session_factory() as owned_session:
             return _lesen(owned_session)
 
+    def liste_fuer_vertrag(self, vertrag_id: str) -> list[RuecklastschriftkostenTable]:
+        """Reiner Read, jüngste Zeile zuerst - für das Kontoblatt-
+        Kostenmodell (Auftrag HV-20261020-KONTOBLATT-KOSTEN): zeigt JEDE
+        erfasste Zeile, auch eine rein dokumentarische ohne
+        `kosten_op_position_id` (noch nicht als Forderung gebucht) -
+        keine neue Berechnung, keine Filterung."""
+
+        with self._session_factory() as session:
+            statement = (
+                select(RuecklastschriftkostenTable)
+                .where(RuecklastschriftkostenTable.vertrag_id == vertrag_id)
+                .order_by(RuecklastschriftkostenTable.gebucht_am.desc())
+            )
+            return list(session.execute(statement).scalars().all())
+
     def anlegen(
         self, *, vertrag_id: str, ruecklastschrift_op_position_id: int, bankentgelt_cent: int,
         rueckgabeursache: str, dem_zahlungspflichtigen_zurechenbar: bool, zurechenbarkeit_begruendung: str,

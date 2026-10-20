@@ -4810,6 +4810,182 @@ def test_mahnbrief_archiv_beleg_import_vervollstaendigt_mahnlauf(backoffice_clie
     assert beleg_download.content == beleg_pdf
 
 
+def _kontoblatt_test_konto(suffix: str):
+    """Eigene, isolierte Einheit/Vertrag/Konto für die Kontoblatt-Tests
+    (Auftrag HV-20261020-KONTOBLATT-KOSTEN) - das gemeinsam genutzte
+    V-601-1 wird von saldo-sensitiven Tests an anderer Stelle in dieser
+    Datei erwartet und darf hier nicht zusätzlich bebucht werden."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id=f"601-TOP-KB-{suffix}", objekt_id="601", bezeichnung=f"Top KB {suffix}", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_vertrag(
+        id=f"V-601-KB-{suffix}", einheit_id=f"601-TOP-KB-{suffix}", debitor_id="DEB-1", gesellschaft_id="7DI",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    vertrag = stammdaten.get_vertrag(f"V-601-KB-{suffix}")
+    konto = stammdaten.get_or_create_konto(vertrag=vertrag)
+    return vertrag, konto, stammdaten
+
+
+def test_kontoauszug_zeigt_beispiel_1000_hauptsaldo_plus_undokumentierte_bankentgelte(backoffice_client):
+    """Wörtliches Beispiel aus dem Auftrag HV-20261020-KONTOBLATT-KOSTEN:
+    1.000 EUR Hauptsaldo plus zwei dokumentierte 7-EUR-Bankentgelte ohne
+    Forderungs-OP - Gesamtsaldo bleibt 1.000,00, die 14,00 EUR erscheinen
+    separat als "dokumentiert – nicht belastet"."""
+
+    from mietinkasso.bank.ruecklastschriftkosten_service import RuecklastschriftkostenRepository, RuecklastschriftkostenService
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    client, *_ = backoffice_client
+    _login(client)
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("BEISPIEL")
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.EROEFFNUNG, betrag_cent=100_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1), faelligkeit=None, beleg_referenz="Eröffnung",
+    )
+    rls_service = RuecklastschriftkostenService(session_factory=session_factory, op_service=op_service, repository=RuecklastschriftkostenRepository(session_factory))
+    # Zwei ZAHLUNG+RUECKLASTSCHRIFT-Paare (eine geplatzte Zahlung gleicht
+    # sich im Saldo selbst aus: -5000 + 5000 = 0) - der Hauptsaldo bleibt
+    # dadurch exakt bei 1.000,00, wie im wörtlichen Auftragsbeispiel.
+    for i in (1, 2):
+        op_service.buchen(
+            ctx=_ctx_admin(), konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=5000,
+            belegdatum=date(2026, 2, i), buchungsdatum=date(2026, 2, i), faelligkeit=None,
+            beleg_referenz=f"Zahlung {i} (später rückgebucht)",
+        )
+        rls_op = op_service.buchen(
+            ctx=_ctx_admin(), konto=konto, typ=OPTyp.RUECKLASTSCHRIFT, betrag_cent=5000,
+            belegdatum=date(2026, 2, i), buchungsdatum=date(2026, 2, i), faelligkeit=None,
+            beleg_referenz=f"Rücklastschrift {i}",
+        )
+        rls_service.erfasse_und_buche(
+            ctx=_ctx_admin(), ruecklastschrift_op_position=rls_op, vertrag_id=vertrag.id, konto=konto,
+            bankentgelt_cent=700, rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=False,
+            zurechenbarkeit_begruendung="Zurechenbarkeit noch nicht belegt, rechtlich in Prüfung.",
+            beleg_referenz=f"Bankbeleg {i}", heute=date(2026, 2, i), akteur="codex-test",
+        )
+    assert op_service.berechne_saldo(konto.id).saldo_cent == 100_000  # exakt 1.000,00 EUR
+
+    seite = client.get(f"/backoffice/konto/{konto.id}")
+    assert seite.status_code == 200
+    assert "Gesamtsaldo: <strong>1.000,00" in seite.text  # exakt 1.000,00, nicht 1.014,00
+    assert "14,00" in seite.text  # Summe der beiden nicht belasteten Bankentgelte, separat sichtbar
+    assert "dokumentiert" in seite.text and "nicht belastet" in seite.text
+
+    pdf_antwort = client.get(f"/backoffice/konto/{konto.id}/kontoauszug.pdf")
+    assert pdf_antwort.status_code == 200
+    assert pdf_antwort.headers["content-type"] == "application/pdf"
+    from pypdf import PdfReader
+    import io
+    text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_antwort.content)).pages)
+    assert "1.000,00 EUR" in text  # Gesamtsaldo exakt 1.000,00
+    assert "14,00 EUR" in text  # die beiden Bankentgelte zusammen, separat sichtbar
+    assert "dokumentiert" in text and "nicht belastet" in text
+
+
+def test_kontoauszug_zeigt_gebuchte_kosten_getrennt_nach_kategorie(backoffice_client):
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
+    from mietinkasso.mahnwesen.kosten_service import MahnkostenService
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    client, *_ = backoffice_client
+    _login(client)
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("KATEGORIEN")
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1), faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ",
+    )
+    mahnkosten_repo = MahnkostenRepository(session_factory)
+    mahnkosten_service = MahnkostenService(mahnkosten_repo, op_service, stammdaten)
+    gebucht = mahnkosten_service.buche_bei_versand(
+        ctx=_ctx_admin(), vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1),
+        versandnachweis_referenz="mahnung:kontoblatt-kategorien", akteur="codex-test",
+    )
+    assert gebucht is not None and gebucht.zinsen_op_position_id is not None
+
+    seite = client.get(f"/backoffice/konto/{konto.id}")
+    assert seite.status_code == 200
+    assert "Verzugszinsen" in seite.text
+    assert "Hauptforderung" in seite.text
+    assert "Mahnspesen" not in seite.text  # kein Zinsprofil freigegeben -> keine Gebühr gebucht
+
+
+def test_kontoauszug_pdf_fuer_objekt_107_ausgeschlossen(backoffice_client):
+    client, _konto_id, konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    antwort = client.get(f"/backoffice/konto/{konto_gesperrt_id}/kontoauszug.pdf")
+    assert antwort.status_code == 400
+
+
+def test_kontoauszug_pdf_ist_reiner_get_ohne_datenbankaenderung(backoffice_client):
+    """Erforderliche Regression: reiner GET/PDF ändert keine DB/kein
+    Audit/kein Versand."""
+
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.infrastructure.db.tables import AuditEventTable
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+    from sqlalchemy import select
+
+    client, *_ = backoffice_client
+    _login(client)
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("REINER-GET")
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.EROEFFNUNG, betrag_cent=42_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1), faelligkeit=None, beleg_referenz="Eröffnung",
+    )
+
+    positionen_vor = op_service.list_alle_positionen(konto.id)
+    with session_factory() as s:
+        audit_vor = list(s.execute(select(AuditEventTable)).scalars())
+
+    for _ in range(3):
+        html_antwort = client.get(f"/backoffice/konto/{konto.id}")
+        assert html_antwort.status_code == 200
+        pdf_antwort = client.get(f"/backoffice/konto/{konto.id}/kontoauszug.pdf")
+        assert pdf_antwort.status_code == 200
+
+    positionen_nach = op_service.list_alle_positionen(konto.id)
+    with session_factory() as s:
+        audit_nach = list(s.execute(select(AuditEventTable)).scalars())
+
+    assert len(positionen_nach) == len(positionen_vor)
+    assert len(audit_nach) == len(audit_vor)
+    assert op_service.berechne_saldo(konto.id).saldo_cent == 42_000
+
+
+def test_mieterakte_zeigt_link_auf_pdf_kontoauszug(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    _vertrag, konto, _stammdaten = _kontoblatt_test_konto("MIETERAKTE-LINK")
+    seite = client.get(f"/backoffice/vertrag/{_vertrag.id}")
+    assert seite.status_code == 200
+    assert f"/backoffice/konto/{konto.id}/kontoauszug.pdf" in seite.text
+    assert "Kostenübersicht" in seite.text
+
+
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
     """MUSS als LETZTER Test in diesem Modul laufen (siehe Kommentar
     unten) - der Login-Ratelimiter ist ein globaler, prozessweiter

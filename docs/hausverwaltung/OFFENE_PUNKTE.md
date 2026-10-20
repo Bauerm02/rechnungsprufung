@@ -5383,3 +5383,111 @@ Vollständiger `tests/mietinkasso`-Lauf nach dieser Runde erneut grün
 (siehe Commit-Historie für die genaue Testanzahl). Keine Livezugriffe,
 kein echter Upload/Testbrief, keine Produktivbuchung, `SEND_ENABLED`
 unverändert `false`. Bankteil unangetastet, kein Deployment.
+
+## HV-20261020-KONTOBLATT-KOSTEN (Kontoblatt-Kostenmodell + PDF-Kontoauszug)
+
+Neuer, eigenständiger Auftrag: Mahngebühren und Rücklastschriftkosten
+müssen dauerhaft auf jedem Kontoblatt ersichtlich sein. Rein lesende
+Erweiterung - keine neue Buchung, keine Migration, keine Anpassung der
+bestehenden Bank-/Versandlogik.
+
+**Neue Dateien:**
+
+- `src/mietinkasso/op/kontoblatt.py` - reines (DB-freies) Kostenmodell:
+  `erstelle_kontoblatt(...)` gruppiert bereits bestehende, aktive
+  OP-Positionen in Hauptforderung/gebuchte Kosten (Verzugszinsen,
+  Mahnspesen §458 UGB, Mahnkostenpauschale §1333 Abs 2 ABGB,
+  Rücklastschriftkosten)/Zahlungs-Stornostand, OHNE den Gesamtsaldo
+  neu zu berechnen - der bleibt IMMER exakt `OPService.
+  berechne_saldo(...).saldo_cent` (zentrale Anti-Doppelzähl-Regel,
+  siehe Moduldoc). Erkennt dokumentierte, aber nicht gebuchte
+  Rücklastschriftkosten (`kosten_op_position_id IS NULL`) und
+  ausstehende (noch nicht kostenverarbeitete) Mahnläufe
+  (`mahnkosten_verarbeitet_am IS NULL`, außer BLOCKIERT/UEBERSPRUNGEN -
+  das ist ein endgültiges "wird nie gebucht"). Folgt der
+  `storniert_durch_id`-Kette bis zu 10 Schritte rückwärts, damit eine
+  über `OPService.storniere_und_korrigiere` korrigierte Kostenzeile
+  (die pauschal `quelle_system="korrektur"` bekommt) ihre Kategorie
+  nicht verliert. `lade_kontoblatt(...)` ist der I/O-Wrapper (lädt über
+  bereits bestehende Repositories, zwei davon additiv um eine reine
+  `liste_fuer_vertrag`/`liste_buchungen_fuer_vertrag`-Lesemethode
+  erweitert - `RuecklastschriftkostenRepository`/`MahnkostenRepository`).
+- `src/mietinkasso/op/kontoauszug_pdf.py` - druckfähiger JLB-PDF-
+  Kontoauszug über demselben `Kontoblatt`. Bewusst EIN EIGENES Layout
+  (kein Fensterkuvert, kein Sperrbereich) statt `mahnwesen/brief_pdf.py`
+  mitzuverwenden ("Mahnbrief ist nicht Kontoblatt") - wiederverwendet
+  aber dieselbe `Absender`-Datenklasse, dieselben Settings-Felder
+  (Logo/Fonts/Farben), denselben Fallback-Font, dieselbe PDF/A-2B-
+  Erzwingung. Zeilen werden wie in `brief_pdf._zeile` per Dry-Run-
+  Höhenprüfung + `will_page_break` geschrieben, damit eine lange
+  Beleg-Referenz/viele Zeilen NIE mitten im Seitenumbruch abgeschnitten
+  werden (geprüft mit einem echten 50-Zeilen-Mehrseiten-PDF, bei dem die
+  letzte Zeile samt Betrag im extrahierten Text nachweislich vollständig
+  erscheint).
+
+**Geänderte Dateien:**
+
+- `src/mietinkasso/bank/ruecklastschriftkosten_service.py` - additive
+  `RuecklastschriftkostenRepository.liste_fuer_vertrag(vertrag_id)`
+  (reiner Read).
+- `src/mietinkasso/mahnwesen/kosten_repository.py` - additive
+  `MahnkostenRepository.liste_buchungen_fuer_vertrag(vertrag_id)`
+  (reiner Read).
+- `src/mietinkasso/backoffice/routes/konten.py` - `GET /backoffice/
+  konto/{konto_id}` zeigt jetzt zusätzlich eine "Kostenübersicht"-Karte
+  (Hauptforderung/gebuchte Kosten/Zahlungs-Stornostand/Gesamtsaldo
+  getrennt, plus dokumentierte-nicht-belastete Bankaufwände und
+  ausstehende Mahnläufe) - die bestehende rohe OP-Tabelle darunter
+  bleibt UNVERÄNDERT (auch ihr historisch laxeres Verhalten für Objekt
+  107 - das ändert dieser Auftrag bewusst nicht, siehe Kommentar im
+  Code). Neue Route `GET /backoffice/konto/{konto_id}/kontoauszug.pdf`
+  (reiner GET, bucht/sendet nichts) - für ein von der Pilotphase
+  ausgeschlossenes Objekt (107) gibt es KEINEN PDF-Kontoauszug.
+- `src/mietinkasso/backoffice/vertragsanlage_form.py` - die Mieterakte
+  verlinkt jetzt zusätzlich den PDF-Kontoauszug neben dem bestehenden
+  "Vollständigen Kontoauszug öffnen"-Link.
+- `tests/mietinkasso/fixtures/backoffice_http_contract.json` - für die
+  eine neue (weiterhin standardmäßig geschlossene, HTTP 503) Route neu
+  generiert.
+
+**Offene Grenzen (bewusst nicht weiter ausgebaut, siehe Auftragsumfang
+"keine neue Buchhaltung"):**
+
+- Eine manuell über die generische Nachbuchung gebuchte GUTSCHRIFT
+  gegen eine Kostenzeile (statt über `storniere_und_korrigiere`) hat
+  keine strukturelle Bindung an die Originalzeile und erscheint deshalb
+  als Hauptforderung, nicht als Kostenkorrektur - betrifft nur die
+  Anzeige-Kategorie, NICHT den Gesamtsaldo (der bleibt in jedem Fall
+  korrekt).
+- "Fremdes Konto/Gesellschaft nicht lesbar" ist in diesem Backoffice
+  strukturell NICHT als Mandantentrennung umsetzbar: `backoffice/
+  auth.py::_ctx` vergibt für JEDE angemeldete Sitzung
+  `AuthContext(rolle=ADMIN, gesellschaft_ids=None)` (Ein-Operator-
+  Pilotmodul, siehe dortiger Code-Kommentar) - `require_gesellschaft_
+  access` ist deshalb in der neuen PDF-Route nur defensiv vorhanden,
+  prüft aber praktisch nichts zusätzlich. Die tatsächlich wirksame
+  Zugriffsschranke in diesem Modul ist durchgehend der
+  Objekt-107-Ausschluss, den die neue Kostenübersicht/der PDF-
+  Kontoauszug konsequent respektiert (anders als die alte, historisch
+  lax belassene rohe OP-Tabelle).
+- Der PDF-Kontoauszug wiederholt die Tabellenüberschriften NICHT auf
+  jeder Folgeseite (nur die JLB-Kopf-/Fußzeile) - eine bewusste
+  Vereinfachung; Inhalt geht dabei nachweislich nicht verloren/wird
+  nicht abgeschnitten (siehe Test oben), nur der Spaltenkontext einer
+  sehr langen Tabelle muss ggf. zur Vorseite zurückgeblättert werden.
+- `MahnkostenGebuehrTable`/`MahnpauschaleFreigabeTable` werden NICHT
+  direkt abgefragt - das "ausstehend"-Signal läuft ausschließlich über
+  `MahnLaufTable.mahnkosten_verarbeitet_am`, das denselben Zustand auf
+  Mahnlauf-Ebene bereits korrekt abbildet (siehe Moduldoc in
+  `kontoblatt.py`); eine lose, von einem Mahnlauf unabhängige
+  `RESERVIERT`-Gebührenzeile existiert nach aktuellem Code-Stand nicht
+  dauerhaft (wird bei sauberer Blockade wieder freigegeben).
+
+Tests: `tests/mietinkasso/test_kontoblatt.py` (12, reine Aggregation +
+ein Integrationstest gegen echte Repositories/DB), `tests/mietinkasso/
+test_kontoauszug_pdf.py` (8, inkl. Mehrseiten-Regression), plus 5 neue
+HTTP-Tests in `test_backoffice.py` (wörtliches 1.000-EUR+14-EUR-Beispiel,
+Kategorietrennung, Objekt-107-Ausschluss der PDF-Route, reiner
+GET/PDF ändert keine DB/kein Audit, Mieterakte-Link). Ausschließlich
+synthetische Testdaten, keine echten IBANs/Originale, keine
+Serverzugriffe, keine Geschäftsaktionen.

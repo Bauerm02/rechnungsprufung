@@ -847,7 +847,9 @@ def detail_ansicht(
         <table><tr><th>Datum</th><th>Typ</th><th>Betrag</th><th>Periode</th><th>Beleg/Quelle</th></tr>
         {zahlungen_zeilen or '<tr><td colspan=5 class="muted">Keine Buchungen.</td></tr>'}</table>
       </details>
-      {f'<p><a href="/backoffice/konto/{h(konto_id)}">Vollständigen Kontoauszug öffnen</a></p>' if konto_id else ''}
+      {f'<p><a href="/backoffice/konto/{h(konto_id)}">Vollständigen Kontoauszug öffnen</a> (mit Kostenübersicht: '
+       f'Hauptforderung, gebuchte Mahngebühren/-pauschale, Verzugszinsen und Rücklastschriftkosten getrennt) · '
+       f'<a href="/backoffice/konto/{h(konto_id)}/kontoauszug.pdf">PDF-Kontoauszug herunterladen</a></p>' if konto_id else ''}
     </div>"""
 
     # -- Sperren (id="sperren") - reine Statusanzeige, KEINE ----------------

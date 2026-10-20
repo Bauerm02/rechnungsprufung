@@ -577,6 +577,18 @@
       ]
     },
     {
+      "path": "/backoffice/konto/{konto_id}/kontoauszug.pdf",
+      "method": "GET",
+      "endpoint": "kontoauszug_pdf",
+      "resolved_endpoint": "kontoauszug_pdf",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
       "path": "/backoffice/login",
       "method": "GET",
       "endpoint": "login_formular",
@@ -1656,6 +1668,13 @@
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
     },
     {
+      "path": "/backoffice/konto/{konto_id}/kontoauszug.pdf",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
       "path": "/backoffice/login",
       "method": "get",
       "status": 503,
@@ -2098,5 +2117,5 @@
     }
   ],
   "session_dependency_count": 1,
-  "baseline_commit": "e095c73fa148f2a6ce8b8e0b8e9ab7735a8120d0 + HV-20261001-BK-AUTOMATIK + HV-20261019-MAHNKOSTEN + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS (additiv: native Rücklastschrift+Bankentgelt-Route) + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS Teil 3 (additiv: Mahnbrief-Archiv-/Anbieterbeleg-Routen)"
+  "baseline_commit": "e095c73fa148f2a6ce8b8e0b8e9ab7735a8120d0 + HV-20261001-BK-AUTOMATIK + HV-20261019-MAHNKOSTEN + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS (additiv: native Rücklastschrift+Bankentgelt-Route) + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS Teil 3 (additiv: Mahnbrief-Archiv-/Anbieterbeleg-Routen) + HV-20261020-KONTOBLATT-KOSTEN (additiv: Kontoauszug-PDF-Route)"
 }
