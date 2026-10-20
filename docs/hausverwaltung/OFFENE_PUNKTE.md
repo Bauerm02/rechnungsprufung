@@ -1,5 +1,151 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## Ergänzung zur laufenden Aufnahme-Korrektur: Rechtsordnung im selben
+## Review korrigierbar + Eckdaten-Anzeigefehler (Markus, 20.10.2026)
+
+Zwei weitere Punkte zur Endabnahme der laufenden Vertragsaufnahme-Runde:
+
+1. **Rechtsordnung war trotz Warnung nicht im selben Review korrigierbar.**
+   Die vorherige Korrektur (Abschnitt weiter unten) warnte nur, wenn die
+   in Schritt 1 gewählte `Vertrag.rechtsordnung` UNGEKLAERT blieb,
+   obwohl das Dokument eine klare MRG-Einordnung nennt - ein Mensch
+   musste zu Schritt 1 zurück und erneut hochladen, um sie zu
+   korrigieren. `rechtsordnung` ist jetzt ein SICHTBARES, editierbares
+   Auswahlfeld direkt im Review (`review_formular`, neues Fieldset
+   "Rechtsordnung", unmittelbar vor der unverbindlichen Rechtsachsen-
+   Einordnung), gespeist aus `werte["rechtsordnung"]` statt eines reinen
+   Hidden-Durchreichens. KEINE automatische Ableitung ("Nicht Büro=>MRG
+   frei ableiten" bleibt gewahrt) - die Auswahl bleibt eine bewusste
+   menschliche Entscheidung, hier aber ohne Systembruch direkt im selben
+   Vorgang möglich. Verifiziert: Schritt 1 UNGEKLAERT, Dokument belegt
+   Teilanwendung, Mensch wählt im Review OESTERREICH_MRG_TEIL -
+   `Vertrag.rechtsordnung` und die anschließende Rechtsprofil-Anlage
+   sind danach konsistent nutzbar (keine Blockade mehr).
+2. **Review-Eckdaten zeigten bei fehlendem Vertragsende "unbefristet"**
+   (`_eckdaten_block` in `vertragsanlage_form.py`) - derselbe, bereits
+   in der zentralen Vertragsübersicht behobene Fehler war hier noch
+   vorhanden. Zeigt jetzt "kein Enddatum hinterlegt/ungeklärt", solange
+   `Befristungsstatus=UNBEFRISTET` nicht ausdrücklich bestätigt ist.
+
+## Ergänzung zur laufenden Aufnahme-Korrektur: vertraglicher
+## Fälligkeitstag (Markus, 20.10.2026)
+
+Im ursprünglichen Fachkonzept bereits als notwendige Rechengrundlage
+vorgesehen, bisher aber NIE durch den Intake weitergegeben:
+`VertragZeile.faelligkeit_tag` fiel beim Vertragsanlage-Formular IMMER
+auf den Parser-Default 5 zurück, unabhängig von einem tatsächlich
+belegten abweichenden Zahlungstermin - bei einem Gewerbevertrag mit
+"Zahlung bis zum 1./15. des Monats" wäre jede spätere Zinsen-/Mahnlauf-
+Berechnung auf dem falschen Tag gelaufen.
+
+Behoben:
+- Neues PDF-Extraktionsmuster (`pdf_extraktion.py::_MUSTER
+  ["faelligkeit_tag"]`) erkennt "Zahlung/Miete/Mietzins ... bis zum
+  X. des Monats" (inkl. "eines jeden Monats"/"des Monats").
+- Neues, sichtbares Formularfeld im NEU-Review (`vertragsanlage_form.py`,
+  Fieldset "Vertragsdauer") - PDF-Vorschlag bleibt editierbar; ein
+  LEERES Feld zeigt per Platzhaltertext ausdrücklich "technischer
+  Standard 5, NICHT belegt" statt einen stillen, ununterscheidbaren
+  Default vorzutäuschen.
+- `routes/vertragsanlage.py::vertragsanlage_vorschau` validiert (1-28)
+  und reicht den Wert NUR bei tatsächlicher Eingabe an `paket_bau.py`
+  weiter - fehlt er, wird das Feld im Paket schlicht WEGGELASSEN
+  (bestehender Parser-Default 5 bleibt transparent wirksam, kein
+  erfundener Wert im Paket).
+- Nutzt die bereits VORHANDENE `VertragZeile.faelligkeit_tag`/Planner-
+  Konflikthash-Prüfung (`_vertrag_felder`) - keine neue Rechenstrecke,
+  reine Weiterleitung einer bereits bestehenden Fachregel.
+- Löst ausdrücklich KEINEN Zahlungsbeleg/keine OP-Buchung aus (reiner
+  Stammdaten-/technischer Vorschreibungsparameter).
+
+## Abnahme-Folgefix nach zweitem unabhängigen Praxistest von 3e10183
+## (Codex, 20.10.2026) — Netto-nach-Betrag, Doppelanlage, Kaution über
+## Satzgrenzen, fehlende Originalzeilen-Muster, Index-Brücke, Belege
+
+3e10183 wurde NICHT abgenommen. Ein zweiter unabhängiger echter
+PDF-/HTTP-/DB-Praxistest (reale Server-Defaults übernommen, keine
+erfundenen POST-Werte) reproduzierte sechs konkrete Kernfehler - diese
+Korrektur behebt sie:
+
+1. **FINANZFEHLER (Netto NACH dem Betrag)**: "Hauptmietzins EUR 1200,00
+   netto, zuzueglich 20 % USt." wurde als Brutto 1200,00 übernommen
+   (`_netto_muster` kannte nur "netto VOR dem Betrag"). Das Brutto-
+   Muster gewann zusätzlich, weil sein negativer Lookahead ebenfalls nur
+   die Voranstellung ausschloss. Beide Muster sind jetzt richtungs-
+   unabhängig; die Brutto/Netto-Entscheidung fällt ausschließlich in
+   `vorschlaege.py` (Netto-Treffer vorhanden → Brutto-Treffer für
+   dieselbe Komponente wird NICHT übernommen). Exakt gegen die zitierten
+   Originalzeilen verifiziert: HMZ 144000/BK 18000/Parkplatz 9600 Cent
+   (1716,00 EUR gesamt), nicht mehr 1430,00 EUR.
+2. **DOPPELANLAGE**: zwei unabhängige PDF-Upload-Durchläufe für dieselbe
+   Einheit erzeugten zwei Verträge/Debitoren, weil Vertrag-/Debitor-ID
+   bei jedem Versuch frisch generiert werden und die alte "ID existiert
+   bereits"-Prüfung dadurch nie anschlägt. Neue Methode
+   `StammdatenRepository.finde_vertrag_mit_quelle_referenz(einheit_id,
+   quelle_referenz)` erkennt einen Wiederupload über den belegten
+   Dokumenthash (`quelle_referenz`, Version-1-Mietvertragsprofil) + die
+   Einheit und verweist auf die bestehende Akte - KEIN zweiter Vertrag,
+   KEINE Löschung.
+3. **Kaution über Satzgrenzen hinweg**: "Kaution: EUR 3000,00
+   vereinbart. Ein Zahlungsbeleg... liegt NICHT bei. Mahngebühr: EUR
+   20,00..." - das 60-Zeichen-Suchfenster ab "Kaution" erfasste den
+   Mahngebühr-Betrag im NÄCHSTEN Satz als zweite, widersprüchliche
+   Kaution (→ Mehrdeutigkeit, kein Vorschlag). Der Satzpunkt `.` ist in
+   diesem und den übrigen betragsnahen Fenstern (Hauptmietzins/BK/HK/
+   Küche/Parkplatz/Mahngebühr) jetzt explizit ausgeschlossen.
+4. **Fehlende Originalzeilen-Muster**: "Unterzeichnung am" (Substantiv-
+   form), "MRG-Anwendung: Teilanwendung"/"Mietzinsbildung: frei
+   vereinbart" (Label-Doppelpunkt-Wert-Schreibweise statt nur Prosa),
+   "Anpassung NUR IM Jaenner" (Füllwort zwischen Label und Monatsname -
+   vorher erlaubte die Lücke nur Nicht-Wortzeichen) und "Zustell-
+   anschrift: ..." (komplett neues Muster, vorher keine PDF-Quelle für
+   `neuer_debitor_adresse`) werden jetzt erkannt. Zusätzlich entdeckt:
+   `_MONATSNAMEN` kannte nur "jänner"/"märz" mit Umlaut, nicht die vom
+   Regex selbst bereits akzeptierte ASCII-Transliteration "jaenner"/
+   "maerz" - ein korrekt erkannter Monat ging dadurch still verloren.
+   Zusätzlich: eine Warnung erscheint, wenn die Rechtsordnung aus
+   Schritt 1 UNGEKLAERT bleibt, obwohl das Dokument eine MRG-Einordnung
+   nennt (macht den Widerspruch sichtbar, leitet NICHTS automatisch ab -
+   "Nicht Büro=>MRG frei ableiten" bleibt gewahrt).
+5. **Index-Brücke für NEU nicht nutzbar**: bei künftigem Mietbeginn
+   zeigte `list_aktive_komponenten(vertrag_id, heute())` in der
+   Indexklausel-Form keine einzige Komponente (Stichtag-Filter), UND
+   jede neu angelegte Komponente bekam `indexierbar=False` ohne jede
+   Auswahlmöglichkeit im Review. Neue Repository-Methode
+   `list_komponenten_fuer_vertrag` (ALLE, auch künftige Komponenten,
+   genutzt von GET UND POST der Indexklausel-Form) sowie ein neues
+   "laut Vertrag wertgesichert/indexierbar"-Häkchen je Mietbestandteil
+   im Review (Default unangehakt, sicherer Altzustand) - jetzt bis in
+   die gespeicherte `VertragsKomponenteTable`-Zeile durchgereicht
+   (`paket_bau.py`). Ein Mensch markiert ausdrücklich NUR die laut
+   Klausel tatsächlich betroffene(n) Komponente(n).
+6. **Quellenbelege/Termine gingen verloren**: `FeldTreffer` liefert
+   Seite+Textauszug für jeden Fund, aber nur der reine Wert wurde
+   übernommen. Jetzt werden Seite+Auszug zusätzlich in die tatsächlich
+   vorhandenen `*_quellenbeleg`-Felder (Kaution/Mahngebühr/
+   Unterzeichnungsdatum/Befristungsstatus/MRG-Achse/Mietzinsbildung-
+   Achse/BK-HK-Abrechnungsart) sowie in `index_klauseltext_auszug`/
+   `_seite` und `verzugszins_klauseltext_auszug`/`_seite` übernommen.
+   Zusätzlich befüllt die Zinsprofil-Form jetzt `gueltig_ab` aus dem
+   tatsächlichen Vertragsbeginn (`Vertrag.gueltig_von`) - getrennt vom
+   bereits vorbefüllten Unterschriftsdatum.
+
+### Verbleibende, ehrlich offene Punkte auch nach dieser Korrektur
+
+- Die Regex-Muster bleiben bewusst einfache Heuristiken - sie decken
+  jetzt beide zitierten Praxistest-Runden ab, aber keine vollständige
+  Vertragssemantik. Eine DRITTE, wieder anders formulierte Praxisprüfung
+  kann erneut unerkannte Formulierungen finden; das Review bleibt in
+  JEDEM Fall Pflicht.
+- Die Rechtsordnung-Konsistenzprüfung ist eine reine WARNUNG, kein
+  Block - ein Mensch kann sie weiterhin übergehen und mit UNGEKLAERT
+  fortfahren (das ist beabsichtigt, keine zusätzliche Sperre ohne
+  gesonderten Auftrag).
+- Das Indexierbar-Häkchen gilt nur für NEU angelegte Komponenten über
+  die Vertragsanlage - eine bestehende, bereits VOR dieser Korrektur
+  angelegte Komponente bleibt `indexierbar=False`, bis sie über einen
+  separaten, hier NICHT gebauten Pflegeweg geändert wird.
+
 ## Abnahme-Folgefix nach unabhängiger Nachprüfung von dc4fa7e (Codex,
 ## 20.10.2026) — echter PDF-zuerst-Weg, Netto/USt/Brutto, Mitmieter
 ## atomar, Index-/Zinsprofil-Vorbefüllung, neue Auslesefelder

@@ -30,6 +30,12 @@ def zinsprofil_formular(vertrag, profile, csrf, mietprofil=None):
     vorbefuellt_vertragsdatum = (
         mietprofil.unterzeichnungsdatum.isoformat() if mietprofil and mietprofil.unterzeichnungsdatum else ""
     )
+    # Abnahme-Folgefix (Codex, zweiter Praxistest, "Zinsprofil gueltig_ab
+    # bleibt leer trotz neuem Mietbeginn"): "gültig ab" (Wirksamkeit
+    # DIESER Zinsprofil-Version) ist GETRENNT vom Unterschriftsdatum
+    # (oben) - der sinnvolle Standardwert dafür ist der tatsächliche
+    # Vertragsbeginn (`Vertrag.gueltig_von`), nicht das Unterschriftsdatum.
+    vorbefuellt_gueltig_ab = vertrag.gueltig_von.isoformat() if getattr(vertrag, "gueltig_von", None) else ""
     vorbefuellt_zinssatz = ""
     if mietprofil and mietprofil.verzugszins_art == "VERTRAGLICH_VEREINBART" and mietprofil.verzugszins_satz_prozent is not None:
         vorbefuellt_zinssatz = h(str(mietprofil.verzugszins_satz_prozent))
@@ -97,7 +103,7 @@ def zinsprofil_formular(vertrag, profile, csrf, mietprofil=None):
         <label>Vertragsdatum (für §456/§458 UGB-Stichtag 16.03.2013 nötig)</label>
         <input type="date" name="vertragsdatum" value="{vorbefuellt_vertragsdatum}">
         <label>Gültig ab (Wirksamkeitsdatum DIESER Version, belegt)</label>
-        <input type="date" name="gueltig_ab">
+        <input type="date" name="gueltig_ab" value="{vorbefuellt_gueltig_ab}">
         <p class="muted">Nötig, sobald für diesen Vertrag mehrmals ein geprüftes Profil angelegt wird - fehlt es bei
            auch nur einer geprüften Version, bleibt die Verzinsung für den GESAMTEN Zeitraum "unberechenbar" statt
            rückwirkend die zuletzt geprüfte Version zu unterstellen.</p>

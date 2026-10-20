@@ -113,8 +113,22 @@ _BETRAG_FRAGMENT = (
 # gezählt. Beide Muster sind bewusst einfache, dokumentierte Heuristiken
 # (siehe Moduldoc) - jeder Treffer bleibt ein bloßer Vorschlag mit
 # Seitenbeleg, nie eine ungeprüfte Übernahme.
+#
+# **Korrektur nach unabhängiger Abnahme (Codex, zweiter Praxistest):**
+# "netto" steht in der Praxis GENAUSO oft NACH dem Betrag ("Hauptmietzins
+# EUR 1200,00 netto, zuzüglich ...") wie davor ("Hauptmietzins (netto):
+# ...") - die vorherige Fassung erkannte NUR die Voranstellung, ein
+# nachgestelltes "netto" blieb unentdeckt UND wurde zusätzlich vom
+# Brutto-Muster (das versuchte, genau diesen Fall per negativem Lookahead
+# auszuschließen, aber nur die Voranstellung kannte) fälschlich als
+# Brutto übernommen. Die Brutto-Ausschlussprüfung läuft deshalb jetzt NICHT
+# mehr per Lookahead in der Regex selbst, sondern in `vorschlaege.py`
+# (Brutto wird NUR übernommen, wenn für dieselbe Komponente KEIN
+# Netto-Treffer vorliegt - siehe dort).
 def _netto_muster(label: str) -> re.Pattern[str]:
-    return re.compile(label + r"[^\d€]{0,10}\(?netto\)?:?[^\d€]{0,20}" + _BETRAG_FRAGMENT, re.IGNORECASE)
+    netto_vor = label + r"[^\d€]{0,10}\(?netto\)?:?[^\d€.]{0,20}" + _BETRAG_FRAGMENT
+    netto_nach = label + r"[^\d€.]{0,40}" + _BETRAG_FRAGMENT + r"\s*,?\s*netto\b"
+    return re.compile(f"(?:{netto_vor})|(?:{netto_nach})", re.IGNORECASE)
 
 
 def _ust_muster(label: str) -> re.Pattern[str]:
@@ -130,7 +144,15 @@ def _ust_muster(label: str) -> re.Pattern[str]:
 # relevanten Wert über `_erste_gruppe`; ein Muster ohne Klammergruppe
 # dient nur als Ja/Nein-Indikator (z. B. Nutzungsart-Hinweise).
 _MUSTER: dict[str, re.Pattern[str]] = {
-    "kaution_cent": re.compile(r"Kaution[^\d€]{0,60}" + _BETRAG_FRAGMENT, re.IGNORECASE),
+    # Korrektur nach unabhängiger Abnahme (Codex, zweiter Praxistest):
+    # "Kaution[^\d€]{0,60}" konnte über einen Satzpunkt HINWEG bis in
+    # einen völlig unrelated Folgesatz greifen (z. B. "... die Kaution
+    # liegt NICHT bei. Mahngebühr: EUR 20,00 ..." - das "20,00" wurde
+    # fälschlich als ZWEITER, widersprüchlicher Kautionsbetrag gewertet
+    # und die gesamte Kaution landete dadurch als Mehrdeutigkeit OHNE
+    # Vorschlag). Der Satzpunkt `.` ist jetzt explizit AUSGESCHLOSSEN -
+    # der Betrag muss im SELBEN Satz wie das Wort "Kaution" stehen.
+    "kaution_cent": re.compile(r"Kaution[^\d€.]{0,60}" + _BETRAG_FRAGMENT, re.IGNORECASE),
     # Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026): "Nettomiete"
     # wurde bisher in DENSELBEN Extraktionsschlüssel wie "Hauptmietzins"/
     # "Miete monatlich" gemischt - `hauptmietzins_cent` ist im System aber
@@ -143,22 +165,23 @@ _MUSTER: dict[str, re.Pattern[str]] = {
     # EIGENEN Extraktionsschlüssel `nettomiete_cent`, der NICHT auf
     # `hauptmietzins_cent` gemappt wird (siehe `vorschlaege.py`).
     #
-    # **Weitere Korrektur (Abnahme-Folgefix, Netto/USt/Brutto je
-    # Mietkomponente):** derselbe Grund gilt für ein unmittelbar dem
-    # Label nachgestelltes "netto" ("Hauptmietzins (netto): ...") - ohne
-    # den negativen Lookahead `(?!\s*\(?netto\)?)` würde so ein Treffer
-    # ZUSÄTZLICH zum eigenen `hauptmietzins_netto_cent`-Treffer (siehe
-    # unten) auch das Brutto-Feld `komponente_hmz` füllen und dort fälschlich
-    # als "maßgebliches Brutto" GEWINNEN (siehe `komponenten_werte_aus_form`-
-    # Docstring: "ein angegebenes Brutto bleibt immer maßgeblich").
+    # **Weitere Korrektur (Abnahme-Folgefix, zweiter Praxistest):** die
+    # Brutto-Ausschlussprüfung über einen negativen Lookahead erkannte NUR
+    # ein VORANGESTELLTES "netto" - ein NACHGESTELLTES "netto" (siehe
+    # `_netto_muster`-Korrektur oben) griff weiterhin zusätzlich hier als
+    # vermeintliches Brutto. Diese Muster bleiben deshalb jetzt bewusst
+    # EINFACHE Betragserkennung OHNE Lookahead; die Brutto/Netto-
+    # Entscheidung fällt ausschließlich in `vorschlaege.py` (Netto-Treffer
+    # vorhanden -> Brutto-Treffer für dieselbe Komponente wird NICHT
+    # übernommen, siehe dort).
     "hauptmietzins_cent": re.compile(
-        r"(?:Hauptmietzins|Miete monatlich)(?!\s*\(?netto\)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE,
+        r"(?:Hauptmietzins|Miete monatlich)[^\d€.]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE,
     ),
-    "nettomiete_cent": re.compile(r"Nettomiete[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
-    "betriebskosten_cent": re.compile(r"Betriebskosten(?!\s*\(?netto\)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
-    "heizkosten_cent": re.compile(r"Heizkosten(?!\s*\(?netto\)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
-    "kueche_cent": re.compile(r"K(?:ü|ue)che(?!\s*\(?netto\)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
-    "parkplatz_cent": re.compile(r"Parkplatz(?!\s*\(?netto\)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
+    "nettomiete_cent": re.compile(r"Nettomiete[^\d€.]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
+    "betriebskosten_cent": re.compile(r"Betriebskosten[^\d€.]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
+    "heizkosten_cent": re.compile(r"Heizkosten[^\d€.]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
+    "kueche_cent": re.compile(r"K(?:ü|ue)che[^\d€.]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
+    "parkplatz_cent": re.compile(r"Parkplatz[^\d€.]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
     # Netto + USt-Satz je Mietkomponente (siehe `_netto_muster`/`_ust_muster`
     # oben) - gemischte Steuersätze je Komponente möglich.
     "hauptmietzins_netto_cent": _netto_muster(r"Hauptmietzins"),
@@ -175,7 +198,7 @@ _MUSTER: dict[str, re.Pattern[str]] = {
     # (mit und ohne Plural-"en") war bisher kein erkanntes Synonym -
     # Verträge verwenden beide Begriffe für dieselbe Fachregel.
     "mahngebuehr_cent": re.compile(
-        r"(?:Mahnspesen?|Mahngeb(?:ü|ue)hr(?:en)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE,
+        r"(?:Mahnspesen?|Mahngeb(?:ü|ue)hr(?:en)?)[^\d€.]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE,
     ),
     "mahngebuehr_keine": re.compile(r"(keine Mahnspesen|keine Mahngeb(?:ü|ue)hr(?:en)?)", re.IGNORECASE),
     "mieter_name": re.compile(r"(?<!Mit)Mieter\s*:?\s*\n?\s*([A-ZÄÖÜ][\wÄÖÜäöüß .,-]{2,70})", re.MULTILINE),
@@ -220,6 +243,20 @@ _MUSTER: dict[str, re.Pattern[str]] = {
         r"(?:Mietende|befristet bis|Ende des Mietverh(?:ä|ae)ltnisses)[^\d]{0,20}(\d{1,2}\.\d{1,2}\.\d{4})",
         re.IGNORECASE,
     ),
+    # Abnahme-Folgefix (Codex, "vertraglicher Fälligkeitstag"): bisher
+    # fiel `VertragZeile.faelligkeit_tag` beim Intake IMMER auf den
+    # Default 5 zurück, unabhängig von einer tatsächlich belegten
+    # abweichenden Fälligkeit ("Zahlung ... bis zum 1./15. des
+    # Monats") - für Zinsen-/Mahnlauf-Berechnung ist das bei einem
+    # Gewerbevertrag mit abweichendem Zahlungstermin FALSCH. Erkennt
+    # gängige Formulierungen ("Zahlung monatlich im Voraus bis zum
+    # 5. des Monats"/"bis zum 1. eines jeden Monats") - bewusst
+    # EINFACHE Heuristik wie alle übrigen Muster hier; bleibt ein
+    # Vorschlag, der im Review geprüft/korrigiert wird.
+    "faelligkeit_tag": re.compile(
+        r"(?:Zahlung|Miete|Mietzins)[^\d.]{0,60}bis zum\s*([0-9]{1,2})\.?[^\d\n]{0,25}?Monats",
+        re.IGNORECASE,
+    ),
     "index_reihe": re.compile(r"(Verbraucherpreisindex\s*\d{4}|VPI\s*\d{4})", re.IGNORECASE),
     "index_schwelle_prozent": re.compile(
         r"(?:um mehr als|übersteigt um|Schwankung von|Schwankung mehr als)\s*([0-9]{1,2}(?:,[0-9]{1,2})?)\s*(?:%|Prozent)",
@@ -240,9 +277,16 @@ _MUSTER: dict[str, re.Pattern[str]] = {
     # Abnahme-Folgefix (Codex): "Anpassung im Jänner"/"Mindestintervall 12
     # Monate" bisher nicht extrahiert - Monatsname wird in `vorschlaege.py`
     # über die bereits bestehende `_MONATSNAMEN`-Tabelle in 1-12 übersetzt.
+    #
+    # **Korrektur nach unabhängiger Abnahme (Codex, zweiter Praxistest):**
+    # "Anpassung NUR IM Jaenner" wurde nicht erkannt - die vorherige
+    # Lücke `[^\wÄÖÜäöüß]{0,20}` erlaubte NUR Nicht-Wortzeichen
+    # (Leerzeichen/Doppelpunkt) zwischen "Anpassung" und dem Monatsnamen,
+    # aber KEIN dazwischenliegendes Füllwort wie "nur". `[^\n]{0,30}?`
+    # (lazy, zeilenbegrenzt) erlaubt jetzt beliebige kurze Zwischentexte.
     "index_anpassungsmonat_name": re.compile(
-        r"Anpassung(?:smonat)?[^\wÄÖÜäöüß]{0,20}(?:erfolgt\s+)?(?:jeweils\s+)?(?:im\s+)?"
-        r"(J(?:ä|ae)nner|Januar|Februar|M(?:ä|ae)rz|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember)",
+        r"Anpassung(?:smonat)?[^\n]{0,30}?\b"
+        r"(J(?:ä|ae)nner|Januar|Februar|M(?:ä|ae)rz|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember)\b",
         re.IGNORECASE,
     ),
     "index_mindestintervall_monate": re.compile(
@@ -267,34 +311,61 @@ _MUSTER: dict[str, re.Pattern[str]] = {
     # Rechtsachse MRG-Anwendungsbereich (Voll/Teil/Ausnahme) - DREI
     # GETRENNTE Hinweismuster wie bei `nutzungsart_*`/`befristet_hinweis`
     # oben; `vorschlaege.py` setzt das Feld NUR bei GENAU EINEM Treffer.
+    #
+    # **Korrektur nach unabhängiger Abnahme (Codex, zweiter Praxistest):**
+    # "MRG-Anwendung: Teilanwendung" (Label-Doppelpunkt-Wert-Schreibweise)
+    # wurde bisher NICHT erkannt - nur zusammenhängende Prosa-Varianten
+    # wie "MRG-Teilanwendung"/"Teilanwendung des MRG". Der optionale
+    # Zwischenteil `(?:Anwendung\s*:?\s*)?` deckt jetzt BEIDE Varianten ab.
     "mrg_vollanwendung_hinweis": re.compile(
-        r"(MRG[- ]?Vollanwendung|Vollanwendung des MRG|volle[rn]? Anwendungsbereich des MRG)", re.IGNORECASE,
+        r"(MRG[- ]?(?:Anwendung\s*:?\s*)?Vollanwendung|Vollanwendung des MRG|volle[rn]? Anwendungsbereich des MRG)",
+        re.IGNORECASE,
     ),
     "mrg_teilanwendung_hinweis": re.compile(
-        r"(MRG[- ]?Teilanwendung|Teilanwendung des MRG|teilweise[rn]? Anwendungsbereich des MRG)", re.IGNORECASE,
+        r"(MRG[- ]?(?:Anwendung\s*:?\s*)?Teilanwendung|Teilanwendung des MRG|teilweise[rn]? Anwendungsbereich des MRG)",
+        re.IGNORECASE,
     ),
     "mrg_ausnahme_hinweis": re.compile(
-        r"(MRG[- ]?(?:Voll-?)?Ausnahme|Ausnahme vom MRG|MRG findet keine Anwendung)", re.IGNORECASE,
+        r"(MRG[- ]?(?:Anwendung\s*:?\s*)?(?:Voll-?)?Ausnahme|Ausnahme vom MRG|MRG findet keine Anwendung)",
+        re.IGNORECASE,
     ),
     # Rechtsachse Mietzinsbildung (frei/Richtwert/Kategorie) - ebenfalls
     # DREI GETRENNTE Hinweismuster, unabhängig von der MRG-Achse oben.
+    # Gleiche Korrektur: "Mietzinsbildung: frei vereinbart" (Label-Wert-
+    # Schreibweise) jetzt zusätzlich zu den Prosa-Varianten erkannt.
     "mietzinsbildung_frei_hinweis": re.compile(
-        r"(freie[r]? Mietzinsbildung|frei vereinbarte[rn]? Mietzins|Mietzins (?:wird |ist )?frei vereinbart)",
+        r"(Mietzinsbildung\s*:?\s*frei(?:\s+vereinbart)?|freie[r]? Mietzinsbildung|"
+        r"frei vereinbarte[rn]? Mietzins|Mietzins (?:wird |ist )?frei vereinbart)",
         re.IGNORECASE,
     ),
     "mietzinsbildung_richtwert_hinweis": re.compile(
-        r"(Richtwertmietzins|Richtwert-?system|nach dem Richtwert(?:system)?)", re.IGNORECASE,
+        r"(Mietzinsbildung\s*:?\s*Richtwert|Richtwertmietzins|Richtwert-?system|nach dem Richtwert(?:system)?)",
+        re.IGNORECASE,
     ),
     "mietzinsbildung_kategorie_hinweis": re.compile(
-        r"(Kategoriemietzins|Kategorie-?system|nach der Kategorie(?:system)?)", re.IGNORECASE,
+        r"(Mietzinsbildung\s*:?\s*Kategorie|Kategoriemietzins|Kategorie-?system|nach der Kategorie(?:system)?)",
+        re.IGNORECASE,
+    ),
+    # Abnahme-Folgefix (Codex, zweiter Praxistest): "Zustellanschrift:
+    # Musterweg 7, Top 8, 1000 Musterort" wurde bisher GAR NICHT
+    # extrahiert - `neuer_debitor_adresse` hatte keine PDF-Quelle. Der
+    # Rest der Zeile (bis zum Zeilenende) wird als Rohvorschlag
+    # übernommen - bleibt wie jeder andere Fund vollständig editierbar.
+    "mieter_adresse": re.compile(
+        r"(?:Zustellanschrift|Anschrift (?:des )?Mieters?|Adresse (?:des )?Mieters?)\s*:?\s*([^\n]{3,120})",
+        re.IGNORECASE,
     ),
     "nutzungsart_wohnung": re.compile(r"(Wohnungsmietvertrag|zu Wohnzwecken)", re.IGNORECASE),
     "nutzungsart_geschaeft": re.compile(r"(Gesch(?:ä|ae)ftsraummietvertrag|Gesch(?:ä|ae)ftslokal)", re.IGNORECASE),
     "nutzungsart_buero": re.compile(r"(B(?:ü|ue)romietvertrag|als B(?:ü|ue)ro vermietet)", re.IGNORECASE),
     # Auftrag HV-20261020-VERTRAGSDATENBASIS - Termine GETRENNT von
     # Mietbeginn/-ende (siehe `vorschlaege.py`):
+    # Abnahme-Folgefix (Codex, zweiter Praxistest): "Unterzeichnung am
+    # 01.06.2026" (Substantiv statt Verbform) wurde bisher NICHT erkannt -
+    # nur "unterzeichnet am"/"unterschrieben am"/"Datum der
+    # Unterzeichnung" waren als Auslöser hinterlegt.
     "unterzeichnungsdatum": re.compile(
-        r"(?:unterzeichnet am|unterschrieben am|Datum der Unterzeichnung)[^\d]{0,20}(\d{1,2}\.\d{1,2}\.\d{4})",
+        r"(?:unterzeichnet am|unterschrieben am|Datum der Unterzeichnung|Unterzeichnung am)[^\d]{0,20}(\d{1,2}\.\d{1,2}\.\d{4})",
         re.IGNORECASE,
     ),
     "uebergabe_am": re.compile(

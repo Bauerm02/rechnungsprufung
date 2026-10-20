@@ -16,7 +16,6 @@ from mietinkasso.auth.service import require_gesellschaft_access
 from mietinkasso.backoffice.indexklausel_form import klausel_form_werte, klausel_formular
 from mietinkasso.backoffice.views import csrf_feld, eur, option, parse_eur_betrag
 from mietinkasso.domain.exceptions import MietinkassoError
-from mietinkasso.indexautomatik.zeit import heute_wien
 from mietinkasso.infrastructure.db.tables import IndexKlauselTable
 
 from mietinkasso.backoffice import dependencies as deps
@@ -81,7 +80,11 @@ def indexklauseln_uebersicht(request: Request, vertrag_id: str, session=Depends(
     if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
         return _fehlerseite(session, "Indexklauseln", "Vertrag nicht verfügbar.")
     require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
-    komponenten = deps._stammdaten_repo.list_aktive_komponenten(vertrag_id, heute_wien())
+    # Abnahme-Folgefix (Codex, zweiter Praxistest): ALLE Komponenten des
+    # Vertrags anzeigen, auch ZUKÜNFTIG erst gültige - `list_aktive_
+    # komponenten(vertrag_id, heute())` zeigte bei künftigem Mietbeginn
+    # sonst gar keine wählbare Komponente (siehe Repository-Docstring).
+    komponenten = deps._stammdaten_repo.list_komponenten_fuer_vertrag(vertrag_id)
     with deps._session_factory() as db:
         klauseln = list(db.execute(select(IndexKlauselTable).where(IndexKlauselTable.vertrag_id == vertrag_id)
                                   .order_by(IndexKlauselTable.version.desc())).scalars())
@@ -98,7 +101,10 @@ async def indexklausel_erstellen(request: Request, vertrag_id: str, session=Depe
     if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
         return _fehlerseite(session, "Indexklauseln", "Vertrag nicht verfügbar.")
     try:
-        werte = klausel_form_werte(form, vertrag, deps._stammdaten_repo.list_aktive_komponenten(vertrag_id, heute_wien()))
+        # Abnahme-Folgefix: dieselbe erweiterte Komponentenliste wie im
+        # GET (siehe dort) - sonst würde eine im Formular angebotene,
+        # künftig gültige Komponente hier als "nicht erlaubt" abgelehnt.
+        werte = klausel_form_werte(form, vertrag, deps._stammdaten_repo.list_komponenten_fuer_vertrag(vertrag_id))
         klausel = deps._indexautomatik.index_service.klausel_anlegen(ctx=_ctx(session), **werte)
         deps._audit_service.log(entity_typ="index_klausel", entity_id=str(klausel.id), aktion="ENTWURF_ERFASST",
                            akteur=session.user_id, payload={"vertrag_id": vertrag_id, "version": klausel.version})

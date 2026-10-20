@@ -526,6 +526,11 @@ async def vertragsanlage_pdf_hochladen(
         # Vorschlag für `gueltig_von` einsetzen (siehe weiter unten).
         basis_werte["gueltig_von"] = kontext["gueltig_von"] or ""
         basis_werte["gueltig_bis"] = kontext["gueltig_bis"] or ""
+        # Abnahme-Folgefix (Codex, Endabnahme-Rückmeldung): die
+        # VERBINDLICHE Rechtsordnung ist jetzt ebenfalls ein sichtbares,
+        # editierbares Review-Feld (siehe `review_formular`) statt eines
+        # reinen Hidden-Durchreichens aus Schritt 1.
+        basis_werte["rechtsordnung"] = kontext["rechtsordnung"]
         basis_werte.update(komponenten_roh_felder)
         basis_werte.update(mitmieter_roh_felder)
         if kontext["neuer_debitor"] is not None:
@@ -581,9 +586,33 @@ async def vertragsanlage_pdf_hochladen(
         quelle_typ = "PDF_EXTRAKTION"
         quelle_referenz = f"pdf-sha256:{dokument.ablage_id}"
 
+        # Abnahme-Folgefix (Codex, zweiter Praxistest, "DOPPELANLAGE"):
+        # Vertrag-ID/neue Debitor-ID werden beim PDF-zuerst-Weg intern
+        # generiert (siehe `neu_kontext_werte`) - zwei unabhängige
+        # Upload-Versuche DESSELBEN Dokuments für dieselbe Einheit
+        # erzeugen dadurch bisher ZWEI frische IDs und damit zwei
+        # Verträge/Debitoren für ein und dasselbe Mietverhältnis, weil
+        # die bestehende "Vertrag-ID existiert bereits"-Prüfung nie
+        # anschlägt. Ein belegter Wiederupload (gleicher Dokumenthash +
+        # gleiche Einheit) wird deshalb HIER erkannt und auf die
+        # bestehende Akte verwiesen - KEINE zweite abrechenbare
+        # Verpflichtung, KEINE Löschung historischer Daten.
+        if ist_neu:
+            bestehender_vertrag = deps._stammdaten_repo.finde_vertrag_mit_quelle_referenz(
+                einheit_id=kontext["einheit_id"], quelle_referenz=quelle_referenz,
+            )
+            if bestehender_vertrag is not None:
+                return _fehlerseite(
+                    session, "Neuer Mietvertrag",
+                    f"Dieses Dokument wurde für diese Einheit bereits verwendet - Vertrag "
+                    f"'{bestehender_vertrag.id}' ist bereits daraus angelegt. Es wird KEIN zweiter Vertrag "
+                    "erzeugt; bitte die bestehende Akte prüfen/bearbeiten statt erneut hochzuladen.",
+                    f"/backoffice/vertrag/{bestehender_vertrag.id}",
+                )
+
     werte = dict(basis_werte)
     _REINE_HINWEISE = (
-        "mieter_name_hinweis", "mieter_email_hinweis", "mieter_telefon_hinweis",
+        "mieter_name_hinweis", "mieter_email_hinweis", "mieter_telefon_hinweis", "mieter_adresse_hinweis",
         "vermieter_name_hinweis", "mitmieter_name_hinweis", "mitmieter_telefon_hinweis", "mitmieter_email_hinweis",
     )
     for feld, vorschlag in vorschlaege.items():
@@ -591,6 +620,49 @@ async def vertragsanlage_pdf_hochladen(
             continue  # reine Hinweise, kein Mietvertragsprofil-Feld (siehe Sonderbehandlung unten/Eckdaten-Block)
         if not werte.get(feld):
             werte[feld] = vorschlag.formularwert
+
+    # Abnahme-Folgefix (Codex, zweiter Praxistest, "Quellenbelege/Termine
+    # weiterreichen"): JEDER `FeldTreffer` trägt bereits Seite+Textauszug
+    # (`Vorschlag.seite`/`.auszug`), aber nur der reine WERT wurde bisher
+    # ins Review übernommen - der Beleg selbst ging verloren, obwohl die
+    # meisten betroffenen Felder ein eigenes, im Formular tatsächlich
+    # gerendertes `*_quellenbeleg`-Pendant haben. Nur Felder aus dieser
+    # festen Allowlist werden befüllt (ein beliebiger Tippfehler soll
+    # keinen toten Formularschlüssel erzeugen).
+    _QUELLENBELEG_FELDER = (
+        "vertragliche_kaution_cent", "mahngebuehr_cent", "unterzeichnungsdatum", "befristungsstatus",
+        "rechtsachse_mrg_anwendungsbereich", "rechtsachse_mietzinsbildung", "bk_hk_abrechnungsart",
+    )
+    for feld in _QUELLENBELEG_FELDER:
+        vorschlag = vorschlaege.get(feld)
+        beleg_feld = f"{feld}_quellenbeleg"
+        if vorschlag is not None and not werte.get(beleg_feld):
+            werte[beleg_feld] = f"Seite {vorschlag.seite}: {vorschlag.auszug}"
+
+    # Index-/Verzugszins-Klauseltext+Seite sind je EIN gemeinsames
+    # Feldpaar für die GESAMTE Klausel (nicht je Einzelwert) - befüllt
+    # aus dem jeweils aussagekräftigsten vorliegenden Einzeltreffer.
+    if not werte.get("index_klauseltext_auszug"):
+        for quellfeld in ("index_schwelle_prozent", "index_urspruenglicher_basiswert", "index_urspruenglicher_basismonat"):
+            vorschlag = vorschlaege.get(quellfeld)
+            if vorschlag is not None:
+                werte["index_klauseltext_auszug"] = vorschlag.auszug
+                werte["index_klauseltext_seite"] = str(vorschlag.seite)
+                break
+    if not werte.get("verzugszins_klauseltext_auszug") and "verzugszins_satz_prozent" in vorschlaege:
+        vorschlag = vorschlaege["verzugszins_satz_prozent"]
+        werte["verzugszins_klauseltext_auszug"] = vorschlag.auszug
+        werte["verzugszins_klauseltext_seite"] = str(vorschlag.seite)
+
+    # Abnahme-Folgefix (Codex, zweiter Praxistest, "Zinsprofil gueltig_ab
+    # bleibt leer trotz neuem Mietbeginn"): die Zinsprofil-Form braucht
+    # ein eigenes, vom Unterschriftsdatum GETRENNTES "gültig ab"
+    # (Wirksamkeit DIESER Zinsprofil-Version) - sinnvoller Standardwert
+    # dafür ist der tatsächliche Mietbeginn, NICHT das Unterschriftsdatum
+    # (das bleibt eigens als `unterzeichnungsdatum` erhalten). Wird hier
+    # NICHT ins Mietvertragsprofil-Formular geschrieben (das kennt dieses
+    # Feld nicht), sondern bei der Zinsprofil-Anlage selbst vorbefüllt -
+    # siehe `zinsprofil_form.py`/`routes/zinsprofile.py`.
 
     # Abnahme-Folgefix (Codex 20.10.2026): "Name bleibt Hinweis" -
     # richtige Mieterkontakte müssen tatsächlich editierbar geprüft
@@ -610,6 +682,8 @@ async def vertragsanlage_pdf_hochladen(
             werte["neuer_debitor_email"] = vorschlaege["mieter_email_hinweis"].formularwert
         if not werte.get("neuer_debitor_telefon") and "mieter_telefon_hinweis" in vorschlaege:
             werte["neuer_debitor_telefon"] = vorschlaege["mieter_telefon_hinweis"].formularwert
+        if not werte.get("neuer_debitor_adresse") and "mieter_adresse_hinweis" in vorschlaege:
+            werte["neuer_debitor_adresse"] = vorschlaege["mieter_adresse_hinweis"].formularwert
 
     if ist_neu:
         # Abnahme-Folgefix (Codex, "echter PDF-zuerst-Weg"): ein im
@@ -631,6 +705,25 @@ async def vertragsanlage_pdf_hochladen(
         if not werte.get("mitmieter_telefon") and "mitmieter_telefon_hinweis" in vorschlaege:
             werte["mitmieter_telefon"] = vorschlaege["mitmieter_telefon_hinweis"].formularwert
 
+        # Abnahme-Folgefix (Codex, zweiter Praxistest): die Rechtsordnung
+        # (Schritt 1, VOR dem PDF gewählt) entscheidet, ob das später
+        # erstellbare Rechtsprofil/die Indexautomatik überhaupt rechnen
+        # KANN - bleibt sie UNGEKLAERT, obwohl das Dokument eine klare
+        # MRG-Einordnung nennt, bleibt die gesamte Berechnung blockiert,
+        # ohne dass das im Review auffällt. Dies leitet die Rechtsordnung
+        # NICHT automatisch ab (Auftrag: "Nicht Büro=>MRG frei ableiten")
+        # - es macht den Widerspruch nur sichtbar, damit ein Mensch ihn
+        # bewusst auflöst (zurück zu Schritt 1, richtige Rechtsordnung
+        # wählen).
+        if kontext["rechtsordnung"] == "UNGEKLAERT" and "rechtsachse_mrg_anwendungsbereich" in vorschlaege:
+            warnungen = (
+                *warnungen,
+                "Das Dokument nennt eine MRG-Einordnung "
+                f"({vorschlaege['rechtsachse_mrg_anwendungsbereich'].formularwert}), die Rechtsordnung aus "
+                "Schritt 1 ist aber weiterhin UNGEKLAERT - ohne eine passende Rechtsordnung bleibt jede "
+                "Rechtsprofil-/Indexberechnung blockiert. Bitte in Schritt 1 die zutreffende Rechtsordnung wählen.",
+            )
+
     kontext_hidden = {"modus": modus, "vertrag_id": vertrag_id, "quelle_typ": quelle_typ}
     if quelle_referenz:
         kontext_hidden["quelle_referenz"] = quelle_referenz
@@ -638,7 +731,10 @@ async def vertragsanlage_pdf_hochladen(
     if ist_neu:
         kontext_hidden.update({
             "einheit_id": kontext["einheit_id"], "debitor_id": kontext["debitor_id"],
-            "gesellschaft_id": kontext["gesellschaft_id"], "rechtsordnung": kontext["rechtsordnung"],
+            "gesellschaft_id": kontext["gesellschaft_id"],
+            # "rechtsordnung" ist KEIN Hidden-Feld mehr - siehe
+            # `review_formular`s neues, sichtbares/editierbares
+            # Rechtsordnung-Auswahlfeld (gespeist aus `werte`).
         })
         if kontext["neuer_debitor"] is not None:
             # Abnahme-Folgefix (Codex 20.10.2026): Name/E-Mail/Telefon
@@ -655,7 +751,7 @@ async def vertragsanlage_pdf_hochladen(
         eckdaten = {
             "vertrag_id": vertrag_id, "objekt_einheit_label": _vertragsanlage_einheit_label(objekt, einheit),
             "mieter_anzeige": mieter_anzeige, "gesellschaft_name": gesellschaft_obj.name if gesellschaft_obj else kontext["gesellschaft_id"],
-            "rechtsordnung": kontext["rechtsordnung"],
+            "rechtsordnung": werte.get("rechtsordnung") or kontext["rechtsordnung"],
             # Abnahme-Folgefix: zeigt den ggf. aus dem PDF vorbefüllten
             # Stand aus `werte`, NICHT mehr den in Schritt 1 (ABSICHTLICH
             # optional) eingegebenen Rohwert aus `kontext` - der
@@ -697,6 +793,21 @@ async def vertragsanlage_vorschau(request: Request, session=Depends(_current_ses
             "gesellschaft_id": str(form.get("gesellschaft_id", "")), "rechtsordnung": str(form.get("rechtsordnung", "")),
             "gueltig_von": str(form.get("gueltig_von", "")), "gueltig_bis": str(form.get("gueltig_bis", "")) or None,
         }
+        # Abnahme-Folgefix (Codex, "vertraglicher Fälligkeitstag"): ein
+        # belegter abweichender Zahlungstermin (z. B. Gewerbevertrag "bis
+        # zum 1./15. des Monats") darf NICHT stillschweigend auf den
+        # technischen Default 5 zurückfallen - ein leeres Feld bleibt
+        # dennoch ausdrücklich der technische Standard, KEIN erfundener
+        # Beleg (siehe Formular-Hinweistext).
+        faelligkeit_tag_roh = str(form.get("faelligkeit_tag", "")).strip()
+        if faelligkeit_tag_roh:
+            try:
+                faelligkeit_tag = int(faelligkeit_tag_roh)
+            except ValueError:
+                return _fehlerseite(session, "Vertragsanlage", "Fälligkeitstag muss eine Zahl sein.", "/backoffice/vertraege/neu")
+            if not (1 <= faelligkeit_tag <= 28):
+                return _fehlerseite(session, "Vertragsanlage", "Fälligkeitstag muss zwischen 1 und 28 liegen.", "/backoffice/vertraege/neu")
+            neuer_vertrag["faelligkeit_tag"] = faelligkeit_tag
         # Abnahme-Folgefix (Codex, "echter PDF-zuerst-Weg"): der
         # Vertragsbeginn ist in Schritt 1 ABSICHTLICH optional
         # (`neu_kontext_werte`) und wird spätestens HIER, beim

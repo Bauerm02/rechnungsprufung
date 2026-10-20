@@ -158,7 +158,7 @@ def _auswahlwert(html: str, feld: str) -> str:
 
     import html as _html
 
-    block = re.search(rf'<select name="{re.escape(feld)}">(.*?)</select>', html, re.DOTALL)
+    block = re.search(rf'<select name="{re.escape(feld)}"[^>]*>(.*?)</select>', html, re.DOTALL)
     if not block:
         return ""
     gewaehlt = re.search(r'<option value="([^"]*)"[^>]*\sselected', block.group(1))
@@ -3057,7 +3057,7 @@ def test_pdf_zuerst_minimalstrecke_end_to_end_nur_sichtbare_defaults_uebernommen
     # abgeschickt - KEIN hier manuell nachgetragener PDF-Wert.
     namensfelder = (
         "modus", "vertrag_id", "quelle_typ", "quelle_referenz", "einheit_id", "debitor_id",
-        "gesellschaft_id", "rechtsordnung", "neuer_debitor_id",
+        "gesellschaft_id", "neuer_debitor_id",
         "gueltig_von", "gueltig_bis", "neuer_debitor_name", "neuer_debitor_email", "neuer_debitor_telefon",
         "neuer_debitor_adresse", "mitmieter_name", "mitmieter_email", "mitmieter_telefon",
         "komponente_hmz", "komponente_hmz_netto",
@@ -3070,7 +3070,7 @@ def test_pdf_zuerst_minimalstrecke_end_to_end_nur_sichtbare_defaults_uebernommen
         "index_anpassungsmonat", "index_mindestintervall_monate", "index_reihe",
     )
     auswahlfelder = (
-        "nutzungsart", "verzugszins_art", "rechtsachse_mrg_anwendungsbereich", "rechtsachse_mietzinsbildung",
+        "rechtsordnung", "nutzungsart", "verzugszins_art", "rechtsachse_mrg_anwendungsbereich", "rechtsachse_mietzinsbildung",
         "index_schwelle_inklusive", "befristungsstatus", "bk_hk_abrechnungsart",
         "verbraucher_unternehmer_status_mieter", "verbraucher_unternehmer_status_vermieter",
         "komponente_hmz_ust", "komponente_bk_ust", "komponente_hk_ust",
@@ -3145,6 +3145,535 @@ def test_pdf_zuerst_minimalstrecke_end_to_end_nur_sichtbare_defaults_uebernommen
     # Kaution-VEREINBARUNG (oben) ist strikt getrennt vom tatsächlichen
     # Zahlungseingang - KEIN fingierter Eingang wurde gebucht.
     assert stammdaten.get_kaution(vertrag_id) is None
+
+
+def test_zweiter_unabhaengiger_praxistest_finanz_termine_rechtsachsen_und_belege(backoffice_client):
+    """Abnahme-Folgefix (Codex, zweiter unabhängiger Praxistest nach
+    3e10183): reproduziert wortwörtlich die im Reject genannten
+    Originalzeilen und prüft alle dort konkret benannten Kernfehler in
+    EINEM End-to-End-Lauf (nur sichtbare Server-Defaults übernommen,
+    keine PDF-Werte per Hand eingetippt):
+
+    1) Netto NACH dem Betrag ("EUR 1200,00 netto, zuzueglich 20% USt.")
+       wird korrekt als Netto erkannt - Brutto gewinnt NICHT fälschlich
+       (vorher 120000 Cent Brutto+20% USt statt 144000 Cent).
+    3) Kaution-Erwähnung über Satzgrenzen hinweg ("...liegt NICHT bei.
+       Mahngebühr: EUR 20,00...") wird NICHT mehr als zweite,
+       widersprüchliche Kaution gewertet.
+    4) "Unterzeichnung am", "MRG-Anwendung: Teilanwendung", "Mietzins-
+       bildung: frei vereinbart", "Anpassung nur im Jaenner" und
+       "Zustellanschrift: ..." werden erkannt.
+    6) Belegtext+Seite werden in die tatsächlichen *_quellenbeleg-/
+       Klauseltext-Felder übernommen, nicht nur als Hinweistext gezeigt."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    from tests.mietinkasso._pdf_test_helpers import build_text_pdf
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-PRAXIS2", objekt_id="601", bezeichnung="Praxistest 2", nutzungsstatus="LEERSTAND")
+
+    pdf = build_text_pdf([
+        "Wohnungsmietvertrag",
+        "Mieter: Praxis Zwei",
+        "Hauptmietzins EUR 1200,00 netto, zuzueglich 20 % USt.",
+        "Betriebskosten EUR 150,00 netto, zuzueglich 20 % USt.",
+        "Parkplatz EUR 80,00 netto, zuzueglich 20 % USt.",
+        "Kaution: EUR 3000,00 vereinbart.",
+        "Ein Zahlungsbeleg fuer die Kaution liegt NICHT bei.",
+        "Mahngebuehr: EUR 20,00 je Mahnung.",
+        "Unterzeichnung am 01.06.2026",
+        "Mietbeginn: 01.12.2026",
+        "MRG-Anwendung: Teilanwendung; Mietzinsbildung: frei vereinbart.",
+        "Anpassung nur im Jaenner, Mindestintervall 12 Monate.",
+        "Zustellanschrift: Musterweg 7, Top 8, 1000 Musterort",
+    ])
+
+    hochgeladen = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "NEU", "csrf_token": csrf,
+            "einheit_id": "601-PRAXIS2", "gesellschaft_id": "7DI", "rechtsordnung": "OESTERREICH_MRG_TEIL",
+        },
+        files={"pdf_datei": ("vertrag.pdf", pdf, "application/pdf")},
+    )
+    assert hochgeladen.status_code == 200
+    text = hochgeladen.text
+    # Keine Mehrdeutigkeit mehr bei der Kaution (Bug 3).
+    assert "Mehrdeutige Angaben" not in text
+    assert _eingabewert(text, "vertragliche_kaution_cent") == "3000,00"
+    assert _eingabewert(text, "mahngebuehr_cent") == "20,00"
+    # Netto korrekt erkannt, KEIN falsches Brutto gesetzt (Bug 1).
+    assert _eingabewert(text, "komponente_hmz_netto") == "1200,00"
+    assert _eingabewert(text, "komponente_hmz") == ""
+    assert _auswahlwert(text, "komponente_hmz_ust") == "20"
+    assert _eingabewert(text, "neuer_debitor_adresse") == "Musterweg 7, Top 8, 1000 Musterort"
+    assert _eingabewert(text, "unterzeichnungsdatum") == "2026-06-01"
+    assert _auswahlwert(text, "rechtsachse_mrg_anwendungsbereich") == "TEIL"
+    assert _auswahlwert(text, "rechtsachse_mietzinsbildung") == "FREI"
+    assert _eingabewert(text, "index_anpassungsmonat") == "1"
+    assert _eingabewert(text, "index_mindestintervall_monate") == "12"
+    # Belege/Seite tatsächlich ins Formular übernommen (Bug 6), nicht nur
+    # als Hinweistext daneben.
+    assert "Teilanwendung" in _eingabewert(text, "rechtsachse_mrg_anwendungsbereich_quellenbeleg")
+    assert "Unterzeichnung" in _eingabewert(text, "unterzeichnungsdatum_quellenbeleg")
+
+    marker = 'name="csrf_token" value="'
+    start = text.index(marker) + len(marker)
+    ende = text.index('"', start)
+    form_csrf = text[start:ende]
+
+    namensfelder = (
+        "modus", "vertrag_id", "quelle_typ", "quelle_referenz", "einheit_id", "debitor_id",
+        "gesellschaft_id", "neuer_debitor_id",
+        "gueltig_von", "gueltig_bis", "neuer_debitor_name", "neuer_debitor_email", "neuer_debitor_telefon",
+        "neuer_debitor_adresse", "mitmieter_name", "mitmieter_email", "mitmieter_telefon",
+        "komponente_hmz", "komponente_hmz_netto", "komponente_hmz_indexierbar",
+        "komponente_bk", "komponente_bk_netto",
+        "komponente_hk", "komponente_hk_netto",
+        "komponente_kueche", "komponente_kueche_netto",
+        "komponente_parkplatz", "komponente_parkplatz_netto",
+        "vertragliche_kaution_cent", "vertragliche_kaution_quellenbeleg",
+        "mahngebuehr_cent", "unterzeichnungsdatum", "unterzeichnungsdatum_quellenbeleg",
+        "rechtsachse_mrg_anwendungsbereich_quellenbeleg", "rechtsachse_mietzinsbildung_quellenbeleg",
+        "index_anpassungsmonat", "index_mindestintervall_monate",
+    )
+    auswahlfelder = (
+        "rechtsordnung", "nutzungsart", "verzugszins_art", "rechtsachse_mrg_anwendungsbereich", "rechtsachse_mietzinsbildung",
+        "index_schwelle_inklusive", "befristungsstatus", "bk_hk_abrechnungsart",
+        "verbraucher_unternehmer_status_mieter", "verbraucher_unternehmer_status_vermieter",
+        "komponente_hmz_ust", "komponente_bk_ust", "komponente_hk_ust",
+        "komponente_kueche_ust", "komponente_parkplatz_ust",
+    )
+    formular = {"csrf_token": form_csrf}
+    for feld in namensfelder:
+        formular[feld] = _eingabewert(text, feld)
+    for feld in auswahlfelder:
+        formular[feld] = _auswahlwert(text, feld)
+    vertrag_id = formular["vertrag_id"]
+
+    vorschau = client.post("/backoffice/vertragsanlage/vorschau", data=formular)
+    assert vorschau.status_code == 200
+    paket_marker = 'name="paket_json" hidden>'
+    p_start = vorschau.text.index(paket_marker) + len(paket_marker)
+    p_ende = vorschau.text.index("</textarea>", p_start)
+    import html as _html
+    paket_json_roh = _html.unescape(vorschau.text[p_start:p_ende])
+
+    uebernommen = client.post(
+        "/backoffice/vertragsanlage/uebernehmen",
+        data={"csrf_token": form_csrf, "paket_json": paket_json_roh},
+        follow_redirects=False,
+    )
+    assert uebernommen.status_code == 303
+
+    vertrag = stammdaten.get_vertrag(vertrag_id)
+    assert vertrag is not None
+    komponenten = stammdaten.list_komponenten_fuer_vertrag(vertrag_id)
+    betraege = {k.art: k.betrag_cent for k in komponenten}
+    assert betraege["HMZ"] == 144000  # 1200 netto + 20% = 1440,00 EUR, NICHT 1200,00 Brutto
+    assert betraege["BK_VORAUSZAHLUNG"] == 18000
+    assert betraege["PARKPLATZ"] == 9600
+    hmz = next(k for k in komponenten if k.art == "HMZ")
+    assert hmz.indexierbar is True
+    bk = next(k for k in komponenten if k.art == "BK_VORAUSZAHLUNG")
+    assert bk.indexierbar is False
+
+    profil = stammdaten.neuestes_mietvertragsprofil(vertrag_id)
+    assert profil is not None
+    assert profil.vertragliche_kaution_cent == 300000
+    assert profil.mahngebuehr_cent == 2000
+    assert profil.unterzeichnungsdatum.isoformat() == "2026-06-01"
+    assert profil.rechtsachse_mrg_anwendungsbereich == "TEIL"
+    assert profil.rechtsachse_mietzinsbildung == "FREI"
+    assert profil.index_anpassungsmonat == 1
+    assert profil.index_mindestintervall_monate == 12
+    assert "Teilanwendung" in (profil.rechtsachse_mrg_anwendungsbereich_quellenbeleg or "")
+    assert "Unterzeichnung" in (profil.unterzeichnungsdatum_quellenbeleg or "")
+    assert stammdaten.get_kaution(vertrag_id) is None  # kein fingierter Zahlungseingang
+
+    debitor = stammdaten.get_debitor(vertrag.debitor_id)
+    assert debitor is not None
+    assert debitor.adresse == "Musterweg 7, Top 8, 1000 Musterort"
+
+    # Bug 5 ("Index-Brücke für NEU nicht nutzbar"): trotz künftigem
+    # Mietbeginn (01.12.2026, "heute" in diesem Lauf ist davor) muss die
+    # Indexklausel-Form die eben als indexierbar markierte HMZ-Komponente
+    # als wählbare Checkbox zeigen - BK/Parkplatz NICHT (nie angehakt).
+    index_seite = client.get(f"/backoffice/vertrag/{vertrag_id}/indexklauseln")
+    assert index_seite.status_code == 200
+    assert f'value="{hmz.id}"' in index_seite.text
+    assert f'value="{bk.id}"' not in index_seite.text
+    assert "Keine freigegebene indexierbare Mietkomponente" not in index_seite.text
+
+    marker2 = 'name="csrf_token" value="'
+    start2 = index_seite.text.index(marker2) + len(marker2)
+    ende2 = index_seite.text.index('"', start2)
+    index_csrf = index_seite.text[start2:ende2]
+    klausel_angelegt = client.post(
+        f"/backoffice/vertrag/{vertrag_id}/indexklausel/erstellen",
+        data={
+            "csrf_token": index_csrf, "abschlussdatum": "2026-06-01", "basis_reihe": "VPI20C18",
+            "basis_monat": "2026-12", "basis_wert": "130,5", "klausel_text": "Testklausel", "komponenten": [hmz.id],
+            "terminmodus": "FIXER_MONAT", "schwelle_prozent": "3", "schwelle_inklusive": "0", "anpassungsmonat": "1",
+            "mindestintervall_monate": "12",
+        },
+        follow_redirects=False,
+    )
+    assert klausel_angelegt.status_code == 303
+
+
+def test_rechtsordnung_im_selben_review_korrigierbar_ohne_erneuten_upload(backoffice_client):
+    """Abnahme-Folgefix (Codex, Endabnahme-Rückmeldung): eine bloße
+    Warnung bei `rechtsordnung=UNGEKLAERT` reicht nicht - die
+    VERBINDLICHE Rechtsordnung muss im SELBEN Review sichtbar geprüft/
+    gewählt werden können, ohne zu Schritt 1 zurückzukehren und erneut
+    hochzuladen. Schritt 1 wählt bewusst UNGEKLAERT; das Dokument belegt
+    eindeutig MRG-Teilanwendung; die Warnung erscheint; die menschliche
+    Entscheidung (hier: TEIL wählen, wie im Praxistest) erfolgt DIREKT im
+    Review-Formular. Danach müssen Quelle (Rechtsachse TEIL) und
+    tatsächliches Vertragsmodell (Vertrag.rechtsordnung) konsistent sein
+    und die Rechtsprofil-/Index-Dienste den Vertrag als geklärt
+    behandeln (keine `RechtsordnungUngeklaertError` mehr)."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    from tests.mietinkasso._pdf_test_helpers import build_text_pdf
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-RECHTSORDNUNG", objekt_id="601", bezeichnung="Rechtsordnungstest", nutzungsstatus="LEERSTAND")
+
+    pdf = build_text_pdf([
+        "Mieter: Rechts Ordnung",
+        "Mietbeginn: 01.12.2026",
+        "MRG-Anwendung: Teilanwendung; Mietzinsbildung: frei vereinbart.",
+    ])
+
+    # Schritt 1: BEWUSST UNGEKLAERT - die rechtliche Einordnung soll erst
+    # anhand des Dokuments im Review entschieden werden.
+    hochgeladen = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "NEU", "csrf_token": csrf,
+            "einheit_id": "601-RECHTSORDNUNG", "gesellschaft_id": "7DI", "rechtsordnung": "UNGEKLAERT",
+        },
+        files={"pdf_datei": ("vertrag.pdf", pdf, "application/pdf")},
+    )
+    assert hochgeladen.status_code == 200
+    text = hochgeladen.text
+    # Die Warnung erscheint UND die Auswahl ist direkt hier korrigierbar -
+    # kein Zurück zu Schritt 1 nötig.
+    assert "Rechtsordnung" in text and "UNGEKLAERT" in text
+    assert 'name="rechtsordnung"' in text
+    assert _auswahlwert(text, "rechtsordnung") == "UNGEKLAERT"  # Default aus Schritt 1, NICHT automatisch abgeleitet
+    assert _auswahlwert(text, "rechtsachse_mrg_anwendungsbereich") == "TEIL"  # Quellachse bereits erkannt
+
+    marker = 'name="csrf_token" value="'
+    start = text.index(marker) + len(marker)
+    ende = text.index('"', start)
+    form_csrf = text[start:ende]
+    namensfelder = (
+        "modus", "vertrag_id", "quelle_typ", "quelle_referenz", "einheit_id", "debitor_id",
+        "gesellschaft_id", "neuer_debitor_id", "gueltig_von", "gueltig_bis",
+        "neuer_debitor_name", "neuer_debitor_email", "neuer_debitor_telefon", "neuer_debitor_adresse",
+        "mitmieter_name", "mitmieter_email", "mitmieter_telefon",
+    )
+    formular = {"csrf_token": form_csrf}
+    for feld in namensfelder:
+        formular[feld] = _eingabewert(text, feld)
+    formular["nutzungsart"] = _auswahlwert(text, "nutzungsart")
+    formular["rechtsachse_mrg_anwendungsbereich"] = _auswahlwert(text, "rechtsachse_mrg_anwendungsbereich")
+    formular["rechtsachse_mietzinsbildung"] = _auswahlwert(text, "rechtsachse_mietzinsbildung")
+    # Die EINE ausdrücklich belegte menschliche Prüfentscheidung dieses
+    # Tests: Rechtsordnung direkt im Review auf die belegte Teilanwendung
+    # umstellen - KEIN Zurück zu Schritt 1, KEIN erneuter Upload.
+    formular["rechtsordnung"] = "OESTERREICH_MRG_TEIL"
+    vertrag_id = formular["vertrag_id"]
+
+    vorschau = client.post("/backoffice/vertragsanlage/vorschau", data=formular)
+    assert vorschau.status_code == 200
+    paket_marker = 'name="paket_json" hidden>'
+    p_start = vorschau.text.index(paket_marker) + len(paket_marker)
+    p_ende = vorschau.text.index("</textarea>", p_start)
+    import html as _html
+    paket_json_roh = _html.unescape(vorschau.text[p_start:p_ende])
+    assert "OESTERREICH_MRG_TEIL" in paket_json_roh
+
+    uebernommen = client.post(
+        "/backoffice/vertragsanlage/uebernehmen",
+        data={"csrf_token": form_csrf, "paket_json": paket_json_roh},
+        follow_redirects=False,
+    )
+    assert uebernommen.status_code == 303
+
+    vertrag = stammdaten.get_vertrag(vertrag_id)
+    assert vertrag is not None
+    assert vertrag.rechtsordnung == "OESTERREICH_MRG_TEIL"  # Quelle und Vertragsmodell jetzt konsistent
+
+    # Die vorhandenen Rechendienste sind jetzt tatsächlich nutzbar -
+    # eine Rechtsprofil-Anlage wird NICHT mehr mit "Rechtsordnung
+    # UNGEKLAERT" blockiert.
+    rechtsprofil_seite = client.get(f"/backoffice/vertrag/{vertrag_id}/rechtsprofil")
+    assert rechtsprofil_seite.status_code == 200
+    marker2 = 'name="csrf_token" value="'
+    start2 = rechtsprofil_seite.text.index(marker2) + len(marker2)
+    ende2 = rechtsprofil_seite.text.index('"', start2)
+    rechtsprofil_csrf = rechtsprofil_seite.text[start2:ende2]
+    rechtsprofil_angelegt = client.post(
+        f"/backoffice/vertrag/{vertrag_id}/rechtsprofil/erstellen",
+        data={
+            "csrf_token": rechtsprofil_csrf, "rechtsordnung": "OESTERREICH_MRG_TEIL",
+            "vertrag_beleg_referenz": "Testbeleg",
+        },
+        follow_redirects=False,
+    )
+    assert rechtsprofil_angelegt.status_code == 303
+
+    # Kleine Anzeige-Korrektur (derselbe Commit): fehlendes Vertragsende
+    # zeigt in den Review-Eckdaten "kein Enddatum hinterlegt/ungeklärt",
+    # NICHT mehr "unbefristet" (das würde UNBEFRISTET fälschlich
+    # vortäuschen, solange der Befristungsstatus nicht ausdrücklich
+    # bestätigt ist).
+    assert "kein Enddatum hinterlegt/ungeklärt" in text
+    assert "<td></td> – <td>unbefristet</td>" not in text
+
+
+def test_wiederholter_pdf_upload_derselben_einheit_erzeugt_keinen_zweiten_vertrag(backoffice_client):
+    """Abnahme-Folgefix (Codex, zweiter Praxistest, "DOPPELANLAGE"): zwei
+    unabhängige, frische Durchläufe (GET /vertraege/neu -> PDF-Upload ->
+    unveränderte Defaults prüfen/bestätigen) mit DEMSELBEN Dokument für
+    dieselbe Einheit erzeugen NUR EINEN Vertrag/Debitor - der zweite
+    Versuch wird VOR jeder zweiten Anlage erkannt und auf die bestehende
+    Akte verwiesen, OHNE etwas zu löschen."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    from tests.mietinkasso._pdf_test_helpers import build_text_pdf
+
+    client, *_ = backoffice_client
+    _login(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-DOPPEL", objekt_id="601", bezeichnung="Doppelanlage-Test", nutzungsstatus="LEERSTAND")
+
+    pdf = build_text_pdf(["Mieter: Doppelt Haelt", "Mietbeginn: 01.12.2026"])
+
+    def _upload():
+        csrf = _csrf_token(client)
+        return client.post(
+            "/backoffice/vertragsanlage/pdf-hochladen",
+            data={
+                "modus": "NEU", "csrf_token": csrf,
+                "einheit_id": "601-DOPPEL", "gesellschaft_id": "7DI", "rechtsordnung": "OESTERREICH_MRG_VOLL",
+            },
+            files={"pdf_datei": ("vertrag.pdf", pdf, "application/pdf")},
+        )
+
+    # Erster, VOLLSTÄNDIGER Durchlauf (Upload -> Vorschau -> Übernehmen) -
+    # legt den Vertrag tatsächlich an.
+    erster_upload = _upload()
+    assert erster_upload.status_code == 200
+    text = erster_upload.text
+    marker = 'name="csrf_token" value="'
+    start = text.index(marker) + len(marker)
+    ende = text.index('"', start)
+    form_csrf = text[start:ende]
+    namensfelder = (
+        "modus", "vertrag_id", "quelle_typ", "quelle_referenz", "einheit_id", "debitor_id",
+        "gesellschaft_id", "neuer_debitor_id", "gueltig_von", "gueltig_bis",
+        "neuer_debitor_name", "neuer_debitor_email", "neuer_debitor_telefon", "neuer_debitor_adresse",
+        "mitmieter_name", "mitmieter_email", "mitmieter_telefon",
+    )
+    formular = {"csrf_token": form_csrf}
+    for feld in namensfelder:
+        formular[feld] = _eingabewert(text, feld)
+    formular["nutzungsart"] = _auswahlwert(text, "nutzungsart")
+    formular["rechtsordnung"] = _auswahlwert(text, "rechtsordnung")
+    erster_vertrag_id = formular["vertrag_id"]
+    assert erster_vertrag_id
+
+    vorschau = client.post("/backoffice/vertragsanlage/vorschau", data=formular)
+    assert vorschau.status_code == 200
+    paket_marker = 'name="paket_json" hidden>'
+    p_start = vorschau.text.index(paket_marker) + len(paket_marker)
+    p_ende = vorschau.text.index("</textarea>", p_start)
+    import html as _html
+    paket_json_roh = _html.unescape(vorschau.text[p_start:p_ende])
+    uebernommen = client.post(
+        "/backoffice/vertragsanlage/uebernehmen",
+        data={"csrf_token": form_csrf, "paket_json": paket_json_roh},
+        follow_redirects=False,
+    )
+    assert uebernommen.status_code == 303
+
+    # Zweiter, UNABHÄNGIGER Durchlauf - frisches GET, dasselbe Dokument,
+    # frische ID-Generierung. Muss SOFORT beim Upload erkannt und
+    # abgelehnt werden, NICHT erst zulassen und dann einen zweiten
+    # Vertrag anlegen.
+    zweiter_upload = _upload()
+    assert zweiter_upload.status_code == 400
+    assert erster_vertrag_id in zweiter_upload.text
+    assert "bereits" in zweiter_upload.text
+
+    alle_vertraege = [v for v in stammdaten.list_alle_vertraege() if v.einheit_id == "601-DOPPEL"]
+    assert len(alle_vertraege) == 1
+    assert alle_vertraege[0].id == erster_vertrag_id
+
+
+def test_vertraglicher_faelligkeitstag_wird_erkannt_und_gespeichert(backoffice_client):
+    """Abnahme-Folgefix (Codex, "vertraglicher Fälligkeitstag"): im
+    Fachkonzept bereits vorgesehene Rechengrundlage, die bisher beim
+    Intake NIE weitergegeben wurde - `VertragZeile.faelligkeit_tag` fiel
+    IMMER auf den Parser-Default 5 zurück, unabhängig vom tatsächlich
+    belegten Vertragstext. Ein Gewerbevertrag mit "bis zum 15. des
+    Monats" muss das auch tatsächlich in `Vertrag.faelligkeit_tag`
+    speichern - sonst laufen Zins-/Mahnfristen auf dem falschen Tag."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    from tests.mietinkasso._pdf_test_helpers import build_text_pdf
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-FAELLIG", objekt_id="601", bezeichnung="Fälligkeitstest", nutzungsstatus="LEERSTAND")
+
+    pdf = build_text_pdf([
+        "Geschäftsraummietvertrag",
+        "Mieter: Gewerbe Betrieb KG",
+        "Mietbeginn: 01.12.2026",
+        "Zahlung monatlich im Voraus bis zum 15. des Monats.",
+    ])
+
+    hochgeladen = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "NEU", "csrf_token": csrf,
+            "einheit_id": "601-FAELLIG", "gesellschaft_id": "7DI", "rechtsordnung": "OESTERREICH_GEWERBE",
+        },
+        files={"pdf_datei": ("vertrag.pdf", pdf, "application/pdf")},
+    )
+    assert hochgeladen.status_code == 200
+    text = hochgeladen.text
+    assert _eingabewert(text, "faelligkeit_tag") == "15"
+
+    marker = 'name="csrf_token" value="'
+    start = text.index(marker) + len(marker)
+    ende = text.index('"', start)
+    form_csrf = text[start:ende]
+    namensfelder = (
+        "modus", "vertrag_id", "quelle_typ", "quelle_referenz", "einheit_id", "debitor_id",
+        "gesellschaft_id", "neuer_debitor_id", "gueltig_von", "gueltig_bis", "faelligkeit_tag",
+        "neuer_debitor_name", "neuer_debitor_email", "neuer_debitor_telefon", "neuer_debitor_adresse",
+        "mitmieter_name", "mitmieter_email", "mitmieter_telefon",
+    )
+    formular = {"csrf_token": form_csrf}
+    for feld in namensfelder:
+        formular[feld] = _eingabewert(text, feld)
+    formular["nutzungsart"] = _auswahlwert(text, "nutzungsart")
+    formular["rechtsordnung"] = _auswahlwert(text, "rechtsordnung")
+    vertrag_id = formular["vertrag_id"]
+
+    vorschau = client.post("/backoffice/vertragsanlage/vorschau", data=formular)
+    assert vorschau.status_code == 200
+    paket_marker = 'name="paket_json" hidden>'
+    p_start = vorschau.text.index(paket_marker) + len(paket_marker)
+    p_ende = vorschau.text.index("</textarea>", p_start)
+    import html as _html
+    paket_json_roh = _html.unescape(vorschau.text[p_start:p_ende])
+    assert '"faelligkeit_tag": 15' in paket_json_roh
+
+    uebernommen = client.post(
+        "/backoffice/vertragsanlage/uebernehmen",
+        data={"csrf_token": form_csrf, "paket_json": paket_json_roh},
+        follow_redirects=False,
+    )
+    assert uebernommen.status_code == 303
+
+    vertrag = stammdaten.get_vertrag(vertrag_id)
+    assert vertrag is not None
+    assert vertrag.faelligkeit_tag == 15  # NICHT der Default 5
+    # Keine Sollbuchung/kein Zahlungsbeleg durch die reine Erfassung.
+    assert stammdaten.get_konto_by_vertrag(vertrag_id) is None
+
+
+def test_faelligkeitstag_ohne_beleg_bleibt_technischer_standard(backoffice_client):
+    """Ohne erkannten/eingetragenen Fälligkeitstag bleibt der Standard
+    (5) unverändert wirksam - das Feld bleibt aber sichtbar LEER im
+    Review (kein erfundener Wert wird vorausgefüllt)."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    from tests.mietinkasso._pdf_test_helpers import build_text_pdf
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_einheit(id="601-FAELLIGLEER", objekt_id="601", bezeichnung="Fälligkeitstest leer", nutzungsstatus="LEERSTAND")
+
+    pdf = build_text_pdf(["Mieter: Ohne Faelligkeitsklausel", "Mietbeginn: 01.12.2026"])
+
+    hochgeladen = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "NEU", "csrf_token": csrf,
+            "einheit_id": "601-FAELLIGLEER", "gesellschaft_id": "7DI", "rechtsordnung": "OESTERREICH_MRG_VOLL",
+        },
+        files={"pdf_datei": ("vertrag.pdf", pdf, "application/pdf")},
+    )
+    assert hochgeladen.status_code == 200
+    assert _eingabewert(hochgeladen.text, "faelligkeit_tag") == ""  # KEIN erfundener Wert
+
+    marker = 'name="csrf_token" value="'
+    start = hochgeladen.text.index(marker) + len(marker)
+    ende = hochgeladen.text.index('"', start)
+    form_csrf = hochgeladen.text[start:ende]
+    namensfelder = (
+        "modus", "vertrag_id", "quelle_typ", "quelle_referenz", "einheit_id", "debitor_id",
+        "gesellschaft_id", "neuer_debitor_id", "gueltig_von", "gueltig_bis", "faelligkeit_tag",
+        "neuer_debitor_name", "neuer_debitor_email", "neuer_debitor_telefon", "neuer_debitor_adresse",
+        "mitmieter_name", "mitmieter_email", "mitmieter_telefon",
+    )
+    formular = {"csrf_token": form_csrf}
+    for feld in namensfelder:
+        formular[feld] = _eingabewert(hochgeladen.text, feld)
+    formular["nutzungsart"] = _auswahlwert(hochgeladen.text, "nutzungsart")
+    formular["rechtsordnung"] = _auswahlwert(hochgeladen.text, "rechtsordnung")
+    vertrag_id = formular["vertrag_id"]
+
+    vorschau = client.post("/backoffice/vertragsanlage/vorschau", data=formular)
+    paket_marker = 'name="paket_json" hidden>'
+    p_start = vorschau.text.index(paket_marker) + len(paket_marker)
+    p_ende = vorschau.text.index("</textarea>", p_start)
+    import html as _html
+    paket_json_roh = _html.unescape(vorschau.text[p_start:p_ende])
+    assert "faelligkeit_tag" not in paket_json_roh  # kein erfundener Wert im Paket
+
+    uebernommen = client.post(
+        "/backoffice/vertragsanlage/uebernehmen",
+        data={"csrf_token": form_csrf, "paket_json": paket_json_roh},
+        follow_redirects=False,
+    )
+    assert uebernommen.status_code == 303
+    vertrag = stammdaten.get_vertrag(vertrag_id)
+    assert vertrag.faelligkeit_tag == 5  # unveränderter technischer Standard
 
 
 def test_mitmieter_hinweis_aus_pdf_erscheint_als_editierbarer_vorschlag(backoffice_client):

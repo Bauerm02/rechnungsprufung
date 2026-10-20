@@ -751,6 +751,55 @@ class StammdatenRepository:
         with self._session_factory() as owned_session:
             return _lesen(owned_session)
 
+    def list_komponenten_fuer_vertrag(self, vertrag_id: str) -> list[VertragsKomponenteTable]:
+        """Abnahme-Folgefix (Codex, zweiter Praxistest, "Index-Brücke für
+        NEU nicht nutzbar"): ANDERS als `list_aktive_komponenten` (die
+        nach einem Stichtag filtert) liefert diese Methode ALLE
+        Komponenten eines Vertrags, auch ZUKÜNFTIG erst gültige - für
+        einen Vertrag mit künftigem Mietbeginn (z. B. Abschluss im
+        Oktober, Mietbeginn erst 01.12.) zeigt `list_aktive_komponenten(
+        vertrag_id, heute())` sonst GAR KEINE Komponente, obwohl die
+        Indexklausel-Vorbereitung VOR Mietbeginn sinnvoll und nötig ist
+        (`backoffice/indexklausel_form.py::klausel_formular`)."""
+
+        with self._session_factory() as session:
+            return list(
+                session.execute(
+                    select(VertragsKomponenteTable)
+                    .where(VertragsKomponenteTable.vertrag_id == vertrag_id)
+                    .order_by(VertragsKomponenteTable.gueltig_von)
+                ).scalars().all()
+            )
+
+    def finde_vertrag_mit_quelle_referenz(self, *, einheit_id: str, quelle_referenz: str) -> VertragTable | None:
+        """Abnahme-Folgefix (Codex, zweiter Praxistest, "DOPPELANLAGE"):
+        da Vertrag-ID/neue Debitor-ID bei der PDF-zuerst-Neuanlage intern
+        generiert werden (`vertragsanlage_form.py::_generiere_technische_
+        id`), erkennt die bisherige "Vertrag-ID existiert bereits"-Prüfung
+        einen WIEDERHOLTEN Upload DESSELBEN Dokuments für dieselbe Einheit
+        NICHT (jeder Versuch bekommt eine frische, bisher unbenutzte ID).
+        Diese Suche findet stattdessen einen bereits aus GENAU diesem
+        Dokument (`quelle_referenz`, z. B. `f"pdf-sha256:{hash}"`)
+        angelegten Vertrag DERSELBEN Einheit über dessen allererste
+        (Version 1) Mietvertragsprofil-Zeile - die Version-1-Zeile trägt
+        IMMER die ursprüngliche Anlage-Quelle, spätere Versionen (Zusatz-
+        Nachträge) können eine andere/leere Quelle haben und sind daher
+        NICHT die richtige Stelle für diesen Abgleich."""
+
+        with self._session_factory() as session:
+            treffer = session.execute(
+                select(VertragTable)
+                .join(MietvertragsprofilTable, MietvertragsprofilTable.vertrag_id == VertragTable.id)
+                .where(
+                    VertragTable.einheit_id == einheit_id,
+                    MietvertragsprofilTable.version == 1,
+                    MietvertragsprofilTable.quelle_referenz == quelle_referenz,
+                )
+                .order_by(VertragTable.id)
+                .limit(1)
+            ).scalar_one_or_none()
+            return treffer
+
     def liste_mietvertragsprofil_versionen(self, vertrag_id: str) -> list[MietvertragsprofilTable]:
         """Für die Anzeige 'Quellen und Historie' im Backoffice-Detail -
         älteste zuerst."""

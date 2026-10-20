@@ -391,11 +391,21 @@ def _komponente_felder_html(feldname: str, bezeichnung: str, *, werte: dict | No
     brutto_hinweis = _beleg_hinweis(vorschlaege, feldname)
     netto_hinweis = _beleg_hinweis(vorschlaege, f"{feldname}_netto")
     ust_hinweis = _beleg_hinweis(vorschlaege, f"{feldname}_ust")
+    # Abnahme-Folgefix (Codex, zweiter Praxistest, "Index-Brücke für NEU
+    # nicht nutzbar"): OHNE dieses Häkchen entsteht JEDE neue Komponente
+    # mit `indexierbar=False` und ist damit in der Indexklausel-Form NIE
+    # auswählbar (`indexklausel_form.py` zeigt nur `k.indexierbar`-
+    # Komponenten als Checkbox an) - Default bleibt bewusst UNGEHAKT
+    # (sicherer Default), ein Mensch markiert ausdrücklich NUR die laut
+    # Vertrag tatsächlich wertgesicherte(n) Komponente(n).
+    indexierbar_angehakt = bool(werte.get(f"{feldname}_indexierbar"))
     return f"""
       <fieldset><legend>{h(bezeichnung)}</legend>
         <label>Brutto (EUR)</label><input name="{feldname}" value="{brutto}">{brutto_hinweis}
         <label>Netto (EUR, alternativ zu Brutto)</label><input name="{feldname}_netto" value="{netto}">{netto_hinweis}
         <label>USt-Satz</label><select name="{feldname}_ust">{ust_optionen}</select>{ust_hinweis}
+        <label><input type="checkbox" name="{feldname}_indexierbar" value="1" {"checked" if indexierbar_angehakt else ""}>
+          Laut Vertrag wertgesichert/indexierbar (für die spätere Indexklausel-Anlage wählbar)</label>
       </fieldset>"""
 
 
@@ -444,6 +454,9 @@ def komponenten_werte_aus_form(form, *, vertrag_id: str, gueltig_von: str) -> li
         eintrag = dict(
             id=f"{vertrag_id}-{art}", art=art, bezeichnung=bezeichnung,
             betrag_cent=betrag_cent, gueltig_von=gueltig_von,
+            # Abnahme-Folgefix: Eignungsflag aus dem Review-Häkchen
+            # weitergeben (Default False bleibt der sichere Altzustand).
+            indexierbar=str(form.get(f"{feldname}_indexierbar", "")) == "1",
         )
         if ust_satz_promille is not None:
             eintrag["ust_satz_promille"] = ust_satz_promille
@@ -533,7 +546,7 @@ def _eckdaten_block(eckdaten: dict | None, pdf_hinweise: dict) -> str:
         <tr><th>Mieter</th><td>{h(eckdaten.get('mieter_anzeige', ''))}{mieter_vergleich}</td></tr>
         <tr><th>Vermieter-Gesellschaft</th><td>{h(eckdaten.get('gesellschaft_name', ''))}{vermieter_vergleich}</td></tr>
         <tr><th>Rechtsordnung</th><td>{h(eckdaten.get('rechtsordnung', ''))}</td></tr>
-        <tr><th>Vertragsbeginn / -ende</th><td>{h(eckdaten.get('gueltig_von') or 'noch nicht erfasst - unten ausfüllen')} – {h(eckdaten.get('gueltig_bis') or 'unbefristet')}</td></tr>
+        <tr><th>Vertragsbeginn / -ende</th><td>{h(eckdaten.get('gueltig_von') or 'noch nicht erfasst - unten ausfüllen')} – {h(eckdaten.get('gueltig_bis') or 'kein Enddatum hinterlegt/ungeklärt')}</td></tr>
       </table>
     </div>"""
 
@@ -599,7 +612,30 @@ def review_formular(
     vertragsdauer_block = ""
     mietbestandteile_block = ""
     mitmieter_neu_block = ""
+    rechtsordnung_block = ""
     if ist_neu:
+        # Abnahme-Folgefix (Codex, Endabnahme-Rückmeldung): die
+        # VERBINDLICHE Rechtsordnung (Vertrag.rechtsordnung - treibt
+        # Rechtsprofil/Index-/Mahnberechnung) war bisher nur ein
+        # verstecktes Hidden-Feld aus Schritt 1 - eine im Dokument
+        # erkannte, abweichende MRG-Einordnung (siehe Rechtsachsen-
+        # Staging unten) löste NUR eine Warnung aus, OHNE dass sie im
+        # selben Review tatsächlich korrigiert werden konnte (ein
+        # Zurück zu Schritt 1 samt erneutem Upload war nötig). Diese
+        # Auswahl ist jetzt SICHTBAR und EDITIERBAR direkt neben der
+        # unverbindlichen Rechtsachsen-Einordnung - KEINE automatische
+        # Ableitung (bleibt eine bewusste menschliche Entscheidung).
+        rechtsordnung_optionen_review = "".join(
+            option(r, r, selected=werte.get("rechtsordnung") == r) for r in RECHTSORDNUNGEN
+        )
+        rechtsordnung_block = f"""
+        <fieldset><legend>Rechtsordnung (verbindlich - bestimmt Rechtsprofil-/Index-/Mahnberechnung)</legend>
+          <label>Rechtsordnung</label>
+          <select name="rechtsordnung" required>{rechtsordnung_optionen_review}</select>
+          <p class="muted">Ersetzt die in Schritt 1 getroffene Wahl - hier direkt korrigierbar, falls das
+             Dokument (siehe Rechtsachsen-Einordnung unten) eine abweichende Einordnung belegt. Wird NIE
+             automatisch aus Nutzungsart/Rechtsachsen abgeleitet.</p>
+        </fieldset>"""
         vertragsdauer_block = f"""
         <fieldset><legend>Vertragsdauer</legend>
           <label>Vertragsbeginn (wird nie automatisch auf heute gesetzt)</label>
@@ -607,6 +643,14 @@ def review_formular(
           {_beleg_hinweis(vorschlaege, "urspruenglicher_mietbeginn")}
           <label>Vertragsende (nur bei tatsächlich befristetem Vertrag)</label>
           <input type="date" name="gueltig_bis" value="{h(str(werte.get('gueltig_bis') or ''))}">
+          <label>Vertraglicher Fälligkeitstag (Tag im Monat laut Vertrag, z. B. "bis zum 1./5./15. des Monats")</label>
+          <input type="number" name="faelligkeit_tag" min="1" max="28"
+                 value="{h(str(werte.get('faelligkeit_tag') or ''))}"
+                 placeholder="leer = technischer Standard 5 (NICHT belegt, nur Platzhalter für die Vorschreibung)">
+          {_beleg_hinweis(vorschlaege, "faelligkeit_tag")}
+          <p class="muted">Löst KEINEN Zahlungsbeleg und KEINE OP-Buchung aus - bestimmt nur den technischen
+             Fälligkeitstag künftiger Vorschreibungen/Mahnfristen. Bleibt das Feld leer, wird der technische
+             Standard (5) verwendet - das ist dann KEIN belegter Vertragswert.</p>
         </fieldset>"""
         mietbestandteile_block = f"""
         <fieldset><legend>Mietbestandteile (Brutto ODER Netto+USt-Satz je Komponente - gemischte Steuersätze möglich)</legend>
@@ -715,6 +759,7 @@ def review_formular(
           <label>Fundstelle Befristung</label>
           <input name="befristungsstatus_quellenbeleg" value="{h(str(werte.get('befristungsstatus_quellenbeleg') or ''))}">
         </fieldset>
+        {rechtsordnung_block}
         <fieldset><legend>Rechtsachsen (unverbindliches Staging, ersetzt NICHT die Rechtsordnung/das Rechtsprofil)</legend>
           <label>MRG-Anwendungsbereich laut Vertrag/Klausel</label>
           <select name="rechtsachse_mrg_anwendungsbereich">{_enum_auswahl("rechtsachse_mrg_anwendungsbereich", RECHTSACHSE_MRG_ANWENDUNGSBEREICH_WERTE)}</select>

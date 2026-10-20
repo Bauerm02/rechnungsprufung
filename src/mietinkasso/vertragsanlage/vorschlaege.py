@@ -46,8 +46,16 @@ def _mietbeginn_iso(ddmmyyyy: str) -> str | None:
 #: österreichischer Schreibweise "Jänner") für die Übersetzung eines im
 #: Vertrag genannten Basismonats in das vom `<input type="month">`
 #: erwartete `YYYY-MM`-Format.
+#: Abnahme-Folgefix (Codex, zweiter Praxistest): die Extraktionsmuster in
+#: `pdf_extraktion.py` erkennen bei "Jänner"/"März" ausdrücklich auch die
+#: ASCII-Transliteration ohne Umlaut ("Jaenner"/"Maerz", via
+#: `J(?:ä|ae)nner`/`M(?:ä|ae)rz`) - diese Tabelle muss deshalb BEIDE
+#: Schreibweisen kennen, sonst liefert `.get()` `None` für einen vom
+#: Regex bereits korrekt erkannten Treffer (genau dieser stille
+#: Fehltreffer verschluckte zuvor einen belegten Anpassungsmonat).
 _MONATSNAMEN = {
-    "jänner": 1, "januar": 1, "februar": 2, "märz": 3, "april": 4, "mai": 5, "juni": 6,
+    "jänner": 1, "jaenner": 1, "januar": 1, "februar": 2, "märz": 3, "maerz": 3,
+    "april": 4, "mai": 5, "juni": 6,
     "juli": 7, "august": 8, "september": 9, "oktober": 10, "november": 11, "dezember": 12,
 }
 
@@ -87,21 +95,10 @@ def _basismonat_iso(roh: str) -> str | None:
 #: Mensch bewusst gegen das Brutto-Feld abgleichen muss.
 _DIREKTE_FELDER = {
     "kaution_cent": "vertragliche_kaution_cent",
-    # Abnahme-Folgefix (Codex, "Netto/USt/Brutto je Mietkomponente"): die
-    # PDF-erkannten Brutto-Beträge je Mietbestandteil mappen jetzt DIREKT
-    # auf die tatsächlich im Review gerenderten `komponente_*`-Felder
-    # (`vertragsanlage_form.py::_komponente_felder_html`) statt auf
-    # tote, nirgends gerenderte Formularnamen.
-    "hauptmietzins_cent": "komponente_hmz",
-    "betriebskosten_cent": "komponente_bk",
-    "heizkosten_cent": "komponente_hk",
-    "kueche_cent": "komponente_kueche",
-    "parkplatz_cent": "komponente_parkplatz",
-    "hauptmietzins_netto_cent": "komponente_hmz_netto",
-    "betriebskosten_netto_cent": "komponente_bk_netto",
-    "heizkosten_netto_cent": "komponente_hk_netto",
-    "kueche_netto_cent": "komponente_kueche_netto",
-    "parkplatz_netto_cent": "komponente_parkplatz_netto",
+    # Abnahme-Folgefix (Codex, "vertraglicher Fälligkeitstag"): belegter
+    # Zahlungstermin ("bis zum X. des Monats") - bleibt editierbarer
+    # Vorschlag, ersetzt NIE stillschweigend den technischen Default.
+    "faelligkeit_tag": "faelligkeit_tag",
     "index_reihe": "index_reihe",
     "index_schwelle_prozent": "index_schwelle_prozent",
     "index_urspruenglicher_basiswert": "index_urspruenglicher_basiswert",
@@ -121,6 +118,7 @@ _DIREKTE_FELDER = {
     # py`).
     "mieter_email": "mieter_email_hinweis",
     "mieter_telefon": "mieter_telefon_hinweis",
+    "mieter_adresse": "mieter_adresse_hinweis",
     # Auftrag HV-20261020-VERTRAGSDATENBASIS: Mitmieter/Vertreter sind KEIN
     # Mietvertragsprofil-Feld - reiner Anzeigehinweis für die manuelle
     # Erfassung über "Partei hinzufügen" (siehe `backoffice/
@@ -213,21 +211,37 @@ def vorschlaege_aus_extraktion(ergebnis: ExtraktionsErgebnis) -> dict[str, Vorsc
         vorschlaege["mahngebuehr_cent"] = Vorschlag(tr.wert, tr.seite, tr.auszug)
     # sonst: kein Vorschlag - Feld bleibt leer -> None (unbekannt, KEIN erfundenes 0)
 
-    # Abnahme-Folgefix: USt-Satz je Mietkomponente - die Auswahlfelder im
-    # Review bieten nur die festen Prozentsätze 0/10/13/20 an (siehe
-    # `_UST_SAETZE_PROZENT`); ein erkannter Wert wird dafür auf eine
-    # glatte Ganzzahl normalisiert ("20,0" -> "20"), damit die
-    # entsprechende Option tatsächlich vorausgewählt erscheint.
-    for quellfeld, formularfeld in (
-        ("hauptmietzins_ust_prozent", "komponente_hmz_ust"),
-        ("betriebskosten_ust_prozent", "komponente_bk_ust"),
-        ("heizkosten_ust_prozent", "komponente_hk_ust"),
-        ("kueche_ust_prozent", "komponente_kueche_ust"),
-        ("parkplatz_ust_prozent", "komponente_parkplatz_ust"),
+    # Abnahme-Folgefix (Codex, zweiter Praxistest): Brutto/Netto/USt je
+    # Mietkomponente werden jetzt HIER, gemeinsam je Komponente,
+    # aufgelöst - NICHT mehr über unabhängige 1:1-Einträge in
+    # `_DIREKTE_FELDER`. Grund: liegt ein Netto-Treffer vor (aus
+    # `pdf_extraktion.py::_netto_muster`, erkennt "netto" VOR oder NACH
+    # dem Betrag), gewinnt der Brutto-Treffer für DIESELBE Komponente
+    # sonst fälschlich (`komponenten_werte_aus_form`: "ein angegebenes
+    # Brutto bleibt immer maßgeblich") - der Netto-Betrag würde dann
+    # STILLSCHWEIGEND verworfen. Ein Brutto-Vorschlag wird deshalb NUR
+    # übernommen, wenn für dieselbe Komponente KEIN Netto-Treffer vorliegt.
+    for brutto_feld, netto_feld, ust_feld, formular_praefix in (
+        ("hauptmietzins_cent", "hauptmietzins_netto_cent", "hauptmietzins_ust_prozent", "komponente_hmz"),
+        ("betriebskosten_cent", "betriebskosten_netto_cent", "betriebskosten_ust_prozent", "komponente_bk"),
+        ("heizkosten_cent", "heizkosten_netto_cent", "heizkosten_ust_prozent", "komponente_hk"),
+        ("kueche_cent", "kueche_netto_cent", "kueche_ust_prozent", "komponente_kueche"),
+        ("parkplatz_cent", "parkplatz_netto_cent", "parkplatz_ust_prozent", "komponente_parkplatz"),
     ):
-        if quellfeld in t:
-            tr = t[quellfeld]
-            vorschlaege[formularfeld] = Vorschlag(_prozent_normalisiert(tr.wert), tr.seite, tr.auszug)
+        if netto_feld in t:
+            tr = t[netto_feld]
+            vorschlaege[f"{formular_praefix}_netto"] = Vorschlag(tr.wert.strip(), tr.seite, tr.auszug)
+            if ust_feld in t:
+                tr_ust = t[ust_feld]
+                # Abnahme-Folgefix: die Auswahlfelder im Review bieten nur
+                # die festen Prozentsätze 0/10/13/20 an (`_UST_SAETZE_
+                # PROZENT`) - ein erkannter Wert wird auf eine glatte
+                # Ganzzahl normalisiert ("20,0" -> "20"), damit die
+                # entsprechende Option tatsächlich vorausgewählt erscheint.
+                vorschlaege[f"{formular_praefix}_ust"] = Vorschlag(_prozent_normalisiert(tr_ust.wert), tr_ust.seite, tr_ust.auszug)
+        elif brutto_feld in t:
+            tr = t[brutto_feld]
+            vorschlaege[formular_praefix] = Vorschlag(tr.wert.strip(), tr.seite, tr.auszug)
 
     # Ein belegter Verzugszins-SATZ ist selbst der Beleg für
     # "vertraglich vereinbart" - ohne eigenes Fundmuster für diese

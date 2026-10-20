@@ -61,7 +61,7 @@ def baue_paket_json(
     paket: dict = {"quelle": quelle}
 
     if neuer_vertrag is not None:
-        paket["vertraege"] = [{
+        vertrag_eintrag = {
             "id": vertrag_id,
             "einheit_id": neuer_vertrag["einheit_id"],
             "debitor_id": neuer_vertrag["debitor_id"],
@@ -69,7 +69,14 @@ def baue_paket_json(
             "rechtsordnung": neuer_vertrag["rechtsordnung"],
             "gueltig_von": neuer_vertrag["gueltig_von"],
             "gueltig_bis": neuer_vertrag.get("gueltig_bis"),
-        }]
+        }
+        # Abnahme-Folgefix (Codex, "vertraglicher Fälligkeitstag"): NUR
+        # bei tatsächlich belegtem/eingegebenem Wert mitschicken - fehlt
+        # er, greift unverändert der bestehende Parser-Default (5),
+        # transparent als technischer Standard (siehe Review-Formular).
+        if neuer_vertrag.get("faelligkeit_tag") is not None:
+            vertrag_eintrag["faelligkeit_tag"] = neuer_vertrag["faelligkeit_tag"]
+        paket["vertraege"] = [vertrag_eintrag]
 
     if neuer_debitor is not None:
         paket["debitoren"] = [{
@@ -104,6 +111,13 @@ def baue_paket_json(
                 "id": k["id"], "vertrag_id": vertrag_id, "art": k["art"], "bezeichnung": k["bezeichnung"],
                 "betrag_cent": k["betrag_cent"], "gueltig_von": k["gueltig_von"],
                 "ust_satz_promille": k.get("ust_satz_promille", 10000),
+                # Abnahme-Folgefix (Codex, zweiter Praxistest, "Index-
+                # Brücke für NEU nicht nutzbar"): das im Review gesetzte
+                # Eignungsflag muss tatsächlich bis in die gespeicherte
+                # `VertragsKomponenteTable`-Zeile durchgereicht werden -
+                # sonst bleibt JEDE neue Komponente für die Indexklausel-
+                # Anlage für immer unauswählbar.
+                "indexierbar": k.get("indexierbar", False),
             }
             for k in komponenten
         ]
