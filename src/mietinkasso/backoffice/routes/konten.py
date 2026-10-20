@@ -22,7 +22,7 @@ from mietinkasso.index.service import UNTERSTUETZTE_BERECHNUNGSPROFILE
 from mietinkasso.mahnwesen.brief_pdf import Absender as _BriefAbsender
 from mietinkasso.op.eroeffnung_import import importiere_eroeffnung_csv_atomar, parse_eroeffnung_csv
 from mietinkasso.op.kontoauszug_pdf import erzeuge_kontoauszug_pdf
-from mietinkasso.op.kontoblatt import KATEGORIE_LABEL, lade_kontoblatt
+from mietinkasso.op.kontoblatt import KATEGORIE_LABEL, STATUS_LABEL, lade_kontoblatt
 from mietinkasso.vorschreibung.service import faelligkeitsdatum
 
 from mietinkasso.backoffice import dependencies as deps
@@ -81,6 +81,20 @@ def _rechenweg_html(positionen) -> str:
     return formel
 
 
+def _kontoblatt_status_html(zeile) -> str:
+    """Codex-Abnahme 20.10.2026, P3: `status` löst die bisherige
+    Mehrdeutigkeit auf (`rest_cent is None` konnte "bezahlt" UND "keine
+    Forderung" bedeuten) - `None` (z. B. GUTSCHRIFT/ZAHLUNG/KORREKTUR,
+    die keinen eigenen Forderungscharakter haben) wird als "—" gezeigt,
+    nie als bezahlt/offen behauptet."""
+
+    if zeile.status is None:
+        return '<span class="muted">—</span>'
+    warn = zeile.status in ("OFFEN", "STORNIERT")
+    css = "warn" if warn else "ok" if zeile.status == "BEZAHLT" else ""
+    return f'<span class="{css}">{h(STATUS_LABEL.get(zeile.status, zeile.status))}</span>'
+
+
 def _kontoblatt_zeile_html(zeile, *, kategorie_spalte: bool) -> str:
     p = zeile.position
     rest_html = eur(zeile.rest_cent) if zeile.rest_cent is not None else '<span class="muted">—</span>'
@@ -88,7 +102,18 @@ def _kontoblatt_zeile_html(zeile, *, kategorie_spalte: bool) -> str:
     return (
         "<tr>"
         f"<td>{p.belegdatum.isoformat()}</td><td>{h(p.typ)}</td>{kategorie_html}"
-        f"<td>{eur(p.betrag_cent)}</td><td>{rest_html}</td>"
+        f"<td>{eur(p.betrag_cent)}</td><td>{rest_html}</td><td>{_kontoblatt_status_html(zeile)}</td>"
+        f"<td>{h(p.beleg_referenz or p.aenderungsgrund or '')}</td>"
+        "</tr>"
+    )
+
+
+def _kontoblatt_historie_zeile_html(zeile) -> str:
+    p = zeile.position
+    return (
+        "<tr>"
+        f"<td>{p.belegdatum.isoformat()}</td><td>{h(KATEGORIE_LABEL.get(zeile.kategorie, zeile.kategorie))}</td>"
+        f"<td>{eur(p.betrag_cent)}</td><td>{_kontoblatt_status_html(zeile)}</td>"
         f"<td>{h(p.beleg_referenz or p.aenderungsgrund or '')}</td>"
         "</tr>"
     )
@@ -105,9 +130,21 @@ def _kontoblatt_html(kontoblatt, *, konto_id: str) -> str:
     hauptforderung_zeilen = "".join(_kontoblatt_zeile_html(z, kategorie_spalte=False) for z in kontoblatt.hauptforderung_zeilen)
     kosten_zeilen = "".join(_kontoblatt_zeile_html(z, kategorie_spalte=True) for z in kontoblatt.kosten_zeilen)
     zahlungen_zeilen = "".join(_kontoblatt_zeile_html(z, kategorie_spalte=False) for z in kontoblatt.zahlungen_zeilen)
+    kosten_historie_zeilen = "".join(_kontoblatt_historie_zeile_html(z) for z in kontoblatt.kosten_historie)
+    kosten_historie_karte = ""
+    if kontoblatt.kosten_historie:
+        kosten_historie_karte = f"""
+        <div class="card"><h3>Kosten-Historie (storniert/ersetzt)</h3>
+          <p class="muted">Nicht mehr gültige Kostenbuchungen - bleiben zur Nachvollziehbarkeit sichtbar,
+             verändern WEDER die aktuelle Kostensumme NOCH den Gesamtsaldo.</p>
+          <table><tr><th>Datum</th><th>Kategorie</th><th>Betrag</th><th>Status</th><th>Beleg/Grund</th></tr>
+          {kosten_historie_zeilen}</table>
+        </div>"""
 
+    _unbekanntes_datum_html = '<span class="muted">Datum unbekannt</span>'
     bankaufwand_zeilen = "".join(
-        f"<tr><td>{b.row.gebucht_am.strftime('%Y-%m-%d') if b.row.gebucht_am else ''}</td>"
+        f"<tr><td>{b.rueckgabe_datum.isoformat() if b.rueckgabe_datum else _unbekanntes_datum_html}</td>"
+        f"<td>{b.row.gebucht_am.strftime('%Y-%m-%d') if b.row.gebucht_am else ''}</td>"
         f"<td>{eur(b.row.bankentgelt_cent)}</td><td>{h(b.row.beleg_referenz)}</td>"
         f"<td>RLS-OP #{b.row.ruecklastschrift_op_position_id}"
         f"{' / Bank-Tx #' + str(b.row.bank_transaktion_id) if b.row.bank_transaktion_id is not None else ''}</td>"
@@ -121,7 +158,7 @@ def _kontoblatt_html(kontoblatt, *, konto_id: str) -> str:
         <div class="card"><h3>Dokumentierte, (noch) nicht belastete Bankaufwände</h3>
           <p class="muted">Erfasst, aber NICHT als Forderung gebucht - NICHT im Gesamtsaldo enthalten. Summe:
              <strong>{eur(bankaufwand_summe)}</strong></p>
-          <table><tr><th>Rückgabe</th><th>Bankentgelt</th><th>Beleg</th><th>Bezug</th><th>Status</th></tr>
+          <table><tr><th>Rückgabe (Bankereignistag)</th><th>Erfasst am</th><th>Bankentgelt</th><th>Beleg</th><th>Bezug</th><th>Status</th></tr>
           {bankaufwand_zeilen}</table>
         </div>"""
 
@@ -142,27 +179,30 @@ def _kontoblatt_html(kontoblatt, *, konto_id: str) -> str:
 
     return f"""
     <div class="card"><h2>Kostenübersicht</h2>
-      <p>Hauptforderung: <strong>{eur(kontoblatt.hauptforderung_cent)}</strong> &nbsp;|&nbsp;
-         Gebuchte Kosten: <strong>{eur(kontoblatt.kosten_cent)}</strong> &nbsp;|&nbsp;
-         Zahlungs-/Stornostand: <strong>{eur(kontoblatt.zahlungen_saldo_cent)}</strong> &nbsp;|&nbsp;
+      <p>Hauptforderung gebucht (Sollsumme vor Zahlungen): <strong>{eur(kontoblatt.hauptforderung_cent)}</strong>
+         &nbsp;· davon noch offen: <strong>{eur(kontoblatt.hauptforderung_offener_rest_cent)}</strong></p>
+      <p>Kosten gebucht (Sollsumme vor Zahlungen): <strong>{eur(kontoblatt.kosten_cent)}</strong>
+         &nbsp;· davon noch offen: <strong>{eur(kontoblatt.kosten_offener_rest_cent)}</strong></p>
+      <p>Zahlungs-/Stornostand: <strong>{eur(kontoblatt.zahlungen_saldo_cent)}</strong> &nbsp;|&nbsp;
          Gesamtsaldo: <strong>{eur(kontoblatt.saldo_cent)}</strong></p>
       <p><a href="/backoffice/konto/{h(konto_id)}/kontoauszug.pdf">PDF-Kontoauszug herunterladen</a></p>
       <details open><summary>Hauptforderung ({len(kontoblatt.hauptforderung_zeilen)})</summary>
-        <table><tr><th>Datum</th><th>Typ</th><th>Betrag</th><th>Offener Rest</th><th>Beleg/Grund</th></tr>
-        {hauptforderung_zeilen if kontoblatt.hauptforderung_zeilen else '<tr><td colspan=5 class="muted">Keine Hauptforderungszeilen.</td></tr>'}
+        <table><tr><th>Datum</th><th>Typ</th><th>Betrag</th><th>Offener Rest</th><th>Status</th><th>Beleg/Grund</th></tr>
+        {hauptforderung_zeilen if kontoblatt.hauptforderung_zeilen else '<tr><td colspan=6 class="muted">Keine Hauptforderungszeilen.</td></tr>'}
         </table>
       </details>
       <details open><summary>Tatsächlich gebuchte Kosten ({len(kontoblatt.kosten_zeilen)}) - bereits im Gesamtsaldo enthalten</summary>
-        <table><tr><th>Datum</th><th>Typ</th><th>Kategorie</th><th>Betrag</th><th>Offener Rest</th><th>Beleg/Grund</th></tr>
-        {kosten_zeilen if kontoblatt.kosten_zeilen else '<tr><td colspan=6 class="muted">Keine gebuchten Mahngebühren/-pauschale, Verzugszinsen oder Rücklastschriftkosten.</td></tr>'}
+        <table><tr><th>Datum</th><th>Typ</th><th>Kategorie</th><th>Betrag</th><th>Offener Rest</th><th>Status</th><th>Beleg/Grund</th></tr>
+        {kosten_zeilen if kontoblatt.kosten_zeilen else '<tr><td colspan=7 class="muted">Keine gebuchten Mahngebühren/-pauschale, Verzugszinsen oder Rücklastschriftkosten.</td></tr>'}
         </table>
       </details>
       <details><summary>Zahlungen / Rücklastschriften - Stornostand ({len(kontoblatt.zahlungen_zeilen)})</summary>
-        <table><tr><th>Datum</th><th>Typ</th><th>Betrag</th><th>Offener Rest</th><th>Beleg/Grund</th></tr>
-        {zahlungen_zeilen if kontoblatt.zahlungen_zeilen else '<tr><td colspan=5 class="muted">Keine Zahlungen/Rücklastschriften.</td></tr>'}
+        <table><tr><th>Datum</th><th>Typ</th><th>Betrag</th><th>Offener Rest</th><th>Status</th><th>Beleg/Grund</th></tr>
+        {zahlungen_zeilen if kontoblatt.zahlungen_zeilen else '<tr><td colspan=6 class="muted">Keine Zahlungen/Rücklastschriften.</td></tr>'}
         </table>
       </details>
     </div>
+    {kosten_historie_karte}
     {bankaufwand_karte}
     {ausstehend_karte}"""
 
@@ -173,12 +213,21 @@ def kontoauszug(request: Request, konto_id: str, session=Depends(_current_sessio
     if konto is None:
         return _fehlerseite(session, "Kontoauszug", f"Unbekanntes Konto {konto_id}.")
     vertrag = deps._stammdaten_repo.get_vertrag(konto.vertrag_id)
-    einheit = deps._stammdaten_repo.get_einheit(vertrag.einheit_id) if vertrag else None
+    if vertrag is None:
+        return _fehlerseite(session, "Kontoauszug", "Stammdaten unvollständig.")
+    # Codex-Abnahme 20.10.2026, P1: bislang prüfte NUR die PDF-Route den
+    # Gesellschaftszugriff - diese HTML-Route las Debitor/Kosten/Saldo
+    # bereits VOR jeder Zugriffsprüfung. Jetzt konsistent VOR jedem
+    # weiteren Datenread auf BEIDEN Wegen geprüft (keine bloße
+    # Ausblendung einzelner Kartenabschnitte für ein fremdes Konto -
+    # eine fehlende Berechtigung bricht die gesamte Route ab).
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    einheit = deps._stammdaten_repo.get_einheit(vertrag.einheit_id)
     debitor = deps._stammdaten_repo.get_debitor(konto.debitor_id)
     gesperrt = _objekt_fuer_vertrag_gesperrt(konto.vertrag_id)
     positionen = deps._op_service.list_alle_positionen(konto_id)
     saldo = deps._op_service.berechne_saldo(konto_id)
-    aktive_sperren = deps._stammdaten_repo.aktive_sperren(vertrag.id) if vertrag is not None else []
+    aktive_sperren = deps._stammdaten_repo.aktive_sperren(vertrag.id)
 
     banner = flash_error("Objekt ist von der Pilotphase ausgeschlossen - nur Ansicht.") if gesperrt else ""
     aktion = "" if gesperrt else f'<p><a href="/backoffice/konto/{h(konto_id)}/buchen">+ Nachbuchung (SOLL/GUTSCHRIFT)</a></p>'

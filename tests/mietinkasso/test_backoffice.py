@@ -4928,11 +4928,186 @@ def test_kontoauszug_zeigt_gebuchte_kosten_getrennt_nach_kategorie(backoffice_cl
     assert "Mahnspesen" not in seite.text  # kein Zinsprofil freigegeben -> keine Gebühr gebucht
 
 
+def test_kontoauszug_zeigt_rueckgabedatum_nicht_erfassungsdatum(backoffice_client):
+    """Codex-Abnahme 20.10.2026, P2: "Rückgabe" muss den tatsächlichen
+    Bankereignistag (`belegdatum` der Rücklastschrift-OP, hier 10.04.)
+    zeigen, NICHT das spätere technische Erfassungsdatum
+    (`RuecklastschriftkostenTable.gebucht_am`, server-seitig der
+    tatsächliche, aktuelle Erfassungszeitpunkt - also heute, nicht der
+    10.04.). Beide Angaben erscheinen getrennt."""
+
+    from mietinkasso.bank.ruecklastschriftkosten_service import RuecklastschriftkostenRepository, RuecklastschriftkostenService
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    client, *_ = backoffice_client
+    _login(client)
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("RUECKGABEDATUM")
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+
+    # Die Rücklastschrift-OP trägt das ECHTE Bankereignisdatum 10.04. -
+    # die Kostenerfassung selbst (gebucht_am) läuft über server_default=
+    # func.now() und ist damit immer das tatsächliche HEUTE, nicht der
+    # 10.04. - genau der Unterschied, den dieser Test belegt.
+    rls_op = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.RUECKLASTSCHRIFT, betrag_cent=700,
+        belegdatum=date(2026, 4, 10), buchungsdatum=date(2026, 4, 10), faelligkeit=None,
+        beleg_referenz="Rücklastschrift 10.04.",
+    )
+    rls_service = RuecklastschriftkostenService(session_factory=session_factory, op_service=op_service, repository=RuecklastschriftkostenRepository(session_factory))
+    rls_service.erfasse_und_buche(
+        ctx=_ctx_admin(), ruecklastschrift_op_position=rls_op, vertrag_id=vertrag.id, konto=konto,
+        bankentgelt_cent=700, rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=False,
+        zurechenbarkeit_begruendung="Zurechenbarkeit noch nicht belegt, rechtlich in Prüfung.",
+        beleg_referenz="Bankbeleg-RUECKGABEDATUM", heute=date(2026, 4, 18), akteur="codex-test",
+    )
+
+    heute_text = date.today().strftime("%Y-%m-%d")
+    seite = client.get(f"/backoffice/konto/{konto.id}")
+    assert seite.status_code == 200
+    assert "2026-04-10" in seite.text  # Rückgabe (Bankereignistag)
+    assert heute_text in seite.text  # Erfasst am (tatsächliches Erfassungsdatum)
+
+    pdf_antwort = client.get(f"/backoffice/konto/{konto.id}/kontoauszug.pdf")
+    assert pdf_antwort.status_code == 200
+    from pypdf import PdfReader
+    import io
+    text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_antwort.content)).pages)
+    assert "Rückgabe 10.04.2026" in text
+    assert f"Erfasst am {date.today().strftime('%d.%m.%Y')}" in text
+
+
+def test_kontoauszug_zeigt_status_und_historie_korrigierter_kostenzeile(backoffice_client):
+    """Codex-Abnahme 20.10.2026, P3: eine korrigierte Mahnspesen-Zeile
+    muss sowohl ihren eigenen Status (offen/teilbezahlt/bezahlt) als
+    auch die stornierte Vorgängerzeile in einer Historie zeigen - der
+    Gesamtsaldo darf sich dabei NICHT ändern (es ist dieselbe Forderung,
+    nur auf einen korrigierten Betrag umgeschrieben)."""
+
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
+    from mietinkasso.mahnwesen.kosten_service import MahnkostenService
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    client, *_ = backoffice_client
+    _login(client)
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("STATUS-HISTORIE")
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1), faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ",
+    )
+    mahnkosten_repo = MahnkostenRepository(session_factory)
+    mahnkosten_service = MahnkostenService(mahnkosten_repo, op_service, stammdaten)
+    gebucht = mahnkosten_service.buche_bei_versand(
+        ctx=_ctx_admin(), vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1),
+        versandnachweis_referenz="mahnung:kontoblatt-status-historie", akteur="codex-test",
+    )
+    assert gebucht is not None and gebucht.zinsen_op_position_id is not None
+    saldo_vor_korrektur = op_service.berechne_saldo(konto.id).saldo_cent
+
+    # Die gebuchte Verzugszinsen-Position wird nachträglich korrigiert
+    # (z. B. ein falscher Zinssatz) - dieselbe Fachbuchung, nur
+    # umgeschrieben, kein zweiter Vorgang.
+    op_service.storniere_und_korrigiere(
+        ctx=_ctx_admin(), konto=konto, original_id=gebucht.zinsen_op_position_id,
+        aenderungsgrund="Zinssatz nachträglich korrigiert", neuer_betrag_cent=200,
+    )
+    assert op_service.berechne_saldo(konto.id).saldo_cent == saldo_vor_korrektur - gebucht.zinsen_cent + 200
+
+    seite = client.get(f"/backoffice/konto/{konto.id}")
+    assert seite.status_code == 200
+    assert "Kosten-Historie" in seite.text
+    assert "ersetzt" in seite.text
+    assert "offen" in seite.text or "bezahlt" in seite.text  # Status der korrigierten (aktiven) Zeile
+    assert "2,00" in seite.text  # der korrigierte Betrag (200 Cent)
+
+
+def test_kontoauszug_zeigt_kostenstatus_offen_teilbezahlt_bezahlt(backoffice_client):
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
+    from mietinkasso.mahnwesen.kosten_service import MahnkostenService
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    client, *_ = backoffice_client
+    _login(client)
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("STATUS-OFFEN-BEZAHLT")
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1), faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ",
+    )
+    mahnkosten_repo = MahnkostenRepository(session_factory)
+    mahnkosten_service = MahnkostenService(mahnkosten_repo, op_service, stammdaten)
+    gebucht = mahnkosten_service.buche_bei_versand(
+        ctx=_ctx_admin(), vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1),
+        versandnachweis_referenz="mahnung:kontoblatt-status-offen", akteur="codex-test",
+    )
+    assert gebucht is not None and gebucht.zinsen_op_position_id is not None
+
+    seite_offen = client.get(f"/backoffice/konto/{konto.id}")
+    assert "offen" in seite_offen.text  # noch keine Zahlung
+
+    # Vollständige Zahlung der Verzugszinsen-Position -> Status "bezahlt".
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.ZAHLUNG, betrag_cent=489,
+        belegdatum=date(2026, 3, 5), buchungsdatum=date(2026, 3, 5), faelligkeit=None,
+        beleg_referenz="Zahlung Verzugszinsen", bezieht_sich_auf_id=gebucht.zinsen_op_position_id,
+    )
+    seite_bezahlt = client.get(f"/backoffice/konto/{konto.id}")
+    assert "bezahlt" in seite_bezahlt.text
+    assert "Gebucht (Sollsumme vor Zahlungen)" in seite_bezahlt.text or "Sollsumme vor Zahlungen" in seite_bezahlt.text
+
+
 def test_kontoauszug_pdf_fuer_objekt_107_ausgeschlossen(backoffice_client):
     client, _konto_id, konto_gesperrt_id, _op_service = backoffice_client
     _login(client)
     antwort = client.get(f"/backoffice/konto/{konto_gesperrt_id}/kontoauszug.pdf")
     assert antwort.status_code == 400
+
+
+def test_kontoauszug_html_und_pdf_lehnen_fremdes_konto_ohne_gesellschaftszugriff_ab(backoffice_client, monkeypatch):
+    """Codex-Abnahme 20.10.2026, P1: bislang prüfte NUR die PDF-Route den
+    Gesellschaftszugriff - die HTML-Route (`kontoauszug`) las Debitor/
+    Kosten/Saldo bereits VOR jeder Zugriffsprüfung. Der echte Ein-
+    Operator-Login liefert immer eine uneingeschränkte ADMIN-Sitzung
+    (`backoffice/auth.py::_ctx`), eine eingeschränkte Gesellschaft lässt
+    sich deshalb nur simulieren, indem `_ctx` GENAU in diesem Routen-
+    Modul (die lokale Bindung aus `from ... import _ctx`) monkeypatcht
+    wird - derselbe Mechanismus, den beide Routen tatsächlich aufrufen.
+    Eine fehlende Berechtigung muss die GESAMTE Route abbrechen (keine
+    bloße Ausblendung eines Kartenabschnitts bei sonst sichtbaren
+    Debitor-/Kostendaten)."""
+
+    import mietinkasso.backoffice.routes.konten as konten_modul
+    from mietinkasso.auth.service import AuthContext
+    from mietinkasso.domain.enums import Rolle
+    from mietinkasso.domain.exceptions import CrossTenantError
+
+    client, konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+
+    fremd_ctx = AuthContext(user_id="fremd", rolle=Rolle.BUCHHALTUNG, gesellschaft_ids=frozenset({"ANDERE-GESELLSCHAFT"}))
+    monkeypatch.setattr(konten_modul, "_ctx", lambda session: fremd_ctx)
+
+    with pytest.raises(CrossTenantError):
+        client.get(f"/backoffice/konto/{konto_id}")
+    with pytest.raises(CrossTenantError):
+        client.get(f"/backoffice/konto/{konto_id}/kontoauszug.pdf")
 
 
 def test_kontoauszug_pdf_ist_reiner_get_ohne_datenbankaenderung(backoffice_client):

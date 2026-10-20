@@ -23,7 +23,24 @@ OP-Summe (das würde jede bereits gebuchte Kostenzeile doppelt zählen).
 Die Kategorie-Zuordnung unten (`Kontoblatt.kosten_zeilen` vs.
 `hauptforderung_zeilen`) dient AUSSCHLIESSLICH der Anzeige/Gruppierung,
 niemals der Saldoberechnung selbst - siehe `test_kontoblatt.py::
-test_summe_aller_kategorien_ergibt_exakt_den_echten_saldo`.
+test_gebuchte_kosten_genau_einmal_beide_ruecklastschriften_separat`/
+`test_lade_kontoblatt_gegen_echte_repositories` (prüfen explizit
+`hauptforderung_cent + kosten_cent + zahlungen_saldo_cent == saldo_cent`).
+
+**Status statt bloßem `rest_cent` (Codex-Abnahme 20.10.2026, P3):**
+`rest_cent is None` konnte bisher sowohl "vollständig beglichen" als auch
+"keine Forderung" (z. B. eine GUTSCHRIFT) bedeuten - `KontoblattZeile.
+status` löst das auf (`STATUS_OFFEN`/`STATUS_TEILBEZAHLT`/
+`STATUS_BEZAHLT`, `None` nur für Zeilen ohne eigenen Forderungscharakter).
+Zusätzlich führt `Kontoblatt.kosten_historie` bereits STORNIERTE (ggf.
+durch eine Korrektur ERSETZTE) Kostenzeilen separat von `kosten_zeilen`/
+`kosten_cent` weiter - eine stornierte Kostenbuchung verschwindet dadurch
+nicht spurlos, verändert aber weder die aktuelle Summe noch den
+Gesamtsaldo. `hauptforderung_cent`/`kosten_cent` sind dabei IMMER die
+gebuchte Sollsumme VOR Zahlungen - der tatsächliche, nach Zahlungen noch
+offene Rückstand steht separat in `hauptforderung_offener_rest_cent`/
+`kosten_offener_rest_cent`, damit eine bereits (teil-)bezahlte Forderung
+nicht als voller Rückstand missverstanden wird.
 
 **Dokumentiert, aber nicht belastet:** ein erfasstes Rücklastschrift-
 Bankentgelt OHNE belegte Zurechenbarkeit zum Zahlungspflichtigen
@@ -59,6 +76,7 @@ betrifft nur die Anzeige-Kategorie, nicht den Gesamtsaldo."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 
 from mietinkasso.domain.enums import OPTyp
 from mietinkasso.infrastructure.db.tables import (
@@ -73,6 +91,28 @@ KATEGORIE_VERZUGSZINSEN = "VERZUGSZINSEN"
 KATEGORIE_MAHNSPESEN = "MAHNSPESEN"
 KATEGORIE_MAHNPAUSCHALE = "MAHNPAUSCHALE"
 KATEGORIE_RUECKLASTSCHRIFTKOSTEN = "RUECKLASTSCHRIFTKOSTEN"
+
+#: Status EINER Zeile (Codex-Abnahme 20.10.2026, P3) - löst die bisherige
+#: Mehrdeutigkeit auf, bei der `rest_cent is None` sowohl "vollständig
+#: bezahlt" als auch "keine Forderung" bedeuten konnte.
+STATUS_OFFEN = "OFFEN"
+STATUS_TEILBEZAHLT = "TEILBEZAHLT"
+STATUS_BEZAHLT = "BEZAHLT"
+#: Nur in `Kontoblatt.kosten_historie` (bereits STORNIERTE Zeilen):
+#: STORNIERT = endgültig storniert, KEIN Ersatz; ERSETZT = storniert UND
+#: durch eine Korrekturzeile (`OPService.storniere_und_korrigiere`)
+#: ersetzt - die Ersatzzeile selbst führt mit ihrem EIGENEN Status
+#: (offen/teilbezahlt/bezahlt) in `kosten_zeilen` fort.
+STATUS_STORNIERT = "STORNIERT"
+STATUS_ERSETZT = "ERSETZT"
+
+STATUS_LABEL = {
+    STATUS_OFFEN: "offen",
+    STATUS_TEILBEZAHLT: "teilbezahlt",
+    STATUS_BEZAHLT: "bezahlt",
+    STATUS_STORNIERT: "storniert",
+    STATUS_ERSETZT: "ersetzt (siehe Korrekturzeile)",
+}
 
 #: Anzeige-Beschriftung je Kostenkategorie (NICHT für HAUPTFORDERUNG -
 #: die zeigt stattdessen den OP-Typ/`beleg_referenz` wie bisher).
@@ -109,16 +149,22 @@ def _effect_cent(position: OPPositionTable) -> int:
 
 @dataclass(frozen=True)
 class KontoblattZeile:
-    """Eine einzelne, bereits auf dem Konto AKTIVE OP-Zeile mit ihrer
-    Kontoblatt-Kategorie - reine Anzeige-Gruppierung, kein eigener
-    Geldwert abseits von `position.betrag_cent`/`position.typ`.
-    `rest_cent` ist `None`, wenn die Zeile nicht forderungsseitig ist
-    oder bereits vollständig beglichen wurde (siehe `OPService.
-    offene_forderungen`)."""
+    """Eine einzelne OP-Zeile mit ihrer Kontoblatt-Kategorie - reine
+    Anzeige-Gruppierung, kein eigener Geldwert abseits von `position.
+    betrag_cent`/`position.typ`. `rest_cent` ist `None`, wenn die Zeile
+    nicht forderungsseitig ist oder bereits vollständig beglichen wurde
+    (siehe `OPService.offene_forderungen`) - `status` löst diese
+    Mehrdeutigkeit ausdrücklich auf (Codex-Abnahme 20.10.2026, P3):
+    `STATUS_BEZAHLT` bei vollständiger Begleichung, `None` bei einer
+    Zeile ohne eigenen Forderungscharakter (z. B. GUTSCHRIFT/ZAHLUNG/
+    KORREKTUR). In `Kontoblatt.kosten_zeilen` ist `status` IMMER eine der
+    drei aktiven Werte (offen/teilbezahlt/bezahlt); in `Kontoblatt.
+    kosten_historie` IMMER `STORNIERT`/`ERSETZT`."""
 
     position: OPPositionTable
     kategorie: str
     rest_cent: int | None
+    status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -126,9 +172,19 @@ class DokumentierterBankaufwand:
     """Ein erfasstes, aber (noch) NICHT als Forderung gebuchtes
     Rücklastschrift-Bankentgelt - KEINE OP-Zeile, fließt daher nicht in
     den Saldo ein. `status_text` ist wörtlich der vom Auftraggeber
-    vorgegebene Text."""
+    vorgegebene Text.
+
+    `rueckgabe_datum` ist der TATSÄCHLICHE Bankereignistag (Codex-Abnahme
+    20.10.2026, P2) - das `belegdatum` der gebundenen Rücklastschrift-
+    OP-Zeile (`row.ruecklastschrift_op_position_id`), NICHT `row.
+    gebucht_am` (das ist nur das spätere ERFASSUNGSdatum dieser Kosten-
+    Dokumentationszeile selbst). `None`, wenn die referenzierte OP-Zeile
+    nicht auffindbar ist ("Datum unbekannt" statt eines erfundenen
+    Datums) - `row.gebucht_am` bleibt daneben als eigenes, korrekt
+    benanntes Erfassungsdatum erhalten."""
 
     row: RuecklastschriftkostenTable
+    rueckgabe_datum: date | None
     status_text: str = "dokumentiert – nicht belastet / rechtlich in Prüfung"
 
 
@@ -138,9 +194,26 @@ class Kontoblatt:
     saldo_cent: int
     faelliger_unstrittiger_rest_cent: int
     hauptforderung_zeilen: list[KontoblattZeile]
+    #: Gebuchte Sollsumme VOR Zahlungen (Codex-Abnahme 20.10.2026, P3 -
+    #: NICHT mit dem aktuellen offenen Rest verwechseln, siehe
+    #: `hauptforderung_offener_rest_cent`).
     hauptforderung_cent: int
+    #: Summe der tatsächlich NOCH offenen Beträge (`rest_cent`) über alle
+    #: `hauptforderung_zeilen` - das ist der tatsächliche Rückstand,
+    #: NICHT `hauptforderung_cent` (das bliebe nach einer Zahlung
+    #: unverändert hoch und würde als Rückstand missverstanden).
+    hauptforderung_offener_rest_cent: int
     kosten_zeilen: list[KontoblattZeile]
+    #: Gebuchte Sollsumme VOR Zahlungen (siehe oben, analog Hauptforderung).
     kosten_cent: int
+    #: Summe der tatsächlich noch offenen Kostenbeträge (siehe oben).
+    kosten_offener_rest_cent: int
+    #: Bereits STORNIERTE (ggf. durch eine Korrektur ERSETZTE) Kosten-
+    #: zeilen - Codex-Abnahme 20.10.2026, P3: separat von `kosten_zeilen`/
+    #: `kosten_cent` geführt, verändert weder Summe noch Saldo, macht
+    #: eine stornierte Kostenbuchung aber nachvollziehbar statt sie
+    #: stillschweigend verschwinden zu lassen.
+    kosten_historie: list[KontoblattZeile]
     zahlungen_zeilen: list[KontoblattZeile]
     zahlungen_saldo_cent: int
     dokumentierte_bankaufwaende: list[DokumentierterBankaufwand]
@@ -186,6 +259,26 @@ def _kategorie_fuer_position(
     return KATEGORIE_HAUPTFORDERUNG
 
 
+def _status_fuer_aktive_zeile(position: OPPositionTable, rest_cent: int | None) -> str | None:
+    """`None` für eine Zeile OHNE eigenen Forderungscharakter (GUTSCHRIFT/
+    ZAHLUNG/KORREKTUR - die mindern eine ANDERE Forderung, haben aber
+    keinen eigenen offenen Rest). Für eine echte Forderung (EROEFFNUNG/
+    SOLL/RUECKLASTSCHRIFT mit positivem Betrag) ist `rest_cent is None`
+    laut `OPService.offene_forderungen` eindeutig "vollständig beglichen"
+    (die Funktion gibt eine Forderung mit `rest_cent <= 0` gar nicht erst
+    zurück) - NIE mehr mit "keine Forderung" verwechselbar."""
+
+    if position.typ not in _POSITIVE_TYPEN or position.betrag_cent <= 0:
+        return None
+    if rest_cent is None:
+        return STATUS_BEZAHLT
+    if rest_cent >= position.betrag_cent:
+        return STATUS_OFFEN
+    if rest_cent > 0:
+        return STATUS_TEILBEZAHLT
+    return STATUS_BEZAHLT
+
+
 def erstelle_kontoblatt(
     *, konto_id: str, saldo_cent: int, faelliger_unstrittiger_rest_cent: int,
     positionen_aktiv: list[OPPositionTable], positionen_alle: list[OPPositionTable],
@@ -211,15 +304,16 @@ def erstelle_kontoblatt(
 
     for p in positionen_aktiv:
         rest = offene_forderungen_rest_je_id.get(p.id)
+        status = _status_fuer_aktive_zeile(p, rest)
         if p.typ in _ZAHLUNGS_TYPEN:
-            zahlungen_zeilen.append(KontoblattZeile(position=p, kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=rest))
+            zahlungen_zeilen.append(KontoblattZeile(position=p, kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=rest, status=status))
             zahlungen_saldo_cent += _effect_cent(p)
             continue
         kategorie = _kategorie_fuer_position(
             p, buchungs_id_kategorie=buchungs_kategorie, ruecklastschriftkosten_ids=ruecklastschriftkosten_ids,
             vorgaenger_index=vorgaenger_index,
         )
-        zeile = KontoblattZeile(position=p, kategorie=kategorie, rest_cent=rest)
+        zeile = KontoblattZeile(position=p, kategorie=kategorie, rest_cent=rest, status=status)
         if kategorie == KATEGORIE_HAUPTFORDERUNG:
             hauptforderung_zeilen.append(zeile)
             hauptforderung_cent += _effect_cent(p)
@@ -227,8 +321,54 @@ def erstelle_kontoblatt(
             kosten_zeilen.append(zeile)
             kosten_cent += _effect_cent(p)
 
+    # Codex-Abnahme 20.10.2026, P3: "gebuchte Sollsumme vor Zahlungen"
+    # (`hauptforderung_cent`/`kosten_cent`, oben) ist NICHT derselbe Wert
+    # wie der tatsächlich noch offene Rückstand - der kommt separat aus
+    # der Summe der je Zeile bereits korrekt verteilten `rest_cent`-Werte
+    # (`OPService.offene_forderungen`), NIE aus einer zweiten eigenen
+    # Zahlungsverteilung.
+    hauptforderung_offener_rest_cent = sum(z.rest_cent or 0 for z in hauptforderung_zeilen)
+    kosten_offener_rest_cent = sum(z.rest_cent or 0 for z in kosten_zeilen)
+
+    # Codex-Abnahme 20.10.2026, P3: bereits STORNIERTE Kostenzeilen bleiben
+    # als eigene Historie sichtbar (NIE Teil von `kosten_zeilen`/
+    # `kosten_cent` - das würde den Gesamtsaldo nicht ändern, aber eine
+    # stornierte Buchung fälschlich wie eine noch gültige behandeln).
+    # `_kategorie_fuer_position` erkennt eine stornierte Kostenzeile auch
+    # dann noch korrekt, wenn `MahnkostenBuchungTable`/
+    # `RuecklastschriftkostenTable` weiterhin auf ihre (jetzt stornierte)
+    # ID verweisen - diese Fremdreferenzen werden bei einer Korrektur NIE
+    # nachträglich umgeschrieben.
+    kosten_historie: list[KontoblattZeile] = []
+    for p in positionen_alle:
+        if p.status != "STORNIERT":
+            continue
+        kategorie = _kategorie_fuer_position(
+            p, buchungs_id_kategorie=buchungs_kategorie, ruecklastschriftkosten_ids=ruecklastschriftkosten_ids,
+            vorgaenger_index=vorgaenger_index,
+        )
+        if kategorie == KATEGORIE_HAUPTFORDERUNG:
+            continue
+        status = STATUS_ERSETZT if p.storniert_durch_id is not None else STATUS_STORNIERT
+        kosten_historie.append(KontoblattZeile(position=p, kategorie=kategorie, rest_cent=None, status=status))
+
+    # Codex-Abnahme 20.10.2026, P2: das tatsächliche Rückgabedatum kommt
+    # aus der gebundenen Rücklastschrift-OP-Zeile (`belegdatum`), NICHT
+    # aus `row.gebucht_am` (das ist nur der spätere Erfassungszeitpunkt
+    # DIESER Kosten-Dokumentationszeile). `positionen_alle` statt nur
+    # `positionen_aktiv`, damit das Datum auch dann noch auffindbar ist,
+    # wenn die Rücklastschrift-OP-Zeile selbst zwischenzeitlich storniert
+    # wurde - fehlt der Bezug ganz, wird NIE ein Datum erfunden.
+    positionen_alle_by_id = {p.id: p for p in positionen_alle}
     dokumentierte_bankaufwaende = [
-        DokumentierterBankaufwand(row=r) for r in ruecklastschriftkosten_zeilen if r.kosten_op_position_id is None
+        DokumentierterBankaufwand(
+            row=r,
+            rueckgabe_datum=(
+                positionen_alle_by_id[r.ruecklastschrift_op_position_id].belegdatum
+                if r.ruecklastschrift_op_position_id in positionen_alle_by_id else None
+            ),
+        )
+        for r in ruecklastschriftkosten_zeilen if r.kosten_op_position_id is None
     ]
     ausstehende_mahnlaeufe = [
         m for m in mahnlaeufe
@@ -238,7 +378,9 @@ def erstelle_kontoblatt(
     return Kontoblatt(
         konto_id=konto_id, saldo_cent=saldo_cent, faelliger_unstrittiger_rest_cent=faelliger_unstrittiger_rest_cent,
         hauptforderung_zeilen=hauptforderung_zeilen, hauptforderung_cent=hauptforderung_cent,
-        kosten_zeilen=kosten_zeilen, kosten_cent=kosten_cent,
+        hauptforderung_offener_rest_cent=hauptforderung_offener_rest_cent,
+        kosten_zeilen=kosten_zeilen, kosten_cent=kosten_cent, kosten_offener_rest_cent=kosten_offener_rest_cent,
+        kosten_historie=kosten_historie,
         zahlungen_zeilen=zahlungen_zeilen, zahlungen_saldo_cent=zahlungen_saldo_cent,
         dokumentierte_bankaufwaende=dokumentierte_bankaufwaende, ausstehende_mahnlaeufe=ausstehende_mahnlaeufe,
     )

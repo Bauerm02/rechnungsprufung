@@ -21,6 +21,11 @@ from mietinkasso.op.kontoblatt import (
     KATEGORIE_MAHNSPESEN,
     KATEGORIE_RUECKLASTSCHRIFTKOSTEN,
     KATEGORIE_VERZUGSZINSEN,
+    STATUS_BEZAHLT,
+    STATUS_ERSETZT,
+    STATUS_OFFEN,
+    STATUS_STORNIERT,
+    STATUS_TEILBEZAHLT,
     erstelle_kontoblatt,
 )
 
@@ -100,6 +105,35 @@ def test_beispiel_1000_hauptsaldo_plus_zwei_undokumentierte_7eur_bankentgelte():
         assert b.status_text == "dokumentiert – nicht belastet / rechtlich in Prüfung"
 
 
+def test_dokumentierter_bankaufwand_zeigt_rueckgabedatum_der_op_nicht_erfassungsdatum():
+    """Codex-Abnahme 20.10.2026, P2: `rueckgabe_datum` muss aus der
+    gebundenen Rücklastschrift-OP-Zeile kommen (`belegdatum`), NICHT aus
+    `row.gebucht_am` (das ist nur das spätere Erfassungsdatum der
+    Kosten-Dokumentationszeile selbst). Rückgabe 10.04., Erfassung
+    18.04. - `rueckgabe_datum` muss den 10.04. zeigen."""
+
+    rueckgabe_op = _op(10, "RUECKLASTSCHRIFT", 5000, belegdatum=date(2026, 4, 10))
+    rls = _ruecklastschrift_kosten(kosten_op_position_id=None, ruecklastschrift_op_position_id=10)
+    rls.gebucht_am = date(2026, 4, 18)  # spätere Erfassung
+
+    blatt = _leer(positionen_aktiv=[rueckgabe_op], positionen_alle=[rueckgabe_op], ruecklastschriftkosten_zeilen=[rls])
+
+    assert len(blatt.dokumentierte_bankaufwaende) == 1
+    aufwand = blatt.dokumentierte_bankaufwaende[0]
+    assert aufwand.rueckgabe_datum == date(2026, 4, 10)
+    assert aufwand.row.gebucht_am == date(2026, 4, 18)  # bleibt als eigenes Erfassungsdatum erhalten
+    assert aufwand.rueckgabe_datum != aufwand.row.gebucht_am
+
+
+def test_dokumentierter_bankaufwand_ohne_auffindbare_op_hat_kein_erfundenes_datum():
+    """Fehlt der Bezug zur Rücklastschrift-OP-Zeile, wird NIE ein Datum
+    erfunden - `rueckgabe_datum` bleibt `None` ("Datum unbekannt")."""
+
+    rls = _ruecklastschrift_kosten(kosten_op_position_id=None, ruecklastschrift_op_position_id=999)
+    blatt = _leer(positionen_aktiv=[], positionen_alle=[], ruecklastschriftkosten_zeilen=[rls])
+    assert blatt.dokumentierte_bankaufwaende[0].rueckgabe_datum is None
+
+
 def test_gebuchte_kosten_genau_einmal_beide_ruecklastschriften_separat():
     """Zwei TATSÄCHLICH gebuchte Rücklastschriftkosten (je eine eigene
     OP-SOLL-Zeile) - jede erscheint genau einmal in `kosten_zeilen`, die
@@ -145,6 +179,65 @@ def test_mahngebuehr_und_zinsen_getrennt():
     assert blatt.hauptforderung_cent == 100_000
 
 
+def test_kostenzeile_status_offen_teilbezahlt_bezahlt():
+    """Codex-Abnahme 20.10.2026, P3: `rest=None` bedeutet nicht mehr
+    pauschal "bezahlt" - `status` macht offen/teilbezahlt/bezahlt
+    ausdrücklich unterscheidbar."""
+
+    gebuehr_offen = _op(2, "SOLL", 2000, quelle_system="mahnkosten")
+    gebuehr_teilbezahlt = _op(3, "SOLL", 2000, quelle_system="mahnkosten")
+    gebuehr_bezahlt = _op(4, "SOLL", 2000, quelle_system="mahnkosten")
+    buchung_offen = _buchung(stufe=1, gebuehr_op_position_id=2)
+    buchung_teil = _buchung(stufe=2, gebuehr_op_position_id=3)
+    buchung_bezahlt = _buchung(stufe=3, gebuehr_op_position_id=4)
+
+    alle = [gebuehr_offen, gebuehr_teilbezahlt, gebuehr_bezahlt]
+    blatt = _leer(
+        positionen_aktiv=alle, positionen_alle=alle,
+        mahnkosten_buchungen=[buchung_offen, buchung_teil, buchung_bezahlt],
+        offene_forderungen_rest_je_id={2: 2000, 3: 800},  # 4 fehlt -> vollständig beglichen
+    )
+    status_je_id = {z.position.id: z.status for z in blatt.kosten_zeilen}
+    assert status_je_id[2] == STATUS_OFFEN
+    assert status_je_id[3] == STATUS_TEILBEZAHLT
+    assert status_je_id[4] == STATUS_BEZAHLT
+    # Gebuchte Sollsumme (6000) vs. tatsächlich noch offener Rest (2000+800=2800).
+    assert blatt.kosten_cent == 6000
+    assert blatt.kosten_offener_rest_cent == 2800
+
+
+def test_rein_stornierte_kostenzeile_ohne_ersatz_zeigt_status_storniert():
+    """Eine Kostenzeile, die OHNE Ersatz storniert wurde (`storniert_durch_id
+    is None`), muss als STORNIERT (nicht ERSETZT) in der Historie
+    erscheinen - und NICHT in kosten_zeilen/kosten_cent."""
+
+    stornierte_gebuehr = _op(10, "SOLL", 2000, status="STORNIERT", quelle_system="mahnkosten", storniert_durch_id=None)
+    buchung = _buchung(gebuehr_op_position_id=10)
+
+    blatt = _leer(saldo_cent=0, positionen_aktiv=[], positionen_alle=[stornierte_gebuehr], mahnkosten_buchungen=[buchung])
+
+    assert blatt.kosten_zeilen == []
+    assert blatt.kosten_cent == 0
+    assert len(blatt.kosten_historie) == 1
+    assert blatt.kosten_historie[0].status == STATUS_STORNIERT
+
+
+def test_hauptforderung_offener_rest_unterscheidet_sich_von_gebuchter_sollsumme():
+    """Codex-Abnahme 20.10.2026, P3: `hauptforderung_cent` (gebuchte
+    Sollsumme) darf NICHT mit `hauptforderung_offener_rest_cent`
+    (tatsächlicher Rückstand nach Zahlungen) verwechselt werden - sonst
+    wird eine bereits teilweise bezahlte Forderung als voller Rückstand
+    missverstanden."""
+
+    hauptforderung = _op(1, "SOLL", 50_000)
+    blatt = _leer(
+        positionen_aktiv=[hauptforderung], positionen_alle=[hauptforderung],
+        offene_forderungen_rest_je_id={1: 20_000},  # 30.000 bereits bezahlt
+    )
+    assert blatt.hauptforderung_cent == 50_000  # gebuchte Sollsumme vor Zahlungen
+    assert blatt.hauptforderung_offener_rest_cent == 20_000  # tatsächlicher Rückstand
+
+
 def test_storno_und_korrektur_einer_kostenzeile_bleibt_kostenzeile():
     """`storniere_und_korrigiere` legt die Ersatzzeile mit
     `quelle_system="korrektur"` an - die korrigierte Zeile muss trotzdem
@@ -167,6 +260,14 @@ def test_storno_und_korrektur_einer_kostenzeile_bleibt_kostenzeile():
     assert blatt.kosten_zeilen[0].kategorie == KATEGORIE_MAHNSPESEN
     assert blatt.kosten_cent == 1000  # der KORRIGIERTE Betrag, nicht der ursprüngliche
     assert blatt.hauptforderung_zeilen == []  # NICHT fälschlich als Hauptforderung einsortiert
+
+    # Codex-Abnahme 20.10.2026, P3: die stornierte ORIGINAL-Zeile bleibt
+    # in der Historie sichtbar (Status ERSETZT, da eine Korrekturzeile
+    # existiert) - NICHT Teil von kosten_zeilen/kosten_cent.
+    assert len(blatt.kosten_historie) == 1
+    assert blatt.kosten_historie[0].position.id == 10
+    assert blatt.kosten_historie[0].status == STATUS_ERSETZT
+    assert blatt.kosten_historie[0].kategorie == KATEGORIE_MAHNSPESEN
 
 
 def test_unkorrigierte_fremde_korrektur_ohne_herkunft_bleibt_hauptforderung():

@@ -5464,8 +5464,10 @@ bestehenden Bank-/Versandlogik.
   auth.py::_ctx` vergibt für JEDE angemeldete Sitzung
   `AuthContext(rolle=ADMIN, gesellschaft_ids=None)` (Ein-Operator-
   Pilotmodul, siehe dortiger Code-Kommentar) - `require_gesellschaft_
-  access` ist deshalb in der neuen PDF-Route nur defensiv vorhanden,
-  prüft aber praktisch nichts zusätzlich. Die tatsächlich wirksame
+  access` ist deshalb (seit der Codex-Gegenprüfung auf BEIDEN Wegen,
+  HTML UND PDF, siehe unten) nur defensiv vorhanden, prüft aber
+  praktisch nichts zusätzlich, solange der Ein-Operator-Login diese
+  Rolle vergibt. Die tatsächlich wirksame
   Zugriffsschranke in diesem Modul ist durchgehend der
   Objekt-107-Ausschluss, den die neue Kostenübersicht/der PDF-
   Kontoauszug konsequent respektiert (anders als die alte, historisch
@@ -5491,3 +5493,56 @@ Kategorietrennung, Objekt-107-Ausschluss der PDF-Route, reiner
 GET/PDF ändert keine DB/kein Audit, Mieterakte-Link). Ausschließlich
 synthetische Testdaten, keine echten IBANs/Originale, keine
 Serverzugriffe, keine Geschäftsaktionen.
+
+### Codex-Gegenprüfung fc3d22a (vier konkrete Korrekturen)
+
+1. **P1 - Gesellschaftszugriff auch auf der HTML-Route**: `kontoauszug()`
+   las bisher Debitor/Kosten/Saldo bereits VOR jeder Zugriffsprüfung -
+   nur die PDF-Route prüfte. Jetzt läuft `require_gesellschaft_access`
+   auf BEIDEN Wegen VOR jedem weiteren Datenread; eine fehlende
+   Berechtigung bricht die GESAMTE Route ab (kein bloßes Ausblenden
+   einzelner Kartenabschnitte). Die oben dokumentierte strukturelle
+   Grenze bleibt bestehen (Ein-Operator-Pilot, `_ctx` liefert immer
+   ADMIN/uneingeschränkt) - getestet durch Monkeypatchen der lokalen
+   `_ctx`-Bindung GENAU in `backoffice/routes/konten.py` (derselbe
+   Mechanismus, den beide Routen tatsächlich aufrufen).
+2. **P2 - Rückgabedatum war das Erfassungsdatum**: HTML und PDF zeigten
+   unter "Rückgabe" bisher `RuecklastschriftkostenTable.gebucht_am` (das
+   spätere Erfassungsdatum DIESER Dokumentationszeile), nicht den
+   tatsächlichen Bankereignistag. `DokumentierterBankaufwand.
+   rueckgabe_datum` (neu) kommt jetzt aus dem `belegdatum` der
+   gebundenen Rücklastschrift-OP-Zeile (`positionen_alle`, damit auch
+   nach einer späteren Stornierung dieser OP-Zeile noch auffindbar) -
+   fehlt der Bezug, "Datum unbekannt" statt eines erfundenen Werts.
+   `gebucht_am` bleibt daneben als eigenes, korrekt benanntes
+   Erfassungsdatum ("Erfasst am") erhalten.
+3. **P3 - Status/Historie statt mehrdeutigem `rest=None`**: neue
+   `KontoblattZeile.status` (OFFEN/TEILBEZAHLT/BEZAHLT, `None` nur für
+   Zeilen ohne eigenen Forderungscharakter) löst die bisherige
+   Mehrdeutigkeit auf. Neue `Kontoblatt.kosten_historie` führt bereits
+   STORNIERTE (ggf. durch eine Korrektur ERSETZTE) Kostenzeilen separat
+   weiter - sichtbar, aber NIE Teil von `kosten_cent`/dem Gesamtsaldo.
+   Neue `hauptforderung_offener_rest_cent`/`kosten_offener_rest_cent`
+   trennen die gebuchte Sollsumme (vor Zahlungen) vom tatsächlichen,
+   nach Zahlungen noch offenen Rückstand - in HTML und PDF jetzt beide
+   Werte beschriftet nebeneinander statt eines einzigen, missverständ-
+   lichen Betrags.
+4. **P4 - PDF-Kopf lief bei langen Bezeichnungen über**: `cell()` bricht
+   nicht um - eine lange echte Firmen-/Objekt-/Einheitsbezeichnung lief
+   bisher rechts aus der Kopfzelle heraus. Jetzt per `multi_cell` mit
+   vorab per Dry-Run ermittelter Höhe mehrzeilig; die Trennlinie/der
+   Fließtextbeginn liegen auf JEDER Seite unter dem jeweils höheren von
+   Logo (großzügig reservierte Mindesthöhe, dieselbe 32-mm-Breite wie
+   bisher, kein neues Logo) und tatsächlich umgebrochenem Titel - per
+   `pypdf`-Textpositionsprüfung geometrisch verifiziert (kein
+   Überlappen zwischen letzter Kopfzeile und Fließtext).
+
+Zusätzliche/angepasste Tests: 5 neue in `test_kontoblatt.py` (Status
+offen/teilbezahlt/bezahlt, Storno ohne Ersatz, Rückgabedatum ≠
+Erfassungsdatum, fehlender Bezug → "Datum unbekannt", gebuchte Sollsumme
+≠ offener Rest), 4 neue in `test_kontoauszug_pdf.py` (Status-Anzeige,
+Kosten-Historie, Kopf-Umbruch-Geometrie, Rückgabedatum-Trennung), 4 neue
+HTTP-Tests in `test_backoffice.py` (fremdes Konto ohne Zugriff für BEIDE
+Routen, Rückgabedatum vs. Erfassungsdatum, Status/Historie einer
+korrigierten Kostenzeile, Statuswechsel offen→bezahlt nach Zahlung).
+Ausschließlich synthetische Testdaten, keine Geschäftsaktion.

@@ -23,7 +23,17 @@ from fpdf import FPDF
 from fpdf.enums import MethodReturnValue
 
 from mietinkasso.mahnwesen.brief_pdf import _FALLBACK_FONT_BOLD, _FALLBACK_FONT_REGULAR, Absender, _hex_to_rgb
-from mietinkasso.op.kontoblatt import KATEGORIE_LABEL, Kontoblatt
+from mietinkasso.op.kontoblatt import KATEGORIE_LABEL, STATUS_LABEL, Kontoblatt
+
+
+def _status_text(zeile) -> str:
+    """`None` (z. B. GUTSCHRIFT/ZAHLUNG/KORREKTUR ohne eigenen
+    Forderungscharakter) wird NIE als "bezahlt"/"offen" behauptet -
+    Codex-Abnahme 20.10.2026, P3."""
+
+    if zeile.status is None:
+        return ""
+    return f" · Status: {STATUS_LABEL.get(zeile.status, zeile.status)}"
 
 _SEITE_BREITE = 210.0
 _RAND = 20.0
@@ -31,6 +41,13 @@ _INHALT_RECHTS = _SEITE_BREITE - _RAND
 _BETRAG_SPALTE_BREITE = 32.0
 _REST_SPALTE_BREITE = 28.0
 _LOGO_BREITE = 32.0
+_LOGO_Y = 10.0
+#: Codex-Abnahme 20.10.2026, P4: großzügig reservierte Mindesthöhe für
+#: eine bis zu 32-mm-breite Wortbildmarke (dieselbe Breite wie in
+#: `brief_pdf.py`, kein neues/anderes Logo) - der Kopf ist zusätzlich
+#: dynamisch so hoch wie der TATSÄCHLICH umgebrochene Titeltext, je
+#: nachdem, was größer ist.
+_LOGO_HOEHE_RESERVIERT = 22.0
 
 
 def _eur(cent: int) -> str:
@@ -51,15 +68,26 @@ class _KontoauszugPDF(FPDF):
     fett_familie = "Konto"
 
     def header(self):
+        # Codex-Abnahme 20.10.2026, P4: `cell()` bricht NICHT um - eine
+        # lange echte Firmen-/Objekt-/Einheitsbezeichnung lief bisher
+        # rechts aus der Zelle heraus (potenziell über das Logo). Jetzt
+        # per `multi_cell` mehrzeilig, mit vorab per Dry-Run ermittelter
+        # Höhe - die Trennlinie/der Fließtextbeginn liegen IMMER unter
+        # dem jeweils höheren von Logo und (ggf. mehrzeiligem) Titel, auf
+        # JEDER Seite gleich (kein Logo-/Farbimprovisation, dieselbe
+        # Breite/Position wie bisher).
         if self.absender.logo_pfad and Path(self.absender.logo_pfad).is_file():
-            self.image(self.absender.logo_pfad, x=_INHALT_RECHTS - _LOGO_BREITE, y=10, w=_LOGO_BREITE)
+            self.image(self.absender.logo_pfad, x=_INHALT_RECHTS - _LOGO_BREITE, y=_LOGO_Y, w=_LOGO_BREITE)
         self.set_font(self.fett_familie, "B", 13)
         self.set_text_color(*self.farbe_anthrazit)
-        self.set_xy(_RAND, 12)
-        self.cell(_INHALT_RECHTS - _RAND - _LOGO_BREITE - 4, 7, self.titel_zeile, new_x="LMARGIN", new_y="NEXT")
+        titel_breite = _INHALT_RECHTS - _RAND - _LOGO_BREITE - 4
+        titel_hoehe = self.multi_cell(titel_breite, 6, self.titel_zeile, align="L", dry_run=True, output=MethodReturnValue.HEIGHT)
+        self.set_xy(_RAND, _LOGO_Y)
+        self.multi_cell(titel_breite, 6, self.titel_zeile, align="L")
+        linie_y = max(_LOGO_Y + _LOGO_HOEHE_RESERVIERT, _LOGO_Y + titel_hoehe + 2)
         self.set_draw_color(*self.farbe_gold)
-        self.line(_RAND, 24, _INHALT_RECHTS, 24)
-        self.set_y(30)
+        self.line(_RAND, linie_y, _INHALT_RECHTS, linie_y)
+        self.set_y(linie_y + 6)
 
     def footer(self):
         self.set_y(-20)
@@ -149,11 +177,16 @@ def erzeuge_kontoauszug_pdf(
         for z in kontoblatt.hauptforderung_zeilen:
             p = z.position
             rest_text = _eur(z.rest_cent) if z.rest_cent is not None else ""
-            bezeichnung = f"{p.typ} · {p.beleg_referenz or p.aenderungsgrund or ''}"
+            bezeichnung = f"{p.typ} · {p.beleg_referenz or p.aenderungsgrund or ''}{_status_text(z)}"
             _zeile(pdf, datum_text=p.belegdatum.strftime("%d.%m.%Y"), bezeichnung=bezeichnung, betrag_cent=p.betrag_cent, rest_text=rest_text)
     else:
         pdf.cell(0, 5, "Keine Hauptforderungszeilen.", new_x="LMARGIN", new_y="NEXT")
-    _zeile(pdf, datum_text="", bezeichnung="Hauptforderung gesamt", betrag_cent=kontoblatt.hauptforderung_cent, fett=True)
+    # Codex-Abnahme 20.10.2026, P3: "gebucht" (Sollsumme VOR Zahlungen)
+    # und "davon noch offen" (tatsächlicher Rückstand NACH Zahlungen)
+    # werden ausdrücklich GETRENNT gezeigt - sonst wird die Bruttosumme
+    # als Rückstand missverstanden.
+    _zeile(pdf, datum_text="", bezeichnung="Hauptforderung gebucht (Sollsumme vor Zahlungen)", betrag_cent=kontoblatt.hauptforderung_cent, fett=True)
+    _zeile(pdf, datum_text="", bezeichnung="davon tatsächlich noch offen", betrag_cent=kontoblatt.hauptforderung_offener_rest_cent, fett=True)
 
     _abschnitt_titel(pdf, "Tatsächlich gebuchte Kosten (Mahngebühr/-pauschale, Verzugszinsen, Rücklastschriftkosten)")
     if kontoblatt.kosten_zeilen:
@@ -161,12 +194,24 @@ def erzeuge_kontoauszug_pdf(
             p = z.position
             rest_text = _eur(z.rest_cent) if z.rest_cent is not None else ""
             label = KATEGORIE_LABEL.get(z.kategorie, z.kategorie)
-            bezeichnung = f"{label} · {p.beleg_referenz or ''}"
+            bezeichnung = f"{label} · {p.beleg_referenz or ''}{_status_text(z)}"
             _zeile(pdf, datum_text=p.belegdatum.strftime("%d.%m.%Y"), bezeichnung=bezeichnung, betrag_cent=p.betrag_cent, rest_text=rest_text)
-        _zeile(pdf, datum_text="", bezeichnung="Kosten gesamt (bereits im Saldo enthalten)", betrag_cent=kontoblatt.kosten_cent, fett=True)
+        _zeile(pdf, datum_text="", bezeichnung="Kosten gebucht (Sollsumme vor Zahlungen, bereits im Saldo enthalten)", betrag_cent=kontoblatt.kosten_cent, fett=True)
+        _zeile(pdf, datum_text="", bezeichnung="davon tatsächlich noch offen", betrag_cent=kontoblatt.kosten_offener_rest_cent, fett=True)
     else:
         pdf.cell(0, 5, "Keine gebuchten Kosten.", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(5)
+
+    if kontoblatt.kosten_historie:
+        _abschnitt_titel(pdf, "Kosten-Historie (storniert/ersetzt)")
+        pdf.set_font("Konto", "", 9)
+        pdf.multi_cell(0, 5, "Nicht mehr gültige Kostenbuchungen - zur Nachvollziehbarkeit erhalten, OHNE die aktuelle Kostensumme oder den Gesamtsaldo zu verändern.")
+        pdf.ln(1)
+        for z in kontoblatt.kosten_historie:
+            p = z.position
+            label = KATEGORIE_LABEL.get(z.kategorie, z.kategorie)
+            bezeichnung = f"{label} · {p.beleg_referenz or ''}{_status_text(z)}"
+            _zeile(pdf, datum_text=p.belegdatum.strftime("%d.%m.%Y"), bezeichnung=bezeichnung, betrag_cent=p.betrag_cent)
 
     _abschnitt_titel(pdf, "Zahlungen / Rücklastschriften (Stornostand)")
     if kontoblatt.zahlungen_zeilen:
@@ -193,14 +238,20 @@ def erzeuge_kontoauszug_pdf(
         pdf.ln(1)
         for b in kontoblatt.dokumentierte_bankaufwaende:
             r = b.row
-            datum_text = r.gebucht_am.strftime("%d.%m.%Y") if isinstance(r.gebucht_am, datetime) else ""
+            # Codex-Abnahme 20.10.2026, P2: "Rückgabe" ist der TATSÄCHLICHE
+            # Bankereignistag (`b.rueckgabe_datum`, aus der gebundenen
+            # Rücklastschrift-OP-Zeile), NICHT `r.gebucht_am` (nur das
+            # spätere Erfassungsdatum dieser Kosten-Dokumentationszeile) -
+            # beide werden getrennt gezeigt, nie vermischt.
+            rueckgabe_text = b.rueckgabe_datum.strftime("%d.%m.%Y") if b.rueckgabe_datum else "Datum unbekannt"
+            erfasst_text = r.gebucht_am.strftime("%d.%m.%Y") if isinstance(r.gebucht_am, datetime) else ""
             bezeichnung = (
-                f"Rückgabe {datum_text} · Ursache: {r.rueckgabeursache} · Beleg: {r.beleg_referenz} · "
-                f"Rücklastschrift-OP #{r.ruecklastschrift_op_position_id}"
+                f"Rückgabe {rueckgabe_text} · Erfasst am {erfasst_text} · Ursache: {r.rueckgabeursache} · "
+                f"Beleg: {r.beleg_referenz} · Rücklastschrift-OP #{r.ruecklastschrift_op_position_id}"
                 + (f" · Bank-Transaktion #{r.bank_transaktion_id}" if r.bank_transaktion_id is not None else "")
                 + f" · Status: {b.status_text}"
             )
-            _zeile(pdf, datum_text=datum_text, bezeichnung=bezeichnung, betrag_cent=r.bankentgelt_cent)
+            _zeile(pdf, datum_text=rueckgabe_text, bezeichnung=bezeichnung, betrag_cent=r.bankentgelt_cent)
         summe_bankaufwaende = sum(b.row.bankentgelt_cent for b in kontoblatt.dokumentierte_bankaufwaende)
         _zeile(pdf, datum_text="", bezeichnung="Summe nicht belasteter Bankaufwände (NICHT im Gesamtsaldo)", betrag_cent=summe_bankaufwaende, fett=True)
 
