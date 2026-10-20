@@ -670,6 +670,25 @@ class MahnPolicyTable(Base):
     gebuehr_cent: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(16), default="ENTWURF")
     freigegeben_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Auftrag HV-20261020-VIER-MAHNSTUFEN (additiv, Default False - KEIN
+    # stillschweigender Verhaltenswechsel für eine bereits produktiv
+    # freigegebene Policy, siehe `MahnStufe`-Moduldoc): nur eine Policy
+    # mit `vier_stufen_profil_aktiv=True` eskaliert über STUFE_2 hinaus
+    # und verwendet dafür die drei `stufeN_mindesttage_..._zugang`-Felder
+    # unten (Zugangsnachweis-basiert, siehe `mahnwesen/fristen.py`)
+    # statt der ALTEN, versandzeitpunktbasierten `stufe2_mindesttage_
+    # nach_stufe1_versand` (die bei `vier_stufen_profil_aktiv=False`
+    # unverändert weiterverwendet wird - bestehende Zwei-Stufen-Policies
+    # bleiben dadurch exakt wie bisher wirksam).
+    vier_stufen_profil_aktiv: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
+    # Jede Stufe volle 14 Tage AB NACHGEWIESENEM ZUGANG (Nutzervorgabe
+    # 20.10.2026, NICHT ab Versand) - rechtssicher berechnet über
+    # `mahnwesen/fristen.py::fristende_ab_zugang` (§902/903 ABGB,
+    # Werktagsverschiebung). Nur wirksam, wenn `vier_stufen_profil_aktiv`
+    # gesetzt ist.
+    stufe2_mindesttage_nach_stufe1_zugang: Mapped[int] = mapped_column(Integer, default=14, server_default=text("14"))
+    stufe3_mindesttage_nach_stufe2_zugang: Mapped[int] = mapped_column(Integer, default=14, server_default=text("14"))
+    stufe4_mindesttage_nach_stufe3_zugang: Mapped[int] = mapped_column(Integer, default=14, server_default=text("14"))
 
 
 class MahnKanalregelTable(Base):
@@ -693,6 +712,15 @@ class MahnKanalregelTable(Base):
     version: Mapped[int] = mapped_column(Integer, unique=True)
     stufe1_kanal: Mapped[str] = mapped_column(String(16), default="EMAIL")
     stufe2_kanal: Mapped[str] = mapped_column(String(16), default="BRIEF")
+    # Auftrag HV-20261020-VIER-MAHNSTUFEN (additiv, Default "BRIEF" wie
+    # Stufe 2 - "Stufe 1 EMAIL, Stufen 2-4 BRIEF", Nutzerentscheidung
+    # 20.10.2026): wirkt NUR, wenn zusätzlich eine `MahnPolicyTable`-
+    # Version mit `vier_stufen_profil_aktiv=True` freigegeben ist UND
+    # diese Kanalregel selbst FREIGEGEBEN ist - keine der beiden
+    # bestehenden Zwei-Stufen-Grenzen (fehlende Kanalregel -> EMAIL,
+    # fehlender Brief-Transport -> blockiert) wird dadurch verändert.
+    stufe3_kanal: Mapped[str] = mapped_column(String(16), default="BRIEF", server_default=text("'BRIEF'"))
+    stufe4_kanal: Mapped[str] = mapped_column(String(16), default="BRIEF", server_default=text("'BRIEF'"))
     status: Mapped[str] = mapped_column(String(16), default="ENTWURF", server_default=text("'ENTWURF'"))
     erstellt_von: Mapped[str] = mapped_column(String(128))
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -763,6 +791,17 @@ class MahnFallTable(Base):
     versand_beansprucht_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     gesendet_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     letzter_versuch_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Auftrag HV-20261020-VIER-MAHNSTUFEN, additiv (ensure_additive_
+    # columns-sicher: LOSE Referenz OHNE ForeignKey, siehe migrations.py-
+    # Moduldoc "neue Fremdschlüsselspalte(n) ohne unterstützte additive
+    # Migration") - verweist auf `MahnLaufTable.id`, SOBALD dieser
+    # MahnFall tatsächlich Teil einer gebündelten Gruppe geworden ist
+    # (siehe `MahnLaufRepository.claim_mitglieder_und_erstelle_gruppe`).
+    # Ermöglicht den Rückweg von EINER Forderung zu IHREM tatsächlichen
+    # Zustellereignis - Grundlage des zugangsnachweis-basierten Fristen-
+    # laufs (siehe `mahnwesen/service.py::_naechste_stufe_fuer_
+    # forderung`). `None` für einen älteren, nie gebündelten Einzelfall.
+    mahnlauf_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class MahnLaufTable(Base):
@@ -825,6 +864,88 @@ class MahnLaufTable(Base):
     # snapshot_json IS NOT NULL AND mahnkosten_verarbeitet_am IS NULL`
     # markiert genau die Recovery-Lücke.
     mahnkosten_verarbeitet_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Auftrag HV-20261020-VIER-MAHNSTUFEN: additiv, alle NULL-fähig/mit
+    # Default - eine BESTEHENDE Zeile (altes Zwei-Stufen-Profil) bleibt
+    # dadurch unverändert lesbar. `effektive_stufe` ist die TATSÄCHLICH
+    # für Ton/Rechtsinhalt/Kosten maßgebliche Stufe dieses EINEN
+    # gebündelten Schreibens - bei einem Lauf, der mehrere, UNTERSCHIEDLICH
+    # weit gediehene Forderungen desselben Vertrags bündelt (siehe
+    # `mahnwesen/service.py::MahnwesenService.plane_mahnlauf`,
+    # `stufen`-Parameter), das Maximum der tatsächlich eingebundenen
+    # Mitglieder-Stufen - `NULL` bei einem alten, vor diesem Auftrag
+    # gebildeten Lauf (dort ist `stufe` bereits eindeutig, siehe
+    # `effektive_stufe_oder_stufe` weiter unten in `repository.py`).
+    effektive_stufe: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Zugangsnachweis DIESES gebündelten Schreibens (nicht des einzelnen
+    # Mitglieds) - dieselbe Fachregel/dieselben Werte wie
+    # `ZUGANGSFORMEN_ALLE`/`ZUGANGSFORMEN_AUSREICHEND`
+    # (`domain/enums.py`, bereits etabliert für Erhöhungsschreiben,
+    # `indexautomatik/outbox_service.py::zugang_bestaetigen`): ein
+    # gewöhnlicher E-Mail-/SMTP-Versand oder eine bloße Brief-Einlieferung
+    # ist NIE automatisch ein rechtssicherer Zugang - siehe
+    # `MahnwesenService.zugang_bestaetigen`. Bei mehreren Empfängern
+    # (Mitmieter, siehe `VertragMitmieterTable`/`MahnEmpfaengerZugangTable`)
+    # ist dies der ZULETZT bestätigte (spätester) Zugang ALLER erwarteten
+    # Empfänger - konservativ, siehe dortiger Service-Docstring.
+    zugangsform: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    zugang_bestaetigt_am: Mapped[date | None] = mapped_column(Date, nullable=True)
+    zugang_beleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    zugang_bestaetigt_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
+class VertragMitmieterTable(Base):
+    """Auftrag HV-20261020-VIER-MAHNSTUFEN: rein additive, NICHT-
+    finanzielle Zusatz-Empfänger eines Vertrags ("Mitmieter") - AUSSCHLIESSLICH
+    für Mahnschreiben-Adressierung/Zugangsnachweis (RIS 4 Ob 75/21i,
+    3 Ob 37/18i: Mahnung gegen jeden Mitmieter, Zugang jeder Person
+    einzeln nachzuweisen). Berührt NIE `KontoTable`/`OPPositionTable`/
+    `DebitorTable` - der bestehende Debitor bleibt der EINZIGE
+    finanzielle Schuldner/Zahlungsempfänger-Bezug dieses Vertrags; ein
+    Mitmieter ist rein ein ZUSÄTZLICHER Briefempfänger, keine zweite
+    Kontoinhaberschaft, keine neue Forderungszuordnung. `aktiv=False`
+    markiert einen nicht mehr zu adressierenden Mitmieter (z. B. nach
+    Auszug), OHNE die Zeile zu löschen (Nachvollziehbarkeit früherer
+    Zustellungen)."""
+
+    __tablename__ = "vertrag_mitmieter"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    name: Mapped[str] = mapped_column(String(256))
+    email: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    adresse: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    postadresse_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
+    aktiv: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("1"))
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MahnEmpfaengerZugangTable(Base):
+    """Auftrag HV-20261020-VIER-MAHNSTUFEN: EIN Zugangsnachweis-Eintrag
+    je tatsächlich erwartetem Empfänger (Hauptdebitor ODER ein konkreter
+    `VertragMitmieterTable`-Eintrag) EINES konkreten `MahnLaufTable`-
+    Schreibens - "Vertragsmitmieter strukturiert mit Empfänger-/
+    Zustellnachweisen pro Person" (wörtliche Nutzervorgabe). `mitmieter_id
+    IS NULL` bedeutet: dieser Eintrag betrifft den Hauptdebitor des
+    Vertrags (nicht polymorph referenziert, da es je Vertrag GENAU einen
+    Debitor gibt - siehe `VertragTable.debitor_id`). Die Stufenfreigabe
+    verlangt einen bestätigten, AUSREICHENDEN Zugang (`ZUGANGSFORMEN_
+    AUSREICHEND`) für JEDEN zum Versandzeitpunkt aktiven erwarteten
+    Empfänger dieses Laufs - siehe `MahnwesenService.zugang_bestaetigen`/
+    `_alle_empfaenger_zugang_bestaetigt`."""
+
+    __tablename__ = "mahn_empfaenger_zugang"
+    __table_args__ = (UniqueConstraint("mahnlauf_id", "mitmieter_id", name="uq_mahn_empfaenger_zugang_person"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    mahnlauf_id: Mapped[int] = mapped_column(ForeignKey("mahnlaeufe.id"), index=True)
+    mitmieter_id: Mapped[int | None] = mapped_column(ForeignKey("vertrag_mitmieter.id"), nullable=True)
+    empfaenger_name_snapshot: Mapped[str] = mapped_column(String(256))
+    zugangsform: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    zugang_bestaetigt_am: Mapped[date | None] = mapped_column(Date, nullable=True)
+    zugang_beleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    erstellt_von: Mapped[str] = mapped_column(String(128))
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class AuditEventTable(Base):

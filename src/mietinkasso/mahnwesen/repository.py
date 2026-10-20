@@ -9,7 +9,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.domain.enums import MahnStatus
 from mietinkasso.infrastructure.db.tables import (
-    BriefAnbieterProfilTable, MahnFallTable, MahnKanalregelTable, MahnLaufTable, MahnPolicyTable,
+    BriefAnbieterProfilTable, MahnEmpfaengerZugangTable, MahnFallTable, MahnKanalregelTable, MahnLaufTable,
+    MahnPolicyTable, VertragMitmieterTable,
 )
 
 
@@ -391,11 +392,15 @@ class MahnLaufRepository:
                 # WIEDERVERWENDET statt eine zweite Zeile mit
                 # identischem, unique-constraint-geschütztem Schlüssel zu
                 # versuchen.
+                # Auftrag HV-20261020-VIER-MAHNSTUFEN: `mahnlauf_id`
+                # (lose, FK-freie Referenz, siehe `MahnFallTable`-
+                # Docstring) wird hier gleich mitgesetzt - `existing.id`
+                # ist bereits bekannt (wiederverwendete Zeile).
                 ergebnis = session.execute(
                     update(MahnFallTable)
                     .where(MahnFallTable.id.in_(mahnfall_ids))
                     .where(MahnFallTable.status == MahnStatus.GEPLANT.value)
-                    .values(status=MahnStatus.GEBUENDELT.value)
+                    .values(status=MahnStatus.GEBUENDELT.value, mahnlauf_id=existing.id)
                 )
                 if ergebnis.rowcount != len(mahnfall_ids):
                     session.rollback()
@@ -420,6 +425,19 @@ class MahnLaufRepository:
                 stufe=stufe, kanal=kanal, mitglieder_mahnfall_ids=json.dumps(sorted(mahnfall_ids)),
             )
             session.add(row)
+            # Auftrag HV-20261020-VIER-MAHNSTUFEN: `flush()` statt
+            # `commit()` hier - weist `row.id` bereits zu, OHNE die
+            # Transaktion abzuschließen, damit die nachfolgende
+            # `mahnlauf_id`-Rückverknüpfung auf den Mitgliedern UND die
+            # Gruppenzeile selbst atomar GEMEINSAM committet (oder bei
+            # einem gleichzeitigen outbox_key-Konflikt GEMEINSAM
+            # zurückgerollt) werden - dieselbe "alles oder nichts"-
+            # Transaktionsgrenze wie beim ursprünglichen Mitglieder-Claim
+            # oben (Rückprüfung Codex 14.09.2026).
+            session.flush()
+            session.execute(
+                update(MahnFallTable).where(MahnFallTable.id.in_(mahnfall_ids)).values(mahnlauf_id=row.id)
+            )
             try:
                 session.commit()
             except IntegrityError:
@@ -585,3 +603,174 @@ class MahnLaufRepository:
     @staticmethod
     def mitglieder_ids(mahnlauf: MahnLaufTable) -> list[int]:
         return list(json.loads(mahnlauf.mitglieder_mahnfall_ids))
+
+    def setze_zugang(
+        self, mahnlauf_id: int, *, zugangsform: str, zugang_bestaetigt_am, zugang_beleg: str, zugang_bestaetigt_von: str,
+    ) -> MahnLaufTable:
+        """Auftrag HV-20261020-VIER-MAHNSTUFEN: schreibt den Zugangsnachweis
+        DIESES gebündelten Schreibens - reiner Persistenzzugriff, ALLE
+        fachlichen Prüfungen (Status GESENDET, Reihenfolge, Zugangsform
+        ausreichend, Plausibilität der Daten) laufen VORHER in
+        `MahnwesenService.zugang_bestaetigen` (siehe dort, mirrors
+        `indexautomatik/outbox_service.py::zugang_bestaetigen`)."""
+
+        with self._session_factory() as session:
+            row = session.get(MahnLaufTable, mahnlauf_id)
+            if row is None:
+                raise ValueError(f"Unbekannter MahnLauf {mahnlauf_id}")
+            row.zugangsform = zugangsform
+            row.zugang_bestaetigt_am = zugang_bestaetigt_am
+            row.zugang_beleg = zugang_beleg
+            row.zugang_bestaetigt_von = zugang_bestaetigt_von
+            session.commit()
+            session.refresh(row)
+            return row
+
+
+class VertragMitmieterRepository:
+    """Auftrag HV-20261020-VIER-MAHNSTUFEN: rein additive Verwaltung der
+    NICHT-finanziellen Zusatz-Empfänger eines Vertrags (siehe
+    `VertragMitmieterTable`-Docstring) - bewusst NICHT Teil von
+    `stammdaten/repository.py::StammdatenRepository` (das bleibt die
+    finanzielle Stammdatenwahrheit: Debitor/Konto/OP bleiben davon
+    unberührt), sondern hier beim Mahnwesen, das diese Daten AUSSCHLIESSLICH
+    für Briefadressierung/Zugangsnachweis verwendet."""
+
+    def __init__(self, session_factory: sessionmaker[Session]):
+        self._session_factory = session_factory
+
+    def anlegen(self, *, vertrag_id: str, name: str, email: str | None, adresse: str | None, erstellt_von: str) -> VertragMitmieterTable:
+        with self._session_factory() as session:
+            row = VertragMitmieterTable(vertrag_id=vertrag_id, name=name, email=email, adresse=adresse, erstellt_von=erstellt_von)
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def get(self, mitmieter_id: int) -> VertragMitmieterTable | None:
+        with self._session_factory() as session:
+            return session.get(VertragMitmieterTable, mitmieter_id)
+
+    def list_aktiv(self, vertrag_id: str) -> list[VertragMitmieterTable]:
+        with self._session_factory() as session:
+            statement = (
+                select(VertragMitmieterTable)
+                .where(VertragMitmieterTable.vertrag_id == vertrag_id, VertragMitmieterTable.aktiv.is_(True))
+                .order_by(VertragMitmieterTable.id)
+            )
+            return list(session.execute(statement).scalars().all())
+
+    def list_alle(self, vertrag_id: str) -> list[VertragMitmieterTable]:
+        with self._session_factory() as session:
+            statement = select(VertragMitmieterTable).where(VertragMitmieterTable.vertrag_id == vertrag_id).order_by(VertragMitmieterTable.id)
+            return list(session.execute(statement).scalars().all())
+
+    def setze_postadresse_geprueft(self, mitmieter_id: int, *, geprueft: bool) -> VertragMitmieterTable:
+        with self._session_factory() as session:
+            row = session.get(VertragMitmieterTable, mitmieter_id)
+            if row is None:
+                raise ValueError(f"Unbekannter Mitmieter {mitmieter_id}")
+            row.postadresse_geprueft = geprueft
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def deaktivieren(self, mitmieter_id: int) -> VertragMitmieterTable:
+        with self._session_factory() as session:
+            row = session.get(VertragMitmieterTable, mitmieter_id)
+            if row is None:
+                raise ValueError(f"Unbekannter Mitmieter {mitmieter_id}")
+            row.aktiv = False
+            session.commit()
+            session.refresh(row)
+            return row
+
+
+class MahnEmpfaengerZugangRepository:
+    """Auftrag HV-20261020-VIER-MAHNSTUFEN: EIN Zugangsnachweis-Eintrag je
+    tatsächlich erwartetem Empfänger EINES `MahnLaufTable`-Schreibens -
+    siehe `MahnEmpfaengerZugangTable`-Docstring. `erstelle_erwartete_
+    eintraege` legt beim BILDEN eines Mahnlaufs für jeden zu diesem
+    Zeitpunkt aktiven erwarteten Empfänger (Hauptdebitor + aktive
+    Mitmieter) einen NOCH UNBESTÄTIGTEN Platzhalter an (`zugangsform IS
+    NULL`), damit das Backoffice von Anfang an zeigt, WER noch fehlt -
+    idempotent über die Unique-Constraint `(mahnlauf_id, mitmieter_id)`."""
+
+    def __init__(self, session_factory: sessionmaker[Session]):
+        self._session_factory = session_factory
+
+    def erstelle_erwartete_eintraege(
+        self, *, mahnlauf_id: int, empfaenger: list[tuple[int | None, str]], erstellt_von: str,
+    ) -> list[MahnEmpfaengerZugangTable]:
+        angelegt: list[MahnEmpfaengerZugangTable] = []
+        with self._session_factory() as session:
+            vorhandene = {
+                (e.mitmieter_id)
+                for e in session.execute(
+                    select(MahnEmpfaengerZugangTable).where(MahnEmpfaengerZugangTable.mahnlauf_id == mahnlauf_id)
+                ).scalars()
+            }
+            for mitmieter_id, name in empfaenger:
+                if mitmieter_id in vorhandene:
+                    continue
+                row = MahnEmpfaengerZugangTable(
+                    mahnlauf_id=mahnlauf_id, mitmieter_id=mitmieter_id, empfaenger_name_snapshot=name, erstellt_von=erstellt_von,
+                )
+                session.add(row)
+                angelegt.append(row)
+            if angelegt:
+                session.commit()
+                for row in angelegt:
+                    session.refresh(row)
+        return angelegt
+
+    def fuer_mahnlauf(self, mahnlauf_id: int) -> list[MahnEmpfaengerZugangTable]:
+        with self._session_factory() as session:
+            statement = select(MahnEmpfaengerZugangTable).where(MahnEmpfaengerZugangTable.mahnlauf_id == mahnlauf_id)
+            return list(session.execute(statement).scalars().all())
+
+    def bestaetige_zugang(
+        self, eintrag_id: int, *, zugangsform: str, zugang_bestaetigt_am, zugang_beleg: str,
+    ) -> MahnEmpfaengerZugangTable:
+        """Reiner Persistenzzugriff - die fachlichen Prüfungen (Status,
+        Zugangsform ausreichend, Plausibilität) laufen in
+        `MahnwesenService.zugang_bestaetigen`."""
+
+        with self._session_factory() as session:
+            row = session.get(MahnEmpfaengerZugangTable, eintrag_id)
+            if row is None:
+                raise ValueError(f"Unbekannter Empfänger-Zugangsnachweis {eintrag_id}")
+            row.zugangsform = zugangsform
+            row.zugang_bestaetigt_am = zugang_bestaetigt_am
+            row.zugang_beleg = zugang_beleg
+            session.commit()
+            session.refresh(row)
+            return row
+
+    @staticmethod
+    def alle_bestaetigt(eintraege: list[MahnEmpfaengerZugangTable], *, ausreichende_formen: frozenset[str]) -> bool:
+        """`True` nur, wenn JEDER erwartete Empfänger einen BESTÄTIGTEN,
+        FORMAL AUSREICHENDEN Zugang hat (siehe `domain/enums.py::
+        ZUGANGSFORMEN_AUSREICHEND`) - ein leerer Erwartungssatz gilt NICHT
+        automatisch als "alle bestätigt" (der Aufrufer muss mindestens
+        den Hauptdebitor-Platzhalter angelegt haben)."""
+
+        if not eintraege:
+            return False
+        return all(
+            e.zugang_bestaetigt_am is not None and e.zugangsform in ausreichende_formen
+            for e in eintraege
+        )
+
+    @staticmethod
+    def spaetester_zugang(eintraege: list[MahnEmpfaengerZugangTable]) -> date | None:
+        """Der ZULETZT bestätigte (späteste) Zugang über alle Einträge -
+        konservative Grundlage für den Fristenlauf bei mehreren
+        Empfängern (siehe `MahnLaufTable.zugang_bestaetigt_am`-
+        Docstring). `None`, solange nicht JEDER Eintrag einen bestätigten
+        Zugang hat."""
+
+        daten = [e.zugang_bestaetigt_am for e in eintraege]
+        if not daten or any(d is None for d in daten):
+            return None
+        return max(daten)

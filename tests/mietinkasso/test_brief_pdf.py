@@ -34,8 +34,8 @@ def _absender(**overrides) -> Absender:
 def _erzeugen(**overrides) -> bytes:
     werte = dict(
         absender=_absender(), empfaenger_name="Max Mustermieter", empfaenger_adresse="Musterstraße 1\n1010 Wien",
-        objekt_bezeichnung="Am Corso", einheit_bezeichnung="Top 3", stufe=2, heute=date(2026, 9, 28),
-        zahlungsfrist_bis=date(2026, 10, 12),
+        objekt_bezeichnung="Am Corso", einheit_bezeichnung="Top 3", stufe=2, rechtsordnung="OESTERREICH_MRG_VOLL",
+        heute=date(2026, 9, 28), zahlungsfrist_bis=date(2026, 10, 12),
         forderungszeilen=[Forderungszeile("HMZ August", date(2026, 8, 5), 83_000)],
         bereits_offene_mahnkosten_cent=2073,
         neue_zinsen_delta_cent=54, zins_segmente=[], zinssatz_einheitlich_text="4,0 % p.a.",
@@ -70,6 +70,38 @@ def test_erste_stufe_heisst_zahlungserinnerung_nicht_mahnung():
     text = reader.pages[0].extract_text()
     assert "Zahlungserinnerung" in text
     assert "Zweite Mahnung" not in text
+
+
+def test_vierte_stufe_zeigt_letzte_zahlungsaufforderung_mit_gesetzlichem_kern():
+    """Auftrag HV-20261020-VIER-MAHNSTUFEN: die Stufe-4-Mahnung muss den
+    gesetzlichen Kern (RA-Übergabe, § 30 Abs 2 Z 1 MRG/§ 1118 ABGB, 'KEINE
+    Kündigung') tatsächlich im gerenderten PDF zeigen - nicht nur in der
+    reinen Textbaustein-Funktion (siehe test_mahnwesen_mahntexte.py)."""
+
+    pdf_bytes = _erzeugen(
+        stufe=4, rechtsordnung="OESTERREICH_MRG_VOLL",
+        forderungszeilen=[Forderungszeile("HMZ August", date(2026, 8, 5), 83_000)],
+        bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0, gesamtbetrag_cent=83_000,
+    )
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = " ".join(p.extract_text() for p in reader.pages).replace("\n", " ")
+    assert "Letzte Zahlungsaufforderung" in text
+    assert "Rechtsanwalt" in text
+    assert "MRG" in text
+    assert "ABGB" in text
+    assert "KEINE Kündigung" in text
+
+
+def test_vierte_stufe_auslaendische_rechtsordnung_zeigt_keine_oesterreichische_norm():
+    pdf_bytes = _erzeugen(
+        stufe=4, rechtsordnung="DEUTSCHLAND",
+        forderungszeilen=[Forderungszeile("HMZ August", date(2026, 8, 5), 83_000)],
+        bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0, gesamtbetrag_cent=83_000,
+    )
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = " ".join(p.extract_text() for p in reader.pages).replace("\n", " ")
+    assert "MRG" not in text
+    assert "ABGB" not in text
 
 
 def test_ohne_konfiguriertes_logo_wird_kein_signet_gezeichnet():

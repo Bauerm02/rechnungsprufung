@@ -52,6 +52,7 @@ from fpdf import FPDF
 from fpdf.enums import MethodReturnValue
 
 from mietinkasso.mahnwesen.kosten import zins_bis_einschliesslich
+from mietinkasso.mahnwesen.mahntexte import text_fuer_stufe
 
 _FALLBACK_FONT_REGULAR = "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"
 _FALLBACK_FONT_BOLD = "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf"
@@ -218,6 +219,7 @@ def erzeuge_mahnbrief_pdf(
     objekt_bezeichnung: str,
     einheit_bezeichnung: str,
     stufe: int,
+    rechtsordnung: str,
     heute: date,
     zahlungsfrist_bis: date,
     forderungszeilen: list[Forderungszeile],
@@ -238,7 +240,13 @@ def erzeuge_mahnbrief_pdf(
 
     anthrazit = _hex_to_rgb(absender.farbe_anthrazit)
     gold = _hex_to_rgb(absender.farbe_gold)
-    betreff = "Zahlungserinnerung" if stufe == 1 else "Zweite Mahnung"
+    # Auftrag HV-20261020-VIER-MAHNSTUFEN: Betreff/Einleitung/Kerntext/
+    # Rechtsabsatz kommen jetzt AUSSCHLIESSLICH aus `mahntexte.
+    # text_fuer_stufe` - demselben Textbaustein, den auch die E-Mail
+    # (`indexautomatik/mailversand_service.py`) verwendet (Moduldoc:
+    # "Kein Kundentext an zwei Stellen unabhängig formuliert").
+    mahntext = text_fuer_stufe(stufe=stufe, rechtsordnung=rechtsordnung, zahlungsfrist_bis=zahlungsfrist_bis)
+    betreff = mahntext.betreff
 
     pdf = _MahnbriefPDF(format="A4", unit="mm", enforce_compliance="PDF/A-2B")
     pdf.farbe_anthrazit, pdf.farbe_gold = anthrazit, gold
@@ -324,7 +332,11 @@ def erzeuge_mahnbrief_pdf(
     pdf.ln(4)
 
     pdf.set_font("Brief", "", 10)
-    pdf.multi_cell(0, 5.5, "Sehr geehrte Damen und Herren,\n\nfür das oben genannte Mietverhältnis sind folgende Forderungen offen:")
+    pdf.multi_cell(
+        0, 5.5,
+        f"Sehr geehrte Damen und Herren,\n\n{mahntext.einleitung} {mahntext.kerntext}\n\n"
+        "Für das oben genannte Mietverhältnis ist folgende Forderung offen:",
+    )
     pdf.ln(2)
 
     hauptforderung_cent = sum(f.betrag_cent for f in forderungszeilen)
@@ -367,6 +379,9 @@ def erzeuge_mahnbrief_pdf(
         "für dieses Mietverhältnis bekannt gegebene Konto. Bei einer inzwischen erfolgten Zahlung senden Sie "
         "uns bitte den Zahlungsbeleg. Bei Fragen zur Forderung wenden Sie sich bitte an untenstehende Kontaktdaten.",
     )
+    if mahntext.rechtlicher_kern:
+        pdf.ln(3)
+        pdf.multi_cell(0, 5.5, mahntext.rechtlicher_kern)
     pdf.ln(6)
     pdf.cell(0, 5, "Mit freundlichen Grüßen", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 5, absender.name, new_x="LMARGIN", new_y="NEXT")

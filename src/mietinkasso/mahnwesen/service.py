@@ -36,16 +36,27 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
 from mietinkasso.auth.service import AuthContext, require_gesellschaft_access, require_schreibrecht
-from mietinkasso.domain.enums import MahnStatus, MahnStufe, rechtsordnung_geklaert
-from mietinkasso.domain.exceptions import BindungInkonsistentError, CrossTenantError, MahnstufeReihenfolgeError
+from mietinkasso.domain.enums import ZUGANGSFORMEN_ALLE, ZUGANGSFORMEN_AUSREICHEND, MahnStatus, MahnStufe, rechtsordnung_geklaert
+from mietinkasso.domain.exceptions import BindungInkonsistentError, CrossTenantError, MahnstufeReihenfolgeError, QuellenbelegFehltError
 from mietinkasso.infrastructure.db.tables import KontoTable, MahnFallTable, MahnLaufTable, MahnPolicyTable, VertragTable
+from mietinkasso.mahnwesen.fristen import frist_abgelaufen, fristende_ab_zugang
 from mietinkasso.mahnwesen.kosten import snapshot_aus_json, snapshot_zu_json
-from mietinkasso.mahnwesen.repository import MahnFallRepository, MahnLaufRepository, MahnPolicyRepository
+from mietinkasso.mahnwesen.repository import MahnEmpfaengerZugangRepository, MahnFallRepository, MahnLaufRepository, MahnPolicyRepository
 from mietinkasso.op.service import OffeneForderung, OPService, compute_content_hash
 from mietinkasso.stammdaten.repository import StammdatenRepository
 from mietinkasso.indexautomatik.mailnachweis import beleg_aus_bestaetigtem_audit, nachweis_daten, versand_belegen
 from mietinkasso.domain.exceptions import TransportFehlerUngewissError
 from mietinkasso.indexautomatik.zeit import heute_wien
+
+#: Auftrag HV-20261020-VIER-MAHNSTUFEN: Feld auf `MahnPolicyTable`, das
+#: die Mindesttage-ab-Zugang-Frist für den Übergang AUF Stufe `N`
+#: (`N` in 2, 3, 4) trägt - siehe `MahnwesenService._mindesttage_fuer_
+#: uebergang`.
+_MINDESTTAGE_ZUGANG_FELD_JE_ZIELSTUFE = {
+    2: "stufe2_mindesttage_nach_stufe1_zugang",
+    3: "stufe3_mindesttage_nach_stufe2_zugang",
+    4: "stufe4_mindesttage_nach_stufe3_zugang",
+}
 
 
 def _versandtag_wien(value):
@@ -103,6 +114,8 @@ class MahnwesenService:
         kanalregel_repository=None,
         brief_anbieterprofil_repository=None,
         brief_transport_verfuegbar: bool = False,
+        mitmieter_repository=None,
+        empfaenger_zugang_repository: MahnEmpfaengerZugangRepository | None = None,
     ):
         self._repository = repository
         self._stammdaten_repository = stammdaten_repository
@@ -132,6 +145,13 @@ class MahnwesenService:
         self._kanalregel_repository = kanalregel_repository
         self._brief_anbieterprofil_repository = brief_anbieterprofil_repository
         self._brief_transport_verfuegbar = brief_transport_verfuegbar
+        # Auftrag HV-20261020-VIER-MAHNSTUFEN: beide optional, Default
+        # `None` - ohne konfiguriertes Repository bleibt das Verhalten
+        # UNVERÄNDERT (kein Mitmieter-/Zugangsnachweis-Tracking, exakt
+        # wie vor diesem Auftrag), siehe `_vervollstaendige_bestaetigten_
+        # mahnlauf`/`zugang_bestaetigen_fuer_empfaenger`.
+        self._mitmieter_repository = mitmieter_repository
+        self._empfaenger_zugang_repository = empfaenger_zugang_repository
 
     def _resolve_kanal(self, stufe: int) -> str:
         """Liefert den für `stufe` (1 oder 2) tatsächlich zu verwendenden
@@ -154,22 +174,95 @@ class MahnwesenService:
             return "EMAIL"
         return regel.stufe1_kanal if stufe == 1 else regel.stufe2_kanal
 
-    def _naechste_stufe_fuer_forderung(self, forderung_op_position_id: int) -> MahnStufe | None:
+    def _naechste_stufe_fuer_forderung(self, forderung_op_position_id: int, *, policy: MahnPolicyTable) -> MahnStufe | None:
+        """Auftrag HV-20261020-VIER-MAHNSTUFEN: verallgemeinert von genau
+        zwei auf bis zu vier Stufen - `policy.vier_stufen_profil_aktiv`
+        entscheidet die oberste erreichbare Stufe (`max_stufe`). Für eine
+        ALTE, NICHT auf das Vier-Stufen-Profil umgestellte Policy ist
+        `max_stufe == 2` und das Verhalten IDENTISCH zur bisherigen
+        Zwei-Stufen-Logik (kein stillschweigender Verhaltenswechsel für
+        bereits laufende Mahnzyklen): existiert bereits ein MahnFall für
+        die oberste erreichbare Stufe, wird NIE weiter eskaliert
+        ("nach der letzten Stufe nur noch interner Bearbeitungsfall"),
+        unabhängig vom Status dieses letzten Falls."""
+
         letzter = self._repository.letzter_mahnfall_fuer_forderung(forderung_op_position_id)
         if letzter is None:
             return MahnStufe.STUFE_1
-        if letzter.stufe == MahnStufe.STUFE_1.value:
-            if letzter.status == MahnStatus.GESENDET.value:
-                return MahnStufe.STUFE_2
-            return MahnStufe.STUFE_1
-        if letzter.stufe == MahnStufe.STUFE_2.value:
-            return None  # nach Stufe 2 nur noch interner Bearbeitungsfall
-        return MahnStufe.STUFE_1
+        max_stufe = 4 if policy.vier_stufen_profil_aktiv else 2
+        if letzter.stufe >= max_stufe:
+            return None
+        if letzter.status != MahnStatus.GESENDET.value:
+            return MahnStufe(letzter.stufe)
+        return MahnStufe(letzter.stufe + 1)
 
     def _bankstand_veraltet(self, *, heute: date, bank_bestaetigt_bis: date | None) -> bool:
         if bank_bestaetigt_bis is None:
             return True
         return (heute - bank_bestaetigt_bis).days > self._bank_stand_max_age_days
+
+    def _pruefe_vorstufe_abstand(
+        self, *, forderung_op_position_id: int, stufe: MahnStufe, policy: MahnPolicyTable,
+        vertrag: VertragTable, heute: date,
+    ) -> tuple[str, str] | None:
+        """Prüft den Mindestabstand zur UNMITTELBAR VORHERIGEN Stufe für
+        `stufe` (2, 3 oder 4) - `None`, wenn der Abstand bereits erreicht
+        ist, sonst `("ZU_FRUEH", grund)`. Wirft `MahnstufeReihenfolgeError`,
+        wenn die Vorstufe nicht nachweislich GESENDET ist (strukturelle
+        Inkonsistenz - "Stufe N verlangt eine erfolgreich gesendete
+        Stufe N-1" -, kein normaler "noch zu früh"-Fall).
+
+        Auftrag HV-20261020-VIER-MAHNSTUFEN: unter `policy.vier_stufen_
+        profil_aktiv` zählt die Frist AB BESTÄTIGTEM ZUGANG (§902/903
+        ABGB, `mahnwesen/fristen.py::fristende_ab_zugang`) - NICHT mehr
+        ab dem bloßen Versanddatum (Nutzervorgabe wörtlich: "Jede Stufe
+        hat volle 14 Tage ab nachgewiesenem Zugang"). Ein Mahnlauf OHNE
+        bestätigten Zugang ALLER erwarteten Empfänger (`MahnLaufTable.
+        zugang_bestaetigt_am`, siehe `zugang_bestaetigen_fuer_
+        empfaenger`) bleibt deshalb strukturell "noch zu früh", statt
+        (wie bei der alten Zwei-Stufen-Logik) automatisch anhand des
+        Versanddatums weiterzulaufen - "ein gewöhnlicher Mail-/SMTP-
+        Versand oder eine bloße Brief-Einlieferung ist nicht automatisch
+        ein rechtssicherer Zugang" (Nutzervorgabe). Für eine Policy OHNE
+        aktiviertes Vier-Stufen-Profil (`vier_stufen_profil_aktiv ==
+        False`, dort NUR für `stufe == 2` überhaupt erreichbar) bleibt
+        die ALTE, versandzeitpunktbasierte Logik unverändert - kein
+        stillschweigender Verhaltenswechsel für bereits laufende
+        Zwei-Stufen-Mahnzyklen."""
+
+        vorstufe_wert = stufe.value - 1
+        letzte_vorstufe = self._repository.letzter_mahnfall_je_stufe_fuer_forderung(forderung_op_position_id, vorstufe_wert)
+        if letzte_vorstufe is None or letzte_vorstufe.status != MahnStatus.GESENDET.value or letzte_vorstufe.gesendet_am is None:
+            raise MahnstufeReihenfolgeError(
+                f"Forderung {forderung_op_position_id}: Stufe {stufe.value} verlangt eine erfolgreich "
+                f"gesendete Stufe {vorstufe_wert}."
+            )
+
+        if not policy.vier_stufen_profil_aktiv:
+            tage_seit_versand = (heute - _versandtag_wien(letzte_vorstufe.gesendet_am)).days
+            mindest_tage = max(policy.stufe2_mindesttage_nach_stufe1_versand, vertrag.zahlungsfrist_tage)
+            if tage_seit_versand < mindest_tage:
+                return "ZU_FRUEH", f"Mindestabstand zu Stufe {vorstufe_wert} noch nicht erreicht ({tage_seit_versand}/{mindest_tage} Tagen)."
+            return None
+
+        mahnlauf = None
+        if self._mahnlauf_repository is not None and letzte_vorstufe.mahnlauf_id is not None:
+            mahnlauf = self._mahnlauf_repository.get(letzte_vorstufe.mahnlauf_id)
+        if mahnlauf is None or mahnlauf.zugang_bestaetigt_am is None:
+            return "ZU_FRUEH", (
+                f"Zugang des Schreibens zu Stufe {vorstufe_wert} ist noch nicht für ALLE erwarteten "
+                "Empfänger bestätigt - die Frist zur nächsten Stufe läuft erst ab bestätigtem Zugang, "
+                "nie automatisch ab dem Versanddatum."
+            )
+        mindest_tage = getattr(policy, _MINDESTTAGE_ZUGANG_FELD_JE_ZIELSTUFE[stufe.value])
+        if not frist_abgelaufen(zugang_am=mahnlauf.zugang_bestaetigt_am, frist_tage=mindest_tage, heute=heute):
+            fristende = fristende_ab_zugang(mahnlauf.zugang_bestaetigt_am, mindest_tage)
+            return "ZU_FRUEH", (
+                f"Die {mindest_tage}-Tage-Frist ab bestätigtem Zugang (§902/903 ABGB, Werktags-"
+                f"verschiebung berücksichtigt) endet erst am {fristende.isoformat()}; heute ist "
+                f"{heute.isoformat()}."
+            )
+        return None
 
     def _pruefe_forderung_planbar(
         self, *, vertrag: VertragTable, konto: KontoTable, forderung: OffeneForderung, policy: MahnPolicyTable,
@@ -231,9 +324,15 @@ class MahnwesenService:
         if forderung.rest_cent <= 0:
             return "KEIN_BETRAG", "Forderung ist bereits ausgeglichen.", None, None
 
-        stufe = self._naechste_stufe_fuer_forderung(forderung.op_position_id)
+        stufe = self._naechste_stufe_fuer_forderung(forderung.op_position_id, policy=policy)
         if stufe is None:
-            return "BLOCKIERT", "Nach Stufe 2 ist nur ein interner Bearbeitungsfall zulässig, keine Stufe 3.", None, None
+            letzte_erreichbare_stufe = 4 if policy.vier_stufen_profil_aktiv else 2
+            return (
+                "BLOCKIERT",
+                f"Nach Stufe {letzte_erreichbare_stufe} ist nur ein interner Bearbeitungsfall zulässig, "
+                "keine weitere automatische Mahnstufe.",
+                None, None,
+            )
 
         # Empfänger-Voraussetzung hängt vom für DIESE Stufe tatsächlich
         # aufgelösten Kanal ab (siehe `_resolve_kanal`) - ERST HIER
@@ -260,21 +359,12 @@ class MahnwesenService:
                     None, None,
                 )
         else:
-            letzte_stufe1 = self._repository.letzter_mahnfall_je_stufe_fuer_forderung(
-                forderung.op_position_id, MahnStufe.STUFE_1.value
+            ergebnis = self._pruefe_vorstufe_abstand(
+                forderung_op_position_id=forderung.op_position_id, stufe=stufe, policy=policy, vertrag=vertrag, heute=heute,
             )
-            if letzte_stufe1 is None or letzte_stufe1.status != MahnStatus.GESENDET.value or letzte_stufe1.gesendet_am is None:
-                raise MahnstufeReihenfolgeError(
-                    f"Forderung {forderung.op_position_id}: Stufe 2 verlangt eine erfolgreich gesendete Stufe 1."
-                )
-            tage_seit_versand = (heute - _versandtag_wien(letzte_stufe1.gesendet_am)).days
-            mindest_tage = max(policy.stufe2_mindesttage_nach_stufe1_versand, vertrag.zahlungsfrist_tage)
-            if tage_seit_versand < mindest_tage:
-                return (
-                    "ZU_FRUEH",
-                    f"Mindestabstand zu Stufe 1 noch nicht erreicht ({tage_seit_versand}/{mindest_tage} Tagen).",
-                    None, None,
-                )
+            if ergebnis is not None:
+                status, grund = ergebnis
+                return status, grund, None, None
 
         snapshot = {
             "vertrag_id": vertrag.id,
@@ -542,14 +632,30 @@ class MahnwesenService:
             return "BLOCKIERT_PERSIST", "Fälligkeit ist inzwischen ungeklärt.", None
         if mahnfall.stufe == 1:
             fruehestens = passende_forderung.faelligkeit + timedelta(days=aktuelle_policy.stufe1_tage_nach_faelligkeit)
+            if heute < fruehestens:
+                return "BLOCKIERT_TRANSIENT", "Mahnfrist ist noch nicht abgelaufen.", None
         else:
-            first = self._repository.letzter_mahnfall_je_stufe_fuer_forderung(mahnfall.forderung_op_position_id, 1)
-            if first is None or first.status != "GESENDET" or first.gesendet_am is None:
-                return "BLOCKIERT_PERSIST", "Zweite Mahnung benötigt die tatsächlich gesendete erste Mahnung.", None
-            fruehestens = _versandtag_wien(first.gesendet_am) + timedelta(days=max(
-                aktuelle_policy.stufe2_mindesttage_nach_stufe1_versand, vertrag.zahlungsfrist_tage))
-        if heute < fruehestens:
-            return "BLOCKIERT_TRANSIENT", "Mahnfrist ist noch nicht abgelaufen.", None
+            # Auftrag HV-20261020-VIER-MAHNSTUFEN: dieselbe verallgemeinerte
+            # Vorstufen-/Zugangsprüfung wie bei der Planung (siehe
+            # `_pruefe_vorstufe_abstand`) - hier wird eine strukturelle
+            # Reihenfolgeninkonsistenz ABSICHTLICH nicht als Exception
+            # durchgereicht (das würde den gesamten Mahnlauf/Batch abbrechen),
+            # sondern dauerhaft blockiert (`BLOCKIERT_PERSIST`), exakt wie
+            # das bisherige Verhalten für eine fehlende erste Mahnung.
+            try:
+                ergebnis = self._pruefe_vorstufe_abstand(
+                    forderung_op_position_id=mahnfall.forderung_op_position_id, stufe=MahnStufe(mahnfall.stufe),
+                    policy=aktuelle_policy, vertrag=vertrag, heute=heute,
+                )
+            except MahnstufeReihenfolgeError:
+                return (
+                    "BLOCKIERT_PERSIST",
+                    f"Stufe {mahnfall.stufe} benötigt die tatsächlich gesendete Vorstufe {mahnfall.stufe - 1}.",
+                    None,
+                )
+            if ergebnis is not None:
+                _status, grund = ergebnis
+                return "BLOCKIERT_TRANSIENT", grund, None
 
         return None, "", passende_forderung
 
@@ -998,6 +1104,29 @@ class MahnwesenService:
             ergebnis=beleg, erlaubt={"IN_VERSAND", "UNSICHER"}, neuer_status="GESENDET", zeitfeld="gesendet_am",
             referenz="mahnungslauf:" + mahnlauf.outbox_key,
         )
+
+        # Auftrag HV-20261020-VIER-MAHNSTUFEN: sobald der Mahnlauf
+        # tatsächlich bestätigt GESENDET ist, werden die zu DIESEM
+        # Zeitpunkt erwarteten Empfänger (Hauptmieter + jeder zu diesem
+        # Zeitpunkt aktive Mitmieter) als NOCH UNBESTÄTIGTE Zugangs-
+        # Platzhalter angelegt - idempotent (`erstelle_erwartete_
+        # eintraege` überspringt bereits vorhandene Paare), optional
+        # (ohne konfiguriertes Repository unverändertes alt-Verhalten).
+        if self._empfaenger_zugang_repository is not None:
+            vertrag_fuer_empfaenger = self._stammdaten_repository.get_vertrag(mahnlauf.vertrag_id)
+            if vertrag_fuer_empfaenger is not None:
+                debitor = self._stammdaten_repository.get_debitor(vertrag_fuer_empfaenger.debitor_id)
+                erwartete_empfaenger: list[tuple[int | None, str]] = []
+                if debitor is not None:
+                    erwartete_empfaenger.append((None, debitor.name))
+                if self._mitmieter_repository is not None:
+                    erwartete_empfaenger.extend(
+                        (m.id, m.name) for m in self._mitmieter_repository.list_aktiv(vertrag_fuer_empfaenger.id)
+                    )
+                if erwartete_empfaenger:
+                    self._empfaenger_zugang_repository.erstelle_erwartete_eintraege(
+                        mahnlauf_id=mahnlauf.id, empfaenger=erwartete_empfaenger, erstellt_von=akteur,
+                    )
         # Jedes Mitglied wurde entweder bei `plane_mahnlauf` atomar auf
         # GEBUENDELT geclaimt (Normalfall) oder - bei einem zwischenzeitlich
         # UNSICHEREN Providerkontakt (siehe `versende_mahnlauf`) -
@@ -1240,3 +1369,83 @@ class MahnwesenService:
         if neuer_status is MahnStatus.GEPLANT:
             raise ValueError("Unklarer Versand wird nicht zurück auf GEPLANT gesetzt; zuerst Providerstatus klären.")
         return self._repository.set_status(mahnfall_id, neuer_status.value)
+
+    def zugang_bestaetigen_fuer_empfaenger(
+        self, *, ctx: AuthContext, mahnlauf_id: int, mitmieter_id: int | None, heute: date, zugang_datum: date,
+        zugangsform: str, zugang_beleg: str, akteur: str,
+    ) -> MahnLaufTable:
+        """Bestätigt den Zugang EINES erwarteten Empfängers (`mitmieter_id
+        is None` -> Hauptmieter/Debitor, sonst ein konkreter Mitmieter)
+        eines bereits GESENDETEN Mahnlaufs - mirrors `indexautomatik/
+        outbox_service.py::OutboxService.zugang_bestaetigen` bewusst
+        1:1 (dieselbe Fachregel, dieselben `ZUGANGSFORMEN_ALLE`/
+        `ZUGANGSFORMEN_AUSREICHEND`-Werte, siehe `domain/enums.py`): ein
+        gewöhnlicher E-Mail-/SMTP-Versand ODER eine bloße Brief-
+        Einlieferung bei der Post ist NIE automatisch ein rechtssicherer,
+        fristauslösender Zugang (Nutzervorgabe wörtlich).
+
+        Sobald ALLE zum Versandzeitpunkt erwarteten Empfänger dieses
+        Mahnlaufs einen bestätigten, FORMAL AUSREICHENDEN Zugang haben,
+        wird `MahnLaufTable.zugang_bestaetigt_am` automatisch auf den
+        SPÄTESTEN (konservativsten) dieser Einzelzugänge gesetzt - das
+        ist die Grundlage, auf der `_pruefe_vorstufe_abstand` die
+        14-Tage-Frist zur NÄCHSTEN Stufe berechnet. Solange nicht ALLE
+        bestätigt haben, bleibt `zugang_bestaetigt_am` `None` - die
+        nächste Stufe bleibt dadurch strukturell "noch zu früh"."""
+
+        mahnlauf = self._mahnlauf_repository.get(mahnlauf_id)
+        if mahnlauf is None:
+            raise ValueError(f"Unbekannter MahnLauf {mahnlauf_id}")
+        vertrag = self._stammdaten_repository.get_vertrag(mahnlauf.vertrag_id)
+        if vertrag is None:
+            raise ValueError(f"Unbekannter Vertrag {mahnlauf.vertrag_id}")
+        require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
+        require_schreibrecht(ctx)
+
+        if mahnlauf.status != "GESENDET":
+            raise ValueError(
+                f"Nur ein GESENDETer Mahnlauf kann einen Zugang bestätigt bekommen (aktueller Status: {mahnlauf.status})."
+            )
+        if zugang_datum > heute:
+            raise ValueError("Zugangsdatum darf nicht in der Zukunft liegen.")
+        versandtag = _versandtag_wien(mahnlauf.gesendet_am) if mahnlauf.gesendet_am is not None else None
+        if versandtag is not None and zugang_datum < versandtag:
+            raise ValueError(
+                f"Zugangsdatum ({zugang_datum.isoformat()}) liegt vor dem tatsächlichen Versanddatum "
+                f"({versandtag.isoformat()}) - unplausible Eingabe."
+            )
+        if zugangsform not in ZUGANGSFORMEN_ALLE:
+            raise ValueError(f"Unbekannte Zugangsform '{zugangsform}'.")
+        if not (zugang_beleg or "").strip():
+            raise QuellenbelegFehltError("Eine Zugangsbestätigung ohne Belegreferenz wird abgelehnt.")
+        if zugangsform not in ZUGANGSFORMEN_AUSREICHEND:
+            raise ValueError(
+                f"Zugangsform '{zugangsform}' gilt NICHT automatisch als rechtzeitiger, fristauslösender "
+                "Zugang (z. B. eine bloß versendete, unbestätigte E-Mail oder eine bloße Brief-Einlieferung "
+                "bei der Post). Bitte einen formal ausreichenden Nachweis erfassen oder den Fall manuell klären."
+            )
+
+        if self._empfaenger_zugang_repository is None:
+            raise ValueError("Kein MahnEmpfaengerZugangRepository konfiguriert.")
+        eintraege = self._empfaenger_zugang_repository.fuer_mahnlauf(mahnlauf_id)
+        ziel = next((e for e in eintraege if e.mitmieter_id == mitmieter_id), None)
+        if ziel is None:
+            raise ValueError(f"Kein erwarteter Empfänger (mitmieter_id={mitmieter_id!r}) für Mahnlauf {mahnlauf_id} gefunden.")
+        self._empfaenger_zugang_repository.bestaetige_zugang(
+            ziel.id, zugangsform=zugangsform, zugang_bestaetigt_am=zugang_datum, zugang_beleg=zugang_beleg,
+        )
+
+        aktualisiert = self._empfaenger_zugang_repository.fuer_mahnlauf(mahnlauf_id)
+        if self._empfaenger_zugang_repository.alle_bestaetigt(aktualisiert, ausreichende_formen=ZUGANGSFORMEN_AUSREICHEND):
+            spaetester = self._empfaenger_zugang_repository.spaetester_zugang(aktualisiert)
+            # Mehrere Empfänger können unterschiedliche Zugangsformen/
+            # -belege haben - das aggregierte Feld auf `MahnLaufTable`
+            # ist bewusst NUR die Fristengrundlage (spätestes Datum),
+            # NICHT der vollständige Nachweis; der bleibt vollständig
+            # und unverkürzt in `MahnEmpfaengerZugangTable` erhalten.
+            aggregierte_form = zugangsform if len(aktualisiert) == 1 else "MEHRERE_EMPFAENGER_SIEHE_EINZELNACHWEISE"
+            self._mahnlauf_repository.setze_zugang(
+                mahnlauf_id, zugangsform=aggregierte_form, zugang_bestaetigt_am=spaetester,
+                zugang_beleg=zugang_beleg, zugang_bestaetigt_von=akteur,
+            )
+        return self._mahnlauf_repository.get(mahnlauf_id)

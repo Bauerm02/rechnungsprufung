@@ -21,12 +21,13 @@ from mietinkasso.mahnwesen.brief_pdf import Forderungszeile as BriefForderungsze
 from mietinkasso.mahnwesen.brief_pdf import Zinssegment as BriefZinssegment
 from mietinkasso.mahnwesen.brief_pdf import erzeuge_mahnbrief_pdf
 from mietinkasso.mahnwesen.kosten import zins_bis_einschliesslich
+from mietinkasso.mahnwesen.mahntexte import text_fuer_stufe
 from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
 from mietinkasso.mahnwesen.kosten_service import MahnkostenService
 from mietinkasso.mahnwesen.mahnbrief_archiv import MahnbriefArchivRepository
 from mietinkasso.mahnwesen.repository import (
-    BriefAnbieterProfilRepository, MahnFallRepository, MahnKanalregelRepository, MahnLaufRepository,
-    MahnPolicyRepository,
+    BriefAnbieterProfilRepository, MahnEmpfaengerZugangRepository, MahnFallRepository, MahnKanalregelRepository,
+    MahnLaufRepository, MahnPolicyRepository, VertragMitmieterRepository,
 )
 from mietinkasso.mahnwesen.service import MahnwesenService, VersandErgebnis
 from mietinkasso.op.repository import OPRepository
@@ -112,6 +113,18 @@ def _mahnkosten_text_baustein(vorschau) -> str:
     return "\n".join(zeilen) + "\n\n"
 
 
+#: Auftrag HV-20261020-VIER-MAHNSTUFEN, Nutzervorgabe wörtlich: "Zwei
+#: deterministische Prüfläufe je Monat, Standard 10. und 25. um 09:00
+#: Europe/Vienna (Implementierungsentscheidung; veränderbar)" - technisch
+#: präzisiert (Server-Readback 20.10.2026): läuft NICHT als eigener
+#: 09:00-Termin, sondern als Tagesbedingung INNERHALB des bestehenden,
+#: bereits täglich um 08:15 Europe/Vienna laufenden `mietinkasso-fristen-
+#: tag.timer` (`scripts/indexautomatik_taegliche_pflege.py`) - KEIN
+#: zweiter, konkurrierender Scheduler. `heute` kommt hier bereits als
+#: Europe/Vienna-Kalendertag (`indexautomatik/zeit.py::heute_wien`) an.
+_VIER_STUFEN_PRUEFTAGE = frozenset({10, 25})
+
+
 class HVMailversandService:
     def __init__(self, session_factory, bundle, settings, *, client=None):
         self.sf, self.bundle, self.settings = session_factory, bundle, settings
@@ -137,6 +150,14 @@ class HVMailversandService:
         self.kanalregel_repo = MahnKanalregelRepository(session_factory)
         self.brief_anbieterprofil_repo = BriefAnbieterProfilRepository(session_factory)
         self.mahnbrief_archiv_repo = MahnbriefArchivRepository(session_factory)
+        # Auftrag HV-20261020-VIER-MAHNSTUFEN: Mitmieter-/Zugangsnachweis-
+        # Repositories IMMER verdrahtet (wie Kanalregel/Brief-
+        # Anbieterprofil oben) - wirksam wird das Vier-Stufen-Verhalten
+        # trotzdem erst, sobald eine Policy mit `vier_stufen_profil_
+        # aktiv=True` tatsächlich freigegeben ist (siehe `MahnwesenService.
+        # _naechste_stufe_fuer_forderung`/`_pruefe_vorstufe_abstand`).
+        self.mitmieter_repo = VertragMitmieterRepository(session_factory)
+        self.empfaenger_zugang_repo = MahnEmpfaengerZugangRepository(session_factory)
         self._brief_sftp_konfiguration = brief_sftp.konfiguration_aus_settings(settings)
         self.brief_sftp_adapter = (
             brief_sftp.PostSftpTransportadapter(self._brief_sftp_konfiguration)
@@ -150,7 +171,8 @@ class HVMailversandService:
             self.op_service, self.policy_repo, bank_stand_max_age_days=settings.bank_stand_max_age_days,
             mahnkosten_service=self.mahnkosten_service, mahnlauf_repository=self.mahnlauf_repo,
             kanalregel_repository=self.kanalregel_repo, brief_anbieterprofil_repository=self.brief_anbieterprofil_repo,
-            brief_transport_verfuegbar=self.brief_sftp_adapter is not None)
+            brief_transport_verfuegbar=self.brief_sftp_adapter is not None,
+            mitmieter_repository=self.mitmieter_repo, empfaenger_zugang_repository=self.empfaenger_zugang_repo)
 
     def owner_senden(self, auftrag):
         if self.client is None or not self.settings.hv_mail_allowlist_bestaetigt:
@@ -252,21 +274,31 @@ class HVMailversandService:
                 (vorschau.bereits_offene_mahnkosten_cent + vorschau.zusaetzlicher_betrag_cent) if vorschau is not None else 0
             )
 
+            # `deadline` bleibt die bisherige, rein als ANZEIGE-Komfort
+            # gedachte Schätzung (`heute + zahlungsfrist_tage`) - die
+            # rechtlich maßgebliche Frist ist "binnen 14 Tagen AB ZUGANG"
+            # (siehe `mahntexte.text_fuer_stufe`/`mahnwesen/fristen.py`),
+            # der tatsächliche Zugang ist zum Versandzeitpunkt aber noch
+            # nicht bekannt - dieses Datum ist deshalb ausdrücklich eine
+            # Orientierungshilfe für den Mieter, nie die rechtliche
+            # Fristgrundlage selbst.
             deadline = heute + timedelta(days=contract.zahlungsfrist_tage)
-            subject = "Zahlungserinnerung" if mahnlauf.stufe == 1 else "Zweite Mahnung"
+            mahntext = text_fuer_stufe(stufe=mahnlauf.stufe, rechtsordnung=contract.rechtsordnung, zahlungsfrist_bis=deadline)
+            subject = mahntext.betreff
             anker = mitglieder[0]
             empfaenger_name = anker.snapshot["empfaenger_name"]
+            rechtlicher_absatz = f"\n\n{mahntext.rechtlicher_kern}" if mahntext.rechtlicher_kern else ""
             text = (
                 f"Guten Tag {empfaenger_name},\n\n"
-                f"für {obj.bezeichnung}, {unit.bezeichnung}, ist folgende Forderung offen:\n\n"
+                f"{mahntext.einleitung} {mahntext.kerntext}\n\n"
+                f"Für {obj.bezeichnung}, {unit.bezeichnung}, ist folgende Forderung offen:\n\n"
                 + "\n".join(posten_zeilen) +
                 f"\n\nHauptforderung gesamt: {_eur_text(gesamt_cent)} EUR.\n\n"
                 + kosten_text +
                 f"Gesamtbetrag (Hauptforderung inkl. noch offener früherer Kosten und neuer zulässiger "
-                f"Zinsen/Gebühr): {_eur_text(gesamtbetrag_cent)} EUR.\n\n"
-                f"Bitte begleichen Sie den offenen Gesamtbetrag bis {deadline.strftime('%d.%m.%Y')} "
-                "auf das Ihnen für dieses Mietverhältnis bekannt gegebene Konto. "
-                "Bei einer inzwischen erfolgten Zahlung senden Sie uns bitte den Zahlungsbeleg.\n\n"
+                f"Zinsen/Gebühr): {_eur_text(gesamtbetrag_cent)} EUR."
+                + rechtlicher_absatz +
+                "\n\nBei einer inzwischen erfolgten Zahlung senden Sie uns bitte den Zahlungsbeleg. "
                 "Bei Fragen zur Forderung antworten Sie bitte auf diese Nachricht."
             )
             op_ids = sorted(m.forderung_op_position_id for m in mitglieder)
@@ -400,6 +432,7 @@ class HVMailversandService:
             absender=absender, empfaenger_name=empfaenger_name,
             empfaenger_adresse=(debitor.adresse or "").replace(", ", "\n"),
             objekt_bezeichnung=obj.bezeichnung, einheit_bezeichnung=unit.bezeichnung, stufe=mahnlauf.stufe,
+            rechtsordnung=contract.rechtsordnung,
             heute=heute, zahlungsfrist_bis=deadline, forderungszeilen=forderungszeilen,
             bereits_offene_mahnkosten_cent=(vorschau.bereits_offene_mahnkosten_cent if vorschau is not None else 0),
             neue_zinsen_delta_cent=(vorschau.neue_zinsen_delta_cent if vorschau is not None else 0),
@@ -600,6 +633,19 @@ class HVMailversandService:
         counts = {"geplant": 0, "gesendet": 0, "blockiert": 0}
         if policy is None:
             return counts
+        # Auftrag HV-20261020-VIER-MAHNSTUFEN, Nutzervorgabe wörtlich:
+        # "Zwei deterministische Prüfläufe je Monat" (Standard 10./25.,
+        # veränderbar) - im BESTEHENDEN täglichen 08:15-Dienst
+        # (`scripts/indexautomatik_taegliche_pflege.py`), KEIN zweiter
+        # konkurrierender Scheduler. Gilt NUR für eine Policy mit
+        # `vier_stufen_profil_aktiv` - eine alte Zwei-Stufen-Policy läuft
+        # UNVERÄNDERT täglich weiter (kein stillschweigender
+        # Verhaltenswechsel für bereits laufende Mahnzyklen). Die bereits
+        # oben ausgeführten Recovery-Schritte (verwaiste Fälle/Läufe,
+        # Kostenabschluss) sind KEINE Eskalation und laufen deshalb
+        # bewusst JEDEN Tag unverändert weiter.
+        if policy.vier_stufen_profil_aktiv and heute.day not in _VIER_STUFEN_PRUEFTAGE:
+            return counts
         st = self.bundle.stammdaten_repository
         for contract in st.list_alle_vertraege():
             if not ctx.has_zugriff(contract.gesellschaft_id):
@@ -621,7 +667,28 @@ class HVMailversandService:
                 # (siehe `_dispatch_mahnlauf`), kein Aufruf mehr je
                 # einzelner Forderung.
                 geplante_stufen = sorted({p.stufe for p in planned if p.status == "GEPLANT"})
-                for stufe in geplante_stufen:
+                # Auftrag HV-20261020-VIER-MAHNSTUFEN, Nutzervorgabe
+                # wörtlich: "Maximal EIN gebündeltes Schreiben pro
+                # Vertrag/Monatslauftermin trotz neuer OPs/verschiedener
+                # alter Stufen, keine neue Gebühr je OP/Mitmieterkopie."
+                # Haben mehrere Forderungen DESSELBEN Vertrags in DIESEM
+                # Lauf unterschiedliche, jeweils für sich genommen
+                # versandreife Stufen erreicht, wird NUR die höchste
+                # davon in DIESEM Lauf tatsächlich dispatcht - eine
+                # niedrigere Stufe bleibt GEPLANT und wird erst in einem
+                # SPÄTEREN Prüflauf berücksichtigt (jede Forderung
+                # behält dabei ihre EIGENE, individuell erreichte Stufe -
+                # keine Vorverlegung/kein "Hochziehen" einer neuen
+                # Forderung auf die Stufe älterer Forderungen desselben
+                # Vertrags). Unter dem ALTEN Zwei-Stufen-Profil ändert
+                # das nichts (dort können ohnehin nicht gleichzeitig zwei
+                # unterschiedliche Stufen für denselben Vertrag
+                # versandreif sein, da Stufe 2 zwingend die gesendete
+                # Stufe 1 derselben Forderung voraussetzt - diese
+                # Einschränkung ist aus Vorsicht/Klarheit aber generell
+                # formuliert, nicht nur für das Vier-Stufen-Profil).
+                stufen_fuer_diesen_lauf = geplante_stufen[-1:] if geplante_stufen else []
+                for stufe in stufen_fuer_diesen_lauf:
                     mahnlauf = self.mahn_service.plane_mahnlauf(
                         ctx=ctx, vertrag=contract, konto=account, stufe=stufe, heute=heute,
                         bank_bestaetigt_bis=confirmed, ungeklaerte_eingaenge_vorhanden=unclear,

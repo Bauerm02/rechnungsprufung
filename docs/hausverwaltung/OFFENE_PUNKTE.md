@@ -5680,3 +5680,249 @@ Zeilen (XSS-Escaping-Regression, Strukturfehler ohne Absturz,
 "Zuordnung/Betrag nicht belegt" statt "nicht gebucht", Basis-Betrag in
 der echten Seite). 210 Tests in den betroffenen Dateien grün.
 Ausschließlich synthetische Testdaten, keine Geschäftsaktion.
+
+## HV-20261020-VIER-MAHNSTUFEN (Ablösung der Zwei-Stufen-Regel)
+
+Löst Fachregel 7 ("genau zwei Stufen") ab: vier Mahnstufen mit
+eigenständigem Ton/Rechtsinhalt je Stufe, zugangsnachweis-basierter
+14-Tage-Fristenlauf (§902/903 ABGB inkl. österreichischem Feiertags-
+kalender), zwei deterministische Prüfläufe im bestehenden täglichen
+08:15-Dienst, Mitmieter-Zustellnachweis. **Vollständig additiv** - jede
+bereits laufende Zwei-Stufen-Policy/Vertrag bleibt beim exakt alten
+Verhalten, solange niemand explizit eine neue Policy mit
+`vier_stufen_profil_aktiv=True` freigibt. Gesamtsuite `tests/mietinkasso`
+(1486 Tests) nach Fertigstellung grün.
+
+### Prozess-Hinweis (Transparenz, kein Fachinhalt)
+
+Während der Umsetzung hat ein von mir selbst zur reinen Recherche
+gestarteter Hintergrund-Agent (sollte NUR Fakten zu Orchestrator/
+Migrationsmechanismus/Repository-Signaturen berichten) eigenständig
+begonnen, Code in `tables.py`/`repository.py` zu schreiben, WÄHREND ich
+dieselben Dateien parallel bearbeitet habe. Ich habe das erkannt, den
+Agenten gestoppt, seine Änderungen vollständig gegengelesen und
+übernommen (sie waren inhaltlich korrekt und folgten bereits
+bestehenden Codebase-Mustern - insbesondere die Wiederverwendung von
+`ZUGANGSFORMEN_ALLE`/`ZUGANGSFORMEN_AUSREICHEND`, die bereits für
+Erhöhungsschreiben etabliert sind), und den gesamten Rest der Umsetzung
+danach durchgehend allein fertiggestellt. Erwähnt hier ausschließlich
+zur Nachvollziehbarkeit, OHNE fachliche Relevanz für den Auftrag selbst.
+
+### 1. Vier Mahnstufen
+
+- `domain/enums.py::MahnStufe` additiv auf STUFE_1..STUFE_4 erweitert.
+- `mahnwesen/mahntexte.py` (neu): EIN gemeinsamer Textbaustein je Stufe
+  (`text_fuer_stufe`), von HTML/E-Mail (`indexautomatik/
+  mailversand_service.py`) UND PDF-Brief (`mahnwesen/brief_pdf.py::
+  erzeuge_mahnbrief_pdf`) GEMEINSAM verwendet - kein unabhängig
+  formulierter Kundentext an zwei Stellen.
+  - Stufe 1: freundlicher Einstieg ("Vielleicht haben Sie die Zahlung
+    übersehen") PLUS konkrete 14-Tage-Frist/Ernst (Nutzerkorrektur
+    20.10.2026: "bloß Vielleicht-übersehen reicht allein nicht").
+  - Stufe 2: Klärungsangebot bei Zahlungsschwierigkeiten, OHNE
+    automatisch einen Zahlungsaufschub zuzusagen (wörtlich im Text
+    verneint) - ebenfalls mit konkreter Frist/Ernst.
+  - Stufe 3: nachdrückliche Zahlungsaufforderung.
+  - Stufe 4: letzte Zahlungsaufforderung + gesetzlicher Kern
+    (`rechtlicher_kern_stufe4`): RA-Übergabe nach fruchtloser Frist,
+    § 30 Abs 2 Z 1 MRG NUR bei `OESTERREICH_MRG_VOLL` (Kündigungsschutz
+    gilt im Teilanwendungsbereich nach § 1 Abs 4 MRG nicht - fachliche
+    Annahme, **vor Produktivgang von Codex/Markus zu bestätigen**), für
+    alle anderen geklärten österreichischen Rechtsordnungen NUR § 1118
+    zweiter Fall ABGB, für eine Rechtsordnung ohne hinterlegten
+    österreichischen Baustein (z. B. `DEUTSCHLAND`) NIE eine erfundene
+    Norm - neutraler Text + rein interner Hinweis (`hinweis_intern`, NIE
+    im Kundentext). Enthält wörtlich "KEINE Kündigung/Auflösung", den
+    § 1118-Fristhinweis ("14 Tage sind kein Ersatz für den nächsten
+    Zinstermin") und die explizite Trennung "Grundlage ist der
+    rückständige MIETZINS, NICHT Verzugszinsen/Mahnkosten".
+  - Betreffzeilen Stufe 1/2 bewusst UNVERÄNDERT ("Zahlungserinnerung"/
+    "Zweite Mahnung") belassen, um keine bestehenden Tests/Vorlagen zu
+    brechen - die inhaltliche Verschärfung steckt im Fließtext, nicht im
+    Betreff.
+- Zinsen/Mahnspesen/Mahnpauschale bleiben strukturell UNVERÄNDERT
+  getrennt von der Hauptforderung (bereits bestehende Trennung in
+  `kosten.py`/`kosten_service.py`/`brief_pdf.py` - NICHT angefasst). Die
+  bestehende §458-UGB-/§1333-Abs-2-ABGB-Logik inkl. der 20-EUR-je-
+  tatsächlich-versendetem-Schreiben-Kostenbasis (`mahngebuehr_
+  kostenbasis_cent`) ist UNVERÄNDERT; dieser Auftrag fügt nur Text/
+  Stufenanzahl/Fristenlauf hinzu, keine neue Kostenlogik.
+- Eine gebündelte Nachricht je Vertrag/Stufe/Lauf bleibt erhalten
+  (`MahnLaufTable`, unverändertes Grundprinzip) - siehe Punkt 3 für die
+  neue "maximal ein Schreiben pro Vertrag pro Lauf"-Regel bei
+  gleichzeitig mehreren versandreifen Stufen.
+
+**Offener Punkt (nicht umgesetzt):** "verifizierter objektbezogener
+Empfänger+IBAN+Referenz" im Brief/Mail-Text - der bestehende UND der neue
+Text sagen weiterhin nur "auf das Ihnen bekannt gegebene Konto", OHNE
+eine konkrete IBAN zu nennen. `BankKontoTable` ist nur auf
+`gesellschaft_id` (nicht auf `Objekt`) bezogen und ein Objekt kann
+mehrere Bankkonten mit unterschiedlichem Zweck haben - eine automatische
+Auflösung "DAS Konto für dieses Objekt" hätte ohne eindeutige
+Objekt→Bankkonto-Zuordnung FALSCHE Zahlungsdaten riskiert (schlimmer als
+gar keine Angabe). Muss vor Produktivgang entweder durch eine neue,
+geprüfte Objekt→Bankkonto-Zuordnung ODER durch eine weiterhin manuelle
+Ergänzung im Anschreiben gelöst werden - **kein Fund = keine Erfindung.**
+
+### 2. Rechtssicherer Fristenlauf (§902/903 ABGB)
+
+- `mahnwesen/fristen.py` (neu): `oesterreichische_feiertage(jahr)`
+  (fixe Feiertage + bewegliche über gaußschen Osteralgorithmus:
+  Karfreitag, Ostermontag, Christi Himmelfahrt, Pfingstmontag,
+  Fronleichnam), `naechster_werktag`, `fristende_ab_zugang` (Zugangstag
+  zählt nicht mit, Fristende verschiebt sich von Samstag/Sonntag/
+  Feiertag auf den nächsten Werktag), `frist_abgelaufen`.
+- Wörtliches Grenzfall-Beispiel verifiziert: Zugang 10.10.2026, 14-Tage-
+  Frist -> rechnerisches Ende 24.10. (Sa) -> 25.10. (So) -> 26.10.
+  (Nationalfeiertag) -> TATSÄCHLICHES Fristende 27.10.2026 - ein
+  Prüflauf am 25.10. eskaliert NICHT, einer am 27.10. (oder später)
+  schon. Über `test_mahnwesen_fristen.py` UND end-to-end über den
+  echten `MahnwesenService` (`test_mahnwesen_vier_stufen.py`) bestätigt.
+- `MahnPolicyTable` additiv erweitert: `vier_stufen_profil_aktiv`
+  (Default `False`), `stufe2_mindesttage_nach_stufe1_zugang`,
+  `stufe3_mindesttage_nach_stufe2_zugang`,
+  `stufe4_mindesttage_nach_stufe3_zugang` (je Default 14). NUR bei
+  `vier_stufen_profil_aktiv=True` zählt die Frist zur NÄCHSTEN Stufe ab
+  bestätigtem ZUGANG statt (wie bisher) ab Versand - eine alte,
+  bereits freigegebene Zwei-Stufen-Policy bleibt unverändert
+  versandzeitpunktbasiert.
+- `MahnwesenService._naechste_stufe_fuer_forderung`/
+  `_pruefe_vorstufe_abstand` (neu, ersetzt die bisherige hartkodierte
+  Stufe-1/Stufe-2-Verzweigung) verallgemeinert auf 1-4 Stufen - für eine
+  Policy OHNE Vier-Stufen-Profil nachweislich IDENTISCHES Verhalten
+  (gesamte bestehende `test_mahnwesen.py`-Suite unverändert grün).
+
+### 3. Zwei Prüfläufe/Monat im bestehenden Dienst, max. ein Schreiben/Vertrag
+
+- KEIN neuer Scheduler: `HVMailversandService.mahnlauf()` (aufgerufen
+  von `scripts/indexautomatik_taegliche_pflege.py`, dem Skript hinter
+  dem bereits produktiv laufenden `mietinkasso-fristen-tag.timer`,
+  08:15 Europe/Vienna täglich - per Server-Readback bestätigt) prüft
+  jetzt zusätzlich `heute.day in {10, 25}` (Konstante
+  `_VIER_STUFEN_PRUEFTAGE`, bewusst leicht änderbar), ABER NUR wenn die
+  aktuell freigegebene Policy `vier_stufen_profil_aktiv=True` hat - eine
+  alte Policy läuft unverändert TÄGLICH weiter. Die bereits vorher im
+  selben Methodenkörper laufenden Recovery-Schritte (verwaiste Fälle/
+  Läufe, Kostenabschluss) sind KEINE Eskalation und laufen bewusst
+  weiterhin jeden Tag.
+- "Maximal ein gebündeltes Schreiben pro Vertrag pro Lauftermin trotz
+  verschiedener gleichzeitig versandreifer Stufen": `mahnlauf()` bildet
+  pro Vertrag/Lauf jetzt NUR noch für die HÖCHSTE an diesem Tag
+  versandreife Stufe einen `plane_mahnlauf`/Dispatch-Aufruf (statt wie
+  bisher für JEDE versandreife Stufe einzeln) - eine niedrigere Stufe
+  bleibt GEPLANT und wird in einem SPÄTEREN Lauf berücksichtigt. Jede
+  Forderung behält dabei ihre EIGENE, individuell erreichte Stufe (keine
+  Vorverlegung neuer Forderungen auf die Stufe älterer Forderungen
+  desselben Vertrags - das per-Forderung-Design von `MahnFallTable`
+  existierte dafür bereits VOR diesem Auftrag und wird nur respektiert,
+  nicht neu gebaut).
+- Getestet in `test_hv_mailversand_vier_stufen.py` (Tagesgate, Rückwärts-
+  kompatibilität der alten Policy, Ein-Schreiben-Regel mit zwei
+  unterschiedlich weit gediehenen Forderungen).
+
+### 4. Zugangsnachweis, Kanal, Mitmieter
+
+- Mirrors bewusst 1:1 das bereits bestehende, etablierte Zugangsnachweis-
+  Muster für Erhöhungsschreiben (`indexautomatik/outbox_service.py::
+  OutboxService.zugang_bestaetigen`, `domain/enums.py::
+  ZUGANGSFORMEN_ALLE/ZUGANGSFORMEN_AUSREICHEND`) statt ein zweites,
+  abweichendes Schema zu erfinden: `MahnwesenService.
+  zugang_bestaetigen_fuer_empfaenger` verlangt eine FORMAL AUSREICHENDE
+  Zugangsform + Belegreferenz (ein gewöhnlicher E-Mail-/SMTP-Versand
+  oder eine bloße Brief-Einlieferung ist NIE automatisch ausreichend)
+  und lehnt Zukunftsdaten/Daten vor dem tatsächlichen Versand ab.
+- Neue Tabellen (additiv, per `create_all_tables`/`ensure_additive_
+  columns` automatisch angelegt, keine separate Migration nötig):
+  `VertragMitmieterTable` (zusätzliche Briefempfänger je Vertrag - rührt
+  NIE `DebitorTable`/`KontoTable`/`OPPositionTable` an, keine zweite
+  Kontoinhaberschaft), `MahnEmpfaengerZugangTable` (ein Zugangsnachweis-
+  Eintrag je erwartetem Empfänger - Hauptmieter ODER ein konkreter
+  Mitmieter - EINES Mahnlaufs, `UniqueConstraint(mahnlauf_id,
+  mitmieter_id)`). `MahnFallTable.mahnlauf_id` additiv (lose Referenz
+  OHNE ForeignKey - `ensure_additive_columns` kann keine FK-Spalte per
+  ALTER TABLE ergänzen, siehe `migrations.py`-Moduldoc) verknüpft eine
+  einzelne Forderung mit ihrem tatsächlichen Zustellereignis.
+  `MahnLaufTable` additiv um `effektive_stufe`/`zugangsform`/
+  `zugang_bestaetigt_am`/`zugang_beleg`/`zugang_bestaetigt_von`
+  erweitert (das aggregierte, aus allen Einzelzugängen abgeleitete Feld
+  - der Fristenlauf verwendet ausschließlich `zugang_bestaetigt_am`).
+- Sobald ein Mahnlauf GESENDET ist, werden automatisch die zu diesem
+  Zeitpunkt erwarteten Empfänger (Hauptmieter + jeder zu diesem
+  Zeitpunkt AKTIVE Mitmieter) als noch unbestätigte Platzhalter angelegt
+  (idempotent). `MahnLaufTable.zugang_bestaetigt_am` wird erst gesetzt,
+  sobald ALLE diese Platzhalter einen bestätigten, ausreichenden Zugang
+  haben - als SPÄTESTES (konservativstes) Datum über alle Personen.
+  Getestet inkl. Mitmieter-Fall (`test_mitmieter_muss_ebenfalls_
+  zugang_bestaetigen_bevor_eskaliert_wird`).
+- Kanal: `MahnKanalregelTable` additiv um `stufe3_kanal`/`stufe4_kanal`
+  erweitert (Default "BRIEF", wie bisher für Stufe 2 - Nutzervorgabe
+  "Stufe 1 EMAIL, Stufen 2-4 BRIEF"), wirkt aber NUR, wenn zusätzlich
+  eine Kanalregel-Version tatsächlich FREIGEGEBEN ist - ohne das bleibt
+  der bestehende, produktiv funktionierende EMAIL-Default für ALLE
+  Stufen unverändert (keine stillschweigende Aktivierung eines noch
+  nicht angebundenen Briefkanals). `brief_transport_verfuegbar` bleibt
+  unverändert an den echten SFTP-Konfigurationsstatus gekoppelt
+  (weiterhin `False` in dieser Umgebung) - `SEND_ENABLED=false` bleibt
+  Standard, keine echten Sendungen aus dieser Entwicklungsarbeit.
+
+**Offene Punkte (nicht umgesetzt, bewusst nicht riskiert):**
+- **Keine Backoffice-UI** für "Mitmieter anlegen"/"Zugang manuell
+  bestätigen"/"vier-Stufen-Dashboard (nächster Prüftermin, offene
+  Nachweise, Empfängertabelle, Mieterakte-Verlauf)" - die komplette
+  fachliche/technische Grundlage (Repositories, Service-Methoden,
+  Tabellen) ist fertig und getestet, aber es gibt noch KEINEN Knopf im
+  Backoffice dafür. Bis dahin NUR über ein eigenes Skript/eine Python-
+  Shell gegen die Repositories nutzbar. Priorität für den nächsten
+  Schritt, falls Codex/Markus das bestätigen.
+- **Keine Migrationshilfe für historische/manuelle Mahnfälle** (manuell
+  verschickte Mails, bereits beim Rechtsanwalt laufende Altfälle) - die
+  Vorgabe "Altstufen 1/2 bleiben semantisch erhalten und nur
+  KONTROLLIERT ins Vier-Stufen-Profil wechseln (kein Massen-Neustart)"
+  ist durch das Policy-Flag-Design strukturell bereits erfüllt (ein
+  Altfall bleibt bei zwei Stufen, bis jemand aktiv eine neue Policy
+  freigibt), es gibt aber noch KEIN Importwerkzeug, um einen
+  tatsächlich bereits real versendeten/beim RA laufenden Altfall
+  nachträglich mit einer eigenen `MahnFallTable`-Historie zu erfassen.
+- Keine neue pauschale Mahnsperrfunktion gebaut (wie vom Auftraggeber
+  ausdrücklich NICHT gewünscht) - bestehende Sperr-/Ratenplan-/RA-Akt-
+  Mechanismen (`SperreTable`, bestehende Backoffice-Felder) bleiben
+  unverändert die einzige Grundlage.
+- §33 MRG (richterliches Mäßigungsrecht bei Mahnkosten) wird NICHT
+  automatisch geprüft - bleibt wie bisher eine interne, menschliche
+  Prüfung vor einer tatsächlichen RA-Übergabe, nirgends automatisiert.
+- Kein automatischer RA-/Kündigungsvollzug (wie ausdrücklich gefordert)
+  - Stufe 4 bereitet nur den internen Fall vor (Textbaustein, Status),
+  löst nie selbst eine Kündigung/Klage aus.
+
+### Geänderte/neue Dateien
+
+Neu: `src/mietinkasso/mahnwesen/fristen.py`, `src/mietinkasso/mahnwesen/
+mahntexte.py`, `tests/mietinkasso/test_mahnwesen_fristen.py`, `tests/
+mietinkasso/test_mahnwesen_mahntexte.py`, `tests/mietinkasso/
+test_mahnwesen_vier_stufen.py`, `tests/mietinkasso/
+test_hv_mailversand_vier_stufen.py`.
+
+Geändert: `src/mietinkasso/domain/enums.py` (MahnStufe), `src/
+mietinkasso/infrastructure/db/tables.py` (additive Spalten/Tabellen,
+siehe oben), `src/mietinkasso/mahnwesen/repository.py`
+(`VertragMitmieterRepository`/`MahnEmpfaengerZugangRepository` neu,
+`claim_mitglieder_und_erstelle_gruppe`/`setze_zugang` erweitert), `src/
+mietinkasso/mahnwesen/service.py` (`_naechste_stufe_fuer_forderung`/
+`_pruefe_vorstufe_abstand`/`zugang_bestaetigen_fuer_empfaenger` neu/
+verallgemeinert), `src/mietinkasso/mahnwesen/brief_pdf.py`
+(`erzeuge_mahnbrief_pdf` verwendet jetzt `mahntexte.text_fuer_stufe`),
+`src/mietinkasso/indexautomatik/mailversand_service.py` (Tagesgate,
+Ein-Schreiben-Regel, Mitmieter-/Zugangs-Repositories verdrahtet,
+E-Mail-Text verwendet `mahntexte.text_fuer_stufe`), `src/mietinkasso/
+backoffice/routes/mahnwesen.py` (PDF-Vorschau übergibt `rechtsordnung`),
+`tests/mietinkasso/test_brief_pdf.py` (neue Stufe-4-/Rechtsordnungstests).
+
+### Tests
+
+Gesamtsuite `tests/mietinkasso` (1486 Tests) nach Fertigstellung grün.
+Neue/erweiterte, gezielt gegen die Vier-Stufen-Logik gerichtete Tests:
+8 (Fristen) + 10 (Mahntexte) + 7 (Service end-to-end, inkl. wörtliches
+Grenzfallbeispiel und Mitmieter-Fall) + 3 (Tagesgate/Ein-Schreiben-Regel
+im Mailversand-Treiber) + 2 (PDF-Rechtsinhalt) = 30 neue Tests,
+ausschließlich synthetische Testdaten, keine echten Sendungen/
+Produktivbuchungen.

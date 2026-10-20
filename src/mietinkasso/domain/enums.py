@@ -40,8 +40,22 @@ class VorschreibungStatus(str, enum.Enum):
 
 
 class MahnStufe(int, enum.Enum):
+    """Auftrag HV-20261020-VIER-MAHNSTUFEN: von genau zwei auf vier
+    Stufen erweitert (Nutzerentscheidung 20.10.2026, löst die bisherige
+    Fachregel 7 "genau zwei Stufen" ab) - additiv, STUFE_1/STUFE_2
+    behalten ihre bisherigen Werte, bestehende Daten/Vergleiche bleiben
+    gültig. Ob eine konkrete Forderung/ein Vertrag tatsächlich über
+    STUFE_2 hinaus eskaliert wird, entscheidet weiterhin die jeweils
+    FREIGEGEBENE `MahnPolicyTable`-Version (siehe `mahnwesen/service.py::
+    MahnwesenService._naechste_stufe_fuer_forderung`) - eine alte, vor
+    diesem Auftrag freigegebene Policy ohne Vier-Stufen-Profil bleibt bei
+    genau zwei Stufen (kein stillschweigender Verhaltenswechsel für
+    bereits laufende Mahnzyklen)."""
+
     STUFE_1 = 1
     STUFE_2 = 2
+    STUFE_3 = 3
+    STUFE_4 = 4
 
 
 class MahnStatus(str, enum.Enum):

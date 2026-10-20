@@ -605,7 +605,8 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
     try:
         pdf_bytes = _erzeuge_mahnbrief_pdf(
             absender=absender, empfaenger_name=debitor.name, empfaenger_adresse=(debitor.adresse or "").replace(", ", "\n"),
-            objekt_bezeichnung=objekt.bezeichnung, einheit_bezeichnung=einheit.bezeichnung, stufe=stufe, heute=heute_datum,
+            objekt_bezeichnung=objekt.bezeichnung, einheit_bezeichnung=einheit.bezeichnung, stufe=stufe,
+            rechtsordnung=vertrag.rechtsordnung, heute=heute_datum,
             zahlungsfrist_bis=heute_datum + timedelta(days=vertrag.zahlungsfrist_tage),
             forderungszeilen=forderungszeilen, bereits_offene_mahnkosten_cent=vorschau.bereits_offene_mahnkosten_cent,
             neue_zinsen_delta_cent=vorschau.neue_zinsen_delta_cent, zins_segmente=zins_segmente,
