@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal, InvalidOperation
 
 from mietinkasso.vertragsanlage.pdf_extraktion import ExtraktionsErgebnis, FeldTreffer
 
@@ -86,14 +87,26 @@ def _basismonat_iso(roh: str) -> str | None:
 #: Mensch bewusst gegen das Brutto-Feld abgleichen muss.
 _DIREKTE_FELDER = {
     "kaution_cent": "vertragliche_kaution_cent",
-    "hauptmietzins_cent": "hauptmietzins_cent",
-    "betriebskosten_cent": "betriebskosten_cent",
-    "heizkosten_cent": "heizkosten_cent",
-    "kueche_cent": "kueche_cent",
-    "parkplatz_cent": "parkplatz_cent",
+    # Abnahme-Folgefix (Codex, "Netto/USt/Brutto je Mietkomponente"): die
+    # PDF-erkannten Brutto-Beträge je Mietbestandteil mappen jetzt DIREKT
+    # auf die tatsächlich im Review gerenderten `komponente_*`-Felder
+    # (`vertragsanlage_form.py::_komponente_felder_html`) statt auf
+    # tote, nirgends gerenderte Formularnamen.
+    "hauptmietzins_cent": "komponente_hmz",
+    "betriebskosten_cent": "komponente_bk",
+    "heizkosten_cent": "komponente_hk",
+    "kueche_cent": "komponente_kueche",
+    "parkplatz_cent": "komponente_parkplatz",
+    "hauptmietzins_netto_cent": "komponente_hmz_netto",
+    "betriebskosten_netto_cent": "komponente_bk_netto",
+    "heizkosten_netto_cent": "komponente_hk_netto",
+    "kueche_netto_cent": "komponente_kueche_netto",
+    "parkplatz_netto_cent": "komponente_parkplatz_netto",
     "index_reihe": "index_reihe",
     "index_schwelle_prozent": "index_schwelle_prozent",
     "index_urspruenglicher_basiswert": "index_urspruenglicher_basiswert",
+    "index_mindestintervall_monate": "index_mindestintervall_monate",
+    "verzugszins_satz_prozent": "verzugszins_satz_prozent",
     "mieter_name": "mieter_name_hinweis",
     "vermieter_name": "vermieter_name_hinweis",
     "nettomiete_cent": "nettomiete_hinweis_cent",
@@ -200,7 +213,77 @@ def vorschlaege_aus_extraktion(ergebnis: ExtraktionsErgebnis) -> dict[str, Vorsc
         vorschlaege["mahngebuehr_cent"] = Vorschlag(tr.wert, tr.seite, tr.auszug)
     # sonst: kein Vorschlag - Feld bleibt leer -> None (unbekannt, KEIN erfundenes 0)
 
+    # Abnahme-Folgefix: USt-Satz je Mietkomponente - die Auswahlfelder im
+    # Review bieten nur die festen Prozentsätze 0/10/13/20 an (siehe
+    # `_UST_SAETZE_PROZENT`); ein erkannter Wert wird dafür auf eine
+    # glatte Ganzzahl normalisiert ("20,0" -> "20"), damit die
+    # entsprechende Option tatsächlich vorausgewählt erscheint.
+    for quellfeld, formularfeld in (
+        ("hauptmietzins_ust_prozent", "komponente_hmz_ust"),
+        ("betriebskosten_ust_prozent", "komponente_bk_ust"),
+        ("heizkosten_ust_prozent", "komponente_hk_ust"),
+        ("kueche_ust_prozent", "komponente_kueche_ust"),
+        ("parkplatz_ust_prozent", "komponente_parkplatz_ust"),
+    ):
+        if quellfeld in t:
+            tr = t[quellfeld]
+            vorschlaege[formularfeld] = Vorschlag(_prozent_normalisiert(tr.wert), tr.seite, tr.auszug)
+
+    # Ein belegter Verzugszins-SATZ ist selbst der Beleg für
+    # "vertraglich vereinbart" - ohne eigenes Fundmuster für diese
+    # Einordnung würde das Auswahlfeld sonst bei UNGEKLAERT bleiben,
+    # obwohl der Satz direkt daneben bereits als Vorschlag steht.
+    if "verzugszins_satz_prozent" in t:
+        tr = t["verzugszins_satz_prozent"]
+        vorschlaege["verzugszins_art"] = Vorschlag("VERTRAGLICH_VEREINBART", tr.seite, tr.auszug)
+
+    if "index_anpassungsmonat_name" in t:
+        tr = t["index_anpassungsmonat_name"]
+        monat = _MONATSNAMEN.get(tr.wert.strip().lower())
+        if monat is not None:
+            vorschlaege["index_anpassungsmonat"] = Vorschlag(str(monat), tr.seite, tr.auszug)
+
+    # Tri-State wie `befristungsstatus`/`nutzungsart` oben: NUR bei GENAU
+    # EINEM der beiden Hinweise ein Vorschlag - bei beiden/keinem bleibt
+    # die Einordnung ungeklärt statt geraten.
+    schwelle_treffer = {
+        "0": t.get("index_schwelle_exklusiv_hinweis"),
+        "1": t.get("index_schwelle_inklusiv_hinweis"),
+    }
+    gefundene_schwelle = {k: v for k, v in schwelle_treffer.items() if v is not None}
+    if len(gefundene_schwelle) == 1:
+        (inklusive, tr), = gefundene_schwelle.items()
+        vorschlaege["index_schwelle_inklusive"] = Vorschlag(inklusive, tr.seite, tr.auszug)
+
+    mrg_treffer = {
+        "VOLL": t.get("mrg_vollanwendung_hinweis"),
+        "TEIL": t.get("mrg_teilanwendung_hinweis"),
+        "AUSNAHME": t.get("mrg_ausnahme_hinweis"),
+    }
+    gefundene_mrg = {k: v for k, v in mrg_treffer.items() if v is not None}
+    if len(gefundene_mrg) == 1:
+        (anwendungsbereich, tr), = gefundene_mrg.items()
+        vorschlaege["rechtsachse_mrg_anwendungsbereich"] = Vorschlag(anwendungsbereich, tr.seite, tr.auszug)
+
+    mietzinsbildung_treffer = {
+        "FREI": t.get("mietzinsbildung_frei_hinweis"),
+        "RICHTWERT": t.get("mietzinsbildung_richtwert_hinweis"),
+        "KATEGORIE": t.get("mietzinsbildung_kategorie_hinweis"),
+    }
+    gefundene_mietzinsbildung = {k: v for k, v in mietzinsbildung_treffer.items() if v is not None}
+    if len(gefundene_mietzinsbildung) == 1:
+        (mietzinsbildung, tr), = gefundene_mietzinsbildung.items()
+        vorschlaege["rechtsachse_mietzinsbildung"] = Vorschlag(mietzinsbildung, tr.seite, tr.auszug)
+
     return vorschlaege
+
+
+def _prozent_normalisiert(roh: str) -> str:
+    try:
+        wert = Decimal(roh.strip().replace(",", "."))
+    except InvalidOperation:
+        return roh.strip()
+    return str(int(wert)) if wert == wert.to_integral_value() else str(wert)
 
 
 #: Zuordnung Extraktionsfeld -> menschenlesbares Label für die

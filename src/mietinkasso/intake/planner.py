@@ -41,6 +41,7 @@ from mietinkasso.infrastructure.db.tables import (
     ObjektTable,
     OPPositionTable,
     SperreTable,
+    VertragMitmieterTable,
     VertragsKomponenteTable,
     VertragTable,
 )
@@ -53,6 +54,7 @@ from mietinkasso.intake.schema import (
     MietvertragsprofilZeile,
     NachbuchungZeile,
     SperreZeile,
+    VertragMitmieterZeile,
     paket_hash,
 )
 
@@ -664,6 +666,21 @@ def pruefe_paket(
             continue
         _pruefe_mietvertragsprofil(z, session=session, befunde=befunde, vertrag_bekannt=_vertrag_bekannt(z.vertrag_id))
 
+    # Abnahme-Folgefix (Codex, "Mitmieter atomar im selben bestätigten
+    # Intake"): höchstens EINE Mitmieter-Zeile je Vertrag UND PAKET (der
+    # bestehende, separate "Partei hinzufügen"-Weg bleibt für JEDEN
+    # weiteren Mitmieter zuständig - kein zweiter Mechanismus hierfür).
+    mitmieter_mehrfach = _mehrfache_werte([z.vertrag_id for z in paket.mitmieter])
+    for z in paket.mitmieter:
+        if z.vertrag_id in mitmieter_mehrfach:
+            befunde.append(PruefBefund(
+                "Mitmieter", z.vertrag_id, "KONFLIKT",
+                f"Mitmieter für Vertrag '{z.vertrag_id}' ist mehrfach im selben Paket vertreten - weitere "
+                "Parteien bitte nach der Übernahme über 'Partei hinzufügen' erfassen.",
+            ))
+            continue
+        _pruefe_mitmieter(z, session=session, befunde=befunde, vertrag_bekannt=_vertrag_bekannt(z.vertrag_id))
+
     if fehlende_email_anzahl:
         hinweise.append(f"{fehlende_email_anzahl} Debitor(en) ohne E-Mail — bleiben anlegbar, sind aber nie automatisch mahnfähig.")
     if fehlende_faelligkeit_anzahl:
@@ -920,6 +937,37 @@ def _pruefe_kaution(
         befunde.append(PruefBefund(entitaet, z.vertrag_id, "UNVERAENDERT"))
     else:
         befunde.append(PruefBefund(entitaet, z.vertrag_id, "KONFLIKT", f"Kaution für Vertrag '{z.vertrag_id}' existiert bereits mit abweichendem Inhalt."))
+
+
+def _pruefe_mitmieter(
+    z: VertragMitmieterZeile, *, session: Session, befunde: list[PruefBefund], vertrag_bekannt: bool,
+) -> None:
+    """Analog zu `_pruefe_kaution`: STRIKTE Idempotenz je Vertrag - keine
+    stille Zusammenführung mehrerer Parteien über den generischen Intake
+    (das bleibt der gesonderten "Partei hinzufügen"-Route in der
+    Mieterakte vorbehalten, siehe `routes/vertragsanlage.py::
+    vertragsanlage_partei_hinzufuegen`). Da ein Vertrag mit Mitmieter in
+    diesem Auftrag ausschließlich ATOMAR zusammen mit einem BRANDNEUEN
+    Vertrag entsteht, ist `bereits_vorhanden` in der Praxis nur bei einem
+    Wiederholungsversuch nach bereits erfolgter Anlage relevant."""
+
+    entitaet = "Mitmieter"
+    if not vertrag_bekannt:
+        befunde.append(PruefBefund(entitaet, z.vertrag_id, "KONFLIKT", f"Mitmieter referenziert unbekannten Vertrag '{z.vertrag_id}'."))
+        return
+    bereits_vorhanden = session.execute(
+        select(VertragMitmieterTable).where(
+            VertragMitmieterTable.vertrag_id == z.vertrag_id, VertragMitmieterTable.aktiv.is_(True),
+        )
+    ).first()
+    if bereits_vorhanden is not None:
+        befunde.append(PruefBefund(
+            entitaet, z.vertrag_id, "KONFLIKT",
+            f"Für Vertrag '{z.vertrag_id}' besteht bereits eine aktive Partei - bitte über "
+            "'Partei hinzufügen' in der Mieterakte ergänzen statt über die Vertragsanlage.",
+        ))
+        return
+    befunde.append(PruefBefund(entitaet, z.vertrag_id, "NEU"))
 
 
 def _neuestes_mietvertragsprofil(session: Session, vertrag_id: str) -> MietvertragsprofilTable | None:

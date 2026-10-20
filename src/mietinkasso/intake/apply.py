@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from mietinkasso.auth.service import AuthContext
 from mietinkasso.domain.enums import OPTyp, Rolle
 from mietinkasso.domain.exceptions import IntakeNichtAnwendbarError
-from mietinkasso.infrastructure.db.tables import VertragsKomponenteTable, VertragTable
+from mietinkasso.infrastructure.db.tables import VertragMitmieterTable, VertragsKomponenteTable, VertragTable
 from mietinkasso.intake.planner import IntakePlan, pruefe_paket, sperre_ist_bereits_aktiv
 from mietinkasso.intake.schema import IntakePaket, paket_hash
 from mietinkasso.op.service import OPService
@@ -45,6 +45,7 @@ class IntakeErgebnis:
     anzahl_komponenten: int
     anzahl_kautionen: int
     anzahl_mietvertragsprofile: int
+    anzahl_mitmieter: int
 
 
 def wende_an(
@@ -231,6 +232,21 @@ def wende_an(
                         erstellt_von=akteur, session=session,
                     )
 
+            # Mitmieter: strikte Idempotenz wie Kaution (siehe
+            # planner.py::_pruefe_mitmieter) - NUR bei Status NEU
+            # anlegen, direkt über dieselbe Session wie der Rest des
+            # Pakets (ATOMAR mit dem neuen Vertrag, siehe Modul-Docstring);
+            # bewusst NICHT über `VertragMitmieterRepository.anlegen`, das
+            # eine EIGENE Session öffnet und damit die Atomarität brechen würde.
+            mitmieter_status = {b.id: b.status for b in plan.befunde if b.entitaet == "Mitmieter"}
+            for z in paket.mitmieter:
+                if mitmieter_status.get(z.vertrag_id) == "NEU":
+                    session.add(VertragMitmieterTable(
+                        vertrag_id=z.vertrag_id, rolle=z.rolle, debitor_id=None, name=z.name,
+                        email=z.email, adresse=z.adresse, telefon=z.telefon, zustand=z.zustand,
+                        quelle_typ=z.quelle_typ, quelle_referenz=z.quelle_referenz, erstellt_von=akteur,
+                    ))
+
             session.commit()
         except Exception as exc:
             session.rollback()
@@ -256,4 +272,5 @@ def wende_an(
         anzahl_komponenten=len(paket.komponenten),
         anzahl_kautionen=len(paket.kautionen),
         anzahl_mietvertragsprofile=len(paket.mietvertragsprofile),
+        anzahl_mitmieter=len(paket.mitmieter),
     )

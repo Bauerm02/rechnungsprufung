@@ -34,7 +34,12 @@ def zinsprofil_uebersicht(request: Request, vertrag_id: str, session=Depends(_cu
         return _fehlerseite(session, "Zinsprofil", "Vertrag nicht verfügbar.")
     require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
     profile = deps._hv_mail.mahnkosten_repo.liste_fuer_vertrag(vertrag_id)
-    return _layout(request, session, "Zinsprofil", zinsprofil_formular(vertrag, profile, session.csrf_token))
+    # Abnahme-Folgefix (Codex, "Zinsprofil-Form noch gar keine
+    # Quellwerte"): die im Mietvertragsprofil bereits erfassten,
+    # ausdrücklich unverbindlichen Verzugszins-/Mahngebühr-Quellfelder
+    # befüllen hier NUR die Formular-Standardwerte vor.
+    mietprofil = deps._stammdaten_repo.neuestes_mietvertragsprofil(vertrag_id)
+    return _layout(request, session, "Zinsprofil", zinsprofil_formular(vertrag, profile, session.csrf_token, mietprofil=mietprofil))
 
 
 @router.post("/vertrag/{vertrag_id}/zinsprofil/erstellen")

@@ -6,6 +6,25 @@ from html import escape as h
 from mietinkasso.backoffice.views import csrf_feld, eur, option
 
 
+#: Übersetzt das freie `MietvertragsprofilTable.index_reihe`-Textfeld
+#: (z. B. "VPI 2020", von der PDF-Extraktion als Vorschlag übernommen) in
+#: den von der tatsächlichen `IndexKlauselTable.basis_reihe`-Auswahl
+#: erwarteten Code - rein additive Vorbefüllung, KEINE automatische
+#: Übernahme (das Auswahlfeld bleibt wie bisher frei änderbar).
+_REIHEN_CODE_AUS_TEXT = {
+    "2020": "VPI20C18", "2015": "VPI15C18", "2000": "VPI00", "1996": "VPI96",
+}
+
+
+def _reihe_code_aus_profiltext(text: str | None) -> str | None:
+    if not text:
+        return None
+    for jahr, code in _REIHEN_CODE_AUS_TEXT.items():
+        if jahr in text:
+            return code
+    return None
+
+
 def klausel_formular(vertrag, komponenten, klauseln, csrf, mietprofil=None):
     beginn = mietprofil.urspruenglicher_mietbeginn if mietprofil else None
     beginn_text = beginn.strftime("%d.%m.%Y") if beginn else "noch nicht gesondert belegt"
@@ -25,7 +44,33 @@ def klausel_formular(vertrag, komponenten, klauseln, csrf, mietprofil=None):
             f'{k.schwelle_prozent} %</td><td>{k.anpassungsmonat or "kein fixer Monat"}</td>'
             f'<td><details><summary>Vertragsbeleg</summary><pre>{h(k.klausel_text or "")}</pre></details>{aktion}</td></tr>'
         )
-    reihen = "".join(option(code, label) for code, label in [
+    # Abnahme-Folgefix (Codex, "Indexklausel-Form nutzt bisher vom
+    # Mietprofil nur den Beginn"): die bereits im Mietvertragsprofil
+    # erfassten, ausdrücklich UNVERBINDLICHEN Index-Quellfelder (PDF-
+    # Vorschlag oder manuell im Review erfasst) befüllen hier NUR die
+    # Formular-Standardwerte vor - JEDES Feld bleibt frei änderbar, die
+    # tatsächliche Vertragsregel entsteht weiterhin erst durch diesen
+    # Entwurf samt menschlicher Bestätigung ("Vertragsklausel bestätigen").
+    vorbefuellt_reihe = _reihe_code_aus_profiltext(mietprofil.index_reihe) if mietprofil else None
+    vorbefuellt_basismonat = h(str(mietprofil.index_urspruenglicher_basismonat or "")) if mietprofil else ""
+    vorbefuellt_basiswert = (
+        h(str(mietprofil.index_urspruenglicher_basiswert)) if mietprofil and mietprofil.index_urspruenglicher_basiswert is not None else ""
+    )
+    vorbefuellt_schwelle_prozent = (
+        h(str(mietprofil.index_schwelle_prozent)) if mietprofil and mietprofil.index_schwelle_prozent is not None else ""
+    )
+    vorbefuellt_schwelle_inklusive = mietprofil.index_schwelle_inklusive if mietprofil else None
+    vorbefuellt_anpassungsmonat = (
+        str(mietprofil.index_anpassungsmonat) if mietprofil and mietprofil.index_anpassungsmonat is not None else ""
+    )
+    vorbefuellt_mindestintervall = (
+        str(mietprofil.index_mindestintervall_monate) if mietprofil and mietprofil.index_mindestintervall_monate is not None else ""
+    )
+    vorbefuellt_klauseltext = h(str(mietprofil.index_klauseltext_auszug or "")) if mietprofil else ""
+    vorbefuellt_abschlussdatum = (
+        mietprofil.unterzeichnungsdatum.isoformat() if mietprofil and mietprofil.unterzeichnungsdatum else ""
+    )
+    reihen = "".join(option(code, label, selected=code == vorbefuellt_reihe) for code, label in [
         ("VPI20C18", "VPI 2020"), ("VPI15C18", "VPI 2015"), ("VPI00", "VPI 2000"), ("VPI96", "VPI 1996")])
     return f'''
     <div class="card"><h1>Vertragliche Indexklausel – {h(vertrag.id)}</h1>
@@ -42,14 +87,17 @@ def klausel_formular(vertrag, komponenten, klauseln, csrf, mietprofil=None):
         <p class="muted">Unterschrift im Juni, Mietbeginn im Dezember: keine Anpassung vor Dezember.
            Eine ausdrücklich vereinbarte VPI-Basis bleibt erhalten. Das Abschlussdatum wird für
            gesetzliche Fristen separat geführt. Frühere Erhöhungen werden nicht nochmals gerechnet.</p>
-        <label>Datum des Vertragsabschlusses (Unterschrift)</label><input type="date" name="abschlussdatum" required>
+        <label>Datum des Vertragsabschlusses (Unterschrift)</label>
+        <input type="date" name="abschlussdatum" value="{h(vorbefuellt_abschlussdatum)}" required>
         <label>VPI-Reihe laut Vertrag</label><select name="basis_reihe">{reihen}</select>
-        <label>VPI-Basismonat</label><input type="month" name="basis_monat" required>
-        <label>Tatsächlich verwendeter VPI-Basiswert</label><input name="basis_wert" required placeholder="z. B. 130,0">
+        <label>VPI-Basismonat</label><input type="month" name="basis_monat" value="{vorbefuellt_basismonat}" required>
+        <label>Tatsächlich verwendeter VPI-Basiswert</label>
+        <input name="basis_wert" value="{vorbefuellt_basiswert}" required placeholder="z. B. 130,0">
         <label>Monat der letzten tatsächlich durchgeführten Anpassung</label>
         <input type="month" name="letzte_anpassung_monat">
         <p class="muted">Nur leer lassen, wenn noch nie angepasst wurde. Bei unbekannter bisheriger Basis bleibt die Fachfreigabe offen.</p>
-        <label>Vertragswortlaut und Fundstelle</label><textarea name="klausel_text" rows="5" required></textarea>
+        <label>Vertragswortlaut und Fundstelle</label>
+        <textarea name="klausel_text" rows="5" required>{vorbefuellt_klauseltext}</textarea>
         <label>Indexierbare Mietbestandteile</label>{komponenten_html}
       </fieldset>
       <fieldset><legend>Schwelle und Kalenderregel</legend>
@@ -59,13 +107,15 @@ def klausel_formular(vertrag, komponenten, klauseln, csrf, mietprofil=None):
           <option value="BEI_SCHWELLE">Bei Erreichen der Schwelle, ohne festen Monat</option>
           <option value="INTERVALL">Nach Mindestabstand, ohne festen Monat</option></select>
         <label>Schwelle in Prozent (0 nur bei belegter Anpassung ohne Schwelle)</label>
-        <input name="schwelle_prozent" required>
+        <input name="schwelle_prozent" value="{vorbefuellt_schwelle_prozent}" required>
         <label>Grenze</label><select name="schwelle_inklusive">
-          <option value="0">Erst über der Schwelle</option><option value="1">Ab Erreichen der Schwelle</option></select>
+          {option("0", "Erst über der Schwelle", selected=vorbefuellt_schwelle_inklusive is False)}
+          {option("1", "Ab Erreichen der Schwelle", selected=vorbefuellt_schwelle_inklusive is True)}
+        </select>
         <label>Fester Anpassungsmonat, falls vertraglich vereinbart</label>
-        <input type="number" name="anpassungsmonat" min="1" max="12">
+        <input type="number" name="anpassungsmonat" min="1" max="12" value="{vorbefuellt_anpassungsmonat}">
         <label>Mindestabstand zwischen Anpassungen (Monate)</label>
-        <input type="number" name="mindestintervall_monate" min="1">
+        <input type="number" name="mindestintervall_monate" min="1" value="{vorbefuellt_mindestintervall}">
         <label>Rundung des Indexwerts (Nachkommastellen, nur bei ausdrücklicher Klausel)</label>
         <input type="number" name="indexwert_rundung_dezimalstellen" min="0" max="6">
         <p class="muted">Die Rundung des Indexwerts ist keine Rundung der Schwellen-Grenzwerte.</p>

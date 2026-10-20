@@ -235,6 +235,28 @@ class MietvertragsprofilZeile:
 
 
 @dataclass(frozen=True)
+class VertragMitmieterZeile:
+    """Optionaler zweiter Vertragspartner (Mitmieter), ATOMAR im selben
+    bestätigten Intake wie der neue Vertrag angelegt (Abnahme-Folgefix:
+    "Mitmieter atomar im selben bestätigten Intake" statt eines
+    separaten, nachträglichen `/vertrag/{id}/parteien`-POSTs). Nutzt
+    dieselbe `VertragMitmieterTable` wie die bestehende manuelle Route -
+    KEIN zweites Rechen-/Datenmodell. `rolle` bleibt auf `MITMIETER`/
+    `VERTRETER` beschränkt (siehe `VertragMitmieterTable`-Docstring -
+    `HAUPTMIETER` läuft weiterhin ausschließlich über den Debitor)."""
+
+    vertrag_id: str
+    name: str
+    email: str | None = None
+    telefon: str | None = None
+    adresse: str | None = None
+    rolle: str = "MITMIETER"
+    zustand: str = "BESTAETIGT"
+    quelle_typ: str | None = None
+    quelle_referenz: str | None = None
+
+
+@dataclass(frozen=True)
 class IntakePaket:
     """Vollständig geparstes, aber noch NICHT fachlich geprüftes Paket -
     egal ob aus einer JSON-Datei oder einem CSV-Bündel geparst, identisch
@@ -253,6 +275,7 @@ class IntakePaket:
     komponenten: tuple[KomponenteZeile, ...] = field(default_factory=tuple)
     kautionen: tuple[KautionZeile, ...] = field(default_factory=tuple)
     mietvertragsprofile: tuple[MietvertragsprofilZeile, ...] = field(default_factory=tuple)
+    mitmieter: tuple[VertragMitmieterZeile, ...] = field(default_factory=tuple)
 
 
 def paket_hash(paket: IntakePaket) -> str:

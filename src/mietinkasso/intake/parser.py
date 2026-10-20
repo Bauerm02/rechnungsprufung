@@ -27,6 +27,7 @@ from mietinkasso.intake.schema import (
     NachbuchungZeile,
     ObjektZeile,
     SperreZeile,
+    VertragMitmieterZeile,
     VertragZeile,
 )
 from mietinkasso.stammdaten.telefon import TelefonUngueltigError, normalisiere_telefon
@@ -346,6 +347,32 @@ def _mietvertragsprofil_aus_dict(zeile: dict) -> MietvertragsprofilZeile:
     )
 
 
+_MITMIETER_ROLLEN = ("MITMIETER", "VERTRETER")
+
+
+def _mitmieter_aus_dict(zeile: dict) -> VertragMitmieterZeile:
+    kontext = f"Mitmieter für Vertrag '{zeile.get('vertrag_id')}'"
+    rolle = (_optional_str(zeile, "rolle") or "MITMIETER").upper()
+    if rolle not in _MITMIETER_ROLLEN:
+        raise IntakeFormatFehlerError(f"{kontext}: ungültige Rolle '{rolle}' (Hauptmieter läuft über den Debitor).")
+    telefon_roh = _optional_str(zeile, "telefon")
+    try:
+        telefon = normalisiere_telefon(telefon_roh) if telefon_roh else None
+    except TelefonUngueltigError as exc:
+        raise IntakeFormatFehlerError(f"{kontext}: Feld 'telefon' ungültig - {exc}") from exc
+    return VertragMitmieterZeile(
+        vertrag_id=_pflicht_str(zeile, "vertrag_id", "Mitmieter"),
+        name=_pflicht_str(zeile, "name", kontext),
+        email=_optional_str(zeile, "email"),
+        telefon=telefon,
+        adresse=_optional_str(zeile, "adresse"),
+        rolle=rolle,
+        zustand=(_optional_str(zeile, "zustand") or "BESTAETIGT").upper(),
+        quelle_typ=_optional_str(zeile, "quelle_typ"),
+        quelle_referenz=_optional_str(zeile, "quelle_referenz"),
+    )
+
+
 def _optional_int_oder_none(zeile: dict, feld: str, kontext: str) -> int | None:
     if feld not in zeile or zeile.get(feld) in (None, ""):
         return None
@@ -378,6 +405,7 @@ def parse_json_paket(text: str) -> IntakePaket:
         mietvertragsprofile=tuple(
             _mietvertragsprofil_aus_dict(z) for z in rohdaten.get("mietvertragsprofile", [])
         ),
+        mitmieter=tuple(_mitmieter_aus_dict(z) for z in rohdaten.get("mitmieter", [])),
     )
 
 

@@ -103,6 +103,27 @@ _BETRAG_FRAGMENT = (
     r")"
 )
 
+
+# Abnahme-Folgefix (Codex, "Netto/USt/Brutto je Mietkomponente inkl.
+# gemischter Steuersätze"): Netto-Betrag und USt-Satz je Mietkomponente
+# werden als ZWEI GETRENNTE Muster erfasst (Betrag/Prozentsatz), da ein
+# einzelner Treffer immer nur EINEN Wert liefert (siehe `_erste_gruppe`).
+# Ein bloßer Brutto-Betrag OHNE das Wort "netto" bleibt unverändert nur
+# vom bereits bestehenden Brutto-Muster oben erfasst - NIE doppelt
+# gezählt. Beide Muster sind bewusst einfache, dokumentierte Heuristiken
+# (siehe Moduldoc) - jeder Treffer bleibt ein bloßer Vorschlag mit
+# Seitenbeleg, nie eine ungeprüfte Übernahme.
+def _netto_muster(label: str) -> re.Pattern[str]:
+    return re.compile(label + r"[^\d€]{0,10}\(?netto\)?:?[^\d€]{0,20}" + _BETRAG_FRAGMENT, re.IGNORECASE)
+
+
+def _ust_muster(label: str) -> re.Pattern[str]:
+    return re.compile(
+        label + r"[^%]{0,100}?(?:zzgl\.?|zuz(?:ü|ue)glich)[^%\d]{0,10}([0-9]{1,2}(?:,[0-9]{1,2})?)\s*%\s*"
+        r"(?:USt\.?|Ust\.?|Umsatzsteuer)",
+        re.IGNORECASE,
+    )
+
 # Bewusst EINFACHE, dokumentierte Regex-Heuristiken für gängige
 # deutschsprachige Vertragsformulierungen - KEIN Anspruch auf
 # vollständige Vertragssemantik. Jedes Muster liefert GENAU EINEN
@@ -121,14 +142,35 @@ _MUSTER: dict[str, re.Pattern[str]] = {
     # still als Brutto übernehmen") - "Nettomiete" hat deshalb jetzt einen
     # EIGENEN Extraktionsschlüssel `nettomiete_cent`, der NICHT auf
     # `hauptmietzins_cent` gemappt wird (siehe `vorschlaege.py`).
+    #
+    # **Weitere Korrektur (Abnahme-Folgefix, Netto/USt/Brutto je
+    # Mietkomponente):** derselbe Grund gilt für ein unmittelbar dem
+    # Label nachgestelltes "netto" ("Hauptmietzins (netto): ...") - ohne
+    # den negativen Lookahead `(?!\s*\(?netto\)?)` würde so ein Treffer
+    # ZUSÄTZLICH zum eigenen `hauptmietzins_netto_cent`-Treffer (siehe
+    # unten) auch das Brutto-Feld `komponente_hmz` füllen und dort fälschlich
+    # als "maßgebliches Brutto" GEWINNEN (siehe `komponenten_werte_aus_form`-
+    # Docstring: "ein angegebenes Brutto bleibt immer maßgeblich").
     "hauptmietzins_cent": re.compile(
-        r"(?:Hauptmietzins|Miete monatlich)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE,
+        r"(?:Hauptmietzins|Miete monatlich)(?!\s*\(?netto\)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE,
     ),
     "nettomiete_cent": re.compile(r"Nettomiete[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
-    "betriebskosten_cent": re.compile(r"Betriebskosten[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
-    "heizkosten_cent": re.compile(r"Heizkosten[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
-    "kueche_cent": re.compile(r"K(?:ü|ue)che[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
-    "parkplatz_cent": re.compile(r"Parkplatz[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
+    "betriebskosten_cent": re.compile(r"Betriebskosten(?!\s*\(?netto\)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
+    "heizkosten_cent": re.compile(r"Heizkosten(?!\s*\(?netto\)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
+    "kueche_cent": re.compile(r"K(?:ü|ue)che(?!\s*\(?netto\)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
+    "parkplatz_cent": re.compile(r"Parkplatz(?!\s*\(?netto\)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
+    # Netto + USt-Satz je Mietkomponente (siehe `_netto_muster`/`_ust_muster`
+    # oben) - gemischte Steuersätze je Komponente möglich.
+    "hauptmietzins_netto_cent": _netto_muster(r"Hauptmietzins"),
+    "hauptmietzins_ust_prozent": _ust_muster(r"Hauptmietzins"),
+    "betriebskosten_netto_cent": _netto_muster(r"Betriebskosten"),
+    "betriebskosten_ust_prozent": _ust_muster(r"Betriebskosten"),
+    "heizkosten_netto_cent": _netto_muster(r"Heizkosten"),
+    "heizkosten_ust_prozent": _ust_muster(r"Heizkosten"),
+    "kueche_netto_cent": _netto_muster(r"K(?:ü|ue)che"),
+    "kueche_ust_prozent": _ust_muster(r"K(?:ü|ue)che"),
+    "parkplatz_netto_cent": _netto_muster(r"Parkplatz"),
+    "parkplatz_ust_prozent": _ust_muster(r"Parkplatz"),
     # Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026): "Mahngebühr"
     # (mit und ohne Plural-"en") war bisher kein erkanntes Synonym -
     # Verträge verwenden beide Begriffe für dieselbe Fachregel.
@@ -195,6 +237,57 @@ _MUSTER: dict[str, re.Pattern[str]] = {
         re.IGNORECASE,
     ),
     "index_urspruenglicher_basiswert": re.compile(r"Basiswert[^\d]{0,10}([0-9]+(?:[.,][0-9]+)?)", re.IGNORECASE),
+    # Abnahme-Folgefix (Codex): "Anpassung im Jänner"/"Mindestintervall 12
+    # Monate" bisher nicht extrahiert - Monatsname wird in `vorschlaege.py`
+    # über die bereits bestehende `_MONATSNAMEN`-Tabelle in 1-12 übersetzt.
+    "index_anpassungsmonat_name": re.compile(
+        r"Anpassung(?:smonat)?[^\wÄÖÜäöüß]{0,20}(?:erfolgt\s+)?(?:jeweils\s+)?(?:im\s+)?"
+        r"(J(?:ä|ae)nner|Januar|Februar|M(?:ä|ae)rz|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember)",
+        re.IGNORECASE,
+    ),
+    "index_mindestintervall_monate": re.compile(
+        r"Mindest(?:abstand|intervall)[^\d]{0,30}([0-9]{1,2})\s*Monate", re.IGNORECASE,
+    ),
+    # Tri-State wie `befristet_hinweis`/`unbefristet_hinweis`: "mehr als
+    # X %" ist eindeutig EXKLUSIV (die Schwelle muss überschritten, nicht
+    # nur erreicht werden), siehe auch `index_schwelle_prozent` oben. Die
+    # enge %-Nähe (max. 15 Zeichen) verhindert einen Fehltreffer auf ein
+    # unrelated "mehr als" an anderer Stelle im Vertrag.
+    "index_schwelle_exklusiv_hinweis": re.compile(r"(?:mehr als|übersteigt(?:\s+um)?)[^%]{0,15}%", re.IGNORECASE),
+    "index_schwelle_inklusiv_hinweis": re.compile(
+        r"(?:ab (?:einer |der )?(?:Schwankung|Ver(?:ä|ae)nderung)[^%]{0,15}%|ab Erreichen (?:der|einer) Schwelle)",
+        re.IGNORECASE,
+    ),
+    # Abnahme-Folgefix: Verzugszins-Satz (löst GLEICHZEITIG
+    # `verzugszins_art=VERTRAGLICH_VEREINBART` in `vorschlaege.py` aus -
+    # ein belegter konkreter Satz IST die vertragliche Vereinbarung).
+    "verzugszins_satz_prozent": re.compile(
+        r"Verzugszins(?:en)?[^\d%]{0,40}([0-9]{1,2}(?:,[0-9]{1,2})?)\s*%", re.IGNORECASE,
+    ),
+    # Rechtsachse MRG-Anwendungsbereich (Voll/Teil/Ausnahme) - DREI
+    # GETRENNTE Hinweismuster wie bei `nutzungsart_*`/`befristet_hinweis`
+    # oben; `vorschlaege.py` setzt das Feld NUR bei GENAU EINEM Treffer.
+    "mrg_vollanwendung_hinweis": re.compile(
+        r"(MRG[- ]?Vollanwendung|Vollanwendung des MRG|volle[rn]? Anwendungsbereich des MRG)", re.IGNORECASE,
+    ),
+    "mrg_teilanwendung_hinweis": re.compile(
+        r"(MRG[- ]?Teilanwendung|Teilanwendung des MRG|teilweise[rn]? Anwendungsbereich des MRG)", re.IGNORECASE,
+    ),
+    "mrg_ausnahme_hinweis": re.compile(
+        r"(MRG[- ]?(?:Voll-?)?Ausnahme|Ausnahme vom MRG|MRG findet keine Anwendung)", re.IGNORECASE,
+    ),
+    # Rechtsachse Mietzinsbildung (frei/Richtwert/Kategorie) - ebenfalls
+    # DREI GETRENNTE Hinweismuster, unabhängig von der MRG-Achse oben.
+    "mietzinsbildung_frei_hinweis": re.compile(
+        r"(freie[r]? Mietzinsbildung|frei vereinbarte[rn]? Mietzins|Mietzins (?:wird |ist )?frei vereinbart)",
+        re.IGNORECASE,
+    ),
+    "mietzinsbildung_richtwert_hinweis": re.compile(
+        r"(Richtwertmietzins|Richtwert-?system|nach dem Richtwert(?:system)?)", re.IGNORECASE,
+    ),
+    "mietzinsbildung_kategorie_hinweis": re.compile(
+        r"(Kategoriemietzins|Kategorie-?system|nach der Kategorie(?:system)?)", re.IGNORECASE,
+    ),
     "nutzungsart_wohnung": re.compile(r"(Wohnungsmietvertrag|zu Wohnzwecken)", re.IGNORECASE),
     "nutzungsart_geschaeft": re.compile(r"(Gesch(?:ä|ae)ftsraummietvertrag|Gesch(?:ä|ae)ftslokal)", re.IGNORECASE),
     "nutzungsart_buero": re.compile(r"(B(?:ü|ue)romietvertrag|als B(?:ü|ue)ro vermietet)", re.IGNORECASE),

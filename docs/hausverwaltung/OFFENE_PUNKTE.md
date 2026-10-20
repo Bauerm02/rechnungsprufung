@@ -1,5 +1,117 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## Abnahme-Folgefix nach unabhängiger Nachprüfung von dc4fa7e (Codex,
+## 20.10.2026) — echter PDF-zuerst-Weg, Netto/USt/Brutto, Mitmieter
+## atomar, Index-/Zinsprofil-Vorbefüllung, neue Auslesefelder
+
+Codex hatte dc4fa7e NICHT als Gesamt-Abnahme akzeptiert: "Der echte
+PDF-zuerst-Weg ist weiterhin nicht da - `neu_kontext_formular` verlangt
+vertrag_id, neue Debitor-ID und gueltig_von VOR Upload." Diese Korrektur
+schließt genau diese Kernwege:
+
+1. **Echter PDF-zuerst-Weg abgeschlossen**: `neu_kontext_formular`
+   verlangt jetzt NUR noch Einheit + Gesellschaft (+ Rechtsordnung) vor
+   dem Upload - Vertrag-ID, neue Debitor-ID UND Vertragsbeginn dürfen
+   leer bleiben und werden intern generiert/aus dem PDF vorgeschlagen
+   (`vertragsanlage_form.py::_generiere_technische_id`/`neu_kontext_werte`).
+   Ein erkannter Mietbeginn wird im Review als editierbares `<input
+   type="date" name="gueltig_von">` vorbefüllt (`routes/vertragsanlage.py`:
+   `gueltig_von`/`gueltig_bis` laufen jetzt über `werte`/PDF-Merge statt
+   blind durchgereichter Hidden-Felder); fehlt er, wird er ERST beim
+   tatsächlichen Übernahmeversuch (`vertragsanlage_vorschau`) verbindlich
+   verlangt - NIEMALS automatisch das heutige Datum.
+2. **Netto/USt/Brutto je Mietkomponente inkl. gemischter Steuersätze**
+   jetzt vollständig verdrahtet: `_komponente_felder_html` rendert
+   Brutto-, Netto- UND (per `<select>`) USt-Satz-Feld je Komponente im
+   Review-Formular; `komponenten_werte_aus_form` berechnet ein fehlendes
+   Brutto aus Netto+USt-Satz (Brutto bleibt maßgeblich, wenn angegeben).
+   PDF-Extraktion liefert jetzt auch Netto-Betrag + USt-Satz je
+   Komponente (`pdf_extraktion.py::_netto_muster`/`_ust_muster`) - ein
+   Fund mit explizitem "netto" wird NICHT mehr zusätzlich fälschlich als
+   Brutto übernommen (negativer Lookahead in den bestehenden Brutto-
+   Mustern). Verifiziert exakt gegen das genannte Abnahme-Beispiel: HMZ
+   1.200 netto + 20 % USt → 1.440 Brutto, BK 150→180, Parkplatz 80→96,
+   Summe 1.716,00 EUR.
+3. **Mitmieter ATOMAR im selben bestätigten Intake**: neue
+   `VertragMitmieterZeile` im Intake-Schema (`intake/schema.py`), Parser
+   (`_mitmieter_aus_dict`), Planner-Prüfung (`_pruefe_mitmieter`, strikte
+   Idempotenz wie Kaution) und Apply (`intake/apply.py` schreibt die
+   `VertragMitmieterTable`-Zeile DIREKT über dieselbe Session wie der Rest
+   des Pakets, NICHT über `VertragMitmieterRepository.anlegen` - das
+   würde die Atomarität brechen). `paket_bau.py::baue_paket_json`/
+   `pruefe_schmale_form` entsprechend erweitert. Review-Formular zeigt
+   ein neues, editierbares Mitmieter-Fieldset (Name/E-Mail/Telefon,
+   PDF-vorbefüllt), das NUR bei tatsächlicher Namensangabe mit anlegt -
+   der bestehende separate "Partei hinzufügen"-Weg bleibt für JEDEN
+   weiteren/späteren Mitmieter zuständig (höchstens einer je Vertrag UND
+   Paket über diesen Weg).
+4. **Belegte Index-/Zinsquellwerte befüllen jetzt die tatsächlichen
+   Entwurfs-/Freigabeformulare vor** (vorher nur leere Links):
+   - `indexklausel_form.py::klausel_formular` nutzte vom Mietprofil
+     bisher NUR den Mietbeginn (reiner Anzeigetext) - befüllt jetzt
+     zusätzlich Abschlussdatum (aus `unterzeichnungsdatum`), VPI-Reihe
+     (Textmapping "VPI 2020" → `VPI20C18` u. Ä.), Basismonat/-wert,
+     Schwelle-Prozent/-Inklusivität, Anpassungsmonat, Mindestintervall
+     und den Klauseltext-Auszug vor. Jedes Feld bleibt frei änderbar;
+     die Klausel entsteht weiterhin erst durch diesen Entwurf samt
+     menschlicher Bestätigung.
+   - `zinsprofil_form.py::zinsprofil_formular` nutzte bisher GAR KEINE
+     Quellwerte - befüllt jetzt Vertragsdatum (aus `unterzeichnungsdatum`),
+     den vereinbarten Zinssatz samt Klauselbeleg (NUR wenn
+     `verzugszins_art == VERTRAGLICH_VEREINBART` - ein gesetzlicher
+     Fallback befüllt das Feld bewusst NICHT, um keine Vereinbarung
+     vorzutäuschen) sowie die Mahnkostenpauschale (§1333 Abs 2 ABGB,
+     passender Match für eine frei vereinbarte "X EUR je Mahnung" als die
+     B2B-spezifische §458-UGB-Pauschale) samt Beleg vor. Prüf-/Freigabe-
+     Checkboxen werden NIE vorangehakt.
+5. **Neue PDF-Auslesefelder** (`pdf_extraktion.py`/`vorschlaege.py`):
+   Verzugszins-Satz (löst gleichzeitig `verzugszins_art=
+   VERTRAGLICH_VEREINBART` aus), MRG-Anwendungsbereich (Voll/Teil/
+   Ausnahme, drei GETRENNTE Hinweismuster wie bei Nutzungsart/
+   Befristungsstatus - nur bei GENAU EINEM Treffer ein Vorschlag),
+   Mietzinsbildung (frei/Richtwert/Kategorie, ebenso getrennt),
+   Schwelle-Inklusivität ("mehr als X %" → exklusiv, "ab einer
+   Schwankung von X %"/"ab Erreichen der Schwelle" → inklusiv),
+   Anpassungsmonat (Monatsname inkl. "Jänner" → 1-12) und
+   Mindestintervall in Monaten.
+6. **Tests folgen der tatsächlichen Abnahme-Methodik**: der neue
+   End-to-End-Test `test_pdf_zuerst_minimalstrecke_end_to_end_nur_
+   sichtbare_defaults_uebernommen` (`tests/mietinkasso/test_backoffice.py`)
+   lädt ein synthetisches PDF mit NUR Einheit/Gesellschaft/Rechtsordnung
+   hoch, liest die vom Server GERENDERTEN Standardwerte über neue Test-
+   Helfer `_eingabewert`/`_auswahlwert` aus (reine Regex-Extraktion von
+   `<input value=...>`/`<select><option selected>`, KEIN eigenes PDF-
+   Parsing), schickt GENAU diese Werte unverändert als Vorschau-POST und
+   prüft danach die TATSÄCHLICH in der DB gespeicherten Daten - kein
+   PDF-erkannter Wert wird im Test selbst per Hand eingetippt.
+
+### Verbleibende, ehrlich offene Punkte dieser Runde
+
+- Die neuen Regex-Muster (Netto+USt je Komponente, Verzugszins-Satz,
+  MRG-/Mietzinsbildungs-Achse, Schwelle-Inklusivität, Anpassungsmonat/
+  Mindestintervall) sind bewusst einfache, dokumentierte Heuristiken
+  (wie alle bisherigen Muster in `pdf_extraktion.py`) - sie decken
+  gängige deutschsprachige Formulierungen ab, aber KEINEN Anspruch auf
+  vollständige Vertragssemantik. Eine vom hier verifizierten
+  synthetischen Testtext abweichende tatsächliche Formulierung in einer
+  unabhängigen Praxisprüfung kann unerkannt bleiben - das Review bleibt
+  in JEDEM Fall Pflicht, nichts wird ungeprüft übernommen.
+- Die Indexklausel-/Zinsprofil-Vorbefüllung ist reine Formular-
+  Vorbelegung, KEINE automatische Verbindung/Freigabe - ein Mensch
+  entscheidet weiterhin eigenständig über jede tatsächlich wirksame
+  Klausel/jedes Zinsprofil (unverändert gegenüber der bisherigen
+  Vorgabe "keine zusätzliche Automatik erfinden").
+- Mitmieter-Atomarität ist auf GENAU EINEN Mitmieter je neu angelegtem
+  Vertrag UND Paket beschränkt (strikte Idempotenz, siehe
+  `planner.py::_pruefe_mitmieter`) - ein zweiter/weiterer Mitmieter oder
+  eine spätere Änderung laufen weiterhin über die bestehende, separate
+  "Partei hinzufügen"-Route in der Mieterakte, nicht über diesen Intake.
+- Die VPI-Reihen-Textübersetzung (`indexklausel_form.py::
+  _reihe_code_aus_profiltext`) erkennt nur die vier bereits im Formular
+  hinterlegten Jahreszahlen (2020/2015/2000/1996) über eine einfache
+  Teilstring-Suche - ein abweichend formuliertes Reihen-Kürzel bleibt
+  unbefüllt (kein Fehler, nur kein Vorschlag).
+
 ## Abnahme-Folgefix nach Rückweisung von 534b131 (Codex, 20.10.2026) —
 ## Kontaktextraktion, Indexbasis, PDF-zuerst für neuen Mieter, Wording,
 ## zwei Mahn-Tageslauf-Bugs
@@ -73,6 +185,14 @@ Mahn-Ergänzungen #31/teilweise #32):
 
 ### Bewusst NICHT in dieser Korrektur (ehrlich offen, keine "Abschluss"-
 ### Behauptung für diese Punkte)
+
+> **Überholt durch die Abnahme-Folgefix-Sektion ganz oben in diesem
+> Dokument (Nachprüfung von dc4fa7e)**: Netto/USt/Brutto je
+> Mietkomponente ist seither vollständig verdrahtet, und Index-/
+> Zinsprofil-Formulare werden seither aus dem Mietvertragsprofil
+> vorbefüllt. Dieser Abschnitt bleibt als historischer Beleg stehen
+> (Auftrag: offene Punkte nie stillschweigend löschen), beschreibt aber
+> NICHT mehr den aktuellen Stand.
 
 - **Netto/USt/brutto ist in der Neuanlage-Mietbestandteile-Erfassung
   weiterhin NICHT verdrahtet.** Das Formular (`_KOMPONENTEN_FELDER`/

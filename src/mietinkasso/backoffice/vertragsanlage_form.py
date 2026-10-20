@@ -8,8 +8,9 @@ und übersetzt Formularwerte in `IntakePaket`-Rohdaten."""
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from html import escape as h
+from uuid import uuid4
 
 from mietinkasso.backoffice.views import csrf_feld, eur, option, parse_eur_betrag, sperrgrund_label
 from mietinkasso.domain.enums import (
@@ -225,22 +226,26 @@ def neu_kontext_formular(*, einheiten_mit_objekt: list[tuple], debitoren: list, 
         {csrf_feld(csrf)}
         <input type="hidden" name="modus" value="NEU">
         <fieldset><legend>Vertrag</legend>
-          <label>Vertrag-ID (frei wählbar, eindeutig)</label>
-          <input name="vertrag_id" required placeholder="z. B. V-601-TOP4">
+          <label>Vertrag-ID (optional - leer lassen erzeugt automatisch eine technische ID)</label>
+          <input name="vertrag_id" placeholder="automatisch, falls leer">
           <label>Einheit</label><select name="einheit_id" required>{einheit_optionen}</select>
           <label>Vermieter-Gesellschaft</label><select name="gesellschaft_id" required>{gesellschaft_optionen}</select>
           <label>Rechtsordnung</label><select name="rechtsordnung" required>{rechtsordnung_optionen}</select>
-          <label>Vertragsbeginn (technisch, Sollstellung/OP)</label><input type="date" name="gueltig_von" required>
+          <label>Vertragsbeginn (technisch, Sollstellung/OP; optional - kann im nächsten Schritt aus dem PDF
+                 übernommen werden, wird aber NIE automatisch auf das heutige Datum gesetzt)</label>
+          <input type="date" name="gueltig_von">
           <label>Vertragsende (nur bei tatsächlich befristetem Vertrag - leer lassen bedeutet NICHT automatisch
                  unbefristet, siehe Befristungsstatus im nächsten Schritt)</label>
           <input type="date" name="gueltig_bis">
         </fieldset>
         <fieldset><legend>Mieter</legend>
           <label>Vorhandenen Mieter wählen</label><select name="debitor_id">{debitor_optionen}</select>
-          <p class="muted">ODER neu anlegen (wenn eine ID eingetragen ist, hat das Vorrang vor der Auswahl oben).
-             Name/E-Mail/Telefon können HIER leer bleiben und im nächsten Schritt aus einem hochgeladenen PDF
-             übernommen und geprüft werden - nur die ID muss bereits feststehen.</p>
-          <label>Neue Mieter-ID</label><input name="neuer_debitor_id" placeholder="z. B. DEB-NEU-1">
+          <p class="muted">ODER neu anlegen (sobald hier etwas ausgewählt/eingegeben wird, hat das Vorrang).
+             OHNE Auswahl UND ohne Eingabe wird automatisch ein NEUER Mieter mit technischer ID angelegt -
+             Name/E-Mail/Telefon können dann im nächsten Schritt aus einem hochgeladenen PDF übernommen und
+             geprüft werden.</p>
+          <label>Neue Mieter-ID (optional - leer lassen erzeugt automatisch eine technische ID)</label>
+          <input name="neuer_debitor_id" placeholder="automatisch, falls leer">
           <label>Name (optional - kann im nächsten Schritt aus dem PDF ergänzt werden)</label>
           <input name="neuer_debitor_name">
           <label>E-Mail (optional)</label><input name="neuer_debitor_email" type="email">
@@ -248,14 +253,12 @@ def neu_kontext_formular(*, einheiten_mit_objekt: list[tuple], debitoren: list, 
           <label for="neuer-debitor-telefon">Telefon (optional)</label>
           <input id="neuer-debitor-telefon" name="neuer_debitor_telefon" type="tel" maxlength="{TELEFON_MAX_LAENGE}">
         </fieldset>
-        <fieldset><legend>Mietbestandteile (optional, geprüfte Komponenten - keine historische Sollbuchung)</legend>
+        <fieldset><legend>Mietbestandteile (optional - können auch im nächsten Schritt aus dem PDF übernommen
+               werden; keine historische Sollbuchung)</legend>
           <p class="muted">Werden als aktive Vertragskomponenten ab Vertragsbeginn angelegt, lösen aber KEINE
-             rückwirkende OP-Buchung aus - die künftige Vorschreibung nutzt sie normal.</p>
-          <label>Hauptmietzins (brutto, EUR)</label><input name="komponente_hmz">
-          <label>Betriebskosten (brutto, EUR)</label><input name="komponente_bk">
-          <label>Heizkosten (brutto, EUR)</label><input name="komponente_hk">
-          <label>Küche (brutto, EUR)</label><input name="komponente_kueche">
-          <label>Parkplatz (brutto, EUR)</label><input name="komponente_parkplatz">
+             rückwirkende OP-Buchung aus - die künftige Vorschreibung nutzt sie normal. Brutto ODER Netto+USt-Satz
+             angeben; sind beide leer, bleibt die Komponente unbesetzt.</p>
+          {"".join(_komponente_felder_html(feldname, bezeichnung) for feldname, _, bezeichnung in _KOMPONENTEN_FELDER)}
         </fieldset>
         <fieldset><legend>Optionale einmalige PDF-Aufnahme</legend>
           <p class="muted">Lokale Texterkennung ohne KI-/Cloud-Aufruf - liefert nur Vorschläge mit Seitenbeleg,
@@ -267,52 +270,86 @@ def neu_kontext_formular(*, einheiten_mit_objekt: list[tuple], debitoren: list, 
     </div>"""
 
 
+def _generiere_technische_id(*, praefix: str, bezug: str) -> str:
+    """Erzeugt eine technische ID für eine neue Vertrag-/Debitor-Zeile,
+    wenn der Mensch keine eigene angibt (Abnahme-Folgefix: "technische
+    IDs intern generieren") - kurz, lesbar (Bezug zur Einheit), praktisch
+    kollisionsfrei. Eine tatsächliche Kollision wird NICHT hier, sondern
+    an der bestehenden, bereits vorhandenen Stelle geprüft (`routes/
+    vertragsanlage.py` prüft `get_vertrag`/legt den Debitor idempotent
+    über den generischen Intake an) - diese Funktion hat bewusst keinen
+    DB-Zugriff (bleibt eine reine Funktion wie der Rest dieses Moduls)."""
+
+    return f"{praefix}-{bezug}-{uuid4().hex[:6].upper()}"
+
+
 def neu_kontext_werte(form) -> dict:
+    """Abnahme-Folgefix (Codex, unabhängige Nachprüfung von dc4fa7e):
+    "Der echte PDF-zuerst-Weg ist weiterhin nicht da". NUR Einheit und
+    Gesellschaft sind jetzt noch Pflichtfelder - Vertrag-ID, neue
+    Debitor-ID UND Vertragsbeginn dürfen leer bleiben:
+
+    - Vertrag-ID/neue Debitor-ID werden, wenn leer, HIER automatisch als
+      technische ID generiert (`_generiere_technische_id`) - ein Mensch
+      kann weiterhin eine eigene ID eintragen, die hat dann Vorrang.
+    - Ist WEDER ein bestehender Mieter ausgewählt NOCH irgendein
+      Neuanlage-Feld ausgefüllt, wird automatisch ein NEUER Mieter mit
+      generierter ID angenommen (Name/Kontakt bleiben vorerst leer - sie
+      werden im Review entweder aus dem PDF übernommen oder müssen dort
+      von Hand ergänzt werden, siehe `routes/vertragsanlage.py::
+      vertragsanlage_pdf_hochladen`/`review_formular`).
+    - `gueltig_von` (Vertragsbeginn) bleibt HIER unvalidiert optional -
+      NIEMALS automatisch das heutige Datum. Es wird im Review editierbar
+      (ggf. aus der PDF-Mietbeginn-Erkennung vorbefüllt) und erst beim
+      tatsächlichen Übernahmeversuch (`vertragsanlage_vorschau`)
+      verbindlich verlangt."""
+
     vertrag_id = str(form.get("vertrag_id", "")).strip()
-    if not vertrag_id:
-        raise ValueError("Vertrag-ID darf nicht leer sein.")
     einheit_id = str(form.get("einheit_id", "")).strip()
     gesellschaft_id = str(form.get("gesellschaft_id", "")).strip()
     rechtsordnung = str(form.get("rechtsordnung", "")).strip()
     if rechtsordnung not in RECHTSORDNUNGEN:
         raise ValueError("Ungültige Rechtsordnung.")
+    if not (einheit_id and gesellschaft_id):
+        raise ValueError("Einheit und Gesellschaft sind Pflichtfelder.")
+    if not vertrag_id:
+        vertrag_id = _generiere_technische_id(praefix="V", bezug=einheit_id)
 
+    debitor_id_auswahl = str(form.get("debitor_id", "")).strip()
     neuer_debitor_id = str(form.get("neuer_debitor_id", "")).strip()
     neuer_debitor_name = str(form.get("neuer_debitor_name", "")).strip()
-    neuer_debitor: dict | None = None
-    # Abnahme-Folgefix (Codex 20.10.2026): "Neuanlage verlangt Name/IDs/
-    # Termine VOR PDF, kein PDF-zuerst-Ablauf" - der NAME darf HIER noch
-    # leer bleiben (und im nächsten Schritt aus dem hochgeladenen PDF
-    # übernommen/editiert werden, siehe `routes/vertragsanlage.py::
-    # vertragsanlage_pdf_hochladen`) - NUR die ID muss bereits feststehen,
-    # weil sie die technische Debitor-Identität ist, die kein PDF liefern
-    # kann. Auslöser für "neuer Mieter" ist deshalb jetzt die ID, NICHT
-    # mehr zwingend der Name.
-    if neuer_debitor_id or neuer_debitor_name:
+    neuer_debitor_email = str(form.get("neuer_debitor_email", "")).strip()
+    neuer_debitor_adresse = str(form.get("neuer_debitor_adresse", "")).strip()
+    neuer_debitor_telefon_roh = str(form.get("neuer_debitor_telefon", "")).strip()
+
+    if debitor_id_auswahl and not (
+        neuer_debitor_id or neuer_debitor_name or neuer_debitor_email or neuer_debitor_adresse or neuer_debitor_telefon_roh
+    ):
+        # Ein bestehender Mieter wurde bewusst ausgewählt - KEINE Neuanlage.
+        debitor_id = debitor_id_auswahl
+        neuer_debitor = None
+    else:
+        # Weder Auswahl noch irgendein Neuanlage-Feld ausgefüllt: ein
+        # neuer Mieter wird angenommen (technische ID, Rest bleibt für
+        # das PDF/Review offen) - das ist der PDF-zuerst-Normalfall.
         if not neuer_debitor_id:
-            raise ValueError("Neue Mieter-ID darf nicht leer sein.")
+            neuer_debitor_id = _generiere_technische_id(praefix="DEB", bezug=einheit_id)
         neuer_debitor = dict(
             id=neuer_debitor_id, name=neuer_debitor_name,
-            email=str(form.get("neuer_debitor_email", "")).strip() or None,
-            adresse=str(form.get("neuer_debitor_adresse", "")).strip() or None,
-            telefon=normalisiere_telefon(form.get("neuer_debitor_telefon", "")),
+            email=neuer_debitor_email or None, adresse=neuer_debitor_adresse or None,
+            telefon=normalisiere_telefon(neuer_debitor_telefon_roh),
         )
         debitor_id = neuer_debitor_id
-    else:
-        debitor_id = str(form.get("debitor_id", "")).strip()
 
-    if not (einheit_id and debitor_id and gesellschaft_id):
-        raise ValueError("Einheit, Mieter (Auswahl oder Neuanlage) und Gesellschaft sind Pflichtfelder.")
     gueltig_von_raw = str(form.get("gueltig_von", "")).strip()
-    if not gueltig_von_raw:
-        raise ValueError("Vertragsbeginn ist ein Pflichtfeld.")
-    date.fromisoformat(gueltig_von_raw)  # Formatprüfung
+    if gueltig_von_raw:
+        date.fromisoformat(gueltig_von_raw)  # Formatprüfung
     gueltig_bis_raw = str(form.get("gueltig_bis", "")).strip()
     if gueltig_bis_raw:
         date.fromisoformat(gueltig_bis_raw)  # Formatprüfung
     return dict(
         vertrag_id=vertrag_id, einheit_id=einheit_id, debitor_id=debitor_id, gesellschaft_id=gesellschaft_id,
-        rechtsordnung=rechtsordnung, gueltig_von=gueltig_von_raw, gueltig_bis=gueltig_bis_raw or None,
+        rechtsordnung=rechtsordnung, gueltig_von=gueltig_von_raw or None, gueltig_bis=gueltig_bis_raw or None,
         neuer_debitor=neuer_debitor,
     )
 
@@ -330,22 +367,87 @@ _KOMPONENTEN_FELDER = (
 )
 
 
+#: Übliche österreichische USt-Sätze zur Auswahl (Auftrag: "gemischte
+#: Steuersätze" - je Komponente FREI wählbar, kein systemweit einheitlicher
+#: Satz mehr).
+_UST_SAETZE_PROZENT = ("0", "10", "13", "20")
+
+
+def _komponente_felder_html(feldname: str, bezeichnung: str, *, werte: dict | None = None, vorschlaege: dict | None = None) -> str:
+    """Eine Mietbestandteil-Zeile mit Brutto-, Netto- und USt-Satz-Feld
+    (Abnahme-Folgefix: "Netto/USt/Brutto je Mietkomponente inkl.
+    gemischter Steuersätze") - Brutto ODER Netto+USt-Satz angeben;
+    `komponenten_werte_aus_form` berechnet fehlendes Brutto aus Netto+USt,
+    NIE umgekehrt (ein angegebenes Brutto bleibt immer maßgeblich)."""
+
+    werte = werte or {}
+    vorschlaege = vorschlaege or {}
+    brutto = h(str(werte.get(feldname) or ""))
+    netto = h(str(werte.get(f"{feldname}_netto") or ""))
+    ust = str(werte.get(f"{feldname}_ust") or "")
+    ust_optionen = option("", "– USt-Satz wählen –", selected=ust == "") + "".join(
+        option(satz, f"{satz} %", selected=ust == satz) for satz in _UST_SAETZE_PROZENT
+    )
+    brutto_hinweis = _beleg_hinweis(vorschlaege, feldname)
+    netto_hinweis = _beleg_hinweis(vorschlaege, f"{feldname}_netto")
+    ust_hinweis = _beleg_hinweis(vorschlaege, f"{feldname}_ust")
+    return f"""
+      <fieldset><legend>{h(bezeichnung)}</legend>
+        <label>Brutto (EUR)</label><input name="{feldname}" value="{brutto}">{brutto_hinweis}
+        <label>Netto (EUR, alternativ zu Brutto)</label><input name="{feldname}_netto" value="{netto}">{netto_hinweis}
+        <label>USt-Satz</label><select name="{feldname}_ust">{ust_optionen}</select>{ust_hinweis}
+      </fieldset>"""
+
+
 def komponenten_werte_aus_form(form, *, vertrag_id: str, gueltig_von: str) -> list[dict]:
     """Baut aus den (optionalen) Mietbestandteile-Feldern im
     Neuanlage-Formular `komponenten[]`-Rohdaten für den generischen
     Intake - nur ausgefüllte Felder werden übernommen, kein erfundener
-    Nullbetrag für ein leer gelassenes Feld."""
+    Nullbetrag für ein leer gelassenes Feld.
+
+    Netto/USt/Brutto (Abnahme-Folgefix): jede Komponente kann EINEN
+    eigenen USt-Satz haben (gemischte Steuersätze, z. B. HMZ 10 % und
+    BK/Parkplatz 20 %). Ist ein Brutto-Betrag angegeben, bleibt der
+    MASSGEBLICH (unverändertes Altverhalten, Default-USt-Satz 10 % bleibt
+    dabei unverändert über `paket_bau.py`/Intake-Schema-Default, außer
+    zusätzlich ein USt-Satz gewählt wurde). Fehlt Brutto, aber Netto UND
+    USt-Satz sind angegeben, wird Brutto daraus berechnet - NIE
+    umgekehrt aus einem ungeprüften Brutto ein Netto erfunden."""
 
     ergebnis: list[dict] = []
     for feldname, art, bezeichnung in _KOMPONENTEN_FELDER:
-        roh = str(form.get(feldname, "")).strip()
-        if not roh:
+        brutto_roh = str(form.get(feldname, "")).strip()
+        netto_roh = str(form.get(f"{feldname}_netto", "")).strip()
+        ust_roh = str(form.get(f"{feldname}_ust", "")).strip()
+        if not (brutto_roh or netto_roh):
             continue
-        betrag_cent = parse_eur_betrag(roh)
-        ergebnis.append(dict(
+
+        ust_satz_promille: int | None = None
+        if ust_roh:
+            try:
+                ust_satz_promille = int(Decimal(ust_roh.replace(",", ".")) * 1000)
+            except InvalidOperation:
+                raise ValueError(f"'{bezeichnung}': ungültiger USt-Satz.") from None
+
+        if brutto_roh:
+            betrag_cent = parse_eur_betrag(brutto_roh)
+        else:
+            if ust_satz_promille is None:
+                raise ValueError(f"'{bezeichnung}': USt-Satz fehlt, um aus dem Netto-Betrag den Brutto-Betrag zu berechnen.")
+            netto_cent = parse_eur_betrag(netto_roh)
+            # `ust_satz_promille` folgt derselben Skalierung wie überall
+            # im System (`domain/money.py::zerlege_brutto_cent`-Docstring):
+            # 20000 = 20 % - der Multiplikator ist deshalb
+            # (100000 + ust_satz_promille) / 100000, NICHT /1000.
+            betrag_cent = int((Decimal(netto_cent) * (Decimal(100_000) + ust_satz_promille) / Decimal(100_000)).to_integral_value(rounding=ROUND_HALF_UP))
+
+        eintrag = dict(
             id=f"{vertrag_id}-{art}", art=art, bezeichnung=bezeichnung,
             betrag_cent=betrag_cent, gueltig_von=gueltig_von,
-        ))
+        )
+        if ust_satz_promille is not None:
+            eintrag["ust_satz_promille"] = ust_satz_promille
+        ergebnis.append(eintrag)
     return ergebnis
 
 
@@ -418,17 +520,11 @@ def _eckdaten_block(eckdaten: dict | None, pdf_hinweise: dict) -> str:
         f' <span class="muted">(laut Dokument, Seite {vermieter_hinweis.seite}: „{h(vermieter_hinweis.formularwert)}“ — bitte mit Auswahl vergleichen)</span>'
         if vermieter_hinweis else ""
     )
-    mitmieter_hinweis = pdf_hinweise.get("mitmieter_name_hinweis")
-    mitmieter_telefon_hinweis = pdf_hinweise.get("mitmieter_telefon_hinweis")
-    mitmieter_zeile = ""
-    if mitmieter_hinweis:
-        telefon_zusatz = f", Telefon „{h(mitmieter_telefon_hinweis.formularwert)}“" if mitmieter_telefon_hinweis else ""
-        mitmieter_zeile = (
-            f'<tr><th>Mitmieter (laut Dokument, Seite {mitmieter_hinweis.seite})</th>'
-            f'<td>„{h(mitmieter_hinweis.formularwert)}“{telefon_zusatz} — '
-            'wird NICHT automatisch angelegt; nach dem Übernehmen über '
-            '"Partei hinzufügen" in der Mieterakte erfassen und prüfen.</td></tr>'
-        )
+    # Abnahme-Folgefix: der Mitmieter-Hinweis ist jetzt ein editierbares
+    # Formularfeld weiter unten (`mitmieter_neu_block`, ATOMAR im selben
+    # Intake übernehmbar) - KEINE zusätzliche, nur-lesende Vergleichszeile
+    # hier mehr nötig (die hätte sonst "wird NICHT automatisch angelegt"
+    # behauptet, obwohl genau das jetzt möglich ist).
     return f"""
     <div class="card"><h2>Eckdaten dieses Vorgangs</h2>
       <table>
@@ -437,8 +533,7 @@ def _eckdaten_block(eckdaten: dict | None, pdf_hinweise: dict) -> str:
         <tr><th>Mieter</th><td>{h(eckdaten.get('mieter_anzeige', ''))}{mieter_vergleich}</td></tr>
         <tr><th>Vermieter-Gesellschaft</th><td>{h(eckdaten.get('gesellschaft_name', ''))}{vermieter_vergleich}</td></tr>
         <tr><th>Rechtsordnung</th><td>{h(eckdaten.get('rechtsordnung', ''))}</td></tr>
-        <tr><th>Vertragsbeginn / -ende</th><td>{h(eckdaten.get('gueltig_von', ''))} – {h(eckdaten.get('gueltig_bis') or 'unbefristet')}</td></tr>
-        {mitmieter_zeile}
+        <tr><th>Vertragsbeginn / -ende</th><td>{h(eckdaten.get('gueltig_von') or 'noch nicht erfasst - unten ausfüllen')} – {h(eckdaten.get('gueltig_bis') or 'unbefristet')}</td></tr>
       </table>
     </div>"""
 
@@ -494,6 +589,44 @@ def review_formular(
           <input name="neuer_debitor_adresse" value="{h(str(werte.get('neuer_debitor_adresse') or ''))}">
         </fieldset>"""
 
+    # Abnahme-Folgefix (Codex, "echter PDF-zuerst-Weg"): Vertragsbeginn/
+    # -ende sind beim Neuanlage-Durchlauf jetzt SICHTBARE, editierbare
+    # Felder (vorbefüllt aus Schritt 1 und/oder PDF-Vorschlag, siehe
+    # Route) statt blind durchgereichter Hidden-Felder - erst beim
+    # tatsächlichen Übernahmeversuch (`vertragsanlage_vorschau`) wird ein
+    # fehlender Vertragsbeginn verbindlich verlangt, NIE automatisch das
+    # heutige Datum.
+    vertragsdauer_block = ""
+    mietbestandteile_block = ""
+    mitmieter_neu_block = ""
+    if ist_neu:
+        vertragsdauer_block = f"""
+        <fieldset><legend>Vertragsdauer</legend>
+          <label>Vertragsbeginn (wird nie automatisch auf heute gesetzt)</label>
+          <input type="date" name="gueltig_von" value="{h(str(werte.get('gueltig_von') or ''))}" required>
+          {_beleg_hinweis(vorschlaege, "urspruenglicher_mietbeginn")}
+          <label>Vertragsende (nur bei tatsächlich befristetem Vertrag)</label>
+          <input type="date" name="gueltig_bis" value="{h(str(werte.get('gueltig_bis') or ''))}">
+        </fieldset>"""
+        mietbestandteile_block = f"""
+        <fieldset><legend>Mietbestandteile (Brutto ODER Netto+USt-Satz je Komponente - gemischte Steuersätze möglich)</legend>
+          {"".join(_komponente_felder_html(feldname, bezeichnung, werte=werte, vorschlaege=vorschlaege) for feldname, _, bezeichnung in _KOMPONENTEN_FELDER)}
+        </fieldset>"""
+        mitmieter_neu_block = f"""
+        <fieldset><legend>Mitmieter (optional - wird im selben bestätigten Vorgang mitangelegt)</legend>
+          <p class="muted">Ein zweiter Vertragspartner neben dem Hauptmieter oben - aus dem PDF vorgeschlagen
+             und/oder hier direkt editierbar. Leer lassen, wenn es keinen Mitmieter gibt.</p>
+          <label>Name</label>
+          <input name="mitmieter_name" value="{h(str(werte.get('mitmieter_name') or ''))}">
+          {_beleg_hinweis(vorschlaege, "mitmieter_name_hinweis")}
+          <label>E-Mail</label>
+          <input name="mitmieter_email" type="email" value="{h(str(werte.get('mitmieter_email') or ''))}">
+          {_beleg_hinweis(vorschlaege, "mitmieter_email_hinweis")}
+          <label>Telefon</label>
+          <input name="mitmieter_telefon" type="tel" maxlength="{TELEFON_MAX_LAENGE}" value="{h(str(werte.get('mitmieter_telefon') or ''))}">
+          {_beleg_hinweis(vorschlaege, "mitmieter_telefon_hinweis")}
+        </fieldset>"""
+
     return f"""
     <div class="card">
       <h1>{'Neuen Mietvertrag prüfen' if ist_neu else 'Mietvertragsprofil aktualisieren'}</h1>
@@ -508,6 +641,9 @@ def review_formular(
         {csrf_feld(csrf)}
         {hidden_felder}
         {neuer_mieter_block}
+        {vertragsdauer_block}
+        {mietbestandteile_block}
+        {mitmieter_neu_block}
         <fieldset><legend>Nutzung und Rechtsgrundlage</legend>
           <label>Nutzungsart (unabhängig von der Rechtsordnung)</label>
           <select name="nutzungsart">{nutzungsart_optionen}</select>

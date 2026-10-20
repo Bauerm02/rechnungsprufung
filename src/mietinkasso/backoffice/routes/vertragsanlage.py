@@ -461,10 +461,23 @@ async def vertragsanlage_pdf_hochladen(
     neuer_debitor_adresse: str = Form(""),
     neuer_debitor_telefon: str = Form(""),
     komponente_hmz: str = Form(""),
+    komponente_hmz_netto: str = Form(""),
+    komponente_hmz_ust: str = Form(""),
     komponente_bk: str = Form(""),
+    komponente_bk_netto: str = Form(""),
+    komponente_bk_ust: str = Form(""),
     komponente_hk: str = Form(""),
+    komponente_hk_netto: str = Form(""),
+    komponente_hk_ust: str = Form(""),
     komponente_kueche: str = Form(""),
+    komponente_kueche_netto: str = Form(""),
+    komponente_kueche_ust: str = Form(""),
     komponente_parkplatz: str = Form(""),
+    komponente_parkplatz_netto: str = Form(""),
+    komponente_parkplatz_ust: str = Form(""),
+    mitmieter_name: str = Form(""),
+    mitmieter_email: str = Form(""),
+    mitmieter_telefon: str = Form(""),
     pdf_datei: UploadFile | None = File(None),
     session=Depends(_current_session),
 ) -> HTMLResponse:
@@ -472,9 +485,13 @@ async def vertragsanlage_pdf_hochladen(
     require_schreibrecht(_ctx(session))
     ist_neu = modus == "NEU"
     komponenten_roh_felder = {
-        "komponente_hmz": komponente_hmz, "komponente_bk": komponente_bk, "komponente_hk": komponente_hk,
-        "komponente_kueche": komponente_kueche, "komponente_parkplatz": komponente_parkplatz,
+        "komponente_hmz": komponente_hmz, "komponente_hmz_netto": komponente_hmz_netto, "komponente_hmz_ust": komponente_hmz_ust,
+        "komponente_bk": komponente_bk, "komponente_bk_netto": komponente_bk_netto, "komponente_bk_ust": komponente_bk_ust,
+        "komponente_hk": komponente_hk, "komponente_hk_netto": komponente_hk_netto, "komponente_hk_ust": komponente_hk_ust,
+        "komponente_kueche": komponente_kueche, "komponente_kueche_netto": komponente_kueche_netto, "komponente_kueche_ust": komponente_kueche_ust,
+        "komponente_parkplatz": komponente_parkplatz, "komponente_parkplatz_netto": komponente_parkplatz_netto, "komponente_parkplatz_ust": komponente_parkplatz_ust,
     }
+    mitmieter_roh_felder = {"mitmieter_name": mitmieter_name, "mitmieter_email": mitmieter_email, "mitmieter_telefon": mitmieter_telefon}
 
     if ist_neu:
         try:
@@ -501,6 +518,16 @@ async def vertragsanlage_pdf_hochladen(
             return _fehlerseite(session, "Neuer Mietvertrag", "Unbekannter Mieter.", "/backoffice/vertraege/neu")
         require_gesellschaft_access(_ctx(session), kontext["gesellschaft_id"])
         basis_werte = {}
+        # Abnahme-Folgefix (Codex, PDF-zuerst-Weg): Vertragsbeginn/-ende
+        # und Mietbestandteile werden jetzt wie die neuer_debitor_*-Felder
+        # als SICHTBARE, editierbare Werte behandelt statt blind in
+        # `kontext_hidden` durchgereicht - nur so kann der PDF-Merge unten
+        # ein erkanntes `urspruenglicher_mietbeginn` tatsächlich als
+        # Vorschlag für `gueltig_von` einsetzen (siehe weiter unten).
+        basis_werte["gueltig_von"] = kontext["gueltig_von"] or ""
+        basis_werte["gueltig_bis"] = kontext["gueltig_bis"] or ""
+        basis_werte.update(komponenten_roh_felder)
+        basis_werte.update(mitmieter_roh_felder)
         if kontext["neuer_debitor"] is not None:
             # Bereits in Schritt 1 eingegebene Kontaktangaben eines neuen
             # Mieters bleiben führend - der PDF-Merge unten befüllt NUR
@@ -584,6 +611,26 @@ async def vertragsanlage_pdf_hochladen(
         if not werte.get("neuer_debitor_telefon") and "mieter_telefon_hinweis" in vorschlaege:
             werte["neuer_debitor_telefon"] = vorschlaege["mieter_telefon_hinweis"].formularwert
 
+    if ist_neu:
+        # Abnahme-Folgefix (Codex, "echter PDF-zuerst-Weg"): ein im
+        # Dokument erkannter Mietbeginn wird zum editierbaren Vorschlag
+        # für den (in Schritt 1 ABSICHTLICH optional gelassenen)
+        # Vertragsbeginn - NIEMALS automatisch das heutige Datum
+        # (`neu_kontext_werte`-Docstring). Bereits in Schritt 1
+        # eingegebene Werte bleiben führend.
+        if not werte.get("gueltig_von") and "urspruenglicher_mietbeginn" in vorschlaege:
+            werte["gueltig_von"] = vorschlaege["urspruenglicher_mietbeginn"].formularwert
+        # Mitmieter-Hinweis wird - ANDERS als bei einer bestehenden Partei
+        # (siehe Eckdaten-Block, reiner Vergleichshinweis) - für einen
+        # GERADE neu entstehenden Vertrag direkt zum editierbaren
+        # Vorschlag für die atomare Mitmieter-Anlage im selben Intake.
+        if not werte.get("mitmieter_name") and "mitmieter_name_hinweis" in vorschlaege:
+            werte["mitmieter_name"] = vorschlaege["mitmieter_name_hinweis"].formularwert
+        if not werte.get("mitmieter_email") and "mitmieter_email_hinweis" in vorschlaege:
+            werte["mitmieter_email"] = vorschlaege["mitmieter_email_hinweis"].formularwert
+        if not werte.get("mitmieter_telefon") and "mitmieter_telefon_hinweis" in vorschlaege:
+            werte["mitmieter_telefon"] = vorschlaege["mitmieter_telefon_hinweis"].formularwert
+
     kontext_hidden = {"modus": modus, "vertrag_id": vertrag_id, "quelle_typ": quelle_typ}
     if quelle_referenz:
         kontext_hidden["quelle_referenz"] = quelle_referenz
@@ -592,9 +639,7 @@ async def vertragsanlage_pdf_hochladen(
         kontext_hidden.update({
             "einheit_id": kontext["einheit_id"], "debitor_id": kontext["debitor_id"],
             "gesellschaft_id": kontext["gesellschaft_id"], "rechtsordnung": kontext["rechtsordnung"],
-            "gueltig_von": kontext["gueltig_von"], "gueltig_bis": kontext["gueltig_bis"] or "",
         })
-        kontext_hidden.update(komponenten_roh_felder)
         if kontext["neuer_debitor"] is not None:
             # Abnahme-Folgefix (Codex 20.10.2026): Name/E-Mail/Telefon
             # sind jetzt SICHTBARE, editierbare Felder im Review (siehe
@@ -610,7 +655,13 @@ async def vertragsanlage_pdf_hochladen(
         eckdaten = {
             "vertrag_id": vertrag_id, "objekt_einheit_label": _vertragsanlage_einheit_label(objekt, einheit),
             "mieter_anzeige": mieter_anzeige, "gesellschaft_name": gesellschaft_obj.name if gesellschaft_obj else kontext["gesellschaft_id"],
-            "rechtsordnung": kontext["rechtsordnung"], "gueltig_von": kontext["gueltig_von"], "gueltig_bis": kontext["gueltig_bis"],
+            "rechtsordnung": kontext["rechtsordnung"],
+            # Abnahme-Folgefix: zeigt den ggf. aus dem PDF vorbefüllten
+            # Stand aus `werte`, NICHT mehr den in Schritt 1 (ABSICHTLICH
+            # optional) eingegebenen Rohwert aus `kontext` - der
+            # editierbare Review-Input unten bleibt die maßgebliche Stelle.
+            "gueltig_von": werte.get("gueltig_von") or "",
+            "gueltig_bis": werte.get("gueltig_bis") or "",
         }
 
     inhalt = _vertragsanlage_review_formular(
@@ -639,12 +690,25 @@ async def vertragsanlage_vorschau(request: Request, session=Depends(_current_ses
     bestehende_kaution_vorhanden = False
     neuer_debitor: dict | None = None
     komponenten: list[dict] = []
+    mitmieter: dict | None = None
     if ist_neu:
         neuer_vertrag = {
             "einheit_id": str(form.get("einheit_id", "")), "debitor_id": str(form.get("debitor_id", "")),
             "gesellschaft_id": str(form.get("gesellschaft_id", "")), "rechtsordnung": str(form.get("rechtsordnung", "")),
             "gueltig_von": str(form.get("gueltig_von", "")), "gueltig_bis": str(form.get("gueltig_bis", "")) or None,
         }
+        # Abnahme-Folgefix (Codex, "echter PDF-zuerst-Weg"): der
+        # Vertragsbeginn ist in Schritt 1 ABSICHTLICH optional
+        # (`neu_kontext_werte`) und wird spätestens HIER, beim
+        # tatsächlichen Übernahmeversuch, verbindlich verlangt - NIEMALS
+        # automatisch auf das heutige Datum gesetzt.
+        if not neuer_vertrag["gueltig_von"]:
+            return _fehlerseite(
+                session, "Vertragsanlage",
+                "Vertragsbeginn fehlt - bitte im erkannten PDF-Vorschlag prüfen oder von Hand ergänzen "
+                "(wird nie automatisch auf das heutige Datum gesetzt).",
+                "/backoffice/vertraege/neu",
+            )
         require_gesellschaft_access(ctx, neuer_vertrag["gesellschaft_id"])
         einheit = deps._stammdaten_repo.get_einheit(neuer_vertrag["einheit_id"])
         if einheit is None:
@@ -684,6 +748,18 @@ async def vertragsanlage_vorschau(request: Request, session=Depends(_current_ses
             komponenten = _vertragsanlage_komponenten_werte_aus_form(form, vertrag_id=vertrag_id, gueltig_von=neuer_vertrag["gueltig_von"])
         except ValueError as exc:
             return _fehlerseite(session, "Vertragsanlage", str(exc), "/backoffice/vertraege/neu")
+
+        # Abnahme-Folgefix: "Mitmieter atomar im selben bestätigten
+        # Intake" - ein optional mitgeschickter Mitmieter-Name wird in
+        # GENAU DIESEM Paket (siehe `paket_bau.py::baue_paket_json`)
+        # mitgeschrieben, NICHT über einen separaten Folge-POST.
+        mitmieter_name = str(form.get("mitmieter_name", "")).strip()
+        if mitmieter_name:
+            mitmieter = {
+                "name": mitmieter_name,
+                "email": str(form.get("mitmieter_email", "")).strip() or None,
+                "telefon": str(form.get("mitmieter_telefon", "")).strip() or None,
+            }
         zurueck_href = "/backoffice/vertraege/neu"
     else:
         vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
@@ -709,7 +785,7 @@ async def vertragsanlage_vorschau(request: Request, session=Depends(_current_ses
     paket_json = _vertragsanlage_baue_paket_json(
         quelle=f"backoffice-vertragsanlage:{session.user_id}", vertrag_id=vertrag_id, neuer_vertrag=neuer_vertrag,
         profil_werte=profil_werte, kaution_werte=kaution_werte, quelle_typ=quelle_typ, quelle_referenz=quelle_referenz,
-        neuer_debitor=neuer_debitor, komponenten=komponenten,
+        neuer_debitor=neuer_debitor, komponenten=komponenten, mitmieter=mitmieter,
     )
     try:
         paket = _intake_parse_json_paket(paket_json)
@@ -824,6 +900,7 @@ async def vertragsanlage_uebernehmen(request: Request, session=Depends(_current_
                 "anzahl_vertraege": ergebnis.anzahl_vertraege,
                 "anzahl_mietvertragsprofile": ergebnis.anzahl_mietvertragsprofile,
                 "anzahl_kautionen": ergebnis.anzahl_kautionen,
+                "anzahl_mitmieter": ergebnis.anzahl_mitmieter,
             },
         )
     except (MietinkassoError, ValueError) as exc:

@@ -217,11 +217,14 @@ def test_mietbestandteile_werden_getrennt_extrahiert():
     ])
     ergebnis = extrahiere(pdf, max_seiten=10)
     vorschlaege = vorschlaege_aus_extraktion(ergebnis)
-    assert vorschlaege["hauptmietzins_cent"].formularwert == "500,00"
-    assert vorschlaege["betriebskosten_cent"].formularwert == "80,00"
-    assert vorschlaege["heizkosten_cent"].formularwert == "40,00"
-    assert vorschlaege["kueche_cent"].formularwert == "30,00"
-    assert vorschlaege["parkplatz_cent"].formularwert == "50,00"
+    # Abnahme-Folgefix: die Brutto-Vorschläge mappen jetzt DIREKT auf die
+    # tatsächlich im Review gerenderten `komponente_*`-Felder statt auf
+    # tote, nirgends gerenderte Formularnamen.
+    assert vorschlaege["komponente_hmz"].formularwert == "500,00"
+    assert vorschlaege["komponente_bk"].formularwert == "80,00"
+    assert vorschlaege["komponente_hk"].formularwert == "40,00"
+    assert vorschlaege["komponente_kueche"].formularwert == "30,00"
+    assert vorschlaege["komponente_parkplatz"].formularwert == "50,00"
 
 
 def test_mietende_wird_extrahiert():

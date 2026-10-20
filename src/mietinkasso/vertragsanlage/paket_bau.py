@@ -56,6 +56,7 @@ def baue_paket_json(
     quelle_referenz: str | None,
     neuer_debitor: dict | None = None,
     komponenten: list[dict] | None = None,
+    mitmieter: dict | None = None,
 ) -> str:
     paket: dict = {"quelle": quelle}
 
@@ -107,6 +108,15 @@ def baue_paket_json(
             for k in komponenten
         ]
 
+    if mitmieter is not None:
+        # Abnahme-Folgefix: Mitmieter ATOMAR im selben Paket wie der neue
+        # Vertrag - keine zweite, nachträgliche Schreibstrecke.
+        paket["mitmieter"] = [{
+            "vertrag_id": vertrag_id, "name": mitmieter["name"],
+            "email": mitmieter.get("email"), "telefon": mitmieter.get("telefon"),
+            "adresse": mitmieter.get("adresse"),
+        }]
+
     return json.dumps(paket, ensure_ascii=False)
 
 
@@ -145,12 +155,14 @@ def pruefe_schmale_form(paket, *, erwarteter_vertrag_id: str) -> None:
         raise PaketFormUngueltigError("Paket enthält mehr als einen Vertrag/ein Mietvertragsprofil/eine Kaution.")
     if len(paket.debitoren) > 1:
         raise PaketFormUngueltigError("Paket enthält mehr als einen neuen Debitor.")
+    if len(paket.mitmieter) > 1:
+        raise PaketFormUngueltigError("Paket enthält mehr als einen Mitmieter.")
     for vertrag_zeile in paket.vertraege:
         if vertrag_zeile.id != erwarteter_vertrag_id:
             raise PaketFormUngueltigError(
                 f"Paket referenziert einen anderen Vertrag ('{vertrag_zeile.id}') als erwartet ('{erwarteter_vertrag_id}')."
             )
-    for zeile in (*paket.mietvertragsprofile, *paket.kautionen, *paket.komponenten):
+    for zeile in (*paket.mietvertragsprofile, *paket.kautionen, *paket.komponenten, *paket.mitmieter):
         if zeile.vertrag_id != erwarteter_vertrag_id:
             raise PaketFormUngueltigError(
                 f"Paket referenziert einen anderen Vertrag ('{zeile.vertrag_id}') als erwartet ('{erwarteter_vertrag_id}')."

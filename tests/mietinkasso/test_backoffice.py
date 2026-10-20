@@ -137,6 +137,37 @@ def _csrf_token(client) -> str:
     return seite.text[start:ende]
 
 
+def _eingabewert(html: str, feld: str) -> str:
+    """Liest den aktuell im gerenderten Formular sichtbaren Standardwert
+    eines `<input name="feld" ... value="...">` - für Tests, die (wie
+    eine unabhängige HTTP-Praxisprüfung) NUR die bereits vom Server
+    vorbefüllten Standardwerte übernehmen, statt PDF-erkannte Werte
+    selbst per Hand einzutippen."""
+
+    import html as _html
+
+    m = re.search(rf'name="{re.escape(feld)}"[^>]*\svalue="([^"]*)"', html)
+    return _html.unescape(m.group(1)) if m else ""
+
+
+def _auswahlwert(html: str, feld: str) -> str:
+    """Wie `_eingabewert`, aber für ein `<select name="feld">` - liefert
+    den Wert der als `selected` markierten `<option>` (oder, falls keine
+    markiert ist, den der ERSTEN Option - genau das Verhalten eines
+    Browsers, der ein unverändertes `<select>` abschickt)."""
+
+    import html as _html
+
+    block = re.search(rf'<select name="{re.escape(feld)}">(.*?)</select>', html, re.DOTALL)
+    if not block:
+        return ""
+    gewaehlt = re.search(r'<option value="([^"]*)"[^>]*\sselected', block.group(1))
+    if gewaehlt:
+        return _html.unescape(gewaehlt.group(1))
+    erste = re.search(r'<option value="([^"]*)"', block.group(1))
+    return _html.unescape(erste.group(1)) if erste else ""
+
+
 def test_ready_endpunkt_ist_offen_und_liest_db(backoffice_client):
     """`/ready` (Paket A) ist wie `/health` ohne Auth erreichbar, prüft
     aber tatsächlich lesend die DB - keine Kontodaten in der Antwort."""
@@ -2940,12 +2971,192 @@ def test_neue_vertragsdatenbasis_felder_im_formular_und_der_akte_bedienbar_und_p
         assert erwartet in detail_nach_nachtrag.text
 
 
-def test_mitmieter_hinweis_aus_pdf_erscheint_im_review_ohne_automatische_anlage(backoffice_client):
+def test_pdf_zuerst_minimalstrecke_end_to_end_nur_sichtbare_defaults_uebernommen(backoffice_client):
+    """Abnahme-Folgefix (Codex, unabhängige Nachprüfung): der 'echte
+    PDF-zuerst-Weg' muss tatsächlich funktionieren - Einheit/Gesellschaft
+    wählen, PDF hochladen, ALLE technischen IDs werden intern generiert,
+    der erkannte Mietbeginn erscheint editierbar im Review (NIE das
+    heutige Datum). Diese Ergebnisprüfung tippt KEINEN PDF-erkannten Wert
+    selbst ein - sie übernimmt ausschließlich die vom Server bereits
+    GERENDERTEN Standardwerte (`_eingabewert`/`_auswahlwert`) und prüft
+    danach die TATSÄCHLICH gespeicherten Daten, mirror der vom
+    Auftraggeber beschriebenen unabhängigen HTTP-Praxisprüfung."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.repository import VertragMitmieterRepository
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    from tests.mietinkasso._pdf_test_helpers import build_text_pdf
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    pdf = build_text_pdf([
+        "Wohnungsmietvertrag",
+        "Mieter: Erika Musterfrau",
+        "E-Mail Mieter: erika@example.at",
+        "Telefon Mieter: 0664 1111111",
+        "Mitmieter: Alex Beispiel Tel: 0664 2222222",
+        "Unterzeichnet am 01.06.2026",
+        "Mietbeginn: 01.12.2026",
+        "Kaution: 3.000,00 EUR",
+        "Die Kaution ist vereinbart, ein Zahlungseingang ist hier nicht belegt.",
+        "Hauptmietzins (netto): 1.200,00 EUR zzgl. 20 % USt",
+        "Betriebskosten (netto): 150,00 EUR zzgl. 20 % USt",
+        "Parkplatz (netto): 80,00 EUR zzgl. 20 % USt",
+        "Verzugszinsen in Höhe von 8 % p.a.",
+        "Mahngebühr: 20,00 EUR",
+        "MRG-Teilanwendung, freie Mietzinsbildung vereinbart.",
+        "Die Schwankung des Index um mehr als 3 % löst die Anpassung aus.",
+        "Anpassung erfolgt jeweils im Jänner, Mindestabstand 12 Monate.",
+        "VPI 2020 Basismonat Dezember 2026 Basiswert 130,5",
+    ])
+
+    # Schritt 1: NUR Einheit + Gesellschaft + Rechtsordnung - KEINE
+    # Vertrag-ID, KEIN Debitor, KEIN Vertragsbeginn.
+    hochgeladen = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "NEU", "csrf_token": csrf,
+            "einheit_id": "601-KURZ1", "gesellschaft_id": "7DI", "rechtsordnung": "OESTERREICH_MRG_TEIL",
+        },
+        files={"pdf_datei": ("vertrag.pdf", pdf, "application/pdf")},
+    )
+    assert hochgeladen.status_code == 200
+    text = hochgeladen.text
+    assert "2026-12-01" in text  # Mietbeginn-Vorschlag, NICHT das heutige Datum
+    assert _eingabewert(text, "gueltig_von") == "2026-12-01"
+    assert _eingabewert(text, "neuer_debitor_name") == "Erika Musterfrau"
+    assert _eingabewert(text, "neuer_debitor_email") == "erika@example.at"
+    assert "1111111" in _eingabewert(text, "neuer_debitor_telefon")
+    assert _eingabewert(text, "mitmieter_name") == "Alex Beispiel"
+    assert "2222222" in _eingabewert(text, "mitmieter_telefon")
+    assert _eingabewert(text, "komponente_hmz_netto") == "1.200,00"
+    assert _auswahlwert(text, "komponente_hmz_ust") == "20"
+    assert _eingabewert(text, "komponente_bk_netto") == "150,00"
+    assert _eingabewert(text, "komponente_parkplatz_netto") == "80,00"
+    assert _eingabewert(text, "vertragliche_kaution_cent") == "3.000,00"
+    assert _eingabewert(text, "mahngebuehr_cent") == "20,00"
+    assert _eingabewert(text, "verzugszins_satz_prozent") == "8"
+    assert _auswahlwert(text, "verzugszins_art") == "VERTRAGLICH_VEREINBART"
+    assert _auswahlwert(text, "rechtsachse_mrg_anwendungsbereich") == "TEIL"
+    assert _auswahlwert(text, "rechtsachse_mietzinsbildung") == "FREI"
+    assert _auswahlwert(text, "index_schwelle_inklusive") == "0"
+    assert _eingabewert(text, "index_anpassungsmonat") == "1"
+    assert _eingabewert(text, "index_mindestintervall_monate") == "12"
+    assert _eingabewert(text, "index_urspruenglicher_basiswert") == "130,5"
+
+    marker = 'name="csrf_token" value="'
+    start = text.index(marker) + len(marker)
+    ende = text.index('"', start)
+    form_csrf = text[start:ende]
+
+    # Schritt 2: die im Review-Formular GENANNTEN Felder werden
+    # ausschließlich mit ihrem bereits gerenderten Standardwert erneut
+    # abgeschickt - KEIN hier manuell nachgetragener PDF-Wert.
+    namensfelder = (
+        "modus", "vertrag_id", "quelle_typ", "quelle_referenz", "einheit_id", "debitor_id",
+        "gesellschaft_id", "rechtsordnung", "neuer_debitor_id",
+        "gueltig_von", "gueltig_bis", "neuer_debitor_name", "neuer_debitor_email", "neuer_debitor_telefon",
+        "neuer_debitor_adresse", "mitmieter_name", "mitmieter_email", "mitmieter_telefon",
+        "komponente_hmz", "komponente_hmz_netto",
+        "komponente_bk", "komponente_bk_netto",
+        "komponente_hk", "komponente_hk_netto",
+        "komponente_kueche", "komponente_kueche_netto",
+        "komponente_parkplatz", "komponente_parkplatz_netto",
+        "vertragliche_kaution_cent", "mahngebuehr_cent", "verzugszins_satz_prozent",
+        "index_urspruenglicher_basiswert", "index_urspruenglicher_basismonat", "index_schwelle_prozent",
+        "index_anpassungsmonat", "index_mindestintervall_monate", "index_reihe",
+    )
+    auswahlfelder = (
+        "nutzungsart", "verzugszins_art", "rechtsachse_mrg_anwendungsbereich", "rechtsachse_mietzinsbildung",
+        "index_schwelle_inklusive", "befristungsstatus", "bk_hk_abrechnungsart",
+        "verbraucher_unternehmer_status_mieter", "verbraucher_unternehmer_status_vermieter",
+        "komponente_hmz_ust", "komponente_bk_ust", "komponente_hk_ust",
+        "komponente_kueche_ust", "komponente_parkplatz_ust",
+    )
+    formular = {"csrf_token": form_csrf}
+    for feld in namensfelder:
+        formular[feld] = _eingabewert(text, feld)
+    for feld in auswahlfelder:
+        formular[feld] = _auswahlwert(text, feld)
+    vertrag_id = formular["vertrag_id"]
+    neuer_debitor_id = formular["neuer_debitor_id"]
+    assert vertrag_id and vertrag_id.startswith("V-")  # technische ID, nicht händisch vergeben
+    assert neuer_debitor_id and neuer_debitor_id.startswith("DEB-")
+
+    vorschau = client.post("/backoffice/vertragsanlage/vorschau", data=formular)
+    assert vorschau.status_code == 200
+    assert "Jetzt übernehmen" in vorschau.text
+
+    paket_marker = 'name="paket_json" hidden>'
+    p_start = vorschau.text.index(paket_marker) + len(paket_marker)
+    p_ende = vorschau.text.index("</textarea>", p_start)
+    import html as _html
+    paket_json_roh = _html.unescape(vorschau.text[p_start:p_ende])
+    paket = json.loads(paket_json_roh)
+    assert paket["mitmieter"][0]["name"] == "Alex Beispiel"
+
+    uebernommen = client.post(
+        "/backoffice/vertragsanlage/uebernehmen",
+        data={"csrf_token": form_csrf, "paket_json": paket_json_roh},
+        follow_redirects=False,
+    )
+    assert uebernommen.status_code == 303
+    assert uebernommen.headers["location"] == f"/backoffice/vertrag/{vertrag_id}"
+
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    vertrag = stammdaten.get_vertrag(vertrag_id)
+    assert vertrag is not None
+    assert vertrag.gueltig_von.isoformat() == "2026-12-01"  # NICHT das heutige Datum
+
+    debitor = stammdaten.get_debitor(neuer_debitor_id)
+    assert debitor is not None
+    assert debitor.name == "Erika Musterfrau"
+    assert debitor.email == "erika@example.at"
+    assert "1111111" in (debitor.telefon or "")
+
+    mitmieter_repo = VertragMitmieterRepository(build_session_factory(get_settings().database_url))
+    mitmieter_liste = mitmieter_repo.list_aktiv(vertrag_id)
+    assert len(mitmieter_liste) == 1
+    assert mitmieter_liste[0].name == "Alex Beispiel"
+    assert "2222222" in (mitmieter_liste[0].telefon or "")
+    assert mitmieter_liste[0].rolle == "MITMIETER"
+
+    komponenten = stammdaten.list_aktive_komponenten(vertrag_id, date(2026, 12, 1))
+    betraege = {k.art: k.betrag_cent for k in komponenten}
+    assert betraege["HMZ"] == 144000
+    assert betraege["BK_VORAUSZAHLUNG"] == 18000
+    assert betraege["PARKPLATZ"] == 9600
+    assert betraege["HMZ"] + betraege["BK_VORAUSZAHLUNG"] + betraege["PARKPLATZ"] == 171600
+
+    profil = stammdaten.neuestes_mietvertragsprofil(vertrag_id)
+    assert profil is not None
+    assert profil.vertragliche_kaution_cent == 300000
+    assert profil.mahngebuehr_cent == 2000
+    assert profil.verzugszins_art == "VERTRAGLICH_VEREINBART"
+    assert profil.rechtsachse_mrg_anwendungsbereich == "TEIL"
+    assert profil.rechtsachse_mietzinsbildung == "FREI"
+    assert profil.index_schwelle_inklusive is False
+    assert profil.index_anpassungsmonat == 1
+    assert profil.index_mindestintervall_monate == 12
+
+    # Kaution-VEREINBARUNG (oben) ist strikt getrennt vom tatsächlichen
+    # Zahlungseingang - KEIN fingierter Eingang wurde gebucht.
+    assert stammdaten.get_kaution(vertrag_id) is None
+
+
+def test_mitmieter_hinweis_aus_pdf_erscheint_als_editierbarer_vorschlag(backoffice_client):
     """Auftrag HV-20261020-VERTRAGSDATENBASIS: "Kontakt-/Parteiextraktion
-    mit richtiger Zuordnung" ist bedienbar - ein im PDF gefundener
-    Mitmieter wird als geprüfter Hinweis im Review angezeigt, aber NIE
-    automatisch als Partei angelegt (das bleibt der manuellen Erfassung
-    über "Partei hinzufügen" vorbehalten)."""
+    mit richtiger Zuordnung" ist bedienbar. Abnahme-Folgefix: ein im PDF
+    gefundener Mitmieter ist jetzt ein EDITIERBARER Formularvorschlag
+    (`mitmieter_name` u. a.), der ATOMAR im selben bestätigten Intake wie
+    der neue Vertrag übernommen wird (siehe End-to-End-Test oben) - NICHT
+    mehr nur ein reiner Hinweistext, der eine separate, nachträgliche
+    "Partei hinzufügen"-Erfassung verlangt. Der bestehende Hauptmieter-
+    Vergleichshinweis (bei einem bereits ausgewählten Debitor) bleibt
+    davon unberührt zusätzlich sichtbar."""
 
     from tests.mietinkasso._pdf_test_helpers import build_text_pdf
 
@@ -2964,9 +3175,8 @@ def test_mitmieter_hinweis_aus_pdf_erscheint_im_review_ohne_automatische_anlage(
         files={"pdf_datei": ("vertrag.pdf", pdf, "application/pdf")},
     )
     assert hochgeladen.status_code == 200
-    assert "Erika Musterfrau" in hochgeladen.text
-    assert "Partei hinzufügen" in hochgeladen.text
-    assert 'name="mitmieter_name"' not in hochgeladen.text  # kein eigenes übernehmbares Formularfeld
+    assert _eingabewert(hochgeladen.text, "mitmieter_name") == "Erika Musterfrau"
+    assert "1234567" in _eingabewert(hochgeladen.text, "mitmieter_telefon")
 
 
 def test_zentrale_uebersicht_objekt_und_mieterfilter_wirken(backoffice_client):
@@ -3109,10 +3319,13 @@ def test_pdf_erster_ablauf_liest_mieterkontakte_und_indexbasis_editierbar_aus_un
     5) Vermieterkontakte werden NIE in ein editierbares/übernehmbares
        Feld übernommen.
 
-    Zusätzlich: Mitmieter-Kontakt (Name/Telefon/E-Mail) bleibt reiner
-    Hinweis für die spätere manuelle "Partei hinzufügen"-Erfassung, wird
-    NICHT automatisch als Partei angelegt. Bestehende Verträge/OP
-    bleiben unberührt (reiner Stammdaten-Vorgang, keine Buchung)."""
+    Zusätzlich: Mitmieter-Kontakt (Name/Telefon/E-Mail) erscheint als
+    editierbarer Formularvorschlag (Abnahme-Folgefix: ATOMAR im selben
+    Intake übernehmbar, siehe eigener End-to-End-Test) - hier bewusst
+    NICHT mit übernommen (kein `mitmieter_name` im Vorschau-POST unten),
+    um weiterhin NUR den bereits etablierten, engen Umfang dieses Tests
+    zu prüfen. Bestehende Verträge/OP bleiben unberührt (reiner
+    Stammdaten-Vorgang, keine Buchung)."""
 
     from tests.mietinkasso._pdf_test_helpers import build_text_pdf
     from mietinkasso.infrastructure.config import get_settings
@@ -3169,10 +3382,11 @@ def test_pdf_erster_ablauf_liest_mieterkontakte_und_indexbasis_editierbar_aus_un
     # (3) Index-Basismonat/-Basiswert extrahiert.
     assert 'name="index_urspruenglicher_basismonat" value="2026-12"' in hochgeladen.text
     assert "130,5" in hochgeladen.text
-    # Mitmieter bleibt reiner Hinweis, kein übernehmbares Profilfeld.
+    # Mitmieter ist jetzt ein editierbarer, aus dem PDF vorbefüllter
+    # Formularvorschlag (Abnahme-Folgefix) - dieser Test übernimmt ihn
+    # unten bewusst NICHT (kein `mitmieter_name` im Vorschau-POST).
     assert "Alex Beispiel" in hochgeladen.text
-    assert "Partei hinzufügen" in hochgeladen.text
-    assert 'name="mitmieter_name"' not in hochgeladen.text
+    assert _eingabewert(hochgeladen.text, "mitmieter_name") == "Alex Beispiel"
 
     marker = 'name="csrf_token" value="'
     start = hochgeladen.text.index(marker) + len(marker)

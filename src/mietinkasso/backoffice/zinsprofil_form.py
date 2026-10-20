@@ -7,9 +7,37 @@ from datetime import date
 from html import escape as h
 
 from mietinkasso.backoffice.views import csrf_feld, eur, parse_eur_betrag
+from mietinkasso.domain.money import cents_to_decimal
 
 
-def zinsprofil_formular(vertrag, profile, csrf):
+def _eur_ohne_symbol(cent: int) -> str:
+    """Wie `views.eur()`, aber OHNE " €"-Suffix - für die Formular-
+    Vorbefüllung, damit ein unverändert abgeschicktes Feld wieder
+    `parse_eur_betrag()`-kompatibel ist (das lehnt ein Suffix als
+    mehrdeutig ab) - identische Logik wie `vertragsanlage_form.py::
+    _eur_ohne_symbol`, hier dupliziert statt eines Imports zwischen zwei
+    unabhängigen Renderer-Modulen (siehe Moduldoc dieser Datei)."""
+
+    return f"{cents_to_decimal(cent):,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
+
+
+def zinsprofil_formular(vertrag, profile, csrf, mietprofil=None):
+    # Abnahme-Folgefix (Codex, "Zinsprofil-Form noch gar keine
+    # Quellwerte"): reine Formular-Vorbefüllung aus den ausdrücklich
+    # unverbindlichen Mietvertragsprofil-Staging-Feldern - JEDES Feld
+    # bleibt frei änderbar, Prüf-/Freigabe-Checkboxen werden NIE
+    # vorangehakt (menschliche Prüfung bleibt zwingend).
+    vorbefuellt_vertragsdatum = (
+        mietprofil.unterzeichnungsdatum.isoformat() if mietprofil and mietprofil.unterzeichnungsdatum else ""
+    )
+    vorbefuellt_zinssatz = ""
+    if mietprofil and mietprofil.verzugszins_art == "VERTRAGLICH_VEREINBART" and mietprofil.verzugszins_satz_prozent is not None:
+        vorbefuellt_zinssatz = h(str(mietprofil.verzugszins_satz_prozent))
+    vorbefuellt_zins_beleg = h(str(mietprofil.verzugszins_klauseltext_auszug or "")) if mietprofil else ""
+    vorbefuellt_mahnpauschale = (
+        _eur_ohne_symbol(mietprofil.mahngebuehr_cent) if mietprofil and mietprofil.mahngebuehr_cent else ""
+    )
+    vorbefuellt_mahnpauschale_beleg = h(str(mietprofil.mahngebuehr_quellenbeleg or "")) if mietprofil else ""
     historien = []
     for p in profile:
         aktion = ""
@@ -67,7 +95,7 @@ def zinsprofil_formular(vertrag, profile, csrf):
       <fieldset><legend>Vertragseinordnung</legend>
         <label><input type="checkbox" name="ist_b2b" value="1"> Beiderseits unternehmensbezogenes Geschäft (B2B)</label>
         <label>Vertragsdatum (für §456/§458 UGB-Stichtag 16.03.2013 nötig)</label>
-        <input type="date" name="vertragsdatum">
+        <input type="date" name="vertragsdatum" value="{vorbefuellt_vertragsdatum}">
         <label>Gültig ab (Wirksamkeitsdatum DIESER Version, belegt)</label>
         <input type="date" name="gueltig_ab">
         <p class="muted">Nötig, sobald für diesen Vertrag mehrmals ein geprüftes Profil angelegt wird - fehlt es bei
@@ -75,10 +103,11 @@ def zinsprofil_formular(vertrag, profile, csrf):
            rückwirkend die zuletzt geprüfte Version zu unterstellen.</p>
       </fieldset>
       <fieldset><legend>Vereinbarter Zinssatz (nur nach Prüfung wirksam)</legend>
-        <label>Vereinbarter Zinssatz in Prozent p.a.</label><input name="vereinbarter_zinssatz_prozent" placeholder="z. B. 5,0">
+        <label>Vereinbarter Zinssatz in Prozent p.a.</label>
+        <input name="vereinbarter_zinssatz_prozent" value="{vorbefuellt_zinssatz}" placeholder="z. B. 5,0">
         <label><input type="checkbox" name="vereinbarung_geprueft" value="1">
           Wirksamkeit der Klausel wurde menschlich geprüft (KSchG §6 Abs 1 Z 13/OGH 7Ob111/25m)</label>
-        <label>Beleg/Fundstelle der Vereinbarung</label><textarea name="vereinbarung_beleg" rows="3"></textarea>
+        <label>Beleg/Fundstelle der Vereinbarung</label><textarea name="vereinbarung_beleg" rows="3">{vorbefuellt_zins_beleg}</textarea>
       </fieldset>
       <fieldset><legend>Verzugsverantwortung (§456 UGB - erhöhter Zinssatz)</legend>
         <label><input type="checkbox" name="verzugsverantwortung_geprueft" value="1">
@@ -109,9 +138,9 @@ def zinsprofil_formular(vertrag, profile, csrf):
           Dieser Betrag ist als grundsätzlich plausibler Ausgangspunkt für eine künftige Einzelfallfreigabe
           markiert (bindet NICHTS automatisch)</label>
         <label>Vorschlagsbetrag je Mahnschreiben in EUR (unverbindlich)</label>
-        <input name="mahnpauschale_kostenbasis_cent" placeholder="z. B. 20,00 - reiner Vorschlagswert, keine Buchungsgrundlage">
+        <input name="mahnpauschale_kostenbasis_cent" value="{vorbefuellt_mahnpauschale}" placeholder="z. B. 20,00 - reiner Vorschlagswert, keine Buchungsgrundlage">
         <label>Beleg/Begründung (Vertragsklausel, typischer Aufwand)</label>
-        <textarea name="mahnpauschale_kostenbasis_beleg" rows="3"></textarea>
+        <textarea name="mahnpauschale_kostenbasis_beleg" rows="3">{vorbefuellt_mahnpauschale_beleg}</textarea>
         <p class="muted"><strong>Dieser Vorschlagswert löst KEINE Buchung aus.</strong> Eine Mahnkostenpauschale
            wird ausschließlich über eine dokumentierte EINZELFALL-Freigabe JE KONKRETER Forderungsgruppe gebucht
            (Erforderlichkeit, tatsächlicher Aufwand, Schuldhaftigkeit DIESES Rückstands, Verhältnismäßigkeit zur
