@@ -115,12 +115,17 @@ _BETRAG_SPALTE_BREITE = 32.0
 _REST_SPALTE_BREITE = 28.0
 _LOGO_BREITE = 32.0
 _LOGO_Y = 10.0
-#: Codex-Abnahme 20.10.2026, P4: großzügig reservierte Mindesthöhe für
-#: eine bis zu 32-mm-breite Wortbildmarke (dieselbe Breite wie in
-#: `brief_pdf.py`, kein neues/anderes Logo) - der Kopf ist zusätzlich
-#: dynamisch so hoch wie der TATSÄCHLICH umgebrochene Titeltext, je
-#: nachdem, was größer ist.
-_LOGO_HOEHE_RESERVIERT = 22.0
+#: Codex-Abnahme 20.10.2026, P4, korrigiert nach unabhängiger Prüfung
+#: gegen eine echte geschützte Kopie: das tatsächliche Produktionslogo
+#: ist QUADRATISCH (32-mm-Breite => 32-mm-Höhe) - der ursprüngliche
+#: Wert von 22.0 reichte dafür NICHT (Trennlinie/erster Betrag liefen
+#: auf Folgeseiten durch das Logo). Jetzt 32 mm + 2 mm Marge als
+#: Mindesthöhe/Fallback; `header()` verwendet zusätzlich bevorzugt die
+#: TATSÄCHLICH gerenderte Höhe aus der `ImageInfo` von `image()`, falls
+#: ein künftiges Logo ein anderes Seitenverhältnis hat. Der Kopf ist
+#: zusätzlich dynamisch so hoch wie der TATSÄCHLICH umgebrochene
+#: Titeltext, je nachdem, was größer ist.
+_LOGO_HOEHE_RESERVIERT = 34.0
 
 
 def _eur(cent: int) -> str:
@@ -149,15 +154,32 @@ class _KontoauszugPDF(FPDF):
         # dem jeweils höheren von Logo und (ggf. mehrzeiligem) Titel, auf
         # JEDER Seite gleich (kein Logo-/Farbimprovisation, dieselbe
         # Breite/Position wie bisher).
+        #
+        # Korrektur nach unabhängiger Prüfung gegen eine echte
+        # geschützte Kopie: das Produktionslogo ist QUADRATISCH (32 mm
+        # Breite => 32 mm Höhe) - der frühere Fallback-Wert (22 mm) war
+        # dafür zu niedrig, wodurch auf Folgeseiten die Trennlinie/der
+        # erste Betrag durch das Logo liefen. `image()` liefert in
+        # `rendered_height` die TATSÄCHLICHE gerenderte Höhe (bereits in
+        # mm, da `unit="mm"`) - diese wird bevorzugt verwendet (robust
+        # auch gegen ein künftiges Logo mit anderem Seitenverhältnis),
+        # mit `_LOGO_HOEHE_RESERVIERT` (32 mm + 2 mm Marge) als
+        # garantierte Mindesthöhe.
+        logo_hoehe_tatsaechlich: float | None = None
         if self.absender.logo_pfad and Path(self.absender.logo_pfad).is_file():
-            self.image(self.absender.logo_pfad, x=_INHALT_RECHTS - _LOGO_BREITE, y=_LOGO_Y, w=_LOGO_BREITE)
+            bild_info = self.image(self.absender.logo_pfad, x=_INHALT_RECHTS - _LOGO_BREITE, y=_LOGO_Y, w=_LOGO_BREITE)
+            logo_hoehe_tatsaechlich = getattr(bild_info, "rendered_height", None)
+        if logo_hoehe_tatsaechlich:
+            logo_reserviert = max(logo_hoehe_tatsaechlich + 2.0, _LOGO_HOEHE_RESERVIERT)
+        else:
+            logo_reserviert = _LOGO_HOEHE_RESERVIERT
         self.set_font(self.fett_familie, "B", 13)
         self.set_text_color(*self.farbe_anthrazit)
         titel_breite = _INHALT_RECHTS - _RAND - _LOGO_BREITE - 4
         titel_hoehe = self.multi_cell(titel_breite, 6, self.titel_zeile, align="L", dry_run=True, output=MethodReturnValue.HEIGHT)
         self.set_xy(_RAND, _LOGO_Y)
         self.multi_cell(titel_breite, 6, self.titel_zeile, align="L")
-        linie_y = max(_LOGO_Y + _LOGO_HOEHE_RESERVIERT, _LOGO_Y + titel_hoehe + 2)
+        linie_y = max(_LOGO_Y + logo_reserviert, _LOGO_Y + titel_hoehe + 2)
         self.set_draw_color(*self.farbe_gold)
         self.line(_RAND, linie_y, _INHALT_RECHTS, linie_y)
         self.set_y(linie_y + 6)

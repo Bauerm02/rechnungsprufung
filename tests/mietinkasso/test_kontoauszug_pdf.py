@@ -417,3 +417,68 @@ def test_pdf_kopf_bricht_lange_firmen_objekt_einheit_bezeichnung_um_ohne_ueberla
     gesamter_text = "".join(p.extract_text() for p in reader.pages)
     assert "Ein außergewöhnlich lang ausgeschriebenes Objekt mit vielen zusätzlichen Worten" in gesamter_text.replace("\n", " ")
     assert "1.000,00 EUR" in gesamter_text  # Betrag bleibt trotz langer Kopfzeile lesbar/vollständig
+
+
+def test_pdf_kopf_reserviert_genug_hoehe_fuer_quadratisches_produktionslogo(tmp_path):
+    """Letzter visueller P4-Befund aus einer echten geschützten Kopie: das
+    TATSÄCHLICHE Produktionslogo ist QUADRATISCH (32-mm-Breite => 32-mm-
+    Höhe), nicht ein flaches Wortbild wie zuvor angenommen. Der frühere
+    Fallback-Wert (22 mm) reichte dafür NICHT - auf Folgeseiten liefen
+    Trennlinie und der erste rechte Betrag/Rest durch das Logo. Geprüft
+    mit einem ECHTEN quadratischen 32×32-mm-Logo (nicht nur einer
+    falschen 22-mm-Annahme): KEIN Textinhalt darf innerhalb des
+    tatsächlichen Logo-Rechtecks (x- UND y-Bereich) auf einer Folgeseite
+    liegen."""
+
+    from PIL import Image
+
+    logo_pfad = tmp_path / "quadratlogo.png"
+    Image.new("RGB", (300, 300), (10, 10, 10)).save(logo_pfad)
+    absender = _absender(logo_pfad=str(logo_pfad))
+
+    # Genug Zeilen, um sicher auf Seite 2 umzubrechen (Logo erscheint auf
+    # JEDER Seite, der Bug betrifft also jede Folgeseite gleichermaßen).
+    # `rest_cent` bewusst gesetzt (nicht `None`): die dadurch gefüllte
+    # "Offener Rest"-Spalte liegt vollständig innerhalb der x-Spanne des
+    # Logos (siehe `logo_x_links` unten) - genau DAS war der konkret
+    # gemeldete Befund ("der erste Zahlungsbetrag rechts unter dem
+    # Logo").
+    viele_zeilen = [
+        KontoblattZeile(position=_op(i, "SOLL", 1000 * i, referenz=f"Position {i:03d}"), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=1000 * i)
+        for i in range(1, 60)
+    ]
+    gesamtsumme = sum(z.position.betrag_cent for z in viele_zeilen)
+    kontoblatt = _leeres_kontoblatt(
+        hauptforderung_zeilen=viele_zeilen, hauptforderung_cent=gesamtsumme,
+        saldo_cent=gesamtsumme, faelliger_unstrittiger_rest_cent=gesamtsumme,
+    )
+    pdf_bytes = _erzeugen(kontoblatt, absender=absender)
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    assert len(reader.pages) > 1, "Der Test braucht tatsächlich eine Folgeseite."
+
+    # Geometrie des quadratischen Logos (dieselben Konstanten wie im
+    # Produktionscode, hier bewusst als Erwartungswerte dupliziert, damit
+    # der Test eine ECHTE Regression gegen die tatsächliche Logo-Fläche
+    # prüft, nicht gegen die (zuvor falsche) 22-mm-Annahme selbst).
+    logo_y_oben, logo_breite, logo_hoehe = 10.0, 32.0, 32.0
+    logo_x_links = 210.0 - 20.0 - logo_breite  # _SEITE_BREITE - _RAND - _LOGO_BREITE
+    logo_y_unten = logo_y_oben + logo_hoehe
+
+    pt_je_mm = 72.0 / 25.4
+    for seite in reader.pages[1:]:
+        hoehe_pt = float(seite.mediabox.height)
+        treffer: list[tuple[float, float, str]] = []
+
+        def visitor(text, cm, tm, font_dict, font_size, _treffer=treffer, _hoehe_pt=hoehe_pt):
+            if text.strip():
+                _treffer.append((tm[4] / pt_je_mm, (_hoehe_pt - tm[5]) / pt_je_mm, text))
+
+        seite.extract_text(visitor_text=visitor)
+        assert treffer, "Die Seite ist nicht leer - der Test prüft etwas Echtes."
+        im_logo_bereich = [
+            (x, y, t) for x, y, t in treffer
+            if x + 1.0 >= logo_x_links and y < logo_y_unten  # kleine Toleranz für Textbreite/Rundung
+        ]
+        assert im_logo_bereich == [], (
+            f"Textinhalt überlappt das tatsächliche 32×32-mm-Logo-Rechteck: {im_logo_bereich}"
+        )

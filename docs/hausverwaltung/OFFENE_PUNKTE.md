@@ -5643,6 +5643,27 @@ Verschärfung nötig, da rein lesend.
    ohne nachvollziehbare Zuordnung zu GENAU dieser Forderung. Umbenannt
    in "Zuordnung/Betrag nicht belegt" (HTML und PDF).
 
+### Letzter visueller P4-Befund aus echter geschützter Kopie (PDF-Kopfhöhe)
+
+Das TATSÄCHLICHE Produktionslogo ist QUADRATISCH (32-mm-Breite => 32-mm-
+Höhe), nicht ein flaches Wortbild wie ursprünglich angenommen -
+`_LOGO_HOEHE_RESERVIERT=22.0` reichte dafür nicht: auf Folgeseiten liefen
+Trennlinie und der erste rechte Betrag/Rest durch das Logo. Behoben:
+`_LOGO_HOEHE_RESERVIERT` auf `34.0` (32 mm + 2 mm Marge) angehoben;
+`header()` verwendet zusätzlich bevorzugt die TATSÄCHLICH gerenderte
+Logohöhe aus der von `image()` zurückgegebenen `ImageInfo.
+rendered_height` (robust auch gegen ein künftiges Logo mit anderem
+Seitenverhältnis), mit der 34-mm-Konstante als garantierter Mindesthöhe.
+Neuer Geometrietest `test_pdf_kopf_reserviert_genug_hoehe_fuer_
+quadratisches_produktionslogo` mit einem ECHTEN quadratischen 32×32-mm-
+Logo (per PIL erzeugt) statt der zuvor falschen 22-mm-Annahme - prüft
+auf einer echten Folgeseite, dass kein Textinhalt in das tatsächliche
+Logo-Rechteck (x- und y-Bereich) hineinragt. Gegenprobe durchgeführt:
+mit dem alten, simulierten 22-mm-Fallback schlägt dieser Test
+nachweislich fehl (erkennt die Regression), mit der Korrektur ist er
+grün. 18 Tests in `test_kontoauszug_pdf.py` grün, keine erneute
+Gesamtsuite, keine Geschäftsaktion.
+
 Zusätzlich (optionaler Hinweis aus derselben Prüfung): das PDF-
 Einzugszeichen "↳" (U+21B3) fehlt im Zeichensatz der Fallback-Schrift
 (LiberationSerif, geprüft per `fontTools`) und wurde durch einen
