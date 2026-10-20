@@ -19,14 +19,20 @@ def test_grenzfall_zugang_10_oktober_eskaliert_nicht_am_25_oktober():
     """Wörtliches Beispiel aus dem Auftrag: Zugang 10.10.2026, 14-Tage-
     Frist. Rechnerisches Ende 24.10.2026 (Samstag) -> 25. ist Sonntag ->
     26. ist Nationalfeiertag -> tatsächliches Fristende 27.10.2026. Der
-    Prüflauf am 25.10.2026 darf NICHT eskalieren, der am 27.10.2026 (oder
-    später) schon."""
+    Prüflauf am 25.10.2026 darf NICHT eskalieren.
+
+    **Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026):** §903
+    ABGB lässt die Frist erst mit ABLAUF (Mitternacht) des Fristendetages
+    enden - der 27.10.2026 SELBST gehört noch vollständig zur Frist, ein
+    Prüflauf an diesem Tag darf deshalb ebenfalls NOCH NICHT eskalieren;
+    erst der 28.10.2026 darf es (die vorherige Fassung dieses Tests
+    erwartete fälschlich bereits am 27.10.2026 `True`)."""
 
     zugang = date(2026, 10, 10)
     assert fristende_ab_zugang(zugang, 14) == date(2026, 10, 27)
     assert frist_abgelaufen(zugang_am=zugang, frist_tage=14, heute=date(2026, 10, 25)) is False
     assert frist_abgelaufen(zugang_am=zugang, frist_tage=14, heute=date(2026, 10, 26)) is False
-    assert frist_abgelaufen(zugang_am=zugang, frist_tage=14, heute=date(2026, 10, 27)) is True
+    assert frist_abgelaufen(zugang_am=zugang, frist_tage=14, heute=date(2026, 10, 27)) is False
     assert frist_abgelaufen(zugang_am=zugang, frist_tage=14, heute=date(2026, 10, 28)) is True
 
 

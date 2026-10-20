@@ -154,8 +154,8 @@ class MahnwesenService:
         self._empfaenger_zugang_repository = empfaenger_zugang_repository
 
     def _resolve_kanal(self, stufe: int) -> str:
-        """Liefert den für `stufe` (1 oder 2) tatsächlich zu verwendenden
-        Versandkanal ("EMAIL" | "BRIEF"). Default für BEIDE Stufen bleibt
+        """Liefert den für `stufe` (1-4) tatsächlich zu verwendenden
+        Versandkanal ("EMAIL" | "BRIEF"). Default für ALLE Stufen bleibt
         "EMAIL", solange kein `kanalregel_repository` konfiguriert ist
         ODER keine `MahnKanalregelTable`-Version FREIGEGEBEN ist - das
         erhält 100%ige Rückwärtskompatibilität mit dem bisherigen,
@@ -165,14 +165,29 @@ class MahnwesenService:
         anlegt UND freigibt - ein stillschweigender Default-Wechsel
         würde den heute funktionierenden Stufe-2-E-Mail-Versand
         andernfalls unangekündigt brechen, solange der Briefkanal noch
-        keinen echten Transport hat."""
+        keinen echten Transport hat.
+
+        **Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026):** die
+        vorherige Fassung kannte nur `stufe1_kanal`/`stufe2_kanal` und
+        lieferte für Stufe 3/4 FÄLSCHLICH immer `stufe2_kanal` zurück -
+        die mit Auftrag HV-20261020-VIER-MAHNSTUFEN hinzugefügten Felder
+        `stufe3_kanal`/`stufe4_kanal` (`MahnKanalregelTable`) wurden dabei
+        ignoriert. Eine freigegebene Regel mit z. B.
+        Stufe1=EMAIL/Stufe2=EMAIL/Stufe3=BRIEF/Stufe4=BRIEF sendete Stufe
+        3/4 dadurch weiterhin per E-Mail statt per Brief."""
 
         if self._kanalregel_repository is None:
             return "EMAIL"
         regel = self._kanalregel_repository.aktuelle_freigegebene()
         if regel is None:
             return "EMAIL"
-        return regel.stufe1_kanal if stufe == 1 else regel.stufe2_kanal
+        kanal_je_stufe = {
+            1: regel.stufe1_kanal,
+            2: regel.stufe2_kanal,
+            3: regel.stufe3_kanal,
+            4: regel.stufe4_kanal,
+        }
+        return kanal_je_stufe[stufe]
 
     def _naechste_stufe_fuer_forderung(self, forderung_op_position_id: int, *, policy: MahnPolicyTable) -> MahnStufe | None:
         """Auftrag HV-20261020-VIER-MAHNSTUFEN: verallgemeinert von genau

@@ -46,16 +46,26 @@ sichtbar ist (siehe `_MahnKernErgebnis.hinweis_intern` - NIE Teil des an
 den Mieter gehenden Textes, Auftrag Markus: "dokumentierter
 Prüfhintergrund NICHT in Kundentext").
 
-**Rechtsordnungs-Zuordnung des §30-Abs-2-Z1-MRG-Hinweises (fachliche
-Annahme, VOR Produktivgang durch Codex/Markus zu bestätigen - siehe
-`docs/hausverwaltung/OFFENE_PUNKTE.md`):** `§30 Abs 2 Z1 MRG` (gericht-
-liche Aufkündigung wegen qualifizierten Zahlungsrückstands) wird NUR bei
-`OESTERREICH_MRG_VOLL` genannt - der Kündigungsschutz des § 30 MRG gilt
-im MRG-Teilanwendungsbereich nach § 1 Abs 4 MRG grundsätzlich NICHT. Für
-alle anderen geklärten österreichischen Rechtsordnungen (MRG_TEIL,
-MRG_FREI, GEWERBE, WGG) wird deshalb NUR § 1118 zweiter Fall ABGB
-genannt (die allgemeine vorzeitige Auflösung wegen qualifizierten
-Zahlungsverzugs, unabhängig vom MRG-Anwendungsbereich)."""
+**Rechtsordnungs-Zuordnung des §30-Abs-2-Z1-MRG-Hinweises - KORRIGIERT
+nach unabhängiger Abnahme (Codex, 20.10.2026, Primärquelle RIS §1 MRG):**
+die vorherige Fassung behauptete, der Kündigungsschutz des § 30 MRG gelte
+im MRG-Teilanwendungsbereich NICHT - DAS WAR FALSCH. § 1 Abs 4 MRG
+erklärt für den Teilanwendungsbereich ausdrücklich (unter anderem) die
+§§ 29 bis 36 MRG für anwendbar, damit grundsätzlich AUCH § 30 MRG. Sowohl
+`OESTERREICH_MRG_VOLL` als auch `OESTERREICH_MRG_TEIL` erhalten deshalb
+jetzt BEIDE einen § 30 Abs 2 Z1 MRG-Hinweis - für TEIL zusätzlich
+AUSDRÜCKLICH gehedgt ("soweit... anwendbar ist"), weil § 1 Abs 4 MRG
+mehrere, unterschiedliche Teilanwendungsfälle kennt und ob § 30 MRG
+konkret einschlägig ist, vom jeweiligen Einzelfall abhängt - diese
+Funktion behauptet das deshalb NIE unbedingt. Für `OESTERREICH_GEWERBE`
+(Legacy-Enum) gilt weiterhin NUR § 1118 ABGB, OHNE damit zu behaupten,
+Gewerbenutzung sei automatisch eine MRG-Ausnahme (das ist sie nicht - ob
+das MRG auf ein konkretes Gewerbemietverhältnis voll/teilweise anwendbar
+ist, ist eine vom Legacy-Enum NICHT abgedeckte, separate Frage, siehe
+`hinweis_intern` unten und das künftige Rechtsachsen-Modell, Auftrag
+HV-20261020-VERTRAGSDATENBASIS). KEINE Garantie für Rechtssicherheit im
+Einzelfall - vor Produktivgang durch Codex/Markus fachlich zu bestätigen,
+siehe `docs/hausverwaltung/OFFENE_PUNKTE.md`."""
 
 from __future__ import annotations
 
@@ -85,15 +95,40 @@ _1118_FRIST_HINWEIS = (
 )
 
 #: Nutzervorlage 20.10.2026, Quellen laut Nutzerangabe: RIS 4 Ob 75/21i,
-#: 3 Ob 37/18i - Mitmieter-Zustellungsgrundsatz. Rein deskriptiv, erzeugt
-#: KEINE automatische Mehrfachzustellung (das übernimmt die
-#: Empfänger-/Zugangsnachweis-Verwaltung je Person, siehe
-#: `mahnwesen/repository.py::MahnEmpfaengerRepository`).
-_MITMIETER_HINWEIS = (
-    "Bestehen mehrere Mieter desselben Mietverhältnisses (Mitmieter), ergeht dieses Schreiben "
-    "gegen JEDEN von ihnen gesondert; der Zugang muss für jede Person einzeln nachgewiesen werden "
+#: 3 Ob 37/18i - Mitmieter-Zustellungsgrundsatz.
+#:
+#: **Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026):** dieser
+#: Hinweis ist ein interner Zustellprüf-/Prozesshinweis für das
+#: Backoffice (Auftrag Markus: "allgemeine Zustellprüfhinweise/
+#: Mitmieter-rechtssicherer-Zugang gehören intern, nicht als technischer
+#: Prozesshinweis in Kundentext") - er war bisher FÄLSCHLICH Teil des an
+#: den Mieter gehenden `rechtlicher_kern`-Textes. Er wird jetzt
+#: AUSSCHLIESSLICH über `hinweis_intern` zurückgegeben, NIE mehr in den
+#: Kundentext eingebaut.
+_MITMIETER_HINWEIS_INTERN = (
+    "Bestehen mehrere Mieter desselben Mietverhältnisses (Mitmieter), muss dieses Schreiben gegen "
+    "JEDEN von ihnen gesondert ergehen und der Zugang für jede Person einzeln nachgewiesen werden "
     "(ein gewöhnlicher E-Mail-/SMTP-Versand oder die bloße Brief-Einlieferung bei der Post ist dafür "
-    "NICHT automatisch ein rechtssicherer Zugangsnachweis)."
+    "NICHT automatisch ein rechtssicherer Zugangsnachweis) - NIE Teil des Kundentexts."
+)
+
+#: Legacy-Enum-Hinweis (Korrektur nach unabhängiger Abnahme, Codex
+#: 20.10.2026): `OESTERREICH_GEWERBE` sagt NICHTS darüber aus, ob das MRG
+#: (und damit der Kündigungsschutz der §§ 29-36 MRG) auf dieses
+#: Gewerbemietverhältnis im Voll- oder Teilanwendungsbereich zutrifft -
+#: Gewerbenutzung ist KEINE automatische MRG-Ausnahme (Auftrag Markus,
+#: HV-20261020-VERTRAGSDATENBASIS). Der Stufe-4-Text nennt deshalb bewusst
+#: nur § 1118 ABGB; die tatsächliche MRG-Anwendbarkeit ist erst mit dem
+#: separaten Rechtsachsen-Modell (MRG-Anwendungsbereich getrennt von
+#: Nutzungsart) fachlich zu klären, NIE automatisch aus dem Legacy-Enum
+#: abgeleitet.
+_GEWERBE_LEGACY_HINWEIS_INTERN = (
+    "Legacy-Rechtsordnung GEWERBE sagt NICHTS darüber aus, ob das MRG (und damit der Kündigungsschutz "
+    "der §§ 29-36 MRG) auf dieses Gewerbemietverhältnis im Voll- oder Teilanwendungsbereich zutrifft - "
+    "Gewerbenutzung ist KEINE automatische MRG-Ausnahme. Der Stufe-4-Text nennt deshalb bewusst nur "
+    "§ 1118 ABGB; die tatsächliche MRG-Anwendbarkeit ist fachlich gesondert zu klären (Auftrag "
+    "HV-20261020-VERTRAGSDATENBASIS, Rechtsachsen-Modell), NIE automatisch aus diesem Legacy-Enum "
+    "abgeleitet."
 )
 
 
@@ -115,14 +150,19 @@ class MahnstufeText:
     hinweis_intern: str | None = None
 
 
-#: MRG-Vollanwendungsbereich ist die EINZIGE Rechtsordnung, in der der
-#: § 30 Abs 2 Z1 MRG-Kündigungsschutz greift (siehe Moduldoc) - für ALLE
-#: anderen geklärten österreichischen Rechtsordnungen bleibt NUR § 1118
-#: ABGB zweiter Fall als allgemeine Grundlage.
-_OESTERREICHISCHE_RECHTSORDNUNGEN_MIT_ABGB = frozenset(
+#: Rechtsordnungen, bei denen § 30 Abs 2 Z1 MRG grundsätzlich (bedingt,
+#: siehe Moduldoc) in Betracht kommt - MRG-Vollanwendung UNBEDINGT (das
+#: ganze Hauptstück gilt), MRG-Teilanwendung GEHEDGT (§ 1 Abs 4 MRG
+#: erklärt §§ 29-36 MRG nur "soweit" der jeweilige Teilanwendungsfall das
+#: vorsieht).
+_RECHTSORDNUNGEN_MIT_PARAGRAPH_30 = frozenset(
+    {Rechtsordnung.OESTERREICH_MRG_VOLL.value, Rechtsordnung.OESTERREICH_MRG_TEIL.value}
+)
+
+#: Weitere österreichische Rechtsordnungen MIT ABGB, aber OHNE (hier
+#: behauptetem) § 30 MRG-Bezug - NUR § 1118 ABGB zweiter Fall.
+_OESTERREICHISCHE_RECHTSORDNUNGEN_NUR_ABGB = frozenset(
     {
-        Rechtsordnung.OESTERREICH_MRG_VOLL.value,
-        Rechtsordnung.OESTERREICH_MRG_TEIL.value,
         Rechtsordnung.OESTERREICH_MRG_FREI.value,
         Rechtsordnung.OESTERREICH_WGG.value,
         Rechtsordnung.OESTERREICH_GEWERBE.value,
@@ -133,64 +173,88 @@ _OESTERREICHISCHE_RECHTSORDNUNGEN_MIT_ABGB = frozenset(
 def rechtlicher_kern_stufe4(*, rechtsordnung: str) -> tuple[str, str | None]:
     """Liefert `(rechtlicher_kern_text, hinweis_intern)` für die
     Stufe-4-Mahnung - NIE geraten, siehe Moduldoc "Unbekanntes nicht
-    erfinden". Für eine Rechtsordnung OHNE hinterlegten österreichischen
-    Gesetzesbaustein (z. B. `DEUTSCHLAND`) ist `rechtlicher_kern_text`
-    bewusst ALLGEMEIN gehalten (keine erfundene ausländische Norm) und
-    `hinweis_intern` macht das für das Backoffice sichtbar. Wird NIE für
-    `UNGEKLAERT` aufgerufen - diese Rechtsordnung ist bereits strukturell
-    von jeder Mahnung ausgeschlossen (`rechtsordnung_geklaert`)."""
+    erfinden". `hinweis_intern` ist IMMER gesetzt (mindestens der
+    Mitmieter-Zustellprüfhinweis, siehe `_MITMIETER_HINWEIS_INTERN`) -
+    NIE Teil des an den Mieter gehenden Textes. Für eine Rechtsordnung
+    OHNE hinterlegten österreichischen Gesetzesbaustein (z. B.
+    `DEUTSCHLAND`) ist `rechtlicher_kern_text` bewusst ALLGEMEIN gehalten
+    (keine erfundene ausländische Norm). Wird NIE für `UNGEKLAERT`
+    aufgerufen - diese Rechtsordnung ist bereits strukturell von jeder
+    Mahnung ausgeschlossen (`rechtsordnung_geklaert`)."""
 
     satz_folgen = (
         "Erfolgt innerhalb der oben genannten Frist keine vollständige Zahlung, werden wir diesen Fall "
         "einem Rechtsanwalt zur gerichtlichen Geltendmachung übergeben."
     )
-    if rechtsordnung == Rechtsordnung.OESTERREICH_MRG_VOLL.value:
+    hinweise_intern = [_MITMIETER_HINWEIS_INTERN]
+
+    if rechtsordnung in _RECHTSORDNUNGEN_MIT_PARAGRAPH_30:
+        if rechtsordnung == Rechtsordnung.OESTERREICH_MRG_VOLL.value:
+            paragraph_30_einleitung = "eine gerichtliche Aufkündigung wegen qualifizierten Zahlungsrückstands gemäß § 30 Abs 2 Z 1 MRG oder"
+        else:
+            paragraph_30_einleitung = (
+                "- soweit der Kündigungsschutz der §§ 29 bis 36 MRG nach § 1 Abs 4 MRG auf dieses "
+                "Mietverhältnis im Teilanwendungsbereich anwendbar ist - eine gerichtliche Aufkündigung "
+                "wegen qualifizierten Zahlungsrückstands gemäß § 30 Abs 2 Z 1 MRG oder"
+            )
         kern = (
-            f"{satz_folgen} Dabei kommt gegebenenfalls eine gerichtliche Aufkündigung wegen "
-            "qualifizierten Zahlungsrückstands gemäß § 30 Abs 2 Z 1 MRG oder die vorzeitige "
+            f"{satz_folgen} Dabei kommt gegebenenfalls {paragraph_30_einleitung} die vorzeitige "
             "Vertragsauflösung gemäß § 1118 zweiter Fall ABGB in Betracht, sofern die dafür "
             f"jeweils erforderlichen gesetzlichen Voraussetzungen vorliegen. {_1118_FRIST_HINWEIS} "
             f"Grundlage einer solchen Kündigung/Auflösung ist ausschließlich der oben gesondert "
             f"ausgewiesene RÜCKSTÄNDIGE MIETZINS - NICHT die gesondert ausgewiesenen Verzugszinsen "
-            f"oder Mahnkosten. {_MITMIETER_HINWEIS} {_MAHNSCHREIBEN_IST_KEINE_KUENDIGUNG}"
+            f"oder Mahnkosten. {_MAHNSCHREIBEN_IST_KEINE_KUENDIGUNG}"
         )
-        return kern, None
-    if rechtsordnung in _OESTERREICHISCHE_RECHTSORDNUNGEN_MIT_ABGB:
+        return kern, "\n".join(hinweise_intern)
+
+    if rechtsordnung in _OESTERREICHISCHE_RECHTSORDNUNGEN_NUR_ABGB:
         kern = (
             f"{satz_folgen} Dabei kommt gegebenenfalls die vorzeitige Vertragsauflösung gemäß "
             f"§ 1118 zweiter Fall ABGB in Betracht, sofern die dafür erforderlichen gesetzlichen "
             f"Voraussetzungen vorliegen. {_1118_FRIST_HINWEIS} Grundlage einer solchen Auflösung "
             f"ist ausschließlich der oben gesondert ausgewiesene RÜCKSTÄNDIGE MIETZINS - NICHT die "
-            f"gesondert ausgewiesenen Verzugszinsen oder Mahnkosten. {_MITMIETER_HINWEIS} "
-            f"{_MAHNSCHREIBEN_IST_KEINE_KUENDIGUNG}"
+            f"gesondert ausgewiesenen Verzugszinsen oder Mahnkosten. {_MAHNSCHREIBEN_IST_KEINE_KUENDIGUNG}"
         )
-        return kern, None
+        if rechtsordnung == Rechtsordnung.OESTERREICH_GEWERBE.value:
+            hinweise_intern.append(_GEWERBE_LEGACY_HINWEIS_INTERN)
+        return kern, "\n".join(hinweise_intern)
+
     # Keine hinterlegte österreichische Rechtsgrundlage (z. B. eine
     # ausländische Rechtsordnung wie DEUTSCHLAND) - NIE eine Norm
     # erfinden, stattdessen allgemein formulieren und intern markieren.
     kern = (
         f"{satz_folgen} Die weiteren rechtlichen Schritte richten sich nach den für dieses "
-        f"Mietverhältnis anwendbaren gesetzlichen Bestimmungen. {_MITMIETER_HINWEIS} "
-        f"{_MAHNSCHREIBEN_IST_KEINE_KUENDIGUNG}"
+        f"Mietverhältnis anwendbaren gesetzlichen Bestimmungen. {_MAHNSCHREIBEN_IST_KEINE_KUENDIGUNG}"
     )
-    hinweis_intern = (
+    hinweise_intern.append(
         f"Rechtsordnung {rechtsordnung!r} hat KEINEN hinterlegten österreichischen MRG/ABGB-"
         "Gesetzestextbaustein (z. B. ausländische Rechtsordnung) - der Stufe-4-Text bleibt bewusst "
         "allgemein. Vor einer tatsächlichen RA-Übergabe/Kündigung ist die konkrete Rechtsgrundlage "
         "fachlich gesondert zu prüfen (NIE automatisch aus dieser Stufe abgeleitet)."
     )
-    return kern, hinweis_intern
+    return kern, "\n".join(hinweise_intern)
 
 
 def text_fuer_stufe(*, stufe: int, rechtsordnung: str, zahlungsfrist_bis: date) -> MahnstufeText:
     """Der vollständige Textbaustein für GENAU eine Stufe (1-4) - reine
     Funktion, von HTML/E-Mail/PDF GEMEINSAM verwendet (siehe Moduldoc).
-    `zahlungsfrist_bis` ist das bereits anderswo (siehe `mahnwesen/
-    fristen.py::fristende_ab_zugang`) berechnete, auf den nächsten
-    Werktag verschobene tatsächliche Fristende - diese Funktion
-    berechnet selbst KEIN Datum."""
 
-    frist_text = zahlungsfrist_bis.strftime("%d.%m.%Y")
+    **Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026):** der
+    Kundentext nannte bisher ein konkretes Kalenderdatum ("...binnen 14
+    Tagen ab Zugang dieses Schreibens, also bis spätestens {datum}") -
+    das ist in sich widersprüchlich, weil der tatsächliche Zugang zum
+    Versandzeitpunkt noch NICHT bekannt ist (er liegt per Definition in
+    der Zukunft) und deshalb KEIN konkretes Datum als Tatsache behauptet
+    werden darf (Auftrag Markus: "keine vorgetäuschten Zugangsdaten").
+    Der Kundentext bleibt deshalb jetzt durchgehend REIN RELATIV ("binnen
+    14 Tagen ab Zugang dieses Schreibens"), OHNE ein daraus abgeleitetes
+    Kalenderdatum zu nennen. `zahlungsfrist_bis` wird deshalb hier NICHT
+    mehr zur Textbildung verwendet - der Parameter bleibt (noch) in der
+    Signatur, um die Aufrufer (`brief_pdf.py`, `mailversand_service.py`)
+    nicht in diesem ohnehin schon umfangreichen Korrekturcommit zusätzlich
+    umbauen zu müssen; eine Bereinigung der Signatur ist als kleiner
+    Folgepunkt in `docs/hausverwaltung/OFFENE_PUNKTE.md` vermerkt."""
+
     if stufe == MahnStufe.STUFE_1.value:
         return MahnstufeText(
             stufe=1,
@@ -199,9 +263,9 @@ def text_fuer_stufe(*, stufe: int, rechtsordnung: str, zahlungsfrist_bis: date) 
             kerntext=(
                 f"Für das unten genannte Mietverhältnis ist die unten aufgeschlüsselte Forderung "
                 f"fällig und noch nicht bei uns eingelangt. Wir ersuchen Sie, den Gesamtbetrag "
-                f"binnen 14 Tagen ab Zugang dieses Schreibens, also bis spätestens {frist_text}, "
-                "vollständig zu begleichen. Sollte die Zahlung bereits erfolgt sein, betrachten Sie "
-                "dieses Schreiben bitte als gegenstandslos und senden uns den Zahlungsbeleg."
+                "binnen 14 Tagen ab Zugang dieses Schreibens vollständig zu begleichen. Sollte die "
+                "Zahlung bereits erfolgt sein, betrachten Sie dieses Schreiben bitte als "
+                "gegenstandslos und senden uns den Zahlungsbeleg."
             ),
         )
     if stufe == MahnStufe.STUFE_2.value:
@@ -216,13 +280,12 @@ def text_fuer_stufe(*, stufe: int, rechtsordnung: str, zahlungsfrist_bis: date) 
             betreff="Zweite Mahnung",
             einleitung="Die mit unserem vorangegangenen Schreiben angeführte Forderung ist weiterhin offen.",
             kerntext=(
-                f"Wir ersuchen Sie neuerlich, den unten aufgeschlüsselten Gesamtbetrag binnen 14 "
-                f"Tagen ab Zugang dieses Schreibens, also bis spätestens {frist_text}, vollständig "
-                "zu begleichen; eine weitere Verzögerung über diese Nachfrist hinaus können wir "
-                "nicht in Aussicht stellen. Falls es Zahlungsschwierigkeiten gibt, melden Sie sich "
-                "bitte umgehend zur Klärung bei uns - damit ist noch KEIN Zahlungsaufschub "
-                "zugesagt; eine etwaige Stundung/Ratenvereinbarung bedarf einer gesonderten, "
-                "ausdrücklichen Vereinbarung mit uns."
+                "Wir ersuchen Sie neuerlich, den unten aufgeschlüsselten Gesamtbetrag binnen 14 "
+                "Tagen ab Zugang dieses Schreibens vollständig zu begleichen; eine weitere "
+                "Verzögerung über diese Nachfrist hinaus können wir nicht in Aussicht stellen. "
+                "Falls es Zahlungsschwierigkeiten gibt, melden Sie sich bitte umgehend zur Klärung "
+                "bei uns - damit ist noch KEIN Zahlungsaufschub zugesagt; eine etwaige Stundung/"
+                "Ratenvereinbarung bedarf einer gesonderten, ausdrücklichen Vereinbarung mit uns."
             ),
         )
     if stufe == MahnStufe.STUFE_3.value:
@@ -231,10 +294,9 @@ def text_fuer_stufe(*, stufe: int, rechtsordnung: str, zahlungsfrist_bis: date) 
             betreff="Nachdrückliche Zahlungsaufforderung",
             einleitung="Die unten aufgeschlüsselte Forderung ist trotz zweier vorangegangener Schreiben weiterhin unbeglichen.",
             kerntext=(
-                f"Wir fordern Sie hiermit nachdrücklich auf, den Gesamtbetrag binnen 14 Tagen ab "
-                f"Zugang dieses Schreibens, also bis spätestens {frist_text}, vollständig zu "
-                "begleichen. Eine weitere Nichtzahlung wird weitere, auch rechtliche Schritte zur "
-                "Folge haben."
+                "Wir fordern Sie hiermit nachdrücklich auf, den Gesamtbetrag binnen 14 Tagen ab "
+                "Zugang dieses Schreibens vollständig zu begleichen. Eine weitere Nichtzahlung wird "
+                "weitere, auch rechtliche Schritte zur Folge haben."
             ),
         )
     if stufe == MahnStufe.STUFE_4.value:
@@ -244,9 +306,8 @@ def text_fuer_stufe(*, stufe: int, rechtsordnung: str, zahlungsfrist_bis: date) 
             betreff="Letzte Zahlungsaufforderung",
             einleitung="Die unten aufgeschlüsselte Forderung ist trotz mehrerer vorangegangener Schreiben weiterhin unbeglichen.",
             kerntext=(
-                f"Wir fordern Sie hiermit LETZTMALIG auf, den Gesamtbetrag binnen 14 Tagen ab "
-                f"Zugang dieses Schreibens, also bis spätestens {frist_text}, vollständig zu "
-                "begleichen."
+                "Wir fordern Sie hiermit LETZTMALIG auf, den Gesamtbetrag binnen 14 Tagen ab Zugang "
+                "dieses Schreibens vollständig zu begleichen."
             ),
             rechtlicher_kern=rechtlicher_kern,
             hinweis_intern=hinweis_intern,

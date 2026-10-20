@@ -1,10 +1,23 @@
-"""Rechtssichere Fristberechnung für das Mahnwesen (Auftrag
-HV-20261020-VIER-MAHNSTUFEN): §902/§903 ABGB (Fristenlauf) + die
-österreichischen gesetzlichen Feiertage (Bundesgesetz vom 1. März 1961
-betreffend die Arbeitsruhe an Feiertagen, BGBl. Nr. 37/1961 - "Karfreitag"
-wird hier auf AUSDRÜCKLICHEN Auftrag Markus als fristenhemmender Tag
-behandelt, unabhängig von der engeren arbeitsrechtlichen Diskussion um
-seinen Status als "gesetzlicher Feiertag" für alle Arbeitnehmer).
+"""Fristberechnung für das Mahnwesen (Auftrag HV-20261020-VIER-
+MAHNSTUFEN) nach §902/§903 ABGB - KEINE Garantie für Rechtssicherheit im
+Einzelfall, vor Produktivgang durch Codex/Markus fachlich zu bestätigen
+(siehe `docs/hausverwaltung/OFFENE_PUNKTE.md`).
+
+**Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026):** die
+vorherige Fassung dieses Moduldocstrings bezeichnete "BGBl. Nr. 37/1961"
+fälschlich als das Bundesgesetz über die Arbeitsruhe an Feiertagen - DAS
+STIMMT NICHT (verifiziert per Recherche: das tatsächliche
+Feiertagsruhegesetz ist das Feiertagsruhegesetz 1957, BGBl. Nr. 153/1957).
+"BGBl. Nr. 37/1961" wurde vom Auftraggeber als Quelle für §902/903 ABGB
+selbst genannt (zusammen mit der RIS-Fundstelle NOR12018627) - OHNE dass
+hier zweifelsfrei verifiziert werden konnte, WELCHE genaue ABGB-Fassung/
+-Wiederverlautbarung diese Nummer bezeichnet; diese Zuordnung bleibt
+deshalb bewusst UNGEKLÄRT und ist von Codex/Markus anhand des RIS-
+Fundstellennachweises zu bestätigen, statt hier eine zweite, erneut
+möglicherweise falsche Behauptung aufzustellen. Die FESTEN Feiertage in
+`oesterreichische_feiertage` stützen sich stattdessen auf das
+Feiertagsruhegesetz 1957 (BGBl. Nr. 153/1957) in seiner seither
+novellierten Fassung.
 
 **§902/§903 ABGB - Grundregel:** der Tag des fristauslösenden Ereignisses
 (hier: der nachgewiesene Zugang eines Mahnschreibens) wird NICHT
@@ -118,8 +131,18 @@ def fristende_ab_zugang(zugang_am: date, frist_tage: int) -> date:
 
 def frist_abgelaufen(*, zugang_am: date, frist_tage: int, heute: date) -> bool:
     """`True`, wenn `heute` das (werktagsverschobene) Fristende aus
-    `fristende_ab_zugang` bereits ERREICHT ODER ÜBERSCHRITTEN hat (die
-    Frist endet mit ABLAUF des Fristendetages - `heute == Fristende`
-    zählt deshalb bereits als abgelaufen, nicht erst der Folgetag)."""
+    `fristende_ab_zugang` bereits ÜBERSCHRITTEN hat.
 
-    return heute >= fristende_ab_zugang(zugang_am, frist_tage)
+    **Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026):** die
+    vorherige Fassung verwendete `>=` und erklärte die Frist damit bereits
+    AM Fristendetag selbst (schon am Morgen eines datumsbasierten
+    08:15-Prüflaufs) für abgelaufen. Das widerspricht §903 ABGB: die
+    Frist endet erst mit ABLAUF (Mitternacht) des letzten Tages - der
+    Fristendetag selbst gehört noch VOLLSTÄNDIG zur Frist, die
+    Rechtsfolge (hier: Eskalationsberechtigung) tritt deshalb frühestens
+    am FOLGETag ein. Für das Grenzfallbeispiel (Zugang 10.10.2026,
+    Fristende 27.10.2026, siehe Moduldoc) darf ein Prüflauf am 27.10.2026
+    selbst NOCH NICHT eskalieren, sondern erst am 28.10.2026 - siehe
+    Regressionstest in `test_mahnwesen_fristen.py`."""
+
+    return heute > fristende_ab_zugang(zugang_am, frist_tage)

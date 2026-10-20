@@ -123,7 +123,9 @@ def test_vier_stufen_literalbeispiel_zugang_10_oktober_keine_eskalation_25_oktob
     """Wörtliches Grenzfall-Beispiel aus dem Auftrag: Zugang der Stufe-1-
     Mahnung am 10.10.2026 - am 25.10.2026 darf NOCH NICHT auf Stufe 2
     eskaliert werden (Fristende ist erst der 27.10.2026, siehe
-    `fristen.py`), am 27.10.2026 (oder später) schon."""
+    `fristen.py`). §903 ABGB lässt die Frist erst mit ABLAUF des
+    Fristendetages enden - auch am 27.10.2026 SELBST noch keine
+    Eskalation, erst ab 28.10.2026."""
 
     vertrag, konto = basis_vertrag
     ctx = ctx_factory("7DI")
@@ -158,12 +160,22 @@ def test_vier_stufen_literalbeispiel_zugang_10_oktober_keine_eskalation_25_oktob
     )
     assert all(p.status != "GEPLANT" or p.stufe != 2 for p in geplant_25), geplant_25
 
-    # 27.10.2026: Frist ist abgelaufen - Stufe 2 wird geplant.
+    # 27.10.2026 (der Fristendetag SELBST): §903 ABGB lässt die Frist
+    # erst mit dessen ABLAUF enden - auch an diesem Tag selbst NOCH KEINE
+    # Eskalation (Korrektur nach unabhängiger Abnahme, Codex 20.10.2026 -
+    # siehe `fristen.py::frist_abgelaufen`).
     geplant_27 = mahn_service.plane_alle_offenen_forderungen(
         ctx=ctx, vertrag=vertrag, konto=konto, policy=freigegebene_vier_stufen_policy, heute=date(2026, 10, 27),
         bank_bestaetigt_bis=date(2026, 10, 27),
     )
-    assert any(p.status == "GEPLANT" and p.stufe == 2 for p in geplant_27), geplant_27
+    assert all(p.status != "GEPLANT" or p.stufe != 2 for p in geplant_27), geplant_27
+
+    # 28.10.2026: der Fristendetag ist abgelaufen - Stufe 2 wird geplant.
+    geplant_28 = mahn_service.plane_alle_offenen_forderungen(
+        ctx=ctx, vertrag=vertrag, konto=konto, policy=freigegebene_vier_stufen_policy, heute=date(2026, 10, 28),
+        bank_bestaetigt_bis=date(2026, 10, 28),
+    )
+    assert any(p.status == "GEPLANT" and p.stufe == 2 for p in geplant_28), geplant_28
 
 
 def test_zugangsbestaetigung_mit_unzureichender_zugangsform_abgelehnt(mahn_service, op_service, basis_vertrag, ctx_factory, freigegebene_vier_stufen_policy):

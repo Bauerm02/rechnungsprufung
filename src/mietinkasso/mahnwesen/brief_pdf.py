@@ -372,12 +372,18 @@ def erzeuge_mahnbrief_pdf(
     _zeile(pdf, "Gesamtbetrag", gesamtbetrag_cent, fett=True)
     pdf.ln(4)
 
+    # Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026): KEIN
+    # konkretes Kalenderdatum mehr nennen - der tatsächliche Zugang ist
+    # zum Versandzeitpunkt noch nicht bekannt, ein daraus abgeleitetes
+    # "bis {datum}" wäre ein vorgetäuschtes Zugangsdatum (siehe
+    # `mahntexte.py::text_fuer_stufe`-Docstring, dieselbe Korrektur).
     pdf.set_font("Brief", "", 10)
     pdf.multi_cell(
         0, 5.5,
-        f"Bitte begleichen Sie den Gesamtbetrag bis {zahlungsfrist_bis.strftime('%d.%m.%Y')} auf das Ihnen "
-        "für dieses Mietverhältnis bekannt gegebene Konto. Bei einer inzwischen erfolgten Zahlung senden Sie "
-        "uns bitte den Zahlungsbeleg. Bei Fragen zur Forderung wenden Sie sich bitte an untenstehende Kontaktdaten.",
+        "Bitte begleichen Sie den Gesamtbetrag binnen 14 Tagen ab Zugang dieses Schreibens auf das "
+        "Ihnen für dieses Mietverhältnis bekannt gegebene Konto. Bei einer inzwischen erfolgten "
+        "Zahlung senden Sie uns bitte den Zahlungsbeleg. Bei Fragen zur Forderung wenden Sie sich "
+        "bitte an untenstehende Kontaktdaten.",
     )
     if mahntext.rechtlicher_kern:
         pdf.ln(3)

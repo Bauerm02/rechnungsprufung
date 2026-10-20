@@ -5926,3 +5926,164 @@ Grenzfallbeispiel und Mitmieter-Fall) + 3 (Tagesgate/Ein-Schreiben-Regel
 im Mailversand-Treiber) + 2 (PDF-Rechtsinhalt) = 30 neue Tests,
 ausschließlich synthetische Testdaten, keine echten Sendungen/
 Produktivbuchungen.
+
+## Korrekturrunde nach unabhängiger Abnahme von Commit d4da16a (Codex, 20.10.2026)
+
+Codex hat den oben beschriebenen Commit `d4da16a` unabhängig geprüft und
+vier produktivkritische Fehler konkret reproduziert (teils mit eigenen
+Tests, "4 rot / 2 grün" bzw. "5 rot / 2 grün"). Alle vier sind in dieser
+Runde behoben, mit Regressionstests, OHNE die laufende
+HV-20261020-VERTRAGSDATENBASIS-Arbeit zu vermischen (eigener,
+abgegrenzter Commit). Wichtig: diese Zusammenfassung gibt die
+Fachpunkte wieder, die Markus als Auftraggeber im Namen von Codex an
+Claude weitergegeben hat - es handelt sich um Codex' Prüfbefunde, nicht
+um eine von Claude selbst unabhängig durchgeführte Rechtsprüfung, und
+NICHT um eine Garantie für Rechtssicherheit im Einzelfall (vor
+Produktivgang weiterhin durch Codex/Markus zu bestätigen).
+
+### 1. § 30 Abs 2 Z1 MRG gilt bedingt auch im Teilanwendungsbereich (behoben)
+
+`mahntexte.py::rechtlicher_kern_stufe4` behauptete bisher, der
+Kündigungsschutz des § 30 MRG gelte im Teilanwendungsbereich (§ 1 Abs 4
+MRG) grundsätzlich NICHT - das war falsch (§ 1 Abs 4 MRG erklärt dort
+u. a. die §§ 29 bis 36 MRG, also auch § 30, für anwendbar). Sowohl
+`OESTERREICH_MRG_VOLL` als auch `OESTERREICH_MRG_TEIL` erhalten jetzt
+einen § 30-Hinweis - für TEIL ausdrücklich gehedgt ("soweit... im
+Teilanwendungsbereich anwendbar ist"), KEINE unbedingte Behauptung.
+`OESTERREICH_GEWERBE` (Legacy-Enum) bleibt bei § 1118 ABGB, OHNE zu
+behaupten, Gewerbenutzung sei automatisch eine MRG-Ausnahme (ist sie
+nicht) - ein entsprechender interner Hinweis macht diese Legacy-Lücke
+für das Backoffice sichtbar, bis das Rechtsachsen-Modell aus
+HV-20261020-VERTRAGSDATENBASIS MRG-Anwendungsbereich und Nutzungsart
+tatsächlich trennt.
+
+### 2. Allgemeine Zustellprüf-/Mitmieterhinweise standen fälschlich im Kundentext (behoben)
+
+Der Mitmieter-Zustellprüfhinweis (ein gewöhnlicher Mail-/Brief-Versand
+ist kein automatisch rechtssicherer Zugang) war Teil des an den Mieter
+gehenden `rechtlicher_kern`-Texts. Er wird jetzt ausschließlich über
+`hinweis_intern` transportiert (Backoffice-only), NIE mehr im
+Kundentext.
+
+### 3. Vorgetäuschtes Zugangsdatum im Kundentext (behoben)
+
+Alle vier Stufentexte sowie der Mahnbrief-PDF-Schlussabsatz nannten ein
+konkretes Kalenderdatum ("binnen 14 Tagen ab Zugang ..., also bis
+spätestens {Datum}") - in sich widersprüchlich, weil der tatsächliche
+Zugang zum Versandzeitpunkt noch nicht bekannt ist. Der Kundentext ist
+jetzt durchgehend rein relativ formuliert ("binnen 14 Tagen ab Zugang
+dieses Schreibens"), ohne ein daraus abgeleitetes Datum zu behaupten.
+Kleiner verbleibender Aufräumpunkt: der Parameter `zahlungsfrist_bis`
+bleibt in den Signaturen von `text_fuer_stufe`/`erzeuge_mahnbrief_pdf`
+erhalten (wird aber nicht mehr zur Textbildung verwendet), um in diesem
+bereits umfangreichen Korrekturcommit keinen zusätzlichen,
+signaturändernden Umbau über alle Aufrufer/Tests vorzunehmen - eine
+spätere Bereinigung ist unkritisch und kann mit der nächsten
+inhaltlichen Änderung an diesen Funktionen mitgehen.
+
+### 4. §903 ABGB Off-by-one: Fristende-Tag selbst galt fälschlich als abgelaufen (behoben)
+
+`fristen.py::frist_abgelaufen` verwendete `>=` und erklärte die Frist
+dadurch schon AM Fristendetag selbst (z. B. bereits am Morgen eines
+datumsbasierten 08:15-Prüflaufs) für abgelaufen. §903 ABGB lässt die
+Frist aber erst mit ABLAUF (Mitternacht) des letzten Tages enden - jetzt
+`>` statt `>=`. Grenztest korrigiert: am 27.10.2026 (dem Fristendetag
+selbst, wörtliches Auftragsbeispiel) KEINE Eskalation mehr, erst ab
+28.10.2026. Zusätzlich wurde die vorherige Modul-Dokumentation
+korrigiert, die "BGBl. Nr. 37/1961" fälschlich als das Bundesgesetz über
+die Arbeitsruhe an Feiertagen bezeichnete - per Recherche verifiziert
+ist das tatsächliche Feiertagsruhegesetz BGBl. Nr. 153/1957; welche
+genaue ABGB-Fassung/-Wiederverlautbarung "BGBl. Nr. 37/1961" bezeichnet,
+bleibt bewusst als ungeklärt dokumentiert statt erneut geraten.
+
+### 5. `_resolve_kanal` ignorierte Stufe3/4-Kanalfelder (behoben)
+
+Lieferte für Stufe 3/4 fälschlich immer `stufe2_kanal` zurück, obwohl
+Auftrag HV-20261020-VIER-MAHNSTUFEN bereits eigene `stufe3_kanal`/
+`stufe4_kanal`-Felder (`MahnKanalregelTable`) eingeführt hatte. Eine
+Regel 1=EMAIL/2=EMAIL/3=BRIEF/4=BRIEF sendete Stufe 3/4 dadurch
+weiterhin per E-Mail statt Brief. Jetzt löst jede Stufe ihr eigenes
+Feld auf.
+
+### 6. Doppelversand bei wiederholtem Tageslauf-Aufruf (behoben, schwerwiegendster Fund)
+
+`HVMailversandService.mahnlauf` wählte je Aufruf nur die höchste gerade
+geplante Stufe je Vertrag (`geplante_stufen[-1:]`) - das schützt nur
+INNERHALB eines Funktionsaufrufs. Ein zweiter Aufruf für dasselbe
+Prüfdatum (Crash-Retry, Parallelität, oder weil zwischenzeitlich eine
+neue, bereits fällige Forderung desselben Vertrags gebucht wurde) konnte
+dadurch einen zweiten tatsächlichen Versand für denselben Vertrag am
+selben Tag auslösen - von Codex konkret reproduziert. Behoben über eine
+neue, additive `MahnTageslaufTable` (UNIQUE `vertrag_id`+`pruefdatum`,
+Claim-dann-CAS-Mechanismus wie bei `MahnFallRepository.claim_fuer_
+versand`): höchstens EIN tatsächlicher Versandversuch (GESENDET/
+UNSICHER) je (Vertrag, Prüfdatum), DB-seitig erzwungen statt nur per
+In-Memory-Prüfung. Ein Aufruf, bei dem nichts tatsächlich versandt wurde
+(z. B. Bankstand veraltet), gibt den Slot wieder frei - ein späterer,
+legitimer Retry desselben Tages kann dann noch senden. Ein zwischen
+Claim und Ergebnis abgestürzter Prozess wird nach 15 Minuten über
+`freigeben_verwaiste` aufgelöst. Die Planung selbst (`plane_alle_
+offenen_forderungen`) bleibt UNGEGATED - nur der tatsächliche Versand
+wird begrenzt, damit eine neue Forderung weiterhin sofort sichtbar/
+nachvollziehbar geplant wird, auch wenn für diesen Tag bereits
+versandt wurde.
+
+### Weiterhin offen (von Markus/Codex bewusst auf NACH diesem Korrekturcommit verschoben)
+
+Diese drei Punkte sind weiterhin beauftragt, nicht abgeschlossen, und
+werden NACH dem abgegrenzten HV-20261020-VERTRAGSDATENBASIS-Commit
+fortgesetzt:
+
+- **IBAN/Kontoinhaber/Referenz + vollständige Perioden-Tabelle im
+  Mahnschreiben:** weder E-Mail- noch Brief-Text zeigen aktuell eine
+  geprüfte Ziel-IBAN/Kontoinhaber/Zahlungsreferenz, und die Forderungs-
+  liste zeigt nur Restbetrag+Fälligkeit, nicht Periode/Position/
+  Ursprungsbetrag/angerechnete Zahlungen. Bestehende Bank-/OP-Zuordnung
+  soll genutzt werden; bei ungeklärter IBAN soll konkret blockiert
+  werden statt ein beliebiges Konto zu zeigen oder die Angabe global
+  wegzulassen.
+- **Mitmieter-Zugang vs. tatsächlicher Versandweg:** `MahnEmpfaenger
+  ZugangTable` erfasst erwartete Zugänge für Mitmieter, der tatsächliche
+  Versand (E-Mail wie Brief) geht aber weiterhin NUR an den
+  Ankerdebitor. Keine behauptete Mehrfachzustellung ohne echten
+  Einzelnachweis - entweder echten Einzelversand je Person bauen
+  (Gebühr bleibt pro Schreiben/Vertrag, nicht pro Kopie) oder das
+  Tracking ehrlich auf das reduzieren, was tatsächlich passiert.
+- **Backoffice-UI für Zugang/Mitmieter/4-Stufen-Profil:** das Backend
+  ist vollständig und getestet, es fehlt aber weiterhin eine
+  bedienbare Oberfläche, um Zugang je Empfänger zu bestätigen,
+  Mitmieter anzulegen und das 4-Stufen-Profil/den nächsten Prüftermin/
+  offene Nachweise einzusehen - ohne UI ist der Automatikauftrag nicht
+  wie vorgesehen bedienbar.
+
+### Geänderte/neue Dateien (dieser Korrekturcommit)
+
+Neu: `src/mietinkasso/infrastructure/db/tables.py` (`MahnTageslaufTable`
+ergänzt, keine neue Datei), `src/mietinkasso/mahnwesen/repository.py`
+(`MahnTageslaufRepository` ergänzt).
+
+Geändert: `src/mietinkasso/mahnwesen/fristen.py` (Off-by-one-Fix,
+BGBl-Korrektur), `src/mietinkasso/mahnwesen/mahntexte.py` (§30-TEIL,
+Mitmieter-Hinweis intern, kein Zugangsdatum), `src/mietinkasso/
+mahnwesen/brief_pdf.py` (kein Zugangsdatum im Schlussabsatz), `src/
+mietinkasso/mahnwesen/service.py` (`_resolve_kanal` Stufe3/4), `src/
+mietinkasso/indexautomatik/mailversand_service.py`
+(`MahnTageslaufRepository` verdrahtet, Claim/Freigabe/Markiere-versendet
+um die Dispatch-Schleife), `tests/mietinkasso/test_mahnwesen_fristen.py`
+(Grenztest korrigiert), `tests/mietinkasso/test_mahnwesen_mahntexte.py`
+(§30-TEIL/Mitmieter/Datum-Tests ersetzt/ergänzt), `tests/mietinkasso/
+test_mahnwesen_vier_stufen.py` (Grenztest korrigiert), `tests/
+mietinkasso/test_mahnwesen.py` (Stufe3/4-Kanal-Regressionstest), `tests/
+mietinkasso/test_hv_mailversand_vier_stufen.py` (zwei neue Tageslauf-
+Regressionstests).
+
+### Tests (dieser Korrekturcommit)
+
+Gesamtsuite `tests/mietinkasso` (1495 Tests) grün. Neue/geänderte
+gezielte Tests: 1 Grenztest korrigiert (Fristen) + 1 Grenztest
+korrigiert (Vier-Stufen-Service) + 1 Kanal-Regressionstest + 2
+Tageslauf-Regressionstests (Doppelversand-Reproduktion + legitimer
+Retry nach Freigabe) + mehrere ersetzte/ergänzte Mahntexte-Tests
+(§30-TEIL, Mitmieter-Hinweis, Zugangsdatum). Ausschließlich
+synthetische Testdaten, keine echten Sendungen/Produktivbuchungen,
+kein Deployment.

@@ -169,3 +169,78 @@ def test_zwei_verschiedene_stufen_desselben_vertrags_ergeben_nur_einen_mahnlauf_
             .count()
         )
     assert offene_stufe1_faelle == 1
+
+
+def test_zweiter_aufruf_desselben_pruefdatums_sendet_nicht_erneut_bei_neuer_op(
+    hv, basis_vertrag, admin_ctx, session_factory,
+):
+    """Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026,
+    reproduzierter Fehler): `geplante_stufen[-1:]` schützt nur INNERHALB
+    EINES Aufrufs - ein zweiter Aufruf für DASSELBE Prüfdatum, bei dem
+    inzwischen eine NEUE, bereits fällige Forderung desselben Vertrags
+    hinzugekommen ist, löste bisher einen ZWEITEN tatsächlichen Versand
+    für denselben Vertrag am selben Tag aus. Der DB-seitige
+    Tageslauf-Claim (`MahnTageslaufTable`) muss das verhindern."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx, vier_stufen=True, faelligkeit=date(2026, 9, 5))
+
+    state["sent"] = "2026-09-25T08:00:00Z"
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="SYNTHETIC-BANK", bestaetigt_bis=date(2026, 9, 25), bestaetigt_von="SYNTHETIC-TEST")
+    ergebnis_lauf1 = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 25))
+    assert ergebnis_lauf1["gesendet"] == 1
+    with session_factory() as session:
+        versendete_laeufe_nach_lauf1 = session.query(MahnLaufTable).filter(MahnLaufTable.status == "GESENDET").count()
+    assert versendete_laeufe_nach_lauf1 == 1
+
+    # Zwischenzeitlich (z. B. durch einen manuellen Nachtrag) wird eine
+    # ZWEITE, unabhängige Forderung DESSELBEN Vertrags buchbar, die SOFORT
+    # (Fälligkeit weit in der Vergangenheit) Stufe-1-reif ist.
+    service.op_service.buchen(
+        ctx=admin_ctx, konto=account, typ=OPTyp.SOLL, betrag_cent=83000, belegdatum=date(2026, 8, 1),
+        buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 1), beleg_referenz="SYNTHETIC Nachtrag",
+    )
+
+    # Ein ZWEITER Aufruf für DASSELBE Prüfdatum (Crash-Retry/Parallelität/
+    # erneuter manueller Trigger) darf für diesen Vertrag NICHTS mehr
+    # versenden - der Slot für (Vertrag, 25.09.2026) ist bereits VERSENDET.
+    ergebnis_lauf1_wiederholt = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 25))
+    assert ergebnis_lauf1_wiederholt["gesendet"] == 0
+
+    with session_factory() as session:
+        versendete_laeufe_gesamt = session.query(MahnLaufTable).filter(MahnLaufTable.status == "GESENDET").count()
+        offene_stufe1_faelle = (
+            session.query(MahnFallTable)
+            .filter(MahnFallTable.stufe == 1, MahnFallTable.status == "GEPLANT")
+            .count()
+        )
+    assert versendete_laeufe_gesamt == 1  # KEIN zweiter tatsächlicher Versand am selben Tag.
+    assert offene_stufe1_faelle == 1  # Die neue Forderung bleibt GEPLANT, verschoben auf einen SPÄTEREN Lauf.
+
+
+def test_freigegebener_slot_erlaubt_legitimen_retry_am_selben_tag(
+    hv, basis_vertrag, admin_ctx, session_factory,
+):
+    """Ein Aufruf, bei dem NICHTS tatsächlich versandt wurde (hier: die
+    Bankbestätigung fehlte noch), darf den Tageslauf-Slot NICHT dauerhaft
+    schließen - ein SPÄTERER, legitimer Retry DESSELBEN Tages muss noch
+    senden können, sobald die Blockade behoben ist."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    # `_seed_debt` bestätigt die Bank standardmäßig nur bis 2026-09-13
+    # (weit mehr als `bank_stand_max_age_days` vor dem 25.09.) - OHNE
+    # eine erneute Bestätigung bleibt der Bankstand am 25.09. veraltet,
+    # der Lauf blockiert vollständig (NICHTS wird tatsächlich versandt).
+    _seed_debt(hv, contract, account, admin_ctx, vier_stufen=True, faelligkeit=date(2026, 9, 5))
+
+    ergebnis_blockiert = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 25))
+    assert ergebnis_blockiert["gesendet"] == 0
+
+    # Die Bank wird jetzt tatsächlich bestätigt - ein Retry DESSELBEN
+    # Prüfdatums muss trotzdem noch senden können (Slot war freigegeben).
+    state["sent"] = "2026-09-25T09:00:00Z"
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="SYNTHETIC-BANK", bestaetigt_bis=date(2026, 9, 25), bestaetigt_von="SYNTHETIC-TEST")
+    ergebnis_retry = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 25))
+    assert ergebnis_retry["gesendet"] == 1

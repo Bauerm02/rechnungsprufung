@@ -1195,6 +1195,32 @@ def test_resolve_kanal_nutzt_freigegebene_regel(
     assert service._resolve_kanal(2) == "BRIEF"
 
 
+def test_resolve_kanal_beruecksichtigt_stufe3_und_stufe4_eigenstaendig(
+    mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+    kanalregel_repo, brief_anbieterprofil_repo,
+):
+    """Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026,
+    reproduzierter Fehler): `_resolve_kanal` lieferte für Stufe 3/4
+    FÄLSCHLICH immer `stufe2_kanal` zurück und ignorierte die mit
+    Auftrag HV-20261020-VIER-MAHNSTUFEN hinzugefügten Felder
+    `stufe3_kanal`/`stufe4_kanal`. Regel hier: 1=EMAIL, 2=EMAIL,
+    3=BRIEF, 4=BRIEF - Stufe 3/4 müssen EIGENSTÄNDIG BRIEF liefern,
+    nicht das (hier abweichende) Stufe-2-EMAIL."""
+
+    service = _mahn_service_mit_brief(
+        mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
+        kanalregel_repo, brief_anbieterprofil_repo,
+    )
+    regel = kanalregel_repo.anlegen(
+        stufe1_kanal="EMAIL", stufe2_kanal="EMAIL", stufe3_kanal="BRIEF", stufe4_kanal="BRIEF", erstellt_von="test",
+    )
+    kanalregel_repo.freigeben(regel.id, freigegeben_von="test")
+    assert service._resolve_kanal(1) == "EMAIL"
+    assert service._resolve_kanal(2) == "EMAIL"
+    assert service._resolve_kanal(3) == "BRIEF"
+    assert service._resolve_kanal(4) == "BRIEF"
+
+
 def test_plane_forderung_stufe2_brief_erfordert_postadresse_nicht_email(
     mahn_fall_repo, stammdaten_repo, op_service, mahn_policy_repo, mahnlauf_repo,
     kanalregel_repo, brief_anbieterprofil_repo, freigegebene_kanalregel_email_brief,

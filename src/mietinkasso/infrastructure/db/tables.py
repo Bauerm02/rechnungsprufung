@@ -893,6 +893,51 @@ class MahnLaufTable(Base):
     zugang_bestaetigt_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
+class MahnTageslaufTable(Base):
+    """Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026,
+    reproduzierter Fehler): `HVMailversandService.mahnlauf` wählte bisher
+    je AUFRUF nur die höchste gerade geplante Stufe je Vertrag
+    (`geplante_stufen[-1:]`) - das schützt NUR INNERHALB EINES
+    Funktionsaufrufs, nicht DAUERHAFT über mehrere Aufrufe für denselben
+    Kalendertag hinweg. Ein zweiter Aufruf für dasselbe `pruefdatum`
+    (Crash-Retry, Parallelität, oder weil zwischenzeitlich eine NEUE
+    Forderung desselben Vertrags fällig/versandreif wurde) konnte dadurch
+    einen ZWEITEN tatsächlichen Versand für denselben Vertrag am selben
+    Prüftag auslösen.
+
+    GENAU EIN Eintrag je (`vertrag_id`, `pruefdatum`) - der
+    UNIQUE-Constraint ist die EINZIGE Quelle der Exklusivität (kein
+    reiner In-Memory-Check, siehe Auftrag Markus "DB-seitig idempotenter
+    Slot ... kein reiner InMemory-Check"). Die Beanspruchung läuft über
+    denselben bewährten Claim-dann-CAS-Mechanismus wie
+    `MahnFallRepository.claim_fuer_versand`/`MahnLaufRepository.
+    claim_fuer_versand`: INSERT (`status=IN_BEARBEITUNG`) oder, falls
+    bereits eine Zeile mit `status=KEIN_VERSAND` existiert (ein früherer
+    Aufruf DESSELBEN Tages hat NICHTS tatsächlich versandt, z. B. weil
+    die Bankbestätigung fehlte), ein atomares `UPDATE ... WHERE
+    status=KEIN_VERSAND`. Ein Aufruf, der NICHTS claimen kann (die Zeile
+    ist bereits `VERSENDET` oder wird GERADE von einem anderen,
+    gleichzeitig laufenden Aufruf bearbeitet), überspringt diesen Vertrag
+    für den Rest DIESES Aufrufs vollständig - siehe
+    `mahnwesen/repository.py::MahnTageslaufRepository` und
+    `indexautomatik/mailversand_service.py::HVMailversandService.
+    mahnlauf`. Ein zwischen Claim und Ergebnis abgestürzter Prozess
+    hinterlässt die Zeile bei `IN_BEARBEITUNG` - `freigeben_verwaiste`
+    löst das NUR nach einer Mindestwartezeit auf (kein blinder
+    Sofort-Retry innerhalb eines noch laufenden Prozesses)."""
+
+    __tablename__ = "mahn_tageslaeufe"
+    __table_args__ = (UniqueConstraint("vertrag_id", "pruefdatum", name="uq_mahn_tageslauf_vertrag_datum"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    pruefdatum: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="IN_BEARBEITUNG", server_default=text("'IN_BEARBEITUNG'"))
+    mahnlauf_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    aktualisiert_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class VertragMitmieterTable(Base):
     """Auftrag HV-20261020-VIER-MAHNSTUFEN: rein additive, NICHT-
     finanzielle Zusatz-Empfänger eines Vertrags ("Mitmieter") - AUSSCHLIESSLICH

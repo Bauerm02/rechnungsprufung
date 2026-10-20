@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from mietinkasso.domain.enums import MahnStatus
 from mietinkasso.infrastructure.db.tables import (
     BriefAnbieterProfilTable, MahnEmpfaengerZugangTable, MahnFallTable, MahnKanalregelTable, MahnLaufTable,
-    MahnPolicyTable, VertragMitmieterTable,
+    MahnPolicyTable, MahnTageslaufTable, VertragMitmieterTable,
 )
 
 
@@ -774,3 +774,101 @@ class MahnEmpfaengerZugangRepository:
         if not daten or any(d is None for d in daten):
             return None
         return max(daten)
+
+
+class MahnTageslaufRepository:
+    """DB-seitig atomarer Slot "höchstens EIN tatsächlicher Versand-
+    versuch je (Vertrag, Prüfdatum)" - siehe `MahnTageslaufTable`-
+    Docstring für den reproduzierten Fehler, den das behebt. Verwendet
+    denselben Claim-dann-CAS-Mechanismus wie `MahnFallRepository.
+    claim_fuer_versand`/`MahnLaufRepository.claim_fuer_versand`."""
+
+    def __init__(self, session_factory: sessionmaker[Session]):
+        self._session_factory = session_factory
+
+    def claim(self, *, vertrag_id: str, pruefdatum: date) -> MahnTageslaufTable | None:
+        """Beansprucht den Slot für (`vertrag_id`, `pruefdatum`) - gibt
+        die geclaimte Zeile zurück, wenn ERFOLGREICH (entweder neu
+        angelegt, oder eine frühere Zeile DESSELBEN Tages stand auf
+        `KEIN_VERSAND`, also hat NICHTS tatsächlich versandt), sonst
+        `None` (die Zeile ist bereits `VERSENDET` oder wird GERADE von
+        einem anderen, noch laufenden Aufruf bearbeitet - der Aufrufer
+        überspringt diesen Vertrag dann für den Rest DIESES Aufrufs
+        vollständig)."""
+
+        with self._session_factory() as session:
+            row = MahnTageslaufTable(vertrag_id=vertrag_id, pruefdatum=pruefdatum, status="IN_BEARBEITUNG")
+            session.add(row)
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+            else:
+                session.refresh(row)
+                return row
+
+        with self._session_factory() as session:
+            result = session.execute(
+                update(MahnTageslaufTable)
+                .where(MahnTageslaufTable.vertrag_id == vertrag_id)
+                .where(MahnTageslaufTable.pruefdatum == pruefdatum)
+                .where(MahnTageslaufTable.status == "KEIN_VERSAND")
+                .values(status="IN_BEARBEITUNG", aktualisiert_am=datetime.now(timezone.utc))
+            )
+            session.commit()
+            if result.rowcount == 0:
+                return None
+            return session.execute(
+                select(MahnTageslaufTable)
+                .where(MahnTageslaufTable.vertrag_id == vertrag_id)
+                .where(MahnTageslaufTable.pruefdatum == pruefdatum)
+            ).scalar_one()
+
+    def markiere_versendet(self, tageslauf_id: int, *, mahnlauf_id: int | None) -> None:
+        """Hält den Slot DAUERHAFT geschlossen (`VERSENDET`) - es gab in
+        diesem Aufruf einen TATSÄCHLICHEN Versandversuch (GESENDET oder
+        UNSICHER, also Bytes unterwegs), kein weiterer Aufruf DESSELBEN
+        Tages darf diesen Vertrag deshalb nochmal versuchen."""
+
+        with self._session_factory() as session:
+            session.execute(
+                update(MahnTageslaufTable)
+                .where(MahnTageslaufTable.id == tageslauf_id)
+                .values(status="VERSENDET", mahnlauf_id=mahnlauf_id, aktualisiert_am=datetime.now(timezone.utc))
+            )
+            session.commit()
+
+    def freigeben(self, tageslauf_id: int) -> None:
+        """Gibt den Slot wieder frei - in DIESEM Aufruf wurde NICHTS
+        tatsächlich versandt (z. B. keine versandreife Stufe, oder die
+        Bankbestätigung fehlte) - ein SPÄTERER Aufruf DESSELBEN Tages
+        kann den Vertrag dann erneut versuchen, sobald sich das ändert."""
+
+        with self._session_factory() as session:
+            session.execute(
+                update(MahnTageslaufTable)
+                .where(MahnTageslaufTable.id == tageslauf_id)
+                .where(MahnTageslaufTable.status == "IN_BEARBEITUNG")
+                .values(status="KEIN_VERSAND", aktualisiert_am=datetime.now(timezone.utc))
+            )
+            session.commit()
+
+    def freigeben_verwaiste(self, *, aelter_als: datetime) -> int:
+        """Löst Zeilen auf, die seit `aelter_als` in `IN_BEARBEITUNG`
+        feststecken - z. B. weil der Prozess zwischen `claim` und dem
+        Auflösen des Ergebnisses abgestürzt ist (dasselbe Recovery-
+        Prinzip wie `MahnFallRepository.verwaiste_in_versand`/
+        `markiere_verwaiste_mahnlaeufe_als_unsicher`). Setzt auf
+        `KEIN_VERSAND` zurück (konservativ: ein späterer Aufruf prüft
+        dann erneut, OB tatsächlich etwas fehlt, statt den Vertrag
+        dauerhaft zu blockieren)."""
+
+        with self._session_factory() as session:
+            result = session.execute(
+                update(MahnTageslaufTable)
+                .where(MahnTageslaufTable.status == "IN_BEARBEITUNG")
+                .where(MahnTageslaufTable.erstellt_am < aelter_als)
+                .values(status="KEIN_VERSAND", aktualisiert_am=datetime.now(timezone.utc))
+            )
+            session.commit()
+            return result.rowcount

@@ -27,7 +27,7 @@ from mietinkasso.mahnwesen.kosten_service import MahnkostenService
 from mietinkasso.mahnwesen.mahnbrief_archiv import MahnbriefArchivRepository
 from mietinkasso.mahnwesen.repository import (
     BriefAnbieterProfilRepository, MahnEmpfaengerZugangRepository, MahnFallRepository, MahnKanalregelRepository,
-    MahnLaufRepository, MahnPolicyRepository, VertragMitmieterRepository,
+    MahnLaufRepository, MahnPolicyRepository, MahnTageslaufRepository, VertragMitmieterRepository,
 )
 from mietinkasso.mahnwesen.service import MahnwesenService, VersandErgebnis
 from mietinkasso.op.repository import OPRepository
@@ -158,6 +158,14 @@ class HVMailversandService:
         # _naechste_stufe_fuer_forderung`/`_pruefe_vorstufe_abstand`).
         self.mitmieter_repo = VertragMitmieterRepository(session_factory)
         self.empfaenger_zugang_repo = MahnEmpfaengerZugangRepository(session_factory)
+        # Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026,
+        # reproduzierter Fehler): DB-seitiger, über den UNIQUE-Constraint
+        # abgesicherter Claim "höchstens ein tatsächlicher Versandversuch
+        # je (Vertrag, Prüfdatum)" - siehe `MahnTageslaufTable`-Docstring
+        # und `mahnlauf()` unten. IMMER verdrahtet (nicht optional) - die
+        # Exklusivität ist eine allgemeine Korrektheitseigenschaft, nicht
+        # auf das Vier-Stufen-Profil beschränkt.
+        self.tageslauf_repo = MahnTageslaufRepository(session_factory)
         self._brief_sftp_konfiguration = brief_sftp.konfiguration_aus_settings(settings)
         self.brief_sftp_adapter = (
             brief_sftp.PostSftpTransportadapter(self._brief_sftp_konfiguration)
@@ -629,6 +637,14 @@ class HVMailversandService:
         # (siehe `MahnwesenService.vervollstaendige_gesendete_
         # mahnlaeufe`-Docstring).
         self.mahn_service.vervollstaendige_gesendete_mahnlaeufe(ctx=ctx, akteur="hv-mailversand-recovery")
+        # Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026): löst
+        # Tageslauf-Claims auf, die seit mind. 15 Minuten in
+        # IN_BEARBEITUNG feststecken (z. B. Absturz zwischen Claim und
+        # Ergebnis) - siehe `MahnTageslaufRepository.freigeben_
+        # verwaiste`-Docstring. Dieselbe Mindestwartezeit-Logik wie die
+        # bestehende Mahnfall-/Mahnlauf-Recovery oben, kein Sofort-Retry
+        # innerhalb eines noch laufenden Prozesses.
+        self.tageslauf_repo.freigeben_verwaiste(aelter_als=datetime.now(timezone.utc) - timedelta(minutes=15))
         policy = self.policy_repo.aktuelle_freigegebene()
         counts = {"geplant": 0, "gesendet": 0, "blockiert": 0}
         if policy is None:
@@ -656,6 +672,9 @@ class HVMailversandService:
                 if account is None:
                     continue
                 confirmed, unclear = bank_freigabe_ableiten(self.bank_repo, self.bank_service, contract.gesellschaft_id, contract.id)
+                # Planung läuft IMMER (harmlos/idempotent, hält die
+                # MahnFall-Zeilen aktuell) - NUR der tatsächliche Versand
+                # weiter unten wird pro Prüftag begrenzt.
                 planned = self.mahn_service.plane_alle_offenen_forderungen(ctx=ctx, vertrag=contract,
                     konto=account, policy=policy, heute=heute, bank_bestaetigt_bis=confirmed,
                     ungeklaerte_eingaenge_vorhanden=unclear)
@@ -688,17 +707,52 @@ class HVMailversandService:
                 # Einschränkung ist aus Vorsicht/Klarheit aber generell
                 # formuliert, nicht nur für das Vier-Stufen-Profil).
                 stufen_fuer_diesen_lauf = geplante_stufen[-1:] if geplante_stufen else []
-                for stufe in stufen_fuer_diesen_lauf:
-                    mahnlauf = self.mahn_service.plane_mahnlauf(
-                        ctx=ctx, vertrag=contract, konto=account, stufe=stufe, heute=heute,
-                        bank_bestaetigt_bis=confirmed, ungeklaerte_eingaenge_vorhanden=unclear,
-                    )
-                    if mahnlauf is None:
-                        continue
-                    ergebnis = self._dispatch_mahnlauf(
-                        ctx=ctx, mahnlauf=mahnlauf, heute=heute, confirmed=confirmed, unclear=unclear,
-                    )
-                    counts["gesendet" if ergebnis.status == "GESENDET" else "blockiert"] += 1
+                if not stufen_fuer_diesen_lauf:
+                    continue
+
+                # Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026,
+                # reproduzierter Fehler): die Auswahl "höchstens eine
+                # Stufe je Aufruf" OBEN schützt NUR innerhalb DIESES
+                # Funktionsaufrufs - ein zweiter Aufruf für `heute`
+                # (Crash-Retry, Parallelität, oder eine zwischenzeitlich
+                # neu gebuchte, bereits fällige Forderung) konnte sonst
+                # einen ZWEITEN tatsächlichen Versand für denselben
+                # Vertrag am selben Prüftag auslösen. Der DB-seitige,
+                # über den UNIQUE-Constraint abgesicherte Claim
+                # (`MahnTageslaufTable`) ist die EINZIGE Quelle der
+                # Exklusivität - siehe dortigen Docstring. Erst HIER
+                # geclaimt (nicht schon vor der Planung), damit ein
+                # bereits für `heute` geschlossener Slot die harmlose
+                # Planung/Buchführung nicht mitblockiert.
+                tageslauf = self.tageslauf_repo.claim(vertrag_id=contract.id, pruefdatum=heute)
+                if tageslauf is None:
+                    continue
+                tatsaechlich_versucht = False
+                letzter_mahnlauf = None
+                try:
+                    for stufe in stufen_fuer_diesen_lauf:
+                        letzter_mahnlauf = self.mahn_service.plane_mahnlauf(
+                            ctx=ctx, vertrag=contract, konto=account, stufe=stufe, heute=heute,
+                            bank_bestaetigt_bis=confirmed, ungeklaerte_eingaenge_vorhanden=unclear,
+                        )
+                        if letzter_mahnlauf is None:
+                            continue
+                        ergebnis = self._dispatch_mahnlauf(
+                            ctx=ctx, mahnlauf=letzter_mahnlauf, heute=heute, confirmed=confirmed, unclear=unclear,
+                        )
+                        counts["gesendet" if ergebnis.status == "GESENDET" else "blockiert"] += 1
+                        if ergebnis.status in ("GESENDET", "UNSICHER"):
+                            # Bytes waren tatsächlich unterwegs - der Slot
+                            # bleibt DAUERHAFT geschlossen, egal ob der
+                            # Provider die Annahme schon bestätigt hat.
+                            tatsaechlich_versucht = True
+                finally:
+                    if tatsaechlich_versucht:
+                        self.tageslauf_repo.markiere_versendet(
+                            tageslauf.id, mahnlauf_id=(letzter_mahnlauf.id if letzter_mahnlauf is not None else None),
+                        )
+                    else:
+                        self.tageslauf_repo.freigeben(tageslauf.id)
             except ObjektAusgeschlossenError:
                 continue
         return counts
