@@ -287,12 +287,6 @@ class HVMailversandService:
 
         send_enabled = bool(self.client and self.settings.send_enabled and self.settings.hv_mail_allowlist_bestaetigt)
         vorschau_slot: dict = {}
-        # Auftrag HV-20261020-MAHN-FORTSETZUNG ("tatsächlich belegter
-        # Versand an alle bestätigten Mitmieter"): sammelt je EMAIL-
-        # Mitmieter-Kopie, ob der zusätzliche Versandversuch tatsächlich
-        # geglückt ist - siehe `versand_fn` unten und die Auswertung nach
-        # `versende_mahnlauf`.
-        mitmieter_versand_slot: dict[int, tuple[bool, str | None]] = {}
 
         def versand_fn(mitglieder):
             if mahnlauf.kanal == "BRIEF":
@@ -407,6 +401,37 @@ class HVMailversandService:
                 "Bei Fragen zur Forderung antworten Sie bitte auf diese Nachricht."
             )
             op_ids = sorted(m.forderung_op_position_id for m in mitglieder)
+
+            # Auftrag HV-20261020-MAHN-FORTSETZUNG, Nachprüfung (Markus
+            # 20.10.2026, synthetischer Outcome-Test: "echte Empfänger-
+            # fortsetzung einschließlich Teilfehleridempotenz und
+            # eingefrorenen eigenen Nachweisen"): die erwarteten Empfänger
+            # (Hauptdebitor + die zu DIESEM Zeitpunkt - also VOR jedem
+            # Providerkontakt - tatsächlich bestätigten Mitmieter) werden
+            # jetzt BEREITS HIER eingefroren, nicht erst nachträglich nach
+            # einer (ggf. erst später eintretenden) Bestätigung des
+            # Hauptversands. Dasselbe Prinzip wie der Kosten-/
+            # Inhaltssnapshot oben: durabel VOR dem eigentlichen
+            # Provideraufruf, damit ein Absturz/eine erst später über die
+            # Status-Abgleich-/Recovery-Strecke bestätigte Gruppe keinen
+            # bereits tatsächlich erfolgten Mitmieter-Kopieversand mehr
+            # "vergessen" kann (das war die vorherige Lücke - siehe
+            # OFFENE_PUNKTE.md, "versand_belegt_am-Bookkeeping kann
+            # lückenhaft bleiben").
+            bestaetigte_mitmieter = (
+                self.mitmieter_repo.list_bestaetigte_mitmieter(mahnlauf.vertrag_id)
+                if self.mitmieter_repo is not None else []
+            )
+            empfaenger_zugang_je_mitmieter: dict[int | None, object] = {}
+            if self.empfaenger_zugang_repo is not None:
+                erwartete_empfaenger = [(None, empfaenger_name)] + [(m.id, m.name) for m in bestaetigte_mitmieter]
+                self.empfaenger_zugang_repo.erstelle_erwartete_eintraege(
+                    mahnlauf_id=mahnlauf.id, empfaenger=erwartete_empfaenger, erstellt_von="hv-mailversand",
+                )
+                empfaenger_zugang_je_mitmieter = {
+                    eintrag.mitmieter_id: eintrag for eintrag in self.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id)
+                }
+
             haupt_beleg = self.client.senden(MailOpsAuftrag(
                 "mahnungslauf:" + mahnlauf.outbox_key, "MAHNUNG",
                 anker.snapshot["empfaenger_email"], empfaenger_name, subject, text,
@@ -414,18 +439,21 @@ class HVMailversandService:
                 f"FORDERUNGEN:{','.join(str(i) for i in op_ids)}",
             ))
 
-            # Auftrag HV-20261020-MAHN-FORTSETZUNG ("tatsächlich belegter
-            # Versand an alle bestätigten Mitmieter, primär vorhandene
-            # Services/Empfänger-Snapshots nutzen, keine zweite
-            # Finanzstrecke"): JEDER aktive, BESTÄTIGTE Mitmieter mit
-            # hinterlegter E-Mail-Adresse bekommt eine EIGENE Kopie
-            # DESSELBEN, bereits oben komponierten Mahntexts - derselbe
-            # `self.client`/dieselbe `MailOpsAuftrag`-Infrastruktur wie der
-            # Hauptversand, nur mit einem je Person EIGENEN, deterministisch
-            # von `outbox_key` abgeleiteten Idempotenzschlüssel (ein Retry
-            # derselben Gruppe sendet dadurch niemals ein zweites Mal an
-            # dieselbe Person - dieselbe Idempotenzgarantie wie beim
-            # bestehenden Hauptversand).
+            # JEDER aktive, BESTÄTIGTE Mitmieter mit hinterlegter E-Mail-
+            # Adresse bekommt eine EIGENE Kopie DESSELBEN, bereits oben
+            # komponierten Mahntexts - derselbe `self.client`/dieselbe
+            # `MailOpsAuftrag`-Infrastruktur wie der Hauptversand, primär
+            # vorhandene Services/Empfänger-Snapshots genutzt, KEINE zweite
+            # Finanzstrecke. Jede Person bekommt einen EIGENEN,
+            # deterministisch von `outbox_key` abgeleiteten
+            # Idempotenzschlüssel (ein Retry derselben Gruppe sendet
+            # dadurch niemals ein zweites Mal an dieselbe Person - dieselbe
+            # Idempotenzgarantie wie beim bestehenden Hauptversand); der
+            # tatsächliche Erfolg wird UNMITTELBAR NACH DIESEM EINEN
+            # Versuch durabel in `MahnEmpfaengerZugangTable` nachgetragen -
+            # NICHT erst nachträglich nach Bestätigung des Hauptversands,
+            # und NIE in einer nur lokal gehaltenen, bei einem Absturz
+            # verlorenen Zwischenvariable.
             #
             # BEWUSST in einem eigenen try/except JE PERSON: ein
             # fehlgeschlagener/unsicherer Mitmieter-Kopieversand darf NIE
@@ -433,14 +461,16 @@ class HVMailversandService:
             # einen weiteren Mitmieter überspringen - jede Person wird
             # GENAU EINMAL versucht, unabhängig vom Ergebnis der anderen.
             # Der `MahnLauf`-/Mahnfall-Status (GESENDET/UNSICHER/BLOCKIERT)
-            # richtet sich WEITERHIN ausschließlich nach `haupt_beleg` -
-            # eine fehlgeschlagene Mitmieter-Kopie blockiert/verdoppelt den
-            # Hauptversand nicht, bleibt aber über `mitmieter_versand_slot`
-            # sichtbar (siehe Auswertung nach `versende_mahnlauf` unten).
-            if self.mitmieter_repo is not None:
-                for mitmieter in self.mitmieter_repo.list_bestaetigte_mitmieter(mahnlauf.vertrag_id):
+            # richtet sich WEITERHIN ausschließlich nach `haupt_beleg`.
+            if self.empfaenger_zugang_repo is not None:
+                for mitmieter in bestaetigte_mitmieter:
                     if not mitmieter.email:
                         continue  # keine angenommene/erfundene Adresse - kein Versand ohne echte E-Mail
+                    eintrag = empfaenger_zugang_je_mitmieter.get(mitmieter.id)
+                    if eintrag is None:
+                        continue  # konnte nicht eingefroren werden - kein Versand ohne zugehörigen Nachweisplatz
+                    if eintrag.versand_belegt_am is not None:
+                        continue  # bereits belegt (Teilfehleridempotenz) - nie ein zweites Mal versuchen
                     mitmieter_text = text.replace(f"Guten Tag {empfaenger_name},", f"Guten Tag {mitmieter.name},", 1)
                     mitmieter_schluessel = f"mahnungslauf:{mahnlauf.outbox_key}:mitmieter:{mitmieter.id}"
                     try:
@@ -450,36 +480,27 @@ class HVMailversandService:
                             f"MITMIETER:{mitmieter.id}",
                         ))
                     except Exception:
-                        mitmieter_versand_slot[mitmieter.id] = (False, None)
-                        continue
+                        continue  # bleibt unbelegt - sichtbarer, nicht erfundener Fehlversuch
                     proof = nachweis_daten(kopie_beleg)
-                    mitmieter_versand_slot[mitmieter.id] = (
-                        proof is not None, (proof["externe_referenz"] if proof is not None else None)
+                    if proof is None:
+                        continue  # kein tatsächlicher Versandnachweis - kein erfundener Beleg
+                    # Eingefrorener EIGENER Nachweis dieser Person: der
+                    # TATSÄCHLICHE, vom Provider bestätigte Versandzeitpunkt
+                    # (nicht die lokale Serverzeit "jetzt") plus dessen
+                    # externe Referenz - dasselbe Belegprinzip wie beim
+                    # Hauptversand (`nachweis_daten`/`versand_belegen`).
+                    self.empfaenger_zugang_repo.markiere_versand(
+                        eintrag.id, versand_belegt_am=datetime.fromisoformat(proof["versendet_am"]),
+                        versand_referenz=proof["externe_referenz"],
                     )
 
             return haupt_beleg
 
-        ergebnis = self.mahn_service.versende_mahnlauf(
+        return self.mahn_service.versende_mahnlauf(
             ctx=ctx, mahnlauf_id=mahnlauf.id, heute=heute, bank_bestaetigt_bis=confirmed,
             ungeklaerte_eingaenge_vorhanden=unclear, send_enabled=send_enabled,
             versand_fn=versand_fn, mahnkosten_vorschau_slot=vorschau_slot,
         )
-        if ergebnis.status == "GESENDET" and mitmieter_versand_slot and self.empfaenger_zugang_repo is not None:
-            # Erst JETZT existieren die erwarteten-Empfänger-Platzhalter
-            # dieses Mahnlaufs (`_vervollstaendige_bestaetigten_mahnlauf`
-            # legt sie beim bestätigten GESENDET-Übergang an) - die oben
-            # gesammelten Versandergebnisse werden ihnen hier nachgetragen,
-            # reiner Bookkeeping-Schritt OHNE jede Auswirkung auf den
-            # bereits abgeschlossenen Versand/die Kostenbuchung.
-            for eintrag in self.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id):
-                if eintrag.mitmieter_id is None or eintrag.mitmieter_id not in mitmieter_versand_slot:
-                    continue
-                erfolgreich, referenz = mitmieter_versand_slot[eintrag.mitmieter_id]
-                if erfolgreich:
-                    self.empfaenger_zugang_repo.markiere_versand(
-                        eintrag.id, versand_belegt_am=datetime.now(timezone.utc), versand_referenz=referenz,
-                    )
-        return ergebnis
 
     def _sende_brief(self, *, mahnlauf, mitglieder, heute, vorschau_slot) -> None:
         """Kanal-BRIEF-Gegenstück zu `_dispatch_mahnlauf`s E-Mail-

@@ -1241,3 +1241,71 @@ def test_bestaetigte_mitmieter_bekommen_eigene_kopie_teilausfall_ohne_doppelvers
     service.client.senden = original_senden
     service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 14))
     assert len(state["calls"]) == 2
+
+
+def test_mitmieter_kopiennachweis_bleibt_durabel_auch_bei_absturz_nach_dem_versand(
+    hv, basis_vertrag, admin_ctx, monkeypatch,
+):
+    """Nachprüfung (Markus 20.10.2026, synthetischer Outcome-Test): das
+    Mitmieter-Versandbookkeeping darf NICHT erst in einem Schritt NACH
+    `versende_mahnlauf()` geschrieben werden (dort wäre es bei einem
+    Absturz/einer Exception ZWISCHEN bestätigtem Versand und Kosten-
+    buchung verloren, obwohl die Kopie tatsächlich bereits beim Provider
+    angenommen wurde) - es wird jetzt UNMITTELBAR nach dem einzelnen
+    Mitmieter-Sendeversuch INNERHALB von `versand_fn` selbst eingefroren,
+    bevor überhaupt etwas anderes passieren kann. Reproduziert exakt
+    denselben Absturzpunkt wie `test_absturz_zwischen_bestaetigtem_versand_
+    und_kostenbuchung_wird_anhand_snapshot_nachgeholt`, diesmal mit einem
+    bestätigten Mitmieter."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    state["status"] = "GESENDET"
+    _seed_zwei_komponenten(hv, contract, account, admin_ctx, faelligkeit=date(2026, 1, 5))
+    _bank_bestaetigen(service, contract, date(2026, 3, 1))
+    profil = service.mahnkosten_repo.zinsprofil_anlegen(
+        vertrag_id=contract.id, ist_b2b=False, vertragsdatum=None, erstellt_von="test",
+    )
+    service.mahnkosten_repo.zinsprofil_freigeben(profil.id, freigegeben_von="test")
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email="mitmieterin-a@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+
+    original_buche_vorschau = service.mahnkosten_service.buche_vorschau
+    aufrufe = {"anzahl": 0}
+
+    def kaputte_buchung(*args, **kwargs):
+        aufrufe["anzahl"] += 1
+        if aufrufe["anzahl"] == 1:
+            raise RuntimeError("Simulierter Absturz NACH bestätigtem Versand (inkl. Mitmieter-Kopie), VOR der Kostenbuchung.")
+        return original_buche_vorschau(*args, **kwargs)
+
+    monkeypatch.setattr(service.mahnkosten_service, "buche_vorschau", kaputte_buchung)
+    with pytest.raises(RuntimeError):
+        service.mahnlauf(ctx=admin_ctx, heute=date(2026, 3, 1))
+    monkeypatch.undo()
+
+    # Beide Nachrichten (Hauptversand + Mitmieter-Kopie) wurden TATSÄCHLICH
+    # an den Provider gesendet, BEVOR der simulierte Absturz eintrat.
+    empfaenger = {json.loads(c.content)["empfaenger_email"] for c in state["calls"]}
+    assert empfaenger == {"mieter@example.at", "mitmieterin-a@example.at"}
+    anzahl_nach_absturz = len(state["calls"])
+
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    eintrag = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    # ENTSCHEIDEND: trotz des Absturzes (NACH dem Versand, VOR der
+    # Kostenbuchung) ist der Mitmieter-Kopiennachweis bereits durabel
+    # vorhanden - er wurde NICHT erst nachträglich nach einem
+    # erfolgreichen `versende_mahnlauf()`-Rückgabewert geschrieben.
+    assert eintrag.versand_belegt_am is not None
+    assert eintrag.versand_referenz
+
+    # Die reguläre Recovery (holt NUR die Kostenbuchung nach, sendet NIE
+    # erneut) ändert daran nichts und löst KEINEN zweiten Kopieversand aus.
+    service.mahn_service.vervollstaendige_gesendete_mahnlaeufe(ctx=admin_ctx, akteur="recovery-test")
+    assert len(state["calls"]) == anzahl_nach_absturz
+    eintrag_nach_recovery = next(
+        e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id
+    )
+    assert eintrag_nach_recovery.versand_belegt_am == eintrag.versand_belegt_am
+    assert eintrag_nach_recovery.versand_referenz == eintrag.versand_referenz

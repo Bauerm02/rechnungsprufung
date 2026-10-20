@@ -1,5 +1,71 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## Mahn-Fortsetzung, Nachprüfung (Markus 20.10.2026, synthetischer
+## Outcome-Test gegen 46e68ad): durabler Mitmieter-Kopiennachweis statt
+## nachträglichem Bookkeeping (Teilcheckpoint, KEIN Gesamtabschluss)
+
+Der unabhängige synthetische Outcome-Test gegen den Vorgänger-Commit
+(46e68ad, vor dem Mahn-Fortsetzungs-Commit `b4a5f57`) bestätigte den
+damals bereits bekannten, in diesem Dokument selbst benannten Rest: kein
+tatsächlicher POST an bestätigte Mitmieter. Dieser Rest war mit
+`b4a5f57` bereits behoben (Mitmieter-Kopieversand, siehe Abschnitt
+"Mahn-Fortsetzung" weiter unten) - die dort selbst ehrlich benannte
+verbleibende Lücke ("`versand_belegt_am`-Bookkeeping kann bei einer
+SPÄTER bestätigten Gruppe lückenhaft bleiben") ist jetzt ebenfalls
+geschlossen:
+
+**Vorher:** der Mitmieter-Kopiennachweis (`versand_belegt_am`/
+`versand_referenz`) wurde erst NACH der Rückkehr von
+`MahnwesenService.versende_mahnlauf(...)` geschrieben, und nur, wenn
+diese Rückgabe synchron bereits `GESENDET` meldete. Löste `versand_fn`
+intern bereits erfolgreich beide E-Mails (Hauptversand + Mitmieter-Kopie)
+aus, stürzte aber IRGENDETWAS Nachgelagertes (z. B. die Kostenbuchung)
+ab, BEVOR die Rückgabe diesen Code-Pfad erreichte, ging der bereits
+tatsächlich erfolgte Mitmieter-Nachweis spurlos verloren - kein
+Doppelversand-Risiko (die Idempotenzschlüssel blieben wirksam), aber eine
+unvollständige, irreführende Nachweisanzeige im Backoffice.
+
+**Jetzt** (`indexautomatik/mailversand_service.py::_dispatch_mahnlauf`):
+- Die erwarteten Empfänger (Hauptdebitor + die zu DIESEM Zeitpunkt
+  bestätigten Mitmieter) werden JETZT BEREITS VOR dem ersten tatsächlichen
+  Providerkontakt eingefroren (`MahnEmpfaengerZugangRepository.
+  erstelle_erwartete_eintraege`) - dasselbe "vor jedem Providerkontakt
+  einfrieren"-Prinzip wie der bestehende Kosten-/Inhaltssnapshot, nicht
+  erst nachträglich nach einer (ggf. erst später eintretenden)
+  Bestätigung.
+- Jeder Mitmieter-Kopieversand schreibt sein Ergebnis UNMITTELBAR NACH
+  DEM EINEN Sendeversuch durabel in die Datenbank (`markiere_versand`) -
+  innerhalb von `versand_fn` selbst, NICHT in einer nur lokal gehaltenen
+  Zwischenvariable, die bei einem späteren Absturz verloren ginge.
+- Der eingefrorene Nachweis trägt jetzt den TATSÄCHLICHEN, vom Provider
+  bestätigten Versandzeitpunkt (`nachweis_daten(...)["versendet_am"]`),
+  nicht die lokale Serverzeit zum Zeitpunkt des Schreibens - derselbe
+  Belegstandard wie beim Hauptversand.
+- Teilfehleridempotenz bleibt erhalten und wurde zusätzlich um einen
+  expliziten "bereits belegt" Vorab-Check ergänzt (`eintrag.versand_
+  belegt_am is not None` -> Mitmieter wird übersprungen) - strukturell
+  vorbereitet für eine spätere, noch nicht gebaute manuelle Nachsende-
+  Aktion für einen einzelnen fehlgeschlagenen Kopieversand.
+
+Neuer Regressionstest (`test_mitmieter_kopiennachweis_bleibt_durabel_
+auch_bei_absturz_nach_dem_versand`) reproduziert exakt denselben
+Absturzpunkt wie der bestehende `test_absturz_zwischen_bestaetigtem_
+versand_und_kostenbuchung_wird_anhand_snapshot_nachgeholt`-Test (Crash in
+der Kostenbuchung NACH bestätigtem Versand) und belegt, dass der
+Mitmieter-Kopiennachweis diesen Absturz unverändert übersteht. Voller
+Testlauf (1570 Tests) grün.
+
+**Ehrlich weiterhin offen (bewusst NICHT in diesem Teilcheckpoint
+gelöst, KEIN Gesamtabschluss der Mahnarbeiten):**
+- **Keine manuelle Nachsende-Aktion für einen einzelnen fehlgeschlagenen
+  Mitmieter-Kopieversand.** Schlägt der EINE Sendeversuch fehl (z. B.
+  Providerfehler), bleibt der Eintrag dauerhaft unbelegt - es gibt noch
+  keinen sicheren, explizit ausgelösten "diese eine Kopie jetzt
+  nachsenden"-Schritt im Backoffice. Strukturell bereits vorbereitet
+  (siehe oben), aber nicht gebaut.
+- **BRIEF-Kanal weiterhin ohne Mitmieter-Kopie** (siehe unten, unverändert
+  offen).
+
 ## Mahn-Fortsetzung (HV-20261020-MAHN-FORTSETZUNG, Markus 20.10.2026):
 ## Zahlungsziel aus geprüfter Gesellschaftsbindung, Mitmieter-Kopieversand,
 ## Vier-Stufen-/Kanal-Backoffice-UI
@@ -77,6 +143,13 @@ Einempfänger-Pfad.
   dieser Umgebung ohnehin durchgehend ohne echten Transport bleibt
   (`brief_transport_verfuegbar=False`), ist das Risiko aktuell gering,
   muss aber vor einer echten Brief-Inbetriebnahme nachgezogen werden.
+> **Behoben durch die Nachprüfungs-Sektion ganz oben in diesem Dokument**:
+> das folgende `versand_belegt_am`-Bookkeeping-Problem wurde geschlossen -
+> der Nachweis wird jetzt unmittelbar innerhalb von `versand_fn` selbst
+> geschrieben, nicht erst nachträglich. Dieser Absatz bleibt als
+> historischer Beleg stehen, beschreibt aber NICHT mehr den aktuellen
+> Stand.
+
 - **`versand_belegt_am`-Bookkeeping kann bei einer SPÄTER (nicht
   unmittelbar) bestätigten Gruppe lückenhaft bleiben.** Die
   Mitmieter-Kopien werden zwar IMMER im selben `versand_fn`-Aufruf
