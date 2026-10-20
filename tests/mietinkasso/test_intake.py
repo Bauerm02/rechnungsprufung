@@ -956,6 +956,73 @@ def test_mietvertragsprofil_wird_versioniert_angelegt(session_factory, stammdate
     assert profil.mahngebuehr_cent is None  # kein erfundener Default
 
 
+# -- Auftrag HV-20261020-VERTRAGSDATENBASIS: zwölf zusätzliche Felder ------
+
+
+def test_mietvertragsprofil_neue_felder_werden_versioniert_uebernommen(session_factory, stammdaten_repo, op_service):
+    paket = _paket(mietvertragsprofile=[{
+        "vertrag_id": "V-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL",
+        "unterzeichnungsdatum": "2015-06-01", "unterzeichnungsdatum_quellenbeleg": "Vertrag S.1",
+        "uebergabe_am": "2015-07-01", "letzte_verlaengerung_am": "2020-06-01",
+        "befristungsstatus": "BEFRISTET", "bk_hk_abrechnungsart": "AKONTO_VORAUSZAHLUNG",
+        "bk_hk_verteilungsschluessel": "nach Nutzfläche",
+        "verbraucher_unternehmer_status_mieter": "VERBRAUCHER",
+        "verbraucher_unternehmer_status_vermieter": "UNTERNEHMER",
+        "rechtsachse_mrg_anwendungsbereich": "VOLL", "rechtsachse_mietzinsbildung": "RICHTWERT",
+    }])
+    plan = _plan(paket, session_factory)
+    assert next(b for b in plan.befunde if b.entitaet == "Mietvertragsprofil").status == "NEU"
+    _apply(paket, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    profil = stammdaten_repo.neuestes_mietvertragsprofil("V-1")
+    assert profil.unterzeichnungsdatum.isoformat() == "2015-06-01"
+    assert profil.unterzeichnungsdatum_quellenbeleg == "Vertrag S.1"
+    assert profil.uebergabe_am.isoformat() == "2015-07-01"
+    assert profil.letzte_verlaengerung_am.isoformat() == "2020-06-01"
+    assert profil.befristungsstatus == "BEFRISTET"
+    assert profil.bk_hk_abrechnungsart == "AKONTO_VORAUSZAHLUNG"
+    assert profil.bk_hk_verteilungsschluessel == "nach Nutzfläche"
+    assert profil.verbraucher_unternehmer_status_mieter == "VERBRAUCHER"
+    assert profil.verbraucher_unternehmer_status_vermieter == "UNTERNEHMER"
+    assert profil.rechtsachse_mrg_anwendungsbereich == "VOLL"
+    assert profil.rechtsachse_mietzinsbildung == "RICHTWERT"
+
+
+def test_mietvertragsprofil_neue_felder_defaulten_auf_ungeklaert_ohne_ableitung(session_factory, stammdaten_repo, op_service):
+    """Auftrag Markus: 'Leeres Ende darf NICHT automatisch unbefristet
+    sein' - ein Vertrag OHNE `gueltig_bis` und OHNE ausdrücklich
+    angegebenen `befristungsstatus` bleibt UNGEKLAERT, NIE automatisch
+    UNBEFRISTET. Dasselbe Vorsichtsprinzip gilt für die übrigen neuen
+    Tri-State-Felder: kein Fund/keine Angabe bedeutet UNGEKLAERT, nie
+    eine geratene Ableitung aus Nutzungsart/Betrag/sonstigen Feldern."""
+
+    paket = _paket(mietvertragsprofile=[{"vertrag_id": "V-1", "nutzungsart": "BUERO", "quelle_typ": "MANUELL"}])
+    plan = _plan(paket, session_factory)
+    _apply(paket, plan, stammdaten_repo=stammdaten_repo, op_service=op_service, session_factory=session_factory)
+    profil = stammdaten_repo.neuestes_mietvertragsprofil("V-1")
+    assert profil.befristungsstatus == "UNGEKLAERT"
+    assert profil.bk_hk_abrechnungsart == "UNGEKLAERT"
+    assert profil.verbraucher_unternehmer_status_mieter == "UNGEKLAERT"
+    assert profil.verbraucher_unternehmer_status_vermieter == "UNGEKLAERT"
+    assert profil.rechtsachse_mrg_anwendungsbereich == "UNGEKLAERT"
+    assert profil.rechtsachse_mietzinsbildung == "UNGEKLAERT"
+
+
+@pytest.mark.parametrize("feld,wert", [
+    ("befristungsstatus", "IRGENDWAS"),
+    ("bk_hk_abrechnungsart", "SONSTIGES"),
+    ("verbraucher_unternehmer_status_mieter", "FIRMA"),
+    ("verbraucher_unternehmer_status_vermieter", "FIRMA"),
+    ("rechtsachse_mrg_anwendungsbereich", "HALBVOLL"),
+    ("rechtsachse_mietzinsbildung", "MARKT"),
+])
+def test_mietvertragsprofil_ungueltiger_neuer_enumwert_ist_konflikt(session_factory, feld, wert):
+    paket = _paket(mietvertragsprofile=[{"vertrag_id": "V-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL", feld: wert}])
+    plan = _plan(paket, session_factory)
+    befund = next(b for b in plan.befunde if b.entitaet == "Mietvertragsprofil")
+    assert befund.status == "KONFLIKT"
+    assert feld in befund.grund
+
+
 def test_mietvertragsprofil_abweichender_inhalt_ist_aktualisierung_kein_konflikt(session_factory, stammdaten_repo, op_service):
     paket1 = _paket(mietvertragsprofile=[{"vertrag_id": "V-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL"}])
     plan1 = _plan(paket1, session_factory)

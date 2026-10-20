@@ -241,6 +241,67 @@ class MietvertragsprofilTable(Base):
     erstellt_von: Mapped[str] = mapped_column(String(128))
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    # -- Auftrag HV-20261020-VERTRAGSDATENBASIS: additive Ergänzungen ------
+    # -- (siehe docs/hausverwaltung/IMPORT_VERTRAG.md, Ergänzung 20.10.2026,
+    # -- für die verbindliche Feldbeschreibung) - alle nullable/mit
+    # -- UNGEKLAERT-Default, NIE aus einem anderen Feld geraten.
+
+    # Unterzeichnung/Übergabe/letzte Verlängerung - jeweils GETRENNT von
+    # `urspruenglicher_mietbeginn` (das bleibt der tatsächliche Beginn des
+    # Mietverhältnisses, siehe Tabellendoc oben) und von `VertragTable.
+    # gueltig_von` (bleibt die für Sollstellung/OP maßgebliche technische
+    # Laufzeit). Juni unterschrieben/Dezember Mietbeginn ergibt weiterhin
+    # Dezember als `urspruenglicher_mietbeginn`, NIE Juni.
+    unterzeichnungsdatum: Mapped[date | None] = mapped_column(Date, nullable=True)
+    unterzeichnungsdatum_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    uebergabe_am: Mapped[date | None] = mapped_column(Date, nullable=True)
+    uebergabe_am_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    letzte_verlaengerung_am: Mapped[date | None] = mapped_column(Date, nullable=True)
+    letzte_verlaengerung_am_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Tri-State, NIEMALS aus einem leeren `VertragTable.gueltig_bis`
+    # abgeleitet (Auftrag Markus: "Leeres Ende darf NICHT automatisch
+    # unbefristet sein") - nur eine tatsächlich belegte Klausel setzt
+    # BEFRISTET/UNBEFRISTET, siehe `domain/enums.py::Befristungsstatus`.
+    befristungsstatus: Mapped[str] = mapped_column(String(16), default="UNGEKLAERT", server_default=text("'UNGEKLAERT'"))
+    befristungsstatus_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
+    # BK/HK-Abrechnungsart (Nutzerergänzung 20.10.2026): entscheidet, ob
+    # später eine Nachverrechnung zulässig ist - NIE aus einem bloßen
+    # BK-/HK-Betrag geraten, siehe `domain/enums.py::BkHkAbrechnungsart`.
+    bk_hk_abrechnungsart: Mapped[str] = mapped_column(String(24), default="UNGEKLAERT", server_default=text("'UNGEKLAERT'"))
+    bk_hk_abrechnungsart_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    bk_hk_verteilungsschluessel: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    bk_hk_verteilungsschluessel_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
+    # Verbraucher-/Unternehmerstatus je Partei (Nutzerergänzung
+    # 20.10.2026) - NUR soweit für den gesetzlichen Verzugszins-Fallback
+    # (ABGB/UGB) benötigt, NIE allein aus `nutzungsart` (z. B. "Büro")
+    # abgeleitet, siehe `domain/enums.py::VerbraucherUnternehmerStatus`.
+    verbraucher_unternehmer_status_mieter: Mapped[str] = mapped_column(
+        String(16), default="UNGEKLAERT", server_default=text("'UNGEKLAERT'")
+    )
+    verbraucher_unternehmer_status_mieter_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    verbraucher_unternehmer_status_vermieter: Mapped[str] = mapped_column(
+        String(16), default="UNGEKLAERT", server_default=text("'UNGEKLAERT'")
+    )
+    verbraucher_unternehmer_status_vermieter_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
+    # Rechtsachsen-STAGING (Auftrag HV-20261020-VERTRAGSDATENBASIS) - rein
+    # unverbindliche Zusatzinformation GENAU wie die Index-Quellfelder
+    # oben: ERSETZT NICHT `VertragTable.rechtsordnung`/`RechtsprofilTable`,
+    # löst KEINE Freigabe/Sollstellung/Mahnsperre aus. Drei UNABHÄNGIGE
+    # Achsen statt einer verknüpften Ableitung - siehe `domain/enums.py::
+    # RechtsachseMrgAnwendungsbereich`/`RechtsachseMietzinsbildung`
+    # (die dritte Achse, Nutzungsart, existiert bereits oben).
+    rechtsachse_mrg_anwendungsbereich: Mapped[str] = mapped_column(
+        String(16), default="UNGEKLAERT", server_default=text("'UNGEKLAERT'")
+    )
+    rechtsachse_mrg_anwendungsbereich_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    rechtsachse_mietzinsbildung: Mapped[str] = mapped_column(
+        String(16), default="UNGEKLAERT", server_default=text("'UNGEKLAERT'")
+    )
+    rechtsachse_mietzinsbildung_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
 
 class SperreTable(Base):
     __tablename__ = "sperren"
@@ -939,27 +1000,85 @@ class MahnTageslaufTable(Base):
 
 
 class VertragMitmieterTable(Base):
-    """Auftrag HV-20261020-VIER-MAHNSTUFEN: rein additive, NICHT-
-    finanzielle Zusatz-Empfänger eines Vertrags ("Mitmieter") - AUSSCHLIESSLICH
-    für Mahnschreiben-Adressierung/Zugangsnachweis (RIS 4 Ob 75/21i,
-    3 Ob 37/18i: Mahnung gegen jeden Mitmieter, Zugang jeder Person
-    einzeln nachzuweisen). Berührt NIE `KontoTable`/`OPPositionTable`/
-    `DebitorTable` - der bestehende Debitor bleibt der EINZIGE
-    finanzielle Schuldner/Zahlungsempfänger-Bezug dieses Vertrags; ein
-    Mitmieter ist rein ein ZUSÄTZLICHER Briefempfänger, keine zweite
-    Kontoinhaberschaft, keine neue Forderungszuordnung. `aktiv=False`
-    markiert einen nicht mehr zu adressierenden Mitmieter (z. B. nach
-    Auszug), OHNE die Zeile zu löschen (Nachvollziehbarkeit früherer
-    Zustellungen)."""
+    """Ursprünglich (Auftrag HV-20261020-VIER-MAHNSTUFEN) rein additive,
+    NICHT-finanzielle Zusatz-Empfänger eines Vertrags ("Mitmieter") für
+    Mahnschreiben-Adressierung/Zugangsnachweis (RIS 4 Ob 75/21i, 3 Ob
+    37/18i: Mahnung gegen jeden Mitmieter, Zugang jeder Person einzeln
+    nachzuweisen).
+
+    **Erweitert (Auftrag HV-20261020-VERTRAGSDATENBASIS, Nutzerdesign-
+    vorgabe 20.10.2026):** EINE einzige, führende Partei-/Vertreter-
+    Struktur statt zwei unabhängig zu pflegenden Mitmieterlisten (eine
+    allgemeine für die Vertragsanlage, eine fürs Mahnwesen) - diese
+    Tabelle deckt jetzt BEIDE Verwendungen ab. Diese Erweiterung war
+    zum Zeitpunkt der Änderung noch NICHT produktiv (kein echter Server-
+    zugriff/Versand), die Docstrings der ursprünglichen, engeren Fassung
+    waren deshalb keine fremde, unveränderliche fachliche Vorgabe,
+    sondern Claudes eigene Dokumentation einer zwischenzeitlichen
+    Beschränkung - sauber zusammengeführt statt dauerhaft als zweite
+    Struktur fortbestehen zu lassen. Bereits bestehende, produktiv
+    genutzte `DebitorTable`/`VertragTable`-Daten und echte Versand-
+    nachweise (`MahnEmpfaengerZugangTable` u. ä.) bleiben davon
+    UNBERÜHRT - nur diese eine, selbst noch nicht produktive Tabelle
+    wurde erweitert.
+
+    `rolle` (`domain/enums.py::Vertragsparteirolle`) unterscheidet drei
+    Fälle:
+    - `HAUPTMIETER`: verknüpft über `debitor_id` auf den bestehenden
+      Debitor - KEINE eigenen, abweichend editierbaren Kontaktfelder
+      hier (Name/E-Mail/Adresse/Telefon bleiben NULL, der Debitor ist
+      die EINZIGE Quelle). Diese Zeile existiert nur, um Zustand/Quelle
+      der (z. B. per PDF ausgelesenen) Hauptmieter-Angabe nachvollziehbar
+      zu machen, OHNE den Debitor selbst zu duplizieren.
+    - `MITMIETER`/`VERTRETER`: KEIN Debitor, `debitor_id` bleibt NULL -
+      diese Zeilen tragen ihre Kontaktdaten selbst (sie sind keine
+      zweite Kontoinhaberschaft, keine neue Forderungszuordnung,
+      `KontoTable`/`OPPositionTable` bleiben unberührt).
+
+    `zustand` (`domain/enums.py::Mietparteizustand`) macht den
+    Erfassungsstand nachvollziehbar (ausgelesen/bestätigt/fehlt/
+    mehrdeutig). Mahnwesen adressiert automatisch AUSSCHLIESSLICH
+    bestätigte `MITMIETER`-Zeilen - die Mahn-Empfänger-Snapshots
+    (`MahnEmpfaengerZugangTable`) bleiben dabei weiterhin ein separat
+    EINGEFRORENES Abbild zum Versandzeitpunkt (Nachvollziehbarkeit
+    früherer Zustellungen), entstehen aber jetzt automatisch AUS den
+    hier bestätigten Mietparteien statt aus einer eigenen, unabhängig
+    gepflegten Liste - siehe `VertragMitmieterRepository.
+    list_bestaetigte_mitmieter`/`mahnwesen/service.py::
+    _vervollstaendige_bestaetigten_mahnlauf`.
+
+    `aktiv=False` markiert eine nicht mehr zu adressierende/relevante
+    Partei (z. B. nach Auszug), OHNE die Zeile zu löschen
+    (Nachvollziehbarkeit früherer Zustellungen)."""
 
     __tablename__ = "vertrag_mitmieter"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
-    name: Mapped[str] = mapped_column(String(256))
+    # HAUPTMIETER|MITMIETER|VERTRETER - Default MITMIETER erhält das
+    # Verhalten JEDER vor dieser Erweiterung angelegten Zeile exakt
+    # (ausschließlich Mahnwesen-Mitmieter, siehe Tabellendoc).
+    rolle: Mapped[str] = mapped_column(String(16), default="MITMIETER", server_default=text("'MITMIETER'"))
+    # NUR für rolle=HAUPTMIETER gesetzt - verknüpft auf den bestehenden
+    # Debitor, STATT dessen Kontaktdaten hier zu duplizieren. BEWUSST
+    # OHNE SQLAlchemy-`ForeignKey` (additiv-sicher, siehe `migrations.py::
+    # ensure_additive_columns`-Docstring: neue Spalten auf einer
+    # bestehenden Tabelle dürfen keine neue ForeignKey sein) - die
+    # referentielle Beziehung ist dieselbe lose Referenz wie z. B.
+    # `MahnFallTable.mahnlauf_id`.
+    debitor_id: Mapped[str | None] = mapped_column(String(48), nullable=True, index=True)
+    name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     email: Mapped[str | None] = mapped_column(String(256), nullable=True)
     adresse: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    telefon: Mapped[str | None] = mapped_column(String(48), nullable=True)
     postadresse_geprueft: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("0"))
+    # AUSGELESEN|BESTAETIGT|FEHLT|MEHRDEUTIG - Default BESTAETIGT erhält
+    # das Verhalten JEDER vor dieser Erweiterung angelegten Zeile exakt
+    # (eine manuell im Mahnwesen angelegte Zeile war immer schon
+    # effektiv ein bestätigter Empfänger).
+    zustand: Mapped[str] = mapped_column(String(16), default="BESTAETIGT", server_default=text("'BESTAETIGT'"))
+    quelle_typ: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    quelle_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
     aktiv: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("1"))
     erstellt_von: Mapped[str] = mapped_column(String(128))
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

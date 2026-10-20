@@ -5927,6 +5927,97 @@ im Mailversand-Treiber) + 2 (PDF-Rechtsinhalt) = 30 neue Tests,
 ausschließlich synthetische Testdaten, keine echten Sendungen/
 Produktivbuchungen.
 
+## Auftrag HV-20261020-VERTRAGSDATENBASIS (Fortsetzung)
+
+### Teilschritt 2: MietvertragsprofilTable-Erweiterung (zwölf neue Felder)
+
+Additiv, nullable/mit `UNGEKLAERT`-Default, mit eigenem Quellenbeleg je
+Feld, vollständig durch den Intake (`parser.py`/`planner.py`/
+`apply.py`/`IMPORT_VERTRAG.md` Ergänzung 20.10.2026) UND die PDF-
+Extraktion (wo fachlich sinnvoll) durchgereicht:
+
+- **Termine getrennt:** `unterzeichnungsdatum`, `uebergabe_am`,
+  `letzte_verlaengerung_am` - jeweils GETRENNT von `urspruenglicher_
+  mietbeginn`/`VertragTable.gueltig_von` (Juni unterschrieben/Dezember
+  Mietbeginn ergibt weiterhin Dezember, nie Juni).
+- **Befristungsstatus** (`BEFRISTET`\|`UNBEFRISTET`\|`UNGEKLAERT`) -
+  NIEMALS aus einem leeren `gueltig_bis` automatisch auf `UNBEFRISTET`
+  abgeleitet (Auftrag Markus, mit eigenem Regressionstest).
+- **BK/HK-Abrechnungsart** (`AKONTO_VORAUSZAHLUNG`\|
+  `PAUSCHALE_INKLUSIVMIETE`\|`UNGEKLAERT`) + `bk_hk_verteilungsschluessel`
+  (Nutzerergänzung 20.10.2026) - entscheidet später, ob eine BK/HK-
+  Nachverrechnung zulässig ist; NIE aus einem bloßen BK-Betrag geraten
+  (eigener Regressionstest: ein reiner Betriebskosten-Betrag ohne
+  Akonto-/Pauschale-Formulierung erzeugt KEINEN Vorschlag).
+- **Verbraucher-/Unternehmerstatus** je Partei (`verbraucher_
+  unternehmer_status_mieter`/`_vermieter`, Nutzerergänzung 20.10.2026) -
+  NUR soweit für den gesetzlichen Verzugszins-Fallback nötig, NIE allein
+  aus `nutzungsart` (Büro/Gewerbe) abgeleitet. **Noch KEINE Verbindung
+  zu einer tatsächlichen Verzugszins-Berechnung** - reines Erfassungs-
+  feld, siehe offener Punkt unten.
+- **Rechtsachsen-Staging** (`rechtsachse_mrg_anwendungsbereich`
+  `VOLL`\|`TEIL`\|`AUSNAHME`\|`UNGEKLAERT`, `rechtsachse_
+  mietzinsbildung` `FREI`\|`RICHTWERT`\|`KATEGORIE`\|`ANDERE`\|
+  `UNGEKLAERT`) - AUSDRÜCKLICH unverbindliches Staging-Feld wie die
+  Index-Quellfelder, ERSETZT NICHT `VertragTable.rechtsordnung`/
+  `RechtsprofilTable`, löst KEINE Freigabe/Sollstellung/Mahnsperre aus.
+  Gewerbenutzung/freier Mietzins sind KEINE automatischen MRG-
+  Ausnahmen - diese Achse bleibt deshalb unabhängig von `nutzungsart`.
+  **Noch KEINE Verbindung zum tatsächlichen Rechtsprofil/zur
+  `Rechtsordnung`** - das bleibt bewusst ein größerer, risikoreicherer
+  Folgeschritt (die bestehende `Rechtsordnung`-Enum hat viele
+  Konsumenten im ganzen Repository).
+
+**Noch OHNE Formularfelder** in `vertragsanlage_form.py`/
+`backoffice/routes/vertragsanlage.py` - über JSON/CSV-Intake bereits
+vollständig einspielbar, PDF-Extraktion deckt Termine/Befristung/BK-HK-
+Abrechnungsart ab (Verbraucher-/Unternehmerstatus und die Rechtsachsen
+bewusst NICHT per Regex geraten - zu rechtlich subtil, bleiben manuell).
+
+### Teilschritt 3: EINE führende Parteien-/Vertreter-Struktur (keine zwei Mitmieterlisten)
+
+Nutzerdesignvorgabe 20.10.2026: eine allgemeine Parteien-/Vertreter-
+Struktur ist sinnvoll, solange sie die EINE führende Quelle bleibt,
+der Hauptmieter nicht mit abweichend editierbaren Kontakten neben dem
+Debitor dupliziert wird, und es NICHT zwei unabhängig zu pflegende
+Mitmieterlisten (allgemein + Mahnwesen) gibt. Da diese Struktur zum
+Zeitpunkt der Änderung noch NICHT produktiv war (kein echter
+Serverzugriff/Versand, nur synthetische Testdaten), wurde die
+bestehende `VertragMitmieterTable` (aus HV-20261020-VIER-MAHNSTUFEN)
+additiv erweitert und zusammengeführt, statt eine zweite, parallele
+Tabelle anzulegen:
+
+- Neue Spalten `rolle` (`HAUPTMIETER`\|`MITMIETER`\|`VERTRETER`,
+  Default `MITMIETER` erhält das Verhalten jeder vor dieser Erweiterung
+  angelegten Zeile exakt), `debitor_id` (nullable FK, NUR für
+  `HAUPTMIETER` gesetzt), `telefon`, `zustand`
+  (`AUSGELESEN`\|`BESTAETIGT`\|`FEHLT`\|`MEHRDEUTIG`, Default
+  `BESTAETIGT` erhält ebenfalls das bisherige Verhalten exakt),
+  `quelle_typ`/`quelle_referenz`.
+- Eine `HAUPTMIETER`-Zeile verknüpft AUSSCHLIESSLICH über `debitor_id` -
+  Name/E-Mail/Adresse/Telefon bleiben hier `NULL`, der Debitor bleibt
+  die einzige Kontaktquelle (kein Duplikat).
+- Neue `VertragMitmieterRepository.list_bestaetigte_mitmieter`: NUR
+  aktive, bestätigte `MITMIETER`-Zeilen - `HAUPTMIETER` bleibt
+  ausgeschlossen (der Debitor ist bereits der Anker-Empfänger),
+  `VERTRETER` wird NIE automatisch mitadressiert (bewusste menschliche
+  Entscheidung), eine noch nicht bestätigte Zeile erst recht nicht.
+- `mahnwesen/service.py::_vervollstaendige_bestaetigten_mahnlauf` nutzt
+  jetzt diese Methode statt der bisherigen `list_aktiv` - die
+  Mahn-Empfänger-Snapshots (`MahnEmpfaengerZugangTable`) bleiben
+  weiterhin ein separat EINGEFRORENES Abbild zum Versandzeitpunkt
+  (Nachvollziehbarkeit früherer Zustellungen), entstehen aber jetzt
+  AUTOMATISCH aus den bestätigten Mietparteien statt aus einer
+  unabhängig davon gepflegten Liste.
+
+**Weiterhin offen:** der tatsächliche Versandweg adressiert weiterhin
+NUR den Debitor (Ankerempfänger) - ein echter Einzelversand an jeden
+bestätigten Mitmieter ist noch NICHT gebaut (siehe Task #32/`HOTFIX-
+Folge: Mitmieter-Zugang ehrlich auf tatsächlichen Versandweg
+abstimmen` weiter unten). Keine Backoffice-UI zum Anlegen/Bestätigen
+von Parteien (Vertragsanlage ODER Mahnwesen) - weiterhin nur über
+Repository-Methoden/Tests ansteuerbar.
+
 ## Auftrag HV-20261020-VERTRAGSDATENBASIS (Beginn)
 
 Erster, abgeschlossener Teilschritt: der von Codex konkret reproduzierte

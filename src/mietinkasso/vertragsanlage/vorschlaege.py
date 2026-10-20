@@ -86,6 +86,41 @@ def vorschlaege_aus_extraktion(ergebnis: ExtraktionsErgebnis) -> dict[str, Vorsc
         if iso is not None:
             vorschlaege["gueltig_bis"] = Vorschlag(iso, tr.seite, tr.auszug)
 
+    if "unterzeichnungsdatum" in t:
+        tr = t["unterzeichnungsdatum"]
+        iso = _mietbeginn_iso(tr.wert)
+        if iso is not None:
+            vorschlaege["unterzeichnungsdatum"] = Vorschlag(iso, tr.seite, tr.auszug)
+
+    if "uebergabe_am" in t:
+        tr = t["uebergabe_am"]
+        iso = _mietbeginn_iso(tr.wert)
+        if iso is not None:
+            vorschlaege["uebergabe_am"] = Vorschlag(iso, tr.seite, tr.auszug)
+
+    # Tri-State wie `nutzungsart` oben: NUR bei GENAU EINEM der beiden
+    # Hinweise ein Vorschlag - bei beiden/keinem bleibt das Feld
+    # UNGEKLAERT (Auftrag Markus: "Leeres Ende darf NICHT automatisch
+    # unbefristet sein" - dasselbe Vorsichtsprinzip gilt hier für die
+    # Erkennung selbst, nicht nur für das leere `gueltig_bis`).
+    befristungsstatus_treffer = {
+        "BEFRISTET": t.get("befristet_hinweis"),
+        "UNBEFRISTET": t.get("unbefristet_hinweis"),
+    }
+    gefundene_befristung = {k: v for k, v in befristungsstatus_treffer.items() if v is not None}
+    if len(gefundene_befristung) == 1:
+        (status, tr), = gefundene_befristung.items()
+        vorschlaege["befristungsstatus"] = Vorschlag(status, tr.seite, tr.auszug)
+
+    bk_hk_treffer = {
+        "AKONTO_VORAUSZAHLUNG": t.get("bk_hk_akonto_hinweis"),
+        "PAUSCHALE_INKLUSIVMIETE": t.get("bk_hk_pauschale_hinweis"),
+    }
+    gefundene_bk_hk = {k: v for k, v in bk_hk_treffer.items() if v is not None}
+    if len(gefundene_bk_hk) == 1:
+        (abrechnungsart, tr), = gefundene_bk_hk.items()
+        vorschlaege["bk_hk_abrechnungsart"] = Vorschlag(abrechnungsart, tr.seite, tr.auszug)
+
     nutzungsart_treffer = {
         "WOHNUNG": t.get("nutzungsart_wohnung"),
         "BUERO": t.get("nutzungsart_buero"),
@@ -124,6 +159,8 @@ _FELD_LABELS = {
     "index_schwelle_prozent": "Index-Schwelle",
     "mietbeginn": "Mietbeginn",
     "mietende": "Mietende",
+    "unterzeichnungsdatum": "Unterzeichnungsdatum",
+    "uebergabe_am": "Übergabedatum",
     "mieter_name": "Mieter (Name laut Dokument)",
     "vermieter_name": "Vermieter (Name laut Dokument)",
 }

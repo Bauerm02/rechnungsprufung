@@ -389,6 +389,39 @@ Identischer Inhalt gegenüber der zuletzt gespeicherten Version bleibt
 `UNVERAENDERT` (kein wirkungsloser Zusatz-Insert). Bestehende Konten/
 OP/Sperren/Vertragskomponenten bleiben davon vollständig unberührt.
 
+## Ergänzung 20.10.2026: weitere `mietvertragsprofile[]`-Felder (Auftrag
+## HV-20261020-VERTRAGSDATENBASIS)
+
+Alle zwölf Felder unten sind additiv, NULLABLE bzw. mit `UNGEKLAERT`-
+Default und folgen DERSELBEN Append-only-Regel wie die bereits
+dokumentierten `mietvertragsprofile[]`-Felder (abweichender Inhalt =
+`AKTUALISIERUNG`, keine neue Pflichtangabe, kein Konflikt). Noch OHNE
+eigenes Feld in der Backoffice-Review-Ansicht (`vertragsanlage_form.py`)
+- über das JSON-/CSV-Format aber bereits vollständig einspielbar.
+
+| Feld | Typ | Pflicht | Hinweis |
+|---|---|---|---|
+| `unterzeichnungsdatum` | Datum\|null | nein | Datum der Vertragsunterschrift - GETRENNT von `urspruenglicher_mietbeginn` (Juni unterschrieben/Dezember Mietbeginn ergibt weiterhin Dezember als `urspruenglicher_mietbeginn`, NIE Juni) |
+| `unterzeichnungsdatum_quellenbeleg` | str\|null | nein | |
+| `uebergabe_am` | Datum\|null | nein | Datum der tatsächlichen Objektübergabe, GETRENNT von Unterzeichnung/Mietbeginn/Verwaltungsübernahme |
+| `uebergabe_am_quellenbeleg` | str\|null | nein | |
+| `letzte_verlaengerung_am` | Datum\|null | nein | Datum der letzten dokumentierten Vertragsverlängerung |
+| `letzte_verlaengerung_am_quellenbeleg` | str\|null | nein | |
+| `befristungsstatus` | str | nein (default `UNGEKLAERT`) | `BEFRISTET`\|`UNBEFRISTET`\|`UNGEKLAERT` - **ein leeres `vertraege[].gueltig_bis` darf dieses Feld NIEMALS automatisch auf `UNBEFRISTET` setzen** (Auftrag Markus) - nur eine tatsächlich belegte Klausel |
+| `befristungsstatus_quellenbeleg` | str\|null | nein | |
+| `bk_hk_abrechnungsart` | str | nein (default `UNGEKLAERT`) | `AKONTO_VORAUSZAHLUNG`\|`PAUSCHALE_INKLUSIVMIETE`\|`UNGEKLAERT` - entscheidet, ob eine BK/HK-Nachverrechnung später zulässig ist; NIE aus einem bloßen BK-/HK-Betrag geraten |
+| `bk_hk_abrechnungsart_quellenbeleg` | str\|null | nein | |
+| `bk_hk_verteilungsschluessel` | str\|null | nein | Freitext, z. B. "nach Nutzfläche" |
+| `bk_hk_verteilungsschluessel_quellenbeleg` | str\|null | nein | |
+| `verbraucher_unternehmer_status_mieter` | str | nein (default `UNGEKLAERT`) | `VERBRAUCHER`\|`UNTERNEHMER`\|`UNGEKLAERT` - NUR soweit für den gesetzlichen Verzugszins-Fallback (ABGB/UGB) benötigt; NIEMALS allein aus `nutzungsart` (z. B. "Büro"/"Gewerbe") abgeleitet |
+| `verbraucher_unternehmer_status_mieter_quellenbeleg` | str\|null | nein | |
+| `verbraucher_unternehmer_status_vermieter` | str | nein (default `UNGEKLAERT`) | wie oben, für die Vermieterseite |
+| `verbraucher_unternehmer_status_vermieter_quellenbeleg` | str\|null | nein | |
+| `rechtsachse_mrg_anwendungsbereich` | str | nein (default `UNGEKLAERT`) | `VOLL`\|`TEIL`\|`AUSNAHME`\|`UNGEKLAERT` - AUSDRÜCKLICH unverbindliches Staging-Feld wie die Index-Quellfelder; ERSETZT NICHT `vertraege[].rechtsordnung`/`RechtsprofilTable`, löst KEINE Freigabe/Sollstellung/Mahnsperre aus |
+| `rechtsachse_mrg_anwendungsbereich_quellenbeleg` | str\|null | nein | |
+| `rechtsachse_mietzinsbildung` | str | nein (default `UNGEKLAERT`) | `FREI`\|`RICHTWERT`\|`KATEGORIE`\|`ANDERE`\|`UNGEKLAERT` - gleiches Staging-Prinzip; Gewerbenutzung/freier Mietzins sind KEINE automatischen MRG-Ausnahmen, diese Achse bleibt deshalb unabhängig von `nutzungsart`/`rechtsachse_mrg_anwendungsbereich` |
+| `rechtsachse_mietzinsbildung_quellenbeleg` | str\|null | nein | |
+
 ## JSON-Beispiel (rein synthetisch)
 
 ```json

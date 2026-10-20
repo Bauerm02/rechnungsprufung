@@ -18,6 +18,22 @@ _PROFIL_FELDER = (
     "index_urspruenglicher_basiswert", "index_schwelle_prozent", "index_schwelle_inklusive",
     "index_anpassungsmonat", "index_mindestintervall_monate", "index_klauseltext_auszug",
     "index_klauseltext_seite",
+    # Auftrag HV-20261020-VERTRAGSDATENBASIS: additive Ergänzungen. Noch
+    # OHNE eigenes Formularfeld in `vertragsanlage_form.py` (siehe
+    # docs/hausverwaltung/OFFENE_PUNKTE.md) - hier bereits aufgenommen,
+    # damit die Durchleitung zum Intake vollständig ist, sobald die
+    # Review-UI diese Felder befüllt (ein fehlender Formularwert bleibt
+    # `None` und wird wie bisher NICHT ins Paket aufgenommen).
+    "unterzeichnungsdatum", "unterzeichnungsdatum_quellenbeleg",
+    "uebergabe_am", "uebergabe_am_quellenbeleg",
+    "letzte_verlaengerung_am", "letzte_verlaengerung_am_quellenbeleg",
+    "befristungsstatus", "befristungsstatus_quellenbeleg",
+    "bk_hk_abrechnungsart", "bk_hk_abrechnungsart_quellenbeleg",
+    "bk_hk_verteilungsschluessel", "bk_hk_verteilungsschluessel_quellenbeleg",
+    "verbraucher_unternehmer_status_mieter", "verbraucher_unternehmer_status_mieter_quellenbeleg",
+    "verbraucher_unternehmer_status_vermieter", "verbraucher_unternehmer_status_vermieter_quellenbeleg",
+    "rechtsachse_mrg_anwendungsbereich", "rechtsachse_mrg_anwendungsbereich_quellenbeleg",
+    "rechtsachse_mietzinsbildung", "rechtsachse_mietzinsbildung_quellenbeleg",
 )
 
 

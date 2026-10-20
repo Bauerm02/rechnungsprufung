@@ -1120,13 +1120,23 @@ class MahnwesenService:
             referenz="mahnungslauf:" + mahnlauf.outbox_key,
         )
 
-        # Auftrag HV-20261020-VIER-MAHNSTUFEN: sobald der Mahnlauf
-        # tatsächlich bestätigt GESENDET ist, werden die zu DIESEM
-        # Zeitpunkt erwarteten Empfänger (Hauptmieter + jeder zu diesem
-        # Zeitpunkt aktive Mitmieter) als NOCH UNBESTÄTIGTE Zugangs-
+        # Auftrag HV-20261020-VIER-MAHNSTUFEN, verallgemeinert durch
+        # HV-20261020-VERTRAGSDATENBASIS (Nutzerdesignvorgabe 20.10.2026:
+        # "Mahn-Empfängersnapshots sollen automatisch aus den bestätigten
+        # Mietparteien entstehen, keine zwei unabhängig zu pflegenden
+        # Mitmieterlisten"): sobald der Mahnlauf tatsächlich bestätigt
+        # GESENDET ist, werden die zu DIESEM Zeitpunkt erwarteten
+        # Empfänger (Hauptmieter-Debitor + jeder zu diesem Zeitpunkt
+        # bestätigte Mitmieter, siehe `VertragMitmieterRepository.
+        # list_bestaetigte_mitmieter`) als NOCH UNBESTÄTIGTE Zugangs-
         # Platzhalter angelegt - idempotent (`erstelle_erwartete_
         # eintraege` überspringt bereits vorhandene Paare), optional
         # (ohne konfiguriertes Repository unverändertes alt-Verhalten).
+        # Das hier eingefrorene Ergebnis bleibt ein SEPARATER, dauerhaft
+        # unveränderter Snapshot (Nachvollziehbarkeit früherer
+        # Zustellungen) - nur seine ENTSTEHUNG ist jetzt automatisch an
+        # die bestätigten Mietparteien gekoppelt, keine zweite,
+        # unabhängig davon gepflegte Liste.
         if self._empfaenger_zugang_repository is not None:
             vertrag_fuer_empfaenger = self._stammdaten_repository.get_vertrag(mahnlauf.vertrag_id)
             if vertrag_fuer_empfaenger is not None:
@@ -1136,7 +1146,7 @@ class MahnwesenService:
                     erwartete_empfaenger.append((None, debitor.name))
                 if self._mitmieter_repository is not None:
                     erwartete_empfaenger.extend(
-                        (m.id, m.name) for m in self._mitmieter_repository.list_aktiv(vertrag_fuer_empfaenger.id)
+                        (m.id, m.name) for m in self._mitmieter_repository.list_bestaetigte_mitmieter(vertrag_fuer_empfaenger.id)
                     )
                 if erwartete_empfaenger:
                     self._empfaenger_zugang_repository.erstelle_erwartete_eintraege(

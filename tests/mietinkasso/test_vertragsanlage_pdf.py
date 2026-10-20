@@ -310,6 +310,84 @@ def test_hauptmietzins_und_nettomiete_nebeneinander_bleiben_getrennte_felder():
     assert "hauptmietzins_cent" not in ergebnis.mehrdeutige_treffer
 
 
+# -- Auftrag HV-20261020-VERTRAGSDATENBASIS: Termine/Befristung/BK-HK ----
+
+
+def test_unterzeichnungsdatum_und_uebergabe_getrennt_von_mietbeginn_extrahiert():
+    pdf = build_text_pdf([
+        "Dieser Vertrag wurde unterzeichnet am 15.05.2015.",
+        "Mietbeginn: 01.06.2015", "Übergeben am 02.06.2015",
+    ])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert vorschlaege["unterzeichnungsdatum"].formularwert == "2015-05-15"
+    assert vorschlaege["uebergabe_am"].formularwert == "2015-06-02"
+    assert vorschlaege["urspruenglicher_mietbeginn"].formularwert == "2015-06-01"
+
+
+def test_befristungsstatus_befristet_eindeutig_erkannt():
+    pdf = build_text_pdf(["Dies ist ein befristeter Mietvertrag auf 5 Jahre."])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert vorschlaege["befristungsstatus"].formularwert == "BEFRISTET"
+
+
+def test_befristungsstatus_unbefristet_eindeutig_erkannt():
+    pdf = build_text_pdf(["Dies ist ein unbefristeter Mietvertrag."])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert vorschlaege["befristungsstatus"].formularwert == "UNBEFRISTET"
+
+
+def test_befristungsstatus_mehrdeutig_bleibt_unbesetzt():
+    """Enthält ein Dokument BEIDE Formulierungen (Mischtext/Nachtrag),
+    darf das Feld NICHT geraten werden - bleibt UNGEKLAERT."""
+
+    pdf = build_text_pdf(["Ursprünglich unbefristeter Mietvertrag.", "Nachtrag: befristeter Mietvertrag auf 3 Jahre."])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert "befristungsstatus" not in vorschlaege
+
+
+def test_leeres_mietende_setzt_befristungsstatus_nicht_automatisch_auf_unbefristet():
+    """Auftrag Markus: 'Leeres Ende darf NICHT automatisch unbefristet
+    sein' - ein Dokument OHNE jede Befristungsformulierung und OHNE
+    Mietende-Fund darf KEINEN Vorschlag für `befristungsstatus`
+    erzeugen (das Feld bleibt beim Formular-Default UNGEKLAERT)."""
+
+    pdf = build_text_pdf(["Wohnungsmietvertrag", "Mietbeginn: 01.06.2015"])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert "gueltig_bis" not in vorschlaege
+    assert "befristungsstatus" not in vorschlaege
+
+
+def test_bk_hk_abrechnungsart_akonto_erkannt():
+    pdf = build_text_pdf(["Der Mieter leistet eine monatliche Akontozahlung für die Betriebskosten."])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert vorschlaege["bk_hk_abrechnungsart"].formularwert == "AKONTO_VORAUSZAHLUNG"
+
+
+def test_bk_hk_abrechnungsart_pauschale_erkannt():
+    pdf = build_text_pdf(["Es handelt sich um eine Inklusivmiete."])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert vorschlaege["bk_hk_abrechnungsart"].formularwert == "PAUSCHALE_INKLUSIVMIETE"
+
+
+def test_bk_hk_abrechnungsart_ohne_fund_bleibt_unbesetzt_nie_aus_blossem_betrag_geraten():
+    """Auftrag Markus: 'Das entscheidet, ob später eine Nachverrechnung
+    berechnet werden darf; aus einem bloßen BK-Betrag nicht raten.' Ein
+    bloßer Betriebskosten-BETRAG ohne Akonto-/Pauschale-Formulierung
+    darf KEINEN Abrechnungsart-Vorschlag erzeugen."""
+
+    pdf = build_text_pdf(["Betriebskosten: 80,00 EUR"])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert "bk_hk_abrechnungsart" not in vorschlaege
+
+
 def test_fehlgeschlagene_seitenauswertung_wird_als_warnung_sichtbar(monkeypatch):
     """'Teilseitenerkennung nicht unbemerkt erfolgreich ausgeben' - schlägt
     eine einzelne Seite beim Textzugriff fehl, muss das als Warnung

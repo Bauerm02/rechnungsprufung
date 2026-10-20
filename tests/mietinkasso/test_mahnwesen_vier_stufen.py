@@ -258,6 +258,95 @@ def test_mitmieter_muss_ebenfalls_zugang_bestaetigen_bevor_eskaliert_wird(
     assert vollstaendig.zugang_bestaetigt_am == date(2026, 9, 12)  # später als Hauptmieters 10.09.
 
 
+# -- Auftrag HV-20261020-VERTRAGSDATENBASIS: EINE führende Parteien-/ ------
+# -- Vertreter-Struktur statt zwei unabhängig gepflegter Mitmieterlisten ---
+
+
+def test_hauptmieter_zeile_verknuepft_debitor_ohne_kontaktduplizierung(mitmieter_repo, basis_vertrag, stammdaten_repo):
+    """Nutzerdesignvorgabe 20.10.2026: 'Hauptmieter nicht mit abweichend
+    editierbaren Kontakten neben Debitor duplizieren; bestehende
+    Debitor-ID verknüpfen.' Eine HAUPTMIETER-Zeile trägt deshalb KEINE
+    eigenen Kontaktfelder - der Debitor bleibt die einzige Quelle."""
+
+    vertrag, konto = basis_vertrag
+    zeile = mitmieter_repo.anlegen(
+        vertrag_id=vertrag.id, name=None, email=None, adresse=None, erstellt_von="codex-test",
+        rolle="HAUPTMIETER", debitor_id=vertrag.debitor_id, zustand="BESTAETIGT",
+        quelle_typ="PDF_EXTRAKTION", quelle_referenz="vertrag.pdf#1",
+    )
+    assert zeile.rolle == "HAUPTMIETER"
+    assert zeile.debitor_id == vertrag.debitor_id
+    assert zeile.name is None and zeile.email is None and zeile.adresse is None  # KEINE Duplizierung
+    debitor = stammdaten_repo.get_debitor(zeile.debitor_id)
+    assert debitor is not None  # Name/Kontakt kommen ausschließlich von hier
+
+
+def test_list_bestaetigte_mitmieter_schliesst_hauptmieter_und_vertreter_aus(mitmieter_repo, basis_vertrag):
+    """NUR bestätigte MITMIETER-Zeilen werden automatisch Mahnempfänger -
+    der Hauptmieter ist bereits der Debitor-Anker (siehe Aufrufer in
+    `mahnwesen/service.py`), ein VERTRETER wird NIE automatisch
+    mitadressiert (bewusste menschliche Entscheidung, siehe
+    `Vertragsparteirolle`-Docstring)."""
+
+    vertrag, konto = basis_vertrag
+    mitmieter_repo.anlegen(
+        vertrag_id=vertrag.id, name=None, email=None, adresse=None, erstellt_von="codex-test",
+        rolle="HAUPTMIETER", debitor_id=vertrag.debitor_id, zustand="BESTAETIGT",
+    )
+    mitmieter_repo.anlegen(
+        vertrag_id=vertrag.id, name="Dr. Rechtsanwalt Vertreter", email="vertreter@example.at", adresse=None,
+        erstellt_von="codex-test", rolle="VERTRETER", zustand="BESTAETIGT",
+    )
+    erika = mitmieter_repo.anlegen(
+        vertrag_id=vertrag.id, name="Erika Mustermieter", email="erika@example.at", adresse=None,
+        erstellt_von="codex-test", rolle="MITMIETER", zustand="BESTAETIGT",
+    )
+
+    bestaetigt = mitmieter_repo.list_bestaetigte_mitmieter(vertrag.id)
+    assert [m.id for m in bestaetigt] == [erika.id]
+
+
+def test_list_bestaetigte_mitmieter_schliesst_unbestaetigte_mitmieter_aus(mitmieter_repo, basis_vertrag):
+    """Eine erst AUSGELESENE (noch nicht menschlich bestätigte) Mitmieter-
+    Zeile darf NIE automatisch Mahnempfänger werden - kein Versand an
+    eine noch ungeprüfte, per PDF-Extraktion erratene Angabe."""
+
+    vertrag, konto = basis_vertrag
+    mitmieter_repo.anlegen(
+        vertrag_id=vertrag.id, name="Noch ungeprüft", email="unklar@example.at", adresse=None,
+        erstellt_von="codex-test", rolle="MITMIETER", zustand="AUSGELESEN",
+        quelle_typ="PDF_EXTRAKTION", quelle_referenz="vertrag.pdf#2",
+    )
+    assert mitmieter_repo.list_bestaetigte_mitmieter(vertrag.id) == []
+    # `list_aktiv` bleibt die vollständige Übersicht (für die
+    # Vertragsanlage-Ansicht) - zeigt die Zeile weiterhin.
+    assert len(mitmieter_repo.list_aktiv(vertrag.id)) == 1
+
+
+def test_mahnlauf_empfaenger_snapshot_entsteht_automatisch_ohne_vertreter(
+    mahn_service, op_service, mitmieter_repo, empfaenger_zugang_repo, basis_vertrag, ctx_factory, freigegebene_vier_stufen_policy,
+):
+    """Ein VERTRETER mit BESTAETIGT-Zustand erzeugt KEINEN eigenen
+    Zugangs-Platzhalter beim Versand - nur Hauptmieter(Debitor) + echte,
+    bestätigte Mitmieter werden automatisch adressiert."""
+
+    vertrag, konto = basis_vertrag
+    ctx = ctx_factory("7DI")
+    mitmieter_repo.anlegen(
+        vertrag_id=vertrag.id, name="Dr. Rechtsanwalt Vertreter", email="vertreter@example.at", adresse=None,
+        erstellt_von="codex-test", rolle="VERTRETER", zustand="BESTAETIGT",
+    )
+    mitmieter_repo.anlegen(
+        vertrag_id=vertrag.id, name="Erika Mustermieter", email="erika@example.at", adresse=None,
+        erstellt_von="codex-test", rolle="MITMIETER", zustand="BESTAETIGT",
+    )
+    _mit_faelligem_soll(op_service, konto, ctx, faelligkeit=date(2026, 9, 1))
+    mahnlauf = _plane_und_versende_stufe(mahn_service, ctx=ctx, vertrag=vertrag, konto=konto, policy=freigegebene_vier_stufen_policy, heute=date(2026, 9, 10), stufe=1)
+
+    eintraege = empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id)
+    assert len(eintraege) == 2  # Hauptmieter(Debitor) + Erika - NICHT der Vertreter
+
+
 def test_versuchte_stufe_ohne_gesendete_vorstufe_wirft_reihenfolgefehler(mahn_service, op_service, basis_vertrag, ctx_factory, freigegebene_vier_stufen_policy):
     """`_pruefe_vorstufe_abstand` muss auch für Stufe 3/4 (nicht nur
     Stufe 2) die Reihenfolge erzwingen."""

@@ -201,6 +201,31 @@ class MietvertragsprofilZeile:
     index_klauseltext_seite: int | None = None
     quelle_typ: str = "IMPORT_SCHEMA"
     quelle_referenz: str | None = None
+    # Auftrag HV-20261020-VERTRAGSDATENBASIS: additive Ergänzungen, siehe
+    # `MietvertragsprofilTable`-Docstring / IMPORT_VERTRAG.md Ergänzung
+    # 20.10.2026. Alle UNGEKLAERT/None als Default - NIE aus einem
+    # anderen Feld geraten (insbesondere `befristungsstatus` NICHT aus
+    # einem leeren `gueltig_bis`).
+    unterzeichnungsdatum: date | None = None
+    unterzeichnungsdatum_quellenbeleg: str | None = None
+    uebergabe_am: date | None = None
+    uebergabe_am_quellenbeleg: str | None = None
+    letzte_verlaengerung_am: date | None = None
+    letzte_verlaengerung_am_quellenbeleg: str | None = None
+    befristungsstatus: str = "UNGEKLAERT"
+    befristungsstatus_quellenbeleg: str | None = None
+    bk_hk_abrechnungsart: str = "UNGEKLAERT"
+    bk_hk_abrechnungsart_quellenbeleg: str | None = None
+    bk_hk_verteilungsschluessel: str | None = None
+    bk_hk_verteilungsschluessel_quellenbeleg: str | None = None
+    verbraucher_unternehmer_status_mieter: str = "UNGEKLAERT"
+    verbraucher_unternehmer_status_mieter_quellenbeleg: str | None = None
+    verbraucher_unternehmer_status_vermieter: str = "UNGEKLAERT"
+    verbraucher_unternehmer_status_vermieter_quellenbeleg: str | None = None
+    rechtsachse_mrg_anwendungsbereich: str = "UNGEKLAERT"
+    rechtsachse_mrg_anwendungsbereich_quellenbeleg: str | None = None
+    rechtsachse_mietzinsbildung: str = "UNGEKLAERT"
+    rechtsachse_mietzinsbildung_quellenbeleg: str | None = None
 
 
 @dataclass(frozen=True)

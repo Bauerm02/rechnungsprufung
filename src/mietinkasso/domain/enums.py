@@ -153,6 +153,109 @@ class MietvertragsprofilQuelle(str, enum.Enum):
     IMPORT_SCHEMA = "IMPORT_SCHEMA"
 
 
+class Vertragsparteirolle(str, enum.Enum):
+    """Auftrag HV-20261020-VERTRAGSDATENBASIS (Nutzerdesignvorgabe
+    20.10.2026: 'EINE führende Quelle, Hauptmieter nicht mit abweichend
+    editierbaren Kontakten neben Debitor duplizieren'): die Rolle einer
+    `VertragMitmieterTable`-Zeile. `HAUPTMIETER`-Zeilen verknüpfen
+    AUSSCHLIESSLICH über `debitor_id` auf den bestehenden Debitor (KEINE
+    eigenen Kontaktfelder - der Debitor bleibt die einzige Quelle für
+    Name/E-Mail/Adresse/Telefon). `MITMIETER`/`VERTRETER`-Zeilen tragen
+    ihre Kontaktdaten selbst, weil sie KEIN Debitor sind. Mahnwesen
+    adressiert automatisch nur bestätigte `MITMIETER` (siehe
+    `mahnwesen/repository.py::VertragMitmieterRepository.
+    list_bestaetigte_mitmieter`) - ein `VERTRETER` wird NIE automatisch
+    mitadressiert, das bleibt eine bewusste menschliche Entscheidung."""
+
+    HAUPTMIETER = "HAUPTMIETER"
+    MITMIETER = "MITMIETER"
+    VERTRETER = "VERTRETER"
+
+
+class Mietparteizustand(str, enum.Enum):
+    """Auftrag HV-20261020-VERTRAGSDATENBASIS: Erfassungszustand EINER
+    `VertragMitmieterTable`-Zeile - `AUSGELESEN` (aus einem PDF
+    extrahiert, noch nicht menschlich bestätigt), `BESTAETIGT`
+    (menschlich geprüft/freigegeben - NUR in diesem Zustand wird eine
+    Zeile automatisch Mahnempfänger, siehe `Vertragsparteirolle`-
+    Docstring), `FEHLT` (bekannte Lücke, z. B. Telefonnummer fehlt -
+    blockiert NICHT automatisch andere Verwendungen), `MEHRDEUTIG`
+    (mehrere widersprüchliche Fundstellen, siehe `vertragsanlage/
+    pdf_extraktion.py`)."""
+
+    AUSGELESEN = "AUSGELESEN"
+    BESTAETIGT = "BESTAETIGT"
+    FEHLT = "FEHLT"
+    MEHRDEUTIG = "MEHRDEUTIG"
+
+
+class Befristungsstatus(str, enum.Enum):
+    """Auftrag HV-20261020-VERTRAGSDATENBASIS: explizite Tri-State-
+    Angabe, ob ein Vertrag befristet/unbefristet ist - `UNGEKLAERT` ist
+    der Default und wird NIEMALS automatisch aus einem fehlenden
+    `VertragTable.gueltig_bis`/`MietvertragsprofilZeile`-Wert abgeleitet
+    ("Leeres Ende darf NICHT automatisch unbefristet sein", Auftrag
+    Markus) - nur eine tatsächlich belegte Vertragsklausel setzt
+    `BEFRISTET`/`UNBEFRISTET`."""
+
+    BEFRISTET = "BEFRISTET"
+    UNBEFRISTET = "UNBEFRISTET"
+    UNGEKLAERT = "UNGEKLAERT"
+
+
+class BkHkAbrechnungsart(str, enum.Enum):
+    """Auftrag HV-20261020-VERTRAGSDATENBASIS (Nutzerergänzung
+    20.10.2026): entscheidet, ob eine BK/HK-Nachverrechnung später
+    überhaupt zulässig ist - NIE aus einem bloßen BK-/HK-Betrag
+    geraten. `UNGEKLAERT` ist der Default, solange keine Vertragsklausel
+    das ausdrücklich belegt."""
+
+    AKONTO_VORAUSZAHLUNG = "AKONTO_VORAUSZAHLUNG"
+    PAUSCHALE_INKLUSIVMIETE = "PAUSCHALE_INKLUSIVMIETE"
+    UNGEKLAERT = "UNGEKLAERT"
+
+
+class VerbraucherUnternehmerStatus(str, enum.Enum):
+    """Auftrag HV-20261020-VERTRAGSDATENBASIS (Nutzerergänzung
+    20.10.2026): Verbraucher-/Unternehmerstatus EINER Vertragspartei,
+    soweit für den gesetzlichen Verzugszins-Fallback (ABGB/UGB)
+    erforderlich - NIEMALS allein aus der Nutzungsart (z. B. "Büro"/
+    "Gewerbe") abgeleitet. `UNGEKLAERT` bleibt der Default."""
+
+    VERBRAUCHER = "VERBRAUCHER"
+    UNTERNEHMER = "UNTERNEHMER"
+    UNGEKLAERT = "UNGEKLAERT"
+
+
+class RechtsachseMrgAnwendungsbereich(str, enum.Enum):
+    """Auftrag HV-20261020-VERTRAGSDATENBASIS: EINE von drei getrennten
+    Rechtsachsen (die anderen sind `RechtsachseMietzinsbildung` und
+    `Nutzungsart`) - AUSDRÜCKLICH unverbindliches Staging-Feld auf
+    `MietvertragsprofilTable` (wie die Index-Quellfelder), ERSETZT NICHT
+    `VertragTable.rechtsordnung`/`RechtsprofilTable` und löst KEINE
+    Freigabe/Sollstellung/Mahnsperre aus. Gewerbenutzung ist KEINE
+    automatische MRG-Ausnahme, freier Mietzins ist KEINE automatische
+    MRG-Ausnahme - diese Achse bleibt deshalb bewusst unabhängig von
+    `RechtsachseMietzinsbildung`/`Nutzungsart`."""
+
+    VOLL = "VOLL"
+    TEIL = "TEIL"
+    AUSNAHME = "AUSNAHME"
+    UNGEKLAERT = "UNGEKLAERT"
+
+
+class RechtsachseMietzinsbildung(str, enum.Enum):
+    """Auftrag HV-20261020-VERTRAGSDATENBASIS: zweite der drei getrennten
+    Rechtsachsen (siehe `RechtsachseMrgAnwendungsbereich`-Docstring) -
+    gleiches Staging-Prinzip, keine Wirkung auf Freigabe/Sollstellung."""
+
+    FREI = "FREI"
+    RICHTWERT = "RICHTWERT"
+    KATEGORIE = "KATEGORIE"
+    ANDERE = "ANDERE"
+    UNGEKLAERT = "UNGEKLAERT"
+
+
 def rechtsordnung_geklaert(rechtsordnung: str) -> bool:
     """Zentrale Prüfung, die von `vorschreibung/service.py::sollstellen`,
     `index/service.py::klausel_anlegen`/`berechne_vorschlag` und

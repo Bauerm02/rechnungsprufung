@@ -136,6 +136,34 @@ _MUSTER: dict[str, re.Pattern[str]] = {
     "nutzungsart_wohnung": re.compile(r"(Wohnungsmietvertrag|zu Wohnzwecken)", re.IGNORECASE),
     "nutzungsart_geschaeft": re.compile(r"(Gesch(?:ä|ae)ftsraummietvertrag|Gesch(?:ä|ae)ftslokal)", re.IGNORECASE),
     "nutzungsart_buero": re.compile(r"(B(?:ü|ue)romietvertrag|als B(?:ü|ue)ro vermietet)", re.IGNORECASE),
+    # Auftrag HV-20261020-VERTRAGSDATENBASIS - Termine GETRENNT von
+    # Mietbeginn/-ende (siehe `vorschlaege.py`):
+    "unterzeichnungsdatum": re.compile(
+        r"(?:unterzeichnet am|unterschrieben am|Datum der Unterzeichnung)[^\d]{0,20}(\d{1,2}\.\d{1,2}\.\d{4})",
+        re.IGNORECASE,
+    ),
+    "uebergabe_am": re.compile(
+        r"(?:[Üü]bergeben am|[Üü]bergabe(?:datum)?[^\d€]{0,10}am)[^\d]{0,20}(\d{1,2}\.\d{1,2}\.\d{4})",
+        re.IGNORECASE,
+    ),
+    # Tri-State (siehe `domain/enums.py::Befristungsstatus`) - wie bei
+    # `nutzungsart_*` oben ZWEI GETRENNTE Hinweismuster statt einem
+    # gemeinsamen: `vorschlaege.py` setzt das Feld NUR, wenn GENAU EINES
+    # der beiden trifft - trifft ein Dokument BEIDE (Mischtext/falsch
+    # erkannte Passage), bleibt das Feld bewusst unbesetzt statt zu raten.
+    # Negative Lookbehind "(?<!un)" verhindert, dass "befristet_hinweis"
+    # fälschlich INNERHALB von "unbefristet..." mitgematcht wird
+    # ("befristet" ist eine Teilzeichenkette von "unbefristet").
+    "befristet_hinweis": re.compile(r"(?<!un)(befristet(?:er Mietvertrag| auf| bis)?)", re.IGNORECASE),
+    "unbefristet_hinweis": re.compile(r"(unbefristet(?:er Mietvertrag)?)", re.IGNORECASE),
+    "bk_hk_akonto_hinweis": re.compile(
+        r"(Akontozahlung|Betriebskostenakonto|Vorauszahlung(?:en)? (?:für|auf) (?:die )?Betriebskosten)",
+        re.IGNORECASE,
+    ),
+    "bk_hk_pauschale_hinweis": re.compile(
+        r"(Pauschalmiete|Inklusivmiete|All-in-Miete|Betriebskosten(?:pauschale)? (?:sind|ist) (?:in der Miete )?inkludiert)",
+        re.IGNORECASE,
+    ),
 }
 
 

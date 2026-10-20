@@ -700,6 +700,67 @@ def test_ensure_additive_columns_zieht_debitoren_telefon_nach_und_ist_idempotent
         engine.dispose()
 
 
+def test_ensure_additive_columns_zieht_vertrag_mitmieter_parteien_spalten_additiv_ohne_fk_nach(tmp_path: Path):
+    """Auftrag HV-20261020-VERTRAGSDATENBASIS: `vertrag_mitmieter`
+    existierte bereits (Auftrag HV-20261020-VIER-MAHNSTUFEN) OHNE
+    `rolle`/`debitor_id`/`telefon`/`zustand`/`quelle_typ`/
+    `quelle_referenz`. Kritisch: `debitor_id` referenziert fachlich den
+    bestehenden Debitor, darf aber KEINE SQLAlchemy-`ForeignKey` sein
+    (sonst bricht `ensure_additive_columns` mit einer `RuntimeError` ab,
+    siehe dortige Docstring/"Fremdschlüsselspalte(n) ohne unterstützte
+    additive Migration") - dieser Test stellt sicher, dass genau das
+    NICHT passiert und eine Bestandszeile unverändert erhalten bleibt."""
+
+    from mietinkasso.infrastructure.db.tables import VertragMitmieterTable
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'vertrag-mitmieter-alt.db'}", future=True)
+    meta = sa.MetaData()
+    vertrag_mitmieter_alt = sa.Table(
+        "vertrag_mitmieter",
+        meta,
+        sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
+        sa.Column("vertrag_id", sa.String(48), nullable=False),
+        sa.Column("name", sa.String(256), nullable=False),
+        sa.Column("email", sa.String(256), nullable=True),
+        sa.Column("adresse", sa.String(512), nullable=True),
+        sa.Column("postadresse_geprueft", sa.Boolean, nullable=False, server_default=sa.text("0")),
+        sa.Column("aktiv", sa.Boolean, nullable=False, server_default=sa.text("1")),
+        sa.Column("erstellt_von", sa.String(128), nullable=False),
+        sa.Column("erstellt_am", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        # rolle/debitor_id/telefon/zustand/quelle_typ/quelle_referenz: NEU, bewusst NICHT hier.
+    )
+    try:
+        meta.create_all(engine)
+        with engine.begin() as conn:
+            conn.execute(vertrag_mitmieter_alt.insert().values(
+                vertrag_id="V-ALT", name="Synthetische Alt-Mitmieterin", email="alt-mit@example.at",
+                adresse=None, postadresse_geprueft=False, aktiv=True, erstellt_von="codex-test",
+            ))
+
+        ausgefuehrt = ensure_additive_columns(engine)  # darf KEINE RuntimeError werfen
+        neue_spalten = {"rolle", "debitor_id", "telefon", "zustand", "quelle_typ", "quelle_referenz"}
+        angewendete_spalten = {a.split("ADD COLUMN ")[1].split()[0] for a in ausgefuehrt}
+        assert neue_spalten <= angewendete_spalten
+
+        with engine.begin() as conn:
+            zeile = conn.execute(sa.text("SELECT * FROM vertrag_mitmieter WHERE vertrag_id = 'V-ALT'")).mappings().one()
+        assert zeile["name"] == "Synthetische Alt-Mitmieterin" and zeile["email"] == "alt-mit@example.at"
+        assert zeile["debitor_id"] is None
+
+        assert ensure_additive_columns(engine) == []  # idempotent
+
+        session_factory = sessionmaker(bind=engine, future=True, expire_on_commit=False, class_=Session)
+        with session_factory() as session:
+            zeile_orm = session.execute(
+                sa.select(VertragMitmieterTable).where(VertragMitmieterTable.vertrag_id == "V-ALT")
+            ).scalar_one()
+            assert zeile_orm.rolle == "MITMIETER"  # server_default der neuen Spalte greift für die Altzeile
+            assert zeile_orm.zustand == "BESTAETIGT"
+            assert zeile_orm.debitor_id is None
+    finally:
+        engine.dispose()
+
+
 def test_ensure_additive_columns_zieht_ruecklastschriftkosten_nachtraeglich_spalten_nach(tmp_path: Path):
     """Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS: `ruecklastschriftkosten`
     existiert produktiv OHNE die drei `nachtraeglich_zurechenbar_*`-Spalten

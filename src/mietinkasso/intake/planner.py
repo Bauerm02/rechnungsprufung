@@ -17,12 +17,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.domain.enums import (
+    Befristungsstatus,
+    BkHkAbrechnungsart,
     MietvertragsprofilQuelle,
     Nutzungsart,
     Nutzungsstatus,
     OPTyp,
+    RechtsachseMietzinsbildung,
+    RechtsachseMrgAnwendungsbereich,
     Rechtsordnung,
     Sperrgrund,
+    VerbraucherUnternehmerStatus,
     rechtsordnung_geklaert,
 )
 from mietinkasso.infrastructure.db.tables import (
@@ -52,6 +57,11 @@ from mietinkasso.intake.schema import (
 
 _GUELTIGE_NUTZUNGSARTEN = {e.value for e in Nutzungsart}
 _GUELTIGE_MIETVERTRAGSPROFIL_QUELLEN = {e.value for e in MietvertragsprofilQuelle}
+_GUELTIGE_BEFRISTUNGSSTATUS = {e.value for e in Befristungsstatus}
+_GUELTIGE_BK_HK_ABRECHNUNGSARTEN = {e.value for e in BkHkAbrechnungsart}
+_GUELTIGE_VERBRAUCHER_UNTERNEHMER_STATUS = {e.value for e in VerbraucherUnternehmerStatus}
+_GUELTIGE_RECHTSACHSE_MRG_ANWENDUNGSBEREICH = {e.value for e in RechtsachseMrgAnwendungsbereich}
+_GUELTIGE_RECHTSACHSE_MIETZINSBILDUNG = {e.value for e in RechtsachseMietzinsbildung}
 
 _GUELTIGE_NUTZUNGSSTATUS = {e.value for e in Nutzungsstatus}
 _GUELTIGE_RECHTSORDNUNGEN = {e.value for e in Rechtsordnung}
@@ -218,6 +228,20 @@ def _mietvertragsprofil_felder(
     index_schwelle_prozent, index_schwelle_inklusive: bool | None, index_anpassungsmonat: int | None,
     index_mindestintervall_monate: int | None, index_klauseltext_auszug: str | None,
     index_klauseltext_seite: int | None, quelle_typ: str, quelle_referenz: str | None,
+    unterzeichnungsdatum: date | None = None, unterzeichnungsdatum_quellenbeleg: str | None = None,
+    uebergabe_am: date | None = None, uebergabe_am_quellenbeleg: str | None = None,
+    letzte_verlaengerung_am: date | None = None, letzte_verlaengerung_am_quellenbeleg: str | None = None,
+    befristungsstatus: str = "UNGEKLAERT", befristungsstatus_quellenbeleg: str | None = None,
+    bk_hk_abrechnungsart: str = "UNGEKLAERT", bk_hk_abrechnungsart_quellenbeleg: str | None = None,
+    bk_hk_verteilungsschluessel: str | None = None, bk_hk_verteilungsschluessel_quellenbeleg: str | None = None,
+    verbraucher_unternehmer_status_mieter: str = "UNGEKLAERT",
+    verbraucher_unternehmer_status_mieter_quellenbeleg: str | None = None,
+    verbraucher_unternehmer_status_vermieter: str = "UNGEKLAERT",
+    verbraucher_unternehmer_status_vermieter_quellenbeleg: str | None = None,
+    rechtsachse_mrg_anwendungsbereich: str = "UNGEKLAERT",
+    rechtsachse_mrg_anwendungsbereich_quellenbeleg: str | None = None,
+    rechtsachse_mietzinsbildung: str = "UNGEKLAERT",
+    rechtsachse_mietzinsbildung_quellenbeleg: str | None = None,
 ) -> dict:
     """Feldabbild für den Versionsvergleich (siehe `_pruefe_mietvertragsprofil`)
     - bewusst OHNE `erstellt_von`/`erstellt_am`/`version`: eine neue Version mit
@@ -243,6 +267,26 @@ def _mietvertragsprofil_felder(
         "index_klauseltext_seite": index_klauseltext_seite,
         "quelle_typ": quelle_typ,
         "quelle_referenz": quelle_referenz,
+        "unterzeichnungsdatum": str(unterzeichnungsdatum) if unterzeichnungsdatum else None,
+        "unterzeichnungsdatum_quellenbeleg": unterzeichnungsdatum_quellenbeleg,
+        "uebergabe_am": str(uebergabe_am) if uebergabe_am else None,
+        "uebergabe_am_quellenbeleg": uebergabe_am_quellenbeleg,
+        "letzte_verlaengerung_am": str(letzte_verlaengerung_am) if letzte_verlaengerung_am else None,
+        "letzte_verlaengerung_am_quellenbeleg": letzte_verlaengerung_am_quellenbeleg,
+        "befristungsstatus": befristungsstatus,
+        "befristungsstatus_quellenbeleg": befristungsstatus_quellenbeleg,
+        "bk_hk_abrechnungsart": bk_hk_abrechnungsart,
+        "bk_hk_abrechnungsart_quellenbeleg": bk_hk_abrechnungsart_quellenbeleg,
+        "bk_hk_verteilungsschluessel": bk_hk_verteilungsschluessel,
+        "bk_hk_verteilungsschluessel_quellenbeleg": bk_hk_verteilungsschluessel_quellenbeleg,
+        "verbraucher_unternehmer_status_mieter": verbraucher_unternehmer_status_mieter,
+        "verbraucher_unternehmer_status_mieter_quellenbeleg": verbraucher_unternehmer_status_mieter_quellenbeleg,
+        "verbraucher_unternehmer_status_vermieter": verbraucher_unternehmer_status_vermieter,
+        "verbraucher_unternehmer_status_vermieter_quellenbeleg": verbraucher_unternehmer_status_vermieter_quellenbeleg,
+        "rechtsachse_mrg_anwendungsbereich": rechtsachse_mrg_anwendungsbereich,
+        "rechtsachse_mrg_anwendungsbereich_quellenbeleg": rechtsachse_mrg_anwendungsbereich_quellenbeleg,
+        "rechtsachse_mietzinsbildung": rechtsachse_mietzinsbildung,
+        "rechtsachse_mietzinsbildung_quellenbeleg": rechtsachse_mietzinsbildung_quellenbeleg,
     }
 
 
@@ -259,6 +303,21 @@ def _mietvertragsprofil_felder_aus_zeile(z: MietvertragsprofilZeile) -> dict:
         index_anpassungsmonat=z.index_anpassungsmonat, index_mindestintervall_monate=z.index_mindestintervall_monate,
         index_klauseltext_auszug=z.index_klauseltext_auszug, index_klauseltext_seite=z.index_klauseltext_seite,
         quelle_typ=z.quelle_typ, quelle_referenz=z.quelle_referenz,
+        unterzeichnungsdatum=z.unterzeichnungsdatum, unterzeichnungsdatum_quellenbeleg=z.unterzeichnungsdatum_quellenbeleg,
+        uebergabe_am=z.uebergabe_am, uebergabe_am_quellenbeleg=z.uebergabe_am_quellenbeleg,
+        letzte_verlaengerung_am=z.letzte_verlaengerung_am, letzte_verlaengerung_am_quellenbeleg=z.letzte_verlaengerung_am_quellenbeleg,
+        befristungsstatus=z.befristungsstatus, befristungsstatus_quellenbeleg=z.befristungsstatus_quellenbeleg,
+        bk_hk_abrechnungsart=z.bk_hk_abrechnungsart, bk_hk_abrechnungsart_quellenbeleg=z.bk_hk_abrechnungsart_quellenbeleg,
+        bk_hk_verteilungsschluessel=z.bk_hk_verteilungsschluessel,
+        bk_hk_verteilungsschluessel_quellenbeleg=z.bk_hk_verteilungsschluessel_quellenbeleg,
+        verbraucher_unternehmer_status_mieter=z.verbraucher_unternehmer_status_mieter,
+        verbraucher_unternehmer_status_mieter_quellenbeleg=z.verbraucher_unternehmer_status_mieter_quellenbeleg,
+        verbraucher_unternehmer_status_vermieter=z.verbraucher_unternehmer_status_vermieter,
+        verbraucher_unternehmer_status_vermieter_quellenbeleg=z.verbraucher_unternehmer_status_vermieter_quellenbeleg,
+        rechtsachse_mrg_anwendungsbereich=z.rechtsachse_mrg_anwendungsbereich,
+        rechtsachse_mrg_anwendungsbereich_quellenbeleg=z.rechtsachse_mrg_anwendungsbereich_quellenbeleg,
+        rechtsachse_mietzinsbildung=z.rechtsachse_mietzinsbildung,
+        rechtsachse_mietzinsbildung_quellenbeleg=z.rechtsachse_mietzinsbildung_quellenbeleg,
     )
 
 
@@ -275,6 +334,21 @@ def _mietvertragsprofil_felder_aus_tabelle(t: MietvertragsprofilTable) -> dict:
         index_anpassungsmonat=t.index_anpassungsmonat, index_mindestintervall_monate=t.index_mindestintervall_monate,
         index_klauseltext_auszug=t.index_klauseltext_auszug, index_klauseltext_seite=t.index_klauseltext_seite,
         quelle_typ=t.quelle_typ, quelle_referenz=t.quelle_referenz,
+        unterzeichnungsdatum=t.unterzeichnungsdatum, unterzeichnungsdatum_quellenbeleg=t.unterzeichnungsdatum_quellenbeleg,
+        uebergabe_am=t.uebergabe_am, uebergabe_am_quellenbeleg=t.uebergabe_am_quellenbeleg,
+        letzte_verlaengerung_am=t.letzte_verlaengerung_am, letzte_verlaengerung_am_quellenbeleg=t.letzte_verlaengerung_am_quellenbeleg,
+        befristungsstatus=t.befristungsstatus, befristungsstatus_quellenbeleg=t.befristungsstatus_quellenbeleg,
+        bk_hk_abrechnungsart=t.bk_hk_abrechnungsart, bk_hk_abrechnungsart_quellenbeleg=t.bk_hk_abrechnungsart_quellenbeleg,
+        bk_hk_verteilungsschluessel=t.bk_hk_verteilungsschluessel,
+        bk_hk_verteilungsschluessel_quellenbeleg=t.bk_hk_verteilungsschluessel_quellenbeleg,
+        verbraucher_unternehmer_status_mieter=t.verbraucher_unternehmer_status_mieter,
+        verbraucher_unternehmer_status_mieter_quellenbeleg=t.verbraucher_unternehmer_status_mieter_quellenbeleg,
+        verbraucher_unternehmer_status_vermieter=t.verbraucher_unternehmer_status_vermieter,
+        verbraucher_unternehmer_status_vermieter_quellenbeleg=t.verbraucher_unternehmer_status_vermieter_quellenbeleg,
+        rechtsachse_mrg_anwendungsbereich=t.rechtsachse_mrg_anwendungsbereich,
+        rechtsachse_mrg_anwendungsbereich_quellenbeleg=t.rechtsachse_mrg_anwendungsbereich_quellenbeleg,
+        rechtsachse_mietzinsbildung=t.rechtsachse_mietzinsbildung,
+        rechtsachse_mietzinsbildung_quellenbeleg=t.rechtsachse_mietzinsbildung_quellenbeleg,
     )
 
 
@@ -847,6 +921,20 @@ def _pruefe_mietvertragsprofil(
     if z.quelle_typ not in _GUELTIGE_MIETVERTRAGSPROFIL_QUELLEN:
         befunde.append(PruefBefund(entitaet, z.vertrag_id, "KONFLIKT", f"Mietvertragsprofil '{z.vertrag_id}': ungültiger quelle_typ '{z.quelle_typ}'."))
         return
+    # Auftrag HV-20261020-VERTRAGSDATENBASIS: dieselbe "harter Konflikt
+    # statt stillschweigend geraten"-Regel wie bei nutzungsart/quelle_typ
+    # oben, für alle neuen Tri-State-Felder.
+    for feld_name, wert, gueltige_werte in (
+        ("befristungsstatus", z.befristungsstatus, _GUELTIGE_BEFRISTUNGSSTATUS),
+        ("bk_hk_abrechnungsart", z.bk_hk_abrechnungsart, _GUELTIGE_BK_HK_ABRECHNUNGSARTEN),
+        ("verbraucher_unternehmer_status_mieter", z.verbraucher_unternehmer_status_mieter, _GUELTIGE_VERBRAUCHER_UNTERNEHMER_STATUS),
+        ("verbraucher_unternehmer_status_vermieter", z.verbraucher_unternehmer_status_vermieter, _GUELTIGE_VERBRAUCHER_UNTERNEHMER_STATUS),
+        ("rechtsachse_mrg_anwendungsbereich", z.rechtsachse_mrg_anwendungsbereich, _GUELTIGE_RECHTSACHSE_MRG_ANWENDUNGSBEREICH),
+        ("rechtsachse_mietzinsbildung", z.rechtsachse_mietzinsbildung, _GUELTIGE_RECHTSACHSE_MIETZINSBILDUNG),
+    ):
+        if wert not in gueltige_werte:
+            befunde.append(PruefBefund(entitaet, z.vertrag_id, "KONFLIKT", f"Mietvertragsprofil '{z.vertrag_id}': ungültiger {feld_name} '{wert}'."))
+            return
     bestehend = _neuestes_mietvertragsprofil(session, z.vertrag_id)
     neue_felder = _mietvertragsprofil_felder_aus_zeile(z)
     if bestehend is None:

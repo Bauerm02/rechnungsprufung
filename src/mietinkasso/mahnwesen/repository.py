@@ -628,20 +628,26 @@ class MahnLaufRepository:
 
 
 class VertragMitmieterRepository:
-    """Auftrag HV-20261020-VIER-MAHNSTUFEN: rein additive Verwaltung der
-    NICHT-finanziellen Zusatz-Empfänger eines Vertrags (siehe
-    `VertragMitmieterTable`-Docstring) - bewusst NICHT Teil von
-    `stammdaten/repository.py::StammdatenRepository` (das bleibt die
-    finanzielle Stammdatenwahrheit: Debitor/Konto/OP bleiben davon
-    unberührt), sondern hier beim Mahnwesen, das diese Daten AUSSCHLIESSLICH
-    für Briefadressierung/Zugangsnachweis verwendet."""
+    """Verwaltet die EINE führende Vertragsparteien-/Vertreter-Struktur
+    (siehe `VertragMitmieterTable`-Docstring für die Erweiterungs-
+    begründung) - bewusst NICHT Teil von `stammdaten/repository.py::
+    StammdatenRepository` (das bleibt die finanzielle Stammdatenwahrheit:
+    Debitor/Konto/OP bleiben davon unberührt)."""
 
     def __init__(self, session_factory: sessionmaker[Session]):
         self._session_factory = session_factory
 
-    def anlegen(self, *, vertrag_id: str, name: str, email: str | None, adresse: str | None, erstellt_von: str) -> VertragMitmieterTable:
+    def anlegen(
+        self, *, vertrag_id: str, name: str | None, email: str | None, adresse: str | None, erstellt_von: str,
+        rolle: str = "MITMIETER", debitor_id: str | None = None, telefon: str | None = None,
+        zustand: str = "BESTAETIGT", quelle_typ: str | None = None, quelle_referenz: str | None = None,
+    ) -> VertragMitmieterTable:
         with self._session_factory() as session:
-            row = VertragMitmieterTable(vertrag_id=vertrag_id, name=name, email=email, adresse=adresse, erstellt_von=erstellt_von)
+            row = VertragMitmieterTable(
+                vertrag_id=vertrag_id, rolle=rolle, debitor_id=debitor_id, name=name, email=email,
+                adresse=adresse, telefon=telefon, zustand=zustand, quelle_typ=quelle_typ,
+                quelle_referenz=quelle_referenz, erstellt_von=erstellt_von,
+            )
             session.add(row)
             session.commit()
             session.refresh(row)
@@ -652,10 +658,39 @@ class VertragMitmieterRepository:
             return session.get(VertragMitmieterTable, mitmieter_id)
 
     def list_aktiv(self, vertrag_id: str) -> list[VertragMitmieterTable]:
+        """ALLE aktiven Parteien/Vertreter dieses Vertrags (jede Rolle,
+        jeder Zustand) - für die allgemeine Vertragsanlage-Übersicht.
+        Für die Mahnwesen-Empfängerableitung siehe
+        `list_bestaetigte_mitmieter` (engere Filterung)."""
+
         with self._session_factory() as session:
             statement = (
                 select(VertragMitmieterTable)
                 .where(VertragMitmieterTable.vertrag_id == vertrag_id, VertragMitmieterTable.aktiv.is_(True))
+                .order_by(VertragMitmieterTable.id)
+            )
+            return list(session.execute(statement).scalars().all())
+
+    def list_bestaetigte_mitmieter(self, vertrag_id: str) -> list[VertragMitmieterTable]:
+        """Auftrag HV-20261020-VERTRAGSDATENBASIS: engere Filterung für
+        die automatische Mahnwesen-Empfängerableitung (`mahnwesen/
+        service.py::_vervollstaendige_bestaetigten_mahnlauf`) - NUR
+        aktive, BESTÄTIGTE `MITMIETER`-Zeilen. `HAUPTMIETER` bleibt
+        bewusst ausgeschlossen (der Debitor ist bereits der Anker-
+        Empfänger, siehe Aufrufer), `VERTRETER` wird NIE automatisch
+        mitadressiert (siehe `Vertragsparteirolle`-Docstring) und eine
+        noch nicht bestätigte (`AUSGELESEN`/`FEHLT`/`MEHRDEUTIG`) Zeile
+        erst recht nicht - kein Versand an eine noch ungeprüfte Angabe."""
+
+        with self._session_factory() as session:
+            statement = (
+                select(VertragMitmieterTable)
+                .where(
+                    VertragMitmieterTable.vertrag_id == vertrag_id,
+                    VertragMitmieterTable.aktiv.is_(True),
+                    VertragMitmieterTable.rolle == "MITMIETER",
+                    VertragMitmieterTable.zustand == "BESTAETIGT",
+                )
                 .order_by(VertragMitmieterTable.id)
             )
             return list(session.execute(statement).scalars().all())
