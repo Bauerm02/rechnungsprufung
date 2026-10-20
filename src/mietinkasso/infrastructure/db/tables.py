@@ -1124,6 +1124,16 @@ class MahnEmpfaengerZugangTable(Base):
     zugang_beleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
     erstellt_von: Mapped[str] = mapped_column(String(128))
     erstellt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Auftrag HV-20261020-MAHN-FORTSETZUNG ("tatsächlich belegter Versand
+    # an alle bestätigten Mitmieter"): reines Versand-BOOKKEEPING - belegt
+    # NUR, dass dieser Person tatsächlich eine Kopie des Mahnschreibens
+    # zugestellt (dem Maildienst übergeben) wurde, KEIN rechtssicherer
+    # Zugang (das bleibt ausschließlich `zugang_bestaetigt_am`/
+    # `zugangsform` oben, niemals automatisch aus einem bloßen Sendeerfolg
+    # abgeleitet - "keine angenommenen Zugänge"). `None` bedeutet: (noch)
+    # kein belegter Versandversuch für diese Person.
+    versand_belegt_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    versand_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
 
 class AuditEventTable(Base):

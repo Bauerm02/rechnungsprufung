@@ -415,10 +415,11 @@ def erzeuge_mahnbrief_pdf(
     # "bis {datum}" wäre ein vorgetäuschtes Zugangsdatum (siehe
     # `mahntexte.py::text_fuer_stufe`-Docstring, dieselbe Korrektur).
     # Abnahme-Folgefix (Codex 20.10.2026): "keine geprüfte Ziel-IBAN/
-    # Kontoinhaber/Referenz" - ist eine Zielkontoverbindung konfiguriert
-    # (siehe `infrastructure/config.py::brief_zahlungsziel_iban`), wird
-    # sie HIER KONKRET genannt statt des bisherigen vagen Verweises; ohne
-    # Konfiguration bleibt der bisherige Text unverändert (kein
+    # Kontoinhaber/Referenz" - ist eine eindeutige Bankkontobindung der
+    # Vertrags-Gesellschaft auflösbar (siehe `indexautomatik/
+    # mailversand_service.py::zahlungsziel_fuer_mahnung`), wird sie HIER
+    # KONKRET genannt statt des bisherigen vagen Verweises; ohne
+    # auflösbare Bindung bleibt der bisherige Text unverändert (kein
     # erfundener Platzhalter).
     pdf.set_font("Brief", "", 10)
     if zahlungsziel is not None and zahlungsziel.iban and zahlungsziel.kontoinhaber:

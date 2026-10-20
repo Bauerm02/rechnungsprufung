@@ -17,8 +17,11 @@ from sqlalchemy.exc import IntegrityError
 
 from mietinkasso.auth.service import require_gesellschaft_access, require_schreibrecht
 from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, parse_eur_betrag
+from mietinkasso.domain.enums import ZUGANGSFORMEN_ALLE
 from mietinkasso.domain.exceptions import MietinkassoError
-from mietinkasso.indexautomatik.mailversand_service import bank_freigabe_ableiten, zahlungsziel_fuer_mahnung
+from mietinkasso.indexautomatik.mailversand_service import (
+    bank_freigabe_ableiten, bank_konto_fuer_gesellschaft_eindeutig, zahlungsziel_fuer_mahnung,
+)
 from mietinkasso.indexautomatik.zeit import heute_wien
 from mietinkasso.mahnwesen.brief_pdf import (
     Absender as _BriefAbsender,
@@ -140,6 +143,13 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
     bank_status = (
         f"Bank bestätigt bis {bank_bestaetigt_bis.isoformat()}" if bank_bestaetigt_bis else '<span class="warn">keine ausreichend aktuelle Bankbestätigung</span>'
     ) + (" | <span class='warn'>ungeklärte Eingänge vorhanden</span>" if ungeklaert else "")
+    anzahl_bankkonten = len(deps._bank_repo.list_bank_konten(gesellschaft_id=vertrag.gesellschaft_id))
+    if bank_konto_fuer_gesellschaft_eindeutig(deps._bank_repo, vertrag.gesellschaft_id) is None:
+        grund = "kein Bankkonto hinterlegt" if anzahl_bankkonten == 0 else f"{anzahl_bankkonten} Bankkonten gefunden, keine eindeutige Bindung"
+        bank_status += (
+            f" | <span class='warn'>Zahlungsziel für Mahnschreiben ungeklärt ({h(grund)}) - Brief/E-Mail "
+            "verwenden den allgemeinen Hinweistext statt einer konkreten IBAN.</span>"
+        )
     inhalt += f"""
     <div class="card">
       <p class="muted">Bankstatus: {bank_status}</p>
@@ -150,6 +160,7 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
       <p class="muted">Die Vorschau versendet keine Nachricht. Der separate Versand prüft unmittelbar davor den aktuellen Bank- und Forderungsstand.</p>
     </div>"""
     inhalt += _mahnkosten_vorschau_block(vertrag_id, heute_datum)
+    inhalt += f'<div class="card"><a href="/backoffice/vertrag/{h(vertrag_id)}/mahnempfaenger">Mitmieter &amp; Zugangsnachweise ansehen/bestätigen</a></div>'
     return _layout(request, session, "Mahnvorschau", inhalt)
 
 
@@ -613,7 +624,9 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
             neue_zinsen_delta_cent=vorschau.neue_zinsen_delta_cent, zins_segmente=zins_segmente,
             zinssatz_einheitlich_text=zinssatz_einheitlich_text, neue_gebuehr_cent=(vorschau.gebuehr_cent or 0),
             gebuehr_rechtsgrundlage=vorschau.gebuehr_rechtsgrundlage, gesamtbetrag_cent=gesamtbetrag_cent,
-            zahlungsziel=zahlungsziel_fuer_mahnung(deps._settings, vertrag_id=vertrag_id, stufe=stufe),
+            zahlungsziel=zahlungsziel_fuer_mahnung(
+                deps._bank_repo, deps._stammdaten_repo, gesellschaft_id=vertrag.gesellschaft_id, vertrag_id=vertrag_id, stufe=stufe,
+            ),
         )
     except _BriefAdressfehlerError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -832,11 +845,17 @@ def _policy_zeile_html(policy) -> str:
           {{csrf}}
           <button type="submit" class="secondary">Freigeben</button>
         </form>"""
+    profil_text = (
+        f"4 Stufen (je {policy.stufe2_mindesttage_nach_stufe1_zugang}/{policy.stufe3_mindesttage_nach_stufe2_zugang}/"
+        f"{policy.stufe4_mindesttage_nach_stufe3_zugang} Tage ab Zugang)"
+        if policy.vier_stufen_profil_aktiv else "2 Stufen (versandzeitpunktbasiert)"
+    )
     return f"""
     <tr>
       <td>{policy.version}</td>
       <td>{policy.stufe1_tage_nach_faelligkeit} Tage</td>
       <td>{policy.stufe2_mindesttage_nach_stufe1_versand} Tage</td>
+      <td>{h(profil_text)}</td>
       <td>{policy.zinsen_prozent}%</td>
       <td>{policy.gebuehr_cent} Cent</td>
       <td>{h(policy.status)}</td>
@@ -855,7 +874,8 @@ def mahnpolicy_uebersicht(request: Request, session=Depends(_current_session)) -
           <p class="ok">Aktuell freigegeben: Version {aktuelle.version} — Stufe 1 nach {aktuelle.stufe1_tage_nach_faelligkeit}
           Tagen, Stufe 2 frühestens {aktuelle.stufe2_mindesttage_nach_stufe1_versand} Tage nach tatsächlich
           versandter Stufe 1 UND erst nach deren vertraglicher Zahlungsfrist (serverseitig als Maximum
-          erzwungen). Zinsen/Gebühren: {aktuelle.zinsen_prozent}% / {aktuelle.gebuehr_cent} Cent.</p>
+          erzwungen). Zinsen/Gebühren: {aktuelle.zinsen_prozent}% / {aktuelle.gebuehr_cent} Cent.
+          {"Vier-Stufen-Profil AKTIV" if aktuelle.vier_stufen_profil_aktiv else "Vier-Stufen-Profil NICHT aktiv (alte Zwei-Stufen-Logik)"}.</p>
         </div>"""
         if aktuelle is not None
         else flash_error("Keine freigegebene MahnPolicy vorhanden — es kann derzeit NICHTS automatisch gemahnt werden.")
@@ -866,12 +886,12 @@ def mahnpolicy_uebersicht(request: Request, session=Depends(_current_session)) -
     inhalt = f"""
     <div class="card" style="max-width:820px;">
       <h1>Mahnstufen-Konfiguration</h1>
-      <p class="muted">Genau zwei automatische Mahnstufen (Fachregel 7) — keine dritte Stufe, kein
-         Inkasso/RA, Zinsen/Gebühren in diesem Auftrag fest auf 0 (nicht editierbar). Bestehende Sperren
-         (RA/Ratenplan/Insolvenz/ungeklärter Eingang/unklarer Eröffnungssaldo/manuelle Sperre) sowie die
-         BESTÄTIGTE Bankvollständigkeit gelten unverändert und werden hier NICHT umgangen.
-         <code>SEND_ENABLED=false</code> bleibt Standard — diese Seite ändert daran nichts, sie plant nur
-         Fristen, sie versendet nichts.</p>
+      <p class="muted">Zwei ODER (mit aktiviertem Vier-Stufen-Profil, Auftrag HV-20261020-VIER-MAHNSTUFEN)
+         bis zu vier automatische Mahnstufen — kein Inkasso/RA, Zinsen/Gebühren in diesem Auftrag fest auf 0
+         (nicht editierbar). Bestehende Sperren (RA/Ratenplan/Insolvenz/ungeklärter Eingang/unklarer
+         Eröffnungssaldo/manuelle Sperre) sowie die BESTÄTIGTE Bankvollständigkeit gelten unverändert und
+         werden hier NICHT umgangen. <code>SEND_ENABLED=false</code> bleibt Standard — diese Seite ändert
+         daran nichts, sie plant nur Fristen, sie versendet nichts.</p>
     </div>
     {aktuelle_html}
     <div class="card">
@@ -880,9 +900,18 @@ def mahnpolicy_uebersicht(request: Request, session=Depends(_current_session)) -
         {csrf_feld(session.csrf_token)}
         <label>Stufe 1: Tage nach belegter Fälligkeit</label>
         <input type="number" name="stufe1_tage_nach_faelligkeit" min="1" value="{deps._settings.mahn_stufe1_tage_nach_faelligkeit}" required>
-        <label>Stufe 2: Mindesttage nach tatsächlich versandter Stufe 1 (zusätzlich wird serverseitig
-               IMMER auch die vertragliche Zahlungsfrist abgewartet — das Maximum beider Werte gilt)</label>
+        <label>Stufe 2 (altes Zwei-Stufen-Profil): Mindesttage nach tatsächlich versandter Stufe 1
+               (zusätzlich wird serverseitig IMMER auch die vertragliche Zahlungsfrist abgewartet — das
+               Maximum beider Werte gilt; wirkt NUR, solange das Vier-Stufen-Profil unten NICHT aktiviert ist)</label>
         <input type="number" name="stufe2_mindesttage_nach_stufe1_versand" min="1" value="{deps._settings.mahn_stufe2_mindesttage_nach_stufe1}" required>
+        <label><input type="checkbox" name="vier_stufen_profil_aktiv" value="1"> Vier-Stufen-Profil aktivieren
+               (Fristen ab BESTÄTIGTEM Zugang je Stufe statt ab Versanddatum, §902/903 ABGB)</label>
+        <label>Stufe 2: Mindesttage ab bestätigtem Zugang von Stufe 1 (nur bei aktiviertem Vier-Stufen-Profil)</label>
+        <input type="number" name="stufe2_mindesttage_nach_stufe1_zugang" min="1" value="14" required>
+        <label>Stufe 3: Mindesttage ab bestätigtem Zugang von Stufe 2</label>
+        <input type="number" name="stufe3_mindesttage_nach_stufe2_zugang" min="1" value="14" required>
+        <label>Stufe 4: Mindesttage ab bestätigtem Zugang von Stufe 3</label>
+        <input type="number" name="stufe4_mindesttage_nach_stufe3_zugang" min="1" value="14" required>
         <p class="muted">Zinsen: 0% · Gebühr: 0 Cent (in diesem Auftrag fest, nicht editierbar).</p>
         <button type="submit">Als Entwurf anlegen</button>
       </form>
@@ -890,10 +919,11 @@ def mahnpolicy_uebersicht(request: Request, session=Depends(_current_session)) -
     <div class="card">
       <h2>Versionen</h2>
       <table>
-        <tr><th>Version</th><th>Stufe 1</th><th>Stufe 2</th><th>Zinsen</th><th>Gebühr</th><th>Status</th><th>Freigegeben am</th><th></th></tr>
-        {zeilen_html or '<tr><td colspan=8 class="muted">Noch keine Policy angelegt.</td></tr>'}
+        <tr><th>Version</th><th>Stufe 1</th><th>Stufe 2 (alt)</th><th>Profil</th><th>Zinsen</th><th>Gebühr</th><th>Status</th><th>Freigegeben am</th><th></th></tr>
+        {zeilen_html or '<tr><td colspan=9 class="muted">Noch keine Policy angelegt.</td></tr>'}
       </table>
-    </div>"""
+    </div>
+    {_kanalregel_block(session)}"""
     return _layout(request, session, "Mahnstufen-Konfiguration", inhalt)
 
 
@@ -902,15 +932,28 @@ def mahnpolicy_anlegen(
     request: Request,
     stufe1_tage_nach_faelligkeit: int = Form(...),
     stufe2_mindesttage_nach_stufe1_versand: int = Form(...),
+    stufe2_mindesttage_nach_stufe1_zugang: int = Form(14),
+    stufe3_mindesttage_nach_stufe2_zugang: int = Form(14),
+    stufe4_mindesttage_nach_stufe3_zugang: int = Form(14),
+    vier_stufen_profil_aktiv: str | None = Form(None),
     csrf_token: str = Form(...),
     session=Depends(_current_session),
 ) -> HTMLResponse:
     _verify_csrf(session, csrf_token)
-    if stufe1_tage_nach_faelligkeit < 1 or stufe2_mindesttage_nach_stufe1_versand < 1:
-        return _fehlerseite(session, "Mahnstufen-Konfiguration", "Beide Werte müssen mindestens 1 Tag betragen.", "/backoffice/mahnwesen/policy")
+    werte = (
+        stufe1_tage_nach_faelligkeit, stufe2_mindesttage_nach_stufe1_versand,
+        stufe2_mindesttage_nach_stufe1_zugang, stufe3_mindesttage_nach_stufe2_zugang, stufe4_mindesttage_nach_stufe3_zugang,
+    )
+    if any(wert < 1 for wert in werte):
+        return _fehlerseite(session, "Mahnstufen-Konfiguration", "Alle Tageswerte müssen mindestens 1 Tag betragen.", "/backoffice/mahnwesen/policy")
+    aktiv = vier_stufen_profil_aktiv == "1"
     policy = deps._mahn_policy_repo.anlegen(
         stufe1_tage_nach_faelligkeit=stufe1_tage_nach_faelligkeit,
         stufe2_mindesttage_nach_stufe1_versand=stufe2_mindesttage_nach_stufe1_versand,
+        vier_stufen_profil_aktiv=aktiv,
+        stufe2_mindesttage_nach_stufe1_zugang=stufe2_mindesttage_nach_stufe1_zugang,
+        stufe3_mindesttage_nach_stufe2_zugang=stufe3_mindesttage_nach_stufe2_zugang,
+        stufe4_mindesttage_nach_stufe3_zugang=stufe4_mindesttage_nach_stufe3_zugang,
         # Fest auf 0 - dieser Auftrag verlangt ausdrücklich "keine Zinsen/Gebühren"; kein Formularfeld,
         # das versehentlich (oder absichtlich via rohem POST) einen anderen Wert setzen könnte.
         zinsen_prozent=Decimal("0"),
@@ -919,9 +962,104 @@ def mahnpolicy_anlegen(
     )
     deps._audit_service.log(
         entity_typ="mahn_policy", entity_id=str(policy.id), aktion="angelegt", akteur=session.user_id,
-        payload={"version": policy.version, "stufe1_tage": stufe1_tage_nach_faelligkeit, "stufe2_mindesttage": stufe2_mindesttage_nach_stufe1_versand},
+        payload={"version": policy.version, "stufe1_tage": stufe1_tage_nach_faelligkeit,
+                 "stufe2_mindesttage": stufe2_mindesttage_nach_stufe1_versand, "vier_stufen_profil_aktiv": aktiv},
     )
     inhalt = flash_ok(f"Policy-Version {policy.version} als ENTWURF angelegt — muss noch freigegeben werden, bevor sie wirkt.")
+    inhalt += '<p><a href="/backoffice/mahnwesen/policy">&larr; zurück</a></p>'
+    return _layout(request, session, "Mahnstufen-Konfiguration", inhalt)
+
+
+# -- Kanalregel-Konfiguration (Stufe1-4 Kanal EMAIL/BRIEF, HV-20260914- ----
+# -- MAHNUNG-BRIEF/HV-20261020-VIER-MAHNSTUFEN) -----------------------------
+
+
+def _kanalregel_zeile_html(regel) -> str:
+    aktion = ""
+    if regel.status == "ENTWURF":
+        aktion = f"""
+        <form method="post" action="/backoffice/mahnwesen/kanalregel/{regel.id}/freigeben" class="inline">
+          {{csrf}}
+          <button type="submit" class="secondary">Freigeben</button>
+        </form>"""
+    return f"""
+    <tr>
+      <td>{regel.version}</td><td>{h(regel.stufe1_kanal)}</td><td>{h(regel.stufe2_kanal)}</td>
+      <td>{h(regel.stufe3_kanal)}</td><td>{h(regel.stufe4_kanal)}</td><td>{h(regel.status)}</td>
+      <td>{regel.geprueft_am.isoformat() if regel.geprueft_am else '-'}</td><td>{aktion}</td>
+    </tr>"""
+
+
+def _kanalregel_block(session) -> str:
+    aktuelle = deps._mahn_kanalregel_repo.aktuelle_freigegebene()
+    alle = deps._mahn_kanalregel_repo.alle()
+    aktuelle_html = (
+        f"""<p class="ok">Aktuell freigegeben: Version {aktuelle.version} — Stufe1 {h(aktuelle.stufe1_kanal)},
+        Stufe2 {h(aktuelle.stufe2_kanal)}, Stufe3 {h(aktuelle.stufe3_kanal)}, Stufe4 {h(aktuelle.stufe4_kanal)}.</p>"""
+        if aktuelle is not None
+        else '<p class="warn">Keine freigegebene Kanalregel — Default bleibt EMAIL für jede Stufe.</p>'
+    )
+    zeilen_html = "".join(_kanalregel_zeile_html(r).replace("{csrf}", csrf_feld(session.csrf_token)) for r in alle)
+    optionen = ("EMAIL", "BRIEF")
+    felder = "".join(
+        f"""<label>Stufe {stufe}</label>
+        <select name="stufe{stufe}_kanal">{''.join(f'<option value="{o}">{o}</option>' for o in optionen)}</select>"""
+        for stufe in (1, 2, 3, 4)
+    )
+    return f"""
+    <div class="card">
+      <h2>Versandkanal je Mahnstufe</h2>
+      {aktuelle_html}
+      <p class="muted">Der Briefkanal bleibt vollständig blockiert, solange kein echter Transport
+         angebunden ist (siehe Mahnvorschau) — eine hier freigegebene BRIEF-Regel löst dadurch allein
+         keinen Versand aus.</p>
+      <form method="post" action="/backoffice/mahnwesen/kanalregel/anlegen">
+        {csrf_feld(session.csrf_token)}
+        {felder}
+        <button type="submit">Als Entwurf anlegen</button>
+      </form>
+      <table>
+        <tr><th>Version</th><th>Stufe1</th><th>Stufe2</th><th>Stufe3</th><th>Stufe4</th><th>Status</th><th>Freigegeben am</th><th></th></tr>
+        {zeilen_html or '<tr><td colspan=8 class="muted">Noch keine Kanalregel angelegt.</td></tr>'}
+      </table>
+    </div>"""
+
+
+@router.post("/mahnwesen/kanalregel/anlegen", response_class=HTMLResponse)
+def mahnkanalregel_anlegen(
+    request: Request,
+    stufe1_kanal: str = Form(...), stufe2_kanal: str = Form(...),
+    stufe3_kanal: str = Form(...), stufe4_kanal: str = Form(...),
+    csrf_token: str = Form(...), session=Depends(_current_session),
+) -> HTMLResponse:
+    _verify_csrf(session, csrf_token)
+    require_schreibrecht(_ctx(session))
+    for kanal in (stufe1_kanal, stufe2_kanal, stufe3_kanal, stufe4_kanal):
+        if kanal not in ("EMAIL", "BRIEF"):
+            return _fehlerseite(session, "Mahnstufen-Konfiguration", f"Unbekannter Kanal '{kanal}'.", "/backoffice/mahnwesen/policy")
+    regel = deps._mahn_kanalregel_repo.anlegen(
+        stufe1_kanal=stufe1_kanal, stufe2_kanal=stufe2_kanal, stufe3_kanal=stufe3_kanal, stufe4_kanal=stufe4_kanal,
+        erstellt_von=session.user_id,
+    )
+    deps._audit_service.log(
+        entity_typ="mahn_kanalregel", entity_id=str(regel.id), aktion="angelegt", akteur=session.user_id,
+        payload={"version": regel.version, "stufe1": stufe1_kanal, "stufe2": stufe2_kanal, "stufe3": stufe3_kanal, "stufe4": stufe4_kanal},
+    )
+    inhalt = flash_ok(f"Kanalregel-Version {regel.version} als ENTWURF angelegt — muss noch freigegeben werden.")
+    inhalt += '<p><a href="/backoffice/mahnwesen/policy">&larr; zurück</a></p>'
+    return _layout(request, session, "Mahnstufen-Konfiguration", inhalt)
+
+
+@router.post("/mahnwesen/kanalregel/{regel_id}/freigeben", response_class=HTMLResponse)
+def mahnkanalregel_freigeben(request: Request, regel_id: int, csrf_token: str = Form(...), session=Depends(_current_session)) -> HTMLResponse:
+    _verify_csrf(session, csrf_token)
+    require_schreibrecht(_ctx(session))
+    try:
+        regel = deps._mahn_kanalregel_repo.freigeben(regel_id, freigegeben_von=session.user_id)
+    except ValueError as exc:
+        return _fehlerseite(session, "Mahnstufen-Konfiguration", str(exc), "/backoffice/mahnwesen/policy")
+    deps._audit_service.log(entity_typ="mahn_kanalregel", entity_id=str(regel.id), aktion="freigegeben", akteur=session.user_id, payload={"version": regel.version})
+    inhalt = flash_ok(f"Kanalregel-Version {regel.version} freigegeben.")
     inhalt += '<p><a href="/backoffice/mahnwesen/policy">&larr; zurück</a></p>'
     return _layout(request, session, "Mahnstufen-Konfiguration", inhalt)
 
@@ -937,3 +1075,128 @@ def mahnpolicy_freigeben(request: Request, policy_id: int, csrf_token: str = For
     inhalt = flash_ok(f"Policy-Version {policy.version} freigegeben.")
     inhalt += '<p><a href="/backoffice/mahnwesen/policy">&larr; zurück</a></p>'
     return _layout(request, session, "Mahnstufen-Konfiguration", inhalt)
+
+
+# -- Mitmieter & Zugangsnachweise je Vertrag (Auftrag HV-20261020- ---------
+# -- MAHN-FORTSETZUNG, HOTFIX-Folge #33) ------------------------------------
+#
+# Reine Übersicht + die einzige bestehende Schreibaktion dieser Seite
+# (`zugang_bestaetigen_fuer_empfaenger`) - KEIN neuer Mechanismus, nur die
+# bisher ungenutzte vorhandene Fachlogik (`MahnwesenService.
+# zugang_bestaetigen_fuer_empfaenger`/`MahnEmpfaengerZugangRepository`/
+# `VertragMitmieterRepository`) sichtbar gemacht.
+
+
+def _mitmieter_zeile_html(m) -> str:
+    return f"""
+    <tr>
+      <td>{m.id}</td><td>{h(m.rolle)}</td><td>{h(m.name or '-')}</td><td>{h(m.email or '-')}</td>
+      <td>{h(m.adresse or '-')}</td><td>{h(m.zustand)}</td><td>{'ja' if m.aktiv else 'nein'}</td>
+    </tr>"""
+
+
+def _empfaenger_zugang_zeile_html(vertrag_id: str, eintrag, csrf_token: str) -> str:
+    wer = "Hauptdebitor" if eintrag.mitmieter_id is None else f"Mitmieter #{eintrag.mitmieter_id}"
+    versand_html = (
+        f"belegt am {eintrag.versand_belegt_am.strftime('%d.%m.%Y %H:%M')}"
+        if eintrag.versand_belegt_am else '<span class="muted">kein Kopieversand belegt</span>'
+    ) if eintrag.mitmieter_id is not None else '<span class="muted">siehe Hauptversandnachweis oben</span>'
+    if eintrag.zugang_bestaetigt_am is not None:
+        zugang_html = f"{h(eintrag.zugangsform)} am {eintrag.zugang_bestaetigt_am.isoformat()} ({h(eintrag.zugang_beleg or '')})"
+        formular = ""
+    else:
+        optionen = "".join(f'<option value="{f}">{f}</option>' for f in sorted(ZUGANGSFORMEN_ALLE))
+        zugang_html = '<span class="warn">noch nicht bestätigt</span>'
+        formular = f"""
+        <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/mahnempfaenger/{eintrag.id}/zugang-bestaetigen" class="inline">
+          {csrf_feld(csrf_token)}
+          <select name="zugangsform" required>{optionen}</select>
+          <input type="date" name="zugang_datum" required>
+          <input name="zugang_beleg" placeholder="Beleg (z. B. Rückschein-Nr.)" required>
+          <button type="submit" class="secondary">Zugang bestätigen</button>
+        </form>"""
+    return f"""
+    <tr>
+      <td>{h(eintrag.empfaenger_name_snapshot)} ({h(wer)})</td><td>{versand_html}</td><td>{zugang_html}</td><td>{formular}</td>
+    </tr>"""
+
+
+@router.get("/vertrag/{vertrag_id}/mahnempfaenger", response_class=HTMLResponse)
+def mahnempfaenger_uebersicht(request: Request, vertrag_id: str, session=Depends(_current_session)) -> HTMLResponse:
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Mitmieter & Zugang", f"Unbekannter Vertrag {vertrag_id}.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+
+    mitmieter = deps._mitmieter_repo.list_alle(vertrag_id)
+    mitmieter_html = "".join(_mitmieter_zeile_html(m) for m in mitmieter)
+
+    mahnlaeufe_html = []
+    for lauf in deps._hv_mail.mahnlauf_repo.list_fuer_vertrag(vertrag_id):
+        eintraege = deps._hv_mail.empfaenger_zugang_repo.fuer_mahnlauf(lauf.id)
+        zeilen = "".join(_empfaenger_zugang_zeile_html(vertrag_id, e, session.csrf_token) for e in eintraege)
+        mahnlaeufe_html.append(f"""
+        <div class="card">
+          <h3>Stufe {lauf.stufe}, Kanal {h(lauf.kanal)} — Status {h(lauf.status)}</h3>
+          <p class="muted">Geplant am {lauf.geplant_am.isoformat() if lauf.geplant_am else '-'},
+             gesendet am {lauf.gesendet_am.isoformat() if lauf.gesendet_am else '-'},
+             Zugang (Gruppe, spätester Einzelzugang) {lauf.zugang_bestaetigt_am.isoformat() if lauf.zugang_bestaetigt_am else '-'}.</p>
+          <table>
+            <tr><th>Empfänger</th><th>Kopieversand (Mitmieter)</th><th>Zugang</th><th></th></tr>
+            {zeilen or '<tr><td colspan=4 class="muted">Noch keine erwarteten Empfänger erfasst.</td></tr>'}
+          </table>
+        </div>""")
+
+    inhalt = f"""
+    <div class="card">
+      <h1>Mitmieter &amp; Zugangsnachweise — {h(vertrag_id)}</h1>
+      <p class="muted">Nur AKTIVE, BESTÄTIGTE Mitmieter bekommen automatisch eine eigene Kopie jedes
+         tatsächlichen E-Mail-Mahnversands (siehe Vertragsanlage für die Mitmieter-Pflege). Ein
+         belegter Kopieversand ist KEIN Zugangsnachweis - Zugang wird ausschließlich über einen echten
+         Beleg unten bestätigt.</p>
+      <table>
+        <tr><th>ID</th><th>Rolle</th><th>Name</th><th>E-Mail</th><th>Adresse</th><th>Zustand</th><th>Aktiv</th></tr>
+        {mitmieter_html or '<tr><td colspan=7 class="muted">Keine Mitmieter/Vertreter erfasst.</td></tr>'}
+      </table>
+    </div>
+    {''.join(mahnlaeufe_html) or '<div class="card muted">Noch kein Mahnlauf für diesen Vertrag.</div>'}
+    <p><a href="/backoffice/vertrag/{h(vertrag_id)}/mahnvorschau">&larr; zurück zur Mahnvorschau</a></p>"""
+    return _layout(request, session, "Mitmieter & Zugang", inhalt)
+
+
+@router.post("/vertrag/{vertrag_id}/mahnempfaenger/{eintrag_id}/zugang-bestaetigen", response_class=HTMLResponse)
+def mahnempfaenger_zugang_bestaetigen(
+    request: Request, vertrag_id: str, eintrag_id: int, csrf_token: str = Form(...),
+    zugangsform: str = Form(...), zugang_datum: str = Form(...), zugang_beleg: str = Form(...),
+    session=Depends(_current_session),
+) -> HTMLResponse:
+    _verify_csrf(session, csrf_token)
+    rueck = f"/backoffice/vertrag/{vertrag_id}/mahnempfaenger"
+    zeile = None
+    for lauf in deps._hv_mail.mahnlauf_repo.list_fuer_vertrag(vertrag_id):
+        for e in deps._hv_mail.empfaenger_zugang_repo.fuer_mahnlauf(lauf.id):
+            if e.id == eintrag_id:
+                zeile = (lauf, e)
+                break
+        if zeile is not None:
+            break
+    if zeile is None:
+        return _fehlerseite(session, "Mitmieter & Zugang", f"Unbekannter Zugangsnachweis {eintrag_id}.", rueck)
+    lauf, _e = zeile
+    try:
+        zugang_datum_wert = date.fromisoformat(zugang_datum)
+    except ValueError:
+        return _fehlerseite(session, "Mitmieter & Zugang", "Ungültiges Zugangsdatum (Format YYYY-MM-DD erwartet).", rueck)
+    try:
+        deps._hv_mail.mahn_service.zugang_bestaetigen_fuer_empfaenger(
+            ctx=_ctx(session), mahnlauf_id=lauf.id, mitmieter_id=_e.mitmieter_id, heute=date.today(),
+            zugang_datum=zugang_datum_wert, zugangsform=zugangsform, zugang_beleg=zugang_beleg.strip(),
+            akteur=session.user_id,
+        )
+        deps._audit_service.log(
+            entity_typ="mahn_empfaenger_zugang", entity_id=str(eintrag_id), aktion="ZUGANG_BESTAETIGT",
+            akteur=session.user_id, payload={"vertrag_id": vertrag_id, "mahnlauf_id": lauf.id, "zugangsform": zugangsform},
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Mitmieter & Zugang", str(exc), rueck)
+    return RedirectResponse(url=rueck, status_code=303)

@@ -1,5 +1,141 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## Mahn-Fortsetzung (HV-20261020-MAHN-FORTSETZUNG, Markus 20.10.2026):
+## Zahlungsziel aus geprüfter Gesellschaftsbindung, Mitmieter-Kopieversand,
+## Vier-Stufen-/Kanal-Backoffice-UI
+
+Separater, in sich geschlossener Folgecommit zur (bereits abgenommenen)
+Vertragsanlage-Runde, wie von Markus ausdrücklich beauftragt. Betrifft
+AUSSCHLIESSLICH `src/mietinkasso/`, keine Deployment-/Versandfreigabe
+(`SEND_ENABLED=false` unverändert Standard).
+
+### Task 36 (core): Zahlungsziel aus geprüfter Vertrag/Objekt/
+### Gesellschaft-Bindung statt globaler IBAN
+
+Die in der VORHERIGEN Runde eingeführten globalen Settings
+`brief_zahlungsziel_iban`/`brief_zahlungsziel_kontoinhaber`
+(`infrastructure/config.py`) waren strukturell falsch für mehrere
+Vermietergesellschaften mit jeweils EIGENEM Bankkonto - eine einzige
+globale IBAN kann höchstens für eine Gesellschaft stimmen, für jede
+andere wäre das eine FALSCH adressierte Zahlung. Beide Felder wurden
+ERSATZLOS entfernt.
+
+`zahlungsziel_fuer_mahnung` (`indexautomatik/mailversand_service.py`)
+leitet die Ziel-IBAN jetzt IMMER aus der TATSÄCHLICHEN
+`BankKontoTable`-Bindung der Vertrags-Gesellschaft ab
+(`bank_konto_fuer_gesellschaft_eindeutig`): existiert GENAU EIN
+Bankkonto für diese Gesellschaft, wird dessen IBAN plus der registrierte
+Gesellschaftsname als Kontoinhaber verwendet. Fehlt ein Bankkonto ODER
+sind es MEHRERE (keine ausgezeichnete Markierung, welches "das" Konto
+ist), bleibt die Rückgabe `iban=None`/`kontoinhaber=None` - NIE geraten,
+NIE eine fremde/globale IBAN. Brief UND E-Mail fallen in diesem Fall auf
+den bisherigen allgemeinen Hinweistext zurück (kein "mis-addressed"
+Schreiben, nur unspezifisch) - die Mahnvorschau
+(`backoffice/routes/mahnwesen.py`) zeigt diesen ungeklärten Fall jetzt
+zusätzlich als sichtbare Warnung inkl. Anzahl gefundener Bankkonten, damit
+er nicht unbemerkt bleibt.
+
+Getestet (`tests/mietinkasso/test_hv_mailversand.py`): zwei Gesellschaften
+mit zwei unterschiedlichen IBANs, korrekt getrennt für E-Mail UND
+Briefkanal; fehlende Bindung; mehrdeutige Bindung (zwei Konten derselben
+Gesellschaft).
+
+### Tatsächlich belegter Versand an alle bestätigten Mitmieter
+
+Bisher wurden zwar `MahnEmpfaengerZugangTable`-Platzhalter für jeden
+bestätigten Mitmieter angelegt (sobald ein Mahnlauf tatsächlich GESENDET
+wurde), aber NIE tatsächlich eine Kopie des Mahnschreibens an sie
+versendet - nur der Hauptdebitor bekam die E-Mail. Für den EMAIL-Kanal
+sendet `HVMailversandService._dispatch_mahnlauf` jetzt zusätzlich an
+JEDEN aktiven, BESTÄTIGTEN Mitmieter (`VertragMitmieterRepository.
+list_bestaetigte_mitmieter`, dieselbe bereits bestehende Quelle wie die
+Zugangs-Platzhalter) mit hinterlegter E-Mail-Adresse eine EIGENE Kopie
+DESSELBEN, bereits für den Hauptdebitor komponierten Mahntexts - über
+dieselbe `MailOpsClient`/`MailOpsAuftrag`-Infrastruktur, mit einem je
+Person EIGENEN, deterministischen Idempotenzschlüssel
+(`mahnungslauf:<outbox_key>:mitmieter:<id>`), keine zweite Finanzstrecke.
+
+Ein fehlgeschlagener Kopieversand an EINE Person blockiert/verdoppelt
+weder den Hauptversand noch eine ANDERE Person (eigenes try/except je
+Person); der tatsächliche Erfolg/Zeitpunkt wird als reines Bookkeeping in
+zwei neuen, additiven Spalten auf `MahnEmpfaengerZugangTable`
+(`versand_belegt_am`/`versand_referenz`) nachgetragen - ausdrücklich
+GETRENNT von `zugang_bestaetigt_am`/`zugangsform` (ein belegter
+Kopieversand ist NIE automatisch ein rechtssicherer Zugang, "keine
+angenommenen Zugänge").
+
+Getestet: zwei bestätigte Mitmieter, einer schlägt gezielt fehl - der
+andere UND der Hauptversand bleiben unberührt; ein erneuter Lauf für
+dieselbe, bereits versandversuchte Gruppe löst keine zweite Kopie aus;
+Regressionstest ohne Mitmieter bleibt byte-identisch zum bisherigen
+Einempfänger-Pfad.
+
+**Ehrlich offen (bewusst NICHT in dieser Runde gelöst):**
+- **BRIEF-Kanal bekommt KEINE Mitmieter-Kopie.** Nur der EMAIL-Kanal
+  verdoppelt an bestätigte Mitmieter; ein Mitmieter-Brief an eine
+  eigene, abweichende Postadresse ist nicht gebaut. Da der Briefkanal in
+  dieser Umgebung ohnehin durchgehend ohne echten Transport bleibt
+  (`brief_transport_verfuegbar=False`), ist das Risiko aktuell gering,
+  muss aber vor einer echten Brief-Inbetriebnahme nachgezogen werden.
+- **`versand_belegt_am`-Bookkeeping kann bei einer SPÄTER (nicht
+  unmittelbar) bestätigten Gruppe lückenhaft bleiben.** Die
+  Mitmieter-Kopien werden zwar IMMER im selben `versand_fn`-Aufruf
+  versucht (unabhängig davon, ob der Hauptversand sofort GESENDET oder
+  zunächst nur UNSICHER zurückkommt) - die Nachtrag-Logik in
+  `_dispatch_mahnlauf`, die das Ergebnis in `MahnEmpfaengerZugangTable`
+  schreibt, läuft aber NUR unmittelbar im selben Aufruf, wenn
+  `versende_mahnlauf` dort direkt `GESENDET` zurückgibt. Wird der
+  Hauptversand stattdessen erst SPÄTER über die bestehende Status-
+  Abgleich-/Recovery-Strecke (`vervollstaendige_unsichere_mahnlaeufe`)
+  bestätigt, werden die `MahnEmpfaengerZugangTable`-Platzhalter zwar
+  korrekt nachträglich angelegt, aber das bereits erfolgte
+  Mitmieter-Versandergebnis (nur im lokalen `mitmieter_versand_slot`
+  dieses längst beendeten Aufrufs vorhanden) geht dabei verloren - die
+  Kopie wurde tatsächlich verschickt, bleibt in der Backoffice-Übersicht
+  aber als "kein Kopieversand belegt" sichtbar. KEIN Doppelversand-Risiko
+  (die Idempotenzschlüssel schützen weiterhin), nur eine unvollständige
+  Nachweisanzeige in diesem Pfad - sollte nachgezogen werden, falls die
+  Mitmieter-Zugangsnachweise für Stufe-3/4-Fristen relevant werden.
+
+### Vierstufige Policy-/Kanal-/Zugangs-UI (Backoffice)
+
+Bisher nur über die Repository-Schicht erreichbar, jetzt im Backoffice
+sichtbar/bedienbar (`backoffice/routes/mahnwesen.py`):
+- `/backoffice/mahnwesen/policy`: Formular "Neue Version vorschlagen"
+  hat jetzt zusätzlich `vier_stufen_profil_aktiv` (Checkbox) und die drei
+  `stufeN_mindesttage_..._zugang`-Felder; die Versionstabelle zeigt das
+  aktive Profil je Version.
+- Neuer Abschnitt "Versandkanal je Mahnstufe" auf derselben Seite:
+  `MahnKanalregelTable` (Stufe1-4 EMAIL/BRIEF) anlegen/freigeben, inkl.
+  Versionsliste - vorher nur über Tests/Repository erreichbar.
+- Neue Seite `/backoffice/vertrag/{id}/mahnempfaenger` (verlinkt von der
+  Mahnvorschau): zeigt alle Parteien/Vertreter des Vertrags
+  (`VertragMitmieterRepository.list_alle`) UND, je Mahnlauf, die
+  erwarteten Empfänger samt Kopieversand-/Zugangsstatus
+  (`MahnEmpfaengerZugangTable`) - inkl. Formular, um einen ECHTEN
+  Zugangsbeleg (Rückschein/Übergabe/Lesebestätigung/sonstiger Nachweis)
+  für Hauptdebitor ODER einen konkreten Mitmieter zu erfassen
+  (`MahnwesenService.zugang_bestaetigen_fuer_empfaenger`, bereits
+  bestehende Fachlogik, bisher ohne jede Oberfläche).
+
+**Ehrlich offen:**
+- Es gibt KEINE Mitmieter-ANLAGE/-Bearbeitung über diese Seite (nur
+  Anzeige) - das Anlegen läuft weiterhin ausschließlich über die
+  Vertragsanlage-/Intake-Pipeline (`VertragMitmieterZeile`), wie in der
+  vorherigen Runde gebaut. Eine direkte Mitmieter-Pflege im Mahnwesen
+  selbst war nicht Teil dieses Auftrags.
+- Die Zahlungsziel-Prüffall-Warnung (siehe Task 36 oben) ist nur je
+  Vertrag in dessen eigener Mahnvorschau sichtbar, keine aggregierte
+  Liste "alle Gesellschaften mit ungeklärter Bindung" über alle Verträge
+  hinweg.
+
+### Tests/Status
+
+Gezielte neue/angepasste Tests (`test_hv_mailversand.py`,
+`test_backoffice.py`) plus der VOLLSTÄNDIGE Hintergrund-Pytest-Lauf
+(1569 Tests) liefen vor diesem Push durch, inkl. der aktualisierten
+`fixtures/backoffice_http_contract.json` (vier neue Backoffice-Routen).
+
 ## Ergänzung zur laufenden Aufnahme-Korrektur: Rechtsordnung im selben
 ## Review korrigierbar + Eckdaten-Anzeigefehler (Markus, 20.10.2026)
 
@@ -312,6 +448,15 @@ reproduzierte Outcome-Tests waren rot. Diese Korrektur behebt sie:
      `False` und gab den Slot als `KEIN_VERSAND` frei. Schlägt jetzt
      konservativ den tatsächlichen `MahnLaufTable`-Status nach (wie
      bereits `freigeben_verwaiste`), bevor freigegeben wird.
+
+> **Überholt durch die Mahn-Fortsetzungs-Sektion ganz oben in diesem
+> Dokument (HV-20261020-MAHN-FORTSETZUNG)**: die hier beschriebenen
+> globalen Settings `brief_zahlungsziel_iban`/`brief_zahlungsziel_
+> kontoinhaber` wurden ERSATZLOS entfernt und durch eine echte, je
+> Gesellschaft aufgelöste Bankkontobindung ersetzt (eine einzige globale
+> IBAN kann bei mehreren Gesellschaften strukturell nicht korrekt sein).
+> Dieser Absatz bleibt als historischer Beleg stehen, beschreibt aber
+> NICHT mehr den aktuellen Stand.
 
 Zusätzlich im selben Commit abgeschlossen (Rest der zuvor offenen
 Mahn-Ergänzungen #31/teilweise #32):

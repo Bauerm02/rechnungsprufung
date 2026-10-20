@@ -56,17 +56,62 @@ def _eur_text(cent: int) -> str:
     return f"{cent/100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def zahlungsziel_fuer_mahnung(settings, *, vertrag_id: str, stufe: int) -> BriefZahlungsziel:
+def bank_konto_fuer_gesellschaft_eindeutig(bank_repo, gesellschaft_id: str):
+    """Liefert das EINE Bankkonto dieser Gesellschaft, wenn (und nur wenn)
+    es eindeutig ist - `None` sowohl bei FEHLENDER (kein Konto hinterlegt)
+    als auch bei MEHRDEUTIGER (mehr als ein Konto, keine ausgezeichnete
+    "Hauptkonto"-Markierung existiert) Bindung. Es gibt bewusst KEINE
+    Rangfolge/Heuristik (z. B. "das zuerst angelegte"/"das zuletzt
+    verwendete") - eine echte Mehrdeutigkeit bleibt ein Prüffall, nie eine
+    geratene Wahl (Nutzervorgabe 20.10.2026: "keine falsche globale
+    Kontoverbindung")."""
+
+    konten = bank_repo.list_bank_konten(gesellschaft_id=gesellschaft_id)
+    if len(konten) != 1:
+        return None
+    return konten[0]
+
+
+def zahlungsziel_fuer_mahnung(bank_repo, stammdaten_repo, *, gesellschaft_id: str, vertrag_id: str, stufe: int) -> BriefZahlungsziel:
     """Baut das Zahlungsziel für Brief UND E-Mail aus genau EINER Quelle
     (Abnahme-Folgefix Codex 20.10.2026) - `verwendungszweck` wird
-    deterministisch aus Vertrag/Stufe gebildet, NIE frei erfunden; ohne
-    konfigurierte IBAN/Kontoinhaber bleibt der jeweilige allgemeine
-    Hinweistext unverändert (siehe `brief_pdf.py`/Aufrufer unten)."""
+    deterministisch aus Vertrag/Stufe gebildet, NIE frei erfunden.
 
-    return BriefZahlungsziel(
-        iban=settings.brief_zahlungsziel_iban, kontoinhaber=settings.brief_zahlungsziel_kontoinhaber,
-        verwendungszweck=f"Mahnung Stufe {stufe}, Vertrag {vertrag_id}",
-    )
+    Auftrag HV-20261020-MAHN-FORTSETZUNG (Nutzervorgabe 20.10.2026:
+    "Zahlungsziel aus geprüfter Vertrag/Objekt/Gesellschaft-Bindung statt
+    globaler IBAN"): die vorherige Fassung las AUSSCHLIESSLICH eine
+    einzige globale Einstellung (`settings.brief_zahlungsziel_iban`/
+    `_kontoinhaber`) - das kann bei mehreren Vermietergesellschaften mit
+    jeweils EIGENEM Bankkonto strukturell nur für höchstens eine von ihnen
+    richtig sein (für jede andere wäre es eine FALSCH adressierte Zahlung).
+
+    Die IBAN wird deshalb jetzt IMMER aus der TATSÄCHLICHEN, bereits
+    bestehenden `BankKontoTable`-Bindung der Vertrags-Gesellschaft
+    abgeleitet (`vertrag.gesellschaft_id`, dieselbe Bindung wie
+    Bankabgleich/-vollständigkeit) - KEIN neuer Zuordnungsmechanismus, kein
+    Rateschritt. Der Kontoinhaber ist dabei schlicht der registrierte Name
+    DIESER Gesellschaft (`GesellschaftTable.name`) - ein Geschäftskonto
+    lautet auf seine Inhabergesellschaft, keine separate Eingabe nötig/
+    erfunden.
+
+    Fehlt für die Gesellschaft ein Bankkonto ODER sind es MEHRERE (ohne
+    eindeutige Auflösung), bleibt die Rückgabe `iban=None`/
+    `kontoinhaber=None` - der Aufrufer zeigt dafür weiterhin den
+    bestehenden allgemeinen Hinweistext ("auf das Ihnen bekannt gegebene
+    Konto"), NIE eine geratene oder gar fremde IBAN. Das ist ausdrücklich
+    kein Blockieren des Versands selbst (ein unspezifischer Hinweistext
+    adressiert niemanden falsch) - sichtbar gemacht wird der ungeklärte
+    Fall stattdessen in der Mahnvorschau (`backoffice/routes/mahnwesen.py`)."""
+
+    verwendungszweck = f"Mahnung Stufe {stufe}, Vertrag {vertrag_id}"
+    konto = bank_konto_fuer_gesellschaft_eindeutig(bank_repo, gesellschaft_id)
+    if konto is None:
+        return BriefZahlungsziel(iban=None, kontoinhaber=None, verwendungszweck=verwendungszweck)
+    gesellschaft = stammdaten_repo.get_gesellschaft(gesellschaft_id)
+    kontoinhaber = gesellschaft.name if gesellschaft is not None else None
+    if not konto.iban or not kontoinhaber:
+        return BriefZahlungsziel(iban=None, kontoinhaber=None, verwendungszweck=verwendungszweck)
+    return BriefZahlungsziel(iban=konto.iban, kontoinhaber=kontoinhaber, verwendungszweck=verwendungszweck)
 
 
 def _mahnkosten_text_baustein(vorschau) -> str:
@@ -242,6 +287,12 @@ class HVMailversandService:
 
         send_enabled = bool(self.client and self.settings.send_enabled and self.settings.hv_mail_allowlist_bestaetigt)
         vorschau_slot: dict = {}
+        # Auftrag HV-20261020-MAHN-FORTSETZUNG ("tatsächlich belegter
+        # Versand an alle bestätigten Mitmieter"): sammelt je EMAIL-
+        # Mitmieter-Kopie, ob der zusätzliche Versandversuch tatsächlich
+        # geglückt ist - siehe `versand_fn` unten und die Auswertung nach
+        # `versende_mahnlauf`.
+        mitmieter_versand_slot: dict[int, tuple[bool, str | None]] = {}
 
         def versand_fn(mitglieder):
             if mahnlauf.kanal == "BRIEF":
@@ -327,7 +378,9 @@ class HVMailversandService:
             # IBAN/Kontoinhaber/Referenz" - dieselbe `_zahlungsziel`-Quelle
             # wie der PDF-Brief (siehe `_sende_brief` unten), damit Mail-
             # und Brieftext nie auseinanderlaufen.
-            zahlungsziel = zahlungsziel_fuer_mahnung(self.settings, vertrag_id=mahnlauf.vertrag_id, stufe=mahnlauf.stufe)
+            zahlungsziel = zahlungsziel_fuer_mahnung(
+                self.bank_repo, st, gesellschaft_id=contract.gesellschaft_id, vertrag_id=mahnlauf.vertrag_id, stufe=mahnlauf.stufe,
+            )
             if zahlungsziel.iban and zahlungsziel.kontoinhaber:
                 zahlungsziel_text = (
                     "\n\nBitte überweisen Sie den Gesamtbetrag binnen 14 Tagen ab Zugang dieser Nachricht auf "
@@ -354,18 +407,79 @@ class HVMailversandService:
                 "Bei Fragen zur Forderung antworten Sie bitte auf diese Nachricht."
             )
             op_ids = sorted(m.forderung_op_position_id for m in mitglieder)
-            return self.client.senden(MailOpsAuftrag(
+            haupt_beleg = self.client.senden(MailOpsAuftrag(
                 "mahnungslauf:" + mahnlauf.outbox_key, "MAHNUNG",
                 anker.snapshot["empfaenger_email"], empfaenger_name, subject, text,
                 f"MAHNPOLICY:{anker.policy_version}:VERTRAG:{mahnlauf.vertrag_id}:STUFE:{mahnlauf.stufe}:"
                 f"FORDERUNGEN:{','.join(str(i) for i in op_ids)}",
             ))
 
-        return self.mahn_service.versende_mahnlauf(
+            # Auftrag HV-20261020-MAHN-FORTSETZUNG ("tatsächlich belegter
+            # Versand an alle bestätigten Mitmieter, primär vorhandene
+            # Services/Empfänger-Snapshots nutzen, keine zweite
+            # Finanzstrecke"): JEDER aktive, BESTÄTIGTE Mitmieter mit
+            # hinterlegter E-Mail-Adresse bekommt eine EIGENE Kopie
+            # DESSELBEN, bereits oben komponierten Mahntexts - derselbe
+            # `self.client`/dieselbe `MailOpsAuftrag`-Infrastruktur wie der
+            # Hauptversand, nur mit einem je Person EIGENEN, deterministisch
+            # von `outbox_key` abgeleiteten Idempotenzschlüssel (ein Retry
+            # derselben Gruppe sendet dadurch niemals ein zweites Mal an
+            # dieselbe Person - dieselbe Idempotenzgarantie wie beim
+            # bestehenden Hauptversand).
+            #
+            # BEWUSST in einem eigenen try/except JE PERSON: ein
+            # fehlgeschlagener/unsicherer Mitmieter-Kopieversand darf NIE
+            # den bereits oben erhaltenen `haupt_beleg` verwerfen oder
+            # einen weiteren Mitmieter überspringen - jede Person wird
+            # GENAU EINMAL versucht, unabhängig vom Ergebnis der anderen.
+            # Der `MahnLauf`-/Mahnfall-Status (GESENDET/UNSICHER/BLOCKIERT)
+            # richtet sich WEITERHIN ausschließlich nach `haupt_beleg` -
+            # eine fehlgeschlagene Mitmieter-Kopie blockiert/verdoppelt den
+            # Hauptversand nicht, bleibt aber über `mitmieter_versand_slot`
+            # sichtbar (siehe Auswertung nach `versende_mahnlauf` unten).
+            if self.mitmieter_repo is not None:
+                for mitmieter in self.mitmieter_repo.list_bestaetigte_mitmieter(mahnlauf.vertrag_id):
+                    if not mitmieter.email:
+                        continue  # keine angenommene/erfundene Adresse - kein Versand ohne echte E-Mail
+                    mitmieter_text = text.replace(f"Guten Tag {empfaenger_name},", f"Guten Tag {mitmieter.name},", 1)
+                    mitmieter_schluessel = f"mahnungslauf:{mahnlauf.outbox_key}:mitmieter:{mitmieter.id}"
+                    try:
+                        kopie_beleg = self.client.senden(MailOpsAuftrag(
+                            mitmieter_schluessel, "MAHNUNG", mitmieter.email, mitmieter.name, subject, mitmieter_text,
+                            f"MAHNPOLICY:{anker.policy_version}:VERTRAG:{mahnlauf.vertrag_id}:STUFE:{mahnlauf.stufe}:"
+                            f"MITMIETER:{mitmieter.id}",
+                        ))
+                    except Exception:
+                        mitmieter_versand_slot[mitmieter.id] = (False, None)
+                        continue
+                    proof = nachweis_daten(kopie_beleg)
+                    mitmieter_versand_slot[mitmieter.id] = (
+                        proof is not None, (proof["externe_referenz"] if proof is not None else None)
+                    )
+
+            return haupt_beleg
+
+        ergebnis = self.mahn_service.versende_mahnlauf(
             ctx=ctx, mahnlauf_id=mahnlauf.id, heute=heute, bank_bestaetigt_bis=confirmed,
             ungeklaerte_eingaenge_vorhanden=unclear, send_enabled=send_enabled,
             versand_fn=versand_fn, mahnkosten_vorschau_slot=vorschau_slot,
         )
+        if ergebnis.status == "GESENDET" and mitmieter_versand_slot and self.empfaenger_zugang_repo is not None:
+            # Erst JETZT existieren die erwarteten-Empfänger-Platzhalter
+            # dieses Mahnlaufs (`_vervollstaendige_bestaetigten_mahnlauf`
+            # legt sie beim bestätigten GESENDET-Übergang an) - die oben
+            # gesammelten Versandergebnisse werden ihnen hier nachgetragen,
+            # reiner Bookkeeping-Schritt OHNE jede Auswirkung auf den
+            # bereits abgeschlossenen Versand/die Kostenbuchung.
+            for eintrag in self.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id):
+                if eintrag.mitmieter_id is None or eintrag.mitmieter_id not in mitmieter_versand_slot:
+                    continue
+                erfolgreich, referenz = mitmieter_versand_slot[eintrag.mitmieter_id]
+                if erfolgreich:
+                    self.empfaenger_zugang_repo.markiere_versand(
+                        eintrag.id, versand_belegt_am=datetime.now(timezone.utc), versand_referenz=referenz,
+                    )
+        return ergebnis
 
     def _sende_brief(self, *, mahnlauf, mitglieder, heute, vorschau_slot) -> None:
         """Kanal-BRIEF-Gegenstück zu `_dispatch_mahnlauf`s E-Mail-
@@ -493,7 +607,9 @@ class HVMailversandService:
             neue_gebuehr_cent=((vorschau.gebuehr_cent or 0) if vorschau is not None else 0),
             gebuehr_rechtsgrundlage=(vorschau.gebuehr_rechtsgrundlage if vorschau is not None else None),
             gesamtbetrag_cent=gesamtbetrag_cent,
-            zahlungsziel=zahlungsziel_fuer_mahnung(self.settings, vertrag_id=mahnlauf.vertrag_id, stufe=mahnlauf.stufe),
+            zahlungsziel=zahlungsziel_fuer_mahnung(
+                self.bank_repo, st, gesellschaft_id=contract.gesellschaft_id, vertrag_id=mahnlauf.vertrag_id, stufe=mahnlauf.stufe,
+            ),
         )
 
         try:

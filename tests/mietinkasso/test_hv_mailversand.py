@@ -1,18 +1,20 @@
 """Real business services and HTTP protocol, exclusively synthetic in-memory data."""
 import hashlib
+import io
 import json
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
 import pytest
+from pypdf import PdfReader
 from sqlalchemy import select
 
 from mietinkasso.domain.enums import OPTyp, MahnStatus
 from mietinkasso.domain.exceptions import VorgangIdKonfliktError
 from mietinkasso.indexautomatik.bootstrap import bauen
 from mietinkasso.indexautomatik.mailops_client import MailOpsClient, MailOpsErgebnis
-from mietinkasso.indexautomatik.mailversand_service import HVMailversandService
+from mietinkasso.indexautomatik.mailversand_service import HVMailversandService, zahlungsziel_fuer_mahnung
 from mietinkasso.infrastructure.config import Settings
 from mietinkasso.infrastructure.db.tables import (
     AuditEventTable, MahnFallTable, MahnkostenBuchungTable, MahnkostenGebuehrTable, MahnLaufTable,
@@ -40,31 +42,6 @@ def hv(session_factory, basis_vertrag, tmp_path):
     return HVMailversandService(session_factory, bundle, settings, client=client), state
 
 
-@pytest.fixture
-def hv_mit_zahlungsziel(session_factory, basis_vertrag, tmp_path):
-    """Wie `hv`, aber mit konfigurierter Ziel-IBAN/Kontoinhaber (Abnahme-
-    Folgefix Codex 20.10.2026)."""
-
-    token = tmp_path / "synthetic-token"
-    token.write_text("SYNTHETIC-TOKEN", encoding="utf-8")
-    state = {"status": "ANGENOMMEN", "calls": [], "sent": "2026-09-14T22:30:00Z"}
-
-    def provider(request):
-        state["calls"].append(request)
-        payload = json.loads(request.content) if request.method == "POST" else None
-        ref = payload["referenz"] if payload else request.url.params["referenz"]
-        external = "JLBHV-" + hashlib.sha256(json.dumps(ref, ensure_ascii=False).encode()).hexdigest()
-        return httpx.Response(200, json={"status": state["status"], "externe_referenz": external,
-            "provider_referenz": "SYNTHETIC-SENT-1", "versendet_am": state["sent"] if state["status"] == "GESENDET" else None})
-
-    client = MailOpsClient(token_file=token, transport_factory=lambda: httpx.MockTransport(provider))
-    settings = Settings(
-        owner_email="mb@jlb-immo.at", send_enabled=True, hv_mail_allowlist_bestaetigt=True,
-        indexautomatik_send_enabled=True, vertragsende_erinnerung_send_enabled=True,
-        brief_zahlungsziel_iban="AT611904300234573201", brief_zahlungsziel_kontoinhaber="JLB Projects GmbH",
-    )
-    bundle = bauen(session_factory, settings)
-    return HVMailversandService(session_factory, bundle, settings, client=client), state
 
 
 def _echter_beleg_pdf(text: str) -> bytes:
@@ -154,17 +131,25 @@ def test_mahnung_acceptance_then_actual_sending_get_only_and_stage2_clock(hv, ba
     assert len(state["calls"]) == 3
 
 
-def test_konfiguriertes_zahlungsziel_erscheint_im_mahntext_mit_periode_ursprung_und_rest(hv_mit_zahlungsziel, basis_vertrag, admin_ctx):
+def test_konfiguriertes_zahlungsziel_erscheint_im_mahntext_mit_periode_ursprung_und_rest(hv, basis_vertrag, admin_ctx):
     """Abnahme-Folgefix (Codex 20.10.2026): "Brief/Mailentwurf enthält
     noch keine geprüfte Ziel-IBAN/Kontoinhaber/Referenz und keine
     vollständige Periode/Position/Ursprungsbetrag/angerechnete
     Zahlungen/Rest-Tabelle". Eine teilweise angerechnete Zahlung macht
-    Ursprungsbetrag/Rest im Mailtext sichtbar; die konfigurierte
-    Kontoverbindung erscheint konkret statt des vagen Hinweistextes."""
+    Ursprungsbetrag/Rest im Mailtext sichtbar; die aus der tatsächlichen,
+    eindeutigen Gesellschafts-Bankkontobindung aufgelöste Kontoverbindung
+    erscheint konkret statt des vagen Hinweistextes (Auftrag HV-20261020-
+    MAHN-FORTSETZUNG - keine globale Settings-IBAN mehr)."""
 
-    service, state = hv_mit_zahlungsziel
+    service, state = hv
     contract, account = basis_vertrag
-    _seed_debt(hv_mit_zahlungsziel, contract, account, admin_ctx)
+    _seed_debt(hv, contract, account, admin_ctx)
+    # Dieselbe Bankkonto-ID wie `_seed_debt` - EIN upsert auf dieselbe
+    # Zeile, keine zweite, sonst wäre die Bindung mehrdeutig.
+    service.bank_repo.upsert_bank_konto(
+        id="SYNTHETIC-BANK", gesellschaft_id=contract.gesellschaft_id,
+        iban="AT611904300234573201", bezeichnung="Testkonto Zahlungsziel",
+    )
     # Teilzahlung auf die Septemberforderung - Ursprungsbetrag 830,00 EUR,
     # davon 200,00 EUR bereits angerechnet, Rest 630,00 EUR.
     service.op_service.buchen(
@@ -177,7 +162,7 @@ def test_konfiguriertes_zahlungsziel_erscheint_im_mahntext_mit_periode_ursprung_
     body = json.loads(state["calls"][0].content)
     text = body["text"]
     assert "AT611904300234573201" in text
-    assert "JLB Projects GmbH" in text
+    assert "7D Immobilien GmbH" in text
     assert "ursprünglich 830,00 EUR" in text
     assert "bereits angerechnet 200,00 EUR" in text
     assert "Rest 630,00 EUR" in text
@@ -1047,3 +1032,212 @@ def test_fehler_nach_upload_fuehrt_zu_unsicher_nie_zu_blockiert_oder_retry(hv, b
     )
     assert archiv is not None
     assert archiv.pdf_bytes[:5] == b"%PDF-"
+
+
+# -- Auftrag HV-20261020-MAHN-FORTSETZUNG: Zahlungsziel aus geprüfter ------
+# -- Vertrag/Objekt/Gesellschaft-Bindung (Task 36), tatsächlich belegter ---
+# -- Versand an alle bestätigten Mitmieter ----------------------------------
+
+
+def _zweite_gesellschaft_vertrag(service, *, gesellschaft_id="JLB", gesellschaft_name="JLB Projects GmbH"):
+    """Baut eine ZWEITE, von `basis_vertrag` ("7DI") unabhängige
+    Gesellschaft samt Objekt/Einheit/Debitor/Vertrag/Konto auf - für Tests,
+    die belegen müssen, dass das Zahlungsziel NIE zwischen zwei
+    Gesellschaften vermischt wird."""
+
+    st = service.bundle.stammdaten_repository
+    st.upsert_gesellschaft(id=gesellschaft_id, name=gesellschaft_name)
+    st.upsert_objekt(id=f"{gesellschaft_id}-OBJ", gesellschaft_id=gesellschaft_id, bezeichnung="Zweites Objekt")
+    st.upsert_einheit(
+        id=f"{gesellschaft_id}-TOP1", objekt_id=f"{gesellschaft_id}-OBJ", bezeichnung="Top 1",
+        nutzungsstatus="DAUERVERMIETUNG",
+    )
+    st.upsert_debitor(id=f"DEB-{gesellschaft_id}", name="Zweite Mieterin", email="zweite@example.at")
+    st.upsert_vertrag(
+        id=f"V-{gesellschaft_id}-1", einheit_id=f"{gesellschaft_id}-TOP1", debitor_id=f"DEB-{gesellschaft_id}",
+        gesellschaft_id=gesellschaft_id, rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    vertrag = st.get_vertrag(f"V-{gesellschaft_id}-1")
+    konto = st.get_or_create_konto(vertrag=vertrag)
+    return vertrag, konto
+
+
+def test_zahlungsziel_je_gesellschaft_eindeutig_keine_vermischung_kein_raten(hv, basis_vertrag):
+    """Task 36 (core): Zahlungsziel kommt je Gesellschaft aus deren
+    EIGENER, eindeutiger Bankkontobindung - niemals aus einer globalen
+    Einstellung (die gibt es nicht mehr), niemals geraten/vermischt. Eine
+    fehlende ODER mehrdeutige Bindung bleibt explizit None/None."""
+
+    service, _ = hv
+    contract_a, _account_a = basis_vertrag
+    contract_b, _account_b = _zweite_gesellschaft_vertrag(service)
+    st = service.bundle.stammdaten_repository
+
+    service.bank_repo.upsert_bank_konto(
+        id="BANK-A", gesellschaft_id=contract_a.gesellschaft_id, iban="AT000000000000000001", bezeichnung="Konto A")
+    service.bank_repo.upsert_bank_konto(
+        id="BANK-B", gesellschaft_id=contract_b.gesellschaft_id, iban="AT000000000000000002", bezeichnung="Konto B")
+
+    ziel_a = zahlungsziel_fuer_mahnung(
+        service.bank_repo, st, gesellschaft_id=contract_a.gesellschaft_id, vertrag_id=contract_a.id, stufe=1)
+    ziel_b = zahlungsziel_fuer_mahnung(
+        service.bank_repo, st, gesellschaft_id=contract_b.gesellschaft_id, vertrag_id=contract_b.id, stufe=1)
+    assert ziel_a.iban == "AT000000000000000001" and ziel_a.kontoinhaber == "7D Immobilien GmbH"
+    assert ziel_b.iban == "AT000000000000000002" and ziel_b.kontoinhaber == "JLB Projects GmbH"
+
+    # Fehlende Bindung (keine Gesellschaft/kein Konto) bleibt None/None.
+    ziel_unbekannt = zahlungsziel_fuer_mahnung(
+        service.bank_repo, st, gesellschaft_id="UNBEKANNT", vertrag_id="V-X", stufe=1)
+    assert ziel_unbekannt.iban is None and ziel_unbekannt.kontoinhaber is None
+
+    # Eine MEHRDEUTIGE Bindung (zwei Konten derselben Gesellschaft) bleibt
+    # ebenso None/None - nie eine geratene Wahl zwischen beiden.
+    service.bank_repo.upsert_bank_konto(
+        id="BANK-A-ZWEITES", gesellschaft_id=contract_a.gesellschaft_id, iban="AT000000000000000099",
+        bezeichnung="Zweites Konto A")
+    ziel_a_mehrdeutig = zahlungsziel_fuer_mahnung(
+        service.bank_repo, st, gesellschaft_id=contract_a.gesellschaft_id, vertrag_id=contract_a.id, stufe=1)
+    assert ziel_a_mehrdeutig.iban is None and ziel_a_mehrdeutig.kontoinhaber is None
+
+
+def test_mahnlauf_zwei_gesellschaften_email_verwendet_jeweils_eigene_iban(hv, basis_vertrag, admin_ctx):
+    """Task 36: zwei Gesellschaften mit abweichenden IBANs - der
+    tatsächlich gesendete E-Mail-Text jeder Gesellschaft nennt
+    AUSSCHLIESSLICH ihre EIGENE IBAN, nie die der anderen."""
+
+    service, state = hv
+    contract_a, account_a = basis_vertrag
+    contract_b, account_b = _zweite_gesellschaft_vertrag(service)
+    policy = service.policy_repo.anlegen(stufe1_tage_nach_faelligkeit=7,
+        stufe2_mindesttage_nach_stufe1_versand=14, zinsen_prozent=Decimal("0"), gebuehr_cent=0, status="ENTWURF")
+    service.policy_repo.freigeben(policy.id)
+
+    service.op_service.buchen(ctx=admin_ctx, konto=account_a, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5), beleg_referenz="A Sept")
+    service.op_service.buchen(ctx=admin_ctx, konto=account_b, typ=OPTyp.SOLL, betrag_cent=70_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5), beleg_referenz="B Sept")
+
+    service.bank_repo.upsert_bank_konto(
+        id="BANK-A", gesellschaft_id=contract_a.gesellschaft_id, iban="AT000000000000000001", bezeichnung="Konto A")
+    service.bank_repo.upsert_bank_konto(
+        id="BANK-B", gesellschaft_id=contract_b.gesellschaft_id, iban="AT000000000000000002", bezeichnung="Konto B")
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="BANK-A", bestaetigt_bis=date(2026, 9, 13), bestaetigt_von="TEST")
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="BANK-B", bestaetigt_bis=date(2026, 9, 13), bestaetigt_von="TEST")
+
+    result = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    assert result["geplant"] == 2
+    assert len(state["calls"]) == 2
+
+    texte = [json.loads(c.content)["text"] for c in state["calls"]]
+    text_a = next(t for t in texte if "500,00 EUR" in t)
+    text_b = next(t for t in texte if "700,00 EUR" in t)
+    assert "AT000000000000000001" in text_a and "AT000000000000000002" not in text_a
+    assert "AT000000000000000002" in text_b and "AT000000000000000001" not in text_b
+
+
+def test_mahnlauf_zwei_gesellschaften_brief_verwendet_jeweils_eigene_iban(hv, basis_vertrag, admin_ctx):
+    """Task 36: dieselbe Zwei-Gesellschaften-Garantie auch für den
+    Briefkanal - das archivierte PDF jeder Gesellschaft nennt nur ihre
+    EIGENE IBAN."""
+
+    service, _state = hv
+    contract_a, account_a = basis_vertrag
+    contract_b, account_b = _zweite_gesellschaft_vertrag(service)
+    _seed_debt(hv, contract_a, account_a, admin_ctx)
+    service.op_service.buchen(ctx=admin_ctx, konto=account_b, typ=OPTyp.SOLL, betrag_cent=70_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5), beleg_referenz="B Sept")
+    service.bank_repo.upsert_bank_konto(
+        id="BANK-B", gesellschaft_id=contract_b.gesellschaft_id, iban="AT000000000000000002", bezeichnung="Konto B")
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="BANK-B", bestaetigt_bis=date(2026, 9, 13), bestaetigt_von="TEST")
+
+    _richte_brief_kanal_ein(service, contract_a, account_a)
+    service.bundle.stammdaten_repository.upsert_debitor(
+        id=account_b.debitor_id, name="Zweite Mieterin", email=None,
+        adresse="Zweitstraße 2, 2020 Wien", postadresse_geprueft=True,
+    )
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+
+    mahnlauf_a = service.mahnlauf_repo.list_fuer_vertrag(contract_a.id)[0]
+    mahnlauf_b = service.mahnlauf_repo.list_fuer_vertrag(contract_b.id)[0]
+    archiv_a = service.mahnbrief_archiv_repo.fuer_mahnlauf(vertrag_id=contract_a.id, stufe=1, mahnlauf_schluessel=mahnlauf_a.outbox_key)
+    archiv_b = service.mahnbrief_archiv_repo.fuer_mahnlauf(vertrag_id=contract_b.id, stufe=1, mahnlauf_schluessel=mahnlauf_b.outbox_key)
+    assert archiv_a is not None and archiv_b is not None
+    text_a = " ".join(p.extract_text() for p in PdfReader(io.BytesIO(archiv_a.pdf_bytes)).pages)
+    text_b = " ".join(p.extract_text() for p in PdfReader(io.BytesIO(archiv_b.pdf_bytes)).pages)
+    assert "SYNTHETIC-NOT-A-REAL-IBAN" in text_a
+    assert "AT000000000000000002" in text_b
+    assert "AT000000000000000002" not in text_a
+    assert "SYNTHETIC-NOT-A-REAL-IBAN" not in text_b
+
+
+def test_ohne_bestaetigte_mitmieter_bleibt_einzelempfaenger_versand_unveraendert(hv, basis_vertrag, admin_ctx):
+    """Regression: OHNE bestätigte Mitmieter bleibt der Versand
+    unverändert zum bisherigen Einempfänger-Pfad - GENAU EIN
+    Provideraufruf, GENAU EIN Empfänger."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    result = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    assert result["geplant"] == 1
+    assert len(state["calls"]) == 1
+    body = json.loads(state["calls"][0].content)
+    assert body["empfaenger_email"] == "mieter@example.at"
+
+
+def test_bestaetigte_mitmieter_bekommen_eigene_kopie_teilausfall_ohne_doppelversand(hv, basis_vertrag, admin_ctx):
+    """Auftrag HV-20261020-MAHN-FORTSETZUNG: tatsächlich belegter Versand
+    an ALLE bestätigten Mitmieter - ein fehlschlagender Kopieversand
+    blockiert weder den Hauptversand noch einen ANDEREN Mitmieter (jede
+    Person wird GENAU EINMAL versucht), und ein erneuter Lauf für dieselbe,
+    bereits versandversuchte Gruppe löst KEINEN zweiten Kopieversand aus."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    state["status"] = "GESENDET"
+    _seed_debt(hv, contract, account, admin_ctx)
+
+    m_ok = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email="mitmieterin-a@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    m_fail = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieter B", email="mitmieter-b@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    # Kein Versand an eine noch ungeklärte Angabe oder an VERTRETER (nie
+    # automatisch mitadressiert, siehe `list_bestaetigte_mitmieter`-Docstring).
+    service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Ungeklärt", email="ungeklaert@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="AUSGELESEN")
+    service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Vertreterin", email="vertreterin@example.at", adresse=None,
+        erstellt_von="test", rolle="VERTRETER", zustand="BESTAETIGT")
+
+    original_senden = service.client.senden
+
+    def gezielt_fehlschlagend(auftrag):
+        if auftrag.empfaenger_email == "mitmieter-b@example.at":
+            raise RuntimeError("Simulierter Providerfehler NUR für diesen Empfänger (Test).")
+        return original_senden(auftrag)
+
+    service.client.senden = gezielt_fehlschlagend
+    result = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    assert result["geplant"] == 1
+
+    empfaenger = {json.loads(c.content)["empfaenger_email"] for c in state["calls"]}
+    assert empfaenger == {"mieter@example.at", "mitmieterin-a@example.at"}
+    assert len(state["calls"]) == 2  # Hauptversand + GENAU EINE erfolgreiche Mitmieter-Kopie
+
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    zugang_eintraege = service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id)
+    eintrag_a = next(e for e in zugang_eintraege if e.mitmieter_id == m_ok.id)
+    eintrag_b = next(e for e in zugang_eintraege if e.mitmieter_id == m_fail.id)
+    assert eintrag_a.versand_belegt_am is not None and eintrag_a.versand_referenz
+    assert eintrag_b.versand_belegt_am is None  # Fehlversuch bleibt sichtbar, kein erfundener Beleg
+
+    # Ein erneuter Lauf für dieselbe (bereits versandversuchte, UNSICHERE)
+    # Gruppe darf NIEMALS eine zweite Kopie an Mitmieterin A auslösen -
+    # auch nicht, nachdem der simulierte Providerfehler behoben ist.
+    service.client.senden = original_senden
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 14))
+    assert len(state["calls"]) == 2

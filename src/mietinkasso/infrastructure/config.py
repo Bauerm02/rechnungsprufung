@@ -189,16 +189,15 @@ class Settings(BaseSettings):
     brief_fenster_hoehe_mm: float = 45.0
 
     # Zahlungsziel für Mahnschreiben (Auftrag HV-20261020-VIER-MAHNSTUFEN,
-    # Abnahme-Folgefix Codex 20.10.2026: "Brief/Mailentwurf enthält noch
-    # keine geprüfte Ziel-IBAN/Kontoinhaber/Referenz"). Bewusst OPTIONAL
-    # (kein erfundener Platzhalter): ohne konfigurierte IBAN bleibt der
-    # bisherige allgemeine Hinweistext ("auf das Ihnen bekannt gegebene
-    # Konto") unverändert bestehen - siehe `mahnwesen/brief_pdf.py`/
-    # `indexautomatik/mailversand_service.py`. KEINE IBAN-Prüfsummen-
-    # validierung hier (bewusst keine neue Automatik erfunden) - die
-    # Korrektheit bleibt Aufgabe der Person, die den Wert konfiguriert.
-    brief_zahlungsziel_iban: str | None = None
-    brief_zahlungsziel_kontoinhaber: str | None = None
+    # Abnahme-Folgefix Codex 20.10.2026, GEÄNDERT durch Auftrag
+    # HV-20261020-MAHN-FORTSETZUNG, Nutzervorgabe 20.10.2026: "Zahlungsziel
+    # aus geprüfter Vertrag/Objekt/Gesellschaft-Bindung statt globaler
+    # IBAN"). EINE globale IBAN/Kontoinhaber kann bei mehreren
+    # Vermietergesellschaften/Objektkonten strukturell nicht korrekt sein -
+    # diese beiden Felder wurden deshalb ERSATZLOS entfernt. Die Ziel-IBAN
+    # wird jetzt IMMER live aus der tatsächlichen `BankKontoTable`-Bindung
+    # der Vertrags-Gesellschaft abgeleitet, siehe
+    # `indexautomatik/mailversand_service.py::zahlungsziel_fuer_mahnung`.
 
     # Post-SFTP-Bulkversand (Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS,
     # Teil 3, siehe `mahnwesen/brief_sftp.py`): GESCHLOSSEN per Default -

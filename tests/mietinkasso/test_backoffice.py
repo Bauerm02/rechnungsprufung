@@ -1220,8 +1220,9 @@ def test_mahnvorschau_unterscheidet_planbar_von_tatsaechlich_geplant(backoffice_
 
 def test_mahnpolicy_seite_zeigt_genau_zwei_stufen_und_erzwingt_null_zinsen_gebuehr(backoffice_client):
     """HV-20260912-ECHTBETRIEB Punkt 2: die Mahnstufen-Konfiguration ist
-    im Backoffice sichtbar/speicherbar - genau zwei Stufen (kein
-    Formularfeld für eine dritte Stufe existiert überhaupt), Zinsen/
+    im Backoffice sichtbar/speicherbar - ein POST OHNE das (seit Auftrag
+    HV-20261020-VIER-MAHNSTUFEN/HV-20261020-MAHN-FORTSETZUNG optionale)
+    Vier-Stufen-Profil bleibt beim alten Zwei-Stufen-Verhalten, Zinsen/
     Gebühr bleiben fest auf 0, auch wenn ein roher POST versucht, andere
     Werte zu setzen (kein Formularfeld dafür in dieser Version - der
     Server ignoriert unbekannte Felder und setzt ohnehin hart 0)."""
@@ -1269,6 +1270,97 @@ def test_mahnpolicy_seite_zeigt_genau_zwei_stufen_und_erzwingt_null_zinsen_gebue
     freigegeben = client.post(f"/backoffice/mahnwesen/policy/{neueste.id}/freigeben", data={"csrf_token": csrf2})
     assert freigegeben.status_code == 200
     assert "freigegeben" in freigegeben.text
+
+
+def test_mahnpolicy_vier_stufen_profil_ueber_backoffice_aktivierbar(backoffice_client):
+    """Task 33 (Backoffice-UI für das Vier-Stufen-Profil, Auftrag
+    HV-20261020-MAHN-FORTSETZUNG): das bisher nur über die Repository-
+    Schicht erreichbare `vier_stufen_profil_aktiv`/die drei Zugangs-
+    Mindesttage-Felder sind jetzt über das normale Formular setzbar und
+    werden korrekt persistiert."""
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    seite = client.get("/backoffice/mahnwesen/policy")
+    assert "vier_stufen_profil_aktiv" in seite.text
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', seite.text).group(1)
+
+    angelegt = client.post(
+        "/backoffice/mahnwesen/policy/anlegen",
+        data={
+            "stufe1_tage_nach_faelligkeit": "7", "stufe2_mindesttage_nach_stufe1_versand": "14",
+            "vier_stufen_profil_aktiv": "1", "stufe2_mindesttage_nach_stufe1_zugang": "10",
+            "stufe3_mindesttage_nach_stufe2_zugang": "11", "stufe4_mindesttage_nach_stufe3_zugang": "12",
+            "csrf_token": csrf,
+        },
+    )
+    assert angelegt.status_code == 200 and "als ENTWURF angelegt" in angelegt.text
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.repository import MahnPolicyRepository
+
+    neueste = MahnPolicyRepository(build_session_factory(get_settings().database_url)).alle()[0]
+    assert neueste.vier_stufen_profil_aktiv is True
+    assert (neueste.stufe2_mindesttage_nach_stufe1_zugang, neueste.stufe3_mindesttage_nach_stufe2_zugang,
+            neueste.stufe4_mindesttage_nach_stufe3_zugang) == (10, 11, 12)
+
+
+def test_mahnkanalregel_backoffice_ui_anlegen_und_freigeben(backoffice_client):
+    """Task 33: Kanalregel (Stufe1-4 EMAIL/BRIEF) ist jetzt über das
+    Backoffice anlegbar/freigebbar, nicht nur über die Repository-Schicht."""
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    seite = client.get("/backoffice/mahnwesen/policy")
+    assert "Versandkanal je Mahnstufe" in seite.text
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', seite.text).group(1)
+
+    angelegt = client.post(
+        "/backoffice/mahnwesen/kanalregel/anlegen",
+        data={"stufe1_kanal": "EMAIL", "stufe2_kanal": "BRIEF", "stufe3_kanal": "BRIEF", "stufe4_kanal": "BRIEF", "csrf_token": csrf},
+    )
+    assert angelegt.status_code == 200 and "als ENTWURF angelegt" in angelegt.text
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.repository import MahnKanalregelRepository
+
+    repo = MahnKanalregelRepository(build_session_factory(get_settings().database_url))
+    neueste = repo.alle()[0]
+    assert (neueste.stufe1_kanal, neueste.stufe2_kanal, neueste.stufe3_kanal, neueste.stufe4_kanal) == ("EMAIL", "BRIEF", "BRIEF", "BRIEF")
+
+    uebersicht = client.get("/backoffice/mahnwesen/policy")
+    csrf2 = re.search(r'name="csrf_token" value="([^"]+)"', uebersicht.text).group(1)
+    freigegeben = client.post(f"/backoffice/mahnwesen/kanalregel/{neueste.id}/freigeben", data={"csrf_token": csrf2})
+    assert freigegeben.status_code == 200 and "freigegeben" in freigegeben.text
+    assert repo.aktuelle_freigegebene().id == neueste.id
+
+
+def test_mahnempfaenger_uebersicht_zeigt_mitmieter_und_ist_erreichbar(backoffice_client):
+    """Task 33 (Mitmieter-/Zugangs-Übersicht je Vertrag): die neue Seite
+    ist erreichbar und zeigt bereits erfasste Mitmieter an."""
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.repository import VertragMitmieterRepository
+
+    mitmieter_repo = VertragMitmieterRepository(build_session_factory(get_settings().database_url))
+    mitmieter_repo.anlegen(
+        vertrag_id="V-601-1", name="Mitmieterin Test", email="mitmieterin@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT",
+    )
+
+    seite = client.get("/backoffice/vertrag/V-601-1/mahnempfaenger")
+    assert seite.status_code == 200
+    assert "Mitmieterin Test" in seite.text and "mitmieterin@example.at" in seite.text
+
+    # Auch über die Mahnvorschau erreichbar.
+    vorschau = client.get("/backoffice/vertrag/V-601-1/mahnvorschau")
+    assert "mahnempfaenger" in vorschau.text
 
 
 def _ctx_admin():

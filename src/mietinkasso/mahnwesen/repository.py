@@ -782,6 +782,24 @@ class MahnEmpfaengerZugangRepository:
             session.refresh(row)
             return row
 
+    def markiere_versand(self, eintrag_id: int, *, versand_belegt_am, versand_referenz: str | None) -> MahnEmpfaengerZugangTable:
+        """Reines Versand-Bookkeeping (Auftrag HV-20261020-MAHN-
+        FORTSETZUNG) - belegt NUR, dass dieser Person tatsächlich eine
+        Kopie zugestellt wurde, ändert NIE `zugangsform`/
+        `zugang_bestaetigt_am` (das bleibt ein separater, niemals aus
+        einem Sendeerfolg automatisch abgeleiteter Bestätigungsschritt,
+        siehe `MahnEmpfaengerZugangTable`-Docstring)."""
+
+        with self._session_factory() as session:
+            row = session.get(MahnEmpfaengerZugangTable, eintrag_id)
+            if row is None:
+                raise ValueError(f"Unbekannter Empfänger-Zugangsnachweis {eintrag_id}")
+            row.versand_belegt_am = versand_belegt_am
+            row.versand_referenz = versand_referenz
+            session.commit()
+            session.refresh(row)
+            return row
+
     @staticmethod
     def alle_bestaetigt(eintraege: list[MahnEmpfaengerZugangTable], *, ausreichende_formen: frozenset[str]) -> bool:
         """`True` nur, wenn JEDER erwartete Empfänger einen BESTÄTIGTEN,
