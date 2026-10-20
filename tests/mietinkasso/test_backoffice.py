@@ -5073,6 +5073,78 @@ def test_kontoauszug_zeigt_kostenstatus_offen_teilbezahlt_bezahlt(backoffice_cli
     assert "Gebucht (Sollsumme vor Zahlungen)" in seite_bezahlt.text or "Sollsumme vor Zahlungen" in seite_bezahlt.text
 
 
+def test_kontoauszug_offene_ruecklastschrift_zaehlt_in_hauptforderung_offener_rest(backoffice_client):
+    """Unabhängiger Befund nach Commit 239e33c: eine offene RUECKLASTSCHRIFT
+    ohne weitere offene Hauptforderung darf NICHT als "davon noch offen:
+    0,00 EUR" erscheinen - der echte Reststand der Rücklastschrift muss
+    mitgezählt werden."""
+
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    client, *_ = backoffice_client
+    _login(client)
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("OFFENE-RLS")
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.RUECKLASTSCHRIFT, betrag_cent=120_790,
+        belegdatum=date(2026, 4, 10), buchungsdatum=date(2026, 4, 10), faelligkeit=date(2026, 4, 10),
+        beleg_referenz="Rückbuchung Miete April",
+    )
+    echter_saldo = op_service.berechne_saldo(konto.id).saldo_cent
+    assert echter_saldo == 120_790
+
+    seite = client.get(f"/backoffice/konto/{konto.id}")
+    assert seite.status_code == 200
+    assert "davon noch offen: <strong>1.207,90 €</strong>" in seite.text
+
+
+def test_kontoauszug_zeigt_versandnachweis_und_zinszuordnung_bei_echter_mahnkostenbuchung(backoffice_client):
+    """Zusatz Zinszuordnung (Folgeschritt zu Commit 239e33c): die bereits
+    bestehenden `MahnkostenBuchungTable`-Ledgerdetails (Mahnbeleg,
+    zugrunde liegende Forderungen, kumulatives Zinssegment-Bild getrennt
+    vom tatsächlich gebuchten Delta) müssen im Kontoauszug sichtbar
+    sein - gegen eine ECHTE Buchung über `MahnkostenService`."""
+
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
+    from mietinkasso.mahnwesen.kosten_service import MahnkostenService
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    client, *_ = backoffice_client
+    _login(client)
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("ZINSZUORDNUNG")
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+
+    hauptforderung = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1), faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ",
+    )
+    mahnkosten_repo = MahnkostenRepository(session_factory)
+    mahnkosten_service = MahnkostenService(mahnkosten_repo, op_service, stammdaten)
+    gebucht = mahnkosten_service.buche_bei_versand(
+        ctx=_ctx_admin(), vertrag_id=vertrag.id, stufe=1, heute=date(2026, 3, 1),
+        versandnachweis_referenz="mahnung:kontoblatt-zinszuordnung", akteur="codex-test",
+    )
+    assert gebucht is not None and gebucht.zinsen_op_position_id is not None
+
+    seite = client.get(f"/backoffice/konto/{konto.id}")
+    assert seite.status_code == 200
+    assert "mahnung:kontoblatt-zinszuordnung" in seite.text  # Mahnbeleg/Versandnachweis
+    assert f"#{hauptforderung.id}" in seite.text  # zugrunde liegende Forderung
+    assert "kumulatives Zinsbild" in seite.text
+    assert "tatsächlich an diesem Tag neu gebucht" in seite.text
+
+
 def test_kontoauszug_pdf_fuer_objekt_107_ausgeschlossen(backoffice_client):
     client, _konto_id, konto_gesperrt_id, _op_service = backoffice_client
     _login(client)

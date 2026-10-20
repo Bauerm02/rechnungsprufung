@@ -22,7 +22,14 @@ from mietinkasso.index.service import UNTERSTUETZTE_BERECHNUNGSPROFILE
 from mietinkasso.mahnwesen.brief_pdf import Absender as _BriefAbsender
 from mietinkasso.op.eroeffnung_import import importiere_eroeffnung_csv_atomar, parse_eroeffnung_csv
 from mietinkasso.op.kontoauszug_pdf import erzeuge_kontoauszug_pdf
-from mietinkasso.op.kontoblatt import KATEGORIE_LABEL, STATUS_LABEL, lade_kontoblatt
+from mietinkasso.op.kontoblatt import (
+    KATEGORIE_LABEL,
+    KATEGORIE_MAHNPAUSCHALE,
+    KATEGORIE_MAHNSPESEN,
+    KATEGORIE_VERZUGSZINSEN,
+    STATUS_LABEL,
+    lade_kontoblatt,
+)
 from mietinkasso.vorschreibung.service import faelligkeitsdatum
 
 from mietinkasso.backoffice import dependencies as deps
@@ -95,6 +102,49 @@ def _kontoblatt_status_html(zeile) -> str:
     return f'<span class="{css}">{h(STATUS_LABEL.get(zeile.status, zeile.status))}</span>'
 
 
+def _kontoblatt_ledger_html(zeile) -> str:
+    """Zusatz Zinszuordnung (Folgeschritt zu Commit 239e33c): zeigt die
+    bereits bestehenden `MahnkostenBuchungTable`-Ledgerdetails EINER
+    Verzugszinsen-/Mahnspesen-/Mahnpauschale-Zeile - rein lesend. Fehlt
+    `ledger` (z. B. eine fremd/manuell gebuchte Kostenzeile ohne
+    `MahnkostenBuchungTable`-Bezug), wird das ausdrücklich als "fehlend"
+    gezeigt, NIE als leeres Feld/erfundener Beleg. Für Verzugszinsen
+    zusätzlich je zugrunde liegender Forderung GETRENNT das kumulative
+    Segment-Bild (rein deskriptiv/Audit) und das an DIESEM Tag
+    tatsächlich NEU gebuchte Delta - diese beiden dürfen NIE verwechselt
+    werden (siehe `kontoblatt.py`-Moduldoc)."""
+
+    if zeile.kategorie not in (KATEGORIE_VERZUGSZINSEN, KATEGORIE_MAHNSPESEN, KATEGORIE_MAHNPAUSCHALE):
+        return ""
+    ledger = zeile.ledger
+    if ledger is None:
+        return '<div class="muted">Mahnbeleg/Ledger: fehlend</div>'
+
+    teile = [
+        f"Mahnbeleg: {h(ledger.versandnachweis_referenz)}",
+        "zugrunde liegende Forderungen: " + (", ".join(f"#{i}" for i in ledger.forderung_op_position_ids) or "—"),
+    ]
+    html = f'<div class="muted">{" · ".join(teile)}</div>'
+
+    if zeile.kategorie == KATEGORIE_VERZUGSZINSEN:
+        zeilen_html = []
+        for zuordnung in ledger.zins_zuordnung:
+            segmente_text = "; ".join(
+                f"{s.get('von', '?')}–{s.get('bis', '?')}: "
+                f"{s.get('satz_prozent') + ' %' if s.get('satz_prozent') else 'Basis ungeklärt'} "
+                f"({h(str(s.get('quelle') or '?'))}) → {eur(s.get('zinsen_cent') or 0)} kumulativ"
+                for s in zuordnung.segmente
+            ) or "keine Segmente erfasst"
+            delta_text = eur(zuordnung.delta_cent) if zuordnung.delta_cent is not None else "nicht gebucht"
+            zeilen_html.append(
+                f"<li>Forderung #{zuordnung.op_position_id} — kumulatives Zinsbild: {segmente_text} "
+                f"&nbsp;·&nbsp; tatsächlich an diesem Tag neu gebucht: <strong>{delta_text}</strong></li>"
+            )
+        if zeilen_html:
+            html += f'<ul class="muted">{"".join(zeilen_html)}</ul>'
+    return html
+
+
 def _kontoblatt_zeile_html(zeile, *, kategorie_spalte: bool) -> str:
     p = zeile.position
     rest_html = eur(zeile.rest_cent) if zeile.rest_cent is not None else '<span class="muted">—</span>'
@@ -103,7 +153,7 @@ def _kontoblatt_zeile_html(zeile, *, kategorie_spalte: bool) -> str:
         "<tr>"
         f"<td>{p.belegdatum.isoformat()}</td><td>{h(p.typ)}</td>{kategorie_html}"
         f"<td>{eur(p.betrag_cent)}</td><td>{rest_html}</td><td>{_kontoblatt_status_html(zeile)}</td>"
-        f"<td>{h(p.beleg_referenz or p.aenderungsgrund or '')}</td>"
+        f"<td>{h(p.beleg_referenz or p.aenderungsgrund or '')}{_kontoblatt_ledger_html(zeile)}</td>"
         "</tr>"
     )
 
@@ -114,7 +164,7 @@ def _kontoblatt_historie_zeile_html(zeile) -> str:
         "<tr>"
         f"<td>{p.belegdatum.isoformat()}</td><td>{h(KATEGORIE_LABEL.get(zeile.kategorie, zeile.kategorie))}</td>"
         f"<td>{eur(p.betrag_cent)}</td><td>{_kontoblatt_status_html(zeile)}</td>"
-        f"<td>{h(p.beleg_referenz or p.aenderungsgrund or '')}</td>"
+        f"<td>{h(p.beleg_referenz or p.aenderungsgrund or '')}{_kontoblatt_ledger_html(zeile)}</td>"
         "</tr>"
     )
 

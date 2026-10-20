@@ -23,7 +23,14 @@ from fpdf import FPDF
 from fpdf.enums import MethodReturnValue
 
 from mietinkasso.mahnwesen.brief_pdf import _FALLBACK_FONT_BOLD, _FALLBACK_FONT_REGULAR, Absender, _hex_to_rgb
-from mietinkasso.op.kontoblatt import KATEGORIE_LABEL, STATUS_LABEL, Kontoblatt
+from mietinkasso.op.kontoblatt import (
+    KATEGORIE_LABEL,
+    KATEGORIE_MAHNPAUSCHALE,
+    KATEGORIE_MAHNSPESEN,
+    KATEGORIE_VERZUGSZINSEN,
+    STATUS_LABEL,
+    Kontoblatt,
+)
 
 
 def _status_text(zeile) -> str:
@@ -34,6 +41,48 @@ def _status_text(zeile) -> str:
     if zeile.status is None:
         return ""
     return f" · Status: {STATUS_LABEL.get(zeile.status, zeile.status)}"
+
+
+def _ledger_text(zeile) -> str:
+    """Zusatz Zinszuordnung (Folgeschritt zu Commit 239e33c): dieselben
+    `MahnkostenBuchungTable`-Ledgerdetails wie in der HTML-Ansicht
+    (`backoffice/routes/konten.py::_kontoblatt_ledger_html`), hier als
+    einzeiliger Anhängsel-Text für `_zeile`'s `bezeichnung`. Fehlendes
+    `ledger` wird ausdrücklich als "fehlend" gezeigt, nie ein erfundener
+    Beleg."""
+
+    if zeile.kategorie not in (KATEGORIE_VERZUGSZINSEN, KATEGORIE_MAHNSPESEN, KATEGORIE_MAHNPAUSCHALE):
+        return ""
+    ledger = zeile.ledger
+    if ledger is None:
+        return " · Mahnbeleg/Ledger: fehlend"
+    forderungen_text = ", ".join(f"#{i}" for i in ledger.forderung_op_position_ids) or "—"
+    return f" · Mahnbeleg: {ledger.versandnachweis_referenz} · zugrunde liegende Forderungen: {forderungen_text}"
+
+
+def _zins_zuordnung_zeilen_text(zeile) -> list[str]:
+    """Je zugrunde liegender Forderung EINE eigene Textzeile - trennt
+    scharf das vollständige, kumulative Segment-Bild (rein deskriptiv)
+    vom tatsächlich an diesem Tag neu gebuchten Delta (NIE das eine aus
+    dem anderen ableiten, siehe `kontoblatt.py`-Moduldoc). Nur für
+    Verzugszinsen-Zeilen relevant - sonst leer."""
+
+    if zeile.kategorie != KATEGORIE_VERZUGSZINSEN or zeile.ledger is None:
+        return []
+    texte = []
+    for zuordnung in zeile.ledger.zins_zuordnung:
+        segmente_text = "; ".join(
+            f"{s.get('von', '?')}–{s.get('bis', '?')}: "
+            f"{s.get('satz_prozent') + ' %' if s.get('satz_prozent') else 'Basis ungeklärt'} "
+            f"({s.get('quelle') or '?'}) -> {_eur(s.get('zinsen_cent') or 0)} kumulativ"
+            for s in zuordnung.segmente
+        ) or "keine Segmente erfasst"
+        delta_text = _eur(zuordnung.delta_cent) if zuordnung.delta_cent is not None else "nicht gebucht"
+        texte.append(
+            f"Forderung #{zuordnung.op_position_id} - kumulatives Zinsbild: {segmente_text} "
+            f"/ tatsächlich an diesem Tag neu gebucht: {delta_text}"
+        )
+    return texte
 
 _SEITE_BREITE = 210.0
 _RAND = 20.0
@@ -194,8 +243,11 @@ def erzeuge_kontoauszug_pdf(
             p = z.position
             rest_text = _eur(z.rest_cent) if z.rest_cent is not None else ""
             label = KATEGORIE_LABEL.get(z.kategorie, z.kategorie)
-            bezeichnung = f"{label} · {p.beleg_referenz or ''}{_status_text(z)}"
+            bezeichnung = f"{label} · {p.beleg_referenz or ''}{_status_text(z)}{_ledger_text(z)}"
             _zeile(pdf, datum_text=p.belegdatum.strftime("%d.%m.%Y"), bezeichnung=bezeichnung, betrag_cent=p.betrag_cent, rest_text=rest_text)
+            pdf.set_font("Konto", "", 8.5)
+            for zuordnung_text in _zins_zuordnung_zeilen_text(z):
+                pdf.multi_cell(0, 4.5, "  ↳ " + zuordnung_text, new_x="LMARGIN", new_y="NEXT")
         _zeile(pdf, datum_text="", bezeichnung="Kosten gebucht (Sollsumme vor Zahlungen, bereits im Saldo enthalten)", betrag_cent=kontoblatt.kosten_cent, fett=True)
         _zeile(pdf, datum_text="", bezeichnung="davon tatsächlich noch offen", betrag_cent=kontoblatt.kosten_offener_rest_cent, fett=True)
     else:
@@ -210,7 +262,7 @@ def erzeuge_kontoauszug_pdf(
         for z in kontoblatt.kosten_historie:
             p = z.position
             label = KATEGORIE_LABEL.get(z.kategorie, z.kategorie)
-            bezeichnung = f"{label} · {p.beleg_referenz or ''}{_status_text(z)}"
+            bezeichnung = f"{label} · {p.beleg_referenz or ''}{_status_text(z)}{_ledger_text(z)}"
             _zeile(pdf, datum_text=p.belegdatum.strftime("%d.%m.%Y"), bezeichnung=bezeichnung, betrag_cent=p.betrag_cent)
 
     _abschnitt_titel(pdf, "Zahlungen / Rücklastschriften (Stornostand)")

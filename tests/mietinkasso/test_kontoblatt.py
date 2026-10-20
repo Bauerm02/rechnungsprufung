@@ -15,6 +15,8 @@ from mietinkasso.infrastructure.db.tables import (
     OPPositionTable,
     RuecklastschriftkostenTable,
 )
+import json
+
 from mietinkasso.op.kontoblatt import (
     KATEGORIE_HAUPTFORDERUNG,
     KATEGORIE_MAHNPAUSCHALE,
@@ -44,13 +46,16 @@ def _op(
 def _buchung(
     *, vertrag_id: str = "V-1", stufe: int = 1, zinsen_op_position_id: int | None = None,
     gebuehr_op_position_id: int | None = None, mahnpauschale_op_position_id: int | None = None,
+    versandnachweis_referenz: str = "mahnung:X", forderung_op_position_ids: str = "[]",
+    zins_segmente_json: str = "[]", zinsen_delta_je_op_json: str = "{}",
 ) -> MahnkostenBuchungTable:
     return MahnkostenBuchungTable(
-        vertrag_id=vertrag_id, stufe=stufe, mahnlauf_schluessel="HASH", forderung_op_position_ids="[]",
+        vertrag_id=vertrag_id, stufe=stufe, mahnlauf_schluessel="HASH", forderung_op_position_ids=forderung_op_position_ids,
         hauptforderung_cent=0, zinsbasis="VEREINBART_GEPRUEFT", zinssatz_prozent=0, zins_von=date(2026, 9, 1),
-        zins_bis=date(2026, 9, 30), zinsen_cent=0, versandnachweis_referenz="mahnung:X", erstellt_von="codex-test",
+        zins_bis=date(2026, 9, 30), zinsen_cent=0, versandnachweis_referenz=versandnachweis_referenz, erstellt_von="codex-test",
         zinsen_op_position_id=zinsen_op_position_id, gebuehr_op_position_id=gebuehr_op_position_id,
         mahnpauschale_op_position_id=mahnpauschale_op_position_id,
+        zins_segmente_json=zins_segmente_json, zinsen_delta_je_op_json=zinsen_delta_je_op_json,
     )
 
 
@@ -339,6 +344,137 @@ def test_vollstaendig_beglichene_kostenzeile_hat_rest_cent_none():
         mahnkosten_buchungen=[buchung], offene_forderungen_rest_je_id={},
     )
     assert blatt.kosten_zeilen[0].rest_cent is None
+
+
+def test_offene_ruecklastschrift_ohne_weitere_forderung_zaehlt_als_hauptforderung_offener_rest():
+    """Unabhängiger Befund nach Commit 239e33c: eine RUECKLASTSCHRIFT-Zeile
+    reinstalliert eine ECHTE Forderung und landet zur ANZEIGE in
+    `zahlungen_zeilen` (zusammen mit der Zahlung, die sie storniert) -
+    ist sie selbst noch offen, darf dieser Rest NICHT unsichtbar bleiben.
+    Wörtliches Beispiel aus der Rückmeldung: nur eine offene
+    RUECKLASTSCHRIFT über 1.207,90 EUR - `hauptforderung_offener_rest_cent`
+    darf NICHT 0 bleiben."""
+
+    rls = _op(1, "RUECKLASTSCHRIFT", 120_790)
+    blatt = _leer(
+        saldo_cent=120_790, positionen_aktiv=[rls], positionen_alle=[rls],
+        offene_forderungen_rest_je_id={1: 120_790},
+    )
+
+    assert len(blatt.zahlungen_zeilen) == 1  # Anzeige unverändert: weiterhin in zahlungen_zeilen
+    assert blatt.zahlungen_zeilen[0].rest_cent == 120_790
+    assert blatt.zahlungen_zeilen[0].status == STATUS_OFFEN
+    assert blatt.zahlungen_saldo_cent == 120_790  # Zahlungs-/Stornostand-Anzeige bleibt unverändert
+    assert blatt.hauptforderung_offener_rest_cent == 120_790  # der eigentliche Fehler: war zuvor 0
+    assert blatt.hauptforderung_cent + blatt.kosten_cent + blatt.zahlungen_saldo_cent == blatt.saldo_cent
+
+
+def test_offene_ruecklastschrift_als_kostenzeile_zaehlt_als_kosten_offener_rest():
+    """Dieselbe Lücke wie oben, aber für den Fall, dass die offene
+    RUECKLASTSCHRIFT-Zeile einer Kostenkategorie zugeordnet ist (direkt
+    über `RuecklastschriftkostenTable.kosten_op_position_id`) - muss in
+    `kosten_offener_rest_cent`, NICHT in `hauptforderung_offener_rest_cent`,
+    landen."""
+
+    rls_kosten_op = _op(3, "RUECKLASTSCHRIFT", 700)
+    rls = _ruecklastschrift_kosten(kosten_op_position_id=3)
+    blatt = _leer(
+        positionen_aktiv=[rls_kosten_op], positionen_alle=[rls_kosten_op], ruecklastschriftkosten_zeilen=[rls],
+        offene_forderungen_rest_je_id={3: 700},
+    )
+    assert blatt.hauptforderung_offener_rest_cent == 0
+    assert blatt.kosten_offener_rest_cent == 700
+
+
+def test_kostenzeile_zeigt_versandnachweis_und_forderung_ids():
+    """Zusatz Zinszuordnung: `ledger.versandnachweis_referenz` und
+    `ledger.forderung_op_position_ids` sind die bereits bestehenden
+    `MahnkostenBuchungTable`-Ledgerdetails - rein durchgereicht, keine
+    neue Buchung."""
+
+    gebuehr_op = _op(2, "SOLL", 2000, quelle_system="mahnkosten")
+    buchung = _buchung(
+        gebuehr_op_position_id=2, versandnachweis_referenz="mahnung:V-1:stufe1:2026-09-15",
+        forderung_op_position_ids=json.dumps([100, 101]),
+    )
+    blatt = _leer(positionen_aktiv=[gebuehr_op], positionen_alle=[gebuehr_op], mahnkosten_buchungen=[buchung])
+
+    zeile = blatt.kosten_zeilen[0]
+    assert zeile.ledger is not None
+    assert zeile.ledger.versandnachweis_referenz == "mahnung:V-1:stufe1:2026-09-15"
+    assert zeile.ledger.forderung_op_position_ids == [100, 101]
+    assert zeile.ledger.zins_zuordnung == []  # nur für Verzugszinsen befüllt, nicht für Mahnspesen
+
+
+def test_zinszeile_trennt_kumulatives_segment_von_tatsaechlich_gebuchtem_delta():
+    """Kernregel der Zinszuordnung: das vollständige, KUMULATIVE
+    Segment-Bild (`zins_segmente_json`) darf NIE mit dem an diesem Tag
+    tatsächlich NEU gebuchten Delta (`zinsen_delta_je_op_json`)
+    verwechselt werden - beide müssen UNABHÄNGIG voneinander ablesbar
+    sein."""
+
+    zinsen_op = _op(5, "SOLL", 489, quelle_system="mahnkosten")
+    segmente = [
+        {"op_position_id": 100, "von": "2026-07-01", "bis": "2026-08-31", "rest_cent": 50_000,
+         "satz_prozent": "4.000", "quelle": "VEREINBART_GEPRUEFT", "zinsen_cent": 334},
+        {"op_position_id": 100, "von": "2026-09-01", "bis": "2026-09-15", "rest_cent": 50_000,
+         "satz_prozent": "4.000", "quelle": "VEREINBART_GEPRUEFT", "zinsen_cent": 83},
+    ]
+    # Kumulativ über beide Segmente: 417 Cent - TATSÄCHLICH an diesem Tag
+    # neu gebucht wurden aber nur 83 Cent (die ersten 334 liefen bereits
+    # über eine frühere Mahnstufe).
+    buchung = _buchung(
+        zinsen_op_position_id=5, zins_segmente_json=json.dumps(segmente),
+        zinsen_delta_je_op_json=json.dumps({"100": 83}),
+    )
+    blatt = _leer(positionen_aktiv=[zinsen_op], positionen_alle=[zinsen_op], mahnkosten_buchungen=[buchung])
+
+    zeile = blatt.kosten_zeilen[0]
+    assert zeile.kategorie == KATEGORIE_VERZUGSZINSEN
+    assert len(zeile.ledger.zins_zuordnung) == 1
+    zuordnung = zeile.ledger.zins_zuordnung[0]
+    assert zuordnung.op_position_id == 100
+    assert len(zuordnung.segmente) == 2  # das vollständige kumulative Bild bleibt sichtbar
+    assert sum(s["zinsen_cent"] for s in zuordnung.segmente) == 417  # kumulativ, NICHT das Buchungsdelta
+    assert zuordnung.delta_cent == 83  # das TATSÄCHLICH an diesem Tag gebuchte Delta
+
+
+def test_zinszeile_ohne_gebuchtes_delta_zeigt_ehrlich_nicht_gebucht_statt_erfundener_null():
+    """Eine zugrunde liegende Forderung kann im kumulativen Segment-Bild
+    auftauchen, ohne dass an DIESEM Tag ein Delta für sie gebucht wurde
+    (z. B. weil ihr Anteil bereits vollständig über eine frühere Stufe
+    abgerechnet war) - `delta_cent` muss dann `None` sein, NIE 0 EUR
+    erfunden."""
+
+    zinsen_op = _op(5, "SOLL", 83, quelle_system="mahnkosten")
+    segmente = [
+        {"op_position_id": 200, "von": "2026-07-01", "bis": "2026-09-15", "rest_cent": 30_000,
+         "satz_prozent": "4.000", "quelle": "VEREINBART_GEPRUEFT", "zinsen_cent": 200},
+    ]
+    buchung = _buchung(
+        zinsen_op_position_id=5, zins_segmente_json=json.dumps(segmente), zinsen_delta_je_op_json=json.dumps({}),
+    )
+    blatt = _leer(positionen_aktiv=[zinsen_op], positionen_alle=[zinsen_op], mahnkosten_buchungen=[buchung])
+
+    zuordnung = blatt.kosten_zeilen[0].ledger.zins_zuordnung[0]
+    assert zuordnung.op_position_id == 200
+    assert zuordnung.delta_cent is None  # ehrlich "nicht gebucht", nie 0 erfunden
+
+
+def test_kostenzeile_ohne_auffindbare_buchung_hat_kein_ledger():
+    """Fehlt ausnahmsweise die zugehörige `MahnkostenBuchungTable`-Zeile
+    (z. B. eine fremd/manuell gebuchte Kostenzeile), bleibt `ledger`
+    `None` - Anzeige dann ausdrücklich "fehlend", nie ein erfundener
+    Beleg. Hier simuliert über eine Rücklastschriftkosten-Zeile (hat
+    strukturell ohnehin keinen `MahnkostenBuchungTable`-Bezug)."""
+
+    kosten_op = _op(2, "SOLL", 700, quelle_system="ruecklastschriftkosten")
+    rls = _ruecklastschrift_kosten(kosten_op_position_id=2)
+    blatt = _leer(positionen_aktiv=[kosten_op], positionen_alle=[kosten_op], ruecklastschriftkosten_zeilen=[rls])
+
+    zeile = blatt.kosten_zeilen[0]
+    assert zeile.kategorie == KATEGORIE_RUECKLASTSCHRIFTKOSTEN
+    assert zeile.ledger is None
 
 
 def test_leeres_konto_ergibt_leeres_kontoblatt_ohne_fehler():

@@ -10,7 +10,7 @@ from datetime import date, datetime, timezone
 import pytest
 from pypdf import PdfReader
 
-from mietinkasso.infrastructure.db.tables import MahnLaufTable, OPPositionTable, RuecklastschriftkostenTable
+from mietinkasso.infrastructure.db.tables import MahnkostenBuchungTable, MahnLaufTable, OPPositionTable, RuecklastschriftkostenTable
 from mietinkasso.mahnwesen.brief_pdf import Absender
 from mietinkasso.op.kontoauszug_pdf import erzeuge_kontoauszug_pdf
 from mietinkasso.op.kontoblatt import (
@@ -25,7 +25,19 @@ from mietinkasso.op.kontoblatt import (
     DokumentierterBankaufwand,
     Kontoblatt,
     KontoblattZeile,
+    MahnkostenLedgerEintrag,
+    ZinsZuordnungZeile,
 )
+
+
+def _buchung(**overrides) -> MahnkostenBuchungTable:
+    werte = dict(
+        vertrag_id="V-601-1", stufe=1, mahnlauf_schluessel="HASH", forderung_op_position_ids="[]",
+        hauptforderung_cent=0, zinsbasis="VEREINBART_GEPRUEFT", zinssatz_prozent=0, zins_von=date(2026, 9, 1),
+        zins_bis=date(2026, 9, 30), zinsen_cent=0, versandnachweis_referenz="mahnung:X", erstellt_von="codex-test",
+    )
+    werte.update(overrides)
+    return MahnkostenBuchungTable(**werte)
 
 
 def _absender(**overrides) -> Absender:
@@ -275,6 +287,81 @@ def test_kosten_historie_zeigt_stornierte_und_ersetzte_zeilen_getrennt_von_aktue
     assert "Alte Mahnspesenberechnung" in text
     assert "10,00 EUR" in text  # korrigierter, aktueller Betrag (Kosten gesamt)
     assert "20,00 EUR" in text  # historischer (nicht mehr gültiger) Betrag taucht trotzdem auf
+
+
+def test_pdf_zeigt_versandnachweis_und_zugrunde_liegende_forderungen():
+    """Zusatz Zinszuordnung: Mahnbeleg/Versandnachweis und die zugrunde
+    liegenden Forderungs-OP-IDs (`forderung_op_position_ids`) sind
+    bereits bestehende `MahnkostenBuchungTable`-Ledgerdetails - müssen im
+    PDF bei der jeweiligen Kostenzeile sichtbar sein."""
+
+    buchung = _buchung(gebuehr_op_position_id=1, versandnachweis_referenz="mahnung:V-601-1:stufe1:2026-09-15", forderung_op_position_ids="[100, 101]")
+    ledger = MahnkostenLedgerEintrag(buchung=buchung, versandnachweis_referenz=buchung.versandnachweis_referenz, forderung_op_position_ids=[100, 101])
+    gebuehr = KontoblattZeile(position=_op(1, "SOLL", 2000, referenz="Mahnspesen"), kategorie=KATEGORIE_MAHNSPESEN, rest_cent=2000, status=STATUS_OFFEN, ledger=ledger)
+    kontoblatt = _leeres_kontoblatt(kosten_zeilen=[gebuehr], kosten_cent=2000, kosten_offener_rest_cent=2000, saldo_cent=2000, faelliger_unstrittiger_rest_cent=2000)
+
+    pdf_bytes = _erzeugen(kontoblatt)
+    text = " ".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages).replace("\n", " ")
+    assert "mahnung:V-601-1:stufe1:2026-09-15" in text
+    assert "#100" in text and "#101" in text
+
+
+def test_pdf_fehlendes_ledger_zeigt_ehrlich_fehlend():
+    """Fehlt ausnahmsweise die `MahnkostenBuchungTable`-Zuordnung zu einer
+    Verzugszinsen-/Mahnspesen-/Mahnpauschale-Zeile, muss das PDF das
+    AUSDRÜCKLICH als "fehlend" zeigen - nie ein leeres Feld oder einen
+    erfundenen Beleg."""
+
+    gebuehr_ohne_ledger = KontoblattZeile(position=_op(1, "SOLL", 2000, referenz="Mahnspesen"), kategorie=KATEGORIE_MAHNSPESEN, rest_cent=2000, status=STATUS_OFFEN, ledger=None)
+    kontoblatt = _leeres_kontoblatt(kosten_zeilen=[gebuehr_ohne_ledger], kosten_cent=2000, kosten_offener_rest_cent=2000, saldo_cent=2000, faelliger_unstrittiger_rest_cent=2000)
+
+    pdf_bytes = _erzeugen(kontoblatt)
+    text = " ".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages).replace("\n", " ")
+    assert "Mahnbeleg/Ledger: fehlend" in text
+
+
+def test_pdf_zinszeile_trennt_kumulatives_segment_von_tatsaechlichem_delta():
+    """Kernregel der Zinszuordnung im PDF: das vollständige, kumulative
+    Segment-Bild und das tatsächlich an diesem Tag neu gebuchte Delta
+    müssen BEIDE sichtbar und UNTERSCHEIDBAR sein - das Delta darf NIE
+    mit der kumulativen Summe verwechselt werden."""
+
+    buchung = _buchung(zinsen_op_position_id=5, versandnachweis_referenz="mahnung:V-601-1:stufe2:2026-09-20")
+    zuordnung = ZinsZuordnungZeile(
+        op_position_id=100,
+        segmente=[{"von": "2026-07-01", "bis": "2026-09-15", "satz_prozent": "4.000", "quelle": "VEREINBART_GEPRUEFT", "zinsen_cent": 417}],
+        delta_cent=83,
+    )
+    ledger = MahnkostenLedgerEintrag(buchung=buchung, versandnachweis_referenz=buchung.versandnachweis_referenz, forderung_op_position_ids=[100], zins_zuordnung=[zuordnung])
+    zinsen = KontoblattZeile(position=_op(5, "SOLL", 83, referenz="Verzugszinsen"), kategorie=KATEGORIE_VERZUGSZINSEN, rest_cent=83, status=STATUS_OFFEN, ledger=ledger)
+    kontoblatt = _leeres_kontoblatt(kosten_zeilen=[zinsen], kosten_cent=83, kosten_offener_rest_cent=83, saldo_cent=83, faelliger_unstrittiger_rest_cent=83)
+
+    pdf_bytes = _erzeugen(kontoblatt)
+    text = " ".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages).replace("\n", " ")
+    assert "Forderung #100" in text
+    assert "4,17 EUR kumulativ" in text  # das vollständige kumulative Segment-Bild
+    assert "tatsächlich an diesem Tag neu gebucht: 0,83 EUR" in text  # NICHT 4,17 EUR
+
+
+def test_pdf_zinszeile_ohne_gebuchtes_delta_zeigt_ehrlich_nicht_gebucht():
+    """Eine zugrunde liegende Forderung ohne an diesem Tag gebuchtes
+    Delta darf NIE als 0,00 EUR erscheinen - nur ehrlich "nicht
+    gebucht"."""
+
+    buchung = _buchung(zinsen_op_position_id=5)
+    zuordnung = ZinsZuordnungZeile(
+        op_position_id=200,
+        segmente=[{"von": "2026-07-01", "bis": "2026-09-15", "satz_prozent": "4.000", "quelle": "VEREINBART_GEPRUEFT", "zinsen_cent": 200}],
+        delta_cent=None,
+    )
+    ledger = MahnkostenLedgerEintrag(buchung=buchung, versandnachweis_referenz=buchung.versandnachweis_referenz, forderung_op_position_ids=[200], zins_zuordnung=[zuordnung])
+    zinsen = KontoblattZeile(position=_op(5, "SOLL", 0, referenz="Verzugszinsen"), kategorie=KATEGORIE_VERZUGSZINSEN, rest_cent=None, status=None, ledger=ledger)
+    kontoblatt = _leeres_kontoblatt(kosten_zeilen=[zinsen], kosten_cent=0, kosten_offener_rest_cent=0, saldo_cent=0, faelliger_unstrittiger_rest_cent=0)
+
+    pdf_bytes = _erzeugen(kontoblatt)
+    text = " ".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages).replace("\n", " ")
+    assert "Forderung #200" in text
+    assert "tatsächlich an diesem Tag neu gebucht: nicht gebucht" in text
 
 
 def test_pdf_kopf_bricht_lange_firmen_objekt_einheit_bezeichnung_um_ohne_ueberlappung():

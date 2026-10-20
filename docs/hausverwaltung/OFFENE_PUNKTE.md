@@ -5546,3 +5546,70 @@ HTTP-Tests in `test_backoffice.py` (fremdes Konto ohne Zugriff für BEIDE
 Routen, Rückgabedatum vs. Erfassungsdatum, Status/Historie einer
 korrigierten Kostenzeile, Statuswechsel offen→bezahlt nach Zahlung).
 Ausschließlich synthetische Testdaten, keine Geschäftsaktion.
+
+### Unabhängiger Befund nach Commit 239e33c + Zusatz Zinszuordnung (Folgecommit)
+
+**Bugfix - offener Rest einer RUECKLASTSCHRIFT-Zeile fehlte:** eine
+OP-Zeile vom Typ RUECKLASTSCHRIFT reinstalliert eine ECHTE Forderung
+(zählt zu `_POSITIVE_TYPEN`) und landet zur ANZEIGE trotzdem in
+`zahlungen_zeilen` (`_ZAHLUNGS_TYPEN`, zusammen mit der Zahlung, die sie
+storniert - das bleibt bewusst so). Ihr `rest_cent` fehlte dadurch
+bisher komplett in `hauptforderung_offener_rest_cent`/
+`kosten_offener_rest_cent` (die nur über `hauptforderung_zeilen`/
+`kosten_zeilen` summierten): eine Forderung, deren EINZIGE offene
+Position eine wieder aufgelebte Rücklastschrift war, zeigte fälschlich
+"davon noch offen: 0,00 €". Behoben, indem der tatsächlich offene Rest
+einer solchen Zeile zusätzlich, nach derselben Kategorie-Logik wie
+`hauptforderung_zeilen`/`kosten_zeilen`, in die jeweilige
+`..._offener_rest_cent`-Summe eingerechnet wird - `zahlungen_zeilen`/
+`zahlungen_saldo_cent` (die Anzeige "Zahlungen/Stornostand") bleiben
+dabei UNVERÄNDERT. Neue Tests: `test_offene_ruecklastschrift_ohne_
+weitere_forderung_zaehlt_als_hauptforderung_offener_rest` und
+`test_offene_ruecklastschrift_als_kostenzeile_zaehlt_als_kosten_
+offener_rest` (`test_kontoblatt.py`), `test_kontoauszug_offene_
+ruecklastschrift_zaehlt_in_hauptforderung_offener_rest` (HTTP-
+Regressionstest gegen das echte, wörtliche Beispiel aus der Rückmeldung
+- eine isolierte RUECKLASTSCHRIFT über 1.207,90 EUR zeigt jetzt korrekt
+"davon noch offen: 1.207,90 €" statt 0,00 €).
+
+**Zusatz Zinszuordnung (reine Anzeige-Erweiterung, kein neuer
+Buchungspfad):** `KontoblattZeile.ledger` (neu, `MahnkostenLedgerEintrag
+| None`) macht die bereits bestehenden `MahnkostenBuchungTable`-
+Ledgerdetails für Verzugszinsen-/Mahnspesen-/Mahnpauschale-Zeilen
+sichtbar - `versandnachweis_referenz` (Mahnbeleg) und
+`forderung_op_position_ids` (die zugrunde liegenden Forderungs-OP-IDs).
+Für Verzugszinsen zusätzlich `MahnkostenLedgerEintrag.zins_zuordnung`:
+je zugrunde liegender Forderung (`op_position_id`) GETRENNT das
+vollständige, KUMULATIVE Segment-Bild (`zins_segmente_json` - rein
+deskriptiv/Audit) UND das an DIESEM Buchungstag tatsächlich NEU gebuchte
+Delta (`zinsen_delta_je_op_json`) - diese beiden werden NIE verwechselt
+(ein kumulatives Segment wird nie als "neu gebucht" ausgegeben). Fehlt
+eine Forderung im Delta-JSON, zeigt `delta_cent is None` ehrlich "nicht
+gebucht", nie eine erfundene 0,00-EUR-Zeile. Fehlt zu einer Kostenzeile
+ausnahmsweise die zugehörige Buchung, bleibt `ledger` `None` - Anzeige
+dann ausdrücklich "fehlend". Rein lesende Erweiterung: die bestehende
+20-EUR-pro-tatsächlich-versendetem-Schreiben-Konfiguration
+(`mahngebuehr_kostenbasis_cent`) und der gesamte `MahnkostenService`-
+Buchungspfad (inkl. Zinsprofil-Freigabe-Gate) bleiben vollständig
+unverändert - KEINE neue Architektur, KEINE neue Tabelle/Migration.
+HTML (`_kontoblatt_ledger_html`) und PDF (`_ledger_text`/
+`_zins_zuordnung_zeilen_text`) formatieren unabhängig voneinander
+(gleiches Muster wie `_kontoblatt_status_html`/`_status_text`).
+
+Neue gezielte Tests (keine erneute Gesamtsuite, fokussiert): 4 neue
+reine Funktionstests in `test_kontoblatt.py` (Versandnachweis/
+Forderungs-IDs, kumulatives Segment vs. tatsächliches Delta getrennt,
+fehlendes Delta → "nicht gebucht" statt 0, fehlende Buchung → `ledger is
+None`), 4 neue in `test_kontoauszug_pdf.py` (Versandnachweis/
+Forderungs-IDs im PDF, fehlendes Ledger → "fehlend" im PDF, Segment vs.
+Delta getrennt im PDF, fehlendes Delta → "nicht gebucht" im PDF), 1 neuer
+HTTP-Test in `test_backoffice.py` gegen eine ECHTE `MahnkostenService.
+buche_bei_versand`-Buchung (`test_kontoauszug_zeigt_versandnachweis_und_
+zinszuordnung_bei_echter_mahnkostenbuchung`). Ausschließlich synthetische
+Testdaten, keine Geschäftsaktion, `SEND_ENABLED`/Versand unverändert.
+
+**Offener Punkt:** die oben bereits dokumentierte strukturelle Grenze
+des Ein-Operator-Piloten (`_ctx` liefert immer ADMIN/uneingeschränkt,
+`require_gesellschaft_access` daher defensiv statt real durchsetzend)
+gilt unverändert auch für diese Erweiterung - keine neue Grenze, keine
+Verschärfung nötig, da rein lesend.

@@ -71,11 +71,53 @@ nachbuchung_absenden`, `quelle_system="backoffice"`) gebuchte GUTSCHRIFT
 gegen eine Kostenzeile hat KEINE strukturelle Bindung an die
 Originalzeile (anders als eine `storniere_und_korrigiere`-Korrektur) und
 erscheint deshalb als Hauptforderung, nicht als Kostenkorrektur - das
-betrifft nur die Anzeige-Kategorie, nicht den Gesamtsaldo."""
+betrifft nur die Anzeige-Kategorie, nicht den Gesamtsaldo.
+
+**Offener Rest einer RUECKLASTSCHRIFT-Zeile (unabhängiger Befund nach
+Commit 239e33c):** eine OP-Zeile vom Typ RUECKLASTSCHRIFT reinstalliert
+eine ECHTE Forderung (sie zählt zu `_POSITIVE_TYPEN`, nicht zu einer
+bloßen Zahlung) und kann selbst noch offen sein. Zur Anzeige landet sie
+trotzdem in `zahlungen_zeilen` (`_ZAHLUNGS_TYPEN`, zusammen mit der
+ZAHLUNG, die sie storniert) - das ist weiterhin so gewollt, damit
+"Zahlungen/Stornostand" eine Zahlung und ihre eigene Rücklastschrift als
+EIN zusammengehöriges Paar zeigt. Ihr `rest_cent` fehlte dadurch bisher
+komplett in `hauptforderung_offener_rest_cent`/`kosten_offener_rest_cent`
+(die nur über `hauptforderung_zeilen`/`kosten_zeilen` summierten) - eine
+Forderung, deren EINZIGE offene Position eine wieder aufgelebte
+Rücklastschrift ist, zeigte fälschlich 0,00 EUR offenen Rest. Der
+tatsächlich offene Rest einer solchen Zeile wird deshalb zusätzlich,
+nach derselben Kategorie-Logik wie `hauptforderung_zeilen`/
+`kosten_zeilen`, in die jeweilige `..._offener_rest_cent`-Summe
+eingerechnet - `zahlungen_zeilen`/`zahlungen_saldo_cent` (die Anzeige
+"Zahlungen/Stornostand") bleiben dabei UNVERÄNDERT, siehe
+`test_offene_ruecklastschrift_ohne_weitere_forderung_zaehlt_als_
+hauptforderung_offener_rest`.
+
+**Zusatz Zinszuordnung/Mahnbeleg (Folgeschritt zu Commit 239e33c):**
+`KontoblattZeile.ledger` macht für eine VERZUGSZINSEN-/MAHNSPESEN-/
+MAHNPAUSCHALE-Zeile die bereits bestehenden `MahnkostenBuchungTable`-
+Ledgerdetails sichtbar (`versandnachweis_referenz`, `forderung_op_
+position_ids`) - rein lesend, KEINE neue Buchung/Architektur. Für
+Verzugszinsen zusätzlich `MahnkostenLedgerEintrag.zins_zuordnung`: je
+zugrunde liegender Forderung (`op_position_id`) GETRENNT das
+vollständige, KUMULATIVE Segment-Bild (`zins_segmente_json` - rein
+deskriptiv/Audit, über alle Halbjahres-/Basiszinssatz-Teilperioden bis
+zum Buchungstag) UND das an DIESEM Buchungstag tatsächlich NEU gebuchte
+Delta (`zinsen_delta_je_op_json`). Diese beiden dürfen NIE verwechselt
+werden (siehe `MahnkostenBuchungTable`-Moduldoc: das kumulative Segment
+als "neu gebucht" auszugeben würde bei einer späteren Stufe zu doppelt
+gezählten Zinsen in der ANZEIGE führen, auch wenn die tatsächliche
+Buchung selbst korrekt bleibt) - `delta_cent is None` bedeutet ehrlich
+"für diese Forderung an diesem Tag kein Delta gebucht", nie erfundene
+0,00 EUR. Fehlt zu einer Kostenzeile ausnahmsweise die zugehörige
+Buchung (z. B. eine fremd/manuell gebuchte Kostenzeile ohne
+`MahnkostenBuchungTable`-Eintrag), bleibt `ledger` `None` - Anzeige
+dann ausdrücklich "fehlend", nie ein erfundener Beleg."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from datetime import date
 
 from mietinkasso.domain.enums import OPTyp
@@ -148,6 +190,38 @@ def _effect_cent(position: OPPositionTable) -> int:
 
 
 @dataclass(frozen=True)
+class ZinsZuordnungZeile:
+    """EIN zugrunde liegender Forderungs-`op_position_id` innerhalb einer
+    `MahnkostenBuchungTable`-Zeile - trennt scharf zwischen dem
+    vollständigen, KUMULATIVEN Segment-Bild (`segmente`, rein deskriptiv/
+    Audit, Rohdaten aus `zins_segmente_json`: je Segment `von`/`bis`/
+    `satz_prozent`/`quelle`/`rest_cent`/`zinsen_cent`) und dem an DIESEM
+    Buchungstag TATSÄCHLICH neu gebuchten Delta (`delta_cent`, aus
+    `zinsen_delta_je_op_json`). `delta_cent is None` heißt ehrlich "für
+    diese Forderung an diesem Tag kein Delta gebucht" - NIE aus
+    `segmente` abgeleitet oder mit 0 verwechselt (siehe
+    `MahnkostenBuchungTable`-Moduldoc)."""
+
+    op_position_id: int
+    segmente: list[dict]
+    delta_cent: int | None
+
+
+@dataclass(frozen=True)
+class MahnkostenLedgerEintrag:
+    """Die bereits bestehenden `MahnkostenBuchungTable`-Ledgerdetails zu
+    EINER Kostenzeile (Verzugszinsen/Mahnspesen/Mahnpauschale) - rein
+    lesend durchgereicht, keine neue Buchung/Berechnung. `zins_zuordnung`
+    ist nur für die VERZUGSZINSEN-Zeile befüllt (leer bei Mahnspesen/
+    -pauschale, die kein Zinssegment-Bild haben)."""
+
+    buchung: MahnkostenBuchungTable
+    versandnachweis_referenz: str
+    forderung_op_position_ids: list[int]
+    zins_zuordnung: list[ZinsZuordnungZeile] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class KontoblattZeile:
     """Eine einzelne OP-Zeile mit ihrer Kontoblatt-Kategorie - reine
     Anzeige-Gruppierung, kein eigener Geldwert abseits von `position.
@@ -159,12 +233,15 @@ class KontoblattZeile:
     Zeile ohne eigenen Forderungscharakter (z. B. GUTSCHRIFT/ZAHLUNG/
     KORREKTUR). In `Kontoblatt.kosten_zeilen` ist `status` IMMER eine der
     drei aktiven Werte (offen/teilbezahlt/bezahlt); in `Kontoblatt.
-    kosten_historie` IMMER `STORNIERT`/`ERSETZT`."""
+    kosten_historie` IMMER `STORNIERT`/`ERSETZT`. `ledger` ist nur für
+    Verzugszinsen/Mahnspesen/Mahnpauschale gesetzt (sonst `None`) - siehe
+    `MahnkostenLedgerEintrag`."""
 
     position: OPPositionTable
     kategorie: str
     rest_cent: int | None
     status: str | None = None
+    ledger: MahnkostenLedgerEintrag | None = None
 
 
 @dataclass(frozen=True)
@@ -240,23 +317,97 @@ def _storno_vorgaenger_index(positionen_alle: list[OPPositionTable]) -> dict[int
     return {p.storniert_durch_id: p for p in positionen_alle if p.storniert_durch_id is not None}
 
 
-def _kategorie_fuer_position(
+def _kategorie_und_quelle_id_fuer_position(
     position: OPPositionTable, *, buchungs_id_kategorie: dict[int, str],
     ruecklastschriftkosten_ids: frozenset[int], vorgaenger_index: dict[int, OPPositionTable],
-) -> str:
+) -> tuple[str, int | None]:
+    """Wie die bisherige `_kategorie_fuer_position`, gibt zusätzlich die
+    tatsächlich TREFFENDE (Mahnkosten-/Rücklastschriftkosten-)Id zurück -
+    bei einer korrigierten Zeile die der URSPRÜNGLICHEN (ggf. bereits
+    stornierten) Position, NICHT `position.id` selbst. Diese Id ist der
+    Schlüssel, unter dem `MahnkostenBuchungTable` weiterhin referenziert
+    (siehe Moduldoc "Korrigierte Kostenzeilen bleiben erkennbar") - und
+    damit auch der Schlüssel, um die zugehörigen Ledgerdetails
+    (`MahnkostenLedgerEintrag`) wiederzufinden. `None`, wenn keine
+    Mahnkosten-/Rücklastschriftkosten-Zuordnung existiert (Hauptforderung
+    ohne Kostenbezug)."""
+
     aktuelle = position
     for _ in range(10):
         if aktuelle.id in buchungs_id_kategorie:
-            return buchungs_id_kategorie[aktuelle.id]
+            return buchungs_id_kategorie[aktuelle.id], aktuelle.id
         if aktuelle.id in ruecklastschriftkosten_ids:
-            return KATEGORIE_RUECKLASTSCHRIFTKOSTEN
+            return KATEGORIE_RUECKLASTSCHRIFTKOSTEN, aktuelle.id
         if aktuelle.quelle_system != "korrektur":
-            return KATEGORIE_HAUPTFORDERUNG
+            return KATEGORIE_HAUPTFORDERUNG, None
         vorgaenger = vorgaenger_index.get(aktuelle.id)
         if vorgaenger is None:
-            return KATEGORIE_HAUPTFORDERUNG
+            return KATEGORIE_HAUPTFORDERUNG, None
         aktuelle = vorgaenger
-    return KATEGORIE_HAUPTFORDERUNG
+    return KATEGORIE_HAUPTFORDERUNG, None
+
+
+def _buchungs_id_zu_buchung(buchungen: list[MahnkostenBuchungTable]) -> dict[int, MahnkostenBuchungTable]:
+    """Wie `_buchungs_id_kategorie`, aber auf die vollständige Buchungs-
+    zeile statt nur die Kategorie gemappt - Grundlage für `_ledger_fuer`."""
+
+    mapping: dict[int, MahnkostenBuchungTable] = {}
+    for b in buchungen:
+        if b.zinsen_op_position_id is not None:
+            mapping[b.zinsen_op_position_id] = b
+        if b.gebuehr_op_position_id is not None:
+            mapping[b.gebuehr_op_position_id] = b
+        if b.mahnpauschale_op_position_id is not None:
+            mapping[b.mahnpauschale_op_position_id] = b
+    return mapping
+
+
+def _parse_zins_zuordnung(buchung: MahnkostenBuchungTable) -> list[ZinsZuordnungZeile]:
+    """Zusatz Zinszuordnung (Folgeschritt zu Commit 239e33c): parst
+    `zins_segmente_json` (vollständiges, kumulatives Segment-Bild) und
+    `zinsen_delta_je_op_json` (das an DIESEM Tag tatsächlich NEU gebuchte
+    Delta) GETRENNT je `op_position_id` - niemals das eine aus dem
+    anderen ableiten (siehe `MahnkostenBuchungTable`-Moduldoc). Ein
+    beschädigter/leerer JSON-Wert ergibt leere Listen statt eines Fehlers
+    (rein lesende Anzeige-Funktion)."""
+
+    try:
+        segmente_roh = json.loads(buchung.zins_segmente_json) or []
+    except (TypeError, ValueError):
+        segmente_roh = []
+    try:
+        delta_roh = json.loads(buchung.zinsen_delta_je_op_json) or {}
+    except (TypeError, ValueError):
+        delta_roh = {}
+
+    segmente_je_op: dict[int, list[dict]] = {}
+    for segment in segmente_roh:
+        segmente_je_op.setdefault(segment["op_position_id"], []).append(segment)
+
+    op_ids = sorted(set(segmente_je_op) | {int(k) for k in delta_roh})
+    return [
+        ZinsZuordnungZeile(
+            op_position_id=op_id, segmente=segmente_je_op.get(op_id, []), delta_cent=delta_roh.get(str(op_id)),
+        )
+        for op_id in op_ids
+    ]
+
+
+def _ledger_fuer(kategorie: str, buchung: MahnkostenBuchungTable | None) -> MahnkostenLedgerEintrag | None:
+    """`None`, wenn keine Buchung gefunden wurde - Anzeige dann
+    ausdrücklich "fehlend", NIE ein erfundener Beleg (siehe Moduldoc)."""
+
+    if buchung is None:
+        return None
+    try:
+        forderung_ids = sorted(json.loads(buchung.forderung_op_position_ids) or [])
+    except (TypeError, ValueError):
+        forderung_ids = []
+    zins_zuordnung = _parse_zins_zuordnung(buchung) if kategorie == KATEGORIE_VERZUGSZINSEN else []
+    return MahnkostenLedgerEintrag(
+        buchung=buchung, versandnachweis_referenz=buchung.versandnachweis_referenz,
+        forderung_op_position_ids=forderung_ids, zins_zuordnung=zins_zuordnung,
+    )
 
 
 def _status_fuer_aktive_zeile(position: OPPositionTable, rest_cent: int | None) -> str | None:
@@ -290,6 +441,7 @@ def erstelle_kontoblatt(
     DB-/Zeitabfrage, damit sie ohne DB direkt getestet werden kann."""
 
     buchungs_kategorie = _buchungs_id_kategorie(mahnkosten_buchungen)
+    buchungen_by_id = _buchungs_id_zu_buchung(mahnkosten_buchungen)
     ruecklastschriftkosten_ids = frozenset(
         r.kosten_op_position_id for r in ruecklastschriftkosten_zeilen if r.kosten_op_position_id is not None
     )
@@ -301,6 +453,11 @@ def erstelle_kontoblatt(
     hauptforderung_cent = 0
     kosten_cent = 0
     zahlungen_saldo_cent = 0
+    # Unabhängiger Befund nach Commit 239e33c (siehe Moduldoc "Offener
+    # Rest einer RUECKLASTSCHRIFT-Zeile"): zusätzlich zur Summe über
+    # `hauptforderung_zeilen`/`kosten_zeilen` unten.
+    hauptforderung_offener_rest_zusatz_cent = 0
+    kosten_offener_rest_zusatz_cent = 0
 
     for p in positionen_aktiv:
         rest = offene_forderungen_rest_je_id.get(p.id)
@@ -308,12 +465,30 @@ def erstelle_kontoblatt(
         if p.typ in _ZAHLUNGS_TYPEN:
             zahlungen_zeilen.append(KontoblattZeile(position=p, kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=rest, status=status))
             zahlungen_saldo_cent += _effect_cent(p)
+            # Eine RUECKLASTSCHRIFT-Zeile reinstalliert eine ECHTE
+            # Forderung und kann selbst noch offen sein - dieser Rest
+            # fehlte bisher komplett in den `..._offener_rest_cent`-
+            # Summen, weil die Zeile zur ANZEIGE in `zahlungen_zeilen`
+            # steht (das bleibt unverändert so). Nur der tatsächlich
+            # offene Rest wird hier zusätzlich derselben Kategorie
+            # zugeschlagen, die `hauptforderung_zeilen`/`kosten_zeilen`
+            # auch für eine gewöhnliche Forderung verwenden würden.
+            if rest:
+                zahlungstyp_kategorie, _ = _kategorie_und_quelle_id_fuer_position(
+                    p, buchungs_id_kategorie=buchungs_kategorie, ruecklastschriftkosten_ids=ruecklastschriftkosten_ids,
+                    vorgaenger_index=vorgaenger_index,
+                )
+                if zahlungstyp_kategorie == KATEGORIE_HAUPTFORDERUNG:
+                    hauptforderung_offener_rest_zusatz_cent += rest
+                else:
+                    kosten_offener_rest_zusatz_cent += rest
             continue
-        kategorie = _kategorie_fuer_position(
+        kategorie, quelle_id = _kategorie_und_quelle_id_fuer_position(
             p, buchungs_id_kategorie=buchungs_kategorie, ruecklastschriftkosten_ids=ruecklastschriftkosten_ids,
             vorgaenger_index=vorgaenger_index,
         )
-        zeile = KontoblattZeile(position=p, kategorie=kategorie, rest_cent=rest, status=status)
+        ledger = _ledger_fuer(kategorie, buchungen_by_id.get(quelle_id)) if quelle_id is not None else None
+        zeile = KontoblattZeile(position=p, kategorie=kategorie, rest_cent=rest, status=status, ledger=ledger)
         if kategorie == KATEGORIE_HAUPTFORDERUNG:
             hauptforderung_zeilen.append(zeile)
             hauptforderung_cent += _effect_cent(p)
@@ -326,16 +501,18 @@ def erstelle_kontoblatt(
     # wie der tatsächlich noch offene Rückstand - der kommt separat aus
     # der Summe der je Zeile bereits korrekt verteilten `rest_cent`-Werte
     # (`OPService.offene_forderungen`), NIE aus einer zweiten eigenen
-    # Zahlungsverteilung.
-    hauptforderung_offener_rest_cent = sum(z.rest_cent or 0 for z in hauptforderung_zeilen)
-    kosten_offener_rest_cent = sum(z.rest_cent or 0 for z in kosten_zeilen)
+    # Zahlungsverteilung. Zusätzlich fließt der oben ermittelte Rest
+    # offener RUECKLASTSCHRIFT-Zeilen ein (unabhängiger Befund nach
+    # Commit 239e33c).
+    hauptforderung_offener_rest_cent = sum(z.rest_cent or 0 for z in hauptforderung_zeilen) + hauptforderung_offener_rest_zusatz_cent
+    kosten_offener_rest_cent = sum(z.rest_cent or 0 for z in kosten_zeilen) + kosten_offener_rest_zusatz_cent
 
     # Codex-Abnahme 20.10.2026, P3: bereits STORNIERTE Kostenzeilen bleiben
     # als eigene Historie sichtbar (NIE Teil von `kosten_zeilen`/
     # `kosten_cent` - das würde den Gesamtsaldo nicht ändern, aber eine
     # stornierte Buchung fälschlich wie eine noch gültige behandeln).
-    # `_kategorie_fuer_position` erkennt eine stornierte Kostenzeile auch
-    # dann noch korrekt, wenn `MahnkostenBuchungTable`/
+    # `_kategorie_und_quelle_id_fuer_position` erkennt eine stornierte
+    # Kostenzeile auch dann noch korrekt, wenn `MahnkostenBuchungTable`/
     # `RuecklastschriftkostenTable` weiterhin auf ihre (jetzt stornierte)
     # ID verweisen - diese Fremdreferenzen werden bei einer Korrektur NIE
     # nachträglich umgeschrieben.
@@ -343,14 +520,15 @@ def erstelle_kontoblatt(
     for p in positionen_alle:
         if p.status != "STORNIERT":
             continue
-        kategorie = _kategorie_fuer_position(
+        kategorie, quelle_id = _kategorie_und_quelle_id_fuer_position(
             p, buchungs_id_kategorie=buchungs_kategorie, ruecklastschriftkosten_ids=ruecklastschriftkosten_ids,
             vorgaenger_index=vorgaenger_index,
         )
         if kategorie == KATEGORIE_HAUPTFORDERUNG:
             continue
+        ledger = _ledger_fuer(kategorie, buchungen_by_id.get(quelle_id)) if quelle_id is not None else None
         status = STATUS_ERSETZT if p.storniert_durch_id is not None else STATUS_STORNIERT
-        kosten_historie.append(KontoblattZeile(position=p, kategorie=kategorie, rest_cent=None, status=status))
+        kosten_historie.append(KontoblattZeile(position=p, kategorie=kategorie, rest_cent=None, status=status, ledger=ledger))
 
     # Codex-Abnahme 20.10.2026, P2: das tatsächliche Rückgabedatum kommt
     # aus der gebundenen Rücklastschrift-OP-Zeile (`belegdatum`), NICHT
