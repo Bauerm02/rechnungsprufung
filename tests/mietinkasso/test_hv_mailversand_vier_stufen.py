@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
@@ -17,7 +17,7 @@ from mietinkasso.indexautomatik.bootstrap import bauen
 from mietinkasso.indexautomatik.mailops_client import MailOpsClient
 from mietinkasso.indexautomatik.mailversand_service import HVMailversandService
 from mietinkasso.infrastructure.config import Settings
-from mietinkasso.infrastructure.db.tables import MahnFallTable, MahnLaufTable
+from mietinkasso.infrastructure.db.tables import MahnFallTable, MahnLaufTable, MahnTageslaufTable
 
 
 @pytest.fixture
@@ -244,3 +244,86 @@ def test_freigegebener_slot_erlaubt_legitimen_retry_am_selben_tag(
     service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="SYNTHETIC-BANK", bestaetigt_bis=date(2026, 9, 25), bestaetigt_von="SYNTHETIC-TEST")
     ergebnis_retry = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 25))
     assert ergebnis_retry["gesendet"] == 1
+
+
+def test_tageslauf_slot_nach_bestaetigtem_providerkontakt_nicht_als_unversandt_freigegeben(
+    hv, basis_vertrag, admin_ctx, session_factory, monkeypatch,
+):
+    """Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026,
+    reproduzierter Fehler): der Provider hat das erste Schreiben bereits
+    bestätigt angenommen (MahnLauf wird GESENDET) - DANACH stürzt
+    `markiere_versendet` mit einem simulierten DB-/Prozessfehler ab,
+    BEVOR der Tageslauf-Slot selbst auf VERSENDET geschlossen wird. Eine
+    spätere Recovery (`freigeben_verwaiste`) darf diesen Slot NICHT als
+    sicher unversandt (`KEIN_VERSAND`) freigeben - sonst sendet ein
+    späterer Lauf für eine zwischenzeitlich neu fällige Forderung
+    desselben Vertrags ein ZWEITES tatsächliches Schreiben."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx, vier_stufen=True, faelligkeit=date(2026, 9, 5))
+
+    aufrufe = {"n": 0}
+
+    def kaputtes_markiere_versendet(tageslauf_id, *, mahnlauf_id):
+        aufrufe["n"] += 1
+        raise RuntimeError("simulierter DB-/Prozessfehler NACH bestätigtem Providerkontakt")
+
+    monkeypatch.setattr(service.tageslauf_repo, "markiere_versendet", kaputtes_markiere_versendet)
+
+    state["sent"] = "2026-09-25T08:00:00Z"
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="SYNTHETIC-BANK", bestaetigt_bis=date(2026, 9, 25), bestaetigt_von="SYNTHETIC-TEST")
+    with pytest.raises(RuntimeError, match="simulierter"):
+        service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 25))
+    assert aufrufe["n"] == 1
+
+    # Der tatsächliche Versand hat trotzdem stattgefunden (der MahnLauf
+    # selbst ist GESENDET) - NUR die Slot-Buchführung ist abgestürzt, und
+    # der Slot bleibt dank `verknuepfe_mahnlauf` (VOR dem Versandversuch
+    # gesetzt) bereits mit diesem konkreten Mahnlauf verknüpft.
+    with session_factory() as session:
+        mahnlauf_zeile = session.query(MahnLaufTable).order_by(MahnLaufTable.id.desc()).first()
+        assert mahnlauf_zeile.status == "GESENDET"
+        tageslauf_zeile = session.query(MahnTageslaufTable).filter(MahnTageslaufTable.vertrag_id == contract.id).one()
+        assert tageslauf_zeile.status == "IN_BEARBEITUNG"
+        assert tageslauf_zeile.mahnlauf_id == mahnlauf_zeile.id
+
+    # "15 Minuten später" (wie am Anfang eines echten Tageslaufs): die
+    # Recovery darf den Slot NICHT als unversandt auflösen, weil der
+    # verknüpfte Mahnlauf tatsächlich GESENDET ist.
+    service.tageslauf_repo.freigeben_verwaiste(aelter_als=datetime.now(timezone.utc) + timedelta(hours=1))
+    with session_factory() as session:
+        tageslauf_zeile = session.query(MahnTageslaufTable).filter(MahnTageslaufTable.vertrag_id == contract.id).one()
+        assert tageslauf_zeile.status == "VERSENDET"
+
+    # Eine zwischenzeitlich neu fällige Forderung desselben Vertrags darf
+    # am selben Prüftag trotzdem NICHT zu einem zweiten Versand führen.
+    service.op_service.buchen(
+        ctx=admin_ctx, konto=account, typ=OPTyp.SOLL, betrag_cent=83000, belegdatum=date(2026, 8, 1),
+        buchungsdatum=date(2026, 8, 1), faelligkeit=date(2026, 8, 1), beleg_referenz="SYNTHETIC Nachtrag",
+    )
+    ergebnis_zweiter_lauf = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 25))
+    assert ergebnis_zweiter_lauf["gesendet"] == 0
+    with session_factory() as session:
+        versendete_laeufe = session.query(MahnLaufTable).filter(MahnLaufTable.status == "GESENDET").count()
+    assert versendete_laeufe == 1  # KEIN zweiter tatsächlicher Versand
+
+
+def test_freigeben_verwaiste_setzt_ohne_tatsaechlichen_providerkontakt_weiterhin_kein_versand(
+    hv, basis_vertrag, admin_ctx, session_factory,
+):
+    """Gegenprobe: eine verwaiste Zeile OHNE verknüpften Mahnlauf (nichts
+    wurde überhaupt geplant/versucht) muss weiterhin auf `KEIN_VERSAND`
+    aufgelöst werden - die Korrektur darf legitime Retries nicht
+    blockieren."""
+
+    service, _ = hv
+    contract, _ = basis_vertrag
+    tageslauf = service.tageslauf_repo.claim(vertrag_id=contract.id, pruefdatum=date(2026, 9, 25))
+    assert tageslauf is not None
+    assert tageslauf.mahnlauf_id is None
+
+    service.tageslauf_repo.freigeben_verwaiste(aelter_als=datetime.now(timezone.utc) + timedelta(hours=1))
+    with session_factory() as session:
+        tageslauf_zeile = session.query(MahnTageslaufTable).filter(MahnTageslaufTable.vertrag_id == contract.id).one()
+        assert tageslauf_zeile.status == "KEIN_VERSAND"

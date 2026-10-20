@@ -737,6 +737,15 @@ class HVMailversandService:
                         )
                         if letzter_mahnlauf is None:
                             continue
+                        # Korrektur nach unabhängiger Abnahme (Codex,
+                        # 20.10.2026, reproduzierter Fehler): VOR jedem
+                        # tatsächlichen Versandversuch verknüpfen, damit
+                        # eine spätere Recovery (`freigeben_verwaiste`)
+                        # bei einem Absturz NACH bestätigtem
+                        # Providerkontakt den tatsächlichen Mahnlauf-
+                        # Status nachschlagen kann, statt den Slot blind
+                        # als sicher unversandt freizugeben.
+                        self.tageslauf_repo.verknuepfe_mahnlauf(tageslauf.id, mahnlauf_id=letzter_mahnlauf.id)
                         ergebnis = self._dispatch_mahnlauf(
                             ctx=ctx, mahnlauf=letzter_mahnlauf, heute=heute, confirmed=confirmed, unclear=unclear,
                         )

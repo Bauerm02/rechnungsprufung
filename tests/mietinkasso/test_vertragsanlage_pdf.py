@@ -243,6 +243,28 @@ def test_betrag_ohne_trennzeichen_direkt_nach_waehrung_wird_nicht_abgeschnitten(
     assert ergebnis.treffer["hauptmietzins_cent"].wert == "1200"
 
 
+@pytest.mark.parametrize("text", [
+    "Hauptmietzins: EUR1234.5678",       # Betrag nach Währung, Punkt-Dezimal, 4 Nachkommastellen
+    "Hauptmietzins: 1200,0005 EUR",      # Betrag vor Währung, Komma-Dezimal, 4 Nachkommastellen
+    "Hauptmietzins: 1234,5678 EUR",      # dieselbe Rückwärtsalternative mit Komma
+    "Hauptmietzins: EUR1200.0005",       # dieselbe Vorwärtsalternative mit Punkt
+])
+def test_ueberschuessige_dezimalstellen_werden_komplett_verworfen_nicht_teilweise_uebernommen(text):
+    """Reproduktion (Codex-Abnahme 20.10.2026): 'EUR1234.5678' wurde zu
+    '1234.567', 'EUR1200,0005' zu '1200,000' - beide Male ein
+    stillschweigend TEILWEISE korrekter, aber inhaltlich FALSCHER
+    Betrag. Eine nicht unterstützte Präzision (mehr als 2 Nachkomma-
+    stellen, keine gültige 3er-Tausendergruppe) muss die GESAMTE Zahl
+    an dieser Stelle unerkannt lassen (kein Fund), niemals einen
+    verkürzten Suffix als gültigen Betrag liefern - geprüft für BEIDE
+    Alternativen (Betrag vor/nach Währung) und beide Dezimaltrennzeichen."""
+
+    pdf = build_text_pdf([text])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert "hauptmietzins_cent" not in ergebnis.treffer
+    assert "hauptmietzins_cent" not in ergebnis.mehrdeutige_treffer
+
+
 def test_mehrdeutiges_format_bleibt_als_mehrdeutigkeit_sichtbar_nach_der_korrektur():
     """Die Korrektur darf eine ECHTE (semantische) Mehrdeutigkeit -
     unterschiedliche Beträge für dasselbe Feld - nicht verdecken; sie

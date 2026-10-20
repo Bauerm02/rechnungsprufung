@@ -76,11 +76,30 @@ _MINDEST_TEXTLAENGE_FUER_TEXTLAGE = 20
 # korrekt erkannte Formate ("1.500,00", "1.500.000,00", "45.50") werden
 # dadurch NICHT umgedeutet - nur der Umfang der führenden Zifferngruppe
 # selbst ändert sich.
+#
+# **Zweite Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026,
+# zwei weitere reproduzierte Grenzfälle):** "EUR1234.5678" wurde zu
+# "1234.567" und "EUR1200,0005" zu "1200,000" - eine Zahl mit MEHR
+# Nachkommastellen als unterstützt (max. 2, oder exakt 3-stellige
+# Tausendergruppen) wurde bisher nicht abgelehnt, sondern nach den
+# zuerst passenden optionalen Gruppen einfach STEHEN GELASSEN, mit
+# einer unverarbeiteten Restziffer direkt danach - ein stillschweigend
+# TEILWEISE korrekter, aber inhaltlich FALSCHER Betrag (Auftrag Markus:
+# "niemals teilweise als gültiger Betrag gelten"). Der nachgestellte
+# negative Lookahead `(?![.,]?\d)` verlangt, dass UNMITTELBAR nach dem
+# letzten erfolgreich konsumierten Zeichen KEINE weitere Ziffer (auch
+# nicht durch einen weiteren Trenner eingeleitet) folgt - reicht die
+# tatsächliche Präzision über das unterstützte Format hinaus, schlägt
+# dadurch JEDE Backtracking-Variante fehl und die gesamte Zahl bleibt
+# AN DIESER STELLE unerkannt (kein Treffer), statt einen verkürzten
+# Suffix zu matchen. Siehe Regressionstests in
+# `test_vertragsanlage_pdf.py` (inkl. der spiegelbildlichen
+# Betrag-vor-Währung-Alternative).
 _BETRAG_FRAGMENT = (
     r"(?:in H(?:ö|oe)he von\s*)?(?:"
-    r"(?:€|EUR)\s*([0-9]+(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)"
+    r"(?:€|EUR)\s*([0-9]+(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)(?![.,]?\d)"
     r"|"
-    r"([0-9]+(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)\s*(?:€|EUR)"
+    r"([0-9]+(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)(?![.,]?\d)\s*(?:€|EUR)"
     r")"
 )
 

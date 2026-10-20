@@ -1,5 +1,52 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## Zwei Folgefixes nach unabhängiger Abnahme von 2edb938/c1c62b6 (Codex, 20.10.2026)
+
+### Mahn-Folgefix: Tageslauf-Slot nach bestätigtem Providerkontakt (behoben)
+
+Von Codex konkret reproduzierter Crashfall auf Commit `2edb938`: der
+Provider bestätigt das erste Schreiben (MahnLauf wird `GESENDET`),
+DANACH stürzt `markiere_versendet` selbst (simulierter DB-/
+Prozessfehler) ab, BEVOR der Tageslauf-Slot auf `VERSENDET`
+geschlossen wird. Die vorherige `freigeben_verwaiste`-Fassung setzte
+JEDE seit 15 Minuten in `IN_BEARBEITUNG` feststeckende Zeile blind auf
+`KEIN_VERSAND` zurück - auch diese, obwohl der Versand tatsächlich
+stattgefunden hatte. Eine neue, zwischenzeitlich fällige Forderung
+hätte dadurch ein zweites tatsächliches Schreiben für denselben
+Vertrag/Tag ausgelöst.
+
+Behoben über eine neue `MahnTageslaufRepository.verknuepfe_mahnlauf`,
+die den Slot bereits VOR jedem tatsächlichen Versandversuch (nicht erst
+danach) mit dem konkreten `MahnLauf` verknüpft. `freigeben_verwaiste`
+schlägt für jede verwaiste Zeile MIT verknüpftem Mahnlauf dessen
+TATSÄCHLICHEN Status nach: `GESENDET`/`UNSICHER` schließt den Slot
+dauerhaft (`VERSENDET`) - exakt das, was das abgestürzte `markiere_
+versendet` eigentlich hätte tun sollen. Nur eine Zeile ohne
+verknüpften Mahnlauf (nichts wurde überhaupt versucht) wird weiterhin
+auf `KEIN_VERSAND` zurückgesetzt, damit ein legitimer Retry (z. B. nach
+vorher fehlender Bankbestätigung) nicht blockiert wird.
+
+Zwei neue Regressionstests in `test_hv_mailversand_vier_stufen.py`:
+der reproduzierte Crashfall (Slot bleibt `VERSENDET`, kein zweiter
+Versand) und die Gegenprobe (eine Zeile ohne Versuch bleibt weiterhin
+retry-fähig). Produktionsversand bleibt bis zur (noch ausstehenden)
+Abnahme aus, keine echten Sendungen.
+
+### Parser-Folgefix: überschüssige Dezimalstellen (behoben)
+
+Von Codex auf Commit `c1c62b6` reproduziert: "EUR1234.5678" wurde zu
+"1234.567", "EUR1200,0005" zu "1200,000" - eine nicht unterstützte
+Präzision (mehr als 2 Nachkommastellen, keine gültige 3-stellige
+Tausendergruppe) wurde bisher NICHT abgelehnt, sondern als verkürzter,
+inhaltlich falscher Betrag übernommen. `_BETRAG_FRAGMENT` verlangt
+jetzt über einen negativen Lookahead `(?![.,]?\d)` unmittelbar nach dem
+erkannten Betrag, dass KEINE weitere Ziffer (auch nicht über einen
+weiteren Trenner) folgt - reicht die tatsächliche Präzision über das
+unterstützte Format hinaus, bleibt die GESAMTE Zahl an dieser Stelle
+unerkannt (kein Fund), statt einen Suffix zu liefern. Getestet für
+beide Alternativen (Betrag vor/nach Währungssymbol) und beide
+Dezimaltrennzeichen.
+
 ## OP-Korrekturen und Ablaufprüfung 20.09.2026 — HV-20260920-OP-ABLAEUFE
 
 Die beiden OP-Befunde des Fachreviews sind auf `codex/hv-op-ablaeufe-20260920`

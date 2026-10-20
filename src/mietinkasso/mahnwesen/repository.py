@@ -859,6 +859,24 @@ class MahnTageslaufRepository:
                 .where(MahnTageslaufTable.pruefdatum == pruefdatum)
             ).scalar_one()
 
+    def verknuepfe_mahnlauf(self, tageslauf_id: int, *, mahnlauf_id: int) -> None:
+        """Verknüpft den Slot MIT dem konkreten `MahnLauf`, BEVOR
+        überhaupt ein tatsächlicher Versandversuch (`_dispatch_mahnlauf`)
+        unternommen wird - siehe Codex-Abnahme 20.10.2026, reproduzierter
+        Fehler: stürzt der Prozess NACH einem bestätigten Providerkontakt,
+        aber VOR (oder während) `markiere_versendet` ab, kann
+        `freigeben_verwaiste` dank dieser frühen Verknüpfung den
+        tatsächlichen Mahnlauf-Status nachschlagen, statt den Slot blind
+        als sicher unversandt freizugeben (siehe dortige Docstring)."""
+
+        with self._session_factory() as session:
+            session.execute(
+                update(MahnTageslaufTable)
+                .where(MahnTageslaufTable.id == tageslauf_id)
+                .values(mahnlauf_id=mahnlauf_id, aktualisiert_am=datetime.now(timezone.utc))
+            )
+            session.commit()
+
     def markiere_versendet(self, tageslauf_id: int, *, mahnlauf_id: int | None) -> None:
         """Hält den Slot DAUERHAFT geschlossen (`VERSENDET`) - es gab in
         diesem Aufruf einen TATSÄCHLICHEN Versandversuch (GESENDET oder
@@ -893,17 +911,52 @@ class MahnTageslaufRepository:
         feststecken - z. B. weil der Prozess zwischen `claim` und dem
         Auflösen des Ergebnisses abgestürzt ist (dasselbe Recovery-
         Prinzip wie `MahnFallRepository.verwaiste_in_versand`/
-        `markiere_verwaiste_mahnlaeufe_als_unsicher`). Setzt auf
-        `KEIN_VERSAND` zurück (konservativ: ein späterer Aufruf prüft
-        dann erneut, OB tatsächlich etwas fehlt, statt den Vertrag
-        dauerhaft zu blockieren)."""
+        `markiere_verwaiste_mahnlaeufe_als_unsicher`).
 
+        **Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026,
+        reproduzierter Fehler):** die vorherige Fassung setzte JEDE
+        verwaiste Zeile blind auf `KEIN_VERSAND` zurück - auch dann, wenn
+        der Provider das Schreiben bereits bestätigt angenommen hatte und
+        NUR das anschließende `markiere_versendet` selbst abgestürzt war
+        (DB-/Prozessfehler NACH dem Providerkontakt, VOR Abschluss des
+        Slots). Ein Slot darf nach möglichem/bestätigtem Providerkontakt
+        NIEMALS als sicher unversandt freigegeben werden - sonst sendet
+        ein späterer Lauf für eine zwischenzeitlich neu fällige Forderung
+        ein ZWEITES tatsächliches Schreiben für denselben Vertrag/Tag.
+
+        Prüft deshalb für jede verwaiste Zeile MIT verknüpftem
+        `mahnlauf_id` (siehe `verknuepfe_mahnlauf` - verknüpft VOR jedem
+        tatsächlichen Versandversuch) den TATSÄCHLICHEN Status dieses
+        Mahnlaufs: `GESENDET`/`UNSICHER` (ein Providerkontakt hat
+        tatsächlich stattgefunden oder ist ungewiss, siehe `versende_
+        mahnlauf`) schließt den Slot DAUERHAFT (`VERSENDET`) - exakt das,
+        was das abgestürzte `markiere_versendet` eigentlich hätte tun
+        sollen. Nur eine Zeile OHNE verknüpften Mahnlauf, oder mit einem
+        Mahnlauf, der NIE über `GEPLANT`/`IN_VERSAND` hinauskam (kein
+        tatsächlicher Providerkontakt), wird auf `KEIN_VERSAND`
+        zurückgesetzt - ein späterer Aufruf prüft dann erneut, ob
+        tatsächlich etwas fehlt, statt den Vertrag dauerhaft zu
+        blockieren."""
+
+        geloest = 0
         with self._session_factory() as session:
-            result = session.execute(
-                update(MahnTageslaufTable)
+            verwaiste = list(session.execute(
+                select(MahnTageslaufTable)
                 .where(MahnTageslaufTable.status == "IN_BEARBEITUNG")
                 .where(MahnTageslaufTable.erstellt_am < aelter_als)
-                .values(status="KEIN_VERSAND", aktualisiert_am=datetime.now(timezone.utc))
-            )
+            ).scalars().all())
+            for zeile in verwaiste:
+                neuer_status = "KEIN_VERSAND"
+                if zeile.mahnlauf_id is not None:
+                    mahnlauf = session.get(MahnLaufTable, zeile.mahnlauf_id)
+                    if mahnlauf is not None and mahnlauf.status in ("GESENDET", "UNSICHER"):
+                        neuer_status = "VERSENDET"
+                result = session.execute(
+                    update(MahnTageslaufTable)
+                    .where(MahnTageslaufTable.id == zeile.id)
+                    .where(MahnTageslaufTable.status == "IN_BEARBEITUNG")
+                    .values(status=neuer_status, aktualisiert_am=datetime.now(timezone.utc))
+                )
+                geloest += result.rowcount
             session.commit()
-            return result.rowcount
+        return geloest
