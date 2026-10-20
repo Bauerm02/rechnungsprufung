@@ -5613,3 +5613,49 @@ des Ein-Operator-Piloten (`_ctx` liefert immer ADMIN/uneingeschränkt,
 `require_gesellschaft_access` daher defensiv statt real durchsetzend)
 gilt unverändert auch für diese Erweiterung - keine neue Grenze, keine
 Verschärfung nötig, da rein lesend.
+
+### Unabhängige Prüfung Commit 8ae0406 (vier konkrete Korrekturen an der Ledgeranzeige)
+
+1. **Fehlende Rechenbasis je Zinssegment**: `rest_cent` (der tatsächlich
+   verzinste Außenstand - kann sich zwischen Teilzahlungen ändern)
+   fehlte in HTML/PDF. Jetzt zeigt jedes Segment zusätzlich "auf Basis
+   X €/EUR", damit nachvollziehbar ist, WELCHER Außenstand mit
+   `satz_prozent` verzinst wurde.
+2. **Inkonsistentes Escaping in `_kontoblatt_ledger_html`**: `von`/`bis`/
+   `satz_prozent` wurden roh aus dem JSON interpoliert, nur `quelle` war
+   mit `h()` escaped. Jetzt wird der GESAMTE zusammengesetzte Segment-/
+   Zuordnungstext EINMAL am Ende escaped (kein Doppel-Escaping, da keine
+   der Rohwerte mehr einzeln vorher escaped wird) - per Regressionstest
+   gegen einen `<script>`-Payload in `quelle` abgesichert.
+3. **`_parse_zins_zuordnung` prüfte nur JSON-Syntax, nicht die Struktur**
+   (echter Bug): gültiges JSON mit falscher Form (`{"oops":1}` statt
+   Array, `[null]`, ein Segment ohne `op_position_id`, ein
+   nicht-numerischer Delta-Schlüssel) führte zu einer rohen Exception
+   (HTTP 500). Jetzt validiert die Funktion jede Struktur-Erwartung
+   einzeln, überspringt fehlerhafte Elemente (nie als 0/bezahlt/gebucht
+   fehlinterpretiert) und liefert zusätzlich `MahnkostenLedgerEintrag.
+   zins_nachweis_unvollstaendig` - HTML/PDF zeigen dann ausdrücklich
+   "Zinsnachweis unvollständig/beschädigt - Originaldaten prüfen."
+   statt abzustürzen oder den Defekt zu verschweigen.
+4. **Irreführender Text bei fehlendem Delta**: "nicht gebucht" behauptete
+   fälschlich, dass FÜR DIESE FORDERUNG gar keine Zinsen gebucht wurden -
+   tatsächlich kann die Zinsbuchung insgesamt sehr wohl erfolgt sein, nur
+   ohne nachvollziehbare Zuordnung zu GENAU dieser Forderung. Umbenannt
+   in "Zuordnung/Betrag nicht belegt" (HTML und PDF).
+
+Zusätzlich (optionaler Hinweis aus derselben Prüfung): das PDF-
+Einzugszeichen "↳" (U+21B3) fehlt im Zeichensatz der Fallback-Schrift
+(LiberationSerif, geprüft per `fontTools`) und wurde durch einen
+einfachen, in jeder Schrift vorhandenen Einzug ("- ") ersetzt.
+
+Neue gezielte Tests (keine erneute Gesamtsuite): 4 neue in
+`test_kontoblatt.py` (zwei Strukturfehler-Fälle crashen nicht und setzen
+`zins_nachweis_unvollstaendig`, ein Segment ohne `op_position_id` wird
+übersprungen statt zu crashen, ein nicht-numerischer Delta-Schlüssel
+crasht nicht), 2 angepasste PDF-Tests (Basis-Betrag ergänzt, Umbenennung
+"nicht gebucht" → "Zuordnung/Betrag nicht belegt"), 4 neue HTTP-Tests in
+`test_backoffice.py` gegen ECHT persistierte `MahnkostenBuchungTable`-
+Zeilen (XSS-Escaping-Regression, Strukturfehler ohne Absturz,
+"Zuordnung/Betrag nicht belegt" statt "nicht gebucht", Basis-Betrag in
+der echten Seite). 210 Tests in den betroffenen Dateien grün.
+Ausschließlich synthetische Testdaten, keine Geschäftsaktion.

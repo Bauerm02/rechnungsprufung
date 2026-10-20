@@ -102,6 +102,26 @@ def _kontoblatt_status_html(zeile) -> str:
     return f'<span class="{css}">{h(STATUS_LABEL.get(zeile.status, zeile.status))}</span>'
 
 
+def _segment_text_roh(s: dict) -> str:
+    """EIN Zinssegment als ROHER (noch NICHT escapter) Text - der
+    Aufrufer escapt den gesamten zusammengesetzten Satz EINMAL (siehe
+    `_kontoblatt_ledger_html`), deshalb hier bewusst KEIN `h()`.
+    Unabhängige Prüfung Commit 8ae0406, (1): `rest_cent` (die tatsächlich
+    verzinste Außenstandsbasis - kann sich zwischen Teilzahlungen
+    ändern) fehlte bisher komplett; ohne sie ist nicht nachvollziehbar,
+    WELCHER Außenstand mit `satz_prozent` verzinst wurde."""
+
+    von, bis = s.get("von", "?"), s.get("bis", "?")
+    satz = s.get("satz_prozent")
+    satz_text = f"{satz} %" if satz else "Basis ungeklärt"
+    quelle = s.get("quelle") or "?"
+    rest_cent = s.get("rest_cent")
+    basis_text = eur(rest_cent) if isinstance(rest_cent, int) else "unbekannt"
+    zinsen_cent = s.get("zinsen_cent")
+    zinsen_text = eur(zinsen_cent) if isinstance(zinsen_cent, int) else "unbekannt"
+    return f"{von}–{bis}: {satz_text} ({quelle}) auf Basis {basis_text} → {zinsen_text} kumulativ"
+
+
 def _kontoblatt_ledger_html(zeile) -> str:
     """Zusatz Zinszuordnung (Folgeschritt zu Commit 239e33c): zeigt die
     bereits bestehenden `MahnkostenBuchungTable`-Ledgerdetails EINER
@@ -127,19 +147,35 @@ def _kontoblatt_ledger_html(zeile) -> str:
     html = f'<div class="muted">{" · ".join(teile)}</div>'
 
     if zeile.kategorie == KATEGORIE_VERZUGSZINSEN:
+        if ledger.zins_nachweis_unvollstaendig:
+            html += '<div class="warn">Zinsnachweis unvollständig/beschädigt - Originaldaten prüfen.</div>'
         zeilen_html = []
         for zuordnung in ledger.zins_zuordnung:
-            segmente_text = "; ".join(
-                f"{s.get('von', '?')}–{s.get('bis', '?')}: "
-                f"{s.get('satz_prozent') + ' %' if s.get('satz_prozent') else 'Basis ungeklärt'} "
-                f"({h(str(s.get('quelle') or '?'))}) → {eur(s.get('zinsen_cent') or 0)} kumulativ"
-                for s in zuordnung.segmente
-            ) or "keine Segmente erfasst"
-            delta_text = eur(zuordnung.delta_cent) if zuordnung.delta_cent is not None else "nicht gebucht"
-            zeilen_html.append(
-                f"<li>Forderung #{zuordnung.op_position_id} — kumulatives Zinsbild: {segmente_text} "
-                f"&nbsp;·&nbsp; tatsächlich an diesem Tag neu gebucht: <strong>{delta_text}</strong></li>"
+            # Unabhängige Prüfung Commit 8ae0406, (1)+(2): `rest_cent`
+            # (die tatsächlich verzinste Außenstandsbasis je Segment -
+            # kann sich zwischen Teilzahlungen ändern) fehlte bisher
+            # ganz; der gesamte Segmenttext wird jetzt EINMAL am Ende mit
+            # `h()` escaped, statt einzelne rohe JSON-Werte (von/bis/
+            # satz_prozent) ungeschützt direkt zu interpolieren, während
+            # nur `quelle` escaped war - kein Doppel-Escaping, da die
+            # rohen Werte selbst hier an KEINER Stelle einzeln durch
+            # `h()` laufen.
+            segmente_text_roh = "; ".join(_segment_text_roh(s) for s in zuordnung.segmente) or "keine Segmente erfasst"
+            delta_text_roh = (
+                eur(zuordnung.delta_cent) if zuordnung.delta_cent is not None
+                # Unabhängige Prüfung Commit 8ae0406, (4): "nicht gebucht"
+                # behauptete fälschlich, dass FÜR DIESE FORDERUNG gar
+                # keine Zinsen gebucht wurden - tatsächlich kann die
+                # Zinsbuchung insgesamt sehr wohl erfolgt sein, nur OHNE
+                # nachvollziehbare Zuordnung/Delta zu GENAU dieser
+                # Forderung (z. B. beschädigtes/unvollständiges JSON).
+                else "Zuordnung/Betrag nicht belegt"
             )
+            zeile_text = (
+                f"Forderung #{zuordnung.op_position_id} — kumulatives Zinsbild: {segmente_text_roh} "
+                f"· tatsächlich an diesem Tag neu gebucht: {delta_text_roh}"
+            )
+            zeilen_html.append(f"<li>{h(zeile_text)}</li>")
         if zeilen_html:
             html += f'<ul class="muted">{"".join(zeilen_html)}</ul>'
     return html

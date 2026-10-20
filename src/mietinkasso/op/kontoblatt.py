@@ -213,12 +213,20 @@ class MahnkostenLedgerEintrag:
     EINER Kostenzeile (Verzugszinsen/Mahnspesen/Mahnpauschale) - rein
     lesend durchgereicht, keine neue Buchung/Berechnung. `zins_zuordnung`
     ist nur für die VERZUGSZINSEN-Zeile befüllt (leer bei Mahnspesen/
-    -pauschale, die kein Zinssegment-Bild haben)."""
+    -pauschale, die kein Zinssegment-Bild haben). `zins_nachweis_
+    unvollstaendig` ist `True`, wenn `zins_segmente_json`/`zinsen_delta_
+    je_op_json` zwar gültiges JSON, aber NICHT die erwartete Struktur
+    enthalten (z. B. kein Array, ein Segment ohne `op_position_id`, ein
+    nicht-numerischer Delta-Schlüssel) - Anzeige-Pflicht: als
+    "unvollständiger Nachweis" kennzeichnen, NIE stillschweigend
+    ignorieren, abstürzen oder als 0/bezahlt ausgeben (Codex-Abnahme,
+    unabhängige Prüfung Commit 8ae0406)."""
 
     buchung: MahnkostenBuchungTable
     versandnachweis_referenz: str
     forderung_op_position_ids: list[int]
     zins_zuordnung: list[ZinsZuordnungZeile] = field(default_factory=list)
+    zins_nachweis_unvollstaendig: bool = False
 
 
 @dataclass(frozen=True)
@@ -362,35 +370,73 @@ def _buchungs_id_zu_buchung(buchungen: list[MahnkostenBuchungTable]) -> dict[int
     return mapping
 
 
-def _parse_zins_zuordnung(buchung: MahnkostenBuchungTable) -> list[ZinsZuordnungZeile]:
+def _parse_zins_zuordnung(buchung: MahnkostenBuchungTable) -> tuple[list[ZinsZuordnungZeile], bool]:
     """Zusatz Zinszuordnung (Folgeschritt zu Commit 239e33c): parst
     `zins_segmente_json` (vollständiges, kumulatives Segment-Bild) und
     `zinsen_delta_je_op_json` (das an DIESEM Tag tatsächlich NEU gebuchte
     Delta) GETRENNT je `op_position_id` - niemals das eine aus dem
-    anderen ableiten (siehe `MahnkostenBuchungTable`-Moduldoc). Ein
-    beschädigter/leerer JSON-Wert ergibt leere Listen statt eines Fehlers
-    (rein lesende Anzeige-Funktion)."""
+    anderen ableiten (siehe `MahnkostenBuchungTable`-Moduldoc).
+
+    Unabhängige Prüfung Commit 8ae0406, echter Bug: bisher wurde nur die
+    JSON-SYNTAX geprüft - gültiges JSON mit der FALSCHEN Struktur (kein
+    Array, `[null]`, ein Segment ohne `op_position_id`, ein nicht-
+    numerischer Delta-Schlüssel) führte zu einer rohen Exception (500)
+    statt einer ehrlichen Anzeige. Jetzt wird jede Struktur-Erwartung
+    EINZELN geprüft, ein fehlerhaftes Element wird übersprungen (NIE als
+    0/bezahlt/gebucht fehlinterpretiert) und der zweite Rückgabewert
+    (`unvollstaendig`) zeigt an, dass mindestens ein Element nicht der
+    erwarteten Struktur entsprach - die Anzeige muss das als
+    "unvollständiger Nachweis" kennzeichnen, nicht stillschweigend
+    ignorieren."""
+
+    unvollstaendig = False
 
     try:
-        segmente_roh = json.loads(buchung.zins_segmente_json) or []
+        segmente_roh = json.loads(buchung.zins_segmente_json)
     except (TypeError, ValueError):
+        segmente_roh = None
+    if segmente_roh is None:
         segmente_roh = []
+    elif not isinstance(segmente_roh, list):
+        unvollstaendig = True
+        segmente_roh = []
+
     try:
-        delta_roh = json.loads(buchung.zinsen_delta_je_op_json) or {}
+        delta_roh = json.loads(buchung.zinsen_delta_je_op_json)
     except (TypeError, ValueError):
+        delta_roh = None
+    if delta_roh is None:
+        delta_roh = {}
+    elif not isinstance(delta_roh, dict):
+        unvollstaendig = True
         delta_roh = {}
 
     segmente_je_op: dict[int, list[dict]] = {}
     for segment in segmente_roh:
-        segmente_je_op.setdefault(segment["op_position_id"], []).append(segment)
+        op_id = segment.get("op_position_id") if isinstance(segment, dict) else None
+        if not isinstance(op_id, int):
+            unvollstaendig = True
+            continue
+        segmente_je_op.setdefault(op_id, []).append(segment)
 
-    op_ids = sorted(set(segmente_je_op) | {int(k) for k in delta_roh})
-    return [
-        ZinsZuordnungZeile(
-            op_position_id=op_id, segmente=segmente_je_op.get(op_id, []), delta_cent=delta_roh.get(str(op_id)),
-        )
+    delta_je_op: dict[int, int] = {}
+    for roh_schluessel, roh_wert in delta_roh.items():
+        try:
+            op_id = int(roh_schluessel)
+        except (TypeError, ValueError):
+            unvollstaendig = True
+            continue
+        if not isinstance(roh_wert, int):
+            unvollstaendig = True
+            continue
+        delta_je_op[op_id] = roh_wert
+
+    op_ids = sorted(set(segmente_je_op) | set(delta_je_op))
+    zeilen = [
+        ZinsZuordnungZeile(op_position_id=op_id, segmente=segmente_je_op.get(op_id, []), delta_cent=delta_je_op.get(op_id))
         for op_id in op_ids
     ]
+    return zeilen, unvollstaendig
 
 
 def _ledger_fuer(kategorie: str, buchung: MahnkostenBuchungTable | None) -> MahnkostenLedgerEintrag | None:
@@ -400,13 +446,18 @@ def _ledger_fuer(kategorie: str, buchung: MahnkostenBuchungTable | None) -> Mahn
     if buchung is None:
         return None
     try:
-        forderung_ids = sorted(json.loads(buchung.forderung_op_position_ids) or [])
+        forderung_ids_roh = json.loads(buchung.forderung_op_position_ids)
+        forderung_ids = sorted(i for i in forderung_ids_roh if isinstance(i, int)) if isinstance(forderung_ids_roh, list) else []
     except (TypeError, ValueError):
         forderung_ids = []
-    zins_zuordnung = _parse_zins_zuordnung(buchung) if kategorie == KATEGORIE_VERZUGSZINSEN else []
+    zins_zuordnung: list[ZinsZuordnungZeile] = []
+    zins_nachweis_unvollstaendig = False
+    if kategorie == KATEGORIE_VERZUGSZINSEN:
+        zins_zuordnung, zins_nachweis_unvollstaendig = _parse_zins_zuordnung(buchung)
     return MahnkostenLedgerEintrag(
         buchung=buchung, versandnachweis_referenz=buchung.versandnachweis_referenz,
         forderung_op_position_ids=forderung_ids, zins_zuordnung=zins_zuordnung,
+        zins_nachweis_unvollstaendig=zins_nachweis_unvollstaendig,
     )
 
 

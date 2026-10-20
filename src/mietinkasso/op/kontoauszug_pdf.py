@@ -57,7 +57,28 @@ def _ledger_text(zeile) -> str:
     if ledger is None:
         return " · Mahnbeleg/Ledger: fehlend"
     forderungen_text = ", ".join(f"#{i}" for i in ledger.forderung_op_position_ids) or "—"
-    return f" · Mahnbeleg: {ledger.versandnachweis_referenz} · zugrunde liegende Forderungen: {forderungen_text}"
+    text = f" · Mahnbeleg: {ledger.versandnachweis_referenz} · zugrunde liegende Forderungen: {forderungen_text}"
+    if ledger.zins_nachweis_unvollstaendig:
+        text += " · Zinsnachweis unvollständig/beschädigt - Originaldaten prüfen."
+    return text
+
+
+def _segment_text(s: dict) -> str:
+    """EIN Zinssegment als Textzeile für das PDF - `rest_cent` (die
+    tatsächlich verzinste Außenstandsbasis, kann sich zwischen
+    Teilzahlungen ändern) fehlte bisher komplett (unabhängige Prüfung
+    Commit 8ae0406, (1)); ohne sie ist nicht nachvollziehbar, WELCHER
+    Außenstand mit `satz_prozent` verzinst wurde."""
+
+    von, bis = s.get("von", "?"), s.get("bis", "?")
+    satz = s.get("satz_prozent")
+    satz_text = f"{satz} %" if satz else "Basis ungeklärt"
+    quelle = s.get("quelle") or "?"
+    rest_cent = s.get("rest_cent")
+    basis_text = _eur(rest_cent) if isinstance(rest_cent, int) else "unbekannt"
+    zinsen_cent = s.get("zinsen_cent")
+    zinsen_text = _eur(zinsen_cent) if isinstance(zinsen_cent, int) else "unbekannt"
+    return f"{von}–{bis}: {satz_text} ({quelle}) auf Basis {basis_text} -> {zinsen_text} kumulativ"
 
 
 def _zins_zuordnung_zeilen_text(zeile) -> list[str]:
@@ -71,13 +92,16 @@ def _zins_zuordnung_zeilen_text(zeile) -> list[str]:
         return []
     texte = []
     for zuordnung in zeile.ledger.zins_zuordnung:
-        segmente_text = "; ".join(
-            f"{s.get('von', '?')}–{s.get('bis', '?')}: "
-            f"{s.get('satz_prozent') + ' %' if s.get('satz_prozent') else 'Basis ungeklärt'} "
-            f"({s.get('quelle') or '?'}) -> {_eur(s.get('zinsen_cent') or 0)} kumulativ"
-            for s in zuordnung.segmente
-        ) or "keine Segmente erfasst"
-        delta_text = _eur(zuordnung.delta_cent) if zuordnung.delta_cent is not None else "nicht gebucht"
+        segmente_text = "; ".join(_segment_text(s) for s in zuordnung.segmente) or "keine Segmente erfasst"
+        delta_text = (
+            _eur(zuordnung.delta_cent) if zuordnung.delta_cent is not None
+            # Unabhängige Prüfung Commit 8ae0406, (4): "nicht gebucht"
+            # behauptete fälschlich, dass für DIESE Forderung gar keine
+            # Zinsen gebucht wurden - die Zinsbuchung insgesamt kann sehr
+            # wohl erfolgt sein, nur OHNE nachvollziehbare Zuordnung zu
+            # GENAU dieser Forderung.
+            else "Zuordnung/Betrag nicht belegt"
+        )
         texte.append(
             f"Forderung #{zuordnung.op_position_id} - kumulatives Zinsbild: {segmente_text} "
             f"/ tatsächlich an diesem Tag neu gebucht: {delta_text}"
@@ -247,7 +271,12 @@ def erzeuge_kontoauszug_pdf(
             _zeile(pdf, datum_text=p.belegdatum.strftime("%d.%m.%Y"), bezeichnung=bezeichnung, betrag_cent=p.betrag_cent, rest_text=rest_text)
             pdf.set_font("Konto", "", 8.5)
             for zuordnung_text in _zins_zuordnung_zeilen_text(z):
-                pdf.multi_cell(0, 4.5, "  ↳ " + zuordnung_text, new_x="LMARGIN", new_y="NEXT")
+                # Unabhängige Prüfung Commit 8ae0406, optionaler Hinweis:
+                # "↳" (U+21B3) fehlt im Zeichensatz der Fallback-Schrift
+                # (LiberationSerif) - ein einfacher, in jeder Schrift
+                # vorhandener Einzug ("- ") statt eines möglichen
+                # Platzhalter-/Fehlzeichens.
+                pdf.multi_cell(0, 4.5, "    - " + zuordnung_text, new_x="LMARGIN", new_y="NEXT")
         _zeile(pdf, datum_text="", bezeichnung="Kosten gebucht (Sollsumme vor Zahlungen, bereits im Saldo enthalten)", betrag_cent=kontoblatt.kosten_cent, fett=True)
         _zeile(pdf, datum_text="", bezeichnung="davon tatsächlich noch offen", betrag_cent=kontoblatt.kosten_offener_rest_cent, fett=True)
     else:

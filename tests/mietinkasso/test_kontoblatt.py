@@ -459,6 +459,68 @@ def test_zinszeile_ohne_gebuchtes_delta_zeigt_ehrlich_nicht_gebucht_statt_erfund
     zuordnung = blatt.kosten_zeilen[0].ledger.zins_zuordnung[0]
     assert zuordnung.op_position_id == 200
     assert zuordnung.delta_cent is None  # ehrlich "nicht gebucht", nie 0 erfunden
+    assert blatt.kosten_zeilen[0].ledger.zins_nachweis_unvollstaendig is False  # gültige Struktur, nur leeres Delta
+
+
+def test_zins_segmente_json_mit_falscher_struktur_crasht_nicht_und_markiert_unvollstaendig():
+    """Unabhängige Prüfung Commit 8ae0406, (3), echter Bug: bisher wurde
+    nur die JSON-SYNTAX geprüft - gültiges JSON mit der FALSCHEN Struktur
+    (hier: ein Objekt statt eines Arrays) führte beim Iterieren zu einer
+    rohen Exception (500). Jetzt: kein Crash, `zins_nachweis_
+    unvollstaendig` zeigt den Defekt ehrlich an, statt ihn zu verschweigen
+    oder als "keine Zinsen" zu interpretieren."""
+
+    zinsen_op = _op(5, "SOLL", 83, quelle_system="mahnkosten")
+    buchung = _buchung(zinsen_op_position_id=5, zins_segmente_json=json.dumps({"oops": 1}))
+    blatt = _leer(positionen_aktiv=[zinsen_op], positionen_alle=[zinsen_op], mahnkosten_buchungen=[buchung])
+
+    ledger = blatt.kosten_zeilen[0].ledger
+    assert ledger.zins_zuordnung == []
+    assert ledger.zins_nachweis_unvollstaendig is True
+
+
+def test_zins_segmente_json_mit_null_eintrag_crasht_nicht_und_markiert_unvollstaendig():
+    """`[null]` ist gültiges JSON, aber kein Segment-Objekt - darf NICHT
+    mit `segment["op_position_id"]` crashen (ursprünglicher Bug: 500)."""
+
+    zinsen_op = _op(5, "SOLL", 83, quelle_system="mahnkosten")
+    buchung = _buchung(zinsen_op_position_id=5, zins_segmente_json=json.dumps([None]))
+    blatt = _leer(positionen_aktiv=[zinsen_op], positionen_alle=[zinsen_op], mahnkosten_buchungen=[buchung])
+
+    ledger = blatt.kosten_zeilen[0].ledger
+    assert ledger.zins_zuordnung == []
+    assert ledger.zins_nachweis_unvollstaendig is True
+
+
+def test_zins_segment_ohne_op_position_id_wird_uebersprungen_und_markiert_unvollstaendig():
+    zinsen_op = _op(5, "SOLL", 83, quelle_system="mahnkosten")
+    segmente = [
+        {"von": "2026-07-01", "bis": "2026-09-15", "rest_cent": 30_000, "satz_prozent": "4.000", "quelle": "X", "zinsen_cent": 100},
+        {"op_position_id": 100, "von": "2026-09-16", "bis": "2026-09-30", "rest_cent": 30_000, "satz_prozent": "4.000", "quelle": "X", "zinsen_cent": 50},
+    ]
+    buchung = _buchung(
+        zinsen_op_position_id=5, zins_segmente_json=json.dumps(segmente), zinsen_delta_je_op_json=json.dumps({"100": 50}),
+    )
+    blatt = _leer(positionen_aktiv=[zinsen_op], positionen_alle=[zinsen_op], mahnkosten_buchungen=[buchung])
+
+    ledger = blatt.kosten_zeilen[0].ledger
+    assert ledger.zins_nachweis_unvollstaendig is True  # das Segment ohne op_position_id wurde übersprungen
+    assert len(ledger.zins_zuordnung) == 1  # das gültige Segment (op_position_id=100) bleibt erhalten
+    assert ledger.zins_zuordnung[0].op_position_id == 100
+    assert ledger.zins_zuordnung[0].delta_cent == 50
+
+
+def test_zinsen_delta_je_op_json_mit_nichtnumerischem_schluessel_crasht_nicht():
+    """Ein nicht-numerischer Delta-Schlüssel (`int(...)` würde werfen)
+    darf NICHT crashen - wird übersprungen, als unvollständig markiert."""
+
+    zinsen_op = _op(5, "SOLL", 83, quelle_system="mahnkosten")
+    buchung = _buchung(zinsen_op_position_id=5, zinsen_delta_je_op_json=json.dumps({"abc": 50}))
+    blatt = _leer(positionen_aktiv=[zinsen_op], positionen_alle=[zinsen_op], mahnkosten_buchungen=[buchung])
+
+    ledger = blatt.kosten_zeilen[0].ledger
+    assert ledger.zins_zuordnung == []
+    assert ledger.zins_nachweis_unvollstaendig is True
 
 
 def test_kostenzeile_ohne_auffindbare_buchung_hat_kein_ledger():

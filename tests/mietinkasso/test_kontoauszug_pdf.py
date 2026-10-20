@@ -329,7 +329,7 @@ def test_pdf_zinszeile_trennt_kumulatives_segment_von_tatsaechlichem_delta():
     buchung = _buchung(zinsen_op_position_id=5, versandnachweis_referenz="mahnung:V-601-1:stufe2:2026-09-20")
     zuordnung = ZinsZuordnungZeile(
         op_position_id=100,
-        segmente=[{"von": "2026-07-01", "bis": "2026-09-15", "satz_prozent": "4.000", "quelle": "VEREINBART_GEPRUEFT", "zinsen_cent": 417}],
+        segmente=[{"von": "2026-07-01", "bis": "2026-09-15", "satz_prozent": "4.000", "quelle": "VEREINBART_GEPRUEFT", "rest_cent": 50_000, "zinsen_cent": 417}],
         delta_cent=83,
     )
     ledger = MahnkostenLedgerEintrag(buchung=buchung, versandnachweis_referenz=buchung.versandnachweis_referenz, forderung_op_position_ids=[100], zins_zuordnung=[zuordnung])
@@ -339,19 +339,23 @@ def test_pdf_zinszeile_trennt_kumulatives_segment_von_tatsaechlichem_delta():
     pdf_bytes = _erzeugen(kontoblatt)
     text = " ".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages).replace("\n", " ")
     assert "Forderung #100" in text
+    assert "auf Basis 500,00 EUR" in text  # (1): welcher Außenstand verzinst wurde
     assert "4,17 EUR kumulativ" in text  # das vollständige kumulative Segment-Bild
     assert "tatsächlich an diesem Tag neu gebucht: 0,83 EUR" in text  # NICHT 4,17 EUR
 
 
-def test_pdf_zinszeile_ohne_gebuchtes_delta_zeigt_ehrlich_nicht_gebucht():
+def test_pdf_zinszeile_ohne_gebuchtes_delta_zeigt_ehrlich_zuordnung_nicht_belegt():
     """Eine zugrunde liegende Forderung ohne an diesem Tag gebuchtes
-    Delta darf NIE als 0,00 EUR erscheinen - nur ehrlich "nicht
-    gebucht"."""
+    Delta darf NIE als 0,00 EUR erscheinen - UND NIE pauschal "nicht
+    gebucht" heißen (unabhängige Prüfung Commit 8ae0406, (4)): die
+    Zinsbuchung INSGESAMT kann sehr wohl erfolgt sein, nur ohne
+    nachvollziehbare Zuordnung zu GENAU dieser Forderung - deshalb
+    "Zuordnung/Betrag nicht belegt"."""
 
     buchung = _buchung(zinsen_op_position_id=5)
     zuordnung = ZinsZuordnungZeile(
         op_position_id=200,
-        segmente=[{"von": "2026-07-01", "bis": "2026-09-15", "satz_prozent": "4.000", "quelle": "VEREINBART_GEPRUEFT", "zinsen_cent": 200}],
+        segmente=[{"von": "2026-07-01", "bis": "2026-09-15", "satz_prozent": "4.000", "quelle": "VEREINBART_GEPRUEFT", "rest_cent": 30_000, "zinsen_cent": 200}],
         delta_cent=None,
     )
     ledger = MahnkostenLedgerEintrag(buchung=buchung, versandnachweis_referenz=buchung.versandnachweis_referenz, forderung_op_position_ids=[200], zins_zuordnung=[zuordnung])
@@ -361,7 +365,8 @@ def test_pdf_zinszeile_ohne_gebuchtes_delta_zeigt_ehrlich_nicht_gebucht():
     pdf_bytes = _erzeugen(kontoblatt)
     text = " ".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages).replace("\n", " ")
     assert "Forderung #200" in text
-    assert "tatsächlich an diesem Tag neu gebucht: nicht gebucht" in text
+    assert "tatsächlich an diesem Tag neu gebucht: Zuordnung/Betrag nicht belegt" in text
+    assert "auf Basis 300,00 EUR" in text  # die tatsächlich verzinste Außenstandsbasis des Segments
 
 
 def test_pdf_kopf_bricht_lange_firmen_objekt_einheit_bezeichnung_um_ohne_ueberlappung():

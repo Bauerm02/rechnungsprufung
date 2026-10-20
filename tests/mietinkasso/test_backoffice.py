@@ -5145,6 +5145,143 @@ def test_kontoauszug_zeigt_versandnachweis_und_zinszuordnung_bei_echter_mahnkost
     assert "tatsächlich an diesem Tag neu gebucht" in seite.text
 
 
+def test_kontoauszug_html_escaped_rohe_zinssegment_werte_konsistent(backoffice_client):
+    """Unabhängige Prüfung Commit 8ae0406, (2): `von`/`bis`/`satz_prozent`/
+    `quelle` kommen ROH aus `zins_segmente_json` - ein darin enthaltener
+    HTML-Sonderzeichen-Wert darf NICHT ungeschützt in die Seite gelangen
+    (XSS-Hygiene), aber auch NICHT doppelt escaped werden."""
+
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    client, *_ = backoffice_client
+    _login(client)
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("ZINS-ESCAPE")
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+
+    hauptforderung = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1), faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ",
+    )
+    zinsen_op = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=489,
+        belegdatum=date(2026, 3, 1), buchungsdatum=date(2026, 3, 1), faelligkeit=None,
+        beleg_referenz="Verzugszinsen", quelle_system="mahnkosten",
+    )
+    mahnkosten_repo = MahnkostenRepository(session_factory)
+    mahnkosten_repo.buchung_anlegen(
+        vertrag_id=vertrag.id, stufe=1, mahnlauf_schluessel="HASH-ZINS-ESCAPE",
+        forderung_op_position_ids=[hauptforderung.id], hauptforderung_cent=50_000,
+        zinsbasis="VEREINBART_GEPRUEFT", zinssatz_prozent=4, zins_von=date(2026, 1, 1), zins_bis=date(2026, 3, 1),
+        zinsen_cent=489, gebuehr_cent=None, rechtsgrundlage_gebuehr=None,
+        versandnachweis_referenz="mahnung:zins-escape", zinsen_op_position_id=zinsen_op.id, gebuehr_op_position_id=None,
+        erstellt_von="codex-test",
+        zins_segmente_json=json.dumps([
+            {"op_position_id": hauptforderung.id, "von": "2026-01-01", "bis": "2026-03-01", "rest_cent": 50_000,
+             "satz_prozent": "4.000", "quelle": "<script>alert(1)</script> & Co", "zinsen_cent": 489},
+        ]),
+        zinsen_delta_je_op_json=json.dumps({str(hauptforderung.id): 489}),
+    )
+
+    seite = client.get(f"/backoffice/konto/{konto.id}")
+    assert seite.status_code == 200
+    assert "<script>alert(1)</script>" not in seite.text  # kein ungeschütztes HTML
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in seite.text  # genau einmal escaped
+    assert "&amp;lt;" not in seite.text  # kein Doppel-Escaping
+    assert "auf Basis 500,00 €" in seite.text  # (1): die verzinste Außenstandsbasis
+
+
+def test_kontoauszug_html_zeigt_unvollstaendigen_zinsnachweis_statt_absturz(backoffice_client):
+    """Unabhängige Prüfung Commit 8ae0406, (3), echter Bug: gültiges JSON
+    mit der FALSCHEN Struktur führte bisher zu einer rohen Exception
+    (500) statt einer ehrlichen Anzeige - jetzt bleibt die Route
+    funktionsfähig und kennzeichnet den Defekt."""
+
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    client, *_ = backoffice_client
+    _login(client)
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("ZINS-DEFEKT")
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+
+    zinsen_op = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=489,
+        belegdatum=date(2026, 3, 1), buchungsdatum=date(2026, 3, 1), faelligkeit=None,
+        beleg_referenz="Verzugszinsen", quelle_system="mahnkosten",
+    )
+    mahnkosten_repo = MahnkostenRepository(session_factory)
+    mahnkosten_repo.buchung_anlegen(
+        vertrag_id=vertrag.id, stufe=1, mahnlauf_schluessel="HASH-ZINS-DEFEKT",
+        forderung_op_position_ids=[], hauptforderung_cent=0,
+        zinsbasis="VEREINBART_GEPRUEFT", zinssatz_prozent=4, zins_von=date(2026, 1, 1), zins_bis=date(2026, 3, 1),
+        zinsen_cent=489, gebuehr_cent=None, rechtsgrundlage_gebuehr=None,
+        versandnachweis_referenz="mahnung:zins-defekt", zinsen_op_position_id=zinsen_op.id, gebuehr_op_position_id=None,
+        erstellt_von="codex-test",
+        zins_segmente_json=json.dumps({"oops": 1}), zinsen_delta_je_op_json=json.dumps({"abc": 50}),
+    )
+
+    seite = client.get(f"/backoffice/konto/{konto.id}")
+    assert seite.status_code == 200
+    assert "Zinsnachweis unvollständig" in seite.text
+
+
+def test_kontoauszug_html_zeigt_zuordnung_nicht_belegt_statt_nicht_gebucht(backoffice_client):
+    """Unabhängige Prüfung Commit 8ae0406, (4): eine zugrunde liegende
+    Forderung ohne an diesem Tag gebuchtes Delta darf NICHT "nicht
+    gebucht" heißen (die Zinsen INSGESAMT sind sehr wohl gebucht -
+    `zinsen_cent=489` - nur die Zuordnung zu GENAU dieser Forderung
+    fehlt), sondern "Zuordnung/Betrag nicht belegt"."""
+
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    client, *_ = backoffice_client
+    _login(client)
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("ZINS-NICHT-BELEGT")
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+
+    zinsen_op = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=489,
+        belegdatum=date(2026, 3, 1), buchungsdatum=date(2026, 3, 1), faelligkeit=None,
+        beleg_referenz="Verzugszinsen", quelle_system="mahnkosten",
+    )
+    mahnkosten_repo = MahnkostenRepository(session_factory)
+    mahnkosten_repo.buchung_anlegen(
+        vertrag_id=vertrag.id, stufe=1, mahnlauf_schluessel="HASH-ZINS-NICHT-BELEGT",
+        forderung_op_position_ids=[200], hauptforderung_cent=50_000,
+        zinsbasis="VEREINBART_GEPRUEFT", zinssatz_prozent=4, zins_von=date(2026, 1, 1), zins_bis=date(2026, 3, 1),
+        zinsen_cent=489, gebuehr_cent=None, rechtsgrundlage_gebuehr=None,
+        versandnachweis_referenz="mahnung:zins-nicht-belegt", zinsen_op_position_id=zinsen_op.id, gebuehr_op_position_id=None,
+        erstellt_von="codex-test",
+        zins_segmente_json=json.dumps([
+            {"op_position_id": 200, "von": "2026-01-01", "bis": "2026-03-01", "rest_cent": 50_000,
+             "satz_prozent": "4.000", "quelle": "VEREINBART_GEPRUEFT", "zinsen_cent": 489},
+        ]),
+        zinsen_delta_je_op_json=json.dumps({}),  # kein Delta für diese Forderung an DIESEM Tag
+    )
+
+    seite = client.get(f"/backoffice/konto/{konto.id}")
+    assert seite.status_code == 200
+    assert "Zuordnung/Betrag nicht belegt" in seite.text
+    assert "tatsächlich an diesem Tag neu gebucht: nicht gebucht" not in seite.text
+
+
 def test_kontoauszug_pdf_fuer_objekt_107_ausgeschlossen(backoffice_client):
     client, _konto_id, konto_gesperrt_id, _op_service = backoffice_client
     _login(client)
