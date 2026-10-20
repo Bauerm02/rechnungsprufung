@@ -302,6 +302,20 @@ class MietvertragsprofilTable(Base):
     )
     rechtsachse_mietzinsbildung_quellenbeleg: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
+    # Verzugszins-STAGING (Nutzerergänzung 20.10.2026: "Verzugszinsart/
+    # Satz/Beginn/Klausel/gesetzlicher Fallback, extrahierter Wortlaut
+    # getrennt von tatsächlicher Wirksamkeitsfreigabe") - GENAU dasselbe
+    # unverbindliche Staging-Prinzip wie die Index-Quellfelder oben: die
+    # TATSÄCHLICH wirksame Berechnungsgrundlage bleibt ausschließlich die
+    # freigegebene `MahnPolicyTable.zinsen_prozent` (siehe `mahnwesen/
+    # kosten_service.py`) - dieses Feld erzeugt KEINE Freigabe/Buchung.
+    verzugszins_art: Mapped[str] = mapped_column(String(24), default="UNGEKLAERT", server_default=text("'UNGEKLAERT'"))
+    verzugszins_satz_prozent: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
+    verzugszins_beginn_regel: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    verzugszins_gesetzlicher_fallback_hinweis: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    verzugszins_klauseltext_auszug: Mapped[str | None] = mapped_column(Text, nullable=True)
+    verzugszins_klauseltext_seite: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
 
 class SperreTable(Base):
     __tablename__ = "sperren"

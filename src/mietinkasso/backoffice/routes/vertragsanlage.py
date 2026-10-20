@@ -33,6 +33,7 @@ from mietinkasso.intake.apply import wende_an as _intake_wende_an
 from mietinkasso.intake.parser import IntakeFormatFehlerError, parse_json_paket as _intake_parse_json_paket
 from mietinkasso.intake.planner import erstelle_plan as _intake_erstelle_plan
 from mietinkasso.rueckstaende.service import berechne_rueckstandsuebersicht
+from mietinkasso.stammdaten.telefon import normalisiere_telefon
 from mietinkasso.vertragsanlage.ablage import (
     UploadAbgelehntError as _VertragsanlageUploadAbgelehntError,
     speichern as _vertragsanlage_speichern,
@@ -102,8 +103,11 @@ def _hat_gesellschaft_zugriff(ctx: AuthContext, gesellschaft_id: str) -> bool:
 
 
 @router.get("/vertraege", response_class=HTMLResponse)
-def vertragsanlage_liste(request: Request, session=Depends(_current_session)) -> HTMLResponse:
+def vertragsanlage_liste(
+    request: Request, objekt_id: str = "", q: str = "", session=Depends(_current_session),
+) -> HTMLResponse:
     ctx = _ctx(session)
+    alle_objekte = []
     zeilen = []
     einheiten_mit_vertrag: set[str] = set()
     for vertrag in deps._stammdaten_repo.list_alle_vertraege():
@@ -115,16 +119,28 @@ def vertragsanlage_liste(request: Request, session=Depends(_current_session)) ->
         if einheit is None or objekt is None or debitor is None:
             continue
         einheiten_mit_vertrag.add(einheit.id)
-        zeilen.append({"vertrag": vertrag, "objekt": objekt, "einheit": einheit, "debitor": debitor})
+        if objekt_id and objekt.id != objekt_id:
+            continue
+        if q and q.strip().lower() not in debitor.name.lower():
+            continue
+        # Auftrag HV-20261020-VERTRAGSDATENBASIS: zentrale Übersicht zeigt
+        # je Zeile aufklappbare Kurzdetails - braucht dafür das Profil mit,
+        # KEIN zweiter Rechenweg, nur Anzeige bereits gespeicherter Felder.
+        profil = deps._stammdaten_repo.neuestes_mietvertragsprofil(vertrag.id)
+        zeilen.append({"vertrag": vertrag, "objekt": objekt, "einheit": einheit, "debitor": debitor, "profil": profil})
 
     # Leerstände/sonstige Einheiten OHNE Vertrag bleiben sichtbar (Auftrag
     # HV-20260914-UI-EINFACH) - Bestandsart kommt direkt aus dem
     # gepflegten `Einheit.nutzungsstatus`, NIE aus einem erratenen
-    # Nullsaldo/Fehlen eines Kontos.
+    # Nullsaldo/Fehlen eines Kontos. Der Objekt-/Mieterfilter oben wirkt
+    # NUR auf die Mieterliste, Leerstände bleiben immer vollständig
+    # sichtbar (sonst würde ein Mieterfilter versehentlich Leerstände
+    # ausblenden, die er gar nicht betreffen soll).
     leerstand_zeilen = []
     for objekt in deps._stammdaten_repo.list_objekte():
         if objekt.ausgeschlossen or not _hat_gesellschaft_zugriff(ctx, objekt.gesellschaft_id):
             continue
+        alle_objekte.append(objekt)
         for einheit in deps._stammdaten_repo.list_einheiten_fuer_objekt(objekt.id):
             if einheit.id in einheiten_mit_vertrag:
                 continue
@@ -133,7 +149,10 @@ def vertragsanlage_liste(request: Request, session=Depends(_current_session)) ->
     return _layout(
         request, session, "Mieter & Objekte",
         f'<div class="card">{listen_links_html()}</div>'
-        + _vertragsanlage_liste_formular(zeilen, session.csrf_token, leerstand_zeilen=leerstand_zeilen),
+        + _vertragsanlage_liste_formular(
+            zeilen, session.csrf_token, leerstand_zeilen=leerstand_zeilen,
+            objekte=alle_objekte, filter_objekt_id=objekt_id, filter_q=q,
+        ),
     )
 
 
@@ -309,6 +328,7 @@ def vertragsanlage_detail(
     mahnlaeufe = deps._hv_mail.mahnlauf_repo.list_fuer_vertrag(vertrag_id)
     erhoehungsschreiben = deps._indexautomatik.outbox_repository.liste_fuer_vertrag(vertrag_id)
     vertragsende_erinnerungen = deps._indexautomatik.vertragsende_repository.list_fuer_vertrag(vertrag_id)
+    mitmieter = deps._mitmieter_repo.list_aktiv(vertrag_id)
 
     inhalt = _vertragsanlage_detail_ansicht(
         vertrag=vertrag, objekt=objekt, einheit=einheit, debitor=debitor, gesellschaft=gesellschaft,
@@ -325,6 +345,7 @@ def vertragsanlage_detail(
         zahlungen_positionen=zahlungen_positionen, sperren=sperren, mahnfaelle=mahnfaelle,
         mahnlaeufe=mahnlaeufe, erhoehungsschreiben=erhoehungsschreiben,
         vertragsende_erinnerungen=vertragsende_erinnerungen, von_objekt=von_objekt,
+        mitmieter=mitmieter,
     )
     # Mahnbrief-Archiv + Anbieterbeleg-Import (Auftrag HV-20261019-
     # VERSAND-KOSTEN-ABSCHLUSS, Teil 3) - eigene, separate Seite statt
@@ -368,6 +389,57 @@ def vertragsanlage_debitor_telefon(
             )
     except (MietinkassoError, ValueError) as exc:
         return _fehlerseite(session, "Mieterakte", str(exc), f"/backoffice/vertrag/{vertrag_id}")
+    return RedirectResponse(f"/backoffice/vertrag/{vertrag_id}", status_code=303)
+
+
+@router.post("/vertrag/{vertrag_id}/parteien")
+def vertragsanlage_partei_hinzufuegen(
+    request: Request,
+    vertrag_id: str,
+    csrf_token: str = Form(...),
+    rolle: str = Form("MITMIETER"),
+    name: str = Form(""),
+    email: str = Form(""),
+    telefon: str = Form(""),
+    adresse: str = Form(""),
+    zustand: str = Form("BESTAETIGT"),
+    debitor_id: str = Form(""),
+    session=Depends(_current_session),
+):
+    """Pflegt die EINE führende Parteien-/Vertreter-Struktur
+    (`VertragMitmieterTable` über `deps._mitmieter_repo`) direkt, OHNE
+    die generische Intake-Strecke - analog zur Telefon-Route oben: eine
+    zusätzliche Partei/ein Vertreter braucht keine neue Mietvertragsprofil-
+    Version. `HAUPTMIETER` wird hier bewusst NICHT angeboten (siehe
+    `Vertragsparteirolle`-Docstring - der Debitor bleibt die einzige
+    Quelle für den Hauptmieter, keine Dublette mit eigenen Kontaktfeldern)."""
+
+    _verify_csrf(session, csrf_token)
+    ctx = _ctx(session)
+    require_schreibrecht(ctx)
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Mieterakte", "Vertrag nicht verfügbar.", "/backoffice/vertraege")
+    require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
+
+    if rolle not in ("MITMIETER", "VERTRETER"):
+        return _fehlerseite(session, "Partei hinzufügen", "Ungültige Rolle (Hauptmieter wird über den Debitor geführt, nicht hier dupliziert).", f"/backoffice/vertrag/{vertrag_id}")
+    if zustand not in ("AUSGELESEN", "BESTAETIGT", "FEHLT", "MEHRDEUTIG"):
+        return _fehlerseite(session, "Partei hinzufügen", "Ungültiger Zustand.", f"/backoffice/vertrag/{vertrag_id}")
+    name = name.strip() or None
+    if not name:
+        return _fehlerseite(session, "Partei hinzufügen", "Name darf nicht leer sein.", f"/backoffice/vertrag/{vertrag_id}")
+
+    deps._mitmieter_repo.anlegen(
+        vertrag_id=vertrag_id, name=name, email=email.strip() or None, adresse=adresse.strip() or None,
+        telefon=normalisiere_telefon(telefon) if telefon.strip() else None,
+        rolle=rolle, zustand=zustand, debitor_id=debitor_id.strip() or None,
+        quelle_typ="BACKOFFICE_MANUELL", erstellt_von=session.user_id,
+    )
+    deps._audit_service.log(
+        entity_typ="vertrag_mitmieter", entity_id=vertrag_id, aktion="PARTEI_HINZUGEFUEGT", akteur=session.user_id,
+        payload={"vertrag_id": vertrag_id, "rolle": rolle, "zustand": zustand},
+    )
     return RedirectResponse(f"/backoffice/vertrag/{vertrag_id}", status_code=303)
 
 
@@ -473,8 +545,8 @@ async def vertragsanlage_pdf_hochladen(
 
     werte = dict(basis_werte)
     for feld, vorschlag in vorschlaege.items():
-        if feld in ("mieter_name_hinweis", "vermieter_name_hinweis"):
-            continue  # reine Vergleichs-Hinweise, kein übernehmbares Formularfeld
+        if feld in ("mieter_name_hinweis", "vermieter_name_hinweis", "mitmieter_name_hinweis", "mitmieter_telefon_hinweis"):
+            continue  # reine Hinweise, kein Mietvertragsprofil-Feld (Mitmieter-Hinweise siehe Eckdaten-Block/Parteien-Karte)
         if not werte.get(feld):
             werte[feld] = vorschlag.formularwert
 

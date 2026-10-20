@@ -337,6 +337,12 @@ def _mietvertragsprofil_aus_dict(zeile: dict) -> MietvertragsprofilZeile:
         rechtsachse_mrg_anwendungsbereich_quellenbeleg=_optional_str(zeile, "rechtsachse_mrg_anwendungsbereich_quellenbeleg"),
         rechtsachse_mietzinsbildung=(_optional_str(zeile, "rechtsachse_mietzinsbildung") or "UNGEKLAERT").upper(),
         rechtsachse_mietzinsbildung_quellenbeleg=_optional_str(zeile, "rechtsachse_mietzinsbildung_quellenbeleg"),
+        verzugszins_art=(_optional_str(zeile, "verzugszins_art") or "UNGEKLAERT").upper(),
+        verzugszins_satz_prozent=_optional_decimal(zeile, "verzugszins_satz_prozent", kontext),
+        verzugszins_beginn_regel=_optional_str(zeile, "verzugszins_beginn_regel"),
+        verzugszins_gesetzlicher_fallback_hinweis=_optional_str(zeile, "verzugszins_gesetzlicher_fallback_hinweis"),
+        verzugszins_klauseltext_auszug=_optional_str(zeile, "verzugszins_klauseltext_auszug"),
+        verzugszins_klauseltext_seite=_optional_int_oder_none(zeile, "verzugszins_klauseltext_seite", kontext),
     )
 
 

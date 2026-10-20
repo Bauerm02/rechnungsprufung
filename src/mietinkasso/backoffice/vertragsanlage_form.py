@@ -12,6 +12,14 @@ from decimal import Decimal, InvalidOperation
 from html import escape as h
 
 from mietinkasso.backoffice.views import csrf_feld, eur, option, parse_eur_betrag, sperrgrund_label
+from mietinkasso.domain.enums import (
+    Befristungsstatus,
+    BkHkAbrechnungsart,
+    RechtsachseMietzinsbildung,
+    RechtsachseMrgAnwendungsbereich,
+    VerbraucherUnternehmerStatus,
+    VerzugszinsArt,
+)
 from mietinkasso.domain.money import cents_to_decimal, zerlege_brutto_cent
 from mietinkasso.stammdaten.telefon import TELEFON_MAX_LAENGE, normalisiere_telefon, tel_href
 
@@ -20,6 +28,16 @@ RECHTSORDNUNGEN = [
     "UNGEKLAERT", "OESTERREICH_MRG_VOLL", "OESTERREICH_MRG_TEIL", "OESTERREICH_MRG_FREI",
     "OESTERREICH_WGG", "OESTERREICH_GEWERBE", "DEUTSCHLAND",
 ]
+
+# Auftrag HV-20261020-VERTRAGSDATENBASIS: Formular-Optionslisten für die
+# additiven Staging-Felder, direkt aus den Domain-Enums abgeleitet (keine
+# zweite, drift-anfällige Werteliste).
+BEFRISTUNGSSTATUS_WERTE = [e.value for e in Befristungsstatus]
+BK_HK_ABRECHNUNGSARTEN = [e.value for e in BkHkAbrechnungsart]
+VERBRAUCHER_UNTERNEHMER_STATUS_WERTE = [e.value for e in VerbraucherUnternehmerStatus]
+RECHTSACHSE_MRG_ANWENDUNGSBEREICH_WERTE = [e.value for e in RechtsachseMrgAnwendungsbereich]
+RECHTSACHSE_MIETZINSBILDUNG_WERTE = [e.value for e in RechtsachseMietzinsbildung]
+VERZUGSZINS_ARTEN = [e.value for e in VerzugszinsArt]
 
 
 def feld_status(wert, *, unklar_werte: tuple = ()) -> str:
@@ -70,11 +88,58 @@ def einheit_label(objekt, einheit) -> str:
 # ---------------------------------------------------------------------------
 
 
-def vertraege_liste_formular(zeilen: list[dict], csrf: str, *, leerstand_zeilen: list[dict] | None = None) -> str:
-    """`zeilen`: Liste von {vertrag, objekt, einheit, debitor}.
+def _uebersicht_details_html(z: dict) -> str:
+    """Aufklappbare Kurzdetails je Zeile der zentralen Vertragsübersicht
+    (Auftrag Markus, Nutzerergänzung 20.10.2026: "zentrale objekt-/
+    mieterfilterbare Vertragsübersicht mit kurzen Spalten und
+    aufklappbaren Details") - zeigt NUR bereits gespeicherte Werte, KEINE
+    neue Berechnung. `z["profil"]` ist optional (kann `None` sein, wenn
+    noch kein Mietvertragsprofil existiert)."""
+
+    profil = z.get("profil")
+    vertrag = z["vertrag"]
+    if profil is None:
+        return (
+            '<p class="muted">Noch kein Mietvertragsprofil erfasst.</p>'
+            f'<p><a href="/backoffice/vertrag/{h(vertrag.id)}/mietvertragsprofil/bearbeiten">Profil anlegen</a></p>'
+        )
+    index_text = (
+        f"{h(profil.index_reihe)} · Basis {h(profil.index_urspruenglicher_basismonat or '—')}"
+        f"/{profil.index_urspruenglicher_basiswert if profil.index_urspruenglicher_basiswert is not None else '—'}"
+        if profil.index_reihe else "nicht erfasst"
+    )
+    return f"""
+    <table>
+      <tr><th>Vertrag</th><td><code>{h(vertrag.id)}</code></td></tr>
+      <tr><th>Laufzeit</th><td>{vertrag.gueltig_von.isoformat()} – {vertrag.gueltig_bis.isoformat() if vertrag.gueltig_bis else 'unbefristet'}
+          ({h(profil.befristungsstatus)})</td></tr>
+      <tr><th>Indexbasis</th><td>{index_text}</td></tr>
+      <tr><th>Kaution vereinbart</th><td>{eur(profil.vertragliche_kaution_cent) if profil.vertragliche_kaution_cent is not None else 'nicht erfasst'}</td></tr>
+      <tr><th>Mahn-/Zinsregel (Staging)</th>
+          <td>Mahngebühr {eur(profil.mahngebuehr_cent) if profil.mahngebuehr_cent is not None else 'nicht erfasst'}
+          · Verzugszins {h(profil.verzugszins_art)}{f" ({profil.verzugszins_satz_prozent} %)" if profil.verzugszins_satz_prozent is not None else ''}</td></tr>
+      <tr><th>Rechtsachsen (Staging)</th><td>MRG {h(profil.rechtsachse_mrg_anwendungsbereich)} · Mietzins {h(profil.rechtsachse_mietzinsbildung)}
+          · BK/HK {h(profil.bk_hk_abrechnungsart)}</td></tr>
+    </table>
+    <p><a href="/backoffice/vertrag/{h(vertrag.id)}">Mieterakte öffnen</a> ·
+       <a href="/backoffice/vertrag/{h(vertrag.id)}/mietvertragsprofil/bearbeiten">Profil bearbeiten</a></p>"""
+
+
+def vertraege_liste_formular(
+    zeilen: list[dict], csrf: str, *, leerstand_zeilen: list[dict] | None = None,
+    objekte: list | None = None, filter_objekt_id: str = "", filter_q: str = "",
+) -> str:
+    """`zeilen`: Liste von {vertrag, objekt, einheit, debitor, profil?}.
+    `profil` ist optional (nicht jeder Aufrufer lädt es mit) - fehlt es,
+    zeigt der aufklappbare Detailbereich nur "noch kein Profil erfasst".
     `leerstand_zeilen`: Liste von {objekt, einheit} OHNE Vertrag (Auftrag
     HV-20260914-UI-EINFACH: Leerstände bleiben sichtbar, statt nur
-    vermietete Einheiten zu zeigen)."""
+    vermietete Einheiten zu zeigen). `objekte`/`filter_objekt_id`/
+    `filter_q`: zentraler Objekt-/Mieterfilter (Auftrag
+    HV-20261020-VERTRAGSDATENBASIS) - die eigentliche Filterung passiert
+    in der Route (`routes/vertragsanlage.py::vertragsanlage_liste`), hier
+    wird nur das Filterformular gerendert und der aktuelle Filterzustand
+    vorbelegt."""
 
     from mietinkasso.backoffice.views import nutzungsstatus_label
 
@@ -82,14 +147,24 @@ def vertraege_liste_formular(zeilen: list[dict], csrf: str, *, leerstand_zeilen:
         option(z["vertrag"].id, f"{einheit_label(z['objekt'], z['einheit'])} — {z['debitor'].name}")
         for z in zeilen
     )
+    objekt_filter_optionen = option("", "— alle Objekte —", selected=not filter_objekt_id) + "".join(
+        option(o.id, o.bezeichnung, selected=o.id == filter_objekt_id) for o in (objekte or [])
+    )
+    filter_formular = f"""
+    <form method="get" action="/backoffice/vertraege" style="max-width:640px;">
+      <label>Objekt</label><select name="objekt_id">{objekt_filter_optionen}</select>
+      <label>Mieter (Namensteil)</label><input name="q" value="{h(filter_q)}" placeholder="z. B. Musterfrau">
+      <button type="submit" class="secondary">Filtern</button>
+      {f'<a href="/backoffice/vertraege">Filter zurücksetzen</a>' if (filter_objekt_id or filter_q) else ''}
+    </form>"""
     tabellenzeilen = "".join(
         f"<tr><td>{h(z['debitor'].name)}<br><span class='muted'>{h(z['objekt'].bezeichnung)} / "
         f"{h(z['einheit'].bezeichnung)}</span></td>"
         f"<td>{h(nutzungsstatus_label(z['einheit'].nutzungsstatus))}</td>"
         f"<td><a href='/backoffice/vertrag/{h(z['vertrag'].id)}'>Akte öffnen</a>"
-        f"<details><summary>Details</summary>Vertrag: <code>{h(z['vertrag'].id)}</code></details></td></tr>"
+        f"<details><summary>Kurzdetails</summary>{_uebersicht_details_html(z)}</details></td></tr>"
         for z in zeilen
-    ) or "<tr><td colspan=3>Noch keine Verträge vorhanden.</td></tr>"
+    ) or "<tr><td colspan=3>Keine Verträge gefunden (Filter beachten).</td></tr>"
 
     leerstand_zeilen = leerstand_zeilen or []
     leerstand_html = "".join(
@@ -115,6 +190,7 @@ def vertraege_liste_formular(zeilen: list[dict], csrf: str, *, leerstand_zeilen:
       </form>
     </div>
     <div class="card"><h2>Mieter</h2>
+      {filter_formular}
       <div class="tabelle-scroll">
       <table><tr><th>Mieter / Objekt / Einheit</th><th>Bestandsart</th><th></th></tr>
       {tabellenzeilen}</table>
@@ -329,6 +405,17 @@ def _eckdaten_block(eckdaten: dict | None, pdf_hinweise: dict) -> str:
         f' <span class="muted">(laut Dokument, Seite {vermieter_hinweis.seite}: „{h(vermieter_hinweis.formularwert)}“ — bitte mit Auswahl vergleichen)</span>'
         if vermieter_hinweis else ""
     )
+    mitmieter_hinweis = pdf_hinweise.get("mitmieter_name_hinweis")
+    mitmieter_telefon_hinweis = pdf_hinweise.get("mitmieter_telefon_hinweis")
+    mitmieter_zeile = ""
+    if mitmieter_hinweis:
+        telefon_zusatz = f", Telefon „{h(mitmieter_telefon_hinweis.formularwert)}“" if mitmieter_telefon_hinweis else ""
+        mitmieter_zeile = (
+            f'<tr><th>Mitmieter (laut Dokument, Seite {mitmieter_hinweis.seite})</th>'
+            f'<td>„{h(mitmieter_hinweis.formularwert)}“{telefon_zusatz} — '
+            'wird NICHT automatisch angelegt; nach dem Übernehmen über '
+            '"Partei hinzufügen" in der Mieterakte erfassen und prüfen.</td></tr>'
+        )
     return f"""
     <div class="card"><h2>Eckdaten dieses Vorgangs</h2>
       <table>
@@ -338,6 +425,7 @@ def _eckdaten_block(eckdaten: dict | None, pdf_hinweise: dict) -> str:
         <tr><th>Vermieter-Gesellschaft</th><td>{h(eckdaten.get('gesellschaft_name', ''))}{vermieter_vergleich}</td></tr>
         <tr><th>Rechtsordnung</th><td>{h(eckdaten.get('rechtsordnung', ''))}</td></tr>
         <tr><th>Vertragsbeginn / -ende</th><td>{h(eckdaten.get('gueltig_von', ''))} – {h(eckdaten.get('gueltig_bis') or 'unbefristet')}</td></tr>
+        {mitmieter_zeile}
       </table>
     </div>"""
 
@@ -360,6 +448,11 @@ def review_formular(
         option("1", "ab Erreichen der Schwelle (inklusive)", selected=inklusive_wert == "1"),
         option("0", "erst über der Schwelle", selected=inklusive_wert == "0"),
     ])
+
+    def _enum_auswahl(name: str, werte_liste: list[str]) -> str:
+        aktuell = werte.get(name) or "UNGEKLAERT"
+        return "".join(option(w, w, selected=aktuell == w) for w in werte_liste)
+
     return f"""
     <div class="card">
       <h1>{'Neuen Mietvertrag prüfen' if ist_neu else 'Mietvertragsprofil aktualisieren'}</h1>
@@ -424,6 +517,83 @@ def review_formular(
           <textarea name="index_klauseltext_auszug" rows="3">{h(str(werte.get('index_klauseltext_auszug') or ''))}</textarea>
           <label>Seite im Dokument</label>
           <input name="index_klauseltext_seite" value="{h(str(werte.get('index_klauseltext_seite') or ''))}">
+        </fieldset>
+        <fieldset><legend>Termine und Befristung</legend>
+          <label>Unterzeichnungsdatum (GETRENNT vom Mietbeginn)</label>
+          <input type="date" name="unterzeichnungsdatum" value="{h(str(werte.get('unterzeichnungsdatum') or ''))}">
+          {_beleg_hinweis(vorschlaege, "unterzeichnungsdatum")}
+          <label>Fundstelle Unterzeichnungsdatum</label>
+          <input name="unterzeichnungsdatum_quellenbeleg" value="{h(str(werte.get('unterzeichnungsdatum_quellenbeleg') or ''))}">
+          <label>Tatsächliche Objektübergabe am</label>
+          <input type="date" name="uebergabe_am" value="{h(str(werte.get('uebergabe_am') or ''))}">
+          {_beleg_hinweis(vorschlaege, "uebergabe_am")}
+          <label>Letzte dokumentierte Vertragsverlängerung am</label>
+          <input type="date" name="letzte_verlaengerung_am" value="{h(str(werte.get('letzte_verlaengerung_am') or ''))}">
+          <label>Befristungsstatus</label>
+          <select name="befristungsstatus">{_enum_auswahl("befristungsstatus", BEFRISTUNGSSTATUS_WERTE)}</select>
+          {_beleg_hinweis(vorschlaege, "befristungsstatus")}
+          <p class="muted">Ein leeres Vertragsende setzt dieses Feld NIEMALS automatisch auf UNBEFRISTET -
+             nur eine tatsächlich belegte Klausel.</p>
+          <label>Fundstelle Befristung</label>
+          <input name="befristungsstatus_quellenbeleg" value="{h(str(werte.get('befristungsstatus_quellenbeleg') or ''))}">
+        </fieldset>
+        <fieldset><legend>Rechtsachsen (unverbindliches Staging, ersetzt NICHT die Rechtsordnung/das Rechtsprofil)</legend>
+          <label>MRG-Anwendungsbereich laut Vertrag/Klausel</label>
+          <select name="rechtsachse_mrg_anwendungsbereich">{_enum_auswahl("rechtsachse_mrg_anwendungsbereich", RECHTSACHSE_MRG_ANWENDUNGSBEREICH_WERTE)}</select>
+          {_beleg_hinweis(vorschlaege, "rechtsachse_mrg_anwendungsbereich")}
+          <label>Fundstelle MRG-Anwendungsbereich</label>
+          <input name="rechtsachse_mrg_anwendungsbereich_quellenbeleg" value="{h(str(werte.get('rechtsachse_mrg_anwendungsbereich_quellenbeleg') or ''))}">
+          <label>Mietzinsbildung laut Vertrag/Klausel</label>
+          <select name="rechtsachse_mietzinsbildung">{_enum_auswahl("rechtsachse_mietzinsbildung", RECHTSACHSE_MIETZINSBILDUNG_WERTE)}</select>
+          {_beleg_hinweis(vorschlaege, "rechtsachse_mietzinsbildung")}
+          <label>Fundstelle Mietzinsbildung</label>
+          <input name="rechtsachse_mietzinsbildung_quellenbeleg" value="{h(str(werte.get('rechtsachse_mietzinsbildung_quellenbeleg') or ''))}">
+          <p class="muted">Gewerbenutzung/freier Mietzins sind KEINE automatischen MRG-Ausnahmen - diese
+             Achsen bleiben unabhängig von Nutzungsart und voneinander. Die tatsächlich wirksame
+             Rechtsgrundlage bleibt die Rechtsordnung oben und das freigegebene Rechtsprofil.</p>
+        </fieldset>
+        <fieldset><legend>BK/HK-Abrechnung</legend>
+          <label>Abrechnungsart laut Vertrag</label>
+          <select name="bk_hk_abrechnungsart">{_enum_auswahl("bk_hk_abrechnungsart", BK_HK_ABRECHNUNGSARTEN)}</select>
+          {_beleg_hinweis(vorschlaege, "bk_hk_abrechnungsart")}
+          <p class="muted">Entscheidet, ob eine BK/HK-Nachverrechnung später zulässig ist - NIE aus einem
+             bloßen BK-/HK-Betrag geraten.</p>
+          <label>Fundstelle Abrechnungsart</label>
+          <input name="bk_hk_abrechnungsart_quellenbeleg" value="{h(str(werte.get('bk_hk_abrechnungsart_quellenbeleg') or ''))}">
+          <label>Verteilungsschlüssel (Freitext, z. B. "nach Nutzfläche")</label>
+          <input name="bk_hk_verteilungsschluessel" value="{h(str(werte.get('bk_hk_verteilungsschluessel') or ''))}">
+          <label>Fundstelle Verteilungsschlüssel</label>
+          <input name="bk_hk_verteilungsschluessel_quellenbeleg" value="{h(str(werte.get('bk_hk_verteilungsschluessel_quellenbeleg') or ''))}">
+        </fieldset>
+        <fieldset><legend>Verbraucher-/Unternehmerstatus (nur für den gesetzlichen Verzugszins-Fallback relevant)</legend>
+          <label>Status des Mieters</label>
+          <select name="verbraucher_unternehmer_status_mieter">{_enum_auswahl("verbraucher_unternehmer_status_mieter", VERBRAUCHER_UNTERNEHMER_STATUS_WERTE)}</select>
+          {_beleg_hinweis(vorschlaege, "verbraucher_unternehmer_status_mieter")}
+          <label>Fundstelle Mieterstatus</label>
+          <input name="verbraucher_unternehmer_status_mieter_quellenbeleg" value="{h(str(werte.get('verbraucher_unternehmer_status_mieter_quellenbeleg') or ''))}">
+          <label>Status des Vermieters</label>
+          <select name="verbraucher_unternehmer_status_vermieter">{_enum_auswahl("verbraucher_unternehmer_status_vermieter", VERBRAUCHER_UNTERNEHMER_STATUS_WERTE)}</select>
+          {_beleg_hinweis(vorschlaege, "verbraucher_unternehmer_status_vermieter")}
+          <label>Fundstelle Vermieterstatus</label>
+          <input name="verbraucher_unternehmer_status_vermieter_quellenbeleg" value="{h(str(werte.get('verbraucher_unternehmer_status_vermieter_quellenbeleg') or ''))}">
+          <p class="muted">NIEMALS allein aus der Nutzungsart (z. B. "Büro"/"Gewerbe") ableiten - nur eine
+             tatsächlich belegte Angabe.</p>
+        </fieldset>
+        <fieldset><legend>Verzugszins (unverbindliches Staging, ersetzt NICHT die freigegebene Mahn-Zinsregel)</legend>
+          <label>Herkunft des Satzes</label>
+          <select name="verzugszins_art">{_enum_auswahl("verzugszins_art", VERZUGSZINS_ARTEN)}</select>
+          {_beleg_hinweis(vorschlaege, "verzugszins_art")}
+          {_dezimal_feld("verzugszins_satz_prozent", "Vertraglich vereinbarter Satz in Prozent", werte, vorschlaege, hinweis="Nur bei VERTRAGLICH_VEREINBART sinnvoll - eine konkrete belegte Zahl, keine Schätzung.")}
+          <label>Beginn-Regel (Freitext, z. B. "ab Fälligkeit")</label>
+          <input name="verzugszins_beginn_regel" value="{h(str(werte.get('verzugszins_beginn_regel') or ''))}">
+          <label>Hinweis zum gesetzlichen Fallback (ABGB/UGB, rein informativ)</label>
+          <input name="verzugszins_gesetzlicher_fallback_hinweis" value="{h(str(werte.get('verzugszins_gesetzlicher_fallback_hinweis') or ''))}">
+          <p class="muted">Löst KEINE automatische Zinsberechnung aus - die tatsächlich wirksame Grundlage
+             bleibt die freigegebene Mahn-Zinsregel (siehe Mieterakte, Mahnfälle &amp; Schriftverkehr).</p>
+          <label>Klauseltext (Auszug)</label>
+          <textarea name="verzugszins_klauseltext_auszug" rows="3">{h(str(werte.get('verzugszins_klauseltext_auszug') or ''))}</textarea>
+          <label>Seite im Dokument</label>
+          <input name="verzugszins_klauseltext_seite" value="{h(str(werte.get('verzugszins_klauseltext_seite') or ''))}">
         </fieldset>
         <button type="submit">Vorschau anzeigen</button>
       </form>
@@ -501,6 +671,32 @@ def bestehende_werte(profil, kaution) -> dict:
             index_mindestintervall_monate=profil.index_mindestintervall_monate,
             index_klauseltext_auszug=profil.index_klauseltext_auszug,
             index_klauseltext_seite=profil.index_klauseltext_seite,
+            unterzeichnungsdatum=profil.unterzeichnungsdatum.isoformat() if profil.unterzeichnungsdatum else None,
+            unterzeichnungsdatum_quellenbeleg=profil.unterzeichnungsdatum_quellenbeleg,
+            uebergabe_am=profil.uebergabe_am.isoformat() if profil.uebergabe_am else None,
+            uebergabe_am_quellenbeleg=profil.uebergabe_am_quellenbeleg,
+            letzte_verlaengerung_am=profil.letzte_verlaengerung_am.isoformat() if profil.letzte_verlaengerung_am else None,
+            letzte_verlaengerung_am_quellenbeleg=profil.letzte_verlaengerung_am_quellenbeleg,
+            befristungsstatus=profil.befristungsstatus,
+            befristungsstatus_quellenbeleg=profil.befristungsstatus_quellenbeleg,
+            bk_hk_abrechnungsart=profil.bk_hk_abrechnungsart,
+            bk_hk_abrechnungsart_quellenbeleg=profil.bk_hk_abrechnungsart_quellenbeleg,
+            bk_hk_verteilungsschluessel=profil.bk_hk_verteilungsschluessel,
+            bk_hk_verteilungsschluessel_quellenbeleg=profil.bk_hk_verteilungsschluessel_quellenbeleg,
+            verbraucher_unternehmer_status_mieter=profil.verbraucher_unternehmer_status_mieter,
+            verbraucher_unternehmer_status_mieter_quellenbeleg=profil.verbraucher_unternehmer_status_mieter_quellenbeleg,
+            verbraucher_unternehmer_status_vermieter=profil.verbraucher_unternehmer_status_vermieter,
+            verbraucher_unternehmer_status_vermieter_quellenbeleg=profil.verbraucher_unternehmer_status_vermieter_quellenbeleg,
+            rechtsachse_mrg_anwendungsbereich=profil.rechtsachse_mrg_anwendungsbereich,
+            rechtsachse_mrg_anwendungsbereich_quellenbeleg=profil.rechtsachse_mrg_anwendungsbereich_quellenbeleg,
+            rechtsachse_mietzinsbildung=profil.rechtsachse_mietzinsbildung,
+            rechtsachse_mietzinsbildung_quellenbeleg=profil.rechtsachse_mietzinsbildung_quellenbeleg,
+            verzugszins_art=profil.verzugszins_art,
+            verzugszins_satz_prozent=profil.verzugszins_satz_prozent,
+            verzugszins_beginn_regel=profil.verzugszins_beginn_regel,
+            verzugszins_gesetzlicher_fallback_hinweis=profil.verzugszins_gesetzlicher_fallback_hinweis,
+            verzugszins_klauseltext_auszug=profil.verzugszins_klauseltext_auszug,
+            verzugszins_klauseltext_seite=profil.verzugszins_klauseltext_seite,
         ))
     if kaution is not None:
         werte.update(dict(
@@ -540,6 +736,12 @@ def profil_werte_aus_form(form) -> dict:
         except InvalidOperation:
             raise ValueError(f"'{name}' ist keine gültige Dezimalzahl.") from None
 
+    def enum_wert(name: str, gueltige_werte: list[str], label: str) -> str:
+        wert = text(name) or "UNGEKLAERT"
+        if wert not in gueltige_werte:
+            raise ValueError(f"Ungültiger Wert für {label}.")
+        return wert
+
     nutzungsart = text("nutzungsart") or "UNGEKLAERT"
     if nutzungsart not in NUTZUNGSARTEN:
         raise ValueError("Ungültige Nutzungsart.")
@@ -550,6 +752,16 @@ def profil_werte_aus_form(form) -> dict:
     basismonat = text("index_urspruenglicher_basismonat")
     if basismonat is not None:
         date.fromisoformat(basismonat + "-01")  # Formatprüfung, wirft bei ungültigem Wert
+
+    unterzeichnungsdatum = text("unterzeichnungsdatum")
+    if unterzeichnungsdatum is not None:
+        date.fromisoformat(unterzeichnungsdatum)
+    uebergabe_am = text("uebergabe_am")
+    if uebergabe_am is not None:
+        date.fromisoformat(uebergabe_am)
+    letzte_verlaengerung_am = text("letzte_verlaengerung_am")
+    if letzte_verlaengerung_am is not None:
+        date.fromisoformat(letzte_verlaengerung_am)
 
     return dict(
         nutzungsart=nutzungsart,
@@ -572,6 +784,40 @@ def profil_werte_aus_form(form) -> dict:
         kaution_eingegangen_cent=eur_cent("kaution_eingegangen_cent"),
         kaution_eingegangen_stichtag=text("kaution_eingegangen_stichtag"),
         kaution_eingegangen_referenz=text("kaution_eingegangen_referenz"),
+        unterzeichnungsdatum=unterzeichnungsdatum,
+        unterzeichnungsdatum_quellenbeleg=text("unterzeichnungsdatum_quellenbeleg"),
+        uebergabe_am=uebergabe_am,
+        uebergabe_am_quellenbeleg=text("uebergabe_am_quellenbeleg"),
+        letzte_verlaengerung_am=letzte_verlaengerung_am,
+        letzte_verlaengerung_am_quellenbeleg=text("letzte_verlaengerung_am_quellenbeleg"),
+        befristungsstatus=enum_wert("befristungsstatus", BEFRISTUNGSSTATUS_WERTE, "Befristungsstatus"),
+        befristungsstatus_quellenbeleg=text("befristungsstatus_quellenbeleg"),
+        bk_hk_abrechnungsart=enum_wert("bk_hk_abrechnungsart", BK_HK_ABRECHNUNGSARTEN, "BK/HK-Abrechnungsart"),
+        bk_hk_abrechnungsart_quellenbeleg=text("bk_hk_abrechnungsart_quellenbeleg"),
+        bk_hk_verteilungsschluessel=text("bk_hk_verteilungsschluessel"),
+        bk_hk_verteilungsschluessel_quellenbeleg=text("bk_hk_verteilungsschluessel_quellenbeleg"),
+        verbraucher_unternehmer_status_mieter=enum_wert(
+            "verbraucher_unternehmer_status_mieter", VERBRAUCHER_UNTERNEHMER_STATUS_WERTE, "Verbraucher-/Unternehmerstatus (Mieter)",
+        ),
+        verbraucher_unternehmer_status_mieter_quellenbeleg=text("verbraucher_unternehmer_status_mieter_quellenbeleg"),
+        verbraucher_unternehmer_status_vermieter=enum_wert(
+            "verbraucher_unternehmer_status_vermieter", VERBRAUCHER_UNTERNEHMER_STATUS_WERTE, "Verbraucher-/Unternehmerstatus (Vermieter)",
+        ),
+        verbraucher_unternehmer_status_vermieter_quellenbeleg=text("verbraucher_unternehmer_status_vermieter_quellenbeleg"),
+        rechtsachse_mrg_anwendungsbereich=enum_wert(
+            "rechtsachse_mrg_anwendungsbereich", RECHTSACHSE_MRG_ANWENDUNGSBEREICH_WERTE, "MRG-Anwendungsbereich",
+        ),
+        rechtsachse_mrg_anwendungsbereich_quellenbeleg=text("rechtsachse_mrg_anwendungsbereich_quellenbeleg"),
+        rechtsachse_mietzinsbildung=enum_wert(
+            "rechtsachse_mietzinsbildung", RECHTSACHSE_MIETZINSBILDUNG_WERTE, "Mietzinsbildung",
+        ),
+        rechtsachse_mietzinsbildung_quellenbeleg=text("rechtsachse_mietzinsbildung_quellenbeleg"),
+        verzugszins_art=enum_wert("verzugszins_art", VERZUGSZINS_ARTEN, "Verzugszins-Art"),
+        verzugszins_satz_prozent=dezimal("verzugszins_satz_prozent"),
+        verzugszins_beginn_regel=text("verzugszins_beginn_regel"),
+        verzugszins_gesetzlicher_fallback_hinweis=text("verzugszins_gesetzlicher_fallback_hinweis"),
+        verzugszins_klauseltext_auszug=text("verzugszins_klauseltext_auszug"),
+        verzugszins_klauseltext_seite=ganzzahl("verzugszins_klauseltext_seite"),
     )
 
 
@@ -586,6 +832,112 @@ _VORSCHREIBUNG_STATUS_LABEL = {
     "ZUGESTELLT": "zugestellt",
     "EXPORTIERT": "zugestellt, ins Hauptbuch exportiert",
 }
+
+#: Rollen-Label für die Parteien-Karte (Auftrag HV-20261020-VERTRAGSDATENBASIS).
+_ROLLE_LABEL = {"HAUPTMIETER": "Hauptmieter", "MITMIETER": "Mitmieter", "VERTRETER": "Vertreter"}
+_ZUSTAND_LABEL = {
+    "AUSGELESEN": "ausgelesen (ungeprüft)", "BESTAETIGT": "bestätigt",
+    "FEHLT": "fehlt/unvollständig", "MEHRDEUTIG": "mehrdeutig",
+}
+
+
+def berechnungsbereitschaft(*, profil, komponenten, debitor, vertrag, index_klausel_hinweis: str | None) -> dict[str, dict]:
+    """Berechnungsbereitschaft je Rechenzweck (Auftrag Markus,
+    Nutzerergänzung 20.10.2026: "Quellen-/Bestätigungsstatus und
+    Bereitschaft je Rechenzweck anzeigen"). Reine Lesefunktion auf
+    bereits vorhandenen, andernorts geprüften Daten - KEINE neue
+    Berechnung/Freigabe, nur eine zusammenfassende Sicht. Jeder Zweck
+    bekommt `ready` (bool) und `gruende` (Liste konkreter fehlender
+    Punkte); ein fehlendes, für den jeweiligen Zweck irrelevantes Feld
+    (z. B. Telefon für die Mietrechnung) wird NICHT als Blocker gelistet
+    - das ist bewusst, nicht vergessen."""
+
+    ergebnis: dict[str, dict] = {}
+
+    gruende = []
+    if not komponenten:
+        gruende.append("Keine aktiven Mietbestandteile hinterlegt.")
+    ergebnis["Mietrechnung (Vorschreibung)"] = {"ready": not gruende, "gruende": gruende}
+
+    gruende = []
+    if not index_klausel_hinweis:
+        fehlt = []
+        if not (profil and profil.index_reihe):
+            fehlt.append("Indexreihe")
+        if not (profil and profil.index_urspruenglicher_basismonat):
+            fehlt.append("Basismonat")
+        if not (profil and profil.index_urspruenglicher_basiswert is not None):
+            fehlt.append("Basiswert")
+        if not (profil and profil.index_schwelle_prozent is not None):
+            fehlt.append("Schwelle in Prozent")
+        if fehlt:
+            gruende.append("Keine freigegebene Indexklausel - Quellfelder unvollständig: " + ", ".join(fehlt) + ".")
+        else:
+            gruende.append("Keine freigegebene Indexklausel - Quellfelder sind vollständig, Klausel aber noch nicht angelegt/freigegeben.")
+    ergebnis["Index-Anpassung"] = {"ready": not gruende, "gruende": gruende}
+
+    gruende = []
+    if feld_status(vertrag.rechtsordnung, unklar_werte=("UNGEKLAERT",)) != "bereit":
+        gruende.append("Rechtsordnung ungeklärt.")
+    if not (debitor.adresse or "").strip():
+        gruende.append("Keine Zustelladresse für den Debitor hinterlegt.")
+    ergebnis["Mahnung"] = {"ready": not gruende, "gruende": gruende}
+
+    return ergebnis
+
+
+def _berechnungsbereitschaft_html(bereitschaft: dict[str, dict]) -> str:
+    zeilen = []
+    for zweck, info in bereitschaft.items():
+        status = "bereit" if info["ready"] else "Klärung erforderlich"
+        gruende = "".join(f"<li>{h(g)}</li>" for g in info["gruende"])
+        gruende_zelle = f"<ul>{gruende}</ul>" if gruende else '<span class="muted">—</span>'
+        zeilen.append(
+            f"<tr><td>{h(zweck)}</td><td>{_status_badge(status)}</td><td>{gruende_zelle}</td></tr>"
+        )
+    return f"""
+    <div class="card"><h2>Berechnungsbereitschaft je Rechenzweck</h2>
+      <p class="muted">Zusammenfassende Sicht auf bereits andernorts geprüfte Daten - keine eigene neue
+         Berechnung/Freigabe. Ein für einen Zweck irrelevantes fehlendes Feld (z. B. Telefon für die
+         Mietrechnung) wird hier bewusst NICHT als Blocker für diesen Zweck gelistet.</p>
+      <table><tr><th>Rechenzweck</th><th>Status</th><th>Fehlt/unklar</th></tr>{''.join(zeilen)}</table>
+    </div>"""
+
+
+def _parteien_html(vertrag_id: str, mitmieter: list, csrf: str) -> str:
+    zeilen = "".join(
+        f"<tr><td>{h(_ROLLE_LABEL.get(m.rolle, m.rolle))}</td><td>{h(m.name or '')}</td>"
+        f"<td>{h(m.email or '')}</td><td>{telefon_html(m.telefon)}</td>"
+        f"<td>{h(_ZUSTAND_LABEL.get(m.zustand, m.zustand))}</td>"
+        f"<td>{h(m.debitor_id) if m.debitor_id else '—'}</td>"
+        f"<td>{h(m.quelle_typ or '')}{(' (' + h(m.quelle_referenz) + ')') if m.quelle_referenz else ''}</td></tr>"
+        for m in mitmieter
+    ) or "<tr><td colspan=7 class='muted'>Noch keine weiteren Parteien/Vertreter erfasst.</td></tr>"
+    rolle_optionen = "".join(option(r, label) for r, label in _ROLLE_LABEL.items() if r != "HAUPTMIETER")
+    zustand_optionen = "".join(option(z, label) for z, label in _ZUSTAND_LABEL.items())
+    return f"""
+    <div class="card"><h2>Parteien</h2>
+      <p class="muted">EINE führende Quelle für Mitmieter/Vertreter dieses Vertrags - der Hauptmieter ist der
+         bereits oben geführte Debitor und wird hier NICHT mit abweichend editierbaren Kontakten dupliziert.
+         Mahn-Empfängersnapshots entstehen automatisch aus den hier als "bestätigt" erfassten Mitmietern.</p>
+      <table><tr><th>Rolle</th><th>Name</th><th>E-Mail</th><th>Telefon</th><th>Zustand</th>
+        <th>Verknüpfter Debitor</th><th>Quelle</th></tr>{zeilen}</table>
+      <details><summary>Partei/Vertreter hinzufügen</summary>
+        <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/parteien" style="max-width:480px;">
+          {csrf_feld(csrf)}
+          <label>Rolle</label><select name="rolle">{rolle_optionen}</select>
+          <label>Name</label><input name="name">
+          <label>E-Mail</label><input name="email" type="email">
+          <label>Telefon</label><input name="telefon" type="tel" maxlength="{TELEFON_MAX_LAENGE}">
+          <label>Adresse (falls abweichend vom Debitor)</label><input name="adresse">
+          <label>Zustand</label><select name="zustand">{zustand_optionen}</select>
+          <label>Verknüpfte Debitor-ID (optional, falls diese Partei bereits ein eigener Debitor ist)</label>
+          <input name="debitor_id">
+          <p class="muted">Quelle wird automatisch als "BACKOFFICE_MANUELL" vermerkt.</p>
+          <button type="submit" class="secondary">Hinzufügen</button>
+        </form>
+      </details>
+    </div>"""
 
 
 def detail_ansicht(
@@ -606,6 +958,7 @@ def detail_ansicht(
     erhoehungsschreiben: list,
     vertragsende_erinnerungen: list,
     von_objekt: str | None = None,
+    mitmieter: list | None = None,
 ) -> str:
     """Mieterakte (Auftrag HV-20260914-AUFGABEN-MIETERAKTE, Rückprüfung
     Codex 14.09.2026): EIN gemeinsamer, gegliederter Einstieg für NICHT
@@ -631,6 +984,18 @@ def detail_ansicht(
     mahngebuehr_status = "bereit" if (profil and profil.mahngebuehr_cent is not None) else "Angabe fehlt"
     kaution_vereinbart_status = "bereit" if (profil and profil.vertragliche_kaution_cent is not None) else "Angabe fehlt"
     kaution_eingegangen_status = "bereit" if kaution is not None else "Angabe fehlt"
+    verzugszins_status = feld_status(profil.verzugszins_art if profil else "UNGEKLAERT", unklar_werte=("UNGEKLAERT",))
+    rechtsachse_mrg_status = feld_status(profil.rechtsachse_mrg_anwendungsbereich if profil else "UNGEKLAERT", unklar_werte=("UNGEKLAERT",))
+    rechtsachse_mz_status = feld_status(profil.rechtsachse_mietzinsbildung if profil else "UNGEKLAERT", unklar_werte=("UNGEKLAERT",))
+    bk_hk_status = feld_status(profil.bk_hk_abrechnungsart if profil else "UNGEKLAERT", unklar_werte=("UNGEKLAERT",))
+    verbraucher_status_mieter_status = feld_status(profil.verbraucher_unternehmer_status_mieter if profil else "UNGEKLAERT", unklar_werte=("UNGEKLAERT",))
+    verbraucher_status_vermieter_status = feld_status(profil.verbraucher_unternehmer_status_vermieter if profil else "UNGEKLAERT", unklar_werte=("UNGEKLAERT",))
+    befristungsstatus_status = feld_status(profil.befristungsstatus if profil else "UNGEKLAERT", unklar_werte=("UNGEKLAERT",))
+    mitmieter = mitmieter or []
+    parteien_karte = _parteien_html(vertrag.id, mitmieter, csrf)
+    bereitschaft_karte = _berechnungsbereitschaft_html(
+        berechnungsbereitschaft(profil=profil, komponenten=komponenten, debitor=debitor, vertrag=vertrag, index_klausel_hinweis=index_klausel_hinweis)
+    )
 
     # `VertragsKomponenteTable.betrag_cent` ist per Definition BRUTTO
     # (siehe `domain/money.py::zerlege_brutto_cent`-Docstring) - der
@@ -1071,7 +1436,7 @@ def detail_ansicht(
     {zahlungen_karte}
     {sperren_karte}
     {mahnfaelle_karte}
-    <div class="card"><h2>Kaution und Mahngebühren</h2>
+    <div class="card"><h2>Kaution, Mahngebühren und Verzugszins</h2>
       <table>
         <tr><th>Kaution vereinbart (laut Vertrag)</th>
             <td>{eur(profil.vertragliche_kaution_cent) if profil and profil.vertragliche_kaution_cent is not None else '—'}
@@ -1082,8 +1447,35 @@ def detail_ansicht(
             <td>{eur(profil.mahngebuehr_cent) if profil and profil.mahngebuehr_cent is not None else '—'}
             {_status_badge(mahngebuehr_status)}
             {' <span class="muted">(0 = ausdrücklich keine Gebühr vereinbart)</span>' if profil and profil.mahngebuehr_cent == 0 else ''}</td></tr>
+        <tr><th>Verzugszins (Staging, unverbindlich)</th>
+            <td>{h(profil.verzugszins_art) if profil else 'UNGEKLAERT'} {_status_badge(verzugszins_status)}
+            {f" — {profil.verzugszins_satz_prozent} %" if profil and profil.verzugszins_satz_prozent is not None else ''}
+            {f"<br><span class='muted'>Beginn: {h(profil.verzugszins_beginn_regel)}</span>" if profil and profil.verzugszins_beginn_regel else ''}
+            {f"<br><span class='muted'>Gesetzlicher Fallback: {h(profil.verzugszins_gesetzlicher_fallback_hinweis)}</span>" if profil and profil.verzugszins_gesetzlicher_fallback_hinweis else ''}</td></tr>
       </table>
+      <p class="muted">Dieses Feld ersetzt NICHT die tatsächlich wirksame Mahn-Zinsregel - siehe dafür
+         "Mahnfälle &amp; Schriftverkehr" oben und die Mahnvorschau.</p>
     </div>
+    <div class="card"><h2>Rechtsachsen, BK/HK-Abrechnung und Parteistatus (Staging, unverbindlich)</h2>
+      <p class="muted">Rein deskriptive Quellfelder aus dem Vertrag - ERSETZEN NICHT die Rechtsordnung oben
+         oder ein freigegebenes Rechtsprofil und lösen KEINE Freigabe/Sollstellung/Mahnsperre aus.</p>
+      <table>
+        <tr><th>MRG-Anwendungsbereich</th><td>{h(profil.rechtsachse_mrg_anwendungsbereich) if profil else 'UNGEKLAERT'} {_status_badge(rechtsachse_mrg_status)}</td></tr>
+        <tr><th>Mietzinsbildung</th><td>{h(profil.rechtsachse_mietzinsbildung) if profil else 'UNGEKLAERT'} {_status_badge(rechtsachse_mz_status)}</td></tr>
+        <tr><th>BK/HK-Abrechnungsart</th><td>{h(profil.bk_hk_abrechnungsart) if profil else 'UNGEKLAERT'} {_status_badge(bk_hk_status)}
+            {f" — {h(profil.bk_hk_verteilungsschluessel)}" if profil and profil.bk_hk_verteilungsschluessel else ''}</td></tr>
+        <tr><th>Verbraucher-/Unternehmerstatus Mieter</th><td>{h(profil.verbraucher_unternehmer_status_mieter) if profil else 'UNGEKLAERT'} {_status_badge(verbraucher_status_mieter_status)}</td></tr>
+        <tr><th>Verbraucher-/Unternehmerstatus Vermieter</th><td>{h(profil.verbraucher_unternehmer_status_vermieter) if profil else 'UNGEKLAERT'} {_status_badge(verbraucher_status_vermieter_status)}</td></tr>
+        <tr><th>Unterzeichnungsdatum</th><td>{profil.unterzeichnungsdatum.isoformat() if profil and profil.unterzeichnungsdatum else 'nicht hinterlegt'}</td></tr>
+        <tr><th>Objektübergabe am</th><td>{profil.uebergabe_am.isoformat() if profil and profil.uebergabe_am else 'nicht hinterlegt'}</td></tr>
+        <tr><th>Letzte Vertragsverlängerung am</th><td>{profil.letzte_verlaengerung_am.isoformat() if profil and profil.letzte_verlaengerung_am else 'nicht hinterlegt'}</td></tr>
+        <tr><th>Befristungsstatus</th><td>{h(profil.befristungsstatus) if profil else 'UNGEKLAERT'} {_status_badge(befristungsstatus_status)}</td></tr>
+      </table>
+      <p><a href="/backoffice/vertrag/{h(vertrag.id)}/pruefung">Vertragsprüfung öffnen</a> ·
+         <a href="/backoffice/vertrag/{h(vertrag.id)}/rechtsprofil">Rechtsprofil verwalten</a></p>
+    </div>
+    {parteien_karte}
+    {bereitschaft_karte}
     {index_karte}
     <details class="card"><summary>Quellen und Historie (Mietvertragsprofil-Versionen)</summary>
       <p class="muted">"Quelle" (PDF-Extraktion/manuell/Importformat) ist ein Herkunftsvermerk, KEINE fachliche

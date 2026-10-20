@@ -222,6 +222,12 @@ def wende_an(
                         rechtsachse_mrg_anwendungsbereich_quellenbeleg=z.rechtsachse_mrg_anwendungsbereich_quellenbeleg,
                         rechtsachse_mietzinsbildung=z.rechtsachse_mietzinsbildung,
                         rechtsachse_mietzinsbildung_quellenbeleg=z.rechtsachse_mietzinsbildung_quellenbeleg,
+                        verzugszins_art=z.verzugszins_art,
+                        verzugszins_satz_prozent=z.verzugszins_satz_prozent,
+                        verzugszins_beginn_regel=z.verzugszins_beginn_regel,
+                        verzugszins_gesetzlicher_fallback_hinweis=z.verzugszins_gesetzlicher_fallback_hinweis,
+                        verzugszins_klauseltext_auszug=z.verzugszins_klauseltext_auszug,
+                        verzugszins_klauseltext_seite=z.verzugszins_klauseltext_seite,
                         erstellt_von=akteur, session=session,
                     )
 

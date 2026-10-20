@@ -39,6 +39,7 @@ from mietinkasso.mahnwesen.repository import (
     MahnFallRepository,
     MahnKanalregelRepository,
     MahnPolicyRepository,
+    VertragMitmieterRepository,
 )
 from mietinkasso.mahnwesen.service import MahnwesenService
 from mietinkasso.mieweg_vorschau.repository import MieWegVorschauRepository
@@ -117,6 +118,13 @@ _mahn_kanalregel_repo = MahnKanalregelRepository(_session_factory)
 
 
 _brief_anbieterprofil_repo = BriefAnbieterProfilRepository(_session_factory)
+
+
+# EINE führende Parteien-/Vertreter-Struktur (Auftrag HV-20261020-
+# VERTRAGSDATENBASIS) - dieselbe Instanz, die auch `MahnwesenService`
+# für die automatische Mahn-Empfängerableitung nutzt (siehe unten), NIE
+# eine zweite, unabhängig zu pflegende Mitmieterliste.
+_mitmieter_repo = VertragMitmieterRepository(_session_factory)
 
 
 _mahn_service = MahnwesenService(

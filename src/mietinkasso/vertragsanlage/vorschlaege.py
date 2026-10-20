@@ -62,6 +62,12 @@ _DIREKTE_FELDER = {
     "mieter_name": "mieter_name_hinweis",
     "vermieter_name": "vermieter_name_hinweis",
     "nettomiete_cent": "nettomiete_hinweis_cent",
+    # Auftrag HV-20261020-VERTRAGSDATENBASIS: Mitmieter/Vertreter sind KEIN
+    # Mietvertragsprofil-Feld - reiner Anzeigehinweis für die manuelle
+    # Erfassung über "Partei hinzufügen" (siehe `backoffice/
+    # vertragsanlage_form.py::_eckdaten_block`), NIE automatisch angelegt.
+    "mitmieter_name": "mitmieter_name_hinweis",
+    "mitmieter_telefon": "mitmieter_telefon_hinweis",
 }
 
 

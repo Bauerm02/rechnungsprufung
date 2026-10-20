@@ -186,6 +186,30 @@ def test_mieter_und_vermieter_namen_werden_als_hinweis_extrahiert():
     assert vorschlaege["vermieter_name_hinweis"].formularwert == "JLB Projects GmbH"
 
 
+def test_mitmieter_name_und_telefon_werden_als_hinweis_extrahiert_nicht_automatisch_angelegt():
+    """Auftrag HV-20261020-VERTRAGSDATENBASIS: ein Mitmieter im Dokument
+    wird NUR als geprüfter Hinweis mit Seitenbeleg ausgewiesen - die
+    tatsächliche Partei entsteht erst über die manuelle "Partei
+    hinzufügen"-Erfassung in der Mieterakte, niemals automatisch hier."""
+
+    pdf = build_text_pdf(["Mieter: Max Mustermann", "Mitmieter: Erika Musterfrau Tel: 0664 1234567"])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert vorschlaege["mitmieter_name_hinweis"].formularwert == "Erika Musterfrau"
+    assert vorschlaege["mitmieter_telefon_hinweis"].formularwert == "0664 1234567"
+    # Kein übernehmbares Mietvertragsprofil-Feld entsteht daraus.
+    assert "mitmieter_name" not in vorschlaege
+    assert "mitmieter_telefon" not in vorschlaege
+
+
+def test_mitmieterin_ohne_telefon_wird_erkannt():
+    pdf = build_text_pdf(["weitere Mieterin: Anna Beispiel"])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert vorschlaege["mitmieter_name_hinweis"].formularwert == "Anna Beispiel"
+    assert "mitmieter_telefon_hinweis" not in vorschlaege
+
+
 def test_mietbestandteile_werden_getrennt_extrahiert():
     pdf = build_text_pdf([
         "Hauptmietzins: 500,00 EUR", "Betriebskosten: 80,00 EUR",

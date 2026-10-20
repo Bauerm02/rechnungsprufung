@@ -226,6 +226,12 @@ class MietvertragsprofilZeile:
     rechtsachse_mrg_anwendungsbereich_quellenbeleg: str | None = None
     rechtsachse_mietzinsbildung: str = "UNGEKLAERT"
     rechtsachse_mietzinsbildung_quellenbeleg: str | None = None
+    verzugszins_art: str = "UNGEKLAERT"
+    verzugszins_satz_prozent: Decimal | None = None
+    verzugszins_beginn_regel: str | None = None
+    verzugszins_gesetzlicher_fallback_hinweis: str | None = None
+    verzugszins_klauseltext_auszug: str | None = None
+    verzugszins_klauseltext_seite: int | None = None
 
 
 @dataclass(frozen=True)

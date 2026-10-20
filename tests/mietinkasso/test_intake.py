@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from datetime import date
+from decimal import Decimal
 
 import pytest
 
@@ -969,6 +970,9 @@ def test_mietvertragsprofil_neue_felder_werden_versioniert_uebernommen(session_f
         "verbraucher_unternehmer_status_mieter": "VERBRAUCHER",
         "verbraucher_unternehmer_status_vermieter": "UNTERNEHMER",
         "rechtsachse_mrg_anwendungsbereich": "VOLL", "rechtsachse_mietzinsbildung": "RICHTWERT",
+        "verzugszins_art": "VERTRAGLICH_VEREINBART", "verzugszins_satz_prozent": "9.200",
+        "verzugszins_beginn_regel": "ab Fälligkeit", "verzugszins_klauseltext_auszug": "Verzugszinsen 9,2% p.a.",
+        "verzugszins_klauseltext_seite": 3,
     }])
     plan = _plan(paket, session_factory)
     assert next(b for b in plan.befunde if b.entitaet == "Mietvertragsprofil").status == "NEU"
@@ -985,6 +989,11 @@ def test_mietvertragsprofil_neue_felder_werden_versioniert_uebernommen(session_f
     assert profil.verbraucher_unternehmer_status_vermieter == "UNTERNEHMER"
     assert profil.rechtsachse_mrg_anwendungsbereich == "VOLL"
     assert profil.rechtsachse_mietzinsbildung == "RICHTWERT"
+    assert profil.verzugszins_art == "VERTRAGLICH_VEREINBART"
+    assert profil.verzugszins_satz_prozent == Decimal("9.200")
+    assert profil.verzugszins_beginn_regel == "ab Fälligkeit"
+    assert profil.verzugszins_klauseltext_auszug == "Verzugszinsen 9,2% p.a."
+    assert profil.verzugszins_klauseltext_seite == 3
 
 
 def test_mietvertragsprofil_neue_felder_defaulten_auf_ungeklaert_ohne_ableitung(session_factory, stammdaten_repo, op_service):
@@ -1005,6 +1014,8 @@ def test_mietvertragsprofil_neue_felder_defaulten_auf_ungeklaert_ohne_ableitung(
     assert profil.verbraucher_unternehmer_status_vermieter == "UNGEKLAERT"
     assert profil.rechtsachse_mrg_anwendungsbereich == "UNGEKLAERT"
     assert profil.rechtsachse_mietzinsbildung == "UNGEKLAERT"
+    assert profil.verzugszins_art == "UNGEKLAERT"
+    assert profil.verzugszins_satz_prozent is None
 
 
 @pytest.mark.parametrize("feld,wert", [
@@ -1014,6 +1025,7 @@ def test_mietvertragsprofil_neue_felder_defaulten_auf_ungeklaert_ohne_ableitung(
     ("verbraucher_unternehmer_status_vermieter", "FIRMA"),
     ("rechtsachse_mrg_anwendungsbereich", "HALBVOLL"),
     ("rechtsachse_mietzinsbildung", "MARKT"),
+    ("verzugszins_art", "IRGENDWAS"),
 ])
 def test_mietvertragsprofil_ungueltiger_neuer_enumwert_ist_konflikt(session_factory, feld, wert):
     paket = _paket(mietvertragsprofile=[{"vertrag_id": "V-1", "nutzungsart": "WOHNUNG", "quelle_typ": "MANUELL", feld: wert}])

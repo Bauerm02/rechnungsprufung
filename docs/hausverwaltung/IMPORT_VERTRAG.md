@@ -392,12 +392,16 @@ OP/Sperren/Vertragskomponenten bleiben davon vollständig unberührt.
 ## Ergänzung 20.10.2026: weitere `mietvertragsprofile[]`-Felder (Auftrag
 ## HV-20261020-VERTRAGSDATENBASIS)
 
-Alle zwölf Felder unten sind additiv, NULLABLE bzw. mit `UNGEKLAERT`-
+Alle 26 Felder unten (20 aus der ursprünglichen Ergänzung + 6
+Verzugszins-Felder, s. u.) sind additiv, NULLABLE bzw. mit `UNGEKLAERT`-
 Default und folgen DERSELBEN Append-only-Regel wie die bereits
 dokumentierten `mietvertragsprofile[]`-Felder (abweichender Inhalt =
-`AKTUALISIERUNG`, keine neue Pflichtangabe, kein Konflikt). Noch OHNE
-eigenes Feld in der Backoffice-Review-Ansicht (`vertragsanlage_form.py`)
-- über das JSON-/CSV-Format aber bereits vollständig einspielbar.
+`AKTUALISIERUNG`, keine neue Pflichtangabe, kein Konflikt). Alle 26
+Felder haben inzwischen auch ein eigenes Feld in der Backoffice-
+Review-Ansicht (`vertragsanlage_form.py`, Fieldsets "Termine",
+"Rechtsachsen", "BK/HK-Abrechnung", "Verbraucher-/Unternehmerstatus",
+"Verzugszins") - das JSON-/CSV-Format bleibt der zweite, gleichwertige
+Weg zum selben Intake-Pfad.
 
 | Feld | Typ | Pflicht | Hinweis |
 |---|---|---|---|
@@ -421,6 +425,21 @@ eigenes Feld in der Backoffice-Review-Ansicht (`vertragsanlage_form.py`)
 | `rechtsachse_mrg_anwendungsbereich_quellenbeleg` | str\|null | nein | |
 | `rechtsachse_mietzinsbildung` | str | nein (default `UNGEKLAERT`) | `FREI`\|`RICHTWERT`\|`KATEGORIE`\|`ANDERE`\|`UNGEKLAERT` - gleiches Staging-Prinzip; Gewerbenutzung/freier Mietzins sind KEINE automatischen MRG-Ausnahmen, diese Achse bleibt deshalb unabhängig von `nutzungsart`/`rechtsachse_mrg_anwendungsbereich` |
 | `rechtsachse_mietzinsbildung_quellenbeleg` | str\|null | nein | |
+
+### Verzugszins-Felder (ebenfalls Teil von HV-20261020-VERTRAGSDATENBASIS)
+
+Dieselbe Staging-Logik wie oben - AUSDRÜCKLICH unverbindlich, ersetzt
+NICHT die freigegebene `MahnPolicyTable.zinsen_prozent` (siehe
+`mahnwesen/kosten_service.py`); erzeugt KEINE Freigabe/Buchung.
+
+| Feld | Typ | Pflicht | Hinweis |
+|---|---|---|---|
+| `verzugszins_art` | str | nein (default `UNGEKLAERT`) | `VERTRAGLICH_VEREINBART`\|`GESETZLICHER_FALLBACK`\|`UNGEKLAERT` - Herkunft des erfassten Satzes; NIE aus Verbraucher-/Unternehmerstatus allein geraten |
+| `verzugszins_satz_prozent` | Decimal\|null | nein | Nur relevant/sinnvoll bei `VERTRAGLICH_VEREINBART`; eine konkrete belegte Zahl, keine Schätzung |
+| `verzugszins_beginn_regel` | str\|null | nein | Freitext, z. B. "ab Fälligkeit" / "nach erfolglosem Mahnschreiben" |
+| `verzugszins_gesetzlicher_fallback_hinweis` | str\|null | nein | Freitext-Hinweis, welcher gesetzliche Zinssatz (ABGB/UGB) je nach `verbraucher_unternehmer_status_*` in Frage käme - rein informativ, löst KEINE automatische Zinsberechnung aus |
+| `verzugszins_klauseltext_auszug` | str\|null | nein | Wortlaut-Auszug der Klausel, GETRENNT von der tatsächlichen Wirksamkeitsprüfung |
+| `verzugszins_klauseltext_seite` | int\|null | nein | Seitenzahl im Quelldokument |
 
 ## JSON-Beispiel (rein synthetisch)
 

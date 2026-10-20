@@ -650,6 +650,12 @@ class StammdatenRepository:
         rechtsachse_mrg_anwendungsbereich_quellenbeleg: str | None = None,
         rechtsachse_mietzinsbildung: str = "UNGEKLAERT",
         rechtsachse_mietzinsbildung_quellenbeleg: str | None = None,
+        verzugszins_art: str = "UNGEKLAERT",
+        verzugszins_satz_prozent: Decimal | None = None,
+        verzugszins_beginn_regel: str | None = None,
+        verzugszins_gesetzlicher_fallback_hinweis: str | None = None,
+        verzugszins_klauseltext_auszug: str | None = None,
+        verzugszins_klauseltext_seite: int | None = None,
         session: Session | None = None,
     ) -> MietvertragsprofilTable:
         """Reines Insert einer NEUEN Version (append-only, siehe
@@ -711,6 +717,12 @@ class StammdatenRepository:
                 rechtsachse_mrg_anwendungsbereich_quellenbeleg=rechtsachse_mrg_anwendungsbereich_quellenbeleg,
                 rechtsachse_mietzinsbildung=rechtsachse_mietzinsbildung,
                 rechtsachse_mietzinsbildung_quellenbeleg=rechtsachse_mietzinsbildung_quellenbeleg,
+                verzugszins_art=verzugszins_art,
+                verzugszins_satz_prozent=verzugszins_satz_prozent,
+                verzugszins_beginn_regel=verzugszins_beginn_regel,
+                verzugszins_gesetzlicher_fallback_hinweis=verzugszins_gesetzlicher_fallback_hinweis,
+                verzugszins_klauseltext_auszug=verzugszins_klauseltext_auszug,
+                verzugszins_klauseltext_seite=verzugszins_klauseltext_seite,
             )
             active_session.add(row)
             return row

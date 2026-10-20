@@ -2837,6 +2837,192 @@ def test_neuen_mietvertrag_mit_pdf_upload_end_to_end(backoffice_client):
     assert stammdaten.get_kaution("V-601-NEU1") is None
 
 
+def test_neue_vertragsdatenbasis_felder_im_formular_und_der_akte_bedienbar_und_persistent(backoffice_client):
+    """Auftrag HV-20261020-VERTRAGSDATENBASIS (jüngste Markus-Anweisung):
+    die neuen Rechts-/BK-/Parteistatus-/Verzugszinsfelder müssen
+    TATSÄCHLICH im Formular UND in der zentralen Übersicht/Mieterakte
+    bedienbar sein - kein reines Backend-/JSON-Feature. Ein Nachtrag
+    (zweiter Durchlauf) darf bestehende Angaben NICHT auf leer/
+    UNGEKLAERT zurücksetzen."""
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    angelegt = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "NEU", "csrf_token": csrf, "vertrag_id": "V-601-VZS",
+            "einheit_id": "601-KURZ1", "debitor_id": "DEB-1", "gesellschaft_id": "7DI",
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "gueltig_von": "2026-09-01", "gueltig_bis": "",
+        },
+    )
+    assert angelegt.status_code == 200
+    # Die neuen Fieldsets müssen im Review-Formular selbst sichtbar sein.
+    for erwartet in (
+        'name="verzugszins_art"', 'name="rechtsachse_mrg_anwendungsbereich"',
+        'name="rechtsachse_mietzinsbildung"', 'name="bk_hk_abrechnungsart"',
+        'name="verbraucher_unternehmer_status_mieter"', 'name="befristungsstatus"',
+        'name="unterzeichnungsdatum"',
+    ):
+        assert erwartet in angelegt.text
+    marker = 'name="csrf_token" value="'
+    start = angelegt.text.index(marker) + len(marker)
+    ende = angelegt.text.index('"', start)
+    form_csrf = angelegt.text[start:ende]
+
+    basisformular = {
+        "csrf_token": form_csrf, "modus": "NEU", "vertrag_id": "V-601-VZS",
+        "einheit_id": "601-KURZ1", "debitor_id": "DEB-1", "gesellschaft_id": "7DI",
+        "rechtsordnung": "OESTERREICH_MRG_VOLL", "gueltig_von": "2026-09-01", "gueltig_bis": "",
+        "quelle_typ": "MANUELL", "nutzungsart": "WOHNUNG",
+        "verzugszins_art": "VERTRAGLICH_VEREINBART", "verzugszins_satz_prozent": "9,2",
+        "verzugszins_beginn_regel": "ab Fälligkeit",
+        "rechtsachse_mrg_anwendungsbereich": "VOLL", "rechtsachse_mietzinsbildung": "RICHTWERT",
+        "bk_hk_abrechnungsart": "AKONTO_VORAUSZAHLUNG", "bk_hk_verteilungsschluessel": "nach Nutzfläche",
+        "verbraucher_unternehmer_status_mieter": "VERBRAUCHER", "verbraucher_unternehmer_status_vermieter": "UNTERNEHMER",
+        "befristungsstatus": "BEFRISTET", "unterzeichnungsdatum": "2026-08-15",
+    }
+
+    def _vorschau_und_uebernehmen(formular):
+        vorschau = client.post("/backoffice/vertragsanlage/vorschau", data=formular)
+        assert vorschau.status_code == 200
+        paket_marker = 'name="paket_json" hidden>'
+        p_start = vorschau.text.index(paket_marker) + len(paket_marker)
+        p_ende = vorschau.text.index("</textarea>", p_start)
+        import html as _html
+        paket_json_roh = _html.unescape(vorschau.text[p_start:p_ende])
+        uebernommen = client.post(
+            "/backoffice/vertragsanlage/uebernehmen",
+            data={"csrf_token": formular["csrf_token"], "paket_json": paket_json_roh},
+            follow_redirects=False,
+        )
+        assert uebernommen.status_code == 303
+
+    _vorschau_und_uebernehmen(basisformular)
+
+    detail = client.get("/backoffice/vertrag/V-601-VZS")
+    assert detail.status_code == 200
+    for erwartet in (
+        "VERTRAGLICH_VEREINBART", "9.200", "VOLL", "RICHTWERT", "AKONTO_VORAUSZAHLUNG",
+        "VERBRAUCHER", "UNTERNEHMER", "BEFRISTET", "2026-08-15",
+    ):
+        assert erwartet in detail.text
+
+    uebersicht = client.get("/backoffice/vertraege")
+    assert uebersicht.status_code == 200
+    assert "Test Mieterin" in uebersicht.text
+
+    # Nachtrag: NUR ein bisher ungesetztes Feld (Verwaltung) wird ergänzt -
+    # die bereits bestätigten Felder oben dürfen NICHT auf UNGEKLAERT/leer
+    # zurückfallen, nur weil sie im zweiten Formular fehlen würden; das
+    # Bearbeiten-Formular ist deshalb mit den BESTEHENDEN Werten
+    # vorausgefüllt (siehe `bestehende_werte`), das Testformular schickt sie
+    # unverändert mit zurück - das entspricht dem echten Browser-Verhalten
+    # (ein <select> sendet immer einen Wert).
+    bearbeiten_seite = client.get("/backoffice/vertrag/V-601-VZS/mietvertragsprofil/bearbeiten")
+    assert bearbeiten_seite.status_code == 200
+    assert 'value="9.200"' in bearbeiten_seite.text or "9.200" in bearbeiten_seite.text
+    marker2 = 'name="csrf_token" value="'
+    start2 = bearbeiten_seite.text.index(marker2) + len(marker2)
+    ende2 = bearbeiten_seite.text.index('"', start2)
+    bearbeiten_csrf = bearbeiten_seite.text[start2:ende2]
+
+    nachtragsformular = dict(basisformular)
+    nachtragsformular["csrf_token"] = bearbeiten_csrf
+    nachtragsformular["modus"] = "BESTEHEND"
+    nachtragsformular["verwaltung_bezeichnung"] = "JLB Projects GmbH"
+    _vorschau_und_uebernehmen(nachtragsformular)
+
+    detail_nach_nachtrag = client.get("/backoffice/vertrag/V-601-VZS")
+    assert "JLB Projects GmbH" in detail_nach_nachtrag.text
+    for erwartet in ("VERTRAGLICH_VEREINBART", "VOLL", "RICHTWERT", "AKONTO_VORAUSZAHLUNG", "BEFRISTET"):
+        assert erwartet in detail_nach_nachtrag.text
+
+
+def test_mitmieter_hinweis_aus_pdf_erscheint_im_review_ohne_automatische_anlage(backoffice_client):
+    """Auftrag HV-20261020-VERTRAGSDATENBASIS: "Kontakt-/Parteiextraktion
+    mit richtiger Zuordnung" ist bedienbar - ein im PDF gefundener
+    Mitmieter wird als geprüfter Hinweis im Review angezeigt, aber NIE
+    automatisch als Partei angelegt (das bleibt der manuellen Erfassung
+    über "Partei hinzufügen" vorbehalten)."""
+
+    from tests.mietinkasso._pdf_test_helpers import build_text_pdf
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    pdf = build_text_pdf(["Mieter: Max Mustermann", "Mitmieter: Erika Musterfrau Tel: 0664 1234567"])
+    hochgeladen = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "NEU", "csrf_token": csrf, "vertrag_id": "V-601-MITMIETER",
+            "einheit_id": "601-KURZ1", "debitor_id": "DEB-1", "gesellschaft_id": "7DI",
+            "rechtsordnung": "OESTERREICH_MRG_VOLL", "gueltig_von": "2026-09-01", "gueltig_bis": "",
+        },
+        files={"pdf_datei": ("vertrag.pdf", pdf, "application/pdf")},
+    )
+    assert hochgeladen.status_code == 200
+    assert "Erika Musterfrau" in hochgeladen.text
+    assert "Partei hinzufügen" in hochgeladen.text
+    assert 'name="mitmieter_name"' not in hochgeladen.text  # kein eigenes übernehmbares Formularfeld
+
+
+def test_zentrale_uebersicht_objekt_und_mieterfilter_wirken(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+
+    alle = client.get("/backoffice/vertraege")
+    assert alle.status_code == 200
+    assert "Test Mieterin" in alle.text
+
+    nach_objekt = client.get("/backoffice/vertraege", params={"objekt_id": "601"})
+    assert nach_objekt.status_code == 200
+    assert "Test Mieterin" in nach_objekt.text
+
+    kein_treffer = client.get("/backoffice/vertraege", params={"q": "Niemand-Existiert-XYZ"})
+    assert kein_treffer.status_code == 200
+    assert "Keine Verträge gefunden" in kein_treffer.text
+
+
+def test_partei_hinzufuegen_erscheint_in_der_mieterakte(backoffice_client):
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    antwort = client.post(
+        "/backoffice/vertrag/V-601-1/parteien",
+        data={
+            "csrf_token": csrf, "rolle": "MITMIETER", "name": "Erika Musterfrau",
+            "email": "erika@example.at", "zustand": "BESTAETIGT",
+        },
+        follow_redirects=False,
+    )
+    assert antwort.status_code == 303
+    assert antwort.headers["location"] == "/backoffice/vertrag/V-601-1"
+
+    detail = client.get("/backoffice/vertrag/V-601-1")
+    assert "Erika Musterfrau" in detail.text
+    assert "Parteien" in detail.text
+
+
+def test_partei_hinzufuegen_lehnt_hauptmieter_rolle_ab(backoffice_client):
+    """Design-Vorgabe Markus: der Hauptmieter wird über den Debitor
+    geführt, NICHT hier mit abweichenden Kontaktfeldern dupliziert."""
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    antwort = client.post(
+        "/backoffice/vertrag/V-601-1/parteien",
+        data={"csrf_token": csrf, "rolle": "HAUPTMIETER", "name": "Duplikat Versuch"},
+    )
+    assert antwort.status_code == 400
+    assert "Hauptmieter" in antwort.text
+
+
 def test_neuanlage_mit_neuem_mieter_und_mietbestandteilen_end_to_end(backoffice_client):
     """P1-Nachbesserung: 'Neuanlage verlangt bereits bestehenden Debitor
     ... kann keine Mietbestandteile erfassen.' Legt einen VÖLLIG neuen

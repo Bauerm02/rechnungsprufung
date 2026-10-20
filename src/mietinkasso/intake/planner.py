@@ -28,6 +28,7 @@ from mietinkasso.domain.enums import (
     Rechtsordnung,
     Sperrgrund,
     VerbraucherUnternehmerStatus,
+    VerzugszinsArt,
     rechtsordnung_geklaert,
 )
 from mietinkasso.infrastructure.db.tables import (
@@ -62,6 +63,7 @@ _GUELTIGE_BK_HK_ABRECHNUNGSARTEN = {e.value for e in BkHkAbrechnungsart}
 _GUELTIGE_VERBRAUCHER_UNTERNEHMER_STATUS = {e.value for e in VerbraucherUnternehmerStatus}
 _GUELTIGE_RECHTSACHSE_MRG_ANWENDUNGSBEREICH = {e.value for e in RechtsachseMrgAnwendungsbereich}
 _GUELTIGE_RECHTSACHSE_MIETZINSBILDUNG = {e.value for e in RechtsachseMietzinsbildung}
+_GUELTIGE_VERZUGSZINS_ARTEN = {e.value for e in VerzugszinsArt}
 
 _GUELTIGE_NUTZUNGSSTATUS = {e.value for e in Nutzungsstatus}
 _GUELTIGE_RECHTSORDNUNGEN = {e.value for e in Rechtsordnung}
@@ -155,6 +157,7 @@ def _mehrfache_werte(werte: list[str]) -> set[str]:
 #: `_dezimal_kanonisch`.
 _SKALIERUNG_INDEX_BASISWERT = Decimal("0.0001")
 _SKALIERUNG_INDEX_SCHWELLE_PROZENT = Decimal("0.001")
+_SKALIERUNG_VERZUGSZINS_SATZ = Decimal("0.001")
 
 
 def _dezimal_kanonisch(wert: Decimal | None, skalierung: Decimal) -> str | None:
@@ -242,6 +245,12 @@ def _mietvertragsprofil_felder(
     rechtsachse_mrg_anwendungsbereich_quellenbeleg: str | None = None,
     rechtsachse_mietzinsbildung: str = "UNGEKLAERT",
     rechtsachse_mietzinsbildung_quellenbeleg: str | None = None,
+    verzugszins_art: str = "UNGEKLAERT",
+    verzugszins_satz_prozent=None,
+    verzugszins_beginn_regel: str | None = None,
+    verzugszins_gesetzlicher_fallback_hinweis: str | None = None,
+    verzugszins_klauseltext_auszug: str | None = None,
+    verzugszins_klauseltext_seite: int | None = None,
 ) -> dict:
     """Feldabbild für den Versionsvergleich (siehe `_pruefe_mietvertragsprofil`)
     - bewusst OHNE `erstellt_von`/`erstellt_am`/`version`: eine neue Version mit
@@ -287,6 +296,12 @@ def _mietvertragsprofil_felder(
         "rechtsachse_mrg_anwendungsbereich_quellenbeleg": rechtsachse_mrg_anwendungsbereich_quellenbeleg,
         "rechtsachse_mietzinsbildung": rechtsachse_mietzinsbildung,
         "rechtsachse_mietzinsbildung_quellenbeleg": rechtsachse_mietzinsbildung_quellenbeleg,
+        "verzugszins_art": verzugszins_art,
+        "verzugszins_satz_prozent": _dezimal_kanonisch(verzugszins_satz_prozent, _SKALIERUNG_VERZUGSZINS_SATZ),
+        "verzugszins_beginn_regel": verzugszins_beginn_regel,
+        "verzugszins_gesetzlicher_fallback_hinweis": verzugszins_gesetzlicher_fallback_hinweis,
+        "verzugszins_klauseltext_auszug": verzugszins_klauseltext_auszug,
+        "verzugszins_klauseltext_seite": verzugszins_klauseltext_seite,
     }
 
 
@@ -318,6 +333,12 @@ def _mietvertragsprofil_felder_aus_zeile(z: MietvertragsprofilZeile) -> dict:
         rechtsachse_mrg_anwendungsbereich_quellenbeleg=z.rechtsachse_mrg_anwendungsbereich_quellenbeleg,
         rechtsachse_mietzinsbildung=z.rechtsachse_mietzinsbildung,
         rechtsachse_mietzinsbildung_quellenbeleg=z.rechtsachse_mietzinsbildung_quellenbeleg,
+        verzugszins_art=z.verzugszins_art,
+        verzugszins_satz_prozent=z.verzugszins_satz_prozent,
+        verzugszins_beginn_regel=z.verzugszins_beginn_regel,
+        verzugszins_gesetzlicher_fallback_hinweis=z.verzugszins_gesetzlicher_fallback_hinweis,
+        verzugszins_klauseltext_auszug=z.verzugszins_klauseltext_auszug,
+        verzugszins_klauseltext_seite=z.verzugszins_klauseltext_seite,
     )
 
 
@@ -349,6 +370,12 @@ def _mietvertragsprofil_felder_aus_tabelle(t: MietvertragsprofilTable) -> dict:
         rechtsachse_mrg_anwendungsbereich_quellenbeleg=t.rechtsachse_mrg_anwendungsbereich_quellenbeleg,
         rechtsachse_mietzinsbildung=t.rechtsachse_mietzinsbildung,
         rechtsachse_mietzinsbildung_quellenbeleg=t.rechtsachse_mietzinsbildung_quellenbeleg,
+        verzugszins_art=t.verzugszins_art,
+        verzugszins_satz_prozent=t.verzugszins_satz_prozent,
+        verzugszins_beginn_regel=t.verzugszins_beginn_regel,
+        verzugszins_gesetzlicher_fallback_hinweis=t.verzugszins_gesetzlicher_fallback_hinweis,
+        verzugszins_klauseltext_auszug=t.verzugszins_klauseltext_auszug,
+        verzugszins_klauseltext_seite=t.verzugszins_klauseltext_seite,
     )
 
 
@@ -931,6 +958,7 @@ def _pruefe_mietvertragsprofil(
         ("verbraucher_unternehmer_status_vermieter", z.verbraucher_unternehmer_status_vermieter, _GUELTIGE_VERBRAUCHER_UNTERNEHMER_STATUS),
         ("rechtsachse_mrg_anwendungsbereich", z.rechtsachse_mrg_anwendungsbereich, _GUELTIGE_RECHTSACHSE_MRG_ANWENDUNGSBEREICH),
         ("rechtsachse_mietzinsbildung", z.rechtsachse_mietzinsbildung, _GUELTIGE_RECHTSACHSE_MIETZINSBILDUNG),
+        ("verzugszins_art", z.verzugszins_art, _GUELTIGE_VERZUGSZINS_ARTEN),
     ):
         if wert not in gueltige_werte:
             befunde.append(PruefBefund(entitaet, z.vertrag_id, "KONFLIKT", f"Mietvertragsprofil '{z.vertrag_id}': ungültiger {feld_name} '{wert}'."))

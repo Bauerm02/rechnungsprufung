@@ -244,6 +244,22 @@ class RechtsachseMrgAnwendungsbereich(str, enum.Enum):
     UNGEKLAERT = "UNGEKLAERT"
 
 
+class VerzugszinsArt(str, enum.Enum):
+    """Auftrag HV-20261020-VERTRAGSDATENBASIS: Herkunft des im Profil
+    erfassten Verzugszinssatzes - `VERTRAGLICH_VEREINBART` (eine
+    konkrete Klausel nennt einen Satz), `GESETZLICHER_FALLBACK` (keine
+    wirksame vertragliche Vereinbarung, der gesetzliche Zinssatz -
+    ABGB/UGB, je nach `VerbraucherUnternehmerStatus` - gilt), oder
+    `UNGEKLAERT`. Rein unverbindliches Staging wie die Index-Quellfelder
+    - die TATSÄCHLICH wirksame Berechnungsgrundlage bleibt ausschließlich
+    die freigegebene `MahnPolicyTable.zinsen_prozent`, siehe
+    `mahnwesen/kosten_service.py`; dieses Feld erzeugt KEINE Freigabe."""
+
+    VERTRAGLICH_VEREINBART = "VERTRAGLICH_VEREINBART"
+    GESETZLICHER_FALLBACK = "GESETZLICHER_FALLBACK"
+    UNGEKLAERT = "UNGEKLAERT"
+
+
 class RechtsachseMietzinsbildung(str, enum.Enum):
     """Auftrag HV-20261020-VERTRAGSDATENBASIS: zweite der drei getrennten
     Rechtsachsen (siehe `RechtsachseMrgAnwendungsbereich`-Docstring) -

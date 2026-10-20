@@ -1,5 +1,95 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## HV-20261020-VERTRAGSDATENBASIS: vollständige Fertigstellung (Markus-Auftrag
+## nach e953a58, 20.10.2026) — Backend, Formular, zentrale Übersicht, Parteien
+
+Dieser Auftragsschritt schließt die zuvor nur backend-seitig vorhandenen
+Felder vollständig an die Bedienoberfläche an - der frühere Hinweis "noch
+ohne Formularfeld" in diesem Dokument ist damit abgelöst. Umfasst:
+
+- **Verzugszins-Staging** (6 neue, nullable `MietvertragsprofilTable`-Felder:
+  `verzugszins_art`/`_satz_prozent`/`_beginn_regel`/
+  `_gesetzlicher_fallback_hinweis`/`_klauseltext_auszug`/`_klauseltext_seite`)
+  durch die komplette Intake-Kette gezogen (Schema, Parser, Planner-
+  Validierung/-Versionsvergleich, Apply, `paket_bau.py`, `IMPORT_VERTRAG.md`).
+  Wie die bereits vorhandenen Index-Quellfelder AUSDRÜCKLICH unverbindlich -
+  ersetzt NICHT die freigegebene `MahnPolicyTable.zinsen_prozent`.
+- **Formular (`vertragsanlage_form.py::review_formular`)**: fünf neue
+  Fieldsets (Termine/Befristung, Rechtsachsen, BK/HK-Abrechnung,
+  Verbraucher-/Unternehmerstatus, Verzugszins) für ALLE 26 additiven Felder
+  aus dieser und der vorhergehenden Teilauslieferung - jedes mit
+  Belegshinweis wie die bestehenden Felder. `bestehende_werte()`/
+  `profil_werte_aus_form()` entsprechend erweitert (inkl. Enum-Validierung,
+  die bei ungültigem Wert einen KONFLIKT/ValueError erzeugt statt still zu
+  raten). Der bestehende Nie-überschreiben-Mechanismus beim PDF-Merge
+  (`if not werte.get(feld): werte[feld] = vorschlag...`) deckt diese neuen
+  Felder automatisch mit ab - ein Nachtrag setzt bereits bestätigte Angaben
+  NICHT auf leer/UNGEKLAERT zurück (Regressionstest:
+  `test_neue_vertragsdatenbasis_felder_im_formular_und_der_akte_bedienbar_und_persistent`).
+- **Mieterakte (`detail_ansicht`)**: neue Karten "Kaution, Mahngebühren und
+  Verzugszins" (erweitert), "Rechtsachsen, BK/HK-Abrechnung und
+  Parteistatus", "Parteien" (Mitmieter/Vertreter-Liste + Formular) und
+  "Berechnungsbereitschaft je Rechenzweck" (Mietrechnung/Index-Anpassung/
+  Mahnung, mit konkreten Fehlgründen je Zweck - ein für einen Zweck
+  irrelevantes fehlendes Feld, z. B. Telefon für die Mietrechnung, wird dort
+  NICHT als Blocker gelistet).
+- **Parteien-Pflege**: neue Route `POST /backoffice/vertrag/{id}/parteien`
+  gegen die EINE führende `VertragMitmieterTable` (über den neuen
+  `deps._mitmieter_repo`) - Hauptmieter wird dort bewusst NICHT angeboten
+  (bleibt ausschließlich der verknüpfte Debitor, keine Dublette).
+- **Kontakt-/Parteiextraktion aus dem PDF**: neue Regex-Muster
+  `mitmieter_name`/`mitmieter_telefon` in `pdf_extraktion.py` (Synonyme
+  "Mitmieter(in)"/"weitere(r) Mieter(in)"/"zusätzliche(r) Mieter(in)").
+  Der Treffer erscheint im Review-Formular als Hinweis mit Seitenbeleg
+  ("Eckdaten dieses Vorgangs") - er wird **NIE automatisch als Partei
+  angelegt**, sondern verweist auf die manuelle Erfassung über "Partei
+  hinzufügen" in der Mieterakte. Das ist eine bewusste Entscheidung (kein
+  ungeprüfter Datensatz), keine technische Lücke.
+- **Zentrale Vertragsübersicht (`vertraege_liste_formular`)**: Objekt-/
+  Mieterfilter (`GET /backoffice/vertraege?objekt_id=...&q=...`) und je
+  Zeile ein aufklappbares `<details>` mit kurzen Spalten plus Laufzeit/
+  Indexbasis/Kaution/Mahn-Zinsregel/Rechtsachsen-Kurzfassung und direktem
+  Link in die Mieterakte/zum Profil-Bearbeiten.
+- **HTTP-Vertragstest** (`test_backoffice_contract.py`,
+  `fixtures/backoffice_http_contract.json`): Snapshot neu generiert (113
+  statt 112 Routen - additiv die neue Parteien-Route); kein bestehender
+  Routenpfad wurde verändert oder entfernt.
+
+### Bewusst NICHT automatisiert (keine neue Rechenlogik erfunden)
+
+Entspricht der ausdrücklichen Vorgabe "keine zusätzliche Jahresabrechnung
+oder neue Zinsautomatik erfinden, nur mit den vorhandenen Freigabe-/
+Rechendiensten verbinden":
+
+- **BK/HK-Nachverrechnung**: `bk_hk_abrechnungsart`/`bk_hk_verteilungs
+  schluessel` bleiben reines Staging. Es existiert noch KEIN Zielservice
+  im System, der eine jährliche BK/HK-Abrechnung berechnet oder bucht
+  (vgl. `IMPORT_VERTRAG.md`: BK-Abrechnungen "sind noch offen") - diese
+  Felder sind deshalb informativ, nicht an eine Buchung angeschlossen.
+- **Automatische Verzugszins-Satzwahl**: das System wählt den
+  gesetzlichen Fallback-Zinssatz (ABGB/UGB) NICHT automatisch anhand von
+  `verbraucher_unternehmer_status_*`. Die tatsächlich wirksame
+  Berechnungsgrundlage bleibt ausschließlich die freigegebene
+  `MahnPolicyTable.zinsen_prozent` (`mahnwesen/kosten_service.py`) - die
+  neuen Felder sind reiner, mit Quelle versehener Kontext für die Person,
+  die diese Policy freigibt, keine neue Automatik.
+- **Rechtsachsen-Staging → Rechtsprofil**: `rechtsachse_mrg_
+  anwendungsbereich`/`rechtsachse_mietzinsbildung` verbinden sich NICHT
+  automatisch mit `VertragTable.rechtsordnung`/`RechtsprofilTable` - die
+  Mieterakte verlinkt stattdessen auf die bestehende Rechtsprofil-/
+  Vertragsprüfung-Verwaltung (vorhandener Freigabeweg), eine Person
+  entscheidet weiterhin bewusst über die Übernahme.
+
+### Noch offen (nächster Schritt laut Auftragsreihenfolge)
+
+Die übrigen Mahn-Ergänzungen (#31-33 der internen Aufgabenliste) bleiben
+nach diesem Commit beauftragt und offen: vollständige IBAN/Kontoinhaber/
+Referenz-Tabelle im Mahnschreiben, ehrlicher realer Mitmieter-Versandweg
+(bisher nur Debitor als Anker adressiert), Backoffice-UI für Zugang/
+4-Stufen-Profil im Mahnwesen selbst (unterscheidet sich von der hier
+gebauten Vertragsanlage-Parteien-UI, auch wenn beide dieselbe
+`VertragMitmieterTable` nutzen).
+
 ## Zwei Folgefixes nach unabhängiger Abnahme von 2edb938/c1c62b6 (Codex, 20.10.2026)
 
 ### Mahn-Folgefix: Tageslauf-Slot nach bestätigtem Providerkontakt (behoben)

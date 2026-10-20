@@ -138,6 +138,20 @@ _MUSTER: dict[str, re.Pattern[str]] = {
     "mahngebuehr_keine": re.compile(r"(keine Mahnspesen|keine Mahngeb(?:ü|ue)hr(?:en)?)", re.IGNORECASE),
     "mieter_name": re.compile(r"Mieter\s*:?\s*\n?\s*([A-ZÄÖÜ][\wÄÖÜäöüß .,-]{2,70})", re.MULTILINE),
     "vermieter_name": re.compile(r"Vermieter\s*:?\s*\n?\s*([A-ZÄÖÜ][\wÄÖÜäöüß .,-]{2,70})", re.MULTILINE),
+    # Auftrag HV-20261020-VERTRAGSDATENBASIS: Mitmieter/Vertreter sind
+    # KEIN Debitor und werden NIE automatisch angelegt (siehe
+    # `vorschlaege.py`/`backoffice/vertragsanlage_form.py::_parteien_html`)
+    # - nur ein geprüfter Hinweis mit Seitenbeleg für die MANUELLE
+    # Erfassung über "Partei hinzufügen" in der Mieterakte.
+    "mitmieter_name": re.compile(
+        r"(?:Mitmieter(?:in)?|weitere[rn]?\s+Mieter(?:in)?|zus(?:ä|ae)tzliche[rn]?\s+Mieter(?:in)?)\s*:?\s*\n?\s*"
+        r"([A-ZÄÖÜ][\wÄÖÜäöüß .,-]{2,70}?)(?=\s*(?:,|Tel(?:efon)?\.?\s*:|\n|$))",
+        re.MULTILINE | re.IGNORECASE,
+    ),
+    "mitmieter_telefon": re.compile(
+        r"(?:Mitmieter(?:in)?|weitere[rn]?\s+Mieter(?:in)?)[^\n]{0,80}?(?:Tel(?:efon)?\.?\s*:?)\s*([0-9+()/ .-]{6,25})",
+        re.IGNORECASE,
+    ),
     "mietbeginn": re.compile(
         r"(?:Mietbeginn|Beginn des Mietverh(?:ä|ae)ltnisses|Mietverh(?:ä|ae)ltnis beginnt am)"
         r"[^\d]{0,20}(\d{1,2}\.\d{1,2}\.\d{4})",
