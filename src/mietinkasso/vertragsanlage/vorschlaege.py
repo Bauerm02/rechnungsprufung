@@ -42,6 +42,14 @@ def _mietbeginn_iso(ddmmyyyy: str) -> str | None:
 
 #: Direkte 1:1-Übernahmen von Extraktionsfeld -> Formularfeld (keine
 #: weitere Umformung nötig).
+#:
+#: **"nettomiete_cent" ist ABSICHTLICH NICHT hier enthalten** (Korrektur
+#: nach unabhängiger Abnahme, Codex 20.10.2026): `hauptmietzins_cent` ist
+#: im System per Definition BRUTTO (siehe `pdf_extraktion.py`-Kommentar)
+#: - eine als "Nettomiete" bezeichnete Fundstelle wird deshalb NIE in
+#: dieses Brutto-Feld gemappt, sondern unten als eigener, klar als NETTO
+#: beschrifteter Hinweis (`nettomiete_hinweis_cent`) geführt, den ein
+#: Mensch bewusst gegen das Brutto-Feld abgleichen muss.
 _DIREKTE_FELDER = {
     "kaution_cent": "vertragliche_kaution_cent",
     "hauptmietzins_cent": "hauptmietzins_cent",
@@ -53,6 +61,7 @@ _DIREKTE_FELDER = {
     "index_schwelle_prozent": "index_schwelle_prozent",
     "mieter_name": "mieter_name_hinweis",
     "vermieter_name": "vermieter_name_hinweis",
+    "nettomiete_cent": "nettomiete_hinweis_cent",
 }
 
 
@@ -105,6 +114,7 @@ def vorschlaege_aus_extraktion(ergebnis: ExtraktionsErgebnis) -> dict[str, Vorsc
 _FELD_LABELS = {
     "kaution_cent": "Kaution",
     "hauptmietzins_cent": "Hauptmietzins",
+    "nettomiete_cent": "Nettomiete (NICHT automatisch Brutto)",
     "betriebskosten_cent": "Betriebskosten",
     "heizkosten_cent": "Heizkosten",
     "kueche_cent": "Küche",

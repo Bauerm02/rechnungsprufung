@@ -60,11 +60,27 @@ _MINDEST_TEXTLAENGE_FUER_TEXTLAGE = 20
 # Geldbetrag VOR ODER NACH der Währung ("1.500,00 EUR", "EUR 1.500,00",
 # "€ 1.500,00", "in Höhe von EUR 1.500,00") - GENAU eine der beiden
 # Gruppen ist nach einem Treffer belegt, siehe `_erste_gruppe`.
+#
+# **Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026, reproduzierter
+# Fehler):** die vorherige Fassung begrenzte die FÜHRENDE Zifferngruppe
+# auf `[0-9]{1,3}` OHNE eine nachfolgende Zifferngrenze zu verlangen -
+# bei einer unformatierten Zahl ohne Tausenderpunkt (z. B. "1200",
+# "1200,00", "12345,67") matchte die Regex deshalb nur die ERSTEN 1-3
+# Ziffern und ließ den Rest als scheinbar erfolgreichen, aber
+# TRUNKIERTEN Treffer stehen ("1200" -> "120", "12345,67" -> "123").
+# `[0-9]+` (unbegrenzt) statt `[0-9]{1,3}` behebt das: die führende
+# Zifferngruppe konsumiert IMMER den vollständigen zusammenhängenden
+# Ziffernlauf, die nachfolgenden optionalen Gruppen fangen danach nur
+# noch einen WIRKLICHEN Tausenderpunkt-/Dezimaltrenner-Rest ab (siehe
+# Regressionstests in `test_vertragsanlage_pdf.py`). Andere, bereits
+# korrekt erkannte Formate ("1.500,00", "1.500.000,00", "45.50") werden
+# dadurch NICHT umgedeutet - nur der Umfang der führenden Zifferngruppe
+# selbst ändert sich.
 _BETRAG_FRAGMENT = (
     r"(?:in H(?:ö|oe)he von\s*)?(?:"
-    r"(?:€|EUR)\s*([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)"
+    r"(?:€|EUR)\s*([0-9]+(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)"
     r"|"
-    r"([0-9]{1,3}(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)\s*(?:€|EUR)"
+    r"([0-9]+(?:[.,][0-9]{3})*(?:[.,][0-9]{2})?)\s*(?:€|EUR)"
     r")"
 )
 
@@ -75,15 +91,32 @@ _BETRAG_FRAGMENT = (
 # dient nur als Ja/Nein-Indikator (z. B. Nutzungsart-Hinweise).
 _MUSTER: dict[str, re.Pattern[str]] = {
     "kaution_cent": re.compile(r"Kaution[^\d€]{0,60}" + _BETRAG_FRAGMENT, re.IGNORECASE),
+    # Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026): "Nettomiete"
+    # wurde bisher in DENSELBEN Extraktionsschlüssel wie "Hauptmietzins"/
+    # "Miete monatlich" gemischt - `hauptmietzins_cent` ist im System aber
+    # per Definition BRUTTO (siehe `backoffice/vertragsanlage_form.py`,
+    # Label "Hauptmietzins (brutto, EUR)" und `VertragsKomponenteTable.
+    # betrag_cent`-Docstring in `domain/money.py`). Eine explizit als NETTO
+    # bezeichnete Vertragsangabe darf NIE stillschweigend in dieses
+    # Brutto-Feld übernommen werden (Auftrag Markus: "Nettomiete niemals
+    # still als Brutto übernehmen") - "Nettomiete" hat deshalb jetzt einen
+    # EIGENEN Extraktionsschlüssel `nettomiete_cent`, der NICHT auf
+    # `hauptmietzins_cent` gemappt wird (siehe `vorschlaege.py`).
     "hauptmietzins_cent": re.compile(
-        r"(?:Hauptmietzins|Nettomiete|Miete monatlich)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE,
+        r"(?:Hauptmietzins|Miete monatlich)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE,
     ),
+    "nettomiete_cent": re.compile(r"Nettomiete[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
     "betriebskosten_cent": re.compile(r"Betriebskosten[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
     "heizkosten_cent": re.compile(r"Heizkosten[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
     "kueche_cent": re.compile(r"K(?:ü|ue)che[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
     "parkplatz_cent": re.compile(r"Parkplatz[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
-    "mahngebuehr_cent": re.compile(r"Mahnspesen?[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE),
-    "mahngebuehr_keine": re.compile(r"(keine Mahnspesen|keine Mahngeb(?:ü|ue)hr)", re.IGNORECASE),
+    # Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026): "Mahngebühr"
+    # (mit und ohne Plural-"en") war bisher kein erkanntes Synonym -
+    # Verträge verwenden beide Begriffe für dieselbe Fachregel.
+    "mahngebuehr_cent": re.compile(
+        r"(?:Mahnspesen?|Mahngeb(?:ü|ue)hr(?:en)?)[^\d€]{0,40}" + _BETRAG_FRAGMENT, re.IGNORECASE,
+    ),
+    "mahngebuehr_keine": re.compile(r"(keine Mahnspesen|keine Mahngeb(?:ü|ue)hr(?:en)?)", re.IGNORECASE),
     "mieter_name": re.compile(r"Mieter\s*:?\s*\n?\s*([A-ZÄÖÜ][\wÄÖÜäöüß .,-]{2,70})", re.MULTILINE),
     "vermieter_name": re.compile(r"Vermieter\s*:?\s*\n?\s*([A-ZÄÖÜ][\wÄÖÜäöüß .,-]{2,70})", re.MULTILINE),
     "mietbeginn": re.compile(

@@ -207,6 +207,109 @@ def test_mietende_wird_extrahiert():
     assert vorschlaege["gueltig_bis"].formularwert == "2030-05-31"
 
 
+# -- Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026): -------------
+# -- _BETRAG_FRAGMENT truncation + Mahngebühr-Synonym + Nettomiete/Brutto -
+
+
+@pytest.mark.parametrize(
+    "roh,erwartet",
+    [
+        ("1200", "1200"),
+        ("1200,00", "1200,00"),
+        ("1.200,00", "1.200,00"),
+        ("12345,67", "12345,67"),
+    ],
+)
+def test_betragsformate_werden_vollstaendig_erkannt_nicht_truncated(roh, erwartet):
+    """Reproduktion (Codex-Abnahme 20.10.2026): `_BETRAG_FRAGMENT` erlaubte
+    bisher nur 1-3 Ziffern vor einem Tausender-/Dezimaltrenner OHNE eine
+    nachfolgende Zifferngrenze zu verlangen - eine unformatierte Zahl
+    wurde dadurch nach den ersten 1-3 Ziffern abgeschnitten ("1200" ->
+    "120", "1200,00" -> "120", "12345,67" -> "123"). Jedes hier gelistete
+    Format muss jetzt VOLLSTÄNDIG und UNVERÄNDERT erkannt werden - andere,
+    bereits korrekte Formate dürfen dabei NICHT umgedeutet werden."""
+
+    pdf = build_text_pdf([f"Hauptmietzins: {roh} EUR"])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert ergebnis.treffer["hauptmietzins_cent"].wert == erwartet
+
+
+def test_betrag_ohne_trennzeichen_direkt_nach_waehrung_wird_nicht_abgeschnitten():
+    """Dasselbe Grenzfallbeispiel, aber mit der Währung VOR der Zahl ohne
+    Leerzeichen ("EUR1200") - exakt der vom Auftraggeber genannte Fall."""
+
+    pdf = build_text_pdf(["Hauptmietzins EUR1200"])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert ergebnis.treffer["hauptmietzins_cent"].wert == "1200"
+
+
+def test_mehrdeutiges_format_bleibt_als_mehrdeutigkeit_sichtbar_nach_der_korrektur():
+    """Die Korrektur darf eine ECHTE (semantische) Mehrdeutigkeit -
+    unterschiedliche Beträge für dasselbe Feld - nicht verdecken; sie
+    behebt nur die Truncation einzelner, für sich genommen eindeutiger
+    Zahlen."""
+
+    pdf = build_text_pdf(["Hauptmietzins: 1200 EUR", "Hauptmietzins: 1300 EUR"])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert "hauptmietzins_cent" not in ergebnis.treffer
+    werte = {f.wert for f in ergebnis.mehrdeutige_treffer["hauptmietzins_cent"]}
+    assert werte == {"1200", "1300"}
+
+
+def test_mahngebuehr_synonym_ohne_spesen_wortlaut_wird_erkannt():
+    """Reproduktion (Codex-Abnahme 20.10.2026): nur 'Mahnspesen' wurde
+    erkannt, 'Mahngebühr' (ohne 'Spesen'-Wortlaut) nicht - beide Begriffe
+    bezeichnen dieselbe Fachregel."""
+
+    pdf = build_text_pdf(["Mahngebühr: 20,00 EUR"])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert ergebnis.treffer["mahngebuehr_cent"].wert == "20,00"
+
+
+def test_mahngebuehr_plural_wird_erkannt():
+    pdf = build_text_pdf(["Es werden Mahngebühren in Höhe von EUR 15,00 verrechnet."])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert ergebnis.treffer["mahngebuehr_cent"].wert == "15,00"
+
+
+def test_keine_mahngebuehr_klausel_mit_pluralwortlaut_wird_erkannt():
+    pdf = build_text_pdf(["Es werden keine Mahngebühren verrechnet."])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert vorschlaege["mahngebuehr_cent"].formularwert == "0"
+
+
+def test_nettomiete_wird_nicht_als_hauptmietzins_brutto_uebernommen():
+    """Auftrag Markus (Korrektur 20.10.2026): 'Nettomiete niemals still
+    als Brutto übernehmen' - `hauptmietzins_cent` ist im System per
+    Definition BRUTTO (siehe `backoffice/vertragsanlage_form.py`,
+    Label "Hauptmietzins (brutto, EUR)"); eine ausdrücklich als NETTO
+    bezeichnete Angabe darf NIE in dieses Feld einfließen."""
+
+    pdf = build_text_pdf(["Nettomiete: 500,00 EUR"])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert "hauptmietzins_cent" not in ergebnis.treffer
+    assert ergebnis.treffer["nettomiete_cent"].wert == "500,00"
+
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert "hauptmietzins_cent" not in vorschlaege  # NIE automatisch als Brutto übernommen
+    assert vorschlaege["nettomiete_hinweis_cent"].formularwert == "500,00"
+
+
+def test_hauptmietzins_und_nettomiete_nebeneinander_bleiben_getrennte_felder():
+    """Nennt ein Vertrag BEIDE Begriffe (z. B. 'Hauptmietzins (brutto)
+    550,00 EUR' und separat 'Nettomiete 500,00 EUR'), dürfen sie NICHT
+    in dasselbe Extraktionsfeld vermischt werden - das würde sonst als
+    Mehrdeutigkeit zwischen zwei eigentlich unterschiedlichen Größen
+    (netto vs. brutto) fehlinterpretiert."""
+
+    pdf = build_text_pdf(["Hauptmietzins: 550,00 EUR", "Nettomiete: 500,00 EUR"])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert ergebnis.treffer["hauptmietzins_cent"].wert == "550,00"
+    assert ergebnis.treffer["nettomiete_cent"].wert == "500,00"
+    assert "hauptmietzins_cent" not in ergebnis.mehrdeutige_treffer
+
+
 def test_fehlgeschlagene_seitenauswertung_wird_als_warnung_sichtbar(monkeypatch):
     """'Teilseitenerkennung nicht unbemerkt erfolgreich ausgeben' - schlägt
     eine einzelne Seite beim Textzugriff fehl, muss das als Warnung

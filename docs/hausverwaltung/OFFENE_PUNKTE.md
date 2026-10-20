@@ -5927,6 +5927,53 @@ im Mailversand-Treiber) + 2 (PDF-Rechtsinhalt) = 30 neue Tests,
 ausschließlich synthetische Testdaten, keine echten Sendungen/
 Produktivbuchungen.
 
+## Auftrag HV-20261020-VERTRAGSDATENBASIS (Beginn)
+
+Erster, abgeschlossener Teilschritt: der von Codex konkret reproduzierte
+Betragsparser-Fehler in `vertragsanlage/pdf_extraktion.py` ist behoben.
+
+### Betragsparser-Fehler `_BETRAG_FRAGMENT` (behoben)
+
+Die führende Zifferngruppe war auf `[0-9]{1,3}` begrenzt, OHNE eine
+nachfolgende Zifferngrenze zu verlangen - eine unformatierte Zahl ohne
+Tausenderpunkt wurde dadurch nach den ersten 1-3 Ziffern abgeschnitten
+("EUR1200" -> "120", "Nettomiete 1200,00" -> "120", "EUR12345,67" ->
+"123"). Jetzt `[0-9]+` (unbegrenzt) in beiden Alternativen - verifiziert
+für 1200, 1200,00, 1.200,00, 12345,67 sowie für eine ECHTE (semantische)
+Mehrdeutigkeit, die weiterhin korrekt erkannt bleibt. Zusätzlich:
+"Mahngebühr"/"Mahngebühren" wird jetzt gleichrangig zu "Mahnspesen"
+erkannt. "Nettomiete" ist jetzt ein EIGENER Extraktionsschlüssel
+(`nettomiete_cent`) und wird NICHT mehr in das system-definiert BRUTTO
+gemeinte Feld `hauptmietzins_cent` gemappt (Auftrag Markus: "Nettomiete
+niemals still als Brutto übernehmen") - stattdessen ein eigener,
+ausdrücklich als "NICHT automatisch Brutto" beschrifteter Hinweis
+`nettomiete_hinweis_cent`.
+
+**Offen/transparent zu machen:** die Mietbestandteile-Vorschlagsfelder
+aus `vorschlaege.py` (`hauptmietzins_cent`, `betriebskosten_cent`,
+`heizkosten_cent`, `kueche_cent`, `parkplatz_cent`, jetzt auch
+`nettomiete_hinweis_cent`) waren schon VOR dieser Korrektur in KEINER
+Backoffice-Review-Ansicht tatsächlich verdrahtet (kein `name="..."` in
+`vertragsanlage_form.py` für diese Felder) - sie wurden also bereits
+bisher erzeugt, aber nirgends angezeigt. Das wird im Rahmen der
+geplanten Mietbestandteile-Neugestaltung (netto/USt/brutto je
+Komponente) mitbehoben, nicht in diesem engen Korrekturcommit.
+
+### Weiterer Umfang (noch zu tun, Nutzerergänzungen 20.10.2026 bereits eingearbeitet)
+
+Extraktionsmodell (Quelle/Zustand/Parteien inkl. Mitmieter/Vertreter
+getrennt/Objekt/Termine getrennt inkl. Ende explizit befristet/
+unbefristet/unklar), Rechtsachsen (MRG/Mietzinsbildung/Nutzung
+getrennt), Mietbestandteile (netto/USt/brutto je Komponente + BK/HK-
+Abrechnungsart Akonto/Pauschale + Verteilungsschlüssel, jeweils
+nullable/versioniert mit Quelle, NIE aus bloßem Betrag geraten),
+Index-Klausel-Erfassung, Mahngebühr/Verzugszins (inkl. Verbraucher-/
+Unternehmerstatus für den gesetzlichen Zins-Fallback, NIE allein aus
+Nutzungsart abgeleitet)/Kaution getrennt, Upload-Bedienung, zentrale
+Vertragsübersicht, Verbindung zu Rechenprofilen - siehe Taskliste
+dieser Sitzung. Jeder weitere Teilschritt bekommt einen eigenen,
+getesteten Commit.
+
 ## Korrekturrunde nach unabhängiger Abnahme von Commit d4da16a (Codex, 20.10.2026)
 
 Codex hat den oben beschriebenen Commit `d4da16a` unabhängig geprüft und
