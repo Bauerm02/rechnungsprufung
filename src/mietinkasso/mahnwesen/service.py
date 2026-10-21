@@ -922,6 +922,59 @@ class MahnwesenService:
             gesellschaft_id=vertrag.gesellschaft_id, stufe=stufe, kanal=kanal,
         )
 
+    def pruefe_mahnlauf_frisch_versandbereit(
+        self, *, mahnlauf_id: int, heute: date, bank_bestaetigt_bis: date | None,
+        ungeklaerte_eingaenge_vorhanden: bool, zahlungsziel_geklaert: bool = True,
+    ) -> tuple[bool, str]:
+        """Reiner LESE-Check (KEINE Nebenwirkung - ändert NIEMALS
+        `MahnLaufTable`-/`MahnFallTable`-Status), ob ein bereits
+        gebildeter Mahnlauf JETZT, unmittelbar vor einem tatsächlich
+        NEUEN Providerkontakt, noch versandbereit wäre - dieselben
+        Bedingungen (Bank/ungeklärte Eingänge/Zahlungsziel/Policy/
+        Empfänger/OP-Stand/Frist/Briefkanal-Transport), die `versende_
+        mahnlauf` unmittelbar VOR dem Erstversand für jedes Mitglied
+        prüft (`_pruefe_frisch_versandbereit`).
+
+        **Korrektur nach unabhängiger Abnahme (Codex, 21.10.2026,
+        reproduzierter Fehler in `b6e773e`):** `HVMailversandService.
+        nachsenden_einzelempfaenger`/`_nachsenden_email` umgingen diese
+        Prüfung vollständig - ein erneuter tatsächlicher Sendeversuch für
+        einen einzelnen, nachweislich fehlgeschlagenen Empfänger erfolgte
+        auch dann, wenn `SEND_ENABLED` inzwischen deaktiviert wurde ODER
+        die Bankbestätigung inzwischen veraltet war, weil die Nachsende-
+        Aktion `versende_mahnlauf`/`_pruefe_frisch_versandbereit`
+        vollständig umging (eigener, ungegateter Unterpfad). Diese
+        Methode schließt genau diese Lücke, OHNE den bestehenden
+        "ändert nie Gruppen-/Mitgliederstatus"-Grundsatz der
+        Nachsendung zu verletzen - sie liest nur, sie schreibt nichts.
+
+        Rückgabe `(bereit, grund)`: `bereit=True` nur, wenn ALLE
+        eingefrorenen Mitglieder der Gruppe weiterhin versandbereit
+        wären; sonst `False` mit dem Grund des ERSTEN nicht mehr
+        bereiten Mitglieds."""
+
+        mahnlauf = self._mahnlauf_repository.get(mahnlauf_id)
+        if mahnlauf is None:
+            return False, f"Unbekannter Mahnlauf {mahnlauf_id}."
+        vertrag = self._stammdaten_repository.get_vertrag(mahnlauf.vertrag_id)
+        konto = self._stammdaten_repository.get_konto_by_vertrag(mahnlauf.vertrag_id)
+        if vertrag is None or konto is None:
+            return False, "Vertrag/Konto zum Mahnlauf fehlt."
+        aktuelle_policy = self._mahn_policy_repository.aktuelle_freigegebene()
+        mitglieder_ids = MahnLaufRepository.mitglieder_ids(mahnlauf)
+        mitglieder = [self._repository.get(i) for i in mitglieder_ids]
+        if not mitglieder_ids or any(m is None for m in mitglieder):
+            return False, "Mahnlauf-Gruppe inkonsistent (mindestens ein eingefrorenes Mitglied fehlt)."
+        for mahnfall in mitglieder:
+            status_code, grund, _forderung = self._pruefe_frisch_versandbereit(
+                mahnfall=mahnfall, vertrag=vertrag, konto=konto, aktuelle_policy=aktuelle_policy, heute=heute,
+                bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
+                kanal=mahnlauf.kanal, zahlungsziel_geklaert=zahlungsziel_geklaert,
+            )
+            if status_code is not None:
+                return False, f"Mitglied {mahnfall.id}: {grund}"
+        return True, "Versandbereit."
+
     def versende_mahnlauf(
         self,
         *,

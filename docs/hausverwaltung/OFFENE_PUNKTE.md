@@ -1,5 +1,72 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## Abnahmefix zu b6e773e (Codex 21.10.2026): Nachsendung umging das
+## Versand-Gate über einen eigenen Unterpfad (TEILCHECKPOINT, KEIN
+## Gesamtabschluss der Mahnarbeiten)
+
+Konkreter, reproduzierter Abnahmefund gegen den vorherigen Commit
+(`b6e773e`): `HVMailversandService.nachsenden_einzelempfaenger`/
+`_nachsenden_email`/`_nachsenden_brief` prüften zwar bereits das neue
+Zahlungsziel-Gate (siehe unten), aber SONST KEINE der Bedingungen, die
+der Erstversand (`versende_mahnlauf`/`_pruefe_frisch_versandbereit`)
+unmittelbar vor JEDEM tatsächlichen Providerkontakt prüft. Konkret
+reproduziert: (a) `settings.send_enabled=False` nach dem Erstversand
+gesetzt, Nachsendung löste trotzdem einen neuen POST aus; (b) die
+Bankbestätigung blieb unverändert (nur bis zum Erstversandtag bestätigt),
+ein Nachsende-Versuch WOCHEN später löste trotzdem einen neuen POST aus,
+obwohl der Bankstand längst veraltet war. Beide Fälle betrafen EMAIL;
+derselbe fehlende Gate-Aufruf betraf strukturell auch den Briefkanal
+(SFTP-Upload als einziger Transportkontakt).
+
+**Behoben:**
+- Neue, rein lesende Methode `MahnwesenService.pruefe_mahnlauf_frisch_
+  versandbereit(mahnlauf_id, heute, bank_bestaetigt_bis, ungeklaerte_
+  eingaenge_vorhanden, zahlungsziel_geklaert)` - prüft für JEDES
+  eingefrorene Mitglied der Gruppe dieselbe `_pruefe_frisch_
+  versandbereit`-Logik wie der Erstversand (Bank/ungeklärte Eingänge/
+  Zahlungsziel/Policy/Empfänger-Identität/OP-Stand/Frist/Briefkanal-
+  Transport) - OHNE jede Nebenwirkung, ändert NIE `MahnLaufTable`-/
+  `MahnFallTable`-Status (der bestehende Grundsatz "Nachsendung ändert
+  nie den Gruppenstatus" bleibt vollständig erhalten).
+- `nachsenden_einzelempfaenger` berechnet jetzt zusätzlich `send_enabled`
+  (`SEND_ENABLED`+Allowlist, dieselbe Bedingung wie beim Erstversand) UND
+  ruft die neue Prüfung auf; das Ergebnis wird als `versandbereit`/
+  `versandbereit_grund` an `_nachsenden_email`/`_nachsenden_brief`
+  durchgereicht.
+- In BEIDEN Kanälen greift die Sperre GENAU unmittelbar vor dem
+  TATSÄCHLICH NEUEN Transportkontakt, NICHT vor der reinen
+  Statusklärung: EMAIL prüft weiterhin per GET `status_abfragen` (immer
+  erlaubt, "Statusklärung ohne neue Sendung getrennt möglich") und sperrt
+  erst den nachfolgenden POST; BRIEF archiviert (reine, lokale DB-
+  Operation) weiterhin unverändert, sperrt aber den nachfolgenden SFTP-
+  Upload. Ein bereits belegter Empfänger bleibt unverändert ein reiner
+  No-Op (`BEREITS_GESENDET`, kein Gate nötig, kein Kontakt).
+- Neuer Rückgabewert `"BLOCKIERT"` (reiner Statuscode, keine Exception -
+  dieselbe Semantik wie die bestehenden Werte `GESENDET`/
+  `BEREITS_GESENDET`/`UNKLAR`): ein tatsächlich neuer Sendeversuch wäre
+  nötig gewesen, ist aber gerade nicht zulässig. Kein Umgehen über einen
+  separaten Unterpfad mehr möglich - beide private Methoden erhalten das
+  Gate ausschließlich über den gemeinsamen Einstiegspunkt.
+
+Getestet (`test_hv_mailversand.py`, ausschließlich synthetisch, kein
+echter Versand/keine echten Bankdaten): (1) EMAIL mit deaktiviertem
+`send_enabled` nach erfolgreichem Erstversand - Nachsendung liefert
+`BLOCKIERT`, GENAU die Statusabfrage (GET) läuft noch, KEIN neuer POST;
+nach Reaktivierung funktioniert die Nachsendung wieder normal (keine
+dauerhafte Blockade). (2) EMAIL mit seit dem Erstversand nie erneuerter,
+jetzt veralteter Bankbestätigung (Versuch 38 Tage später) - `BLOCKIERT`,
+kein neuer POST; nach frischer Bestätigung funktioniert die Nachsendung
+wieder. (3) BRIEF mit derselben veralteten Bankbestätigung - `BLOCKIERT`,
+KEIN neuer SFTP-Upload (das lokale Archivieren selbst, kein
+Netzkontakt, läuft davon unberührt weiter). Gesamtsuite grün.
+
+**Geänderte Dateien:** `src/mietinkasso/mahnwesen/service.py`
+(`pruefe_mahnlauf_frisch_versandbereit` ergänzt), `src/mietinkasso/
+indexautomatik/mailversand_service.py` (`nachsenden_einzelempfaenger`/
+`_nachsenden_email`/`_nachsenden_brief` gaten jetzt den tatsächlichen
+Retry-Providerkontakt), `tests/mietinkasso/test_hv_mailversand.py` (drei
+neue Regressionstests).
+
 ## Fortsetzung HV-20261021-ABSCHLUSS (Markus 21.10.2026): Brief-
 ## Mitmieter-Versand, sichere Nachsende-Aktion, Vier-Stufen-Ende-zu-
 ## Ende-Test (TEILCHECKPOINT, KEIN Gesamtabschluss der Mahnarbeiten)

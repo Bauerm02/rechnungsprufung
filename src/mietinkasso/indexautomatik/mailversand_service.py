@@ -1004,7 +1004,15 @@ class HVMailversandService:
           oder laut Providerabfrage) - nichts Neues getan.
         - `"UNKLAR"`: Status (noch) nicht eindeutig klärbar ODER der
           erneute Sendeversuch selbst blieb ungewiss - keine weitere
-          automatische Aktion, manuell/später erneut prüfen."""
+          automatische Aktion, manuell/später erneut prüfen.
+        - `"BLOCKIERT"`: ein tatsächlich NEUER Sendeversuch wäre jetzt
+          nötig gewesen (Status nachweislich `NICHT_GEFUNDEN`/BRIEF ohne
+          vorherigen Upload), aber `SEND_ENABLED`/Allowlist ist aus ODER
+          dieselben "frisch versandbereit"-Bedingungen wie beim
+          Erstversand (Bank/ungeklärte Eingänge/Zahlungsziel/Policy/
+          Empfänger/OP-Stand/Frist/Briefkanal-Transport) sind jetzt
+          NICHT erfüllt - KEIN Providerkontakt, reine Statusabklärung
+          (die bereits VOR dieser Prüfung lief) bleibt davon unberührt."""
 
         mahnlauf = self.mahnlauf_repo.get(mahnlauf_id)
         if mahnlauf is None:
@@ -1055,13 +1063,39 @@ class HVMailversandService:
                 "keine Nachsendung an eine zwischenzeitlich geänderte/zurückgezogene Angabe."
             )
 
+        # Korrektur nach unabhängiger Abnahme (Codex, 21.10.2026,
+        # reproduzierter Fehler): bis hierher war NUR das Zahlungsziel-
+        # Gate geprüft - `send_enabled`/Allowlist, die aktuelle
+        # Bankbestätigung UND alle übrigen "frisch versandbereit"-
+        # Bedingungen (Policy/Empfänger/OP-Stand/Frist/Briefkanal-
+        # Transport) waren für die Nachsendung vollständig ungegatet,
+        # obwohl sie der Erstversand unmittelbar vor JEDEM tatsächlichen
+        # Providerkontakt prüft. EIN erneuter Sendeversuch (NICHT die
+        # reine Statusabfrage, die bleibt immer erlaubt) wird deshalb
+        # jetzt GENAU WIE beim Erstversand gegatet - für EMAIL und
+        # BRIEF gleich, kein Umgehen über einen Unterpfad.
+        send_enabled = bool(self.client and self.settings.send_enabled and self.settings.hv_mail_allowlist_bestaetigt)
+        confirmed, unclear = bank_freigabe_ableiten(self.bank_repo, self.bank_service, vertrag.gesellschaft_id, vertrag.id)
+        versandbereit, versandbereit_grund = self.mahn_service.pruefe_mahnlauf_frisch_versandbereit(
+            mahnlauf_id=mahnlauf.id, heute=heute, bank_bestaetigt_bis=confirmed,
+            ungeklaerte_eingaenge_vorhanden=unclear, zahlungsziel_geklaert=True,
+        )
+        if not send_enabled:
+            versandbereit, versandbereit_grund = False, "Versand ist derzeit deaktiviert (SEND_ENABLED/Allowlist)."
+
         if mahnlauf.kanal == "EMAIL":
-            return self._nachsenden_email(mahnlauf=mahnlauf, eintrag=eintrag, mitmieter=mitmieter, heute=heute)
+            return self._nachsenden_email(
+                mahnlauf=mahnlauf, eintrag=eintrag, mitmieter=mitmieter, heute=heute,
+                versandbereit=versandbereit, versandbereit_grund=versandbereit_grund,
+            )
         if mahnlauf.kanal == "BRIEF":
-            return self._nachsenden_brief(mahnlauf=mahnlauf, eintrag=eintrag, mitmieter=mitmieter, heute=heute)
+            return self._nachsenden_brief(
+                mahnlauf=mahnlauf, eintrag=eintrag, mitmieter=mitmieter, heute=heute,
+                versandbereit=versandbereit, versandbereit_grund=versandbereit_grund,
+            )
         raise ValueError(f"Unbekannter Mahnlauf-Kanal {mahnlauf.kanal!r}.")
 
-    def _nachsenden_email(self, *, mahnlauf, eintrag, mitmieter, heute) -> str:
+    def _nachsenden_email(self, *, mahnlauf, eintrag, mitmieter, heute, versandbereit=True, versandbereit_grund="") -> str:
         if self.client is None:
             raise ValueError("Privater Mailweg ist nicht eingerichtet.")
         if eintrag.versand_belegt_am is not None:
@@ -1094,7 +1128,14 @@ class HVMailversandService:
             return "UNKLAR"
 
         # NICHT_GEFUNDEN: nachweislich nie unter dieser Referenz
-        # angenommen - jetzt sicher (erstmalig) nachsendbar.
+        # angenommen - grundsätzlich (erstmalig) nachsendbar. Ab HIER
+        # würde ein TATSÄCHLICH NEUER Providerkontakt erfolgen - dafür
+        # gelten GENAU DIESELBEN aktuellen Versand-/Allowlist-/Bank-/
+        # OP-/Sonderfallbedingungen wie beim Erstversand (Korrektur nach
+        # unabhängiger Abnahme, Codex 21.10.2026).
+        if not versandbereit:
+            return "BLOCKIERT"
+
         mahnfall_ids = MahnLaufRepository.mitglieder_ids(mahnlauf)
         mitglieder = [self.mahn_repo.get(i) for i in mahnfall_ids]
         if not mahnfall_ids or any(m is None for m in mitglieder):
@@ -1124,7 +1165,7 @@ class HVMailversandService:
         )
         return "GESENDET"
 
-    def _nachsenden_brief(self, *, mahnlauf, eintrag, mitmieter, heute) -> str:
+    def _nachsenden_brief(self, *, mahnlauf, eintrag, mitmieter, heute, versandbereit=True, versandbereit_grund="") -> str:
         if self.brief_sftp_adapter is None:
             raise ValueError("Brief-SFTP-Transport ist nicht eingerichtet.")
         if eintrag.brief_status == "UEBERMITTELT":
@@ -1160,6 +1201,15 @@ class HVMailversandService:
                 )
             except VorgangIdKonfliktError as exc:
                 raise ValueError(f"Mahnbrief-Archivierung inkonsistent: {exc}") from exc
+
+        # Der eigentliche SFTP-Upload ist beim Briefkanal der ERSTE und
+        # EINZIGE tatsächliche Transportkontakt (keine separate Status-
+        # Abfrage wie bei EMAIL) - dieselben aktuellen Versand-/Bank-/
+        # OP-/Sonderfallbedingungen wie beim Erstversand gelten deshalb
+        # UNMITTELBAR hier, vor diesem einen Kontakt (Korrektur nach
+        # unabhängiger Abnahme, Codex 21.10.2026).
+        if not versandbereit:
+            return "BLOCKIERT"
 
         dateiname = brief_sftp.baue_dateiname(sende_schluessel=eintrag.brief_sende_schluessel)
         try:

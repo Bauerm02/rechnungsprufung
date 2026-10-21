@@ -1756,3 +1756,138 @@ def test_nachsendung_brief_fuer_nachweislich_nie_archivierten_empfaenger(hv, bas
     # Erneute Nachsendung für den jetzt bereits übermittelten Brief: No-Op.
     ergebnis_erneut = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 15))
     assert ergebnis_erneut == "BEREITS_GESENDET"
+
+
+# -- Regression (Codex-Abnahme 21.10.2026, b6e773e): die Nachsendung --------
+# -- gatete einen TATSÄCHLICH NEUEN Providerkontakt bisher an KEINER -------
+# -- der Erstversand-Bedingungen (SEND_ENABLED/Allowlist, aktuelle ----------
+# -- Bankbestätigung) - repariert für EMAIL UND BRIEF. ----------------------
+
+
+def test_nachsendung_email_sendet_nicht_erneut_wenn_send_enabled_inzwischen_deaktiviert(
+    hv_mit_tracking, basis_vertrag, admin_ctx,
+):
+    """Konkreter Abnahmefund (Codex 21.10.2026): der erste Kopieversand
+    schlägt fehl, der Hauptversand bleibt GESENDET. Wird `SEND_ENABLED`
+    (hier: `settings.send_enabled`) VOR der Nachsendung deaktiviert, darf
+    `nachsenden_einzelempfaenger` KEINEN neuen POST auslösen - genau
+    dieselbe Bedingung, die der Erstversand vor jedem tatsächlichen
+    Providerkontakt prüft. Die reine Statusabklärung (GET) bleibt davon
+    unberührt, löst aber KEINE Sendung aus."""
+
+    service, state = hv_mit_tracking
+    contract, account = basis_vertrag
+    _seed_debt(hv_mit_tracking, contract, account, admin_ctx)
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email="mitmieterin-a@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    state["fehlschlagen_beim_ersten_versuch"].add("mitmieterin-a@example.at")
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    assert mahnlauf.status == "GESENDET"
+    eintrag_vor = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag_vor.versand_belegt_am is None
+
+    service.settings.send_enabled = False
+    anzahl_vor = len(state["calls"])
+    ergebnis = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 14))
+    assert ergebnis == "BLOCKIERT"
+    # GENAU EIN neuer Aufruf - die reine Statusabklärung (GET), die laut
+    # Spezifikation auch bei deaktiviertem Versand erlaubt bleibt
+    # ("Statusklärung ohne neue Sendung getrennt möglich"). KEIN neuer
+    # POST (der wäre der zweite neue Call).
+    assert len(state["calls"]) == anzahl_vor + 1
+    assert state["calls"][-1].method == "GET"
+    eintrag_nach = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag_nach.versand_belegt_am is None  # weiterhin unbelegt, kein erfundener Beleg
+
+    # Wird SEND_ENABLED wieder aktiviert, funktioniert die Nachsendung
+    # unverändert wie zuvor (keine dauerhafte Blockade durch das Gate).
+    service.settings.send_enabled = True
+    ergebnis2 = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 14))
+    assert ergebnis2 == "GESENDET"
+
+
+def test_nachsendung_email_sendet_nicht_erneut_bei_veralteter_bankbestaetigung(
+    hv_mit_tracking, basis_vertrag, admin_ctx,
+):
+    """Konkreter Abnahmefund (Codex 21.10.2026): dieselbe Garantie für
+    die Bankbestätigung - bleibt sie seit dem Erstversand unverändert
+    (hier: nur bis 13.09.2026 bestätigt) und wird die Nachsendung weit
+    später (21.10.2026, lange über `bank_stand_max_age_days` hinaus)
+    versucht, darf das KEINEN neuen POST auslösen."""
+
+    service, state = hv_mit_tracking
+    contract, account = basis_vertrag
+    _seed_debt(hv_mit_tracking, contract, account, admin_ctx)  # Bankbestätigung NUR bis 13.09.2026 (Default von _seed_debt)
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email="mitmieterin-a@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    state["fehlschlagen_beim_ersten_versuch"].add("mitmieterin-a@example.at")
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    assert mahnlauf.status == "GESENDET"
+
+    anzahl_vor = len(state["calls"])
+    # Die Bankbestätigung wurde seitdem NIE erneuert - ein Nachsende-
+    # Versuch weit später (21.10.2026) muss dieselbe Veraltetheitsprüfung
+    # treffen wie ein echter Erstversand an diesem Tag.
+    ergebnis = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 10, 21))
+    assert ergebnis == "BLOCKIERT"
+    assert len(state["calls"]) == anzahl_vor + 1  # NUR die Statusabklärung (GET), KEIN neuer POST
+    eintrag_nach = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag_nach.versand_belegt_am is None
+
+    # Eine frische Bankbestätigung macht die Nachsendung wieder möglich.
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="SYNTHETIC-BANK", bestaetigt_bis=date(2026, 10, 21), bestaetigt_von="SYNTHETIC-TEST")
+    ergebnis2 = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 10, 21))
+    assert ergebnis2 == "GESENDET"
+
+
+def test_nachsendung_brief_sendet_nicht_erneut_bei_veralteter_bankbestaetigung(hv, basis_vertrag, admin_ctx):
+    """Dieselbe Garantie auch für den Briefkanal - der SFTP-Upload ist
+    dort der EINZIGE tatsächliche Transportkontakt (keine separate
+    Statusabfrage), das Gate muss also unmittelbar davor greifen."""
+
+    service, _state = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)  # Bankbestätigung NUR bis 13.09.2026
+    fake_verbindung = _richte_brief_kanal_ein(service, contract, account)
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email=None, adresse="Nebenstraße 2, 1010 Wien",
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    service.mitmieter_repo.setze_postadresse_geprueft(mitmieter.id, geprueft=True)
+
+    original_archiviere_brief = service.empfaenger_zugang_repo.archiviere_brief
+    aufrufe = {"anzahl": 0}
+
+    def kaputte_archivierung(*args, **kwargs):
+        aufrufe["anzahl"] += 1
+        if aufrufe["anzahl"] == 1:
+            raise RuntimeError("Simulierter Fehler bei der Mitmieter-Brief-Archivierung (Test).")
+        return original_archiviere_brief(*args, **kwargs)
+
+    service.empfaenger_zugang_repo.archiviere_brief = kaputte_archivierung
+    try:
+        service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    finally:
+        service.empfaenger_zugang_repo.archiviere_brief = original_archiviere_brief
+
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    eintrag_vor = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag_vor.brief_status is None
+
+    # Der Hauptbrief wurde beim Erstversand bereits erfolgreich
+    # hochgeladen (eigener Sendeschlüssel) - das gehört NICHT zur
+    # Nachsendung und bleibt als Vergleichsbasis unberührt stehen.
+    dateien_vor_nachsendung = set(fake_verbindung.geschriebene_dateien)
+    ergebnis = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 10, 21))
+    assert ergebnis == "BLOCKIERT"
+    assert set(fake_verbindung.geschriebene_dateien) == dateien_vor_nachsendung  # KEIN neuer SFTP-Upload für die Nachsendung selbst
+    eintrag_nach = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    # Das lokale Archivieren (PDF erzeugen/in der DB ablegen, KEIN
+    # Netzkontakt) läuft weiterhin - NUR der tatsächliche SFTP-Upload ist
+    # gesperrt, siehe `geschriebene_dateien` oben.
+    assert eintrag_nach.brief_status == "VORBEREITET"
