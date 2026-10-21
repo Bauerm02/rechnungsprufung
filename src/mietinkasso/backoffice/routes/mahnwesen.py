@@ -20,7 +20,8 @@ from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, 
 from mietinkasso.domain.enums import ZUGANGSFORMEN_ALLE
 from mietinkasso.domain.exceptions import MietinkassoError
 from mietinkasso.indexautomatik.mailversand_service import (
-    bank_freigabe_ableiten, bank_konto_fuer_gesellschaft_eindeutig, zahlungsziel_fuer_mahnung,
+    bank_freigabe_ableiten, bank_konto_fuer_gesellschaft_eindeutig, bank_konto_fuer_vertrag_eindeutig,
+    zahlungsziel_fuer_mahnung, zahlungsziel_geklaert as _zahlungsziel_geklaert_fn,
 )
 from mietinkasso.indexautomatik.zeit import heute_wien
 from mietinkasso.mahnwesen.brief_pdf import (
@@ -94,6 +95,10 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
         return _layout(request, session, "Mahnvorschau", inhalt)
 
     bank_bestaetigt_bis, ungeklaert = _bank_freigabe_ableiten(vertrag.gesellschaft_id, vertrag_id)
+    zahlungsziel_ok = _zahlungsziel_geklaert_fn(
+        deps._bank_repo, deps._hv_mail.zahlungsziel_bindung_repo, deps._stammdaten_repo,
+        gesellschaft_id=vertrag.gesellschaft_id, vertrag_id=vertrag_id,
+    )
     forderungen = deps._op_service.offene_forderungen(konto.id, heute=heute_datum)
     zeilen = []
     for forderung in forderungen:
@@ -104,6 +109,7 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
         ergebnis = deps._mahn_service.vorschau_forderung(
             ctx=_ctx(session), vertrag=vertrag, konto=konto, forderung=forderung, policy=policy, heute=heute_datum,
             bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaert,
+            zahlungsziel_geklaert=zahlungsziel_ok,
         )
         aktion = ""
         status_anzeige = ergebnis.status
@@ -143,13 +149,39 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
     bank_status = (
         f"Bank bestätigt bis {bank_bestaetigt_bis.isoformat()}" if bank_bestaetigt_bis else '<span class="warn">keine ausreichend aktuelle Bankbestätigung</span>'
     ) + (" | <span class='warn'>ungeklärte Eingänge vorhanden</span>" if ungeklaert else "")
-    anzahl_bankkonten = len(deps._bank_repo.list_bank_konten(gesellschaft_id=vertrag.gesellschaft_id))
-    if bank_konto_fuer_gesellschaft_eindeutig(deps._bank_repo, vertrag.gesellschaft_id) is None:
-        grund = "kein Bankkonto hinterlegt" if anzahl_bankkonten == 0 else f"{anzahl_bankkonten} Bankkonten gefunden, keine eindeutige Bindung"
+    zahlungsziel_block = ""
+    if not zahlungsziel_ok:
+        anzahl_bankkonten = len(deps._bank_repo.list_bank_konten(gesellschaft_id=vertrag.gesellschaft_id))
+        grund = "kein Bankkonto hinterlegt" if anzahl_bankkonten == 0 else f"{anzahl_bankkonten} Bankkonten gefunden, keine (gültige) bestätigte Zuordnung"
         bank_status += (
-            f" | <span class='warn'>Zahlungsziel für Mahnschreiben ungeklärt ({h(grund)}) - Brief/E-Mail "
-            "verwenden den allgemeinen Hinweistext statt einer konkreten IBAN.</span>"
+            f" | <span class='warn'>Zahlungsziel für Mahnschreiben ungeklärt ({h(grund)}) - der tatsächliche "
+            "Versand wird deshalb als Prüffall gestoppt, bis das geklärt ist.</span>"
         )
+        if anzahl_bankkonten > 1:
+            konten = deps._bank_repo.list_bank_konten(gesellschaft_id=vertrag.gesellschaft_id)
+            optionen = "".join(f'<option value="{h(k.id)}">{h(k.bezeichnung)} ({h(k.iban)})</option>' for k in konten)
+            zahlungsziel_block = f"""
+            <div class="card">
+              <h3>Zahlungsziel-Bindung bestätigen</h3>
+              <p class="muted">Diese Gesellschaft hat mehrere Bankkonten - es gibt KEINE Auswahl nach erster
+                Zeile oder Bezeichnung. Nur eine ausdrücklich bestätigte, beleggestützte Zuordnung löst die
+                Mehrdeutigkeit auf.</p>
+              <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/zahlungsziel-bindung/bestaetigen" class="inline">
+                {csrf_feld(session.csrf_token)}
+                <label>Bankkonto</label>
+                <select name="bank_konto_id" required>{optionen}</select>
+                <input name="quellenbeleg_referenz" placeholder="Quellenbeleg (z. B. Mietvertrag Anhang 3)" required>
+                <button type="submit">Zuordnung bestätigen</button>
+              </form>
+            </div>"""
+    else:
+        bindung = deps._hv_mail.zahlungsziel_bindung_repo.aktuelle_bindung(vertrag_id)
+        if bindung is not None:
+            konto_anzeige = deps._bank_repo.get_bank_konto(bindung.bank_konto_id)
+            bank_status += (
+                f" | Zahlungsziel: bestätigte Bindung an {h(konto_anzeige.bezeichnung) if konto_anzeige else bindung.bank_konto_id} "
+                f"(Beleg: {h(bindung.quellenbeleg_referenz)}, bestätigt am {bindung.bestaetigt_am.date().isoformat()} von {h(bindung.bestaetigt_von)})"
+            )
     inhalt += f"""
     <div class="card">
       <p class="muted">Bankstatus: {bank_status}</p>
@@ -159,9 +191,42 @@ def mahnvorschau(request: Request, vertrag_id: str, heute: str | None = None, se
       </table>
       <p class="muted">Die Vorschau versendet keine Nachricht. Der separate Versand prüft unmittelbar davor den aktuellen Bank- und Forderungsstand.</p>
     </div>"""
+    inhalt += zahlungsziel_block
     inhalt += _mahnkosten_vorschau_block(vertrag_id, heute_datum)
     inhalt += f'<div class="card"><a href="/backoffice/vertrag/{h(vertrag_id)}/mahnempfaenger">Mitmieter &amp; Zugangsnachweise ansehen/bestätigen</a></div>'
     return _layout(request, session, "Mahnvorschau", inhalt)
+
+
+@router.post("/vertrag/{vertrag_id}/zahlungsziel-bindung/bestaetigen", response_class=HTMLResponse)
+def zahlungsziel_bindung_bestaetigen(
+    request: Request, vertrag_id: str, csrf_token: str = Form(...),
+    bank_konto_id: str = Form(...), quellenbeleg_referenz: str = Form(...),
+    session=Depends(_current_session),
+) -> HTMLResponse:
+    """Bedienbare Auflösung einer Zahlungsziel-Mehrdeutigkeit (Nutzervorgabe
+    21.10.2026: "keine Auswahl nach erster Zeile oder Bezeichnung") - nur
+    eine ausdrücklich bestätigte, beleggestützte Bindung zählt; wird mit
+    einem Bankkonto einer ANDEREN Gesellschaft oder ohne Quellenbeleg
+    abgelehnt statt eines stillen Fehlers."""
+
+    _verify_csrf(session, csrf_token)
+    rueck = f"/backoffice/vertrag/{vertrag_id}/mahnvorschau"
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Mahnvorschau", f"Unbekannter Vertrag {vertrag_id}.", rueck)
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    try:
+        deps._hv_mail.zahlungsziel_bindung_repo.bestaetigen(
+            vertrag_id=vertrag_id, bank_konto_id=bank_konto_id,
+            quellenbeleg_referenz=quellenbeleg_referenz, bestaetigt_von=session.user_id,
+        )
+        deps._audit_service.log(
+            entity_typ="vertrag_zahlungsziel_bindung", entity_id=vertrag_id, aktion="ZAHLUNGSZIEL_BINDUNG_BESTAETIGT",
+            akteur=session.user_id, payload={"bank_konto_id": bank_konto_id, "quellenbeleg_referenz": quellenbeleg_referenz},
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Mahnvorschau", str(exc), rueck)
+    return RedirectResponse(url=rueck, status_code=303)
 
 
 @router.post("/vertrag/{vertrag_id}/forderung/{op_position_id}/planen", response_class=HTMLResponse)
@@ -626,6 +691,7 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
             gebuehr_rechtsgrundlage=vorschau.gebuehr_rechtsgrundlage, gesamtbetrag_cent=gesamtbetrag_cent,
             zahlungsziel=zahlungsziel_fuer_mahnung(
                 deps._bank_repo, deps._stammdaten_repo, gesellschaft_id=vertrag.gesellschaft_id, vertrag_id=vertrag_id, stufe=stufe,
+                zuordnung_repo=deps._hv_mail.zahlungsziel_bindung_repo,
             ),
         )
     except _BriefAdressfehlerError as exc:
@@ -1095,12 +1161,35 @@ def _mitmieter_zeile_html(m) -> str:
     </tr>"""
 
 
-def _empfaenger_zugang_zeile_html(vertrag_id: str, eintrag, csrf_token: str) -> str:
+def _empfaenger_zugang_zeile_html(vertrag_id: str, lauf, eintrag, csrf_token: str) -> str:
     wer = "Hauptdebitor" if eintrag.mitmieter_id is None else f"Mitmieter #{eintrag.mitmieter_id}"
-    versand_html = (
-        f"belegt am {eintrag.versand_belegt_am.strftime('%d.%m.%Y %H:%M')}"
-        if eintrag.versand_belegt_am else '<span class="muted">kein Kopieversand belegt</span>'
-    ) if eintrag.mitmieter_id is not None else '<span class="muted">siehe Hauptversandnachweis oben</span>'
+    if eintrag.mitmieter_id is None:
+        versand_html = '<span class="muted">siehe Hauptversandnachweis oben</span>'
+        bereits_belegt = True
+    elif lauf.kanal == "BRIEF":
+        bereits_belegt = eintrag.brief_status == "UEBERMITTELT"
+        if bereits_belegt:
+            versand_html = f"Brief übermittelt am {eintrag.brief_status_aktualisiert_am.strftime('%d.%m.%Y %H:%M') if eintrag.brief_status_aktualisiert_am else '?'}"
+        elif eintrag.brief_sende_schluessel:
+            versand_html = '<span class="warn">Brief archiviert, noch nicht übermittelt</span>'
+        else:
+            versand_html = '<span class="muted">kein Brief erstellt</span>'
+    else:
+        bereits_belegt = eintrag.versand_belegt_am is not None
+        versand_html = (
+            f"belegt am {eintrag.versand_belegt_am.strftime('%d.%m.%Y %H:%M')}" if bereits_belegt
+            else '<span class="muted">kein Kopieversand belegt</span>'
+        )
+
+    nachsende_formular = ""
+    if eintrag.mitmieter_id is not None and not bereits_belegt and lauf.status in ("GESENDET", "UNSICHER"):
+        nachsende_formular = f"""
+        <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/mahnempfaenger/{eintrag.id}/nachsenden" class="inline">
+          {csrf_feld(csrf_token)}
+          <button type="submit" class="secondary">Sicher nachsenden</button>
+        </form>"""
+        versand_html += nachsende_formular
+
     if eintrag.zugang_bestaetigt_am is not None:
         zugang_html = f"{h(eintrag.zugangsform)} am {eintrag.zugang_bestaetigt_am.isoformat()} ({h(eintrag.zugang_beleg or '')})"
         formular = ""
@@ -1134,7 +1223,7 @@ def mahnempfaenger_uebersicht(request: Request, vertrag_id: str, session=Depends
     mahnlaeufe_html = []
     for lauf in deps._hv_mail.mahnlauf_repo.list_fuer_vertrag(vertrag_id):
         eintraege = deps._hv_mail.empfaenger_zugang_repo.fuer_mahnlauf(lauf.id)
-        zeilen = "".join(_empfaenger_zugang_zeile_html(vertrag_id, e, session.csrf_token) for e in eintraege)
+        zeilen = "".join(_empfaenger_zugang_zeile_html(vertrag_id, lauf, e, session.csrf_token) for e in eintraege)
         mahnlaeufe_html.append(f"""
         <div class="card">
           <h3>Stufe {lauf.stufe}, Kanal {h(lauf.kanal)} — Status {h(lauf.status)}</h3>
@@ -1200,3 +1289,41 @@ def mahnempfaenger_zugang_bestaetigen(
     except (MietinkassoError, ValueError) as exc:
         return _fehlerseite(session, "Mitmieter & Zugang", str(exc), rueck)
     return RedirectResponse(url=rueck, status_code=303)
+
+
+@router.post("/vertrag/{vertrag_id}/mahnempfaenger/{eintrag_id}/nachsenden", response_class=HTMLResponse)
+def mahnempfaenger_nachsenden(
+    request: Request, vertrag_id: str, eintrag_id: int, csrf_token: str = Form(...),
+    session=Depends(_current_session),
+) -> HTMLResponse:
+    _verify_csrf(session, csrf_token)
+    rueck = f"/backoffice/vertrag/{vertrag_id}/mahnempfaenger"
+    zeile = None
+    for lauf in deps._hv_mail.mahnlauf_repo.list_fuer_vertrag(vertrag_id):
+        for e in deps._hv_mail.empfaenger_zugang_repo.fuer_mahnlauf(lauf.id):
+            if e.id == eintrag_id:
+                zeile = (lauf, e)
+                break
+        if zeile is not None:
+            break
+    if zeile is None:
+        return _fehlerseite(session, "Mitmieter & Zugang", f"Unbekannter Zugangsnachweis {eintrag_id}.", rueck)
+    lauf, eintrag = zeile
+    if eintrag.mitmieter_id is None:
+        return _fehlerseite(
+            session, "Mitmieter & Zugang",
+            "Für den Hauptdebitor gibt es keine Einzel-Nachsendung - das bleibt dem normalen Versand/Anbieterbeleg-Import vorbehalten.",
+            rueck,
+        )
+    try:
+        ergebnis = deps._hv_mail.nachsenden_einzelempfaenger(
+            ctx=_ctx(session), mahnlauf_id=lauf.id, mitmieter_id=eintrag.mitmieter_id, heute=date.today(),
+        )
+        deps._audit_service.log(
+            entity_typ="mahn_empfaenger_nachsendung", entity_id=str(eintrag_id), aktion="NACHSENDUNG_VERSUCHT",
+            akteur=session.user_id, payload={"vertrag_id": vertrag_id, "mahnlauf_id": lauf.id, "ergebnis": ergebnis},
+        )
+        inhalt = flash_ok(f"Nachsendung: {ergebnis}")
+        return _layout(request, session, "Mitmieter & Zugang", inhalt + f'<p><a href="{rueck}">&larr; zurück</a></p>')
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Mitmieter & Zugang", str(exc), rueck)

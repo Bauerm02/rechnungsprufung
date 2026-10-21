@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 import json
-from datetime import datetime, timezone
+import uuid
+from datetime import date, datetime, timezone
 
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.domain.enums import MahnStatus
+from mietinkasso.domain.exceptions import VorgangIdKonfliktError
 from mietinkasso.infrastructure.db.tables import (
     BriefAnbieterProfilTable, MahnEmpfaengerZugangTable, MahnFallTable, MahnKanalregelTable, MahnLaufTable,
     MahnPolicyTable, MahnTageslaufTable, VertragMitmieterTable,
 )
+from mietinkasso.mahnwesen.mahnbrief_archiv import _empfaenger_hash, _pruefe_anbieterbeleg_pdf
+
+_BRIEF_STATUS_REIHENFOLGE = ("VORBEREITET", "UEBERMITTELT")
 
 
 class MahnKanalregelRepository:
@@ -457,15 +463,6 @@ class MahnLaufRepository:
         with self._session_factory() as session:
             return session.get(MahnLaufTable, mahnlauf_id)
 
-    def list_fuer_vertrag(self, vertrag_id: str) -> list[MahnLaufTable]:
-        with self._session_factory() as session:
-            statement = (
-                select(MahnLaufTable)
-                .where(MahnLaufTable.vertrag_id == vertrag_id)
-                .order_by(MahnLaufTable.id.desc())
-            )
-            return list(session.execute(statement).scalars().all())
-
     def claim_fuer_versand(self, mahnlauf_id: int, *, jetzt: datetime | None = None, zusatz: dict | None = None) -> bool:
         """Atomarer Compare-and-Swap GEPLANT -> IN_VERSAND auf der
         GRUPPENZEILE selbst - das ist der eigentliche Unterschied zur
@@ -534,13 +531,29 @@ class MahnLaufRepository:
         (HV-20260914-AUFGABEN-MIETERAKTE, Codex-Rückprüfung): tatsächlich
         geplante/gesendete Mahnläufe als Schriftverkehrsnachweis, getrennt
         nach `versand_beansprucht_am` (Transport angenommen) und
-        `gesendet_am` (bestätigter Abschluss) - keine neue Berechnung."""
+        `gesendet_am` (bestätigter Abschluss) - keine neue Berechnung.
+
+        **Korrektur (HV-20261021-ABSCHLUSS, Vier-Stufen-Ende-zu-Ende-Test):**
+        diese Methode war früher im Quellcode DOPPELT definiert - die
+        zweite (hier verbliebene) Fassung hat die erste (die nach `id`
+        sortierte) still überschrieben, ohne dass das auffiel, weil die
+        meisten Aufrufer entweder nur EINEN Mahnlauf je Vertrag kannten
+        oder ohnehin selbst nach `MahnLaufTable.id` sortierten. Eine
+        reine `geplant_am.desc()`-Sortierung OHNE Tiebreaker ist bei
+        SQLite nicht verlässlich "jüngste zuerst": `geplant_am` kommt aus
+        `server_default=func.now()`, das bei SQLite nur Sekunden-
+        Granularität hat - zwei Mahnläufe DESSELBEN Vertrags, die
+        innerhalb derselben Sekunde geplant werden (z. B. zwei
+        aufeinanderfolgende Stufen desselben Tages-Batchlaufs), sortieren
+        dann in UNDEFINIERTER Reihenfolge. `id.desc()` als Tiebreaker
+        macht die Reihenfolge wieder deterministisch (höhere ID wurde
+        garantiert später angelegt)."""
 
         with self._session_factory() as session:
             statement = (
                 select(MahnLaufTable)
                 .where(MahnLaufTable.vertrag_id == vertrag_id)
-                .order_by(MahnLaufTable.geplant_am.desc())
+                .order_by(MahnLaufTable.geplant_am.desc(), MahnLaufTable.id.desc())
             )
             return list(session.execute(statement).scalars().all())
 
@@ -796,6 +809,152 @@ class MahnEmpfaengerZugangRepository:
                 raise ValueError(f"Unbekannter Empfänger-Zugangsnachweis {eintrag_id}")
             row.versand_belegt_am = versand_belegt_am
             row.versand_referenz = versand_referenz
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def archiviere_brief(
+        self, eintrag_id: int, *, pdf_bytes: bytes, versandnachweis_referenz: str,
+        empfaenger_name: str, empfaenger_adresse: str, erstellt_von: str,
+    ) -> MahnEmpfaengerZugangTable:
+        """BRIEF-Gegenstück zu `MahnbriefArchivRepository.archivieren`
+        (Auftrag HV-20261021-ABSCHLUSS) - archiviert das PDF-Schreiben
+        EINES konkreten, bereits über `erstelle_erwartete_eintraege`
+        angelegten Empfängers (Mitmieter). Vergibt bei ERSTER Archivierung
+        einen permanenten `brief_sende_schluessel` (UUID4, VOR jedem
+        Netzkontakt) - ein echter Retry mit IDENTISCHEM PDF-Hash/
+        Empfänger/Referenz bleibt ein sicherer No-Op, ein abweichender
+        Versuch ein `VorgangIdKonfliktError` (NIE ein stiller Erfolg mit
+        dem alten Inhalt) - exakt dasselbe Prinzip wie beim Hauptdebitor."""
+
+        pdf_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+        empfaenger_hash = _empfaenger_hash(empfaenger_name, empfaenger_adresse)
+
+        with self._session_factory() as session:
+            row = session.get(MahnEmpfaengerZugangTable, eintrag_id)
+            if row is None:
+                raise ValueError(f"Unbekannter Empfänger-Zugangsnachweis {eintrag_id}")
+            if row.brief_sende_schluessel is not None:
+                if (
+                    row.brief_pdf_sha256 != pdf_sha256 or row.brief_empfaenger_hash != empfaenger_hash
+                    or row.brief_versandnachweis_referenz != versandnachweis_referenz
+                ):
+                    raise VorgangIdKonfliktError(
+                        f"Mitmieter-Mahnbrief-Archiv {eintrag_id} existiert bereits mit abweichendem "
+                        "PDF-Inhalt, Empfänger und/oder Versandnachweis-Referenz - kein stiller Erfolg bei "
+                        "einem abweichenden Versuch."
+                    )
+                return row  # echter Retry, No-Op
+            row.brief_pdf_bytes = pdf_bytes
+            row.brief_pdf_sha256 = pdf_sha256
+            row.brief_empfaenger_hash = empfaenger_hash
+            row.brief_versandnachweis_referenz = versandnachweis_referenz
+            row.brief_erstellt_von = erstellt_von
+            row.brief_sende_schluessel = uuid.uuid4().hex
+            row.brief_status = "VORBEREITET"
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def aktualisiere_brief_status(
+        self, eintrag_id: int, *, neuer_status: str, beleg_referenz: str, erfasst_von: str,
+    ) -> MahnEmpfaengerZugangTable:
+        """Wie `MahnbriefArchivRepository.aktualisiere_status` - NUR
+        `VORBEREITET` -> `UEBERMITTELT`, nie rückwärts; ein echter Retry
+        mit IDENTISCHER Belegreferenz ist ein No-Op, eine abweichende
+        Referenz für denselben Status ein Konflikt."""
+
+        if neuer_status not in _BRIEF_STATUS_REIHENFOLGE:
+            raise ValueError(f"Unbekannter Mitmieter-Mahnbrief-Status {neuer_status!r}.")
+        if not beleg_referenz or not beleg_referenz.strip():
+            raise ValueError("Ein Statuswechsel verlangt eine explizite Belegreferenz.")
+        with self._session_factory() as session:
+            row = session.get(MahnEmpfaengerZugangTable, eintrag_id)
+            if row is None:
+                raise ValueError(f"Unbekannter Empfänger-Zugangsnachweis {eintrag_id}")
+            if row.brief_status is None:
+                raise ValueError(f"Empfänger-Zugangsnachweis {eintrag_id} hat noch keinen archivierten Mahnbrief.")
+            aktueller_index = _BRIEF_STATUS_REIHENFOLGE.index(row.brief_status)
+            neuer_index = _BRIEF_STATUS_REIHENFOLGE.index(neuer_status)
+            if neuer_index == aktueller_index:
+                if row.brief_status_beleg_referenz != beleg_referenz:
+                    raise VorgangIdKonfliktError(
+                        f"Empfänger-Zugangsnachweis {eintrag_id} hat bereits Brief-Status {row.brief_status!r} "
+                        f"mit abweichender Belegreferenz ({row.brief_status_beleg_referenz!r} != {beleg_referenz!r})."
+                    )
+                return row  # echter Retry, No-Op
+            if neuer_index < aktueller_index:
+                raise ValueError(
+                    f"Empfänger-Zugangsnachweis {eintrag_id}: Brief-Statuswechsel von {row.brief_status!r} zurück "
+                    f"auf {neuer_status!r} ist nicht erlaubt (nur vorwärts)."
+                )
+            row.brief_status = neuer_status
+            row.brief_status_beleg_referenz = beleg_referenz
+            row.brief_status_erfasst_von = erfasst_von
+            row.brief_status_aktualisiert_am = datetime.now(timezone.utc)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def importiere_brief_anbieterbeleg(
+        self, eintrag_id: int, *, anbieterbeleg_pdf_bytes: bytes, anbieterbeleg_referenz: str,
+        postaufgabe_datum: date, importiert_von: str,
+    ) -> MahnEmpfaengerZugangTable:
+        """BRIEF-Gegenstück zu `MahnbriefArchivRepository.
+        importiere_anbieterbeleg` für EINEN konkreten Mitmieter - rein
+        dokumentarischer, menschlich/prozessual erfasster Nachweis aus der
+        echten Post-Portal-Auftragsliste; treibt NIE eine Kostenbuchung
+        oder den Gruppen-GESENDET-Übergang (das bleibt ausschließlich dem
+        Hauptdebitor-Anbieterbeleg vorbehalten, siehe
+        `HVMailversandService.vervollstaendige_mahnlauf_aus_anbieterbeleg`
+        - "keine doppelte Gebührenbuchung"). Ein bloßer Referenztext ist
+        KEIN Beleg; eine Belegreferenz gehört zu GENAU EINER Sendung."""
+
+        if not anbieterbeleg_referenz or not anbieterbeleg_referenz.strip():
+            raise ValueError("Ein Anbieterbeleg-Import verlangt eine explizite, nicht-leere Referenz.")
+        _pruefe_anbieterbeleg_pdf(anbieterbeleg_pdf_bytes)
+        if postaufgabe_datum is None:
+            raise ValueError("Ein Anbieterbeleg-Import verlangt das tatsächliche Postaufgabedatum.")
+        beleg_sha256 = hashlib.sha256(anbieterbeleg_pdf_bytes).hexdigest()
+
+        with self._session_factory() as session:
+            row = session.get(MahnEmpfaengerZugangTable, eintrag_id)
+            if row is None:
+                raise ValueError(f"Unbekannter Empfänger-Zugangsnachweis {eintrag_id}")
+            if row.brief_sende_schluessel is None:
+                raise ValueError(f"Empfänger-Zugangsnachweis {eintrag_id} hat noch keinen archivierten Mahnbrief.")
+
+            fremde_zeile = session.execute(
+                select(MahnEmpfaengerZugangTable).where(
+                    MahnEmpfaengerZugangTable.brief_anbieterbeleg_referenz == anbieterbeleg_referenz,
+                    MahnEmpfaengerZugangTable.id != eintrag_id,
+                )
+            ).scalar_one_or_none()
+            if fremde_zeile is not None:
+                raise VorgangIdKonfliktError(
+                    f"Belegreferenz {anbieterbeleg_referenz!r} ist bereits Empfänger-Zugangsnachweis "
+                    f"{fremde_zeile.id} zugeordnet - eine Belegreferenz gehört zu GENAU EINER Sendung."
+                )
+
+            if row.brief_anbieterbeleg_referenz is not None:
+                identisch = (
+                    row.brief_anbieterbeleg_referenz == anbieterbeleg_referenz
+                    and row.brief_anbieterbeleg_pdf_sha256 == beleg_sha256
+                    and row.brief_anbieterbeleg_postaufgabe_datum == postaufgabe_datum
+                )
+                if not identisch:
+                    raise VorgangIdKonfliktError(
+                        f"Empfänger-Zugangsnachweis {eintrag_id} hat bereits einen Anbieterbeleg - ein "
+                        "abweichender Import wird abgelehnt statt den bestehenden Nachweis zu ersetzen."
+                    )
+                return row  # echter Retry, No-Op
+
+            row.brief_anbieterbeleg_referenz = anbieterbeleg_referenz
+            row.brief_anbieterbeleg_pdf_bytes = anbieterbeleg_pdf_bytes
+            row.brief_anbieterbeleg_pdf_sha256 = beleg_sha256
+            row.brief_anbieterbeleg_postaufgabe_datum = postaufgabe_datum
+            row.brief_anbieterbeleg_importiert_von = importiert_von
+            row.brief_anbieterbeleg_importiert_am = datetime.now(timezone.utc)
             session.commit()
             session.refresh(row)
             return row

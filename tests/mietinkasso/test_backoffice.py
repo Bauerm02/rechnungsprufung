@@ -1135,6 +1135,95 @@ def test_mahnvorschau_blockiert_ohne_bankbestaetigung_und_sendet_nie_echt(backof
     assert 'action="/backoffice/mahnfall/' not in vorschau.text
 
 
+def test_mahnvorschau_zahlungsziel_mehrdeutigkeit_zeigt_bindungsformular_und_loest_sie_auf(backoffice_client):
+    """Nutzervorgabe 21.10.2026: fehlende/mehrdeutige Zahlungszielbindung
+    darf nicht nur eine Warnung sein - bei MEHREREN Bankkonten einer
+    Gesellschaft muss die Mahnvorschau eine bedienbare, beleggestützte
+    Bindungsauflösung anbieten (keine Auswahl nach erster Zeile/
+    Bezeichnung), und erst NACH deren Bestätigung verschwindet die
+    Warnung."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    from mietinkasso.bank.repository import BankRepository
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+
+    # Eigene, isolierte Gesellschaft (siehe Begründung im Nachbartest
+    # `test_mahnvorschau_unterscheidet_planbar_von_tatsaechlich_geplant`).
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_gesellschaft(id="7DI-ZIEL", name="7D Immobilien GmbH (Zahlungsziel-Test)")
+    stammdaten.upsert_gesellschaft(id="7DI-ZIEL-FREMD", name="Fremde Gesellschaft (Zahlungsziel-Test)")
+    stammdaten.upsert_objekt(id="601-ZIEL", gesellschaft_id="7DI-ZIEL", bezeichnung="Am Corso (Zahlungsziel-Test)")
+    stammdaten.upsert_einheit(id="601-TOP-ZIEL", objekt_id="601-ZIEL", bezeichnung="Top Ziel", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_debitor(id="DEB-ZIEL", name="Test Mieterin Ziel", email="ziel@example.at")
+    stammdaten.upsert_vertrag(
+        id="V-601-ZIEL", einheit_id="601-TOP-ZIEL", debitor_id="DEB-ZIEL", gesellschaft_id="7DI-ZIEL",
+        rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-ZIEL"))
+
+    bank = BankRepository(build_session_factory(get_settings().database_url))
+    bank.upsert_bank_konto(id="ZIEL-BANK-A", gesellschaft_id="7DI-ZIEL", iban="AT000000000000000011", bezeichnung="Konto A")
+    bank.upsert_bank_konto(id="ZIEL-BANK-B", gesellschaft_id="7DI-ZIEL", iban="AT000000000000000012", bezeichnung="Konto B")
+    bank.upsert_bank_konto(id="ZIEL-BANK-FREMD", gesellschaft_id="7DI-ZIEL-FREMD", iban="AT000000000000000099", bezeichnung="Fremdkonto")
+
+    vorschau = client.get("/backoffice/vertrag/V-601-ZIEL/mahnvorschau")
+    assert vorschau.status_code == 200
+    assert "Zahlungsziel für Mahnschreiben ungeklärt" in vorschau.text
+    assert "2 Bankkonten gefunden" in vorschau.text
+    assert "Zahlungsziel-Bindung bestätigen" in vorschau.text
+    assert "Konto A (AT000000000000000011)" in vorschau.text
+    assert "Konto B (AT000000000000000012)" in vorschau.text
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', vorschau.text).group(1)
+
+    # Falscher CSRF-Token -> 403.
+    assert client.post(
+        "/backoffice/vertrag/V-601-ZIEL/zahlungsziel-bindung/bestaetigen",
+        data={"csrf_token": "falsch", "bank_konto_id": "ZIEL-BANK-B", "quellenbeleg_referenz": "x"},
+    ).status_code == 403
+
+    # Ohne Quellenbeleg -> abgelehnt, keine beleglose Zuordnung.
+    ohne_beleg = client.post(
+        "/backoffice/vertrag/V-601-ZIEL/zahlungsziel-bindung/bestaetigen",
+        data={"csrf_token": csrf, "bank_konto_id": "ZIEL-BANK-B", "quellenbeleg_referenz": "   "},
+    )
+    assert ohne_beleg.status_code == 400
+
+    # Ein Bankkonto einer ANDEREN Gesellschaft wird abgelehnt - keine
+    # Bindung an ein fremdes Konto.
+    fremd = client.post(
+        "/backoffice/vertrag/V-601-ZIEL/zahlungsziel-bindung/bestaetigen",
+        data={"csrf_token": csrf, "bank_konto_id": "ZIEL-BANK-FREMD", "quellenbeleg_referenz": "Mietvertrag Anhang 3"},
+    )
+    assert fremd.status_code == 400
+
+    # Echte, bestätigte Bindung an Konto B - ausdrücklich NICHT Konto A
+    # (die erste Zeile), um zu belegen, dass keine Positions-/
+    # Bezeichnungsheuristik greift.
+    bestaetigt = client.post(
+        "/backoffice/vertrag/V-601-ZIEL/zahlungsziel-bindung/bestaetigen",
+        data={"csrf_token": csrf, "bank_konto_id": "ZIEL-BANK-B", "quellenbeleg_referenz": "Mietvertrag Anhang 3"},
+        follow_redirects=False,
+    )
+    assert bestaetigt.status_code == 303
+
+    nachher = client.get("/backoffice/vertrag/V-601-ZIEL/mahnvorschau")
+    assert "Zahlungsziel für Mahnschreiben ungeklärt" not in nachher.text
+    assert "bestätigte Bindung an Konto B" in nachher.text
+    assert "Mietvertrag Anhang 3" in nachher.text
+
+    from mietinkasso.indexautomatik.mailversand_service import zahlungsziel_fuer_mahnung
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+    ziel = zahlungsziel_fuer_mahnung(
+        backoffice_deps._bank_repo, backoffice_deps._stammdaten_repo, gesellschaft_id="7DI-ZIEL",
+        vertrag_id="V-601-ZIEL", stufe=1, zuordnung_repo=backoffice_deps._hv_mail.zahlungsziel_bindung_repo,
+    )
+    assert ziel.iban == "AT000000000000000012"  # Konto B, nicht Konto A
+
+
 def test_mahnvorschau_unterscheidet_planbar_von_tatsaechlich_geplant(backoffice_client):
     """Auftrag Markus 14.09.2026: eine reine (noch nicht gespeicherte)
     Vorschau darf nicht denselben Status-Text wie ein tatsächlich
@@ -1361,6 +1450,76 @@ def test_mahnempfaenger_uebersicht_zeigt_mitmieter_und_ist_erreichbar(backoffice
     # Auch über die Mahnvorschau erreichbar.
     vorschau = client.get("/backoffice/vertrag/V-601-1/mahnvorschau")
     assert "mahnempfaenger" in vorschau.text
+
+
+def test_mahnempfaenger_nachsenden_button_und_route_sind_bedienbar(backoffice_client):
+    """Task 38 (sichere Nachsende-Aktion): die 'Sicher nachsenden'-
+    Schaltfläche erscheint NUR für einen Mitmieter, dessen Kopieversand
+    noch nicht belegt ist, und die Route lehnt den Hauptdebitor sowie
+    einen unbekannten Zugangsnachweis sauber ab, statt mit 500 zu
+    scheitern."""
+
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.mahnwesen.repository import (
+        MahnEmpfaengerZugangRepository,
+        MahnLaufRepository,
+        VertragMitmieterRepository,
+    )
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+
+    session_factory = build_session_factory(get_settings().database_url)
+    mitmieter_repo = VertragMitmieterRepository(session_factory)
+    mahnlauf_repo = MahnLaufRepository(session_factory)
+    empfaenger_repo = MahnEmpfaengerZugangRepository(session_factory)
+
+    mitmieter = mitmieter_repo.anlegen(
+        vertrag_id="V-601-1", name="Nachsende Mitmieter", email="nachsende@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT",
+    )
+    lauf = mahnlauf_repo.get_or_create(
+        outbox_key="test-nachsenden-v601-1", vertrag_id="V-601-1", gesellschaft_id="7DI",
+        stufe=1, kanal="EMAIL", status="GESENDET", mitglieder_mahnfall_ids="[]",
+    )
+    eintraege = empfaenger_repo.erstelle_erwartete_eintraege(
+        mahnlauf_id=lauf.id, empfaenger=[(None, "Hauptdebitor"), (mitmieter.id, mitmieter.name)],
+        erstellt_von="test",
+    )
+    haupt_eintrag = next(e for e in eintraege if e.mitmieter_id is None)
+    mitmieter_eintrag = next(e for e in eintraege if e.mitmieter_id == mitmieter.id)
+
+    seite = client.get("/backoffice/vertrag/V-601-1/mahnempfaenger")
+    assert seite.status_code == 200
+    nachsende_action = f"/backoffice/vertrag/V-601-1/mahnempfaenger/{mitmieter_eintrag.id}/nachsenden"
+    assert nachsende_action in seite.text
+    assert f"/backoffice/vertrag/V-601-1/mahnempfaenger/{haupt_eintrag.id}/nachsenden" not in seite.text
+    csrf = re.search(r'name="csrf_token" value="([^"]+)"', seite.text).group(1)
+
+    # Falscher CSRF-Token -> 403, kein stiller Erfolg.
+    assert client.post(nachsende_action, data={"csrf_token": "falsch"}).status_code == 403
+
+    # Hauptdebitor hat keine Einzel-Nachsendung.
+    haupt_versuch = client.post(
+        f"/backoffice/vertrag/V-601-1/mahnempfaenger/{haupt_eintrag.id}/nachsenden",
+        data={"csrf_token": csrf},
+    )
+    assert haupt_versuch.status_code == 400
+    assert "Hauptdebitor" in haupt_versuch.text
+
+    # Unbekannter Zugangsnachweis -> Fehlerseite statt 500.
+    unbekannt = client.post(
+        "/backoffice/vertrag/V-601-1/mahnempfaenger/999999/nachsenden", data={"csrf_token": csrf},
+    )
+    assert unbekannt.status_code == 400
+    assert "Unbekannter Zugangsnachweis" in unbekannt.text
+
+    # Der echte Mitmieter-Nachsendeversuch erreicht den Service (kein
+    # Mailops-Transport in dieser Testumgebung verfügbar) - er darf
+    # weder mit 500 scheitern noch den Flash-Fehlerfall umgehen.
+    versucht = client.post(nachsende_action, data={"csrf_token": csrf})
+    assert versucht.status_code in (200, 400)
 
 
 def _ctx_admin():

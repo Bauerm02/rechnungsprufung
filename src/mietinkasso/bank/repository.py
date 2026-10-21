@@ -12,7 +12,9 @@ from mietinkasso.domain.exceptions import (
     CrossTenantError,
     FremdwaehrungNichtUnterstuetztError,
     ImportConflictError,
+    QuellenbelegFehltError,
     VorgangIdKonfliktError,
+    ZahlungszielBindungUngueltigError,
     ZuordnungUngueltigError,
 )
 from mietinkasso.infrastructure.db.tables import (
@@ -21,6 +23,8 @@ from mietinkasso.infrastructure.db.tables import (
     KontoTable,
     OPPositionTable,
     RuecklastschriftkostenTable,
+    VertragTable,
+    VertragZahlungszielBindungTable,
     ZuordnungTable,
 )
 
@@ -474,3 +478,64 @@ class BankRepository:
                 if transaktion.betrag_cent - zugeordnet > 0:
                     return True
         return False
+
+
+class VertragZahlungszielBindungRepository:
+    """Verwaltet die explizite, ausdrücklich geprüfte Vertrag->Bankkonto-
+    Bindung für Gesellschaften mit MEHR ALS EINEM Bankkonto (Nutzervorgabe
+    21.10.2026: "keine Auswahl nach erster Zeile oder Bezeichnung", siehe
+    `VertragZahlungszielBindungTable`-Docstring). `bestaetigen` validiert,
+    dass das Bankkonto tatsächlich zur Gesellschaft DIESES Vertrags gehört
+    - eine Bindung an ein fremdes Konto ist NIE ein stiller Fehler,
+    sondern ein abgelehnter Versuch."""
+
+    def __init__(self, session_factory: sessionmaker[Session]):
+        self._session_factory = session_factory
+
+    def bestaetigen(
+        self, *, vertrag_id: str, bank_konto_id: str, quellenbeleg_referenz: str, bestaetigt_von: str,
+    ) -> VertragZahlungszielBindungTable:
+        if not quellenbeleg_referenz or not quellenbeleg_referenz.strip():
+            raise QuellenbelegFehltError(
+                "Eine Zahlungsziel-Bindung ohne Quellenbeleg-Referenz wird abgelehnt - "
+                "keine beleglose Klassifizierung."
+            )
+        with self._session_factory() as session:
+            vertrag = session.get(VertragTable, vertrag_id)
+            if vertrag is None:
+                raise ValueError(f"Unbekannter Vertrag {vertrag_id}.")
+            konto = session.get(BankKontoTable, bank_konto_id)
+            if konto is None:
+                raise ValueError(f"Unbekanntes Bankkonto {bank_konto_id}.")
+            if konto.gesellschaft_id != vertrag.gesellschaft_id:
+                raise ZahlungszielBindungUngueltigError(
+                    f"Bankkonto {bank_konto_id} gehört zur Gesellschaft {konto.gesellschaft_id}, "
+                    f"nicht zur Gesellschaft {vertrag.gesellschaft_id} des Vertrags {vertrag_id} - "
+                    "keine Bindung an ein fremdes Konto."
+                )
+            row = VertragZahlungszielBindungTable(
+                vertrag_id=vertrag_id, bank_konto_id=bank_konto_id,
+                quellenbeleg_referenz=quellenbeleg_referenz.strip(), bestaetigt_von=bestaetigt_von,
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row
+
+    def aktuelle_bindung(self, vertrag_id: str) -> VertragZahlungszielBindungTable | None:
+        with self._session_factory() as session:
+            statement = (
+                select(VertragZahlungszielBindungTable)
+                .where(VertragZahlungszielBindungTable.vertrag_id == vertrag_id)
+                .order_by(VertragZahlungszielBindungTable.id.desc())
+            )
+            return session.execute(statement).scalars().first()
+
+    def historie(self, vertrag_id: str) -> list[VertragZahlungszielBindungTable]:
+        with self._session_factory() as session:
+            statement = (
+                select(VertragZahlungszielBindungTable)
+                .where(VertragZahlungszielBindungTable.vertrag_id == vertrag_id)
+                .order_by(VertragZahlungszielBindungTable.id.desc())
+            )
+            return list(session.execute(statement).scalars().all())

@@ -1100,6 +1100,92 @@ def test_zahlungsziel_je_gesellschaft_eindeutig_keine_vermischung_kein_raten(hv,
     assert ziel_a_mehrdeutig.iban is None and ziel_a_mehrdeutig.kontoinhaber is None
 
 
+def test_mahnlauf_stoppt_tatsaechlichen_versand_bei_mehrdeutigem_zahlungsziel(hv, basis_vertrag, admin_ctx):
+    """Konkreter Abnahmehinweis (Markus 21.10.2026) zu Task 36: eine
+    fehlende/mehrdeutige Zahlungszielbindung darf NICHT nur eine Warnung
+    plus unspezifischem Kundentext sein - der tatsächliche Versand muss
+    dafür als gezielter Prüffall STOPPEN (`blockiert`, nicht
+    `gesendet`), damit weder ein falsches noch ein unbrauchbares
+    Zahlungsziel gemahnt wird. Erst eine ausdrücklich bestätigte
+    Vertragsbindung (nicht "die erste Zeile"/"nach Bezeichnung") löst
+    die Mehrdeutigkeit auf und lässt den Versand tatsächlich zu."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+
+    # Ein ZWEITES Bankkonto derselben Gesellschaft macht die Bindung
+    # mehrdeutig - absichtlich mit einer Bezeichnung, die bei einer
+    # naiven "erste Zeile"/"nach Bezeichnung"-Heuristik eher träfe als
+    # "SYNTHETIC-BANK", um eine solche Heuristik sicher aufzudecken.
+    service.bank_repo.upsert_bank_konto(
+        id="AAA-ZUERST", gesellschaft_id=contract.gesellschaft_id, iban="AT000000000000000077", bezeichnung="Hauptkonto")
+
+    ergebnis = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    assert ergebnis["gesendet"] == 0
+    assert ergebnis["blockiert"] == 1
+    assert len(state["calls"]) == 0  # kein einziger Providerkontakt - kein falsches/unbrauchbares Zahlungsziel gemahnt
+
+    # Transienter Prüffall: NICHT einmal ein MahnFallTable-Eintrag wird
+    # angelegt (wie bei jedem anderen `_pruefe_forderung_planbar`-
+    # BLOCKIERT-Grund) - kein dauerhaft toter, manuell zu entsperrender
+    # Zustand, sobald die Bindung bestätigt ist, wird einfach neu geplant.
+    assert service.mahn_repo.list_fuer_vertrag(contract.id) == []
+
+    # Eine ausdrücklich bestätigte Bindung an das ZWEITE Konto (NICHT
+    # das zuerst angelegte "SYNTHETIC-BANK", NICHT das nach Bezeichnung
+    # "passendere" "Hauptkonto") löst die Mehrdeutigkeit auf.
+    service.zahlungsziel_bindung_repo.bestaetigen(
+        vertrag_id=contract.id, bank_konto_id="AAA-ZUERST",
+        quellenbeleg_referenz="Mietvertrag Anhang 3", bestaetigt_von="codex-test",
+    )
+    # Das zweite, jetzt gebundene Konto braucht ebenfalls eine aktuelle
+    # Bankbestätigung (`bank_freigabe_ableiten` nimmt das Minimum über
+    # ALLE Konten der Gesellschaft).
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="AAA-ZUERST", bestaetigt_bis=date(2026, 9, 14), bestaetigt_von="SYNTHETIC-TEST")
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="SYNTHETIC-BANK", bestaetigt_bis=date(2026, 9, 14), bestaetigt_von="SYNTHETIC-TEST")
+    state["status"] = "GESENDET"
+    ergebnis2 = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 14))
+    assert ergebnis2["gesendet"] == 1
+    body = json.loads(state["calls"][0].content)
+    assert "AT000000000000000077" in body["text"]
+    assert "SYNTHETIC-NOT-A-REAL-IBAN" not in body["text"]
+
+
+def test_nachsendung_verweigert_bei_mehrdeutigem_zahlungsziel(hv_mit_tracking, basis_vertrag, admin_ctx):
+    """Dasselbe Versand-Gate gilt auch für die sichere Nachsende-Aktion
+    (Task 2) - eine Nachsendung mit mehrdeutigem Zahlungsziel wird
+    abgelehnt, nicht mit einem unbrauchbaren Zahlungsziel ausgeliefert."""
+
+    service, state = hv_mit_tracking
+    contract, account = basis_vertrag
+    policy = service.policy_repo.anlegen(stufe1_tage_nach_faelligkeit=7,
+        stufe2_mindesttage_nach_stufe1_versand=14, zinsen_prozent=Decimal("0"), gebuehr_cent=0, status="ENTWURF")
+    service.policy_repo.freigeben(policy.id)
+    service.op_service.buchen(ctx=admin_ctx, konto=account, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 9, 1), buchungsdatum=date(2026, 9, 1), faelligkeit=date(2026, 9, 5), beleg_referenz="Sept")
+    service.bank_repo.upsert_bank_konto(
+        id="BANK-1", gesellschaft_id=contract.gesellschaft_id, iban="AT01", bezeichnung="Konto 1")
+    service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="BANK-1", bestaetigt_bis=date(2026, 9, 13), bestaetigt_von="TEST")
+    m = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin", email="mitmieterin@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+
+    state["fehlschlagen_beim_ersten_versuch"] = {"mitmieterin@example.at"}
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+
+    # Erst JETZT, nach dem erfolgreichen Erstversand, wird die Bindung
+    # mehrdeutig (zweites Bankkonto taucht nachträglich auf).
+    service.bank_repo.upsert_bank_konto(
+        id="BANK-2", gesellschaft_id=contract.gesellschaft_id, iban="AT02", bezeichnung="Konto 2")
+
+    with pytest.raises(Exception) as exc_info:
+        service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=m.id, heute=date(2026, 9, 14))
+    from mietinkasso.domain.exceptions import ZahlungszielUngeklaertError
+    assert isinstance(exc_info.value, ZahlungszielUngeklaertError)
+
+
 def test_mahnlauf_zwei_gesellschaften_email_verwendet_jeweils_eigene_iban(hv, basis_vertrag, admin_ctx):
     """Task 36: zwei Gesellschaften mit abweichenden IBANs - der
     tatsächlich gesendete E-Mail-Text jeder Gesellschaft nennt
@@ -1309,3 +1395,364 @@ def test_mitmieter_kopiennachweis_bleibt_durabel_auch_bei_absturz_nach_dem_versa
     )
     assert eintrag_nach_recovery.versand_belegt_am == eintrag.versand_belegt_am
     assert eintrag_nach_recovery.versand_referenz == eintrag.versand_referenz
+
+
+# -- Auftrag HV-20261021-ABSCHLUSS: Briefsendung an ALLE bestätigten -------
+# -- Mitmieter (eigenes PDF, Anschrift, Sendeschlüssel, Anbieterbeleg) ------
+
+
+def test_brief_erreicht_alle_bestaetigten_mitmieter_mit_eigenem_pdf_und_sendeschluessel(
+    hv, basis_vertrag, admin_ctx,
+):
+    """Task 1 (HV-20261021-ABSCHLUSS): JEDER aktive, bestätigte Mitmieter
+    mit geprüfter Postadresse bekommt ein EIGENES Mahnbrief-PDF unter
+    einem EIGENEN, permanenten Sendeschlüssel - ein Vertreter, eine noch
+    ungeklärte Angabe und ein bestätigter Mitmieter OHNE geprüfte
+    Postadresse werden NIE automatisch mitadressiert."""
+
+    service, _state = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake_verbindung = _richte_brief_kanal_ein(service, contract, account)
+
+    m_ok = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email=None, adresse="Nebenstraße 2, 1010 Wien",
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    service.mitmieter_repo.setze_postadresse_geprueft(m_ok.id, geprueft=True)
+    m_ohne_geprueft = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieter ungeprüft", email=None, adresse="Ungeprüfte Gasse 3, 1010 Wien",
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Ungeklärt", email=None, adresse="Irrelevant 4, 1010 Wien",
+        erstellt_von="test", rolle="MITMIETER", zustand="AUSGELESEN")
+    m_vertreter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Vertreter", email=None, adresse="Kanzleigasse 5, 1010 Wien",
+        erstellt_von="test", rolle="VERTRETER", zustand="BESTAETIGT")
+    service.mitmieter_repo.setze_postadresse_geprueft(m_vertreter.id, geprueft=True)
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    eintraege = {e.mitmieter_id: e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id)}
+
+    eintrag_a = eintraege[m_ok.id]
+    assert eintrag_a.brief_status == "UEBERMITTELT"
+    assert eintrag_a.brief_pdf_bytes[:5] == b"%PDF-"
+    assert eintrag_a.brief_sende_schluessel
+
+    eintrag_ohne_geprueft = eintraege[m_ohne_geprueft.id]
+    assert eintrag_ohne_geprueft.brief_status is None  # keine geprüfte Postadresse -> kein Versand
+
+    assert m_vertreter.id not in eintraege  # Vertreter ist nie Teil der erwarteten Empfänger überhaupt
+
+    archiv_hauptbrief = service.mahnbrief_archiv_repo.fuer_mahnlauf(
+        vertrag_id=contract.id, stufe=1, mahnlauf_schluessel=mahnlauf.outbox_key,
+    )
+    dateiname_haupt = brief_sftp.baue_dateiname(sende_schluessel=archiv_hauptbrief.sende_schluessel)
+    dateiname_mitmieter = brief_sftp.baue_dateiname(sende_schluessel=eintrag_a.brief_sende_schluessel)
+    assert dateiname_haupt != dateiname_mitmieter  # zwei EIGENE Sendeschlüssel/Dateinamen
+    assert set(fake_verbindung.geschriebene_dateien) == {f"bulk_tp/{dateiname_haupt}", f"bulk_tp/{dateiname_mitmieter}"}
+    assert fake_verbindung.geschriebene_dateien[f"bulk_tp/{dateiname_mitmieter}"] == eintrag_a.brief_pdf_bytes
+
+
+def test_mitmieter_brief_anbieterbeleg_import_ist_unabhaengig_vom_hauptbrief(hv, basis_vertrag, admin_ctx):
+    """Task 1: ein Anbieterbeleg-Import für EINEN Mitmieter-Brief ist eine
+    rein dokumentarische, eigene Evidenz - treibt NIE die Gruppen-
+    Kostenbuchung/den GESENDET-Übergang (das bleibt ausschließlich dem
+    Hauptdebitor-Anbieterbeleg vorbehalten, "keine doppelte
+    Gebührenbuchung"). Ein Retry mit identischem Beleg ist ein No-Op, ein
+    abweichender Beleg für dieselbe Referenz ein Konflikt."""
+
+    service, _state = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    _richte_brief_kanal_ein(service, contract, account)
+
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email=None, adresse="Nebenstraße 2, 1010 Wien",
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    service.mitmieter_repo.setze_postadresse_geprueft(mitmieter.id, geprueft=True)
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    eintrag = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag.brief_status == "UEBERMITTELT"
+    assert eintrag.brief_anbieterbeleg_referenz is None  # noch kein echter Zustellnachweis
+
+    beleg_pdf = _echter_beleg_pdf("Mitmieter-Anbieterbeleg")
+    aktualisiert = service.empfaenger_zugang_repo.importiere_brief_anbieterbeleg(
+        eintrag.id, anbieterbeleg_pdf_bytes=beleg_pdf, anbieterbeleg_referenz="POST-REF-MITMIETER-1",
+        postaufgabe_datum=date(2026, 9, 13), importiert_von="codex-test",
+    )
+    assert aktualisiert.brief_anbieterbeleg_referenz == "POST-REF-MITMIETER-1"
+    assert aktualisiert.brief_anbieterbeleg_pdf_bytes == beleg_pdf
+
+    # Echter Retry mit identischem Beleg: No-Op.
+    erneut = service.empfaenger_zugang_repo.importiere_brief_anbieterbeleg(
+        eintrag.id, anbieterbeleg_pdf_bytes=beleg_pdf, anbieterbeleg_referenz="POST-REF-MITMIETER-1",
+        postaufgabe_datum=date(2026, 9, 13), importiert_von="codex-test",
+    )
+    assert erneut.brief_anbieterbeleg_importiert_am == aktualisiert.brief_anbieterbeleg_importiert_am
+
+    # Abweichender Beleg für dieselbe Referenz: Konflikt, kein stiller Erfolg.
+    with pytest.raises(VorgangIdKonfliktError):
+        service.empfaenger_zugang_repo.importiere_brief_anbieterbeleg(
+            eintrag.id, anbieterbeleg_pdf_bytes=_echter_beleg_pdf("Abweichender Beleg"),
+            anbieterbeleg_referenz="POST-REF-MITMIETER-1", postaufgabe_datum=date(2026, 9, 14),
+            importiert_von="codex-test",
+        )
+
+    # Das Hauptdebitor-Mahnbrief-Archiv ist davon völlig unberührt -
+    # bleibt weiterhin UNSICHER, keine Kostenbuchung ausgelöst.
+    with service.sf() as db:
+        from mietinkasso.infrastructure.db.tables import MahnFallTable as _MF
+        mahnfall = db.execute(select(_MF).where(_MF.vertrag_id == contract.id)).scalars().first()
+    assert mahnfall.status == "UNSICHER"
+
+
+# -- Auftrag HV-20261021-ABSCHLUSS, Task 2: sichere Nachsende-Aktion -------
+# -- (Status erst klären, nie erfolgreich Gesendete wiederholen, keine -----
+# -- doppelte Gebührenbuchung) ----------------------------------------------
+
+
+@pytest.fixture
+def hv_mit_tracking(session_factory, basis_vertrag, tmp_path):
+    """Wie `hv`, aber mit einem GET/POST-bewussten Mock-Provider, der
+    TATSÄCHLICH nachhält, welche Referenzen je wirklich beim Provider
+    angenommen wurden - nötig, um `status_abfragen` (NICHT_GEFUNDEN vs.
+    GESENDET) realistisch zu testen ("ungewisser Providerstatus erst
+    abklären"). `state["fehlschlagen_beim_ersten_versuch"]` simuliert
+    einen echten Transportfehler NUR beim allerersten POST-Versuch einer
+    Referenz für die genannten Empfänger-E-Mail-Adressen - ein späterer
+    Versuch MIT DERSELBEN Referenz (Nachsendung) gelingt danach
+    tatsächlich, genau wie bei einem echten, idempotenten Mailserver."""
+
+    token = tmp_path / "synthetic-token"
+    token.write_text("SYNTHETIC-TOKEN", encoding="utf-8")
+    state = {"calls": [], "angenommen": set(), "bereits_versucht": set(), "fehlschlagen_beim_ersten_versuch": set()}
+
+    def provider(request):
+        state["calls"].append(request)
+        payload = json.loads(request.content) if request.method == "POST" else None
+        referenz = payload["referenz"] if payload else request.url.params["referenz"]
+        external = "JLBHV-" + hashlib.sha256(json.dumps(referenz, ensure_ascii=False).encode()).hexdigest()
+        if request.method == "POST":
+            if referenz not in state["bereits_versucht"]:
+                state["bereits_versucht"].add(referenz)
+                if payload.get("empfaenger_email") in state["fehlschlagen_beim_ersten_versuch"]:
+                    return httpx.Response(500)
+            state["angenommen"].add(referenz)
+            return httpx.Response(200, json={"status": "GESENDET", "externe_referenz": external,
+                "provider_referenz": "SYNTHETIC-SENT-TRACK", "versendet_am": "2026-09-14T22:30:00Z"})
+        if referenz in state["angenommen"]:
+            return httpx.Response(200, json={"status": "GESENDET", "externe_referenz": external,
+                "provider_referenz": "SYNTHETIC-SENT-TRACK", "versendet_am": "2026-09-14T22:30:00Z"})
+        return httpx.Response(200, json={"status": "NICHT_GEFUNDEN"})
+
+    client = MailOpsClient(token_file=token, transport_factory=lambda: httpx.MockTransport(provider))
+    settings = Settings(owner_email="mb@jlb-immo.at", send_enabled=True, hv_mail_allowlist_bestaetigt=True,
+        indexautomatik_send_enabled=True, vertragsende_erinnerung_send_enabled=True)
+    bundle = bauen(session_factory, settings)
+    return HVMailversandService(session_factory, bundle, settings, client=client), state
+
+
+def test_nachsendung_email_fuer_nachweislich_fehlgeschlagenen_empfaenger_erst_status_klaeren(
+    hv_mit_tracking, basis_vertrag, admin_ctx,
+):
+    """Task 2: der ERSTE Kopieversand an die Mitmieterin schlägt
+    (simuliert) am Transport fehl - `nachsenden_einzelempfaenger` klärt
+    ERST den Providerstatus (NICHT_GEFUNDEN - nachweislich nie
+    angenommen), sendet DANN sicher nach, und ein erneuter Aufruf für
+    dieselbe, jetzt belegte Person ist ein reiner No-Op (kein zweiter
+    POST, "erfolgreich gesendete Empfänger nie wiederholen")."""
+
+    service, state = hv_mit_tracking
+    contract, account = basis_vertrag
+    _seed_debt(hv_mit_tracking, contract, account, admin_ctx)
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email="mitmieterin-a@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    state["fehlschlagen_beim_ersten_versuch"].add("mitmieterin-a@example.at")
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    assert mahnlauf.status == "GESENDET"  # Hauptversand unberührt vom Mitmieter-Fehlschlag
+    eintrag_vor = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag_vor.versand_belegt_am is None  # tatsächlich fehlgeschlagen, kein erfundener Beleg
+
+    anzahl_vor_nachsendung = len(state["calls"])
+    ergebnis = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 14))
+    assert ergebnis == "GESENDET"
+    # GENAU zwei neue Anfragen: die Status-Abklärung (GET) + der eine neue Sendeversuch (POST).
+    assert len(state["calls"]) == anzahl_vor_nachsendung + 2
+    eintrag_nach = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag_nach.versand_belegt_am is not None and eintrag_nach.versand_referenz
+
+    # Ein erneuter Nachsende-Versuch für dieselbe, jetzt bereits belegte
+    # Person löst KEINEN zweiten POST aus - reiner No-Op.
+    anzahl_nach_erster_nachsendung = len(state["calls"])
+    ergebnis_erneut = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 15))
+    assert ergebnis_erneut == "BEREITS_GESENDET"
+    assert len(state["calls"]) == anzahl_nach_erster_nachsendung  # kein weiterer Providerkontakt
+
+
+def test_nachsendung_email_erkennt_bereits_tatsaechlich_gesendet_und_sendet_nicht_doppelt(
+    hv_mit_tracking, basis_vertrag, admin_ctx,
+):
+    """Task 2: der Kopieversand wurde beim Provider TATSÄCHLICH
+    angenommen, aber lokal (z. B. durch einen Verbindungsabbruch NACH
+    Serverannahme) nie als belegt vermerkt. `nachsenden_einzelempfaenger`
+    erkennt das über `status_abfragen` (Status GESENDET) und trägt es NUR
+    nachträglich ein - sendet NIE ein zweites Mal."""
+
+    service, state = hv_mit_tracking
+    contract, account = basis_vertrag
+    _seed_debt(hv_mit_tracking, contract, account, admin_ctx)
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email="mitmieterin-a@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    eintrag_vor = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag_vor.versand_belegt_am is not None  # beim Erstversand bereits erfolgreich belegt
+
+    # Simuliert den "lokal nie belegt, aber tatsächlich angenommen"-Fall:
+    # Nachweis künstlich zurücksetzen, OHNE die Provider-Tracking-Menge
+    # ("angenommen") zu verändern - `status_abfragen` sieht weiterhin GESENDET.
+    with service.sf() as db:
+        from mietinkasso.infrastructure.db.tables import MahnEmpfaengerZugangTable as _MEZ
+        row = db.get(_MEZ, eintrag_vor.id)
+        row.versand_belegt_am = None
+        row.versand_referenz = None
+        db.commit()
+
+    anzahl_vor = len(state["calls"])
+    ergebnis = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 14))
+    assert ergebnis == "BEREITS_GESENDET"
+    assert len(state["calls"]) == anzahl_vor + 1  # NUR die Status-Abfrage (GET), KEIN neuer POST
+    eintrag_nach = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag_nach.versand_belegt_am is not None  # nachträglich korrekt belegt
+
+
+def test_nachsendung_blockiert_solange_providerstatus_ungewiss(hv_mit_tracking, basis_vertrag, admin_ctx, monkeypatch):
+    """Task 2: solange der Providerstatus selbst nicht eindeutig geklärt
+    werden kann (Transportfehler bei der Abfrage), wird NIE automatisch
+    nachgesendet."""
+
+    from mietinkasso.domain.exceptions import TransportFehlerUngewissError
+
+    service, state = hv_mit_tracking
+    contract, account = basis_vertrag
+    _seed_debt(hv_mit_tracking, contract, account, admin_ctx)
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email="mitmieterin-a@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    state["fehlschlagen_beim_ersten_versuch"].add("mitmieterin-a@example.at")
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+
+    def kaputte_statusabfrage(referenz):
+        raise TransportFehlerUngewissError("Simulierter Verbindungsfehler bei der Statusabfrage (Test).")
+
+    monkeypatch.setattr(service.client, "status_abfragen", kaputte_statusabfrage)
+    anzahl_vor = len(state["calls"])
+    ergebnis = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 14))
+    assert ergebnis == "UNKLAR"
+    assert len(state["calls"]) == anzahl_vor  # keine echte HTTP-Anfrage mehr (Monkeypatch greift davor)
+    eintrag = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag.versand_belegt_am is None  # weiterhin unbelegt, NIE geraten
+
+
+def test_nachsendung_verweigert_fuer_unbekannten_mahnlauf(hv, basis_vertrag, admin_ctx):
+    """Task 2: ein unbekannter Mahnlauf wird nie stillschweigend
+    übersprungen - klarer Fehler statt eines erfundenen Ergebnisses."""
+
+    service, _state = hv
+    contract, _account = basis_vertrag
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email="mitmieterin-a@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    with pytest.raises(ValueError):
+        service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=999999, mitmieter_id=mitmieter.id, heute=date(2026, 9, 14))
+
+
+def test_nachsendung_verweigert_fuer_noch_nie_versandte_gruppe(hv, basis_vertrag, admin_ctx):
+    """Task 2: eine Gruppe, die noch nie tatsächlich versandversucht
+    wurde (GEPLANT), darf NIE über die Einzel-Nachsendung "nachgeholt"
+    werden - das bleibt ausschließlich dem normalen Planen/Dispatchen
+    vorbehalten."""
+
+    service, _state = hv
+    contract, _account = basis_vertrag
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email="mitmieterin-a@example.at", adresse=None,
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    geplanter_lauf = service.mahnlauf_repo.get_or_create(
+        outbox_key="test-noch-nie-versandt", vertrag_id=contract.id, gesellschaft_id=contract.gesellschaft_id,
+        stufe=1, mitglieder_mahnfall_ids="[]",
+    )
+    assert geplanter_lauf.status == "GEPLANT"
+
+    with pytest.raises(ValueError):
+        service.nachsenden_einzelempfaenger(
+            ctx=admin_ctx, mahnlauf_id=geplanter_lauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 14),
+        )
+
+
+def test_nachsendung_brief_fuer_nachweislich_nie_archivierten_empfaenger(hv, basis_vertrag, admin_ctx):
+    """Task 2 (Briefkanal): eine Mitmieterin, deren Brief beim Erstversand
+    NIE archiviert werden konnte (simulierter Fehler), bekommt über die
+    Nachsendung ihr Schreiben alsdann tatsächlich erzeugt/archiviert/
+    übertragen - mit demselben eingefrorenen Kostensnapshot, keiner
+    zweiten Gebührenbuchung."""
+
+    service, _state = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake_verbindung = _richte_brief_kanal_ein(service, contract, account)
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email=None, adresse="Nebenstraße 2, 1010 Wien",
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    service.mitmieter_repo.setze_postadresse_geprueft(mitmieter.id, geprueft=True)
+
+    # Simuliert einen Fehlschlag NUR beim Mitmieter-Brief (Hauptbrief
+    # bleibt unberührt) durch gezieltes Monkeypatching der Archivierung
+    # für GENAU diesen einen Aufruf.
+    original_archiviere_brief = service.empfaenger_zugang_repo.archiviere_brief
+    aufrufe = {"anzahl": 0}
+
+    def kaputte_archivierung(*args, **kwargs):
+        aufrufe["anzahl"] += 1
+        if aufrufe["anzahl"] == 1:
+            raise RuntimeError("Simulierter Fehler bei der Mitmieter-Brief-Archivierung (Test).")
+        return original_archiviere_brief(*args, **kwargs)
+
+    service.empfaenger_zugang_repo.archiviere_brief = kaputte_archivierung
+    try:
+        service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    finally:
+        service.empfaenger_zugang_repo.archiviere_brief = original_archiviere_brief
+
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    eintrag_vor = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag_vor.brief_status is None  # nachweislich nie archiviert
+
+    ergebnis = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 14))
+    assert ergebnis == "GESENDET"
+    eintrag_nach = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag_nach.brief_status == "UEBERMITTELT"
+    assert eintrag_nach.brief_pdf_bytes[:5] == b"%PDF-"
+    dateiname = brief_sftp.baue_dateiname(sende_schluessel=eintrag_nach.brief_sende_schluessel)
+    assert f"bulk_tp/{dateiname}" in fake_verbindung.geschriebene_dateien
+
+    # Keine zweite Gebührenbuchung ausgelöst - die Nachsendung bucht
+    # nichts, der Kostensnapshot bleibt unverändert an den Hauptlauf gebunden.
+    with service.sf() as db:
+        from mietinkasso.infrastructure.db.tables import MahnkostenBuchungTable as _MKB
+        buchungen = list(db.execute(select(_MKB).where(_MKB.vertrag_id == contract.id)).scalars())
+    assert buchungen == []  # Hauptlauf bleibt UNSICHER (kein Anbieterbeleg), keine Buchung von irgendwoher
+
+    # Erneute Nachsendung für den jetzt bereits übermittelten Brief: No-Op.
+    ergebnis_erneut = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 15))
+    assert ergebnis_erneut == "BEREITS_GESENDET"

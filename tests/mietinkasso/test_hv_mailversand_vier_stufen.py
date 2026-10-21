@@ -433,3 +433,115 @@ def test_freigeben_verwaiste_setzt_ohne_tatsaechlichen_providerkontakt_weiterhin
     with session_factory() as session:
         tageslauf_zeile = session.query(MahnTageslaufTable).filter(MahnTageslaufTable.vertrag_id == contract.id).one()
         assert tageslauf_zeile.status == "KEIN_VERSAND"
+
+
+def _zweite_gesellschaft_vertrag(service, *, gesellschaft_id="JLB", gesellschaft_name="JLB Projects GmbH"):
+    """Wie `test_hv_mailversand.py::_zweite_gesellschaft_vertrag` - lokal
+    dupliziert statt importiert, weil `tests/mietinkasso/` kein Paket
+    ist (kein `__init__.py`) und jedes Testmodul hier bewusst
+    eigenständig bleibt."""
+
+    st = service.bundle.stammdaten_repository
+    st.upsert_gesellschaft(id=gesellschaft_id, name=gesellschaft_name)
+    st.upsert_objekt(id=f"{gesellschaft_id}-OBJ", gesellschaft_id=gesellschaft_id, bezeichnung="Zweites Objekt")
+    st.upsert_einheit(
+        id=f"{gesellschaft_id}-TOP1", objekt_id=f"{gesellschaft_id}-OBJ", bezeichnung="Top 1",
+        nutzungsstatus="DAUERVERMIETUNG",
+    )
+    st.upsert_debitor(id=f"DEB-{gesellschaft_id}", name="Zweite Mieterin", email="zweite@example.at")
+    st.upsert_vertrag(
+        id=f"V-{gesellschaft_id}-1", einheit_id=f"{gesellschaft_id}-TOP1", debitor_id=f"DEB-{gesellschaft_id}",
+        gesellschaft_id=gesellschaft_id, rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    vertrag = st.get_vertrag(f"V-{gesellschaft_id}-1")
+    konto = st.get_or_create_konto(vertrag=vertrag)
+    return vertrag, konto
+
+
+def test_vier_stufen_ende_zu_ende_mit_eigenem_zahlungskonto_je_gesellschaft(
+    hv, basis_vertrag, admin_ctx, session_factory,
+):
+    """Task 39 (HV-20261021-ABSCHLUSS, Punkt 3): treibt ZWEI unabhängige
+    Verträge verschiedener Gesellschaften über ALLE VIER Mahnstufen -
+    jede Eskalation nutzt AUSSCHLIESSLICH den bereits bestehenden
+    Zugangsnachweis-/Fristenmechanismus (`zugang_bestaetigen_fuer_
+    empfaenger` + die `stufeN_mindesttage_nach_stufeN-1_zugang`-Felder,
+    siehe `test_mahnwesen_vier_stufen.py`), über den tatsächlich
+    bedienbaren Treiber `HVMailversandService.mahnlauf()` (nicht die
+    tieferliegenden Einzelschritte). Bei JEDEM der acht tatsächlich
+    versandten Schreiben (4 Stufen × 2 Gesellschaften) trägt der
+    Mahntext NACHWEISLICH NUR die eigene, eindeutig gebundene IBAN der
+    jeweiligen Gesellschaft - nie die der anderen (Task 36-Garantie,
+    hier über den VOLLEN Vier-Stufen-Zyklus statt nur Stufe 1)."""
+
+    service, state = hv
+    contract_a, account_a = basis_vertrag
+    contract_b, account_b = _zweite_gesellschaft_vertrag(service)
+
+    policy = service.policy_repo.anlegen(
+        stufe1_tage_nach_faelligkeit=7, stufe2_mindesttage_nach_stufe1_versand=14,
+        zinsen_prozent=Decimal("0"), gebuehr_cent=0, status="ENTWURF", vier_stufen_profil_aktiv=True,
+        stufe2_mindesttage_nach_stufe1_zugang=14, stufe3_mindesttage_nach_stufe2_zugang=14,
+        stufe4_mindesttage_nach_stufe3_zugang=14,
+    )
+    service.policy_repo.freigeben(policy.id)
+
+    service.op_service.buchen(ctx=admin_ctx, konto=account_a, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 7, 1), buchungsdatum=date(2026, 7, 1), faelligkeit=date(2026, 7, 1), beleg_referenz="A Juli")
+    service.op_service.buchen(ctx=admin_ctx, konto=account_b, typ=OPTyp.SOLL, betrag_cent=70_000,
+        belegdatum=date(2026, 7, 1), buchungsdatum=date(2026, 7, 1), faelligkeit=date(2026, 7, 1), beleg_referenz="B Juli")
+
+    service.bank_repo.upsert_bank_konto(
+        id="BANK-A", gesellschaft_id=contract_a.gesellschaft_id, iban="AT000000000000000001", bezeichnung="Konto A")
+    service.bank_repo.upsert_bank_konto(
+        id="BANK-B", gesellschaft_id=contract_b.gesellschaft_id, iban="AT000000000000000002", bezeichnung="Konto B")
+
+    # Je 30 Tage Abstand zwischen den Prüftagen (10. jedes Monats) - weit
+    # genug über der 14-Tage-Mindestfrist ab Zugang hinaus, um die
+    # §903-ABGB-Feiertagsgrenzfälle (siehe `test_mahnwesen_vier_stufen.py`)
+    # hier bewusst NICHT erneut prüfen zu müssen - das ist dort bereits
+    # eigenständig abgedeckt.
+    pruefttage = [date(2026, 7, 10), date(2026, 8, 10), date(2026, 9, 10), date(2026, 10, 10)]
+    for stufe, heute in enumerate(pruefttage, start=1):
+        service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="BANK-A", bestaetigt_bis=heute, bestaetigt_von="TEST")
+        service.bank_service.bestaetige_bankvollstaendigkeit(bank_konto_id="BANK-B", bestaetigt_bis=heute, bestaetigt_von="TEST")
+        state["sent"] = f"{heute.isoformat()}T08:00:00Z"
+        vorher = len(state["calls"])
+
+        ergebnis = service.mahnlauf(ctx=admin_ctx, heute=heute)
+        assert ergebnis["gesendet"] == 2, f"Stufe {stufe} ({heute}): erwartet 2 tatsächliche Versendungen, erhalten {ergebnis}"
+
+        neue_calls = state["calls"][vorher:]
+        assert len(neue_calls) == 2
+        texte = [json.loads(c.content)["text"] for c in neue_calls]
+        text_a = next(t for t in texte if "500,00 EUR" in t)
+        text_b = next(t for t in texte if "700,00 EUR" in t)
+        assert "AT000000000000000001" in text_a and "AT000000000000000002" not in text_a
+        assert "AT000000000000000002" in text_b and "AT000000000000000001" not in text_b
+
+        lauf_a = service.mahnlauf_repo.list_fuer_vertrag(contract_a.id)[0]
+        lauf_b = service.mahnlauf_repo.list_fuer_vertrag(contract_b.id)[0]
+        assert lauf_a.stufe == stufe and lauf_a.status == "GESENDET"
+        assert lauf_b.stufe == stufe and lauf_b.status == "GESENDET"
+
+        # Zugangsnachweis bestätigen (derselbe bestehende Mechanismus wie
+        # in `test_mahnwesen_vier_stufen.py`) - ohne ihn bliebe die
+        # nächste Stufe dauerhaft "noch zu früh", unabhängig vom
+        # 10./25.-Tagesgate.
+        service.mahn_service.zugang_bestaetigen_fuer_empfaenger(
+            ctx=admin_ctx, mahnlauf_id=lauf_a.id, mitmieter_id=None, heute=heute + timedelta(days=1),
+            zugang_datum=heute, zugangsform="EINSCHREIBEN_RUECKSCHEIN", zugang_beleg=f"RS-A-{stufe}", akteur="codex-test",
+        )
+        service.mahn_service.zugang_bestaetigen_fuer_empfaenger(
+            ctx=admin_ctx, mahnlauf_id=lauf_b.id, mitmieter_id=None, heute=heute + timedelta(days=1),
+            zugang_datum=heute, zugangsform="EINSCHREIBEN_RUECKSCHEIN", zugang_beleg=f"RS-B-{stufe}", akteur="codex-test",
+        )
+
+    # Beide Gesellschaften haben tatsächlich alle vier Stufen durchlaufen
+    # - keine ist in einer früheren Stufe hängengeblieben.
+    with session_factory() as session:
+        hoechste_stufe_a = max(
+            l.stufe for l in session.query(MahnLaufTable).filter(MahnLaufTable.vertrag_id == contract_a.id).all())
+        hoechste_stufe_b = max(
+            l.stufe for l in session.query(MahnLaufTable).filter(MahnLaufTable.vertrag_id == contract_b.id).all())
+    assert hoechste_stufe_a == 4 and hoechste_stufe_b == 4

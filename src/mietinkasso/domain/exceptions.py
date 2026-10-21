@@ -188,6 +188,26 @@ class VariableAbrechnungKonfliktError(MietinkassoError):
     stillschweigendes Anlegen eines zweiten aktiven Datensatzes."""
 
 
+class ZahlungszielBindungUngueltigError(MietinkassoError):
+    """Eine Vertrag->Bankkonto-Zahlungszielbindung wurde mit einem
+    Bankkonto angefragt, das NICHT zur Gesellschaft des Vertrags gehört,
+    oder ohne Quellenbeleg-Referenz ("keine beleglose Klassifizierung",
+    dasselbe Prinzip wie `QuellenbelegFehltError`). Bei mehr als einem
+    Bankkonto derselben Gesellschaft gibt es KEINE automatische Auswahl
+    (nicht nach erster Zeile, nicht nach Bezeichnung) - nur eine
+    ausdrücklich bestätigte, hier validierte Bindung löst die
+    Mehrdeutigkeit auf (Nutzervorgabe 21.10.2026)."""
+
+
+class ZahlungszielUngeklaertError(MietinkassoError):
+    """Für diesen Vertrag/diese Gesellschaft ist die Ziel-IBAN für eine
+    Mahnung FEHLEND oder MEHRDEUTIG (mehrere Bankkonten ohne bestätigte
+    Zuordnung) - der tatsächliche Versand wird als gezielter Prüffall
+    gestoppt, STATT mit einem unspezifischen Hinweistext ein falsches
+    oder unbrauchbares Zahlungsziel zu mahnen (Nutzervorgabe 21.10.2026:
+    "weder ein falsches noch ein unbrauchbares Zahlungsziel")."""
+
+
 class ObjektAusgeschlossenError(MietinkassoError):
     """Objekt 107 (Sieben Dörfer) is explicitly out of scope for the pilot.
     Enforced centrally (Konto -> Vertrag -> Einheit -> Objekt) on every

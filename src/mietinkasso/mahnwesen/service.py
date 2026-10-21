@@ -282,6 +282,7 @@ class MahnwesenService:
     def _pruefe_forderung_planbar(
         self, *, vertrag: VertragTable, konto: KontoTable, forderung: OffeneForderung, policy: MahnPolicyTable,
         heute: date, bank_bestaetigt_bis: date | None, ungeklaerte_eingaenge_vorhanden: bool,
+        zahlungsziel_geklaert: bool = True,
     ) -> tuple[str, str, MahnStufe | None, dict | None]:
         """Reine Prüfung OHNE Nebenwirkung ALLER Planungsvoraussetzungen
         für GENAU EINE Forderung (Auftrag Markus 14.09.2026: "GET
@@ -327,6 +328,15 @@ class MahnwesenService:
                 "BLOCKIERT",
                 "Es gibt ungeklärte oder nur teilzugeordnete Bankeingänge, die diesen Vertrag betreffen "
                 "könnten; Mahnung bleibt geschlossen, bis das aufgeklärt ist.",
+                None, None,
+            )
+        if not zahlungsziel_geklaert:
+            return (
+                "BLOCKIERT",
+                "Zahlungsziel (Ziel-IBAN) für die Gesellschaft dieses Vertrags ist FEHLEND oder "
+                "MEHRDEUTIG (mehrere Bankkonten ohne ausdrücklich bestätigte Vertragsbindung); Mahnung "
+                "bleibt geschlossen, bis eine Person die Zuordnung bestätigt - nie ein falsches oder "
+                "unbrauchbares Zahlungsziel gemahnt.",
                 None, None,
             )
 
@@ -407,6 +417,7 @@ class MahnwesenService:
         heute: date,
         bank_bestaetigt_bis: date | None,
         ungeklaerte_eingaenge_vorhanden: bool = False,
+        zahlungsziel_geklaert: bool = True,
     ) -> PlanungsErgebnis:
         require_gesellschaft_access(ctx, vertrag.gesellschaft_id)
         require_schreibrecht(ctx)
@@ -422,6 +433,7 @@ class MahnwesenService:
         status, grund, stufe, snapshot = self._pruefe_forderung_planbar(
             vertrag=vertrag, konto=konto, forderung=forderung, policy=policy, heute=heute,
             bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
+            zahlungsziel_geklaert=zahlungsziel_geklaert,
         )
         if status != "GEPLANT":
             return PlanungsErgebnis(status, None, None, forderung.op_position_id, grund)
@@ -455,6 +467,7 @@ class MahnwesenService:
         heute: date,
         bank_bestaetigt_bis: date | None,
         ungeklaerte_eingaenge_vorhanden: bool = False,
+        zahlungsziel_geklaert: bool = True,
     ) -> PlanungsErgebnis:
         """Reine Lesevorschau OHNE JEDE Datenbankänderung (Auftrag Markus
         14.09.2026: "die neue Vorschau soll ohne Datenänderung
@@ -481,6 +494,7 @@ class MahnwesenService:
         status, grund, stufe, _snapshot = self._pruefe_forderung_planbar(
             vertrag=vertrag, konto=konto, forderung=forderung, policy=policy, heute=heute,
             bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
+            zahlungsziel_geklaert=zahlungsziel_geklaert,
         )
         if status != "GEPLANT":
             return PlanungsErgebnis(status, None, None, forderung.op_position_id, grund)
@@ -507,12 +521,14 @@ class MahnwesenService:
         heute: date,
         bank_bestaetigt_bis: date | None,
         ungeklaerte_eingaenge_vorhanden: bool = False,
+        zahlungsziel_geklaert: bool = True,
     ) -> list[PlanungsErgebnis]:
         forderungen = self._op_service.offene_forderungen(konto.id, heute=heute)
         return [
             self.plane_forderung(
                 ctx=ctx, vertrag=vertrag, konto=konto, forderung=forderung, policy=policy, heute=heute,
                 bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
+                zahlungsziel_geklaert=zahlungsziel_geklaert,
             )
             for forderung in forderungen
         ]
@@ -521,7 +537,7 @@ class MahnwesenService:
         self, *, mahnfall: MahnFallTable, vertrag: VertragTable, konto: KontoTable,
         aktuelle_policy: MahnPolicyTable | None, heute: date,
         bank_bestaetigt_bis: date | None, ungeklaerte_eingaenge_vorhanden: bool,
-        kanal: str = "EMAIL",
+        kanal: str = "EMAIL", zahlungsziel_geklaert: bool = True,
     ) -> tuple[str | None, str, OffeneForderung | None]:
         """Reine Prüfung OHNE Nebenwirkung aller unmittelbar-vor-Versand
         Bedingungen für EINEN MahnFall - von `versenden()` (das je nach
@@ -562,6 +578,12 @@ class MahnwesenService:
             ), None
         if ungeklaerte_eingaenge_vorhanden:
             return "BLOCKIERT_PERSIST", "Ungeklärte/teilzugeordnete Bankeingänge sind zwischen Planung und Versand aufgetaucht.", None
+        if not zahlungsziel_geklaert:
+            return "BLOCKIERT_PERSIST", (
+                "Zahlungsziel (Ziel-IBAN) ist FEHLEND oder MEHRDEUTIG (mehrere Bankkonten ohne "
+                "bestätigte Vertragsbindung) - unmittelbar vor Versand erneut geprüft, nie ein "
+                "falsches oder unbrauchbares Zahlungsziel gemahnt."
+            ), None
 
         # Policy frisch prüfen: wurde sie seit der Planung zurückgezogen
         # oder durch eine neue Version ersetzt, wird NICHT mit der alten,
@@ -685,6 +707,7 @@ class MahnwesenService:
         send_enabled: bool,
         versand_fn: Callable[[dict], object],
         mahnkosten_vorschau_slot: dict | None = None,
+        zahlungsziel_geklaert: bool = True,
     ) -> VersandErgebnis:
         """`bank_bestaetigt_bis`/`ungeklaerte_eingaenge_vorhanden` MÜSSEN
         unmittelbar vor diesem Aufruf frisch ermittelt werden - ein bei der
@@ -724,7 +747,7 @@ class MahnwesenService:
         status_code, grund, passende_forderung = self._pruefe_frisch_versandbereit(
             mahnfall=mahnfall, vertrag=vertrag, konto=konto, aktuelle_policy=aktuelle_policy, heute=heute,
             bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
-            kanal=mahnfall.snapshot.get("kanal", "EMAIL"),
+            kanal=mahnfall.snapshot.get("kanal", "EMAIL"), zahlungsziel_geklaert=zahlungsziel_geklaert,
         )
         if status_code == "BLOCKIERT_PERSIST":
             self._repository.set_status(mahnfall_id, MahnStatus.BLOCKIERT.value)
@@ -813,6 +836,7 @@ class MahnwesenService:
         heute: date,
         bank_bestaetigt_bis: date | None,
         ungeklaerte_eingaenge_vorhanden: bool = False,
+        zahlungsziel_geklaert: bool = True,
     ) -> MahnLaufTable | None:
         """Bildet die GENAU EINE, deterministische, tatsächlich
         sendeberechtigte Gruppe aller GEPLANTEN MahnFälle desselben
@@ -867,7 +891,7 @@ class MahnwesenService:
             status_code, _grund, _forderung = self._pruefe_frisch_versandbereit(
                 mahnfall=mahnfall, vertrag=vertrag, konto=konto, aktuelle_policy=aktuelle_policy, heute=heute,
                 bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
-                kanal=kanal,
+                kanal=kanal, zahlungsziel_geklaert=zahlungsziel_geklaert,
             )
             if status_code is None:
                 bereit_ids.append(mahnfall.id)
@@ -909,6 +933,7 @@ class MahnwesenService:
         send_enabled: bool,
         versand_fn: Callable[[list[MahnFallTable]], object],
         mahnkosten_vorschau_slot: dict | None = None,
+        zahlungsziel_geklaert: bool = True,
     ) -> VersandErgebnis:
         """Versendet EINEN bereits über `plane_mahnlauf` gebildeten,
         eingefrorenen Mahnlauf GENAU EINMAL - `versand_fn` wird mit der
@@ -968,7 +993,7 @@ class MahnwesenService:
             status_code, grund, _forderung = self._pruefe_frisch_versandbereit(
                 mahnfall=mahnfall, vertrag=vertrag, konto=konto, aktuelle_policy=aktuelle_policy, heute=heute,
                 bank_bestaetigt_bis=bank_bestaetigt_bis, ungeklaerte_eingaenge_vorhanden=ungeklaerte_eingaenge_vorhanden,
-                kanal=mahnlauf.kanal,
+                kanal=mahnlauf.kanal, zahlungsziel_geklaert=zahlungsziel_geklaert,
             )
             if status_code is not None:
                 if status_code == "BLOCKIERT_PERSIST":

@@ -508,6 +508,30 @@ class BankKontoTable(Base):
     bezeichnung: Mapped[str] = mapped_column(String(128))
 
 
+class VertragZahlungszielBindungTable(Base):
+    """Explizite, ausdrücklich geprüfte Bindung Vertrag -> Bankkonto für
+    den Fall, dass die Gesellschaft dieses Vertrags MEHR ALS EIN
+    Bankkonto hat (Nutzervorgabe 21.10.2026: "keine Auswahl nach erster
+    Zeile oder Bezeichnung" - eine echte Mehrdeutigkeit bleibt ein
+    Prüffall, bis eine Person sie ausdrücklich auflöst). Versioniert/
+    append-only wie `VertragPruefungTable`: die zuletzt angelegte Zeile
+    je Vertrag ist die wirksame Bindung, eine ältere bleibt als Historie
+    unverändert stehen. Pflicht-Quellenbeleg, dasselbe "keine beleglose
+    Klassifizierung"-Prinzip. Hat die Gesellschaft nur EIN Bankkonto,
+    braucht es diese Tabelle gar nicht - die Bindung ist dann bereits
+    durch die Gesellschaft selbst eindeutig (siehe `indexautomatik/
+    mailversand_service.py::bank_konto_fuer_vertrag_eindeutig`)."""
+
+    __tablename__ = "vertrag_zahlungsziel_bindungen"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    bank_konto_id: Mapped[str] = mapped_column(ForeignKey("bank_konten.id"))
+    quellenbeleg_referenz: Mapped[str] = mapped_column(String(256))
+    bestaetigt_von: Mapped[str] = mapped_column(String(128))
+    bestaetigt_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class BankTransaktionTable(Base):
     __tablename__ = "bank_transaktionen"
     __table_args__ = (
@@ -1134,6 +1158,36 @@ class MahnEmpfaengerZugangTable(Base):
     # kein belegter Versandversuch für diese Person.
     versand_belegt_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     versand_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Auftrag HV-20261021-ABSCHLUSS ("Briefsendung samt eigenem PDF,
+    # postalischer Anschrift, permanentem Sendeschlüssel, Anbieter-/
+    # Zugangsnachweis für ALLE bestätigten echten Vertragsmieter"):
+    # BRIEF-Gegenstück zu `versand_belegt_am`/`versand_referenz` oben -
+    # EIN eigenes, dauerhaft archiviertes PDF samt permanentem
+    # `brief_sende_schluessel` (UUID, VOR jedem Netzkontakt vergeben,
+    # exakt dasselbe Prinzip wie `MahnbriefArchivTable.sende_schluessel`)
+    # je Mitmieter. `brief_status` kennt NUR "VORBEREITET"/"UEBERMITTELT"
+    # (= erfolgreich an den Post-SFTP-Server übertragen) - das ist der
+    # EINZIGE maschinell ehrliche Zustand; ein echter Zustellnachweis
+    # kommt AUSSCHLIESSLICH über die `brief_anbieterbeleg_*`-Felder
+    # (menschlich/prozessual aus der Post-Portal-Auftragsliste importiert,
+    # NIE ein bloßer Referenztext). Additiv, FK-frei (siehe
+    # `migrations.py::ensure_additive_columns`-Docstring).
+    brief_pdf_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    brief_pdf_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    brief_empfaenger_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    brief_versandnachweis_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    brief_erstellt_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    brief_sende_schluessel: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    brief_status_erfasst_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    brief_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    brief_status_aktualisiert_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    brief_status_beleg_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    brief_anbieterbeleg_referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    brief_anbieterbeleg_pdf_bytes: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    brief_anbieterbeleg_pdf_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    brief_anbieterbeleg_postaufgabe_datum: Mapped[date | None] = mapped_column(Date, nullable=True)
+    brief_anbieterbeleg_importiert_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    brief_anbieterbeleg_importiert_am: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AuditEventTable(Base):

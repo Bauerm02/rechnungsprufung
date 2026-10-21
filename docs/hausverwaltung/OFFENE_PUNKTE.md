@@ -1,5 +1,289 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## Fortsetzung HV-20261021-ABSCHLUSS (Markus 21.10.2026): Brief-
+## Mitmieter-Versand, sichere Nachsende-Aktion, Vier-Stufen-Ende-zu-
+## Ende-Test (TEILCHECKPOINT, KEIN Gesamtabschluss der Mahnarbeiten)
+
+Ausdrücklich beauftragte Fortsetzung der drei zu diesem Zeitpunkt noch
+offenen Punkte aus dem vorherigen Teilcheckpoint (`07d1f03`, siehe
+Abschnitt direkt darunter). Code-Owner bleibt ausschließlich Claude;
+Codex prüft unabhängig und übernimmt weiterhin die separaten echten
+Kundendaten-/Bankimporte. Betrifft AUSSCHLIESSLICH `src/mietinkasso/`,
+der bestehende Vertragsanlage-Teil (`46e68ad`) wurde NICHT verändert.
+KEINE Geschäftssendungen/Finanzaktionen und KEIN Deployment durch
+Claude - `SEND_ENABLED=false` bleibt Standard, `brief_transport_
+verfuegbar` bleibt in dieser Entwicklungsumgebung `False` (die
+bestellten Post-SFTP-Zugangsdaten bleiben weiterhin extern wartend,
+wurden NICHT erneut angefordert).
+
+### Task 1: Briefsendung an ALLE bestätigten Mitmieter (löst den offenen
+### Punkt "BRIEF-Kanal bekommt KEINE Mitmieter-Kopie" oben auf)
+
+`HVMailversandService._sende_brief` versendet jetzt - wie der EMAIL-Kanal
+bereits zuvor - an JEDEN aktiven, bestätigten Mitmieter mit geprüfter
+Postadresse (`VertragMitmieterRepository.list_bestaetigte_mitmieter` +
+`postadresse_geprueft`) ein EIGENES PDF unter einem EIGENEN, permanenten
+`brief_sende_schluessel` (UUID4, vor jedem Netzkontakt vergeben, exakt
+dasselbe Prinzip wie beim Hauptdebitor-Archiv). Die erwarteten
+Empfänger/Zugangsnachweis-Zeilen für den Hauptdebitor und für die
+Mitmieter werden dafür aus derselben, bereits für den EMAIL-Kanal
+bestehenden Einfrier-Logik (`_friere_erwartete_empfaenger_ein`)
+übernommen - EIN gemeinsamer Mechanismus für beide Kanäle, keine zweite
+Parallelstruktur.
+
+`MahnEmpfaengerZugangTable` trägt dafür 16 neue, additive, FK-freie
+Spalten (`brief_pdf_bytes`/`brief_pdf_sha256`/`brief_empfaenger_hash`/
+`brief_versandnachweis_referenz`/`brief_sende_schluessel`/
+`brief_status`/`brief_status_*`/`brief_anbieterbeleg_*`) - eine exakte,
+aber unabhängige Kopie des bestehenden `MahnbriefArchivTable`-Musters,
+diesmal direkt auf der bereits vorhandenen "ein Eintrag je erwartetem
+Empfänger"-Zeile statt einer neuen Tabelle. Drei neue Repository-Methoden
+(`MahnEmpfaengerZugangRepository.archiviere_brief`/`aktualisiere_brief_
+status`/`importiere_brief_anbieterbeleg`) sind idempotent/konflikt-
+geprüft wie ihr Hauptdebitor-Vorbild: ein echter Retry mit identischem
+Inhalt ist ein No-Op, ein abweichender Versuch ein `VorgangIdKonfliktError`
+(nie ein stiller Erfolg mit dem alten Inhalt).
+
+Ein Vertreter oder eine noch ungeklärte Angabe wird NIE automatisch als
+Brief-Mitmieter adressiert (dieselbe Ausschlussregel wie beim EMAIL-
+Kanal); ein bestätigter Mitmieter OHNE geprüfte Postadresse bleibt
+ebenfalls ohne Brief, statt eine ungeprüfte Adresse zu verwenden. Ein
+fehlgeschlagener SFTP-Upload/eine fehlgeschlagene PDF-Rendering für
+EINEN Mitmieter blockiert weder den Hauptbrief noch einen ANDEREN
+Mitmieter (eigenes try/except je Person, analog zum EMAIL-Kanal).
+
+Getestet (`test_hv_mailversand.py`): mehrere Mitmieter inkl. Vertreter/
+ungeklärter Angabe/fehlender Postadresse-Prüfung erhalten korrekt NUR
+die vorgesehene Teilmenge einen eigenen Brief mit eigenem Sendeschlüssel/
+Dateinamen; ein Mitmieter-Anbieterbeleg-Import ist nachweislich
+unabhängig vom Hauptdebitor-Archiv (treibt NIE dessen Kostenbuchung/
+GESENDET-Übergang, inkl. No-Op-Retry und Konfliktfall).
+
+### Task 2: Sichere Nachsende-Aktion für nachweislich fehlgeschlagene
+### Einzelempfänger (löst den offenen Punkt "Keine manuelle Nachsende-
+### Aktion" oben auf)
+
+Neue Methode `HVMailversandService.nachsenden_einzelempfaenger(ctx,
+mahnlauf_id, mitmieter_id, heute)` plus private Helfer `_nachsenden_
+email`/`_nachsenden_brief`. Kernregeln, wörtlich wie beauftragt:
+
+- **Ungewisser Providerstatus wird ERST geklärt, nie blind wiederholt.**
+  Für EMAIL fragt `MailOpsClient.status_abfragen` den tatsächlichen
+  Stand ab - NUR `"NICHT_GEFUNDEN"` (nachweislich nie angenommen) löst
+  tatsächlich einen neuen Sendeversuch MIT DEMSELBEN deterministischen
+  Idempotenzschlüssel aus; JEDER andere Status (`UNKLAR`/
+  `IN_BEARBEITUNG`/ein Transportfehler bei der Abfrage selbst/...)
+  blockiert die Nachsendung ausdrücklich, statt zu raten. Für BRIEF gibt
+  es keine separate Status-Abfrage-API - die Exklusiv-Erstellungs-
+  Semantik des Post-SFTP-Transports selbst (`PostSftpDateiKonfliktError`
+  bei bereits existierender Datei unter dem permanenten
+  `brief_sende_schluessel`) übernimmt dieselbe Klärungsrolle.
+- **Ein nachweislich bereits tatsächlich gesendeter Empfänger wird NIE
+  wiederholt.** Antwortet die Statusabfrage mit `"GESENDET"` (inkl.
+  validierter externer Referenz), wird NUR das Bookkeeping
+  nachgetragen, kein zweiter Sendeversuch ausgelöst.
+- **Keine doppelte Gebührenbuchung.** Die Nachsendung verwendet
+  AUSSCHLIESSLICH den bereits beim ursprünglichen Versand eingefrorenen
+  Kostensnapshot (`snapshot_aus_json(mahnlauf.mahnkosten_snapshot_
+  json)`) - es gibt KEINE zweite Kostenberechnung/-buchung im
+  Nachsende-Pfad, exakt die bestehende "keine zweite Finanzstrecke"-
+  Leitplanke.
+- **Ein Teilfehler qualifiziert das Ganze nie fälschlich als vollständig
+  gemahnt.** Die Nachsendung ändert ausschließlich den EINEN betroffenen
+  Empfänger-Eintrag, nie den Gruppenstatus der `MahnLaufTable` selbst.
+- Beide Textpfade (E-Mail-Text/Brief-PDF-Inhalt) werden über dieselben,
+  bereits für den ursprünglichen Versand verwendeten Kompositions-
+  Helfer (`_baue_email_mahntext`/`_baue_brief_kontext`+`_rendere_brief_
+  pdf`) erzeugt wie beim Erstversand - garantiert inhaltliche/
+  finanzielle Übereinstimmung, keine zweite, potenziell abweichende
+  Textlogik.
+
+Jetzt auch im Backoffice bedienbar: `/backoffice/vertrag/{id}/
+mahnempfaenger` zeigt je Mitmieter-Zeile, deren Versand noch nicht
+belegt ist, einen "Sicher nachsenden"-Button (neue Route `POST /
+backoffice/vertrag/{id}/mahnempfaenger/{eintrag_id}/nachsenden`) -
+lehnt den Hauptdebitor (eigener, bestehender Versand-/Belegpfad) und
+einen unbekannten Zugangsnachweis mit einer klaren Fehlerseite ab,
+statt mit einem internen Serverfehler zu scheitern.
+
+Getestet (`test_hv_mailversand.py`, neue `hv_mit_tracking`-Fixture mit
+echtem GET/POST-bewusstem Mock-Provider): nachweislich fehlgeschlagener
+Empfänger wird nach Klärung erfolgreich nachgesendet; bereits
+tatsächlich gesendeter Empfänger wird bei Nachsende-Versuch NICHT
+doppelt versendet (nur Bookkeeping nachgetragen); ungewisser
+Providerstatus blockiert die Nachsendung vollständig; unbekannter
+Mahnlauf und eine noch nie versandte Gruppe werden abgelehnt; ein
+Brief-Mitmieter ohne jemals archivierten Brief wird korrekt behandelt.
+Zusätzlich im Backoffice (`test_backoffice.py`): Button erscheint
+NUR für einen noch unbelegten Mitmieter-Eintrag, CSRF-Schutz, klare
+Ablehnung für Hauptdebitor/unbekannten Eintrag statt 500.
+
+### Task 3: Vier-Stufen Ende-zu-Ende-Test über den tatsächlich
+### bedienbaren Treiber, inkl. echtem Fund+Fix
+
+Neuer Integrationstest (`test_hv_mailversand_vier_stufen.py::test_
+vier_stufen_ende_zu_ende_mit_eigenem_zahlungskonto_je_gesellschaft`)
+treibt ZWEI unabhängige Verträge verschiedener Gesellschaften über ALLE
+VIER Mahnstufen - ausschließlich über `HVMailversandService.mahnlauf()`
+(den tatsächlich produktiv laufenden Treiber, nicht die tieferliegenden
+Einzelschritte) und ausschließlich über den bereits bestehenden
+Zugangsnachweis-/Fristenmechanismus (`zugang_bestaetigen_fuer_
+empfaenger` + die `stufeN_mindesttage_nach_stufeN-1_zugang`-Felder).
+Bei jedem der acht tatsächlich versandten Schreiben (4 Stufen × 2
+Gesellschaften) wird geprüft, dass der Mahntext NACHWEISLICH NUR die
+eigene, eindeutig gebundene IBAN der jeweiligen Gesellschaft trägt - nie
+die der anderen (Task-36-Garantie, hier erstmals über den VOLLEN
+Vier-Stufen-Zyklus statt nur Stufe 1 geprüft).
+
+**Echter, beim Schreiben dieses Tests gefundener und behobener Fund:**
+`MahnLaufRepository.list_fuer_vertrag` war im Quellcode ZWEI MAL
+definiert (`mahnwesen/repository.py`). Die zweite Fassung hat die erste
+(nach `id.desc()` sortierte) STILL überschrieben - Python verwendet bei
+einer doppelten Methodendefinition in derselben Klasse ausschließlich
+die letzte, ohne Warnung. Die tatsächlich wirksame zweite Fassung
+sortierte NUR nach `geplant_am.desc()`, OHNE Tiebreaker. `geplant_am`
+kommt aus `server_default=func.now()`, das bei SQLite nur Sekunden-
+Granularität hat - zwei Mahnläufe DESSELBEN Vertrags, die innerhalb
+derselben Sekunde angelegt werden (z. B. zwei aufeinanderfolgende
+Stufen desselben Tages-Batchlaufs, oder genau das im neuen Testlauf),
+sortierten dadurch nachweislich in UNDEFINIERTER Reihenfolge - der neue
+Vier-Stufen-Test schlug mit der ungefixten Fassung reproduzierbar fehl
+(`lauf_a.stufe == 1` statt `2` nach der zweiten Eskalation). Behoben:
+die doppelte (toter Code gewordene) erste Definition wurde entfernt,
+die verbleibende, tatsächlich aktive Fassung sortiert jetzt
+`geplant_am.desc(), id.desc()` - mit `id` als deterministischem
+Tiebreaker, weil die Autoincrement-ID die Anlagereihenfolge immer
+eindeutig abbildet, unabhängig von der Zeitstempel-Granularität der
+Datenbank. Dieser Fund betrifft potenziell auch die bestehende Mieterakte
+(HV-20260914-AUFGABEN-MIETERAKTE), die dieselbe Methode für "jüngste
+Mahnläufe zuerst" verwendet - dort war das Risiko bisher unbemerkt, weil
+die meisten dortigen Szenarien nur einen Mahnlauf je Vertrag kennen oder
+Zeitstempel ausreichend weit auseinanderliegen.
+
+### Abnahmehinweis zu 07d1f03/Task 36 (Markus 21.10.2026): Zahlungsziel-
+### Versandgate + bedienbare Zuordnung bei mehreren Bankkonten
+
+Konkreter Abnahmehinweis zur bestehenden Task-36-Lösung (Zahlungsziel aus
+geprüfter Bankkontobindung): eine fehlende oder mehrdeutige Bindung war
+bisher NUR eine Warnung in der Mahnvorschau plus ein unspezifischer
+Kundentext im sonst UNVERÄNDERT tatsächlich versendeten Schreiben - das
+reicht nicht. Vor dem tatsächlichen Versand muss das jetzt als gezielter
+Prüffall STOPPEN, damit weder ein falsches noch ein unbrauchbares
+Zahlungsziel gemahnt wird; bei mehreren Bankkonten braucht es die
+bestehende/ausdrücklich geprüfte vertragliche Zuordnung, nie eine Auswahl
+nach erster Zeile oder Bezeichnung.
+
+**Neu:**
+- `VertragZahlungszielBindungTable` (`infrastructure/db/tables.py`) +
+  `VertragZahlungszielBindungRepository` (`bank/repository.py`,
+  neue, EIGENSTÄNDIGE Tabelle, echte FKs erlaubt) - versioniert/
+  append-only wie `VertragPruefungTable`: `bestaetigen(vertrag_id,
+  bank_konto_id, quellenbeleg_referenz, bestaetigt_von)` lehnt ein
+  Bankkonto einer ANDEREN Gesellschaft (`ZahlungszielBindungUngueltigError`)
+  und eine fehlende Quellenbeleg-Referenz (`QuellenbelegFehltError`,
+  "keine beleglose Klassifizierung") ab; `aktuelle_bindung(vertrag_id)`
+  liefert die zuletzt bestätigte Zeile.
+- `bank_konto_fuer_vertrag_eindeutig`/`zahlungsziel_geklaert`
+  (`indexautomatik/mailversand_service.py`): bei GENAU EINEM Bankkonto
+  der Gesellschaft unverändert eindeutig; bei MEHREREN Konten löst NUR
+  eine gültige bestätigte Bindung die Mehrdeutigkeit auf - `zahlungsziel_
+  fuer_mahnung` nutzt dieselbe Auflösung (eine Quelle für Text UND Gate).
+- Neuer Parameter `zahlungsziel_geklaert: bool` (Default `True` für volle
+  Rückwärtskompatibilität bestehender Aufrufer/Tests) durch
+  `MahnwesenService`: `_pruefe_forderung_planbar` (Planungszeitpunkt,
+  rein transient - KEIN `MahnFallTable`-Eintrag wird bei `False`
+  überhaupt angelegt, kein dauerhaft toter Zustand) UND `_pruefe_frisch_
+  versandbereit` (unmittelbar VOR dem tatsächlichen Versand, als
+  `BLOCKIERT_PERSIST`-Fall wie Rechtsordnung/Sperre - Defense-in-Depth
+  für den seltenen Fall, dass die Mehrdeutigkeit erst NACH der Planung
+  auftritt). Die Produktionsaufrufer in `mailversand_service.py`
+  (`mahnlauf()`-Tagesbatch, `mahnung_senden`, `nachsenden_
+  einzelempfaenger`) berechnen den echten Wert und reichen ihn durch;
+  `nachsenden_einzelempfaenger` wirft bei Mehrdeutigkeit zusätzlich
+  explizit `ZahlungszielUngeklaertError`, statt eine Nachsendung mit
+  einem unbrauchbaren Zahlungsziel auszuliefern.
+- Bedienbare Oberfläche (`backoffice/routes/mahnwesen.py`,
+  `/vertrag/{id}/mahnvorschau`): bei mehreren Bankkonten erscheint ein
+  Formular (Bankkonto-Auswahl + Pflicht-Quellenbeleg) zur Bindungs-
+  bestätigung (neue Route `POST /vertrag/{id}/zahlungsziel-bindung/
+  bestaetigen`); nach erfolgreicher Bestätigung zeigt die Vorschau die
+  bestätigte Bindung (Konto, Beleg, Datum, Person) statt der Warnung.
+
+Getestet (`test_hv_mailversand.py`): ein zweites Bankkonto macht die
+Bindung mehrdeutig - `mahnlauf()` sendet NICHTS (`gesendet=0`, KEIN
+einziger Providerkontakt), erst eine bestätigte Bindung an das
+"falsche" (nicht zuerst angelegte, nicht nach Bezeichnung passende)
+Konto lässt den Versand mit GENAU dieser IBAN zu; eine Nachsendung mit
+nachträglich aufgetretener Mehrdeutigkeit wird mit
+`ZahlungszielUngeklaertError` abgelehnt. `test_backoffice.py`: das
+Bindungsformular erscheint nur bei Mehrdeutigkeit, lehnt CSRF-Fehler/
+fehlenden Beleg/ein fremdes Bankkonto ab, und die bestätigte Bindung
+wirkt tatsächlich auf `zahlungsziel_fuer_mahnung` (nicht nur auf die
+Anzeige).
+
+**Ehrlich offen:** Codex prüft/befüllt die REALEN Vertrag-Bankkonto-
+Bindungen für die 17 bestehenden Kundendaten separat (keine reale
+IBAN/Kundendaten in diesem Repository) - dieser Commit liefert
+ausschließlich den generischen, synthetisch getesteten Mechanismus.
+
+### Ehrlich offen (bewusst NICHT in diesem Teilcheckpoint gelöst, KEIN
+### Gesamtabschluss der Mahnarbeiten)
+
+- **Kein BRIEF-Kanal-Teilerfolg/Crash/Retry-Test mit echtem SFTP-
+  Konflikt zwischen mehreren Mitmieter-Briefen.** Die neue `hv_mit_
+  tracking`-Fixture (GET/POST-bewusster Mock-Provider für Status-
+  Klärung) deckt dieses Szenario bisher NUR für den EMAIL-Kanal ab. Der
+  BRIEF-Mitmieter-Test prüft zwar "mehrere Empfänger, korrekt nur die
+  vorgesehene Teilmenge" (Vertreter/ungeklärt/ungeprüfte Adresse
+  ausgeschlossen), aber KEINEN simulierten SFTP-Transportfehler für
+  GENAU EINEN von mehreren Brief-Mitmietern bei sonst erfolgreichen
+  anderen. Da der Briefkanal in dieser Umgebung ohnehin durchgehend ohne
+  echten Transport bleibt (`brief_transport_verfuegbar=False`), ist das
+  Risiko aktuell gering, sollte aber vor einer echten Brief-
+  Inbetriebnahme nachgezogen werden.
+- **Keine Backoffice-Smoke-Tests, die eine ECHTE erfolgreiche
+  Nachsendung bis zum tatsächlichen `GESENDET`-Bookkeeping durchspielen.**
+  Die Backoffice-Tests für die neue Nachsende-Route prüfen Sichtbarkeit,
+  CSRF-Schutz und die Ablehnungsfälle (Hauptdebitor, unbekannter
+  Eintrag) - sie lösen den Nachsende-Versuch gegen den echten
+  `HVMailversandService` aus (ohne konfigurierten MailOps-Socket in
+  dieser Testumgebung), prüfen aber keinen tatsächlich erfolgreichen
+  Abschluss über HTTP. Dieser Pfad ist auf Service-Ebene bereits
+  vollständig getestet (`test_hv_mailversand.py`); die Lücke betrifft
+  ausschließlich die zusätzliche HTTP-Schicht selbst.
+- Alle bereits zuvor benannten offenen Punkte (siehe Abschnitte
+  darunter) bleiben unverändert offen, soweit nicht oben ausdrücklich
+  als gelöst markiert.
+- Weiterhin: KEIN Deployment, KEINE Produktivbuchung, KEINE echte
+  Mietermail durch Claude; `SEND_ENABLED=false`/`brief_transport_
+  verfuegbar=False` unverändert Standard; SFTP-Zugangsdaten bleiben
+  extern wartend, nicht erneut angefordert.
+
+### Geänderte/neue Dateien (dieser Teilcheckpoint)
+
+Geändert: `src/mietinkasso/infrastructure/db/tables.py` (16 neue
+additive `brief_*`-Spalten auf `MahnEmpfaengerZugangTable`), `src/
+mietinkasso/mahnwesen/repository.py` (`archiviere_brief`/`aktualisiere_
+brief_status`/`importiere_brief_anbieterbeleg` ergänzt; doppelte
+`list_fuer_vertrag`-Definition entfernt/Tiebreaker ergänzt), `src/
+mietinkasso/indexautomatik/mailversand_service.py` (`_sende_brief`
+Mitmieter-Versand, `nachsenden_einzelempfaenger` + Helfer,
+`_baue_email_mahntext`/`_baue_brief_kontext`/`_rendere_brief_pdf`
+extrahiert), `src/mietinkasso/backoffice/routes/mahnwesen.py`
+(Nachsende-Button + Route `mahnempfaenger_nachsenden`), `tests/
+mietinkasso/test_hv_mailversand.py` (Brief-Mitmieter-Tests,
+Nachsende-Tests, `hv_mit_tracking`-Fixture), `tests/mietinkasso/
+test_hv_mailversand_vier_stufen.py` (Vier-Stufen-Ende-zu-Ende-Test),
+`tests/mietinkasso/test_backoffice.py` (Nachsende-Button/Route-Test),
+`tests/mietinkasso/fixtures/backoffice_http_contract.json`
+(neue Route ergänzt).
+
+### Tests (dieser Teilcheckpoint)
+
+Gesamtsuite `tests/mietinkasso` (1685 Tests) grün. Ausschließlich
+synthetische Testdaten, keine echten Sendungen/Produktivbuchungen, kein
+Deployment.
+
 ## Mahn-Fortsetzung, Nachprüfung (Markus 20.10.2026, synthetischer
 ## Outcome-Test gegen 46e68ad): durabler Mitmieter-Kopiennachweis statt
 ## nachträglichem Bookkeeping (Teilcheckpoint, KEIN Gesamtabschluss)
@@ -57,14 +341,19 @@ Testlauf (1570 Tests) grün.
 
 **Ehrlich weiterhin offen (bewusst NICHT in diesem Teilcheckpoint
 gelöst, KEIN Gesamtabschluss der Mahnarbeiten):**
-- **Keine manuelle Nachsende-Aktion für einen einzelnen fehlgeschlagenen
+> **Beide folgenden Punkte sind durch die Fortsetzung HV-20261021-
+> ABSCHLUSS ganz oben in diesem Dokument inzwischen gebaut und getestet**
+> (sichere Nachsende-Aktion inkl. Backoffice-Button; BRIEF-Mitmieter-
+> Versand). Diese zwei Bullets bleiben als historischer Beleg stehen,
+> beschreiben aber NICHT mehr den aktuellen Stand.
+- ~~**Keine manuelle Nachsende-Aktion für einen einzelnen fehlgeschlagenen
   Mitmieter-Kopieversand.** Schlägt der EINE Sendeversuch fehl (z. B.
   Providerfehler), bleibt der Eintrag dauerhaft unbelegt - es gibt noch
   keinen sicheren, explizit ausgelösten "diese eine Kopie jetzt
   nachsenden"-Schritt im Backoffice. Strukturell bereits vorbereitet
-  (siehe oben), aber nicht gebaut.
-- **BRIEF-Kanal weiterhin ohne Mitmieter-Kopie** (siehe unten, unverändert
-  offen).
+  (siehe oben), aber nicht gebaut.~~
+- ~~**BRIEF-Kanal weiterhin ohne Mitmieter-Kopie** (siehe unten, unverändert
+  offen).~~
 
 ## Mahn-Fortsetzung (HV-20261020-MAHN-FORTSETZUNG, Markus 20.10.2026):
 ## Zahlungsziel aus geprüfter Gesellschaftsbindung, Mitmieter-Kopieversand,

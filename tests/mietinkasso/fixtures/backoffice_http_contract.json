@@ -1102,6 +1102,18 @@
       ]
     },
     {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnempfaenger/{eintrag_id}/nachsenden",
+      "method": "POST",
+      "endpoint": "mahnempfaenger_nachsenden",
+      "resolved_endpoint": "mahnempfaenger_nachsenden",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
       "path": "/backoffice/vertrag/{vertrag_id}/mahnempfaenger/{eintrag_id}/zugang-bestaetigen",
       "method": "POST",
       "endpoint": "mahnempfaenger_zugang_bestaetigen",
@@ -1286,6 +1298,18 @@
       "method": "POST",
       "endpoint": "vorschreibung_sollstellen",
       "resolved_endpoint": "vorschreibung_sollstellen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/zahlungsziel-bindung/bestaetigen",
+      "method": "POST",
+      "endpoint": "zahlungsziel_bindung_bestaetigen",
+      "resolved_endpoint": "zahlungsziel_bindung_bestaetigen",
       "dependencies": [
         {
           "call": "_current_session",
@@ -2043,6 +2067,13 @@
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
     },
     {
+      "path": "/backoffice/vertrag/{vertrag_id}/mahnempfaenger/{eintrag_id}/nachsenden",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
       "path": "/backoffice/vertrag/{vertrag_id}/mahnempfaenger/{eintrag_id}/zugang-bestaetigen",
       "method": "post",
       "status": 503,
@@ -2155,6 +2186,13 @@
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
     },
     {
+      "path": "/backoffice/vertrag/{vertrag_id}/zahlungsziel-bindung/bestaetigen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
       "path": "/backoffice/vertrag/{vertrag_id}/zinsprofil",
       "method": "get",
       "status": 503,
@@ -2212,5 +2250,5 @@
     }
   ],
   "session_dependency_count": 1,
-  "baseline_commit": "e095c73fa148f2a6ce8b8e0b8e9ab7735a8120d0 + HV-20261001-BK-AUTOMATIK + HV-20261019-MAHNKOSTEN + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS (additiv: native Rücklastschrift+Bankentgelt-Route) + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS Teil 3 (additiv: Mahnbrief-Archiv-/Anbieterbeleg-Routen) + HV-20261020-KONTOBLATT-KOSTEN (additiv: Kontoauszug-PDF-Route) + HV-20261020-VERTRAGSDATENBASIS (additiv: zentrale Vertragsübersicht Objekt-/Mieterfilter, Parteien-Route) + HV-20261020-MAHN-FORTSETZUNG (additiv: Mahn-Kanalregel-Backoffice-UI, Mitmieter-/Zugangsnachweis-Übersicht je Vertrag)"
+  "baseline_commit": "e095c73fa148f2a6ce8b8e0b8e9ab7735a8120d0 + HV-20261001-BK-AUTOMATIK + HV-20261019-MAHNKOSTEN + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS (additiv: native Rücklastschrift+Bankentgelt-Route) + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS Teil 3 (additiv: Mahnbrief-Archiv-/Anbieterbeleg-Routen) + HV-20261020-KONTOBLATT-KOSTEN (additiv: Kontoauszug-PDF-Route) + HV-20261020-VERTRAGSDATENBASIS (additiv: zentrale Vertragsübersicht Objekt-/Mieterfilter, Parteien-Route) + HV-20261020-MAHN-FORTSETZUNG (additiv: Mahn-Kanalregel-Backoffice-UI, Mitmieter-/Zugangsnachweis-Übersicht je Vertrag) + HV-20261021-ABSCHLUSS (additiv: sichere Einzel-Nachsende-Route je Mitmieter-Zugangsnachweis) + HV-20261021-ABSCHLUSS Zahlungsziel-Versandgate (additiv: bedienbare Zahlungsziel-Bindungs-Route bei mehreren Bankkonten)"
 }
