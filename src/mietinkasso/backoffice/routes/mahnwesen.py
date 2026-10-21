@@ -292,10 +292,24 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
     (mit Satz/Zeitraum) GETRENNT je Mahnstufe, wie ausdrücklich
     gefordert. `_hv_mail.mahnkosten_service` ist dieselbe Instanz, die
     auch den tatsächlichen Versand bucht (siehe
-    `indexautomatik/mailversand_service.py`)."""
+    `indexautomatik/mailversand_service.py`).
 
+    **Korrektur (Codex-Live-Sichtprüfung 21.10.2026):** iterierte bisher
+    FEST über Stufe 1/2, unabhängig von der tatsächlich aktuell
+    freigegebenen Policy - unter einer Policy mit `vier_stufen_profil_
+    aktiv=True` (Auftrag HV-20261020-VIER-MAHNSTUFEN) fehlten dadurch die
+    Kosten-/PDF-/Briefstatus-Blöcke für Stufe 3/4 vollständig, obwohl
+    `MahnkostenService.vorschau`/`_resolve_kanal`/`mahnbrief.pdf` diese
+    bereits längst generisch unterstützen (nur diese reine Anzeige-
+    Schleife hinkte nach). Iteriert jetzt dynamisch über 1-4, wenn die
+    aktuell freigegebene Policy `vier_stufen_profil_aktiv` ist, sonst wie
+    bisher nur 1/2 - keine Fachregel geändert, nur die technische
+    Stufenbegrenzung dieser Anzeige."""
+
+    aktuelle_policy = deps._mahn_policy_repo.aktuelle_freigegebene()
+    stufen = (1, 2, 3, 4) if aktuelle_policy is not None and aktuelle_policy.vier_stufen_profil_aktiv else (1, 2)
     zeilen = []
-    for stufe in (1, 2):
+    for stufe in stufen:
         kanal = deps._hv_mail.mahn_service._resolve_kanal(stufe)
         vorschau = deps._hv_mail.mahnkosten_service.vorschau(vertrag_id=vertrag_id, stufe=stufe, heute=heute_datum, kanal=kanal)
         if vorschau is None:
@@ -416,8 +430,8 @@ def mahnpauschale_freigabe_formular(
     ausschließlich `kosten.py::berechne_mahnkosten_vorschau` bei der
     nächsten tatsächlichen Mahnlaufverarbeitung vorbehalten."""
 
-    if stufe not in (1, 2):
-        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Stufe muss 1 oder 2 sein.")
+    if stufe not in (1, 2, 3, 4):
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Stufe muss zwischen 1 und 4 liegen.")
     vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
     if vertrag is None:
         return _fehlerseite(session, "Mahnpauschale-Freigabe", f"Unbekannter Vertrag {vertrag_id}.")
@@ -557,8 +571,8 @@ async def mahnpauschale_freigabe_absenden(request: Request, vertrag_id: str, ses
         stufe = int(str(form.get("stufe", "1")))
     except ValueError:
         return _fehlerseite(session, "Mahnpauschale-Freigabe", "Ungültige Stufe.")
-    if stufe not in (1, 2):
-        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Stufe muss 1 oder 2 sein.")
+    if stufe not in (1, 2, 3, 4):
+        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Stufe muss zwischen 1 und 4 liegen.")
     # Unabhängige Rückprüfung Codex 19.10.2026, echter Bug: die Freigabe
     # selbst darf NIE auf ein vom Formular mitgesendetes, ggf. simuliertes
     # Datum erteilt werden - ein manipuliertes/veraltetes `heute` aus dem

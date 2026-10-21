@@ -1,5 +1,54 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## Abnahmefix zu 9f32a87 (Codex-Live-Sichtprüfung 21.10.2026): Mahnkosten-
+## Vorschau zeigte Vier-Stufen-Policy nur als Zwei-Stufen an (TEILCHECKPOINT,
+## KEIN Gesamtabschluss der Mahnarbeiten)
+
+Konkreter Live-Sichtprüfungsfund: `_mahnkosten_vorschau_block`
+(`backoffice/routes/mahnwesen.py`) iterierte FEST über `(1, 2)`,
+unabhängig von der tatsächlich aktuell freigegebenen `MahnPolicy`. Unter
+einer Policy mit `vier_stufen_profil_aktiv=True` (Auftrag
+HV-20261020-VIER-MAHNSTUFEN) fehlten dadurch auf `/vertrag/{id}/
+mahnvorschau` die Kosten-/Brief-PDF-Link-/Briefkanal-Status-Blöcke für
+Stufe 3/4 VOLLSTÄNDIG - obwohl `MahnkostenService.vorschau`/
+`_resolve_kanal`/die `mahnbrief.pdf`-Route diese bereits generisch
+unterstützen (nur diese eine Anzeige-Schleife hinkte technisch nach).
+Zwei weitere, aus demselben historischen Zwei-Stufen-Stand stammende
+Guards (`mahnpauschale_freigabe_formular`/`_absenden`, je `stufe not in
+(1, 2)`) hätten die von der korrigierten Vorschau jetzt erzeugten
+Stufe-3/4-"Freigabe prüfen/erteilen"-Links sonst mit einem Fehler
+abgelehnt.
+
+**Behoben (rein technisch, KEINE Fachregel geändert):**
+- `_mahnkosten_vorschau_block` liest jetzt die aktuell freigegebene
+  Policy und iteriert über `(1, 2, 3, 4)`, wenn `vier_stufen_profil_
+  aktiv` ist, sonst unverändert über `(1, 2)`.
+- Die beiden `mahnpauschale-freigabe`-Guards akzeptieren jetzt `stufe in
+  (1, 2, 3, 4)` statt nur `(1, 2)` - die darunterliegende Logik
+  (`MahnkostenService.vorschau`, `mahnkosten_repo.mahnpauschale_
+  freigaben_historie`) war bereits stufenunabhängig generisch.
+- Ein zugehöriger, jetzt veralteter Test
+  (`test_mahnpauschale_freigabe_erfassen_lehnt_ungueltige_stufe_ab`)
+  prüfte bisher ausdrücklich, dass Stufe 3 abgelehnt wird - das war
+  schlicht der (jetzt behobene) Fehlerzustand. Auf eine tatsächlich
+  ungültige Stufe (5) umgestellt, Absicht des Tests (ungültige Stufe
+  bleibt abgelehnt) bleibt erhalten.
+
+Getestet (`test_backoffice.py`, ausschließlich synthetisch, eigene
+isolierte Gesellschaft/Vertrag, explizite eigene Policy-/Kanalregel-
+Steuerung statt Verlass auf modulweit geteilten Ambient-Zustand): eine
+alte Zwei-Stufen-Policy zeigt weiterhin NUR Stufe 1/2 (keine Regression);
+eine Vier-Stufen-Policy zeigt zusätzlich vollständige Stufe-3/4-Blöcke
+inkl. korrekt aufgelöstem Kanal, Brief-PDF-Link und (Transport in dieser
+Umgebung nie echt angebunden) Briefkanal-Warnhinweis je Stufe; die
+"Freigabe prüfen/erteilen"-Verlinkung für Stufe 3 führt tatsächlich zu
+einer funktionierenden Seite. Gesamtsuite grün.
+
+**Geänderte Dateien:** `src/mietinkasso/backoffice/routes/mahnwesen.py`
+(`_mahnkosten_vorschau_block` dynamisch, zwei Freigabe-Guards auf 1-4
+erweitert), `tests/mietinkasso/test_backoffice.py` (ein veralteter Test
+angepasst, ein neuer Regressionstest für beide Richtungen).
+
 ## Abnahmefix zu b6e773e (Codex 21.10.2026): Nachsendung umging das
 ## Versand-Gate über einen eigenen Unterpfad (TEILCHECKPOINT, KEIN
 ## Gesamtabschluss der Mahnarbeiten)

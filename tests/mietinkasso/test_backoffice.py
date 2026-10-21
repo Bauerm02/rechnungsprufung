@@ -5004,6 +5004,122 @@ def test_mahnvorschau_zeigt_mahnkosten_block_ohne_zu_buchen(backoffice_client):
     assert "reine Vorschau, keine Buchung" in antwort.text
 
 
+def test_mahnvorschau_mahnkostenblock_zeigt_stufen_dynamisch_je_aktiver_policy(backoffice_client):
+    """Korrektur der Live-Sichtprüfung 21.10.2026: `_mahnkosten_vorschau_
+    block` iterierte bisher FEST über Stufe 1/2 (Zeile 298), unabhängig
+    von der tatsächlich aktuell freigegebenen Policy - unter einer
+    Policy mit `vier_stufen_profil_aktiv=True` fehlten Stufe-3/4-Blöcke
+    (samt Brief-PDF-Link/Briefstatus-Hinweis) in der Mahnvorschau
+    vollständig. Dieser Test steuert die aktive Policy EXPLIZIT selbst
+    (statt sich auf einen ambienten Zustand aus anderen Tests dieses
+    Moduls zu verlassen) und prüft BEIDE Richtungen: eine alte
+    Zwei-Stufen-Policy zeigt weiterhin NUR Stufe 1/2 (keine Regression),
+    eine Vier-Stufen-Policy zeigt zusätzlich vollständige Stufe-3/4-
+    Blöcke inkl. Brief-PDF-Link und (da der Briefkanal in dieser
+    Testumgebung nie echt angebunden ist) Briefkanal-Warnhinweis."""
+
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.stammdaten.repository import StammdatenRepository
+    from mietinkasso.mahnwesen.repository import MahnKanalregelRepository, MahnPolicyRepository
+
+    client, _konto_id, _konto_gesperrt_id, op_service = backoffice_client
+    _login(client)
+
+    # Eigene, isolierte Gesellschaft/Vertrag (siehe Begründung bei
+    # `test_mahnvorschau_unterscheidet_planbar_von_tatsaechlich_geplant`)
+    # - nur für die offene Forderung selbst; die MahnPolicy ist
+    # modulweit global und wird deshalb unten explizit in BEIDE
+    # Richtungen gesteuert, statt sich auf den aktuellen Stand anderer
+    # Tests zu verlassen.
+    stammdaten = StammdatenRepository(build_session_factory(get_settings().database_url))
+    stammdaten.upsert_gesellschaft(id="7DI-STUFENBLOCK", name="7D Immobilien GmbH (Stufenblock-Test)")
+    stammdaten.upsert_objekt(id="601-STUFENBLOCK", gesellschaft_id="7DI-STUFENBLOCK", bezeichnung="Am Corso (Stufenblock-Test)")
+    stammdaten.upsert_einheit(id="601-TOP-STUFENBLOCK", objekt_id="601-STUFENBLOCK", bezeichnung="Top Stufenblock", nutzungsstatus="DAUERVERMIETUNG")
+    stammdaten.upsert_debitor(id="DEB-STUFENBLOCK", name="Test Mieterin Stufenblock", email="stufenblock@example.at")
+    stammdaten.upsert_vertrag(
+        id="V-601-STUFENBLOCK", einheit_id="601-TOP-STUFENBLOCK", debitor_id="DEB-STUFENBLOCK",
+        gesellschaft_id="7DI-STUFENBLOCK", rechtsordnung="OESTERREICH_MRG_VOLL", gueltig_von=date(2024, 1, 1),
+    )
+    konto = stammdaten.get_or_create_konto(vertrag=stammdaten.get_vertrag("V-601-STUFENBLOCK"))
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=60_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1), faelligkeit=date(2026, 1, 5),
+        beleg_referenz="Stufenblock-Testforderung",
+    )
+
+    # Briefkanal für Stufe 3/4 einrichten (sonst zeigt die Vorschau für
+    # BRIEF nur den allgemeinen "kein Anbieterprofil"-Hinweis statt des
+    # spezifisch erwarteten "wartet auf Anbindung"-Hinweises). Stufe 1/2
+    # werden BEWUSST NICHT überschrieben (Tabellen-Default EMAIL/BRIEF
+    # bleibt wirksam) - andere, modulweit geteilte Tests verlassen sich
+    # auf genau diesen Default für Stufe 2 (z. B. "Stufe 2 (Kanal:
+    # BRIEF)"); dieser Test darf das globale Kanalregel-/Policy-
+    # Singleton nicht auf eine Weise verändern, die SPÄTER laufende
+    # Tests bricht.
+    kanalregel_repo = MahnKanalregelRepository(build_session_factory(get_settings().database_url))
+    regel = kanalregel_repo.anlegen(stufe3_kanal="BRIEF", stufe4_kanal="BRIEF", erstellt_von="test")
+    kanalregel_repo.freigeben(regel.id, freigegeben_von="test")
+    from mietinkasso.mahnwesen.repository import BriefAnbieterProfilRepository
+    profil_repo = BriefAnbieterProfilRepository(build_session_factory(get_settings().database_url))
+    profil = profil_repo.anlegen(anbieter_name="EinfachBrief (Stufenblock-Test)", quelle_beleg="Testtarif", erstellt_von="test")
+    profil_repo.freigeben(profil.id, freigegeben_von="test")
+
+    mahn_policy_repo = MahnPolicyRepository(build_session_factory(get_settings().database_url))
+
+    # 1) Alte Zwei-Stufen-Policy: weiterhin NUR Stufe 1/2 - keine Regression.
+    policy_zwei = mahn_policy_repo.anlegen(
+        stufe1_tage_nach_faelligkeit=7, stufe2_mindesttage_nach_stufe1_versand=14, status="ENTWURF",
+        vier_stufen_profil_aktiv=False,
+    )
+    mahn_policy_repo.freigeben(policy_zwei.id)
+    seite_zwei = client.get("/backoffice/vertrag/V-601-STUFENBLOCK/mahnvorschau")
+    assert seite_zwei.status_code == 200
+    assert "Stufe 1 (Kanal:" in seite_zwei.text
+    assert "Stufe 2 (Kanal:" in seite_zwei.text
+    assert "Stufe 3 (Kanal:" not in seite_zwei.text
+    assert "Stufe 4 (Kanal:" not in seite_zwei.text
+
+    # 2) Neue Vier-Stufen-Policy: Stufe 3/4 erscheinen jetzt VOLLSTÄNDIG
+    # (eigener Block, Brief-PDF-Link, Briefkanal-Warnhinweis) - nicht nur
+    # als leere Zeile.
+    policy_vier = mahn_policy_repo.anlegen(
+        stufe1_tage_nach_faelligkeit=7, stufe2_mindesttage_nach_stufe1_versand=14, status="ENTWURF",
+        vier_stufen_profil_aktiv=True, stufe2_mindesttage_nach_stufe1_zugang=14,
+        stufe3_mindesttage_nach_stufe2_zugang=14, stufe4_mindesttage_nach_stufe3_zugang=14,
+    )
+    mahn_policy_repo.freigeben(policy_vier.id)
+    seite_vier = client.get("/backoffice/vertrag/V-601-STUFENBLOCK/mahnvorschau")
+    assert seite_vier.status_code == 200
+    assert "Stufe 1 (Kanal:" in seite_vier.text
+    assert "Stufe 2 (Kanal:" in seite_vier.text
+    assert "Stufe 3 (Kanal: BRIEF)" in seite_vier.text
+    assert "Stufe 4 (Kanal: BRIEF)" in seite_vier.text
+    # Brief-PDF-Link für beide neuen Stufen (nicht nur Text, sondern die
+    # tatsächliche, stufenspezifische Download-Route).
+    assert f"/backoffice/vertrag/V-601-STUFENBLOCK/mahnbrief.pdf?stufe=3" in seite_vier.text
+    assert f"/backoffice/vertrag/V-601-STUFENBLOCK/mahnbrief.pdf?stufe=4" in seite_vier.text
+    # Briefkanal-Warnhinweis (Transport in dieser Umgebung nie echt
+    # angebunden) erscheint jetzt auch für Stufe 3/4 - geprüft INNERHALB
+    # je des eigenen Stufenblocks, nicht per Gesamt-Count (der auch von
+    # Stufe 2s eigenem, hier nicht explizit gesetztem Kanal-Default
+    # abhängen könnte und damit unnötig an fremden Modulzustand koppeln
+    # würde).
+    block3 = seite_vier.text[seite_vier.text.index("Stufe 3 (Kanal:"):seite_vier.text.index("Stufe 4 (Kanal:")]
+    block4 = seite_vier.text[seite_vier.text.index("Stufe 4 (Kanal:"):]
+    assert "Brief wartet auf Anbindung" in block3
+    assert "Brief wartet auf Anbindung" in block4
+
+    # Die zuvor funktionierende "Freigabe prüfen/erteilen"-Verlinkung für
+    # Stufe 3/4 führt tatsächlich zu einer funktionierenden Seite statt
+    # eines frühen "Stufe muss ... sein"-Fehlers.
+    freigabe_stufe3 = client.get("/backoffice/vertrag/V-601-STUFENBLOCK/mahnpauschale-freigabe", params={"stufe": 3})
+    assert freigabe_stufe3.status_code == 200
+    assert "Stufe 3" in freigabe_stufe3.text
+
+
 def test_mahnvorschau_get_legt_nie_einen_mahnfall_an(backoffice_client):
     """Auftrag Markus 14.09.2026: GET /vertrag/{id}/mahnvorschau darf
     keine Mahnfälle schreiben - mehrere Aufrufe (auch mit
@@ -5860,13 +5976,19 @@ def test_mahnpauschale_freigabe_erfassen_ignoriert_simuliertes_heute_aus_formula
 
 
 def test_mahnpauschale_freigabe_erfassen_lehnt_ungueltige_stufe_ab(backoffice_client):
+    """Stufe 3/4 sind seit HV-20261020-VIER-MAHNSTUFEN gültige Stufen
+    (siehe Korrektur der Live-Sichtprüfung 21.10.2026, die den vormals
+    fest auf 1/2 begrenzten Freigabe-Guard auf 1-4 erweitert hat) - eine
+    tatsächlich ungültige Stufe (außerhalb 1-4) bleibt weiterhin
+    abgelehnt."""
+
     client, *_ = backoffice_client
     _login(client)
     csrf = _csrf_token(client)
     antwort = client.post(
         "/backoffice/vertrag/V-601-1/mahnpauschale-freigabe/erfassen",
         data={
-            "csrf_token": csrf, "stufe": "3", "heute": date.today().isoformat(),
+            "csrf_token": csrf, "stufe": "5", "heute": date.today().isoformat(),
             "betrag_cent": "20,00", "erforderlichkeit_begruendung": "x", "tatsaechlicher_aufwand_cent": "20,00",
             "tatsaechlicher_aufwand_beleg": "x", "schuldhaftigkeit_begruendung": "x",
             "verhaeltnismaessigkeit_begruendung": "x",
