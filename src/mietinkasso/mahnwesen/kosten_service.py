@@ -31,7 +31,6 @@ ist `uq_mahnkosten_gebuehr_forderung` dagegen das FACHLICHE Gate selbst
 from __future__ import annotations
 
 import json
-import uuid
 from datetime import date
 from decimal import Decimal
 
@@ -209,7 +208,28 @@ class MahnkostenService:
         `buche_vorschau` (keine zweite Buchungs-Engine) - genauso
         idempotent: `None`, wenn kein neues Delta vorliegt (z. B. ein
         sofortiger Retry am selben Tag nach bereits erfolgter
-        Abrechnung)."""
+        Abrechnung).
+
+        **Korrektur nach unabhängiger Rückprüfung Codex 22.10.2026, echter
+        Bug:** `buche_vorschau` bildet den OP-/Ledger-Schlüssel OHNE
+        Override allein aus der eingefrorenen Forderungsmenge
+        (`_mahnlauf_schluessel`) - für den regulären, EINMALIGEN
+        Mahnversand ist das richtig, für eine eigenständige
+        Zinsabrechnung aber falsch: ZWEI echte, zeitlich getrennte
+        Abrechnungstermine (z. B. 11.1. und 21.1.) für DIESELBE
+        Forderungsmenge erzeugten bisher DENSELBEN Schlüssel - der
+        zweite, genuin neue Abrechnungstermin scheiterte an der
+        bestehenden Eindeutigkeit (`uq_mahnkosten_lauf`) mit einem
+        `RuntimeError`, statt das neue Delta zu buchen. Der Schlüssel
+        bindet jetzt zusätzlich an die Abrechnungsperiode
+        (`vorschau.zins_bis` + `vorschau.bereits_gebuchte_zinsen_cent`
+        als Baseline VOR dieser Buchung) - zwei echte Termine mit
+        unterschiedlichem Periodenende/unterschiedlicher Baseline
+        erhalten automatisch unterschiedliche, eigene Zeilen; ein
+        exakter Retry DESSELBEN Termins (identisches Periodenende,
+        identische Baseline - typischerweise weil nichts Neues
+        aufgelaufen ist) liefert weiterhin denselben Schlüssel und bleibt
+        über die bestehende IntegrityError-Rücklese idempotent."""
 
         vorschau = self.vorschau(vertrag_id=vertrag_id, stufe=ZINSABRECHNUNG_STUFE, heute=heute)
         if vorschau is None:
@@ -218,10 +238,17 @@ class MahnkostenService:
             vorschau, gebuehr_segmente=(), gebuehr_cent=None, gebuehr_rechtsgrundlage=None,
             mahnpauschale_cent=None, mahnpauschale_rechtsgrundlage=None,
         )
-        versandnachweis_referenz = f"ZINSABRECHNUNG:{heute.isoformat()}:{uuid.uuid4()}"
+        forderung_schluessel = _mahnlauf_schluessel(list(vorschau.forderung_op_position_ids))
+        perioden_schluessel = (
+            f"{forderung_schluessel}:"
+            f"{vorschau.zins_bis.isoformat() if vorschau.zins_bis else 'OFFEN'}:"
+            f"{vorschau.bereits_gebuchte_zinsen_cent}"
+        )
+        versandnachweis_referenz = f"ZINSABRECHNUNG:{vertrag_id}:{perioden_schluessel}"
         return self.buche_vorschau(
             ctx=ctx, vorschau=vorschau_ohne_gebuehren, heute=heute,
             versandnachweis_referenz=versandnachweis_referenz, akteur=akteur,
+            mahnlauf_schluessel_override=f"ZINSABRECHNUNG:{perioden_schluessel}",
         )
 
     def reserviere_und_kuerze_vorschau(

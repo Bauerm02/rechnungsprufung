@@ -221,6 +221,38 @@ def _zeile(pdf: FPDF, *, datum_text: str, bezeichnung: str, betrag_cent: int, re
     pdf.set_y(max(y1, y0 + 5))
 
 
+def _journal_tabellenkopf(pdf: FPDF) -> None:
+    """Spaltenköpfe des chronologischen Journals (Fix7, unabhängige
+    Rückprüfung Codex 22.10.2026, Sichtprüfung des kanonischen PDFs:
+    "zwei Beträge nebeneinander ohne Kennzeichnung, welcher
+    Buchungsbetrag und welcher laufender Saldo ist") - dieselben
+    Spaltenbreiten/-positionen wie `_zeile`, damit Kopf und Inhalt
+    exakt übereinanderstehen. Wird einmal vor dem Journal UND erneut
+    nach jedem Seitenumbruch INNERHALB des Journals gezeichnet (siehe
+    Aufrufer) - KEIN neues separates Blatt, nur eine wiederholte
+    Kopfzeile derselben Tabelle; Logo/mehrseitiges Layout bleiben
+    unverändert (`header()` oben wird dadurch nicht berührt)."""
+
+    datum_breite = 24.0
+    label_breite = (_INHALT_RECHTS - _RAND - datum_breite) - _BETRAG_SPALTE_BREITE - _REST_SPALTE_BREITE
+    pdf.set_font("Konto", "B", 7.5)
+    pdf.set_text_color(*pdf.farbe_anthrazit)
+    x0, y0 = _RAND, pdf.get_y()
+    pdf.set_xy(x0, y0)
+    pdf.cell(datum_breite, 5, "Datum", align="L")
+    pdf.set_xy(x0 + datum_breite, y0)
+    pdf.cell(label_breite, 5, "Buchung", align="L")
+    pdf.set_xy(x0 + datum_breite + label_breite, y0)
+    pdf.cell(_BETRAG_SPALTE_BREITE, 5, "Betrag (+Soll,-Haben)", align="R")
+    pdf.set_xy(x0 + datum_breite + label_breite + _BETRAG_SPALTE_BREITE, y0)
+    pdf.cell(_REST_SPALTE_BREITE, 5, "Saldo", align="R")
+    pdf.set_y(y0 + 5)
+    pdf.set_draw_color(*pdf.farbe_gold)
+    pdf.line(_RAND, pdf.get_y(), _INHALT_RECHTS, pdf.get_y())
+    pdf.ln(1.5)
+    pdf.set_font("Konto", "", 9.5)
+
+
 def _abschnitt_titel(pdf: FPDF, text: str) -> None:
     if pdf.will_page_break(10):
         pdf.add_page()
@@ -288,7 +320,14 @@ def erzeuge_kontoauszug_pdf(
     _abschnitt_titel(pdf, "Kontoblatt — chronologisches Journal")
     journal = erstelle_journal(kontoblatt)
     if journal:
+        # Fix7 (unabhängige Rückprüfung Codex 22.10.2026): explizite
+        # Spaltenköpfe, VOR dem Journal UND nach jedem Seitenumbruch
+        # INNERHALB des Journals wiederholt (siehe `_journal_tabellenkopf`-
+        # Docstring) - vorher standen zwei Beträge (Buchungsbetrag/
+        # laufender Saldo) nebeneinander ohne erkennbare Kennzeichnung.
+        _journal_tabellenkopf(pdf)
         for jz in journal:
+            seite_vor_zeile = pdf.page_no()
             status_text = _status_text(jz.zeile)
             if not jz.beeinflusst_saldo:
                 status_text += " · wirkt sich NICHT auf den laufenden Saldo aus"
@@ -301,14 +340,19 @@ def erzeuge_kontoauszug_pdf(
                 pdf, datum_text=jz.datum.strftime("%d.%m.%Y"), bezeichnung=bezeichnung, betrag_cent=effekt_cent,
                 rest_text=_eur(jz.laufender_saldo_cent),
             )
+            if pdf.page_no() != seite_vor_zeile:
+                _journal_tabellenkopf(pdf)
             pdf.set_font("Konto", "", 8.5)
             for zuordnung_text in _zins_zuordnung_zeilen_text(jz.zeile):
+                seite_vor_detail = pdf.page_no()
                 # Unabhängige Prüfung Commit 8ae0406, optionaler Hinweis:
                 # "↳" (U+21B3) fehlt im Zeichensatz der Fallback-Schrift
                 # (LiberationSerif) - ein einfacher, in jeder Schrift
                 # vorhandener Einzug ("- ") statt eines möglichen
                 # Platzhalter-/Fehlzeichens.
                 pdf.multi_cell(0, 4.5, "    - " + zuordnung_text, new_x="LMARGIN", new_y="NEXT")
+                if pdf.page_no() != seite_vor_detail:
+                    _journal_tabellenkopf(pdf)
             pdf.set_font("Konto", "", 9.5)
     else:
         pdf.cell(0, 5, "Keine Buchungen.", new_x="LMARGIN", new_y="NEXT")
@@ -353,6 +397,29 @@ def erzeuge_kontoauszug_pdf(
         for m in kontoblatt.ausstehende_mahnlaeufe:
             geplant_text = m.geplant_am.strftime("%d.%m.%Y") if isinstance(m.geplant_am, datetime) else ""
             bezeichnung = f"Stufe {m.stufe} · Kanal {m.kanal} · Status {m.status} · geplant am {geplant_text}"
+            pdf.set_font("Konto", "", 9.5)
+            pdf.multi_cell(0, 5, bezeichnung, new_x="LMARGIN", new_y="NEXT")
+
+    # Fix6 (unabhängige Rückprüfung Codex 22.10.2026): ein Manualimport
+    # OHNE Kosten-Freigabe (`pauschale_abgegolten=False`) erschien bisher
+    # NIRGENDS auf diesem Kontoauszug - `erzeuge_kontoauszug_pdf` kannte
+    # `ManuellerMahnversandTable` überhaupt nicht. Derselbe Belegstand wie
+    # im HTML-Kontoblatt, KEINE erfundene 0,00-EUR-Summe.
+    if kontoblatt.ausstehende_manuelle_mahnversand:
+        _abschnitt_titel(pdf, "Manuell dokumentierte Mahnschreiben (Kosten noch nicht gebucht)")
+        pdf.set_font("Konto", "", 9)
+        pdf.multi_cell(
+            0, 5,
+            "Für diese bereits erfassten, tatsächlich versandten Schreiben ist noch KEINE Kostenbuchung "
+            "erfolgt (Freigabe/Bestätigung steht aus) - das bedeutet 'in Prüfung, noch nicht gebucht', "
+            "NICHT 'keine Kosten'.",
+        )
+        pdf.ln(1)
+        for z in kontoblatt.ausstehende_manuelle_mahnversand:
+            bezeichnung = (
+                f"Stufe {z.stufe} · Kanal {z.kanal} · Versanddatum {z.versanddatum.strftime('%d.%m.%Y')} · "
+                f"Beleg {z.beleg_referenz} · Empfänger {z.empfaenger_name}"
+            )
             pdf.set_font("Konto", "", 9.5)
             pdf.multi_cell(0, 5, bezeichnung, new_x="LMARGIN", new_y="NEXT")
 

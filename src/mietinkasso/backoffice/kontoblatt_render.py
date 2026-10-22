@@ -180,6 +180,27 @@ def render_kontoblatt_html(kontoblatt: Kontoblatt, *, konto_id: str, zinsabrechn
           {mahnlauf_zeilen}</table>
         </div>"""
 
+    # Fix6 (unabhängige Rückprüfung Codex 22.10.2026): ein Manualimport
+    # OHNE Kosten-Freigabe (`pauschale_abgegolten=False`) erschien bisher
+    # NIRGENDS am Kontoblatt - weder Summe noch eigene Zeile. Zeigt hier
+    # dieselben, bereits dokumentierten Belege als "in Prüfung" - KEINE
+    # erfundene 0,00-EUR-Summe, nur die reale Existenz des Vorgangs.
+    manueller_versand_zeilen = "".join(
+        f"<tr><td>{z.versanddatum.isoformat()}</td><td>{z.stufe}</td><td>{h(z.kanal)}</td>"
+        f"<td>{h(z.beleg_referenz)}</td><td>{h(z.empfaenger_name)}</td></tr>"
+        for z in kontoblatt.ausstehende_manuelle_mahnversand
+    )
+    manueller_versand_karte = ""
+    if kontoblatt.ausstehende_manuelle_mahnversand:
+        manueller_versand_karte = f"""
+        <div class="card"><h3>Manuell dokumentierte Mahnschreiben (Kosten noch nicht gebucht)</h3>
+          <p class="warn">Für diese bereits erfassten, tatsächlich versandten Schreiben ist noch KEINE
+             Kostenbuchung erfolgt (Freigabe/Bestätigung steht aus) - das bedeutet "in Prüfung, noch nicht
+             gebucht", NICHT "keine Kosten".</p>
+          <table><tr><th>Versanddatum</th><th>Stufe</th><th>Kanal</th><th>Belegreferenz</th><th>Empfänger</th></tr>
+          {manueller_versand_zeilen}</table>
+        </div>"""
+
     return f"""
     <div class="card"><h2>Kontoblatt</h2>
       <p>Hauptforderung gebucht: <strong>{eur(kontoblatt.hauptforderung_cent)}</strong>
@@ -201,4 +222,5 @@ def render_kontoblatt_html(kontoblatt: Kontoblatt, *, konto_id: str, zinsabrechn
       </details>
     </div>
     {bankaufwand_karte}
-    {ausstehend_karte}"""
+    {ausstehend_karte}
+    {manueller_versand_karte}"""

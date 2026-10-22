@@ -2263,3 +2263,47 @@ def test_nachbuchung_bucht_genau_einmal_nach_spaeter_erteilter_freigabe(
         if p.aenderungsgrund == "Mahnkosten - Mahnkostenpauschale"
     ]
     assert len(pauschale_zeilen_nach_retry) == 1  # weiterhin genau EINE Buchung, kein zweites Mal
+
+
+# -- Zinsabrechnung: zwei echte Termine müssen BEIDE buchen -----------------
+# (unabhängige Rückprüfung Codex 22.10.2026, echter Bug: der bisherige
+# Schlüssel band nur an die Forderungsmenge, nicht an die Abrechnungsperiode
+# - ein zweiter, genuin späterer Abrechnungstermin für dieselbe
+# Forderungsmenge scheiterte an der bestehenden `uq_mahnkosten_lauf`.)
+
+
+def test_buche_zinsabrechnung_zwei_echte_termine_buchen_beide_getrennt(
+    op_service, kosten_service, admin_ctx, basis_vertrag,
+):
+    vertrag, konto = basis_vertrag
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=100_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 1), beleg_referenz="HMZ Jänner",
+    )
+
+    erster = kosten_service.buche_zinsabrechnung(ctx=admin_ctx, vertrag_id=vertrag.id, heute=date(2026, 1, 11), akteur="test")
+    assert erster is not None and erster.zinsen_cent > 0
+
+    # Zweiter, GENUIN SPÄTERER Abrechnungstermin für DIESELBE Forderungsmenge -
+    # muss ein EIGENES, neues Delta buchen, NICHT an der ersten Zeile scheitern.
+    zweiter = kosten_service.buche_zinsabrechnung(ctx=admin_ctx, vertrag_id=vertrag.id, heute=date(2026, 1, 21), akteur="test")
+    assert zweiter is not None and zweiter.zinsen_cent > 0
+    assert zweiter.id != erster.id
+
+    gesamt_gebucht = sum(
+        p.betrag_cent for p in op_service.berechne_saldo(konto.id, stichtag=date(2026, 1, 21)).positionen
+        if p.aenderungsgrund == "Mahnkosten - Verzugszinsen"
+    )
+    assert gesamt_gebucht == erster.zinsen_cent + zweiter.zinsen_cent  # beide Deltas tatsächlich gebucht, keines verloren
+
+    # Ein exakter Retry DESSELBEN zweiten Termins (kein einziger Tag seither
+    # vergangen, also kein neues Delta) bleibt idempotent - kein dritter
+    # Versuch, keine weitere OP-Position.
+    retry = kosten_service.buche_zinsabrechnung(ctx=admin_ctx, vertrag_id=vertrag.id, heute=date(2026, 1, 21), akteur="test")
+    assert retry is None
+    zinsen_zeilen_nach_retry = [
+        p for p in op_service.berechne_saldo(konto.id, stichtag=date(2026, 1, 21)).positionen
+        if p.aenderungsgrund == "Mahnkosten - Verzugszinsen"
+    ]
+    assert len(zinsen_zeilen_nach_retry) == 2  # weiterhin nur die zwei echten Termine

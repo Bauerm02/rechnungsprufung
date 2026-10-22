@@ -2410,14 +2410,27 @@ class ManuellerMahnversandTable(Base):
 
     `mahnkosten_buchung_id` verweist (lose, ohne FK - wie an mehreren
     Stellen in diesem Modul üblich, siehe `MahnkostenBuchungTable`-
-    Referenzen) auf die beim Import tatsächlich gebuchte
-    `MahnkostenBuchungTable`-Zeile (Zinsen-Delta + zu diesem Zeitpunkt
-    BEREITS freigegebene Kosten) - bleibt `NULL`, wenn beim Import nichts
-    zu buchen war (z. B. Zinsdelta 0 und Mahnpauschale noch nicht
-    freigegeben). Eine SPÄTER erteilte Freigabe löst HIER NOCH KEINE
-    automatische Nachbuchung aus (siehe `OFFENE_PUNKTE.md` - das würde
-    die bestehende `uq_mahnkosten_lauf`-Eindeutigkeit berühren und ist
-    bewusst NICHT unter Zeitdruck in dieses Modul hineinimprovisiert)."""
+    Referenzen) auf die ZULETZT tatsächlich gebuchte
+    `MahnkostenBuchungTable`-Zeile dieses Belegs (Zinsen-Delta UND/ODER
+    zu diesem Zeitpunkt bereits freigegebene Kosten) - bleibt `NULL`,
+    wenn noch NICHTS zu buchen war (z. B. `sofort_buchen=False` beim
+    Import - ein reiner Nachweis ohne jede automatische historische
+    Zinsbuchung, siehe `manueller_mahnversand_service.py::importieren`-
+    Docstring - oder Zinsdelta 0 UND Mahnpauschale noch nicht
+    freigegeben).
+
+    `pauschale_abgegolten` (Codex-Rückprüfung 22.10.2026, echter Bug):
+    GENAU EINE Mahnspesen-/Mahnkostenpauschale darf diesem Beleg jemals
+    zugeordnet werden - unabhängig davon, ÜBER WELCHE Freigabe-Zeile sie
+    letztlich ausgelöst wurde. Vorher band `nachbuche_fuer_vertrag_
+    stufe`s Idempotenz fälschlich an die jeweils AUSLÖSENDE
+    `MahnpauschaleFreigabeTable.id` - eine ZWEITE, später für eine
+    GEÄNDERTE Kapitalbasis (z. B. nach einer Teilzahlung) erteilte
+    Freigabe für DIESELBE Forderungsgruppe hätte denselben, bereits
+    einmal bepauschalten Beleg ein zweites Mal belastet. Dieses Flag wird
+    GENAU DANN gesetzt, wenn eine tatsächliche Buchung (Import ODER
+    Nachbuchung) `gebuehr_cent`/`mahnpauschale_cent` > 0 enthielt - jede
+    weitere Nachbuchung für diesen Beleg wird danach übersprungen."""
 
     __tablename__ = "manueller_mahnversand"
     __table_args__ = (
@@ -2439,6 +2452,7 @@ class ManuellerMahnversandTable(Base):
     erfasst_von: Mapped[str] = mapped_column(String(128))
     erfasst_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     mahnkosten_buchung_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pauschale_abgegolten: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("0"))
 
 
 class MahnpauschaleFreigabeTable(Base):

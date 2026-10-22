@@ -7,6 +7,7 @@ aus einem Formularfeld."""
 
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 from decimal import Decimal
 from html import escape as h
@@ -422,7 +423,8 @@ def _mahnkosten_vorschau_block(vertrag_id: str, heute_datum: date) -> str:
 
 @router.get("/vertrag/{vertrag_id}/mahnpauschale-freigabe", response_class=HTMLResponse)
 def mahnpauschale_freigabe_formular(
-    request: Request, vertrag_id: str, stufe: int = 1, heute: str | None = None, session=Depends(_current_session),
+    request: Request, vertrag_id: str, stufe: int = 1, heute: str | None = None,
+    fuer_manualimport_row_id: int | None = None, session=Depends(_current_session),
 ) -> HTMLResponse:
     """Einfache Prüfliste/Freigabemaske für die Mahnkostenpauschale
     (§1333 Abs 2 ABGB) JE KONKRETEM Mahnlauf/Forderungsgruppe (Auftrag
@@ -431,7 +433,27 @@ def mahnpauschale_freigabe_formular(
     eine bereits bestehende (ggf. durch Saldenänderung ungültig
     gewordene) Freigabe; erteilt KEINE Buchung selbst - das bleibt
     ausschließlich `kosten.py::berechne_mahnkosten_vorschau` bei der
-    nächsten tatsächlichen Mahnlaufverarbeitung vorbehalten."""
+    nächsten tatsächlichen Mahnlaufverarbeitung vorbehalten.
+
+    **Nachtrag Markus 22.10.2026 (gezielt, kein zusätzlicher Ausbau):**
+    das allgemeine Formular freigibt bisher IMMER nur die AKTUELLE
+    Gesamtgruppe aller gerade offenen Forderungen von (vertrag_id, stufe)
+    - ist seit einem konkreten Manualimport-Beleg zusätzlich eine NEUE
+    Monatsforderung derselben Stufe hinzugekommen, erzeugt das einen
+    ANDEREN `Forderungsgruppe-Schlüssel` als den des Belegs selbst, und
+    `nachbuche_fuer_vertrag_stufe`s Abgleich (siehe dort) findet die
+    Freigabe für den ALTEN, bereits versandten Beleg dann NIE - dessen
+    Kosten bleiben still unbepauschalt. `fuer_manualimport_row_id` bindet
+    diese Maske stattdessen an GENAU die eingefrorenen `forderung_op_
+    position_ids` DIESES konkreten Belegs (Stufe wird dabei verbindlich
+    vom Beleg selbst übernommen, nie vom `stufe`-Query-Parameter)."""
+
+    manualimport_row = None
+    if fuer_manualimport_row_id is not None:
+        manualimport_row = deps._hv_mail.manueller_mahnversand_repo.get(fuer_manualimport_row_id)
+        if manualimport_row is None or manualimport_row.vertrag_id != vertrag_id:
+            return _fehlerseite(session, "Mahnpauschale-Freigabe", "Unbekannte oder fremde Manualimport-Zeile.")
+        stufe = manualimport_row.stufe
 
     if stufe not in (1, 2, 3, 4):
         return _fehlerseite(session, "Mahnpauschale-Freigabe", "Stufe muss zwischen 1 und 4 liegen.")
@@ -447,11 +469,23 @@ def mahnpauschale_freigabe_formular(
 
     heute_datum = date.fromisoformat(heute) if heute else date.today()
     kanal = deps._hv_mail.mahn_service._resolve_kanal(stufe)
-    vorschau = deps._hv_mail.mahnkosten_service.vorschau(vertrag_id=vertrag_id, stufe=stufe, heute=heute_datum, kanal=kanal)
+    eingefrorene_ids = (
+        frozenset(json.loads(manualimport_row.forderung_op_position_ids_json)) if manualimport_row is not None else None
+    )
+    vorschau = deps._hv_mail.mahnkosten_service.vorschau(
+        vertrag_id=vertrag_id, stufe=stufe, heute=heute_datum, nur_op_position_ids=eingefrorene_ids, kanal=kanal,
+    )
     if vorschau is None:
         return _fehlerseite(session, "Mahnpauschale-Freigabe", "Keine Kostenvorschau für diesen Vertrag/diese Stufe verfügbar.")
 
-    schluessel = _forderungsgruppe_schluessel(vorschau.forderung_op_position_ids)
+    # Bei einem konkreten Beleg GENAU dessen eigene, eingefrorene Ids als
+    # Schlüsselgrundlage (nie die ggf. durch Tilgung/neue Forderungen
+    # abweichende `vorschau.forderung_op_position_ids`) - identisch zu
+    # `manueller_mahnversand_service.py::nachbuche_fuer_vertrag_stufe`s
+    # eigener Berechnung, damit beide GARANTIERT denselben Schlüssel bilden.
+    schluessel = _forderungsgruppe_schluessel(
+        sorted(eingefrorene_ids) if eingefrorene_ids is not None else vorschau.forderung_op_position_ids
+    )
     historie = deps._hv_mail.mahnkosten_repo.mahnpauschale_freigaben_historie(
         vertrag_id=vertrag_id, stufe=stufe, forderungsgruppe_schluessel=schluessel,
     )
@@ -470,9 +504,20 @@ def mahnpauschale_freigabe_formular(
         if anzeige_vorschlag_cent and vorschau.hauptforderung_cent else "–"
     )
 
+    beleg_hinweis = ""
+    if manualimport_row is not None:
+        beleg_hinweis = (
+            f'<p class="warn">Diese Freigabe bindet sich AUSSCHLIESSLICH an die eingefrorenen Forderungen des '
+            f"konkreten Manualimport-Belegs „{h(manualimport_row.beleg_referenz)}“ (Versanddatum "
+            f"{manualimport_row.versanddatum.isoformat()}), NICHT an die aktuelle Gesamtgruppe dieser Stufe - "
+            "spätere, neue Forderungen derselben Stufe bleiben davon unberührt und benötigen ggf. eine eigene "
+            "Freigabe.</p>"
+        )
+    titel_zusatz = f" — Beleg {h(manualimport_row.beleg_referenz)}" if manualimport_row is not None else ""
     kopf = f"""
     <div class="card" style="max-width:720px;">
-      <h1>Mahnkostenpauschale-Freigabe — {h(vertrag_id)}, Stufe {stufe} (Kanal: {h(kanal)})</h1>
+      <h1>Mahnkostenpauschale-Freigabe — {h(vertrag_id)}, Stufe {stufe} (Kanal: {h(kanal)}){titel_zusatz}</h1>
+      {beleg_hinweis}
       <table>
         <tr><th>Hauptforderung dieser Forderungsgruppe (jetzt)</th><td>{eur(vorschau.hauptforderung_cent)}</td></tr>
         <tr><th>Vorgeschlagener Betrag (unverbindlich)</th>
@@ -481,7 +526,8 @@ def mahnpauschale_freigabe_formular(
         <tr><th>Verhältnis Vorschlag / Hauptforderung</th><td>{h(verhaeltnis_text)}</td></tr>
         <tr><th>Vertragsquelle (Profil-Beleg)</th><td>{h(vorschlag_beleg or '–')}</td></tr>
         <tr><th>Versandschritt</th><td>Stufe {stufe}, Kanal {h(kanal)}, Simulationsdatum {heute_datum.isoformat()}</td></tr>
-        <tr><th>Forderungsgruppe-Schlüssel</th><td><code>{h(schluessel[:16])}…</code> ({len(vorschau.forderung_op_position_ids)} Forderung(en))</td></tr>
+        <tr><th>Forderungsgruppe-Schlüssel</th><td><code>{h(schluessel[:16])}…</code>
+            ({len(eingefrorene_ids) if eingefrorene_ids is not None else len(vorschau.forderung_op_position_ids)} Forderung(en))</td></tr>
       </table>
       <p><a href="/backoffice/vertrag/{h(vertrag_id)}/mahnvorschau?heute={heute_datum.isoformat()}">&larr; zurück zur Mahnvorschau</a></p>
     </div>"""
@@ -539,6 +585,7 @@ def mahnpauschale_freigabe_formular(
       <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/mahnpauschale-freigabe/erfassen">
         {csrf_feld(session.csrf_token)}
         <input type="hidden" name="stufe" value="{stufe}">
+        {f'<input type="hidden" name="fuer_manualimport_row_id" value="{manualimport_row.id}">' if manualimport_row is not None else ""}
         <label>Freigegebener Betrag in EUR (Pflicht - nicht notwendig identisch mit dem Vorschlagswert, darf den
                tatsächlichen Aufwand NIE übersteigen)</label>
         <input name="betrag_cent" required value="{f'{anzeige_vorschlag_cent/100:.2f}'.replace('.', ',')}">
@@ -570,10 +617,29 @@ async def mahnpauschale_freigabe_absenden(request: Request, vertrag_id: str, ses
     require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
     require_schreibrecht(_ctx(session))
 
-    try:
-        stufe = int(str(form.get("stufe", "1")))
-    except ValueError:
-        return _fehlerseite(session, "Mahnpauschale-Freigabe", "Ungültige Stufe.")
+    # Nachtrag Markus 22.10.2026 (gezielt, kein zusätzlicher Ausbau):
+    # wie die GET-Ansicht - ist `fuer_manualimport_row_id` mitgesendet,
+    # bindet SERVERSEITIG NEU geladen (nie das Client-Feld selbst als
+    # Wahrheit behandeln) an GENAU die eingefrorenen Forderungen DIESES
+    # konkreten Belegs; `stufe` kommt dann verbindlich vom Beleg, nicht
+    # vom (ggf. inkonsistenten) `stufe`-Formularfeld.
+    manualimport_row = None
+    fuer_manualimport_row_id_roh = str(form.get("fuer_manualimport_row_id", "")).strip()
+    if fuer_manualimport_row_id_roh:
+        try:
+            manualimport_row = deps._hv_mail.manueller_mahnversand_repo.get(int(fuer_manualimport_row_id_roh))
+        except ValueError:
+            manualimport_row = None
+        if manualimport_row is None or manualimport_row.vertrag_id != vertrag_id:
+            return _fehlerseite(session, "Mahnpauschale-Freigabe", "Unbekannte oder fremde Manualimport-Zeile.")
+
+    if manualimport_row is not None:
+        stufe = manualimport_row.stufe
+    else:
+        try:
+            stufe = int(str(form.get("stufe", "1")))
+        except ValueError:
+            return _fehlerseite(session, "Mahnpauschale-Freigabe", "Ungültige Stufe.")
     if stufe not in (1, 2, 3, 4):
         return _fehlerseite(session, "Mahnpauschale-Freigabe", "Stufe muss zwischen 1 und 4 liegen.")
     # Unabhängige Rückprüfung Codex 19.10.2026, echter Bug: die Freigabe
@@ -590,10 +656,22 @@ async def mahnpauschale_freigabe_absenden(request: Request, vertrag_id: str, ses
     # könnte zwischen Formularanzeige und Absenden veraltet oder
     # manipuliert sein). Genau dieselbe Methode wie die GET-Ansicht.
     kanal = deps._hv_mail.mahn_service._resolve_kanal(stufe)
-    vorschau = deps._hv_mail.mahnkosten_service.vorschau(vertrag_id=vertrag_id, stufe=stufe, heute=heute_datum, kanal=kanal)
+    eingefrorene_ids = (
+        frozenset(json.loads(manualimport_row.forderung_op_position_ids_json)) if manualimport_row is not None else None
+    )
+    vorschau = deps._hv_mail.mahnkosten_service.vorschau(
+        vertrag_id=vertrag_id, stufe=stufe, heute=heute_datum, nur_op_position_ids=eingefrorene_ids, kanal=kanal,
+    )
     if vorschau is None:
         return _fehlerseite(session, "Mahnpauschale-Freigabe", "Keine Kostenvorschau für diesen Vertrag/diese Stufe verfügbar.")
-    schluessel = _forderungsgruppe_schluessel(vorschau.forderung_op_position_ids)
+    # Dieselbe Schlüsselbildung wie die GET-Ansicht: bei einem konkreten
+    # Beleg GENAU dessen eigene, eingefrorene Ids (identisch zu
+    # `manueller_mahnversand_service.py::nachbuche_fuer_vertrag_stufe`s
+    # eigener Berechnung), nie die ggf. abweichende `vorschau.
+    # forderung_op_position_ids`.
+    schluessel = _forderungsgruppe_schluessel(
+        sorted(eingefrorene_ids) if eingefrorene_ids is not None else vorschau.forderung_op_position_ids
+    )
 
     try:
         betrag_cent = parse_eur_betrag(str(form.get("betrag_cent", "")).strip())
@@ -754,7 +832,7 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
         kontoblatt=_lade_kontoblatt(
             konto_id=konto.id, vertrag_id=vertrag_id, op_service=deps._op_service,
             mahnkosten_repo=deps._hv_mail.mahnkosten_repo, ruecklastschriftkosten_repo=deps._ruecklastschriftkosten_repo,
-            mahnlauf_repo=deps._hv_mail.mahnlauf_repo,
+            mahnlauf_repo=deps._hv_mail.mahnlauf_repo, manueller_mahnversand_repo=deps._hv_mail.manueller_mahnversand_repo,
         ),
     )
     pdf_bytes = haenge_kontoauszug_pdf_an(pdf_bytes, kontoauszug_pdf_bytes)
@@ -943,15 +1021,36 @@ async def mahnbrief_archiv_beleg_importieren(
 
 
 def _manueller_mahnversand_zeile_html(vertrag_id: str, row) -> str:
-    gebucht_html = (
-        f'<span class="ok">Kostenbuchung #{row.mahnkosten_buchung_id}</span>' if row.mahnkosten_buchung_id is not None
-        else '<span class="warn">keine Kostenbuchung (z. B. Mahnpauschale noch nicht freigegeben) - in Prüfung</span>'
-    )
+    if row.mahnkosten_buchung_id is not None:
+        gebucht_html = f'<span class="ok">Kostenbuchung #{row.mahnkosten_buchung_id}</span>'
+        buchen_link = ""
+    else:
+        gebucht_html = '<span class="warn">noch keine Buchung - reiner Nachweis, in Prüfung</span>'
+        buchen_link = (
+            f' &nbsp;<a href="/backoffice/vertrag/{h(vertrag_id)}/manueller-mahnversand/{row.id}/buchung">'
+            "Vorschau/Jetzt buchen</a>"
+        )
+    # Nachtrag Markus 22.10.2026 (gezielt, kein zusätzlicher Ausbau):
+    # Kostenfreigabe (Mahnspesen-/Mahnkostenpauschale) MUSS für GENAU
+    # diesen Beleg möglich bleiben, auch wenn inzwischen eine neue
+    # Monatsforderung derselben Stufe hinzugekommen ist - das allgemeine
+    # Freigabeformular (Link unten in dieser Ansicht) freigibt sonst nur
+    # die AKTUELLE Gesamtgruppe und erreicht diesen Beleg dann nie mehr
+    # (siehe `mahnpauschale_freigabe_formular`-Docstring). Solange die
+    # Pauschale noch nicht abgegolten ist (`pauschale_abgegolten`), bleibt
+    # dieser gezielte Link sichtbar - unabhängig davon, ob bereits ein
+    # reines Zinsdelta für diesen Beleg gebucht wurde.
+    freigabe_link = ""
+    if not row.pauschale_abgegolten:
+        freigabe_link = (
+            f' &nbsp;<a href="/backoffice/vertrag/{h(vertrag_id)}/mahnpauschale-freigabe'
+            f'?fuer_manualimport_row_id={row.id}">Kostenfreigabe für diesen Beleg</a>'
+        )
     return f"""
     <div class="card">
       <h3>Stufe {row.stufe} - {h(row.versanddatum.isoformat())} ({h(row.kanal)})</h3>
       <p>Empfänger: {h(row.empfaenger_name)}, {h(row.empfaenger_adresse)}</p>
-      <p>Belegreferenz: {h(row.beleg_referenz)} &nbsp;|&nbsp; {gebucht_html}</p>
+      <p>Belegreferenz: {h(row.beleg_referenz)} &nbsp;|&nbsp; {gebucht_html}{buchen_link}{freigabe_link}</p>
       <p><a href="/backoffice/vertrag/{h(vertrag_id)}/manueller-mahnversand/{row.id}/beleg.pdf">Beleg-PDF herunterladen</a></p>
     </div>"""
 
@@ -993,6 +1092,9 @@ def manueller_mahnversand_liste(request: Request, vertrag_id: str, session=Depen
         <input name="beleg_referenz" required>
         <label>Beleg (tatsächliches Dokument als PDF, Pflicht)</label>
         <input type="file" name="beleg_datei" accept="application/pdf" required>
+        <label><input type="checkbox" name="sofort_buchen" value="1">
+          Sofort buchen (Zinsen-Delta + ggf. bereits freigegebene Kosten) - sonst reiner Nachweis,
+          Buchung erst nach separater Vorschau/Bestätigung</label>
         <button type="submit">Importieren</button>
       </form>
     </div>"""
@@ -1033,7 +1135,7 @@ async def manueller_mahnversand_absenden(request: Request, vertrag_id: str, sess
             empfaenger_name=str(form.get("empfaenger_name", "")).strip(),
             empfaenger_adresse=str(form.get("empfaenger_adresse", "")).strip(),
             beleg_referenz=str(form.get("beleg_referenz", "")).strip(), beleg_pdf_bytes=beleg_pdf_bytes,
-            erfasst_von=session.user_id,
+            erfasst_von=session.user_id, sofort_buchen=str(form.get("sofort_buchen", "")) == "1",
         )
         deps._audit_service.log(
             entity_typ="manueller_mahnversand", entity_id=str(row.id), akteur=session.user_id,
@@ -1058,6 +1160,71 @@ def manueller_mahnversand_beleg_pdf(vertrag_id: str, row_id: int, session=Depend
         content=row.beleg_pdf_bytes, media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="ManuellerMahnversand-{row_id}.pdf"'},
     )
+
+
+@router.get("/vertrag/{vertrag_id}/manueller-mahnversand/{row_id}/buchung", response_class=HTMLResponse)
+def manueller_mahnversand_buchung_vorschau(request: Request, vertrag_id: str, row_id: int, session=Depends(_current_session)) -> HTMLResponse:
+    """Reine Lesevorschau (GET, mutationsfrei) der Buchung, die
+    `bestaetige_buchung` für diesen bereits dokumentierten, bislang
+    NICHT gebuchten Manualimport auslösen würde - niemals per GET
+    gebucht."""
+
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Manualimport", "Vertrag nicht verfügbar.", "/backoffice/vertraege")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    row = deps._hv_mail.manueller_mahnversand_repo.get(row_id)
+    if row is None or row.vertrag_id != vertrag_id:
+        return _fehlerseite(session, "Manualimport", "Unbekannte Manualimport-Zeile.")
+    rueck_href = f"/backoffice/vertrag/{vertrag_id}/manueller-mahnversand"
+    if row.mahnkosten_buchung_id is not None:
+        return _fehlerseite(session, "Manualimport", "Dieser Beleg wurde bereits gebucht.", rueck_href)
+
+    vorschau = deps._hv_mail.manueller_mahnversand_service.vorschau_fuer_bestehenden_import(row_id=row_id, heute=date.today())
+    if vorschau is None:
+        return _fehlerseite(session, "Manualimport", "Keine Vorschau möglich (Kontodaten unvollständig).", rueck_href)
+    gebuehr_hinweis = ""
+    if vorschau.gebuehr_cent or vorschau.mahnpauschale_cent:
+        gebuehr_hinweis = f"<p>Zusätzlich bereits freigegebene Kosten: {eur((vorschau.gebuehr_cent or 0) + (vorschau.mahnpauschale_cent or 0))}</p>"
+    inhalt = f"""
+    <div class="card" style="max-width:640px;">
+      <h1>Buchung bestätigen — Beleg {h(row.beleg_referenz)}</h1>
+      <p class="muted">Reine Vorschau (GET, bucht nichts). Eine Buchung erfolgt ausschließlich über "Bestätigen" unten (POST).</p>
+      <table>
+        <tr><th>Neu zu buchendes Zinsdelta</th><td><strong>{eur(vorschau.neue_zinsen_delta_cent)}</strong></td></tr>
+      </table>
+      {gebuehr_hinweis}
+      <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/manueller-mahnversand/{row_id}/buchung/bestaetigen">
+        {csrf_feld(session.csrf_token)}
+        <button type="submit">Jetzt buchen</button>
+      </form>
+      <p><a href="{rueck_href}">&larr; zurück</a></p>
+    </div>"""
+    return _layout(request, session, "Manualimport-Buchung", inhalt)
+
+
+@router.post("/vertrag/{vertrag_id}/manueller-mahnversand/{row_id}/buchung/bestaetigen")
+def manueller_mahnversand_buchung_bestaetigen(
+    request: Request, vertrag_id: str, row_id: int, csrf_token: str = Form(...), session=Depends(_current_session),
+):
+    _verify_csrf(session, csrf_token)
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    rueck_href = f"/backoffice/vertrag/{vertrag_id}/manueller-mahnversand"
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Manualimport", "Vertrag nicht verfügbar.", "/backoffice/vertraege")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    try:
+        ledger = deps._hv_mail.manueller_mahnversand_service.bestaetige_buchung(
+            ctx=_ctx(session), row_id=row_id, heute=date.today(), akteur=session.user_id,
+        )
+        if ledger is not None:
+            deps._audit_service.log(
+                entity_typ="manueller_mahnversand", entity_id=str(row_id), akteur=session.user_id,
+                aktion="BUCHUNG_BESTAETIGT", payload={"vertrag_id": vertrag_id, "mahnkosten_buchung_id": ledger.id},
+            )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Manualimport", str(exc), rueck_href)
+    return RedirectResponse(url=rueck_href, status_code=303)
 
 
 @router.post("/mahnfall/{mahnfall_id}/sendebereitschaft", response_class=HTMLResponse)

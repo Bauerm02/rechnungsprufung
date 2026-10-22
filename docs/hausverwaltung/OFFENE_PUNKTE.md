@@ -7573,3 +7573,258 @@ Retry nach Freigabe) + mehrere ersetzte/ergänzte Mahntexte-Tests
 (§30-TEIL, Mitmieter-Hinweis, Zugangsdatum). Ausschließlich
 synthetische Testdaten, keine echten Sendungen/Produktivbuchungen,
 kein Deployment.
+
+## Korrekturrunde nach unabhängiger Rückprüfung von Commit edb0417 (Codex, 22.10.2026)
+
+Codex hat `edb0417` unabhängig, geschützt und OHNE Netzwerk/Produktivdaten
+geprüft und sechs konkrete, reproduzierte Fehler plus vier zusätzliche
+Quellenbefunde gemeldet ("4 grün, 6 echte rote Outcome-Fälle"). Während
+der Korrektur trafen zwei weitere, unabhängig bestätigte Befunde ein
+(Spaltenköpfe im kanonischen PDF, ein isolierter Belegidentitäts-Repro zu
+Fix2/3 mit identischen Bytes und nur geänderter Stufe). Alle Punkte sind
+in dieser Runde behoben, mit gezielten Regressionstests gegen genau die
+beschriebenen Szenarien - der Rest wurde bewusst NICHT ausgeweitet.
+
+### 1. Zinsabrechnung: zwei echte Termine derselben Forderungsgruppe kollidierten (behoben)
+
+`buche_zinsabrechnung`s Buchungsschlüssel war rein forderungsgruppen-
+basiert - ein zweiter, genuin späterer Abrechnungstermin (z. B. Tag 21
+nach Tag 11) für dieselbe Forderungsgruppe löste fälschlich einen
+Konflikt/eine stillschweigende Kollision mit der ersten Buchung aus statt
+eine eigene, zusätzliche Zinsbuchung zu erzeugen. Behoben über einen
+periodenscharfen `mahnlauf_schluessel_override`
+(Forderungsgruppe+`zins_bis`+bereits gebuchte Zinshistorie) - ein echter
+Folgetermin bucht jetzt zusätzlich, ein exakter Retry desselben Termins
+bleibt weiterhin idempotent (`None`).
+
+### 2. Manualimport: zwei echte, unterschiedliche Schreiben derselben Forderungsgruppe kollidierten (behoben)
+
+Zwei tatsächlich verschiedene manuelle Mahnschreiben (unterschiedliches
+Datum/Dokument) für dieselbe Forderungsgruppe/Stufe erhielten denselben
+generischen, forderungsgruppenbasierten Buchungsschlüssel - der zweite,
+unabhängig freigegebene Import scheiterte dadurch an der Buchung des
+ersten. Jeder Beleg bekommt jetzt über denselben
+`mahnlauf_schluessel_override`-Mechanismus eine EIGENE, an seinen
+`idempotenz_schluessel` gebundene Buchungsidentität.
+
+### 3. Nachbuchung belastete denselben Beleg zweimal über verschiedene Freigabe-IDs (schwerwiegendster Fund, behoben)
+
+Ein bereits mit 20 EUR Pauschale gebuchtes manuelles Schreiben wurde nach
+einer Teilzahlung und einer ZWEITEN, unabhängigen Mahnpauschale-Freigabe
+(andere Freigabe-ID, andere Kapitalbasis) über `nachbuche_fuer_vertrag_
+stufe` ein zweites Mal belastet (4000 statt 2000 Cent) - die Idempotenz
+war fälschlich an die auslösende Freigabe-ID statt an den konkreten Beleg
+gebunden. Neues additives Feld `pauschale_abgegolten` auf
+`ManuellerMahnversandTable` (einmal `True`, nie zurückgesetzt) erzwingt
+jetzt "genau eine Gebühr je ursprünglichem Schreiben, unabhängig von
+Freigabe-ID/Teilzahlung/Retry".
+
+### 4. `journal_als_text` zeigte nur die generische Buchungsart, nicht den Belegbezug (behoben)
+
+Der in E-Mails eingebettete Text-Kontoauszug zeigte je Zeile nur
+"Miete/Vorschreibung" + Datum, nie die tatsächliche Belegreferenz/
+Periodenbeschreibung (z. B. eine konkrete Belegnummer) - das war eine
+stille Kürzung gegenüber der HTML-/PDF-Ansicht. Zeigt jetzt zusätzlich
+`beleg_referenz`/`forderungsbezug` je Zeile, identisch zur gemeinsamen
+Journal-Quelle.
+
+### 5. `haenge_kontoauszug_pdf_an` schluckte jeden Fehler und versandte ohne Pflichtbeilage (behoben)
+
+Ein defekter Kontoauszug-PDF-Anhang führte bisher dazu, dass die Funktion
+JEDE Ausnahme abfing und den Brief unverändert OHNE die Pflichtbeilage
+zurückgab - ein scheinbar erfolgreicher, aber unvollständiger Versand.
+Jetzt fail-closed: jeder Fehler wird als `ValueError` weitergereicht, VOR
+jedem Providerkontakt (Archivierung/SFTP) in `_sende_brief` - kein
+Versand, keine Gebühr ohne Pflichtbeilage. Kein echter Sendetest
+durchgeführt (wie von Codex ausdrücklich vorgegeben) - reine
+Code-/Regressionsprüfung.
+
+### 6. Manualimport ohne Kosten-Freigabe war auf dem Kontoblatt unsichtbar (behoben)
+
+Ein bereits erfasster, aber noch nicht kostenfreigegebener Manualimport
+(`pauschale_abgegolten=False`, 0 EUR gebucht) erschien NIRGENDS auf dem
+gemeinsamen Kontoblatt - `erstelle_kontoblatt`/`lade_kontoblatt` kannten
+`ManuellerMahnversandTable` bisher gar nicht. Neues Feld `Kontoblatt.
+ausstehende_manuelle_mahnversand` (additiv, Default leer) zeigt diese
+Belege jetzt in HTML (`kontoblatt_render.py`), PDF
+(`kontoauszug_pdf.py`) und Mieterakte als "in Prüfung, noch nicht
+gebucht" - keine erfundene 0,00-EUR-Summe.
+
+### Zusätzliche Quellenbefunde (mitbehoben, bewusst nicht weiter ausgebaut)
+
+- **FixA:** das Doppelversand-Gate in `plane_mahnlauf` blockierte bisher
+  PAUSCHAL die gesamte (Vertrag, Stufe) für immer, sobald irgendein
+  Manualimport existierte - auch eine völlig neue, später erst fällige
+  Forderung derselben Stufe wäre dadurch nie mehr automatisch geplant
+  worden. Unabhängig nochmals bestätigt ("Folgemonat-Gate": Januar-
+  forderung voll bezahlt, neue Februarforderung wurde fälschlich
+  geblockt). Jetzt blockiert nur noch die konkret durch einen
+  Manualimport abgedeckte `forderung_op_position_id`, jede andere
+  Forderung derselben Stufe bleibt normal mahnbar.
+- **FixB:** `importieren(..., sofort_buchen=False)` ist jetzt Standard -
+  ein reiner Nachweisimport bucht KEINE automatische historische
+  Zinsbuchung mehr; die tatsächliche Buchung läuft über ein separates,
+  explizites Preview-/Bestätigen-Paar (`vorschau_fuer_bestehenden_
+  import`/`bestaetige_buchung`, neue Backoffice-Routen GET/POST
+  `.../manueller-mahnversand/{row_id}/buchung[/bestaetigen]`),
+  `sofort_buchen=True` bleibt als Kompatibilitätspfad erhalten.
+- **Fix8 (isolierter Nachmeldung während dieser Runde):** ein
+  byteidentischer Originalnachweis (identischer Beleg-Hash/Forderungs-
+  bindung/Versanddatum/Kanal) mit NUR geänderter Stufe erzeugte bisher
+  eine zweite Manualimport-Zeile und damit eine zweite, unabhängige
+  Gebührenbasis für DASSELBE Schreiben. `berechne_idempotenz_schluessel`
+  verwendet `stufe` jetzt bewusst NICHT mehr als Identitätsmerkmal; ein
+  identischer Nachweis mit abweichender Stufe wird explizit als Konflikt
+  (`VorgangIdKonfliktError`) abgelehnt, nie stillschweigend als zweiter
+  Datensatz übernommen.
+- **Fix7 (während dieser Runde zusätzlich gemeldet, Sichtprüfung des
+  kanonischen PDFs):** zwei Beträge standen nebeneinander ohne
+  Kennzeichnung, welcher der Buchungsbetrag und welcher der laufende
+  Saldo ist. Das Journal im PDF-Kontoauszug zeigt jetzt explizite
+  Spaltenköpfe ("Datum"/"Buchung"/"Betrag (+Soll,-Haben)"/"Saldo"), vor
+  dem Journal und nach jedem Seitenumbruch innerhalb des Journals
+  wiederholt - kein neues separates Blatt, Logo/mehrseitiges Layout
+  unverändert.
+
+### Geänderte/neue Dateien (diese Korrekturrunde)
+
+Geändert: `src/mietinkasso/mahnwesen/kosten_service.py` (Fix1),
+`src/mietinkasso/mahnwesen/manueller_mahnversand_service.py` (Fix2/3/B),
+`src/mietinkasso/mahnwesen/manueller_mahnversand_repository.py`
+(Fix2/8, `vorhanden_fuer_stufe` entfernt, `forderung_ids_bereits_
+manuell_versendet` ergänzt), `src/mietinkasso/infrastructure/db/
+tables.py` (`pauschale_abgegolten`-Spalte, additiv), `src/mietinkasso/
+mahnwesen/service.py` (FixA), `src/mietinkasso/mahnwesen/
+kontoauszug_anhang.py` (Fix4/5), `src/mietinkasso/op/kontoblatt.py`
+(Fix6: `ausstehende_manuelle_mahnversand`), `src/mietinkasso/op/
+kontoauszug_pdf.py` (Fix6/7), `src/mietinkasso/backoffice/
+kontoblatt_render.py` (Fix6), `src/mietinkasso/backoffice/routes/
+mahnwesen.py` (neue Preview-/Bestätigen-Routen, `sofort_buchen`-
+Checkbox), `src/mietinkasso/backoffice/routes/konten.py`,
+`src/mietinkasso/backoffice/routes/vertragsanlage.py`, `src/mietinkasso/
+indexautomatik/mailversand_service.py` (alle drei: `manueller_
+mahnversand_repo` an `lade_kontoblatt` durchgereicht), `tests/
+mietinkasso/fixtures/backoffice_http_contract.json` (zwei neue Routen
+additiv ergänzt, keine bestehende Route verändert).
+
+Neu: `tests/mietinkasso/test_kontoauszug_anhang.py` (Fix4/5),
+`tests/mietinkasso/test_kontoblatt_manueller_mahnversand.py` (Fix6).
+
+### Tests (diese Korrekturrunde)
+
+Gesamtsuite `tests/mietinkasso` grün (1720 Tests). Neue/geänderte
+gezielte Tests: 1 Zinsabrechnung-Periodentest (Fix1), mehrere
+Manualimport-Tests für eigene Buchungsidentität/Nachbuchungs-Einmaligkeit/
+Stufen-Konflikt (Fix2/3/8), 2 neue Tests für Belegbezug/Fail-closed
+(Fix4/5), 3 neue Tests für sichtbare ausstehende Manualimport-Kosten in
+HTML/PDF (Fix6), 2 neue Tests für PDF-Spaltenköpfe inkl. Wiederholung
+nach Seitenumbruch (Fix7), 1 Test für das verfeinerte Doppelversand-Gate
+(FixA). Ausschließlich synthetische Testdaten, keine echten Sendungen/
+Produktivbuchungen, kein Deployment, `SEND_ENABLED=false` unverändert.
+Produktion bleibt unverändert bei Commit `54f8f59`.
+
+## Nachtrag Markus 22.10.2026: zwei bereits beauftragte Punkte vor Commit nachgeholt + ein weiterer Paket-Test-Fund
+
+Vor dem finalen Commit dieser Runde hat Markus auf zwei bereits
+beauftragte, in der obigen Korrekturrunde noch nicht erledigte Punkte
+hingewiesen, sowie einen weiteren konkreten Paket-Test-Fund zu Fix5
+gemeldet. Alle drei sind gezielt behoben, ohne weiteren Ausbau.
+
+### (a) `zinsabrechnung_bestaetigen` fehlte `require_schreibrecht` (behoben, GEZIELT nur diese Route)
+
+Die POST-Route `/vertrag/{vertrag_id}/zinsabrechnung/bestaetigen`
+(`backoffice/routes/konten.py`) ist eine tatsächliche Buchungsstelle
+(bucht das Zinsdelta), prüfte bisher aber NUR `require_gesellschaft_
+access`, nicht `require_schreibrecht` - dieselbe Lücke, die an anderer
+Stelle bereits als "kein neues Altproblem fortschreiben" behandelt wird
+(vgl. `manueller_mahnversand_service.py::bestaetige_buchung`). Jetzt
+ergänzt, ausdrücklich NUR für diese eine Route, keine Sanierung aller
+Altrouten. Regressionstest: `tests/mietinkasso/test_backoffice.py::
+test_zinsabrechnung_bestaetigen_lehnt_fehlendes_schreibrecht_ab`
+(simuliert einen Lesezugriff-Nutzer derselben Gesellschaft über denselben
+`_ctx`-Monkeypatch-Mechanismus wie der bereits bestehende
+Gesellschaftszugriffs-Test).
+
+### (b) Kostenfreigabe/Nachbuchung erreichte einen konkreten Manualimport-Beleg nicht mehr, sobald eine neue Forderung hinzukam (behoben, schwerwiegendster Nachtrags-Fund)
+
+Das allgemeine Mahnpauschale-Freigabeformular
+(`/vertrag/{vertrag_id}/mahnpauschale-freigabe`) berechnete den
+Forderungsgruppe-Schlüssel bisher IMMER aus der AKTUELLEN Gesamtgruppe
+aller gerade offenen Forderungen von (vertrag_id, stufe). Ist seit einem
+konkreten Manualimport-Beleg zusätzlich eine neue Monatsforderung
+derselben Stufe hinzugekommen, erzeugt das einen ANDEREN Schlüssel als
+den des Belegs selbst - `nachbuche_fuer_vertrag_stufe`s Abgleich (vgl.
+Punkt 3 oben) findet die Freigabe für den alten Beleg dann NIE mehr,
+dessen Kosten bleiben still unbepauschalt. Ein rein allgemeines
+Freigabeformular erfüllt den Auftrag aus Punkt 3 damit NICHT.
+
+Behoben über einen neuen optionalen Parameter `fuer_manualimport_row_id`
+auf GET/POST `/vertrag/{vertrag_id}/mahnpauschale-freigabe[/erfassen]`:
+ist er gesetzt, bindet die Freigabe serverseitig NEU geladen (nie das
+Client-Feld als Wahrheit behandelt) an GENAU die eingefrorenen
+`forderung_op_position_ids` DIESES konkreten Belegs - Stufe wird dabei
+verbindlich vom Beleg selbst übernommen, nie vom `stufe`-Formularfeld.
+Der Schlüssel wird direkt aus diesen eingefrorenen Ids gebildet (nicht
+aus der ggf. durch Tilgung/neue Forderungen abweichenden `vorschau.
+forderung_op_position_ids`), identisch zu `nachbuche_fuer_vertrag_
+stufe`s eigener Berechnung - beide bilden damit garantiert denselben
+Schlüssel. Ein neuer "Kostenfreigabe für diesen Beleg"-Link erscheint in
+der Manualimport-Liste (`_manueller_mahnversand_zeile_html`) für jede
+Zeile mit `pauschale_abgegolten=False`, unabhängig davon, ob bereits ein
+reines Zinsdelta gebucht wurde.
+
+Regressionstest: `tests/mietinkasso/test_backoffice.py::
+test_mahnpauschale_freigabe_fuer_konkreten_manualimport_beleg_bucht_
+trotz_neuer_forderung_nach` - importiert einen Beleg für eine Forderung,
+bucht danach eine GENUIN neue, andere Forderung derselben Stufe (ohne
+Manualimport), freigibt über `fuer_manualimport_row_id` und prüft, dass
+GENAU der alte Beleg tatsächlich nachgebucht wird (`pauschale_
+abgegolten` wird `True`). Gegenprobe durchgeführt: mit dem alten,
+generischen Schlüsselpfad schlägt dieser Test nachweislich fehl
+(`pauschale_abgegolten` bleibt `False`).
+
+### Konkreter Paket-Test zu Fix5: später nachgesendeter Mitmieter-Brief enthielt keinen Kontoauszug (behoben)
+
+Unabhängiger Paket-Test gegen die TATSÄCHLICH im Fake-SFTP übertragenen
+Bytes (nicht nur gegen den Merge-Helfer isoliert): eine Mitmieterin,
+deren Brief beim Erstversand NIE archiviert werden konnte (Fehlschlag
+VOR dem ersten Archivierungsversuch) und über `nachsenden_
+einzelempfaenger` nachträglich am Folgetag nachgesendet wird, bekam ein
+GESENDET-Ergebnis mit einem nur 1-seitigen PDF OHNE den kanonischen
+Kontoauszug/chronologisches Journal - anders als der Erstversand-
+Hauptbrief (`_sende_brief`). `_nachsenden_brief`
+(`indexautomatik/mailversand_service.py`) baut das späte Einzelempfänger-
+PDF jetzt mit DERSELBEN generischen `lade_kontoblatt`-Quelle/demselben
+Konto wie der Erstversand zusammen und hängt den Kontoauszug GENAUSO
+über `haenge_kontoauszug_pdf_an` an - fail-closed (Fix5) bleibt dabei
+identisch: ein defekter Anhang blockiert VOR jedem Archivierungs-/
+SFTP-Kontakt, exakt wie beim Erstversand. Bereits geprüfte SEND-/Bank-/
+Retry-Gates bleiben unverändert.
+
+Regressionstests (`tests/mietinkasso/test_hv_mailversand.py`):
+- `test_nachsendung_brief_enthaelt_kanonischen_kontoauszug_in_
+  tatsaechlich_uebertragenen_bytes` - prüft die ECHTEN, im
+  `fake_verbindung.geschriebene_dateien` angekommenen Bytes (mehr als 1
+  Seite, enthält "Kontoblatt"/"chronologisches Journal").
+- `test_nachsendung_brief_defekter_kontoauszug_blockiert_vor_
+  archivierung_und_sftp` - ein über `monkeypatch` defekt gemachter
+  Kontoauszug blockiert `ValueError`, VOR jeder Archivierung/jedem
+  SFTP-Kontakt (keine neuen Dateien im Fake-SFTP, Eintrag bleibt
+  unarchiviert).
+
+### Geänderte/neue Dateien (dieser Nachtrag)
+
+Geändert: `src/mietinkasso/backoffice/routes/konten.py` (require_
+schreibrecht), `src/mietinkasso/backoffice/routes/mahnwesen.py`
+(`fuer_manualimport_row_id` GET/POST + Listen-Link), `src/mietinkasso/
+indexautomatik/mailversand_service.py` (`_nachsenden_brief` Kontoauszug-
+Anhang). Tests ergänzt in `tests/mietinkasso/test_backoffice.py` und
+`tests/mietinkasso/test_hv_mailversand.py`.
+
+### Tests (dieser Nachtrag)
+
+Gesamtsuite `tests/mietinkasso` grün. Drei neue, gezielte Regressions-
+tests (siehe oben) plus Gegenprobe-Verifikation (Test schlägt ohne die
+jeweilige Fix-Änderung nachweislich fehl). Ausschließlich synthetische
+Testdaten, kein echter Netzkontakt, `SEND_ENABLED=false` unverändert.
+Produktion bleibt unverändert bei Commit `54f8f59`.

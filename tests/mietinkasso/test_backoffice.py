@@ -6788,6 +6788,106 @@ def test_kontoauszug_html_und_pdf_lehnen_fremdes_konto_ohne_gesellschaftszugriff
         client.get(f"/backoffice/konto/{konto_id}/kontoauszug.pdf")
 
 
+def test_zinsabrechnung_bestaetigen_lehnt_fehlendes_schreibrecht_ab(backoffice_client, monkeypatch):
+    """Nachtrag Markus 22.10.2026 (gezielt NUR diese Route, keine
+    Sanierung aller Altrouten): `zinsabrechnung_bestaetigen` ist eine
+    tatsächliche Buchungsstelle (bucht das Zinsdelta), prüfte bisher aber
+    NUR `require_gesellschaft_access`, nicht `require_schreibrecht` -
+    dieselbe Lücke, die an anderer Stelle bereits als "kein neues
+    Altproblem fortschreiben" behoben wurde (vgl. `manueller_
+    mahnversand_service.py::bestaetige_buchung`). Simuliert einen
+    Lesezugriff-Nutzer DERSELBEN Gesellschaft (damit `require_
+    gesellschaft_access` durchläuft und GENAU `require_schreibrecht`
+    isoliert geprüft wird) über denselben `_ctx`-Monkeypatch-Mechanismus
+    wie oben."""
+
+    import mietinkasso.backoffice.routes.konten as konten_modul
+    from mietinkasso.auth.service import AuthContext
+    from mietinkasso.domain.enums import Rolle
+    from mietinkasso.domain.exceptions import CrossTenantError
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    lese_ctx = AuthContext(user_id="nur-lesen", rolle=Rolle.LESEZUGRIFF, gesellschaft_ids=frozenset({"7DI"}))
+    monkeypatch.setattr(konten_modul, "_ctx", lambda session: lese_ctx)
+
+    with pytest.raises(CrossTenantError):
+        client.post("/backoffice/vertrag/V-601-1/zinsabrechnung/bestaetigen", data={"csrf_token": csrf})
+
+
+def test_mahnpauschale_freigabe_fuer_konkreten_manualimport_beleg_bucht_trotz_neuer_forderung_nach(backoffice_client):
+    """Nachtrag Markus 22.10.2026 (gezielt, kein zusätzlicher Ausbau):
+    ein Manualimport-Beleg deckt EINE eingefrorene Forderung einer Stufe
+    ab; DANACH entsteht eine genuin NEUE, andere Forderung derselben
+    Stufe (z. B. der nächste Monat). Das ALLGEMEINE Freigabeformular
+    würde jetzt die AKTUELLE Gesamtgruppe (beide Forderungen) freigeben -
+    ein anderer Forderungsgruppe-Schlüssel als der des ursprünglichen
+    Belegs, wodurch `nachbuche_fuer_vertrag_stufe` den alten Beleg NIE
+    mehr findet und seine Kosten still unbepauschalt blieben. Über
+    `fuer_manualimport_row_id` bindet die Freigabe stattdessen an GENAU
+    die eingefrorene Forderung des Belegs und bucht sie tatsächlich nach."""
+
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    client, *_ = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("MANUALFREIGABE")
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+
+    alte_forderung = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=100_000,
+        belegdatum=date(2020, 1, 1), buchungsdatum=date(2020, 1, 1), faelligkeit=date(2020, 1, 5),
+        beleg_referenz="HMZ Jänner (bereits manuell gemahnt)",
+    )
+    row = backoffice_deps._hv_mail.manueller_mahnversand_service.importieren(
+        ctx=_ctx_admin(), vertrag_id=vertrag.id, stufe=1, forderung_op_position_ids=[alte_forderung.id],
+        versanddatum=date(2020, 1, 20), kanal="PERSOENLICH", empfaenger_name="Max Mustermieter",
+        empfaenger_adresse="persönlich übergeben", beleg_referenz="Uebergabe-Jaenner",
+        beleg_pdf_bytes=_echter_beleg_pdf("Uebergabe Jaenner"), erfasst_von="codex-test",
+    )
+    assert row.pauschale_abgegolten is False
+
+    # Genuin NEUE, andere Forderung derselben Stufe (z. B. Februar) -
+    # entstanden NACH dem Manualimport, NICHT Teil seiner eingefrorenen Menge.
+    op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=100_000,
+        belegdatum=date(2020, 2, 1), buchungsdatum=date(2020, 2, 1), faelligkeit=date(2020, 2, 5),
+        beleg_referenz="HMZ Februar (neu, noch nicht manuell gemahnt)",
+    )
+
+    vorschau_seite = client.get(
+        f"/backoffice/vertrag/{vertrag.id}/mahnpauschale-freigabe", params={"fuer_manualimport_row_id": row.id},
+    )
+    assert vorschau_seite.status_code == 200
+    assert "1 Forderung(en)" in vorschau_seite.text  # NICHT 2 - nur die eingefrorene Jänner-Forderung
+
+    antwort = client.post(
+        f"/backoffice/vertrag/{vertrag.id}/mahnpauschale-freigabe/erfassen",
+        data={
+            "csrf_token": csrf, "fuer_manualimport_row_id": str(row.id),
+            "betrag_cent": "20,00", "erforderlichkeit_begruendung": "Begründung",
+            "tatsaechlicher_aufwand_cent": "20,00", "tatsaechlicher_aufwand_beleg": "Beleg",
+            "schuldhaftigkeit_begruendung": "Begründung", "verhaeltnismaessigkeit_begruendung": "Begründung",
+        },
+        follow_redirects=False,
+    )
+    assert antwort.status_code == 303
+
+    row_danach = backoffice_deps._hv_mail.manueller_mahnversand_repo.get(row.id)
+    assert row_danach.pauschale_abgegolten is True
+    assert row_danach.mahnkosten_buchung_id is not None
+
+
 def test_kontoauszug_pdf_ist_reiner_get_ohne_datenbankaenderung(backoffice_client):
     """Erforderliche Regression: reiner GET/PDF ändert keine DB/kein
     Audit/kein Versand."""

@@ -10,7 +10,13 @@ from datetime import date, datetime, timezone
 import pytest
 from pypdf import PdfReader
 
-from mietinkasso.infrastructure.db.tables import MahnkostenBuchungTable, MahnLaufTable, OPPositionTable, RuecklastschriftkostenTable
+from mietinkasso.infrastructure.db.tables import (
+    ManuellerMahnversandTable,
+    MahnkostenBuchungTable,
+    MahnLaufTable,
+    OPPositionTable,
+    RuecklastschriftkostenTable,
+)
 from mietinkasso.mahnwesen.brief_pdf import Absender
 from mietinkasso.op.kontoauszug_pdf import erzeuge_kontoauszug_pdf
 from mietinkasso.op.kontoblatt import (
@@ -500,3 +506,70 @@ def test_pdf_kopf_reserviert_genug_hoehe_fuer_quadratisches_produktionslogo(tmp_
         assert im_logo_bereich == [], (
             f"Textinhalt überlappt das tatsächliche 32×32-mm-Logo-Rechteck: {im_logo_bereich}"
         )
+
+
+def test_journal_hat_spaltenkoepfe_datum_buchung_betrag_saldo():
+    """Fix7 (unabhängige Rückprüfung Codex 22.10.2026, Sichtprüfung des
+    kanonischen PDFs): zwei Beträge standen nebeneinander ohne
+    Kennzeichnung, welcher der Buchungsbetrag und welcher der laufende
+    Saldo ist - jetzt mit expliziten Spaltenköpfen."""
+
+    kontoblatt = _leeres_kontoblatt(
+        hauptforderung_zeilen=[KontoblattZeile(position=_op(1, "EROEFFNUNG", 100_000), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=None)],
+        hauptforderung_cent=100_000, saldo_cent=100_000, faelliger_unstrittiger_rest_cent=100_000,
+    )
+    pdf_bytes = _erzeugen(kontoblatt)
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = reader.pages[0].extract_text()
+    assert "Datum" in text
+    assert "Buchung" in text
+    assert "Betrag" in text
+    assert "Saldo" in text
+
+
+def test_journal_spaltenkoepfe_wiederholen_sich_auf_folgeseite():
+    """Fix7: 'bei Fortsetzung sinnvoll wiederholen' - ein mehrseitiges
+    Journal zeigt die Spaltenköpfe auf JEDER Seite, nicht nur auf der
+    ersten."""
+
+    viele_zeilen = [
+        KontoblattZeile(position=_op(i, "SOLL", 1000 * i, referenz=f"Position {i:03d}"), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=1000 * i)
+        for i in range(1, 60)
+    ]
+    gesamtsumme = sum(z.position.betrag_cent for z in viele_zeilen)
+    kontoblatt = _leeres_kontoblatt(
+        hauptforderung_zeilen=viele_zeilen, hauptforderung_cent=gesamtsumme,
+        saldo_cent=gesamtsumme, faelliger_unstrittiger_rest_cent=gesamtsumme,
+    )
+    pdf_bytes = _erzeugen(kontoblatt)
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    assert len(reader.pages) > 1, "Der Test braucht tatsächlich eine Folgeseite."
+    for seite in reader.pages[1:]:
+        text = seite.extract_text()
+        assert "Datum" in text and "Buchung" in text and "Saldo" in text
+
+
+def _manualimport_zeile(*, id: int, beleg_referenz: str = "SYNRENT-1") -> ManuellerMahnversandTable:
+    from datetime import date as _date
+
+    return ManuellerMahnversandTable(
+        id=id, vertrag_id="V-601-1", stufe=1, forderung_op_position_ids_json="[1]",
+        versanddatum=_date(2026, 3, 1), kanal="BRIEF", empfaenger_name="Max Mustermieter",
+        empfaenger_adresse="Musterstraße 1\n1010 Wien", beleg_referenz=beleg_referenz,
+        beleg_pdf_bytes=b"", beleg_sha256="abc", idempotenz_schluessel=f"KEY-{id}",
+        erfasst_von="codex-test", mahnkosten_buchung_id=None, pauschale_abgegolten=False,
+    )
+
+
+def test_pdf_zeigt_ausstehenden_manualimport_fix6():
+    """Fix6: ein Manualimport OHNE Kosten-Freigabe erschien bisher
+    NIRGENDS auf dem PDF-Kontoauszug."""
+
+    kontoblatt = _leeres_kontoblatt(
+        ausstehende_manuelle_mahnversand=[_manualimport_zeile(id=1, beleg_referenz="SYNRENT-MAHNUNG-XY")],
+    )
+    pdf_bytes = _erzeugen(kontoblatt)
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = "".join(p.extract_text() for p in reader.pages)
+    assert "SYNRENT-MAHNUNG-XY" in text
+    assert "noch nicht gebucht" in text

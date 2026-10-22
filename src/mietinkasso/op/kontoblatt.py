@@ -122,6 +122,7 @@ from datetime import date
 
 from mietinkasso.domain.enums import OPTyp
 from mietinkasso.infrastructure.db.tables import (
+    ManuellerMahnversandTable,
     MahnkostenBuchungTable,
     MahnLaufTable,
     OPPositionTable,
@@ -313,6 +314,17 @@ class Kontoblatt:
     #: zeigt, nachdem die bisherige, redundante rohe OP-Tabelle
     #: (`konten.py::op_tabelle`) entfällt.
     hauptforderung_historie: list[KontoblattZeile] = field(default_factory=list)
+    #: Additiv ergänzt (unabhängige Rückprüfung Codex 22.10.2026, Fix6,
+    #: echter Bug): ein Manualimport OHNE Kosten-Freigabe (`pauschale_
+    #: abgegolten=False`, also bislang 0 EUR gebucht) erschien bisher
+    #: NIRGENDS auf dem gemeinsamen Kontoblatt - weder HTML noch PDF noch
+    #: Mieterakte luden überhaupt `ManuellerMahnversandTable`-Zeilen.
+    #: Zeigt hier dieselben, bereits dokumentierten Belege (Stufe/Datum/
+    #: Kanal/Belegreferenz) als "in Prüfung, noch nicht gebucht" - KEINE
+    #: erfundene 0,00-EUR-Summe, nur die reale Existenz des noch
+    #: ungebuchten Vorgangs. Default leer, damit bestehende direkte
+    #: `Kontoblatt(...)`-Konstruktionen in Tests unverändert weiterlaufen.
+    ausstehende_manuelle_mahnversand: list[ManuellerMahnversandTable] = field(default_factory=list)
 
 
 def _buchungs_id_kategorie(buchungen: list[MahnkostenBuchungTable]) -> dict[int, str]:
@@ -496,6 +508,7 @@ def erstelle_kontoblatt(
     positionen_aktiv: list[OPPositionTable], positionen_alle: list[OPPositionTable],
     offene_forderungen_rest_je_id: dict[int, int], mahnkosten_buchungen: list[MahnkostenBuchungTable],
     ruecklastschriftkosten_zeilen: list[RuecklastschriftkostenTable], mahnlaeufe: list[MahnLaufTable],
+    manuelle_mahnversand_zeilen: list[ManuellerMahnversandTable] = (),
 ) -> Kontoblatt:
     """Reine Funktion - bekommt alle Daten bereits geladen übergeben
     (siehe `lade_kontoblatt` unten für den I/O-Teil), keine eigene
@@ -624,6 +637,13 @@ def erstelle_kontoblatt(
         m for m in mahnlaeufe
         if m.mahnkosten_verarbeitet_am is None and m.status not in _MAHNLAUF_STATUS_ENDGUELTIG_OHNE_KOSTEN
     ]
+    # Fix6 (unabhängige Rückprüfung Codex 22.10.2026): ein Manualimport,
+    # dessen Kostenfreigabe noch aussteht, bleibt `pauschale_abgegolten=
+    # False` - genau das ist "noch nicht gebucht, in Prüfung" (siehe
+    # `ManuellerMahnversandTable`-Moduldoc). Eine bereits abgegoltene
+    # Zeile ist bereits über ihre eigene OP-/Ledgerzeile in `kosten_
+    # zeilen` sichtbar und erscheint hier bewusst NICHT noch einmal.
+    ausstehende_manuelle_mahnversand = [z for z in manuelle_mahnversand_zeilen if not z.pauschale_abgegolten]
 
     return Kontoblatt(
         konto_id=konto_id, saldo_cent=saldo_cent, faelliger_unstrittiger_rest_cent=faelliger_unstrittiger_rest_cent,
@@ -634,6 +654,7 @@ def erstelle_kontoblatt(
         zahlungen_zeilen=zahlungen_zeilen, zahlungen_saldo_cent=zahlungen_saldo_cent,
         dokumentierte_bankaufwaende=dokumentierte_bankaufwaende, ausstehende_mahnlaeufe=ausstehende_mahnlaeufe,
         hauptforderung_historie=hauptforderung_historie,
+        ausstehende_manuelle_mahnversand=ausstehende_manuelle_mahnversand,
     )
 
 
@@ -757,12 +778,19 @@ def erstelle_journal(kontoblatt: Kontoblatt) -> list[JournalZeile]:
 
 def lade_kontoblatt(
     *, konto_id: str, vertrag_id: str, op_service, mahnkosten_repo, ruecklastschriftkosten_repo, mahnlauf_repo,
+    manueller_mahnversand_repo=None,
 ) -> Kontoblatt:
     """I/O-Teil: lädt exakt die bereits etablierten Repositories/Services
     (keine neue Query-Logik abseits der additiven `liste_fuer_vertrag`/
     `liste_buchungen_fuer_vertrag`-Lesemethoden) und ruft dann
     `erstelle_kontoblatt` auf. Gemeinsam verwendet von `backoffice/
-    routes/konten.py::kontoauszug`/`kontoauszug_pdf`."""
+    routes/konten.py::kontoauszug`/`kontoauszug_pdf`.
+
+    `manueller_mahnversand_repo` ist bewusst OPTIONAL (Default `None`,
+    Fix6) - nicht jeder bestehende Aufrufer hat dieses Repository bereits
+    verdrahtet; ohne Repository bleibt `ausstehende_manuelle_mahnversand`
+    einfach leer, statt mit einem Pflicht-Parameter alle Call-Sites auf
+    einmal zu brechen."""
 
     saldo = op_service.berechne_saldo(konto_id)
     positionen_alle = op_service.list_alle_positionen(konto_id)
@@ -770,10 +798,14 @@ def lade_kontoblatt(
     mahnkosten_buchungen = mahnkosten_repo.liste_buchungen_fuer_vertrag(vertrag_id)
     ruecklastschriftkosten_zeilen = ruecklastschriftkosten_repo.liste_fuer_vertrag(vertrag_id)
     mahnlaeufe = mahnlauf_repo.list_fuer_vertrag(vertrag_id)
+    manuelle_mahnversand_zeilen = (
+        manueller_mahnversand_repo.list_fuer_vertrag(vertrag_id) if manueller_mahnversand_repo is not None else []
+    )
 
     return erstelle_kontoblatt(
         konto_id=konto_id, saldo_cent=saldo.saldo_cent, faelliger_unstrittiger_rest_cent=saldo.faelliger_unstrittiger_rest_cent,
         positionen_aktiv=saldo.positionen, positionen_alle=positionen_alle,
         offene_forderungen_rest_je_id=offene_forderungen_rest_je_id, mahnkosten_buchungen=mahnkosten_buchungen,
         ruecklastschriftkosten_zeilen=ruecklastschriftkosten_zeilen, mahnlaeufe=mahnlaeufe,
+        manuelle_mahnversand_zeilen=manuelle_mahnversand_zeilen,
     )

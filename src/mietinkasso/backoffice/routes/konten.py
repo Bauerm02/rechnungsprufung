@@ -14,7 +14,7 @@ from html import escape as h
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from mietinkasso.auth.service import require_gesellschaft_access
+from mietinkasso.auth.service import require_gesellschaft_access, require_schreibrecht
 from mietinkasso.backoffice.kontoblatt_render import render_kontoblatt_html
 from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, parse_eur_betrag, sperrgrund_label
 from mietinkasso.domain.enums import OPTyp
@@ -133,7 +133,7 @@ def kontoauszug(request: Request, konto_id: str, session=Depends(_current_sessio
         kontoblatt = lade_kontoblatt(
             konto_id=konto_id, vertrag_id=vertrag.id, op_service=deps._op_service,
             mahnkosten_repo=deps._hv_mail.mahnkosten_repo, ruecklastschriftkosten_repo=deps._ruecklastschriftkosten_repo,
-            mahnlauf_repo=deps._hv_mail.mahnlauf_repo,
+            mahnlauf_repo=deps._hv_mail.mahnlauf_repo, manueller_mahnversand_repo=deps._hv_mail.manueller_mahnversand_repo,
         )
         zinsabrechnung_link_html = f' &nbsp;|&nbsp; <a href="/backoffice/vertrag/{h(vertrag.id)}/zinsabrechnung">Zinsabrechnung</a>'
         kontoblatt_karte = render_kontoblatt_html(kontoblatt, konto_id=konto_id, zinsabrechnung_link_html=zinsabrechnung_link_html)
@@ -221,7 +221,7 @@ def kontoauszug_pdf(konto_id: str, session=Depends(_current_session)):
     kontoblatt = lade_kontoblatt(
         konto_id=konto_id, vertrag_id=vertrag.id, op_service=deps._op_service,
         mahnkosten_repo=deps._hv_mail.mahnkosten_repo, ruecklastschriftkosten_repo=deps._ruecklastschriftkosten_repo,
-        mahnlauf_repo=deps._hv_mail.mahnlauf_repo,
+        mahnlauf_repo=deps._hv_mail.mahnlauf_repo, manueller_mahnversand_repo=deps._hv_mail.manueller_mahnversand_repo,
     )
     absender = _BriefAbsender(
         name=deps._settings.brief_absender_name, adresse=deps._settings.brief_absender_adresse, fn=deps._settings.brief_absender_fn,
@@ -326,6 +326,13 @@ def zinsabrechnung_bestaetigen(
     if vertrag is None:
         return _fehlerseite(session, "Zinsabrechnung", f"Unbekannter Vertrag {vertrag_id}.")
     require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    # Nachtrag Markus 22.10.2026 (gezielt NUR diese Route, keine
+    # Sanierung aller Altrouten): dies ist eine tatsächliche
+    # Buchungsstelle (bucht das Zinsdelta) - `require_gesellschaft_
+    # access` allein prüft nur die Mandantengrenze, nicht das
+    # Schreibrecht selbst (vgl. `manueller_mahnversand_service.py::
+    # bestaetige_buchung`, dieselbe Kombination).
+    require_schreibrecht(_ctx(session))
     if _objekt_fuer_vertrag_gesperrt(vertrag_id):
         return _fehlerseite(session, "Zinsabrechnung", "Objekt ist von der Pilotphase ausgeschlossen - keine Zinsabrechnung.")
     konto = deps._stammdaten_repo.get_konto_by_vertrag(vertrag_id)

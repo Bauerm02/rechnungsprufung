@@ -882,18 +882,20 @@ class MahnwesenService:
         if bestehende_offene_gruppe is not None:
             return bestehende_offene_gruppe
 
-        # Auftrag HV-20261022-EIN-KONTOBLATT: liegt für (Vertrag, Stufe)
-        # bereits ein kontrolliert importierter Nachweis eines TATSÄCHLICH
-        # manuell (außerhalb dieses Systems) versendeten Mahnschreibens
-        # vor, wird HIER KEINE neue automatische Bündelung für dieselbe
-        # Stufe gebildet - das würde sonst einen echten Doppelversand für
-        # denselben (Vertrag, Stufe)-Vorgang erzeugen. Rein additiv (siehe
-        # `_manueller_mahnversand_repository`-Docstring): ändert KEINEN
-        # MahnFall-/Mahnlauf-Status, blockiert nur die NEUE Bündelung.
-        if self._manueller_mahnversand_repository is not None and self._manueller_mahnversand_repository.vorhanden_fuer_stufe(
-            vertrag_id=vertrag.id, stufe=stufe,
-        ):
-            return None
+        # Auftrag HV-20261022-EIN-KONTOBLATT, korrigiert nach unabhängiger
+        # Rückprüfung Codex 22.10.2026 (echter Bug): die ursprüngliche
+        # Fassung blockierte PAUSCHAL die GESAMTE Stufe für immer, sobald
+        # IRGENDEIN Manualimport für (Vertrag, Stufe) existierte - das hätte
+        # auch eine völlig NEUE, später erst fällige Forderung derselben
+        # Stufe für immer von der automatischen Bündelung ausgeschlossen.
+        # Jetzt werden NUR die konkret durch einen Manualimport abgedeckten
+        # `forderung_op_position_id`s von dieser Bündelung ausgeschlossen -
+        # jede ANDERE Forderung derselben Stufe bleibt normal automatisch
+        # mahnbar. Rein additiv, ändert KEINEN MahnFall-/Mahnlauf-Status.
+        manuell_abgedeckte_forderung_ids = (
+            self._manueller_mahnversand_repository.forderung_ids_bereits_manuell_versendet(vertrag_id=vertrag.id, stufe=stufe)
+            if self._manueller_mahnversand_repository is not None else set()
+        )
 
         aktuelle_policy = self._mahn_policy_repository.aktuelle_freigegebene()
         # Der Kanal DIESER Gruppe wird HIER EINMAL für die ganze Stufe
@@ -904,6 +906,7 @@ class MahnwesenService:
         kandidaten = [
             f for f in self._repository.list_fuer_vertrag(vertrag.id)
             if f.stufe == stufe and f.status == MahnStatus.GEPLANT.value
+            and f.forderung_op_position_id not in manuell_abgedeckte_forderung_ids
         ]
         bereit_ids: list[int] = []
         for mahnfall in kandidaten:

@@ -1758,6 +1758,108 @@ def test_nachsendung_brief_fuer_nachweislich_nie_archivierten_empfaenger(hv, bas
     assert ergebnis_erneut == "BEREITS_GESENDET"
 
 
+def test_nachsendung_brief_enthaelt_kanonischen_kontoauszug_in_tatsaechlich_uebertragenen_bytes(hv, basis_vertrag, admin_ctx):
+    """Konkreter Paket-Test gegen die TATSÄCHLICH im Fake-SFTP übertragenen
+    Bytes (nicht nur gegen den Merge-Helfer isoliert, Nachtrag Markus
+    22.10.2026): derselbe Repro wie `test_nachsendung_brief_fuer_
+    nachweislich_nie_archivierten_empfaenger` - eine Mitmieterin, deren
+    Brief beim Erstversand NIE archiviert werden konnte, bekommt ihr
+    Schreiben über die Nachsendung tatsächlich erzeugt/archiviert/
+    übertragen. Bisher (Fund dieser Runde) war dieses SPÄT nachgesendete
+    PDF nur 1 Seite OHNE den kanonischen Kontoauszug/chronologisches
+    Journal - anders als der Erstversand-Hauptbrief. Prüft die ECHTEN,
+    im Fake-SFTP angekommenen Bytes (`fake_verbindung.geschriebene_
+    dateien`), kein echter Netzkontakt."""
+
+    service, _state = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake_verbindung = _richte_brief_kanal_ein(service, contract, account)
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin Kontoauszug", email=None, adresse="Nebenstraße 3, 1010 Wien",
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    service.mitmieter_repo.setze_postadresse_geprueft(mitmieter.id, geprueft=True)
+
+    original_archiviere_brief = service.empfaenger_zugang_repo.archiviere_brief
+    aufrufe = {"anzahl": 0}
+
+    def kaputte_archivierung(*args, **kwargs):
+        aufrufe["anzahl"] += 1
+        if aufrufe["anzahl"] == 1:
+            raise RuntimeError("Simulierter Fehler bei der Mitmieter-Brief-Archivierung (Test).")
+        return original_archiviere_brief(*args, **kwargs)
+
+    service.empfaenger_zugang_repo.archiviere_brief = kaputte_archivierung
+    try:
+        service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    finally:
+        service.empfaenger_zugang_repo.archiviere_brief = original_archiviere_brief
+
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    ergebnis = service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 14))
+    assert ergebnis == "GESENDET"
+
+    eintrag_nach = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    dateiname = brief_sftp.baue_dateiname(sende_schluessel=eintrag_nach.brief_sende_schluessel)
+    uebertragene_bytes = fake_verbindung.geschriebene_dateien[f"bulk_tp/{dateiname}"]
+    assert uebertragene_bytes == eintrag_nach.brief_pdf_bytes  # archivierte und tatsächlich übertragene Bytes sind identisch
+
+    seiten = PdfReader(io.BytesIO(uebertragene_bytes)).pages
+    assert len(seiten) > 1, "Nachgesendetes Mitmieter-PDF muss den kanonischen Kontoauszug als weitere Seite(n) enthalten."
+    text = " ".join(p.extract_text() for p in seiten)
+    assert "Kontoblatt" in text and "chronologisches Journal" in text
+
+
+def test_nachsendung_brief_defekter_kontoauszug_blockiert_vor_archivierung_und_sftp(hv, basis_vertrag, admin_ctx, monkeypatch):
+    """Fix5 gilt identisch auf dem Nachsendeweg: ein defekter Kontoauszug-
+    Anhang muss VOR jedem Providerkontakt (Archivierung/SFTP) blockieren,
+    nie stillschweigend ohne Pflichtbeilage weiterlaufen. Kein echter
+    Netzkontakt - reine Code-/Regressionsprüfung."""
+
+    import mietinkasso.indexautomatik.mailversand_service as mailversand_modul
+
+    service, _state = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake_verbindung = _richte_brief_kanal_ein(service, contract, account)
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin Defekt", email=None, adresse="Nebenstraße 4, 1010 Wien",
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    service.mitmieter_repo.setze_postadresse_geprueft(mitmieter.id, geprueft=True)
+
+    original_archiviere_brief = service.empfaenger_zugang_repo.archiviere_brief
+    aufrufe = {"anzahl": 0}
+
+    def kaputte_archivierung(*args, **kwargs):
+        aufrufe["anzahl"] += 1
+        if aufrufe["anzahl"] == 1:
+            raise RuntimeError("Simulierter Fehler bei der Mitmieter-Brief-Archivierung (Test).")
+        return original_archiviere_brief(*args, **kwargs)
+
+    service.empfaenger_zugang_repo.archiviere_brief = kaputte_archivierung
+    try:
+        service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    finally:
+        service.empfaenger_zugang_repo.archiviere_brief = original_archiviere_brief
+
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    eintrag_vor = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    dateien_vor = dict(fake_verbindung.geschriebene_dateien)
+
+    def kaputter_kontoauszug(**kwargs):
+        return b"DAS-IST-KEIN-PDF"
+
+    monkeypatch.setattr(mailversand_modul, "erzeuge_kontoauszug_pdf", kaputter_kontoauszug)
+
+    with pytest.raises(ValueError):
+        service.nachsenden_einzelempfaenger(ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 14))
+
+    eintrag_nach = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag_nach.brief_status is None  # nicht archiviert
+    assert eintrag_nach.brief_sende_schluessel == eintrag_vor.brief_sende_schluessel  # unverändert (weiterhin None)
+    assert fake_verbindung.geschriebene_dateien == dateien_vor  # kein SFTP-Kontakt
+
+
 # -- Regression (Codex-Abnahme 21.10.2026, b6e773e): die Nachsendung --------
 # -- gatete einen TATSÄCHLICH NEUEN Providerkontakt bisher an KEINER -------
 # -- der Erstversand-Bedingungen (SEND_ENABLED/Allowlist, aktuelle ----------

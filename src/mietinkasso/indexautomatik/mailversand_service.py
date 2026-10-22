@@ -496,7 +496,7 @@ class HVMailversandService:
         kontoauszug_text = journal_als_text(lade_kontoblatt(
             konto_id=account.id, vertrag_id=mahnlauf.vertrag_id, op_service=self.op_service,
             mahnkosten_repo=self.mahnkosten_repo, ruecklastschriftkosten_repo=self.ruecklastschriftkosten_repo,
-            mahnlauf_repo=self.mahnlauf_repo,
+            mahnlauf_repo=self.mahnlauf_repo, manueller_mahnversand_repo=self.manueller_mahnversand_repo,
         ))
         text = (
             f"Guten Tag {empfaenger_name},\n\n"
@@ -837,7 +837,7 @@ class HVMailversandService:
             kontoblatt=lade_kontoblatt(
                 konto_id=account.id, vertrag_id=mahnlauf.vertrag_id, op_service=self.op_service,
                 mahnkosten_repo=self.mahnkosten_repo, ruecklastschriftkosten_repo=self.ruecklastschriftkosten_repo,
-                mahnlauf_repo=self.mahnlauf_repo,
+                mahnlauf_repo=self.mahnlauf_repo, manueller_mahnversand_repo=self.manueller_mahnversand_repo,
             ),
         )
         pdf_bytes = haenge_kontoauszug_pdf_an(pdf_bytes, kontoauszug_pdf_bytes)
@@ -1258,6 +1258,35 @@ class HVMailversandService:
                 )
             except AdressfehlerError as exc:
                 raise ValueError(f"Ungültige Postadresse: {exc}") from exc
+
+            account = self.bundle.stammdaten_repository.get_konto_by_vertrag(mahnlauf.vertrag_id)
+            debitor = self.bundle.stammdaten_repository.get_debitor(account.debitor_id)
+            # Nachtrag Markus 22.10.2026 (konkreter Paket-Test gegen die
+            # tatsächlichen Fake-SFTP-Bytes, kein Scope-Ausbau über Fix5
+            # hinaus): dieser SPÄTE Einzelempfänger-Nachsendeweg baute das
+            # Mitmieter-PDF bisher OHNE den kanonischen Kontoauszug
+            # (anders als der Erstversand in `_sende_brief`) - ein
+            # Mitmieter, dessen Archivierung beim Erstversand fehlschlug,
+            # hätte dadurch ein Schreiben OHNE die Pflichtbeilage
+            # übermittelt bekommen. Dieselbe GENERISCHE `lade_kontoblatt`-
+            # Quelle/derselbe `account`/dieselbe `debitor_name` wie beim
+            # Erstversand (ein Konto hat EINEN Kontoauszug, unabhängig
+            # vom Empfänger der Briefkopie) - KEINE zweite, abweichende
+            # Berechnung. `haenge_kontoauszug_pdf_an` bleibt fail-closed
+            # (Fix5): ein defekter Anhang blockiert HIER, VOR jedem
+            # Archivierungs-/SFTP-Kontakt, denselben Weg wie beim
+            # Erstversand.
+            kontoauszug_pdf_bytes = erzeuge_kontoauszug_pdf(
+                absender=kontext.absender, objekt_bezeichnung=kontext.obj.bezeichnung,
+                einheit_bezeichnung=kontext.unit.bezeichnung, debitor_name=debitor.name,
+                vertrag_id=mahnlauf.vertrag_id, konto_id=account.id, heute=heute,
+                kontoblatt=lade_kontoblatt(
+                    konto_id=account.id, vertrag_id=mahnlauf.vertrag_id, op_service=self.op_service,
+                    mahnkosten_repo=self.mahnkosten_repo, ruecklastschriftkosten_repo=self.ruecklastschriftkosten_repo,
+                    mahnlauf_repo=self.mahnlauf_repo, manueller_mahnversand_repo=self.manueller_mahnversand_repo,
+                ),
+            )
+            pdf_bytes = haenge_kontoauszug_pdf_an(pdf_bytes, kontoauszug_pdf_bytes)
 
             mitmieter_referenz = f"mahnungslauf:{mahnlauf.outbox_key}:mitmieter:{mitmieter.id}"
             try:

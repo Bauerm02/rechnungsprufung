@@ -333,7 +333,7 @@ def vertragsanlage_detail(
         lade_kontoblatt(
             konto_id=konto.id, vertrag_id=vertrag_id, op_service=deps._op_service,
             mahnkosten_repo=deps._hv_mail.mahnkosten_repo, ruecklastschriftkosten_repo=deps._ruecklastschriftkosten_repo,
-            mahnlauf_repo=deps._hv_mail.mahnlauf_repo,
+            mahnlauf_repo=deps._hv_mail.mahnlauf_repo, manueller_mahnversand_repo=deps._hv_mail.manueller_mahnversand_repo,
         ) if konto else None
     )
     sperren = deps._stammdaten_repo.aktive_sperren(vertrag_id)
