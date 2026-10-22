@@ -28,6 +28,7 @@ from mietinkasso.op.kontoblatt import (
     STATUS_ERSETZT,
     STATUS_OFFEN,
     STATUS_TEILBEZAHLT,
+    AusstehenderManuellerMahnversand,
     DokumentierterBankaufwand,
     Kontoblatt,
     KontoblattZeile,
@@ -566,10 +567,35 @@ def test_pdf_zeigt_ausstehenden_manualimport_fix6():
     NIRGENDS auf dem PDF-Kontoauszug."""
 
     kontoblatt = _leeres_kontoblatt(
-        ausstehende_manuelle_mahnversand=[_manualimport_zeile(id=1, beleg_referenz="SYNRENT-MAHNUNG-XY")],
+        ausstehende_manuelle_mahnversand=[
+            AusstehenderManuellerMahnversand(row=_manualimport_zeile(id=1, beleg_referenz="SYNRENT-MAHNUNG-XY"), vorschlag_cent=None),
+        ],
     )
     pdf_bytes = _erzeugen(kontoblatt)
     reader = PdfReader(io.BytesIO(pdf_bytes))
     text = "".join(p.extract_text() for p in reader.pages)
     assert "SYNRENT-MAHNUNG-XY" in text
     assert "noch nicht gebucht" in text
+
+
+def test_pdf_zeigt_unverbindlichen_ansatz_fuer_ausstehenden_manualimport():
+    """Zweite Rückprüfung Codex 22.10.2026, echter Anzeige-Mangel: das
+    importierte, noch nicht freigegebene Schreiben stand zwar mit
+    Referenz/Datum im Kontoblatt, aber OHNE den vorgesehenen Ansatz
+    (z. B. 20,00 EUR) aus der aktuell geltenden Konfiguration - "ungeprüfte
+    Ansätze sichtbar" verlangt ausdrücklich auch den Betrag selbst, als
+    unverbindliche "in Prüfung"-Anzeige, NICHT im Saldo, nicht gebucht."""
+
+    kontoblatt = _leeres_kontoblatt(
+        ausstehende_manuelle_mahnversand=[
+            AusstehenderManuellerMahnversand(
+                row=_manualimport_zeile(id=2, beleg_referenz="SYN-PENDING-LETTER"), vorschlag_cent=2_000,
+            ),
+        ],
+    )
+    pdf_bytes = _erzeugen(kontoblatt)
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text = "".join(p.extract_text() for p in reader.pages)
+    assert "SYN-PENDING-LETTER" in text
+    assert "20,00" in text
+    assert "in Prüfung" in text

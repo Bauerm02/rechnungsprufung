@@ -7828,3 +7828,58 @@ tests (siehe oben) plus Gegenprobe-Verifikation (Test schlägt ohne die
 jeweilige Fix-Änderung nachweislich fehl). Ausschließlich synthetische
 Testdaten, kein echter Netzkontakt, `SEND_ENABLED=false` unverändert.
 Produktion bleibt unverändert bei Commit `54f8f59`.
+
+## Unabhängige Abnahme 8ff31d8: letzter verbleibender Anzeige-Mangel (Fix6-Ergänzung, behoben)
+
+Codex hat Commit `8ff31d8` unabhängig geprüft: 15 von 17 neuen
+synthetischen Tests grün. Einer der zwei roten Fälle ist KEIN Codefehler
+(die legitime `VorgangIdKonfliktError` bei identischem Beleg/abweichender
+Stufe - Fix8 - wird im zugehörigen Test passend als erwartete Ausnahme
+akzeptiert). Der verbleibende, echte Anzeige-Mangel:
+
+Ein importiertes, noch nicht freigegebenes Schreiben (`pauschale_
+abgegolten=False`) stand im gemeinsamen Kontoblatt zwar mit Belegreferenz
+und Versanddatum (Fix6), aber OHNE den vorgesehenen Pauschale-Ansatz
+(z. B. 20,00 EUR aus der aktuell geltenden Zinsprofil-Konfiguration).
+"Ungeprüfte Ansätze sichtbar" verlangt ausdrücklich auch den Betrag
+selbst, nicht nur die Existenz des Vorgangs.
+
+Behoben über einen neuen `vorschlag_cent` auf jedem Eintrag von
+`Kontoblatt.ausstehende_manuelle_mahnversand` (jetzt `list[Ausstehender
+ManuellerMahnversand]` statt roher `ManuellerMahnversandTable`-Zeilen).
+`lade_kontoblatt` ermittelt diesen Wert über GENAU dieselbe, bereits
+bestehende Profil-Auflösung wie die Mahnpauschale-Freigabe-Maske
+(`backoffice/routes/mahnwesen.py::mahnpauschale_freigabe_formular` →
+`ZinsprofilTable.mahnpauschale_kostenbasis_cent`, am echten Tagesdatum
+wirksames Profil über `kosten.py::_profil_wirksam_am`) - KEIN zweiter
+Ledger, KEINE zweite Berechnung, nur derselbe Konfigurationswert an
+einer zweiten Stelle angezeigt. `None`, wenn kein Profilwert
+konfiguriert ist - NIE eine erfundene Zahl. HTML (`kontoblatt_render.
+py`) und PDF (`kontoauszug_pdf.py`) zeigen den Ansatz jetzt klar als
+"(unverbindlich, in Prüfung)" - weiterhin NICHT im Saldo, nicht gebucht,
+nicht versandt; die tatsächliche Buchung bleibt ausschließlich der
+expliziten Freigabe/Nachbuchung vorbehalten.
+
+### Geänderte/neue Dateien
+
+Geändert: `src/mietinkasso/op/kontoblatt.py` (neue Dataclass
+`AusstehenderManuellerMahnversand`, `lade_kontoblatt` ermittelt den
+Vorschlagswert), `src/mietinkasso/backoffice/kontoblatt_render.py`
+(HTML-Spalte "Ansatz (in Prüfung)"), `src/mietinkasso/op/kontoauszug_pdf.py`
+(PDF-Zeile mit Ansatz). Tests angepasst/ergänzt in `tests/mietinkasso/
+test_kontoblatt_manueller_mahnversand.py`, `tests/mietinkasso/
+test_kontoauszug_pdf.py`, `tests/mietinkasso/test_backoffice.py`.
+
+### Tests
+
+Gesamtsuite `tests/mietinkasso` grün (1729 Tests). Neue/geänderte
+gezielte Tests: zwei reine Dataclass-Tests (`vorschlag_cent` durchgereicht/
+`None` ohne Profil), zwei PDF-Tests, ein Ende-zu-Ende-HTTP-Test
+(`test_kontoblatt_zeigt_unverbindlichen_ansatz_fuer_ausstehenden_
+manualimport_html_und_pdf` - reiner Nachweisimport am Forderungs-
+Fälligkeitstag, HTML UND PDF zeigen den Ansatz, Saldo/Buchung
+unverändert). Gegenprobe durchgeführt: mit der alten Render-Fassung
+(ohne Ansatz-Spalte) schlägt der HTTP-Test nachweislich fehl.
+Ausschließlich synthetische Testdaten, keine Produktivaktionen,
+`SEND_ENABLED=false` unverändert. Produktion bleibt unverändert bei
+Commit `54f8f59`.

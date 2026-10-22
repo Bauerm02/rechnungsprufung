@@ -6888,6 +6888,76 @@ def test_mahnpauschale_freigabe_fuer_konkreten_manualimport_beleg_bucht_trotz_ne
     assert row_danach.mahnkosten_buchung_id is not None
 
 
+def test_kontoblatt_zeigt_unverbindlichen_ansatz_fuer_ausstehenden_manualimport_html_und_pdf(backoffice_client):
+    """Unabhängige Abnahme 8ff31d8: der zuvor sichtbare Fix6 (Referenz/
+    Datum) zeigte für ein importiertes, noch nicht freigegebenes
+    Schreiben KEINEN Ansatz - "ungeprüfte Ansätze sichtbar" verlangt
+    aber ausdrücklich auch den vorgesehenen (unverbindlichen) Betrag.
+    Repro wie gemeldet: reiner Nachweisimport (`sofort_buchen=False`,
+    Standard) am Forderungs-Fälligkeitstag selbst (keine Zinsen),
+    `lade_kontoblatt` mit `manueller_mahnversand_repo` - HTML UND PDF
+    müssen jetzt den konfigurierten 20,00-EUR-Ansatz als "in Prüfung"
+    zeigen, aus der bestehenden Zinsprofil-Konfiguration, KEIN zweiter
+    Ledger, KEINE Buchung/Versand."""
+
+    import mietinkasso.backoffice.dependencies as backoffice_deps
+
+    client, *_ = backoffice_client
+    _login(client)
+
+    vertrag, konto, stammdaten = _kontoblatt_test_konto("PENDING-ANSATZ")
+    from mietinkasso.infrastructure.config import get_settings
+    from mietinkasso.infrastructure.db.session import build_session_factory
+    from mietinkasso.domain.enums import OPTyp
+    from mietinkasso.op.repository import OPRepository
+    from mietinkasso.op.service import OPService
+
+    session_factory = build_session_factory(get_settings().database_url)
+    op_service = OPService(OPRepository(session_factory), stammdaten)
+
+    heute = date.today()
+    forderung = op_service.buchen(
+        ctx=_ctx_admin(), konto=konto, typ=OPTyp.SOLL, betrag_cent=100_000,
+        belegdatum=heute, buchungsdatum=heute, faelligkeit=heute, beleg_referenz="HMZ fällig heute",
+    )
+
+    # Bestehende, geltende Konfiguration - genau dieselbe, die auch die
+    # Mahnpauschale-Freigabe-Maske als unverbindlichen Vorschlag anzeigt.
+    zinsprofil = backoffice_deps._hv_mail.mahnkosten_repo.zinsprofil_anlegen(
+        vertrag_id=vertrag.id, erstellt_von="codex-test", ist_b2b=False, vertragsdatum=date(2020, 1, 1),
+        gueltig_ab=date(2020, 1, 1), mahnpauschale_kostenbasis_cent=2_000,
+        mahnpauschale_kostenbasis_beleg="Vertrag Punkt 7",
+    )
+    backoffice_deps._hv_mail.mahnkosten_repo.zinsprofil_freigeben(zinsprofil.id, freigegeben_von="codex-test")
+
+    row = backoffice_deps._hv_mail.manueller_mahnversand_service.importieren(
+        ctx=_ctx_admin(), vertrag_id=vertrag.id, stufe=1, forderung_op_position_ids=[forderung.id],
+        versanddatum=heute, kanal="PERSOENLICH", empfaenger_name="Max Mustermieter",
+        empfaenger_adresse="persönlich übergeben", beleg_referenz="SYN-PENDING-LETTER",
+        beleg_pdf_bytes=_echter_beleg_pdf("Reiner Nachweis"), erfasst_von="codex-test",
+    )
+    assert row.pauschale_abgegolten is False  # reiner Nachweis, noch keine Freigabe
+
+    html_seite = client.get(f"/backoffice/konto/{konto.id}")
+    assert html_seite.status_code == 200
+    assert "SYN-PENDING-LETTER" in html_seite.text
+    assert "20,00" in html_seite.text
+    assert "in Prüfung" in html_seite.text
+
+    pdf_antwort = client.get(f"/backoffice/konto/{konto.id}/kontoauszug.pdf")
+    assert pdf_antwort.status_code == 200
+    from pypdf import PdfReader
+    import io
+    pdf_text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_antwort.content)).pages)
+    assert "SYN-PENDING-LETTER" in pdf_text
+    assert "20,00" in pdf_text
+    assert "in Prüfung" in pdf_text
+
+    # Weiterhin NICHT gebucht/im Saldo - rein unverbindliche Anzeige.
+    assert row.pauschale_abgegolten is False
+    assert op_service.berechne_saldo(konto.id).saldo_cent == 100_000
+
+
 def test_kontoauszug_pdf_ist_reiner_get_ohne_datenbankaenderung(backoffice_client):
     """Erforderliche Regression: reiner GET/PDF ändert keine DB/kein
     Audit/kein Versand."""

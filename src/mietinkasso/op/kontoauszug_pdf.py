@@ -405,6 +405,12 @@ def erzeuge_kontoauszug_pdf(
     # NIRGENDS auf diesem Kontoauszug - `erzeuge_kontoauszug_pdf` kannte
     # `ManuellerMahnversandTable` überhaupt nicht. Derselbe Belegstand wie
     # im HTML-Kontoblatt, KEINE erfundene 0,00-EUR-Summe.
+    #
+    # Zweite Rückprüfung Codex 22.10.2026, echter Anzeige-Mangel: Referenz/
+    # Datum allein zeigten noch KEINEN Ansatz - jetzt zusätzlich der
+    # unverbindliche, aktuell geltende Mahnpauschale-Prüfwert
+    # (`a.vorschlag_cent`, identisch zur Freigabe-Maske) - "ungeprüfte
+    # Ansätze sichtbar", NIE gebucht/versandt.
     if kontoblatt.ausstehende_manuelle_mahnversand:
         _abschnitt_titel(pdf, "Manuell dokumentierte Mahnschreiben (Kosten noch nicht gebucht)")
         pdf.set_font("Konto", "", 9)
@@ -412,13 +418,19 @@ def erzeuge_kontoauszug_pdf(
             0, 5,
             "Für diese bereits erfassten, tatsächlich versandten Schreiben ist noch KEINE Kostenbuchung "
             "erfolgt (Freigabe/Bestätigung steht aus) - das bedeutet 'in Prüfung, noch nicht gebucht', "
-            "NICHT 'keine Kosten'.",
+            "NICHT 'keine Kosten'. Der gezeigte Ansatz ist der unverbindliche, aktuell geltende "
+            "Mahnpauschale-Prüfwert - NICHT im Saldo enthalten, wird erst nach Freigabe/Bestätigung gebucht.",
         )
         pdf.ln(1)
-        for z in kontoblatt.ausstehende_manuelle_mahnversand:
+        for a in kontoblatt.ausstehende_manuelle_mahnversand:
+            z = a.row
+            ansatz_text = (
+                f"{_eur(a.vorschlag_cent)} (unverbindlich, in Prüfung)" if a.vorschlag_cent is not None
+                else "kein Profilwert hinterlegt"
+            )
             bezeichnung = (
                 f"Stufe {z.stufe} · Kanal {z.kanal} · Versanddatum {z.versanddatum.strftime('%d.%m.%Y')} · "
-                f"Beleg {z.beleg_referenz} · Empfänger {z.empfaenger_name}"
+                f"Beleg {z.beleg_referenz} · Empfänger {z.empfaenger_name} · Ansatz: {ansatz_text}"
             )
             pdf.set_font("Konto", "", 9.5)
             pdf.multi_cell(0, 5, bezeichnung, new_x="LMARGIN", new_y="NEXT")

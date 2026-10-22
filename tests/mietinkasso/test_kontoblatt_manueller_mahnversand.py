@@ -2,7 +2,12 @@
 22.10.2026): ein Manualimport OHNE Kosten-Freigabe (`pauschale_
 abgegolten=False`) muss auf dem GEMEINSAMEN Kontoblatt sichtbar sein -
 `erstelle_kontoblatt` kannte `ManuellerMahnversandTable` bisher gar
-nicht. Synthetische Daten, keine DB, kein PDF."""
+nicht. Zweite Rückprüfung Codex 22.10.2026 (echter Anzeige-Mangel):
+Referenz/Datum allein zeigten noch KEINEN Ansatz - `erstelle_kontoblatt`
+reicht jetzt zusätzlich einen bereits von außen ermittelten
+unverbindlichen Mahnpauschale-Prüfwert je Beleg durch (`Ausstehender
+ManuellerMahnversand.vorschlag_cent`). Synthetische Daten, keine DB,
+kein PDF."""
 
 from __future__ import annotations
 
@@ -34,10 +39,28 @@ def _kontoblatt(**overrides):
 def test_manualimport_ohne_kostenfreigabe_erscheint_als_ausstehend():
     nicht_gebucht = _manualimport(id=1, pauschale_abgegolten=False, beleg_referenz="SYNRENT-MAHNUNG-1")
 
-    kontoblatt = _kontoblatt(manuelle_mahnversand_zeilen=[nicht_gebucht])
+    kontoblatt = _kontoblatt(manuelle_mahnversand_zeilen=[nicht_gebucht], manuelle_mahnversand_vorschlag_cent=2_000)
 
     assert len(kontoblatt.ausstehende_manuelle_mahnversand) == 1
-    assert kontoblatt.ausstehende_manuelle_mahnversand[0].beleg_referenz == "SYNRENT-MAHNUNG-1"
+    eintrag = kontoblatt.ausstehende_manuelle_mahnversand[0]
+    assert eintrag.row.beleg_referenz == "SYNRENT-MAHNUNG-1"
+    # Zweite Rückprüfung Codex 22.10.2026: der unverbindliche Ansatz MUSS
+    # tatsächlich durchgereicht werden ("ungeprüfte Ansätze sichtbar"),
+    # nie erfunden/ausgelassen.
+    assert eintrag.vorschlag_cent == 2_000
+
+
+def test_manualimport_ohne_konfigurierten_profilwert_zeigt_ehrlich_kein_vorschlag():
+    """Kein Profilwert konfiguriert (`manuelle_mahnversand_vorschlag_cent`
+    nicht übergeben) - `vorschlag_cent` bleibt `None`, NIE eine erfundene
+    0,00-EUR-Zahl."""
+
+    nicht_gebucht = _manualimport(id=3, pauschale_abgegolten=False, beleg_referenz="SYNRENT-MAHNUNG-OHNE-PROFIL")
+
+    kontoblatt = _kontoblatt(manuelle_mahnversand_zeilen=[nicht_gebucht])
+
+    eintrag = kontoblatt.ausstehende_manuelle_mahnversand[0]
+    assert eintrag.vorschlag_cent is None
 
 
 def test_manualimport_bereits_abgegolten_erscheint_nicht_doppelt_als_ausstehend():

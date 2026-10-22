@@ -128,6 +128,11 @@ from mietinkasso.infrastructure.db.tables import (
     OPPositionTable,
     RuecklastschriftkostenTable,
 )
+#: Dieselbe bereits bestehende Profil-Auflösung wie `backoffice/routes/
+#: mahnwesen.py::mahnpauschale_freigabe_formular` (reine Funktion über
+#: einer bereits gelesenen Historie, kein eigener DB-Zugriff) - siehe
+#: `lade_kontoblatt`/`AusstehenderManuellerMahnversand`.
+from mietinkasso.mahnwesen.kosten import _profil_wirksam_am
 
 KATEGORIE_HAUPTFORDERUNG = "HAUPTFORDERUNG"
 KATEGORIE_VERZUGSZINSEN = "VERZUGSZINSEN"
@@ -275,6 +280,31 @@ class DokumentierterBankaufwand:
 
 
 @dataclass(frozen=True)
+class AusstehenderManuellerMahnversand:
+    """EIN noch nicht kostenfreigegebener Manualimport-Beleg (`row.
+    pauschale_abgegolten=False`) mitsamt dem AKTUELL geltenden, rein
+    unverbindlichen Mahnpauschale-Prüfwert (Codex-Rückprüfung 22.10.2026,
+    echter Anzeige-Mangel - vorherige Fassung zeigte Referenz/Datum, aber
+    KEINEN Betrag, obwohl ausdrücklich "ungeprüfte Ansätze sichtbar"
+    gefordert war).
+
+    `vorschlag_cent` ist GENAU derselbe unverbindliche Prüfwert, den auch
+    `backoffice/routes/mahnwesen.py::mahnpauschale_freigabe_formular`
+    anzeigt (`ZinsprofilTable.mahnpauschale_kostenbasis_cent`, am echten
+    Tagesdatum wirksames Profil) - KEINE zweite, eigene Berechnung/kein
+    zweiter Ledger, nur derselbe bereits bestehende Konfigurationswert an
+    einer zweiten Stelle angezeigt. `None`, wenn kein Profilwert
+    konfiguriert ist - NIE eine erfundene Zahl. Dieser Wert wird NIE
+    gebucht/versandt, er ist ausschließlich eine "in Prüfung, NICHT im
+    Saldo"-Anzeige; die tatsächliche Buchung bleibt ausschließlich der
+    expliziten Freigabe (`mahnpauschale-freigabe?fuer_manualimport_
+    row_id=...`) und Nachbuchung vorbehalten."""
+
+    row: ManuellerMahnversandTable
+    vorschlag_cent: int | None
+
+
+@dataclass(frozen=True)
 class Kontoblatt:
     konto_id: str
     saldo_cent: int
@@ -322,9 +352,14 @@ class Kontoblatt:
     #: Zeigt hier dieselben, bereits dokumentierten Belege (Stufe/Datum/
     #: Kanal/Belegreferenz) als "in Prüfung, noch nicht gebucht" - KEINE
     #: erfundene 0,00-EUR-Summe, nur die reale Existenz des noch
-    #: ungebuchten Vorgangs. Default leer, damit bestehende direkte
-    #: `Kontoblatt(...)`-Konstruktionen in Tests unverändert weiterlaufen.
-    ausstehende_manuelle_mahnversand: list[ManuellerMahnversandTable] = field(default_factory=list)
+    #: ungebuchten Vorgangs. Seit der zweiten Rückprüfung (22.10.2026,
+    #: echter Anzeige-Mangel) trägt jeder Eintrag zusätzlich den
+    #: unverbindlichen Mahnpauschale-Prüfwert aus der AKTUELL geltenden
+    #: Konfiguration (`AusstehenderManuellerMahnversand.vorschlag_cent`,
+    #: siehe dort - "ungeprüfte Ansätze sichtbar", NIE gebucht). Default
+    #: leer, damit bestehende direkte `Kontoblatt(...)`-Konstruktionen in
+    #: Tests unverändert weiterlaufen.
+    ausstehende_manuelle_mahnversand: list[AusstehenderManuellerMahnversand] = field(default_factory=list)
 
 
 def _buchungs_id_kategorie(buchungen: list[MahnkostenBuchungTable]) -> dict[int, str]:
@@ -509,10 +544,19 @@ def erstelle_kontoblatt(
     offene_forderungen_rest_je_id: dict[int, int], mahnkosten_buchungen: list[MahnkostenBuchungTable],
     ruecklastschriftkosten_zeilen: list[RuecklastschriftkostenTable], mahnlaeufe: list[MahnLaufTable],
     manuelle_mahnversand_zeilen: list[ManuellerMahnversandTable] = (),
+    manuelle_mahnversand_vorschlag_cent: int | None = None,
 ) -> Kontoblatt:
     """Reine Funktion - bekommt alle Daten bereits geladen übergeben
     (siehe `lade_kontoblatt` unten für den I/O-Teil), keine eigene
-    DB-/Zeitabfrage, damit sie ohne DB direkt getestet werden kann."""
+    DB-/Zeitabfrage, damit sie ohne DB direkt getestet werden kann.
+
+    `manuelle_mahnversand_vorschlag_cent` ist der bereits AUSSERHALB
+    (von `lade_kontoblatt`, am echten Tagesdatum) ermittelte,
+    unverbindliche Mahnpauschale-Prüfwert aus der aktuell geltenden
+    Zinsprofil-Konfiguration - diese Funktion selbst liest dafür KEINE
+    eigene Historie/Uhrzeit, sondern reicht den einen bereits fertigen
+    Wert nur an jeden ausstehenden Manualimport-Beleg durch (siehe
+    `AusstehenderManuellerMahnversand`-Docstring)."""
 
     buchungs_kategorie = _buchungs_id_kategorie(mahnkosten_buchungen)
     buchungen_by_id = _buchungs_id_zu_buchung(mahnkosten_buchungen)
@@ -643,7 +687,10 @@ def erstelle_kontoblatt(
     # `ManuellerMahnversandTable`-Moduldoc). Eine bereits abgegoltene
     # Zeile ist bereits über ihre eigene OP-/Ledgerzeile in `kosten_
     # zeilen` sichtbar und erscheint hier bewusst NICHT noch einmal.
-    ausstehende_manuelle_mahnversand = [z for z in manuelle_mahnversand_zeilen if not z.pauschale_abgegolten]
+    ausstehende_manuelle_mahnversand = [
+        AusstehenderManuellerMahnversand(row=z, vorschlag_cent=manuelle_mahnversand_vorschlag_cent)
+        for z in manuelle_mahnversand_zeilen if not z.pauschale_abgegolten
+    ]
 
     return Kontoblatt(
         konto_id=konto_id, saldo_cent=saldo_cent, faelliger_unstrittiger_rest_cent=faelliger_unstrittiger_rest_cent,
@@ -801,6 +848,21 @@ def lade_kontoblatt(
     manuelle_mahnversand_zeilen = (
         manueller_mahnversand_repo.list_fuer_vertrag(vertrag_id) if manueller_mahnversand_repo is not None else []
     )
+    # Zweite Rückprüfung Codex 22.10.2026, echter Anzeige-Mangel: der
+    # unverbindliche Mahnpauschale-Prüfwert für jeden noch nicht
+    # freigegebenen Manualimport-Beleg kommt aus GENAU derselben, bereits
+    # bestehenden Zinsprofil-Konfiguration wie die Mahnpauschale-Freigabe-
+    # Maske (`mahnwesen.py::mahnpauschale_freigabe_formular`) - am echten
+    # Tagesdatum wirksames Profil, KEINE zweite Berechnung/kein zweiter
+    # Ledger. Nur abgefragt, wenn tatsächlich etwas ausstehend ist (keine
+    # unnötige Zusatzabfrage bei jedem Kontoblatt-Laden).
+    manuelle_mahnversand_vorschlag_cent = None
+    if any(not z.pauschale_abgegolten for z in manuelle_mahnversand_zeilen):
+        zinsprofil_historie = mahnkosten_repo.historie_geprueft(vertrag_id)
+        aktuelles_profil, _unberechenbar = _profil_wirksam_am(zinsprofil_historie, date.today())
+        manuelle_mahnversand_vorschlag_cent = (
+            aktuelles_profil.mahnpauschale_kostenbasis_cent if aktuelles_profil is not None else None
+        )
 
     return erstelle_kontoblatt(
         konto_id=konto_id, saldo_cent=saldo.saldo_cent, faelliger_unstrittiger_rest_cent=saldo.faelliger_unstrittiger_rest_cent,
@@ -808,4 +870,5 @@ def lade_kontoblatt(
         offene_forderungen_rest_je_id=offene_forderungen_rest_je_id, mahnkosten_buchungen=mahnkosten_buchungen,
         ruecklastschriftkosten_zeilen=ruecklastschriftkosten_zeilen, mahnlaeufe=mahnlaeufe,
         manuelle_mahnversand_zeilen=manuelle_mahnversand_zeilen,
+        manuelle_mahnversand_vorschlag_cent=manuelle_mahnversand_vorschlag_cent,
     )

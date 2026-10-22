@@ -185,10 +185,20 @@ def render_kontoblatt_html(kontoblatt: Kontoblatt, *, konto_id: str, zinsabrechn
     # NIRGENDS am Kontoblatt - weder Summe noch eigene Zeile. Zeigt hier
     # dieselben, bereits dokumentierten Belege als "in Prüfung" - KEINE
     # erfundene 0,00-EUR-Summe, nur die reale Existenz des Vorgangs.
+    #
+    # Zweite Rückprüfung Codex 22.10.2026, echter Anzeige-Mangel: Referenz/
+    # Datum allein zeigten noch KEINEN Betrag - "ungeprüfte Ansätze
+    # sichtbar" verlangt ausdrücklich auch den (unverbindlichen) Ansatz
+    # selbst. `a.vorschlag_cent` ist GENAU der aktuell geltende
+    # Konfigurationswert (siehe `AusstehenderManuellerMahnversand`-
+    # Docstring) - `None` wird ehrlich als "kein Profilwert hinterlegt"
+    # gezeigt, NIE als 0,00 EUR.
     manueller_versand_zeilen = "".join(
-        f"<tr><td>{z.versanddatum.isoformat()}</td><td>{z.stufe}</td><td>{h(z.kanal)}</td>"
-        f"<td>{h(z.beleg_referenz)}</td><td>{h(z.empfaenger_name)}</td></tr>"
-        for z in kontoblatt.ausstehende_manuelle_mahnversand
+        f"<tr><td>{a.row.versanddatum.isoformat()}</td><td>{a.row.stufe}</td><td>{h(a.row.kanal)}</td>"
+        f"<td>{h(a.row.beleg_referenz)}</td><td>{h(a.row.empfaenger_name)}</td>"
+        f"<td>{eur(a.vorschlag_cent) + ' (unverbindlich, in Prüfung)' if a.vorschlag_cent is not None else 'kein Profilwert hinterlegt'}</td>"
+        "</tr>"
+        for a in kontoblatt.ausstehende_manuelle_mahnversand
     )
     manueller_versand_karte = ""
     if kontoblatt.ausstehende_manuelle_mahnversand:
@@ -196,8 +206,9 @@ def render_kontoblatt_html(kontoblatt: Kontoblatt, *, konto_id: str, zinsabrechn
         <div class="card"><h3>Manuell dokumentierte Mahnschreiben (Kosten noch nicht gebucht)</h3>
           <p class="warn">Für diese bereits erfassten, tatsächlich versandten Schreiben ist noch KEINE
              Kostenbuchung erfolgt (Freigabe/Bestätigung steht aus) - das bedeutet "in Prüfung, noch nicht
-             gebucht", NICHT "keine Kosten".</p>
-          <table><tr><th>Versanddatum</th><th>Stufe</th><th>Kanal</th><th>Belegreferenz</th><th>Empfänger</th></tr>
+             gebucht", NICHT "keine Kosten". Der gezeigte Ansatz ist der unverbindliche, aktuell geltende
+             Mahnpauschale-Prüfwert - NICHT im Saldo enthalten, wird erst nach Freigabe/Bestätigung gebucht.</p>
+          <table><tr><th>Versanddatum</th><th>Stufe</th><th>Kanal</th><th>Belegreferenz</th><th>Empfänger</th><th>Ansatz (in Prüfung)</th></tr>
           {manueller_versand_zeilen}</table>
         </div>"""
 
