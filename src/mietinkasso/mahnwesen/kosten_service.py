@@ -31,6 +31,7 @@ ist `uq_mahnkosten_gebuehr_forderung` dagegen das FACHLICHE Gate selbst
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import date
 from decimal import Decimal
 
@@ -44,6 +45,15 @@ from mietinkasso.mahnwesen.kosten import MahnkostenVorschau, berechne_mahnkosten
 from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository, ZinsledgerInkonsistentError
 from mietinkasso.op.service import OPService, compute_content_hash
 from mietinkasso.stammdaten.repository import StammdatenRepository
+
+
+#: Sentinel-"Stufe" für eine eigenständige Zinsabrechnung AUSSERHALB des
+#: Mahnstufenzyklus (Auftrag HV-20261022-EIN-KONTOBLATT) - bewusst
+#: außerhalb des Wertebereichs der echten Mahnstufen 1-4, bleibt aber in
+#: derselben `MahnkostenBuchungTable`/demselben Ledger sichtbar
+#: (Verzugszinsen laufen ohnehin vertragsweit, nicht je Stufe - siehe
+#: `MahnkostenService.vorschau`-Docstring).
+ZINSABRECHNUNG_STUFE = 0
 
 
 def _mahnlauf_schluessel(op_position_ids: list[int]) -> str:
@@ -169,6 +179,51 @@ class MahnkostenService:
             return None
         return self.buche_vorschau(ctx=ctx, vorschau=vorschau, heute=heute, versandnachweis_referenz=versandnachweis_referenz, akteur=akteur)
 
+    def zinsabrechnung_vorschau(self, *, vertrag_id: str, heute: date) -> MahnkostenVorschau | None:
+        """Reine Lesevorschau (bucht NICHTS) einer eigenständigen
+        Zinsabrechnung, UNABHÄNGIG von einem tatsächlichen Mahnversand
+        (Auftrag HV-20261022-EIN-KONTOBLATT: "Zinsen laufend rein
+        rechnerisch"). Identisch zu `vorschau()` mit der Sentinel-Stufe
+        `ZINSABRECHNUNG_STUFE` - zeigt Satz/Zeitraum/Kapital/bereits
+        gebuchte Zinsen/Delta exakt wie die reguläre Mahnkosten-Vorschau,
+        nur ohne jede Bindung an einen bevorstehenden Versand."""
+
+        return self.vorschau(vertrag_id=vertrag_id, stufe=ZINSABRECHNUNG_STUFE, heute=heute)
+
+    def buche_zinsabrechnung(
+        self, *, ctx: AuthContext, vertrag_id: str, heute: date, akteur: str,
+    ):
+        """Explizite Preview→Bestätigen-Buchung NUR des tatsächlich neuen
+        Zinsdeltas, UNABHÄNGIG von einem tatsächlichen Mahnversand
+        (Auftrag HV-20261022-EIN-KONTOBLATT: "OP-Buchung beim
+        tatsächlichen Mahnversand ODER explizit bestätigter Abschluss/
+        Zinsabrechnung"). Berechnet die Vorschau FRISCH (wie jeder andere
+        Buchungsaufruf unmittelbar vor der tatsächlichen Buchung) und
+        entfernt dabei JEDE §458-Gebühr/Mahnkostenpauschale aus der zu
+        buchenden Kopie, BEVOR sie an `buche_vorschau` übergeben wird -
+        diese Aktion bucht NIEMALS eine Gebühr/Pauschale ("Preview/
+        Fehler/Retry niemals Gebühren"), Gebühren/Pauschale bleiben
+        strukturell an einen tatsächlichen, nachgewiesenen Mahnversand
+        gebunden (siehe `buche_bei_versand`/`MahnwesenService.
+        versende_mahnlauf`). Reine Delegation an die bereits bestehende
+        `buche_vorschau` (keine zweite Buchungs-Engine) - genauso
+        idempotent: `None`, wenn kein neues Delta vorliegt (z. B. ein
+        sofortiger Retry am selben Tag nach bereits erfolgter
+        Abrechnung)."""
+
+        vorschau = self.vorschau(vertrag_id=vertrag_id, stufe=ZINSABRECHNUNG_STUFE, heute=heute)
+        if vorschau is None:
+            return None
+        vorschau_ohne_gebuehren = dataclasses.replace(
+            vorschau, gebuehr_segmente=(), gebuehr_cent=None, gebuehr_rechtsgrundlage=None,
+            mahnpauschale_cent=None, mahnpauschale_rechtsgrundlage=None,
+        )
+        versandnachweis_referenz = f"ZINSABRECHNUNG:{heute.isoformat()}:{uuid.uuid4()}"
+        return self.buche_vorschau(
+            ctx=ctx, vorschau=vorschau_ohne_gebuehren, heute=heute,
+            versandnachweis_referenz=versandnachweis_referenz, akteur=akteur,
+        )
+
     def reserviere_und_kuerze_vorschau(
         self, *, vorschau: MahnkostenVorschau, mahnlauf_id: int, akteur: str,
     ) -> MahnkostenVorschau:
@@ -227,9 +282,60 @@ class MahnkostenService:
                 mahnlauf_id=mahnlauf_id,
             )
 
+    def nachbuche_offene_kosten(
+        self, *, ctx: AuthContext, vertrag_id: str, stufe: int, forderung_op_position_ids: list[int],
+        heute: date, akteur: str, ausloeser_referenz: str,
+    ):
+        """Bucht GENAU EINE Nachbuchung nach einer NACHTRÄGLICH erteilten
+        Mahnpauschale-/§458-Gebühren-Freigabe zu einem bereits
+        tatsächlich versendeten (oder per Manualimport dokumentierten)
+        Mahnvorgang (Auftrag HV-20261022-EIN-KONTOBLATT, Punkt 3 -
+        verbindlicher Teil des Auftrags, kein offener Punkt): zum
+        Versand-/Importzeitpunkt war die Pauschale noch NICHT freigegeben
+        (deshalb 0 EUR gebucht/"in Prüfung" gezeigt) - sobald die Freigabe
+        erteilt wird, MUSS genau diese eine Nachbuchung erfolgen, NIE
+        stillschweigend offen bleiben.
+
+        Bucht NIEMALS Zinsen (die bleiben strukturell an einen
+        tatsächlichen Mahnversand oder eine explizit bestätigte
+        Zinsabrechnung gebunden, siehe `buche_zinsabrechnung`) - nur die
+        zu DIESEM Zeitpunkt bereits freigegebenen §458-Gebühren/
+        Mahnkostenpauschale für GENAU diese eingefrorene Forderungsmenge.
+        Reine Delegation an `buche_vorschau` (keine zweite Buchungs-
+        Engine) - der einzige Unterschied ist `mahnlauf_schluessel_
+        override`: ohne diesen würde ein zweiter `buche_vorschau`-Aufruf
+        für DIESELBE Forderungsmenge an der bereits bestehenden
+        `uq_mahnkosten_lauf`-Zeile (dem ursprünglichen, ggf. kostenlosen
+        Versand-/Importbeleg) scheitern und FÄLSCHLICH als "bereits
+        gebucht" interpretiert werden - mit dem Override entsteht
+        stattdessen eine EIGENE, an `ausloeser_referenz` (typischerweise
+        die konkrete `MahnpauschaleFreigabeTable.id`) gebundene Zeile, die
+        bei einem Retry mit DERSELBEN `ausloeser_referenz` selbst wieder
+        idempotent ist (über `uq_mahnkosten_lauf` auf dem Override-
+        Schlüssel). `None`, wenn zu diesem Zeitpunkt nichts Neues zu
+        buchen ist (z. B. noch immer keine Freigabe vorhanden, oder diese
+        Nachbuchung bereits erfolgt)."""
+
+        vorschau = self.vorschau(
+            vertrag_id=vertrag_id, stufe=stufe, heute=heute,
+            nur_op_position_ids=frozenset(forderung_op_position_ids),
+        )
+        if vorschau is None or not vorschau.forderung_op_position_ids:
+            return None
+        vorschau_ohne_zinsen = dataclasses.replace(
+            vorschau, neue_zinsen_delta_cent=0, neue_zinsen_delta_je_op_position={},
+        )
+        override_schluessel = f"NACHBUCHUNG:{_mahnlauf_schluessel(list(vorschau.forderung_op_position_ids))}:{ausloeser_referenz}"
+        return self.buche_vorschau(
+            ctx=ctx, vorschau=vorschau_ohne_zinsen, heute=heute,
+            versandnachweis_referenz=f"NACHBUCHUNG:{ausloeser_referenz}", akteur=akteur,
+            mahnlauf_schluessel_override=override_schluessel,
+        )
+
     def buche_vorschau(
         self, *, ctx: AuthContext, vorschau: MahnkostenVorschau, heute: date,
         versandnachweis_referenz: str, akteur: str, mahnlauf_id: int | None = None,
+        mahnlauf_schluessel_override: str | None = None,
     ):
         """Bucht EXAKT die in `vorschau` berechneten Werte - ruft NIE
         selbst erneut `berechne_mahnkosten_vorschau` auf. Bucht NUR das
@@ -270,7 +376,7 @@ class MahnkostenService:
             return None  # nichts Neues zu buchen (u.a. der Idempotenz-Fall)
 
         stufe = vorschau.stufe
-        mahnlauf_schluessel = _mahnlauf_schluessel(list(vorschau.forderung_op_position_ids))
+        mahnlauf_schluessel = mahnlauf_schluessel_override or _mahnlauf_schluessel(list(vorschau.forderung_op_position_ids))
         zins_bis_fuer_stichtag = vorschau.zins_bis or heute
 
         session_factory = self._repository._session_factory

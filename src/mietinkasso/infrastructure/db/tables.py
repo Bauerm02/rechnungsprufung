@@ -2385,6 +2385,62 @@ class MahnbriefArchivTable(Base):
     anbieterbeleg_importiert_von: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
+class ManuellerMahnversandTable(Base):
+    """Auftrag HV-20261022-EIN-KONTOBLATT: kontrollierter Backoffice-Import
+    EINER tatsächlich AUSSERHALB des automatisierten Mahnlaufs (z. B.
+    persönlich/telefonisch angekündigt, über einen Kanal ohne maschinelle
+    Anbindung) versendeten Mahnung. Additive, eigenständige neue Tabelle -
+    KEINE Wiederverwendung von `MahnbriefArchivTable` (die setzt einen
+    bereits vom System SELBST initiierten, eingefrorenen Mahnlauf voraus -
+    hier geht es um einen Vorgang, von dem das System vorher nichts
+    wusste).
+
+    `idempotenz_schluessel` ist bewusst NICHT nur `stufe`+`zins_bis` oder
+    `stufe`+Forderungsgruppe (unabhängige Rückprüfung Codex 22.10.2026),
+    sondern eine Kombination aus Belegidentität (`beleg_sha256`),
+    Forderungsbindung (`forderung_op_position_ids_json`) UND
+    Betragshistorie (`versanddatum`, `kanal`) - siehe
+    `manueller_mahnversand_service.py::_idempotenz_schluessel`. Ein
+    echter Retry mit IDENTISCHEM Beleg/Forderungsbezug/Datum bleibt ein
+    sicherer No-Op (UNIQUE-Constraint greift, derselbe Datensatz wird
+    zurückgegeben); ein genuin NEUER Nachweis (anderes Dokument, andere
+    Forderungsmenge oder anderes Datum) erzeugt bewusst eine EIGENE neue
+    Zeile mit eigener, unabhängiger Kostenfolge - NIE stillschweigend
+    verschmolzen.
+
+    `mahnkosten_buchung_id` verweist (lose, ohne FK - wie an mehreren
+    Stellen in diesem Modul üblich, siehe `MahnkostenBuchungTable`-
+    Referenzen) auf die beim Import tatsächlich gebuchte
+    `MahnkostenBuchungTable`-Zeile (Zinsen-Delta + zu diesem Zeitpunkt
+    BEREITS freigegebene Kosten) - bleibt `NULL`, wenn beim Import nichts
+    zu buchen war (z. B. Zinsdelta 0 und Mahnpauschale noch nicht
+    freigegeben). Eine SPÄTER erteilte Freigabe löst HIER NOCH KEINE
+    automatische Nachbuchung aus (siehe `OFFENE_PUNKTE.md` - das würde
+    die bestehende `uq_mahnkosten_lauf`-Eindeutigkeit berühren und ist
+    bewusst NICHT unter Zeitdruck in dieses Modul hineinimprovisiert)."""
+
+    __tablename__ = "manueller_mahnversand"
+    __table_args__ = (
+        UniqueConstraint("idempotenz_schluessel", name="uq_manueller_mahnversand_idempotenz"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertrag_id: Mapped[str] = mapped_column(ForeignKey("vertraege.id"), index=True)
+    stufe: Mapped[int] = mapped_column(Integer)
+    forderung_op_position_ids_json: Mapped[str] = mapped_column(Text)
+    versanddatum: Mapped[date] = mapped_column(Date)
+    kanal: Mapped[str] = mapped_column(String(32))
+    empfaenger_name: Mapped[str] = mapped_column(String(256))
+    empfaenger_adresse: Mapped[str] = mapped_column(Text)
+    beleg_referenz: Mapped[str] = mapped_column(String(256))
+    beleg_pdf_bytes: Mapped[bytes] = mapped_column(LargeBinary)
+    beleg_sha256: Mapped[str] = mapped_column(String(64))
+    idempotenz_schluessel: Mapped[str] = mapped_column(String(64))
+    erfasst_von: Mapped[str] = mapped_column(String(128))
+    erfasst_am: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    mahnkosten_buchung_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
 class MahnpauschaleFreigabeTable(Base):
     """Auftrag HV-20261019-MAHNKOSTEN, ZWEITE Nachbesserung (Codex-
     Rückprüfung 19.10.2026): dokumentierte EINZELFALL-Freigabe der

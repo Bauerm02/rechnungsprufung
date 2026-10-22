@@ -2191,3 +2191,75 @@ def test_mahnpauschale_freigabe_fuer_dieselbe_gruppe_zweimal_schlaegt_fehl(koste
     kosten_repo.mahnpauschale_freigabe_anlegen(**kwargs)
     with pytest.raises(Exception):
         kosten_repo.mahnpauschale_freigabe_anlegen(**kwargs)
+
+
+# -- Nachbuchung nach SPÄTER erteilter Freigabe (Auftrag HV-20261022-EIN- --
+# -KONTOBLATT, Punkt 3 - verbindlicher Teil des Auftrags): ein tatsächlicher
+# Versand/Manualimport OHNE Freigabe darf eine später erteilte Freigabe NIE
+# stillschweigend verschlucken - genau EINE Nachbuchung, nie Zinseszinsen,
+# idempotent.
+
+
+def test_nachbuchung_bucht_genau_einmal_nach_spaeter_erteilter_freigabe(
+    op_service, kosten_service, kosten_repo, admin_ctx, basis_vertrag,
+):
+    vertrag, konto = basis_vertrag
+    op_service.buchen(
+        ctx=admin_ctx, konto=konto, typ=OPTyp.SOLL, betrag_cent=50_000,
+        belegdatum=date(2026, 1, 1), buchungsdatum=date(2026, 1, 1),
+        faelligkeit=date(2026, 1, 5), beleg_referenz="HMZ Jänner",
+    )
+    # Tatsächlicher Versand OHNE Freigabe: Zinsen werden (falls fällig)
+    # gebucht, die Pauschale NICHT (siehe `test_mahnpauschale_ohne_
+    # dokumentierte_einzelfallfreigabe_bleibt_automatisch_gesperrt`).
+    vorschau_vor_versand = kosten_service.vorschau(vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1))
+    forderung_ids = list(vorschau_vor_versand.forderung_op_position_ids)
+    kosten_service.buche_bei_versand(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, heute=date(2026, 2, 1),
+        versandnachweis_referenz="mahnung:ohne-freigabe", akteur="test",
+    )
+    pauschale_zeilen_vor_freigabe = [
+        p for p in op_service.berechne_saldo(konto.id, stichtag=date(2026, 2, 1)).positionen
+        if p.aenderungsgrund == "Mahnkosten - Mahnkostenpauschale"
+    ]
+    assert not pauschale_zeilen_vor_freigabe  # 0 EUR gebucht - "in Prüfung", nicht erfunden
+
+    # Freigabe wird ERST JETZT erteilt (derselbe Weg wie im Backoffice:
+    # Freigabe-Route berechnet die Forderungsgruppe exakt wie oben).
+    freigabe = _freigabe_fuer(
+        kosten_repo, op_service, kosten_service, vertrag_id=vertrag.id, stufe=1,
+        konto_id=konto.id, heute=date(2026, 2, 1), betrag_cent=2000,
+    )
+
+    ledger = kosten_service.nachbuche_offene_kosten(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, forderung_op_position_ids=forderung_ids,
+        heute=date(2026, 2, 1), akteur="test", ausloeser_referenz=f"FREIGABE:{freigabe.id}",
+    )
+    assert ledger is not None
+    assert ledger.mahnpauschale_cent == 2000
+    assert ledger.zinsen_cent == 0  # Nachbuchung bucht NIE Zinsen (siehe Docstring)
+
+    pauschale_zeilen_nach_nachbuchung = [
+        p for p in op_service.berechne_saldo(konto.id, stichtag=date(2026, 2, 1)).positionen
+        if p.aenderungsgrund == "Mahnkosten - Mahnkostenpauschale"
+    ]
+    assert len(pauschale_zeilen_nach_nachbuchung) == 1
+    assert pauschale_zeilen_nach_nachbuchung[0].betrag_cent == 2000
+
+    # Idempotenz: derselbe Trigger (dieselbe Freigabe-Id) bucht NIE ein
+    # zweites Mal, auch bei wiederholtem Aufruf (z. B. Doppelklick auf die
+    # Freigabe-Route).
+    zweiter_versuch = kosten_service.nachbuche_offene_kosten(
+        ctx=admin_ctx, vertrag_id=vertrag.id, stufe=1, forderung_op_position_ids=forderung_ids,
+        heute=date(2026, 2, 1), akteur="test", ausloeser_referenz=f"FREIGABE:{freigabe.id}",
+    )
+    # Idempotent über die IntegrityError-Rücklese (derselbe Override-
+    # Schlüssel kollidiert mit der bereits bestehenden Zeile) - liefert
+    # DIESELBE Zeile zurück, bucht aber NIE ein zweites Mal.
+    assert zweiter_versuch is not None
+    assert zweiter_versuch.id == ledger.id
+    pauschale_zeilen_nach_retry = [
+        p for p in op_service.berechne_saldo(konto.id, stichtag=date(2026, 2, 1)).positionen
+        if p.aenderungsgrund == "Mahnkosten - Mahnkostenpauschale"
+    ]
+    assert len(pauschale_zeilen_nach_retry) == 1  # weiterhin genau EINE Buchung, kein zweites Mal

@@ -116,6 +116,7 @@ class MahnwesenService:
         brief_transport_verfuegbar: bool = False,
         mitmieter_repository=None,
         empfaenger_zugang_repository: MahnEmpfaengerZugangRepository | None = None,
+        manueller_mahnversand_repository=None,
     ):
         self._repository = repository
         self._stammdaten_repository = stammdaten_repository
@@ -152,6 +153,11 @@ class MahnwesenService:
         # mahnlauf`/`zugang_bestaetigen_fuer_empfaenger`.
         self._mitmieter_repository = mitmieter_repository
         self._empfaenger_zugang_repository = empfaenger_zugang_repository
+        # Auftrag HV-20261022-EIN-KONTOBLATT: optional, Default `None` -
+        # ohne konfiguriertes Repository bleibt das Verhalten UNVERÄNDERT
+        # (kein Doppelversand-Gate gegen manuell importierte Mahnungen,
+        # exakt wie vor diesem Auftrag), siehe `plane_mahnlauf`.
+        self._manueller_mahnversand_repository = manueller_mahnversand_repository
 
     def _resolve_kanal(self, stufe: int) -> str:
         """Liefert den für `stufe` (1-4) tatsächlich zu verwendenden
@@ -875,6 +881,19 @@ class MahnwesenService:
         )
         if bestehende_offene_gruppe is not None:
             return bestehende_offene_gruppe
+
+        # Auftrag HV-20261022-EIN-KONTOBLATT: liegt für (Vertrag, Stufe)
+        # bereits ein kontrolliert importierter Nachweis eines TATSÄCHLICH
+        # manuell (außerhalb dieses Systems) versendeten Mahnschreibens
+        # vor, wird HIER KEINE neue automatische Bündelung für dieselbe
+        # Stufe gebildet - das würde sonst einen echten Doppelversand für
+        # denselben (Vertrag, Stufe)-Vorgang erzeugen. Rein additiv (siehe
+        # `_manueller_mahnversand_repository`-Docstring): ändert KEINEN
+        # MahnFall-/Mahnlauf-Status, blockiert nur die NEUE Bündelung.
+        if self._manueller_mahnversand_repository is not None and self._manueller_mahnversand_repository.vorhanden_fuer_stufe(
+            vertrag_id=vertrag.id, stufe=stufe,
+        ):
+            return None
 
         aktuelle_policy = self._mahn_policy_repository.aktuelle_freigegebene()
         # Der Kanal DIESER Gruppe wird HIER EINMAL für die ganze Stufe

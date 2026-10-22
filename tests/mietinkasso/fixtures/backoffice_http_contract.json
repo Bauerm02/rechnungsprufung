@@ -1162,6 +1162,42 @@
       ]
     },
     {
+      "path": "/backoffice/vertrag/{vertrag_id}/manueller-mahnversand",
+      "method": "GET",
+      "endpoint": "manueller_mahnversand_liste",
+      "resolved_endpoint": "manueller_mahnversand_liste",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/manueller-mahnversand",
+      "method": "POST",
+      "endpoint": "manueller_mahnversand_absenden",
+      "resolved_endpoint": "manueller_mahnversand_absenden",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/manueller-mahnversand/{row_id}/beleg.pdf",
+      "method": "GET",
+      "endpoint": "manueller_mahnversand_beleg_pdf",
+      "resolved_endpoint": "manueller_mahnversand_beleg_pdf",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
       "path": "/backoffice/vertrag/{vertrag_id}/mietvertragsprofil/bearbeiten",
       "method": "GET",
       "endpoint": "vertragsanlage_bearbeiten_formular",
@@ -1310,6 +1346,30 @@
       "method": "POST",
       "endpoint": "zahlungsziel_bindung_bestaetigen",
       "resolved_endpoint": "zahlungsziel_bindung_bestaetigen",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/zinsabrechnung",
+      "method": "GET",
+      "endpoint": "zinsabrechnung_vorschau_route",
+      "resolved_endpoint": "zinsabrechnung_vorschau_route",
+      "dependencies": [
+        {
+          "call": "_current_session",
+          "children": []
+        }
+      ]
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/zinsabrechnung/bestaetigen",
+      "method": "POST",
+      "endpoint": "zinsabrechnung_bestaetigen",
+      "resolved_endpoint": "zinsabrechnung_bestaetigen",
       "dependencies": [
         {
           "call": "_current_session",
@@ -2102,6 +2162,27 @@
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
     },
     {
+      "path": "/backoffice/vertrag/{vertrag_id}/manueller-mahnversand",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/manueller-mahnversand",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/manueller-mahnversand/{row_id}/beleg.pdf",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
       "path": "/backoffice/vertrag/{vertrag_id}/mietvertragsprofil/bearbeiten",
       "method": "get",
       "status": 503,
@@ -2193,6 +2274,20 @@
       "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
     },
     {
+      "path": "/backoffice/vertrag/{vertrag_id}/zinsabrechnung",
+      "method": "get",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
+      "path": "/backoffice/vertrag/{vertrag_id}/zinsabrechnung/bestaetigen",
+      "method": "post",
+      "status": 503,
+      "location": null,
+      "body_sha256": "5701bca331986d6110f3530c5d250da8153c4512c347f58b3abbb2eb20399fbf"
+    },
+    {
       "path": "/backoffice/vertrag/{vertrag_id}/zinsprofil",
       "method": "get",
       "status": 503,
@@ -2250,5 +2345,5 @@
     }
   ],
   "session_dependency_count": 1,
-  "baseline_commit": "e095c73fa148f2a6ce8b8e0b8e9ab7735a8120d0 + HV-20261001-BK-AUTOMATIK + HV-20261019-MAHNKOSTEN + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS (additiv: native Rücklastschrift+Bankentgelt-Route) + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS Teil 3 (additiv: Mahnbrief-Archiv-/Anbieterbeleg-Routen) + HV-20261020-KONTOBLATT-KOSTEN (additiv: Kontoauszug-PDF-Route) + HV-20261020-VERTRAGSDATENBASIS (additiv: zentrale Vertragsübersicht Objekt-/Mieterfilter, Parteien-Route) + HV-20261020-MAHN-FORTSETZUNG (additiv: Mahn-Kanalregel-Backoffice-UI, Mitmieter-/Zugangsnachweis-Übersicht je Vertrag) + HV-20261021-ABSCHLUSS (additiv: sichere Einzel-Nachsende-Route je Mitmieter-Zugangsnachweis) + HV-20261021-ABSCHLUSS Zahlungsziel-Versandgate (additiv: bedienbare Zahlungsziel-Bindungs-Route bei mehreren Bankkonten)"
+  "baseline_commit": "e095c73fa148f2a6ce8b8e0b8e9ab7735a8120d0 + HV-20261001-BK-AUTOMATIK + HV-20261019-MAHNKOSTEN + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS (additiv: native Rücklastschrift+Bankentgelt-Route) + HV-20261019-VERSAND-KOSTEN-ABSCHLUSS Teil 3 (additiv: Mahnbrief-Archiv-/Anbieterbeleg-Routen) + HV-20261020-KONTOBLATT-KOSTEN (additiv: Kontoauszug-PDF-Route) + HV-20261020-VERTRAGSDATENBASIS (additiv: zentrale Vertragsübersicht Objekt-/Mieterfilter, Parteien-Route) + HV-20261020-MAHN-FORTSETZUNG (additiv: Mahn-Kanalregel-Backoffice-UI, Mitmieter-/Zugangsnachweis-Übersicht je Vertrag) + HV-20261021-ABSCHLUSS (additiv: sichere Einzel-Nachsende-Route je Mitmieter-Zugangsnachweis) + HV-20261021-ABSCHLUSS Zahlungsziel-Versandgate (additiv: bedienbare Zahlungsziel-Bindungs-Route bei mehreren Bankkonten) + HV-20261022-EIN-KONTOBLATT (additiv: Zinsabrechnung Preview/Bestätigen-Routen, Manualimport-Routen GET/POST/Beleg-PDF)"
 }

@@ -1,5 +1,223 @@
 # Offene Punkte — Mietinkasso-Modul
 
+## HV-20261022-EIN-KONTOBLATT: EIN gemeinsames chronologisches Kontoblatt,
+## Manualimport, Nachbuchung nach Freigabe, kanonischer Kontoauszug in der
+## Mahnpipeline (22.10.2026)
+
+Vollständig neuer Auftrag, Claude exklusiv Code-Autor, Codex übernimmt
+Abnahme/Deployment. Ausschließlich synthetische Testdaten, kein
+Serverzugriff, kein echter Versand/Buchung durch Claude. Implementiert
+auf dem freigegebenen Branch ab Commit `54f8f59`.
+
+### Gebaut
+
+1. **EIN chronologisches Journal statt getrennter Kategorietabellen**
+   (`op/kontoblatt.py::erstelle_journal`/`JournalZeile`): fasst
+   Hauptforderung/Kosten/Zahlungen EINES bereits aggregierten
+   `Kontoblatt` zu EINER nach `(Belegdatum, OP-Id)` sortierten Tabelle
+   mit laufendem Saldo zusammen - Datum, verständliche Buchungsart,
+   Soll/Haben, laufender Saldo, Beleg-/Forderungszuordnung. Reine
+   Anzeige-Umformung über bereits etablierten Werten (`_effect_cent`,
+   dieselbe Vorzeichenregel wie `op/service.py`) - KEINE zweite
+   Berechnung, der laufende Saldo endet beweisbar exakt bei
+   `Kontoblatt.saldo_cent`. Stornierte/ersetzte Zeilen (bisher: separate
+   "Kosten-Historie"-Karte, UND stornierte Hauptforderungszeilen nur
+   über die jetzt entfallende rohe OP-Tabelle sichtbar) erscheinen
+   chronologisch eingeordnet, grau markiert, mit `beeinflusst_saldo=
+   False` - additiv ergänztes `Kontoblatt.hauptforderung_historie`-Feld
+   (Default leer) hält bestehende Direktkonstruktionen in Tests
+   kompatibel.
+2. **EIN gemeinsames HTML-Rendering** (`backoffice/kontoblatt_render.py::
+   render_kontoblatt_html`) - identisch eingebettet in Kontoansicht
+   (`backoffice/routes/konten.py::kontoauszug`) UND Mieterakte
+   (`backoffice/routes/vertragsanlage.py`/`vertragsanlage_form.py`,
+   beide lesen jetzt `lade_kontoblatt` statt einer eigenen, abweichenden
+   Teilansicht). Die bisherige, redundante rohe OP-Tabelle in der
+   Kontoansicht ("doppelte widersprüchliche Gesamttabelle") entfällt;
+   Stornieren/Korrigieren- und Rücklastschriftkosten-erfassen-
+   Aktionslinks sind in die Journalzeilen migriert.
+3. **EIN gemeinsames PDF** (`op/kontoauszug_pdf.py::
+   erzeuge_kontoauszug_pdf`) rendert dasselbe `erstelle_journal`-Ergebnis
+   statt vormals fester Kategorie-Reihenfolge (Miete→Kosten→Zahlungen) -
+   chronologisch, darf mehrere Druckseiten haben, kein separates
+   Kosten-/Zinsblatt mehr.
+4. **Zinsabrechnung Preview→Bestätigen** (`kosten_service.py::
+   MahnkostenService.zinsabrechnung_vorschau`/`buche_zinsabrechnung`,
+   Routen `/vertrag/{id}/zinsabrechnung` GET/`...{id}/zinsabrechnung/
+   bestaetigen` POST): eigenständige Verzugszinsen-Buchung UNABHÄNGIG
+   von einem tatsächlichen Mahnversand, über eine Sentinel-Stufe
+   (`ZINSABRECHNUNG_STUFE=0`), entfernt dabei IMMER jede Gebühr/
+   Pauschale aus der zu buchenden Kopie - bucht garantiert NIE
+   Mahnspesen/-pauschale, NIE per GET, idempotent (kein Delta -> `None`).
+   Setzt KEINEN Mahnlauf-/Mahnfallstatus - kann strukturell keine falsche
+   "ein Schreiben wurde versendet"-Wirkung erzeugen.
+5. **Manualimport tatsächlich manuell versendeter Mahnungen**
+   (`mahnwesen/manueller_mahnversand_repository.py`/`_service.py`, neue
+   additive Tabelle `ManuellerMahnversandTable`, Backoffice-Routen
+   `/vertrag/{id}/manueller-mahnversand` GET/POST + geschützter
+   Beleg-PDF-Download): erfasst Vertrag/Stufe/Forderungsbindung/
+   Versanddatum/Kanal/Empfänger/Beleg(PDF+SHA) getrennt. Idempotenz-
+   Schlüssel bewusst aus Belegidentität (SHA) + Forderungsbindung +
+   Betragshistorie (Datum/Kanal) gebildet - NICHT aus `stufe+zins_bis`
+   oder `stufe+Forderungsgruppe` (siehe unabhängige Rückprüfung in der
+   Modul-Doku). Identischer Reimport ist No-Op, ein genuin abweichender
+   Beleg erzeugt eine EIGENE, unabhängige Zeile. Cross-Contract-/
+   Cross-Gesellschaft-Forderungen werden abgelehnt (jede Forderungs-Id
+   wird gegen das tatsächliche Konto des Vertrags geprüft). Bucht bei
+   Import über die BESTEHENDE `MahnkostenService.vorschau`/
+   `buche_vorschau` (kein zweites Buchungsmodul) - eine zum
+   Importzeitpunkt noch nicht freigegebene Mahnpauschale wird NICHT
+   gebucht (bleibt sichtbar ungebucht). `MahnwesenService.plane_mahnlauf`
+   blockiert jetzt die automatische Bündelung für ein (Vertrag, Stufe)
+   mit bereits vorhandenem Manualimport (kein Doppelversand), ohne
+   Mahnfall-/Mahnlauf-Status zu verändern. Routen verwenden dieselben
+   `require_gesellschaft_access`/`require_schreibrecht`/CSRF-Prüfungen
+   wie der Rest des Moduls.
+6. **Nachbuchung genau einmal nach später erteilter Freigabe**
+   (`kosten_service.py::MahnkostenService.nachbuche_offene_kosten`,
+   aufgerufen aus `backoffice/routes/mahnwesen.py::
+   mahnpauschale_freigabe_absenden` UND aus
+   `manueller_mahnversand_service.py::nachbuche_fuer_vertrag_stufe`):
+   wird eine Mahnpauschale-/§458-Freigabe NACH einem bereits
+   tatsächlich erfolgten (automatisierten oder Manualimport-)Versand
+   erteilt, löst die Freigabe-Route selbst genau EINE Nachbuchung für
+   jeden passenden Manualimport-Datensatz UND für den regulären
+   Vorschau-Pfad aus - niemals Zinsen (die bleiben ausschließlich an
+   Versand/Zinsabrechnung gebunden), nur die jetzt freigegebene
+   Gebühr/Pauschale. Reine Delegation an die bestehende `buche_vorschau`
+   über einen neuen, optionalen `mahnlauf_schluessel_override`-Parameter
+   (additiv, Default `None` erhält bisheriges Verhalten) - idempotent
+   über einen deterministischen, an die konkrete `MahnpauschaleFreigabeTable.id`
+   gebundenen Override-Schlüssel (ein zweiter Aufruf für dieselbe
+   Freigabe liefert dieselbe Zeile zurück, bucht nie doppelt).
+7. **Kanonischer Kontoauszug in der tatsächlichen Mahnpipeline, nicht nur
+   als separater Download** (`mahnwesen/kontoauszug_anhang.py`,
+   verdrahtet in `indexautomatik/mailversand_service.py::_sende_brief`/
+   `_baue_email_mahntext` UND in der Live-Vorschau `backoffice/routes/
+   mahnwesen.py::mahnbrief_pdf`): Kanal BRIEF hängt die tatsächlichen
+   Kontoauszug-PDF-Seiten (`lade_kontoblatt`/`erzeuge_kontoauszug_pdf`,
+   dieselbe Quelle wie Kontoansicht/Mieterakte) an das Mahnbrief-PDF an,
+   BEVOR es archiviert/übertragen wird (`haenge_kontoauszug_pdf_an`,
+   reine PDF-Seitenzusammenführung) - EIN physisches Dokument, auch für
+   jede Mitmieter-Kopie. Kanal EMAIL hat in diesem Codebase KEINE
+   Anhangsfähigkeit (`mailops_client.py::MailOpsAuftrag` ist reiner
+   Text) - dort wird derselbe kanonische Journalinhalt als
+   Text-Kurzfassung (`journal_als_text`) in den Mahntext eingebettet,
+   explizit als "Stand vor dieser Mahnung" markiert (zeigt nur bereits
+   gebuchte Werte, NIE die erst nach dem Versand gebuchten neuen
+   Zinsen/Gebühren dieses Mahnlaufs - "gebuchte Werte nicht vor
+   tatsächlichem Versand erfinden"). Die On-Demand-PDF-Vorschau
+   (`/vertrag/{id}/mahnbrief.pdf`) zeigt denselben Anhang, bleibt aber
+   ausdrücklich eine reine Live-Vorschau (kein Nachweis, kein Versand).
+
+### Outcome-Tests (gezielt, exakte Zahlen aus unabhängiger QA-Baseline)
+
+`tests/mietinkasso/test_kontoblatt.py`:
+`test_journal_synthetisches_zahlenbeispiel_ergibt_schlussaldo_627_60`
+(SYNRENT +1000/1.4., SYNPAY -400/2.4., SYNFEE +20/3.4., SYNBANK +7/4.4.,
+SYNINT +0,60/5.4. -> Schlussaldo exakt 627,60 EUR, chronologische
+Reihenfolge, korrekte Soll/Haben-Verteilung) und
+`test_journal_html_und_pdf_zeigen_identischen_schlussaldo_und_reihenfolge`
+(dieselben Zahlen, HTML- UND PDF-Rendering zeigen identischen Saldo UND
+identische chronologische Reihenfolge - keine zweite Engine).
+`tests/mietinkasso/test_mahnwesen_kosten.py::
+test_nachbuchung_bucht_genau_einmal_nach_spaeter_erteilter_freigabe`
+(Versand ohne Freigabe -> 0 EUR Pauschale gebucht, Freigabe später
+erteilt -> genau 1 Nachbuchung, Wiederholung derselben Freigabe bleibt
+idempotent). `tests/mietinkasso/test_manueller_mahnversand.py` (11
+Tests: Idempotenzschlüssel-Formel, identischer Reimport = No-Op, genuin
+abweichender Beleg = eigene Zeile, Cross-Contract-/Cross-Gesellschaft-/
+Schreibrecht-Ablehnung, kein echtes PDF wird abgelehnt, Buchung bei
+Import ohne/mit vorhandener Freigabe, Doppelversand-Gate in
+`plane_mahnlauf` inkl. Regressionssicherung der normalen Bündelung ohne
+Manualimport). Bestehende `test_kontoauszug_pdf.py`/`test_backoffice.py`-
+Tests, die noch auf die alte Kategorie-Ansicht ("Kostenübersicht",
+"Kosten-Historie"-Karte, "davon noch offen: <strong>...") prüften,
+wurden auf die neue, gleichwertig geprüfte Journal-Darstellung
+umgestellt (keine Fachlogik geändert, nur Textassertions). Zwei PDF-
+Tests zusätzlich gegen einen `pypdf`-Extraktionsartefakt gehärtet
+(mehrfache Leerzeichen um die neue gemeinsame Summenzeile werden jetzt
+normalisiert, kein Inhaltsverlust). HTTP-Routen-Vertragstest
+(`test_backoffice_contract.py`) auf die fünf neuen Routen aktualisiert
+(additiv, keine entfernt/geändert). Gesamtsuite `tests/mietinkasso`
+(1706 Tests) grün.
+
+### Ausdrücklich offen / NICHT unter Zeitdruck improvisiert
+
+- **Entscheidung über `uq_mahnkosten_lauf` bei künftigen, genuin neuen
+  Nachbuchungsfällen:** `nachbuche_offene_kosten` löst den konkret
+  beauftragten Fall (Mahnpauschale-Freigabe nach bereits erfolgtem
+  Versand/Manualimport) sauber über einen deterministischen Override-
+  Schlüssel, OHNE die bestehende `MahnkostenBuchungTable.
+  uq_mahnkosten_lauf`-Eindeutigkeit (vertrag_id+stufe+mahnlauf_
+  schluessel) anzutasten. Ein genereller, von Markus/Codex noch nicht
+  entschiedener Fachentscheid - z. B. ob/wie mehrere unabhängige
+  Nachbuchungen zu DEMSELBEN ursprünglichen Mahnlauf künftig generisch
+  (nicht nur für Mahnpauschale-Freigaben) modelliert werden sollen -
+  wurde bewusst NICHT vorweggenommen.
+- **`require_schreibrecht` fehlt in mehreren bestehenden, NICHT von
+  diesem Auftrag neu geschaffenen Schreibrouten in `backoffice/routes/
+  konten.py`** (`nachbuchung_absenden`, `korrektur_absenden`,
+  `ruecklastschriftkosten_absenden`, `eroeffnung_verbuchen` - bereits VOR
+  diesem Auftrag so, Commit `54f8f59` bestätigt) - diese prüfen nur
+  `require_gesellschaft_access`, nicht zusätzlich die Rolle. Die NEUE
+  `zinsabrechnung_bestaetigen`-Route folgt demselben (unvollständigen)
+  bestehenden Muster dieser Datei, NICHT dem in `backoffice/routes/
+  mahnwesen.py` etablierten vollständigen Muster (dort IMMER beides). Im
+  Gegensatz dazu prüfen alle NEUEN Manualimport-Routen in `mahnwesen.py`
+  korrekt beides. Eine Nachschärfung aller Schreibrouten in `konten.py`
+  auf `require_schreibrecht` wäre ein sinnvoller, aber eigenständiger,
+  hier bewusst nicht mitgezogener Folgeauftrag (reine Scope-Erweiterung
+  über HV-20261022-EIN-KONTOBLATT hinaus).
+- **Mahnpauschale-Freigabeformular/-route (`mahnwesen.py::
+  mahnpauschale_freigabe_formular`) scopt die Vorschau weiterhin NICHT
+  auf `nur_op_position_ids`** - für einen Manualimport, dessen
+  Forderungsmenge eine ECHTE Teilmenge der insgesamt offenen Forderungen
+  dieser Stufe ist (z. B. weitere Miete ist seither aufgelaufen), kann
+  die am Freigabeformular angezeigte/berechnete Forderungsgruppe von der
+  im Manualimport eingefrorenen Menge abweichen - `nachbuche_fuer_
+  vertrag_stufe` vergleicht beide Schlüssel exakt und bucht dann
+  schlicht nichts nach, statt falsch zu buchen (sicher, aber in diesem
+  Randfall nicht automatisch selbstheilend). Eine explizite, vom
+  Manualimport-Datensatz ausgehende "Freigabe für genau diese
+  Forderungsmenge erteilen"-Eingabemöglichkeit wäre die sauberere
+  Lösung, wurde aber nicht gebaut.
+- **Keine echte Volllauf-Verifikation des Mahnbrief-PDF-Anhangs gegen
+  einen TATSÄCHLICHEN SFTP-Versand** - die Verdrahtung in `_sende_brief`
+  wurde gegen die bestehende Testsuite (`test_hv_mailversand.py`, 42
+  Tests weiterhin grün) geprüft, es existiert aber kein NEUER, gezielter
+  Test, der explizit öffnet/prüft, dass die archivierten
+  `MahnbriefArchivTable.pdf_bytes` tatsächlich die angehängten
+  Kontoauszug-Seiten enthalten (nur die Kontoblatt-/Journal-Logik selbst
+  ist gezielt getestet). Sollte vor Produktivbetrieb noch gezielt
+  nachgezogen werden.
+
+### Geänderte/neue Dateien
+
+Neu: `src/mietinkasso/backoffice/kontoblatt_render.py`,
+`src/mietinkasso/mahnwesen/manueller_mahnversand_repository.py`,
+`src/mietinkasso/mahnwesen/manueller_mahnversand_service.py`,
+`src/mietinkasso/mahnwesen/kontoauszug_anhang.py`,
+`tests/mietinkasso/test_manueller_mahnversand.py`.
+
+Geändert: `src/mietinkasso/op/kontoblatt.py` (`erstelle_journal`/
+`JournalZeile`, `hauptforderung_historie`), `src/mietinkasso/op/
+kontoauszug_pdf.py` (chronologisches Journal statt Kategorie-Abschnitte),
+`src/mietinkasso/backoffice/routes/konten.py` (gemeinsames Rendering,
+Zinsabrechnung-Routen, redundante OP-Tabelle entfernt),
+`src/mietinkasso/backoffice/routes/vertragsanlage.py`/
+`vertragsanlage_form.py` (Mieterakte liest `lade_kontoblatt`),
+`src/mietinkasso/mahnwesen/kosten_service.py`
+(`zinsabrechnung_vorschau`/`buche_zinsabrechnung`/
+`nachbuche_offene_kosten`, `mahnlauf_schluessel_override`),
+`src/mietinkasso/mahnwesen/service.py` (Doppelversand-Gate in
+`plane_mahnlauf`), `src/mietinkasso/backoffice/routes/mahnwesen.py`
+(Manualimport-Routen, Nachbuchung nach Freigabe),
+`src/mietinkasso/indexautomatik/mailversand_service.py`
+(Manualimport-/Nachbuchungs-Service verdrahtet, Kontoauszug-Anhang in
+Brief/E-Mail), `src/mietinkasso/infrastructure/db/tables.py`
+(`ManuellerMahnversandTable`, additiv), diverse Testdateien (siehe oben).
+
 ## Abnahmefix zu 9f32a87 (Codex-Live-Sichtprüfung 21.10.2026): Mahnkosten-
 ## Vorschau zeigte Vier-Stufen-Policy nur als Zwei-Stufen an (TEILCHECKPOINT,
 ## KEIN Gesamtabschluss der Mahnarbeiten)

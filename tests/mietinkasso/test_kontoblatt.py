@@ -28,6 +28,7 @@ from mietinkasso.op.kontoblatt import (
     STATUS_OFFEN,
     STATUS_STORNIERT,
     STATUS_TEILBEZAHLT,
+    erstelle_journal,
     erstelle_kontoblatt,
 )
 
@@ -644,3 +645,102 @@ def test_lade_kontoblatt_gegen_echte_repositories(op_service, admin_ctx, ctx_fac
     echter_saldo = op_service.berechne_saldo(konto.id).saldo_cent
     assert blatt.saldo_cent == echter_saldo
     assert blatt.hauptforderung_cent + blatt.kosten_cent + blatt.zahlungen_saldo_cent == echter_saldo
+
+
+# -- EIN gemeinsames chronologisches Journal (Auftrag HV-20261022-EIN- -----
+# -KONTOBLATT) - unabhängige QA-Baseline, wörtliches Zahlenbeispiel: SYNRENT
+# (+1000 am 1.4.), SYNPAY (-400 am 2.4.), SYNFEE (+20 am 3.4., ein
+# tatsächlich versendetes, kostenfreigegebenes Mahnschreiben), SYNBANK (+7
+# am 4.4., geprüft/zugerechnete Rücklastschriftkosten), SYNINT (+0.60 am
+# 5.4., gebuchtes Zinsdelta) -> erwarteter Schlussaldo 627,60 EUR.
+
+
+def test_journal_synthetisches_zahlenbeispiel_ergibt_schlussaldo_627_60():
+    rent = _op(1, "SOLL", 100_000, belegdatum=date(2026, 4, 1), beleg_referenz="SYNRENT")
+    pay = _op(2, "ZAHLUNG", 40_000, belegdatum=date(2026, 4, 2), beleg_referenz="SYNPAY")
+    fee = _op(3, "SOLL", 2_000, belegdatum=date(2026, 4, 3), beleg_referenz="SYNFEE")
+    bank = _op(4, "SOLL", 700, belegdatum=date(2026, 4, 4), beleg_referenz="SYNBANK")
+    zins = _op(5, "SOLL", 60, belegdatum=date(2026, 4, 5), beleg_referenz="SYNINT")
+
+    # SYNFEE+SYNINT stammen aus DEMSELBEN tatsächlichen Mahnversand
+    # (ein Mahnlauf kann Zinsen UND Gebühr gleichzeitig buchen) - EIN
+    # `MahnkostenBuchungTable`-Beleg mit beiden Referenzen, wie es
+    # `kosten_service.py::buche_vorschau` auch tatsächlich anlegt.
+    buchung = _buchung(gebuehr_op_position_id=3, zinsen_op_position_id=5, versandnachweis_referenz="mahnung:V-601-1:stufe1:2026-04-05")
+    # SYNBANK: geprüfte/zugerechnete Rücklastschriftkosten - ECHTE
+    # Forderung gebucht (kosten_op_position_id gesetzt), NICHT nur
+    # dokumentarisch.
+    bank_kosten = _ruecklastschrift_kosten(kosten_op_position_id=4, ruecklastschrift_op_position_id=99, bankentgelt_cent=700)
+
+    blatt = _leer(
+        saldo_cent=100_000 - 40_000 + 2_000 + 700 + 60,
+        positionen_aktiv=[rent, pay, fee, bank, zins], positionen_alle=[rent, pay, fee, bank, zins],
+        mahnkosten_buchungen=[buchung], ruecklastschriftkosten_zeilen=[bank_kosten],
+    )
+    assert blatt.saldo_cent == 62_760  # 627,60 EUR
+
+    journal = erstelle_journal(blatt)
+    # EIN gemeinsames Journal - alle fünf Buchungsarten in EINER Liste,
+    # chronologisch, keine Kategorie-Gruppierung.
+    assert [jz.beleg_referenz for jz in journal] == ["SYNRENT", "SYNPAY", "SYNFEE", "SYNBANK", "SYNINT"]
+    assert [jz.datum for jz in journal] == [date(2026, 4, d) for d in (1, 2, 3, 4, 5)]
+    # Soll/Haben korrekt verteilt (Miete/Gebühr/Bankkosten/Zinsen Soll,
+    # Zahlung Haben).
+    assert [(jz.soll_cent, jz.haben_cent) for jz in journal] == [
+        (100_000, 0), (0, 40_000), (2_000, 0), (700, 0), (60, 0),
+    ]
+    # Laufender Saldo wächst/schrumpft Zeile für Zeile und endet exakt
+    # beim Schlussaldo - KEINE zweite, abweichende Berechnung.
+    assert [jz.laufender_saldo_cent for jz in journal] == [100_000, 60_000, 62_000, 62_700, 62_760]
+    assert journal[-1].laufender_saldo_cent == blatt.saldo_cent == 62_760
+    assert all(jz.beeinflusst_saldo for jz in journal)  # keine Historie-Zeile in diesem Beispiel
+
+
+def test_journal_html_und_pdf_zeigen_identischen_schlussaldo_und_reihenfolge():
+    """Dasselbe Zahlenbeispiel wie oben - HTML-Rendering (Kontoansicht/
+    Mieterakte, identische Funktion) UND PDF-Rendering lesen beide
+    AUSSCHLIESSLICH `erstelle_journal(blatt)` - niemals eine zweite,
+    unabhängig berechnete Darstellung."""
+
+    from mietinkasso.backoffice.kontoblatt_render import render_kontoblatt_html
+    from mietinkasso.mahnwesen.brief_pdf import Absender
+    from mietinkasso.op.kontoauszug_pdf import erzeuge_kontoauszug_pdf
+    from pypdf import PdfReader
+    import io
+
+    rent = _op(1, "SOLL", 100_000, belegdatum=date(2026, 4, 1), beleg_referenz="SYNRENT")
+    pay = _op(2, "ZAHLUNG", 40_000, belegdatum=date(2026, 4, 2), beleg_referenz="SYNPAY")
+    fee = _op(3, "SOLL", 2_000, belegdatum=date(2026, 4, 3), beleg_referenz="SYNFEE")
+    bank = _op(4, "SOLL", 700, belegdatum=date(2026, 4, 4), beleg_referenz="SYNBANK")
+    zins = _op(5, "SOLL", 60, belegdatum=date(2026, 4, 5), beleg_referenz="SYNINT")
+    buchung = _buchung(gebuehr_op_position_id=3, zinsen_op_position_id=5, versandnachweis_referenz="mahnung:V-601-1:stufe1:2026-04-05")
+    bank_kosten = _ruecklastschrift_kosten(kosten_op_position_id=4, ruecklastschrift_op_position_id=99, bankentgelt_cent=700)
+    blatt = _leer(
+        saldo_cent=62_760, positionen_aktiv=[rent, pay, fee, bank, zins], positionen_alle=[rent, pay, fee, bank, zins],
+        mahnkosten_buchungen=[buchung], ruecklastschriftkosten_zeilen=[bank_kosten],
+    )
+
+    html = render_kontoblatt_html(blatt, konto_id="K-1")
+    for marker in ("SYNRENT", "SYNPAY", "SYNFEE", "SYNBANK", "SYNINT"):
+        assert marker in html
+    assert "627,60" in html  # Schlussaldo/Gesamtsaldo
+
+    absender = Absender(
+        name="JLB Projects GmbH", adresse="Marc-Aurel-Straße 4/16, 1010 Wien",
+        fn="FN 631126b, Handelsgericht Wien", uid="ATU81269707", telefon="+43 1 435 10 11",
+        website="jlb-immo.at", email="hausverwaltung@jlb-immo.at",
+        farbe_anthrazit="#1F2125", farbe_gold="#C9A86A",
+    )
+    pdf_bytes = erzeuge_kontoauszug_pdf(
+        absender=absender, objekt_bezeichnung="Am Corso, Top 3", einheit_bezeichnung="", debitor_name="Max Mustermieter",
+        vertrag_id="V-601-1", konto_id="K-1", heute=date(2026, 4, 5), kontoblatt=blatt,
+    )
+    pdf_text = " ".join("".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages).split())
+    for marker in ("SYNRENT", "SYNPAY", "SYNFEE", "SYNBANK", "SYNINT"):
+        assert marker in pdf_text
+    assert "627,60" in pdf_text
+    # Chronologische Reihenfolge auch im PDF (nicht mehr Kategorie-
+    # Reihenfolge Miete/Fee/Bank/Zins/Zahlung) - jeder Marker erscheint
+    # strikt NACH dem vorigen.
+    positionen = [pdf_text.index(m) for m in ("SYNRENT", "SYNPAY", "SYNFEE", "SYNBANK", "SYNINT")]
+    assert positionen == sorted(positionen)

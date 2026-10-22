@@ -303,6 +303,16 @@ class Kontoblatt:
     zahlungen_saldo_cent: int
     dokumentierte_bankaufwaende: list[DokumentierterBankaufwand]
     ausstehende_mahnlaeufe: list[MahnLaufTable]
+    #: Bereits STORNIERTE (ggf. ERSETZTE) Hauptforderungszeilen - additiv
+    #: ergänzt (Auftrag HV-20261022-EIN-KONTOBLATT), symmetrisch zu
+    #: `kosten_historie`, aber für die Hauptforderungs-Kategorie. Default
+    #: leer, damit bestehende direkte `Kontoblatt(...)`-Konstruktionen in
+    #: Tests ohne dieses Feld unverändert weiterlaufen. Wird benötigt,
+    #: damit das EINE chronologische Journal (`erstelle_journal`) eine
+    #: stornierte/ersetzte Miet-/Zahlungszeile weiterhin nachvollziehbar
+    #: zeigt, nachdem die bisherige, redundante rohe OP-Tabelle
+    #: (`konten.py::op_tabelle`) entfällt.
+    hauptforderung_historie: list[KontoblattZeile] = field(default_factory=list)
 
 
 def _buchungs_id_kategorie(buchungen: list[MahnkostenBuchungTable]) -> dict[int, str]:
@@ -568,6 +578,15 @@ def erstelle_kontoblatt(
     # ID verweisen - diese Fremdreferenzen werden bei einer Korrektur NIE
     # nachträglich umgeschrieben.
     kosten_historie: list[KontoblattZeile] = []
+    # Additiv ergänzt (Auftrag HV-20261022-EIN-KONTOBLATT): bis hierher
+    # wurde eine stornierte/ersetzte Hauptforderungszeile (z. B. eine
+    # korrigierte Miet-/Zahlungsbuchung) bewusst übersprungen - sie blieb
+    # ausschließlich über die separate rohe OP-Tabelle sichtbar
+    # (`konten.py::op_tabelle`). Mit dem EINEN chronologischen Journal
+    # entfällt diese zweite Tabelle, deshalb wird sie jetzt ins eigene,
+    # symmetrische `hauptforderung_historie`-Feld aufgenommen statt
+    # stillschweigend zu verschwinden.
+    hauptforderung_historie: list[KontoblattZeile] = []
     for p in positionen_alle:
         if p.status != "STORNIERT":
             continue
@@ -575,11 +594,13 @@ def erstelle_kontoblatt(
             p, buchungs_id_kategorie=buchungs_kategorie, ruecklastschriftkosten_ids=ruecklastschriftkosten_ids,
             vorgaenger_index=vorgaenger_index,
         )
-        if kategorie == KATEGORIE_HAUPTFORDERUNG:
-            continue
         ledger = _ledger_fuer(kategorie, buchungen_by_id.get(quelle_id)) if quelle_id is not None else None
         status = STATUS_ERSETZT if p.storniert_durch_id is not None else STATUS_STORNIERT
-        kosten_historie.append(KontoblattZeile(position=p, kategorie=kategorie, rest_cent=None, status=status, ledger=ledger))
+        zeile = KontoblattZeile(position=p, kategorie=kategorie, rest_cent=None, status=status, ledger=ledger)
+        if kategorie == KATEGORIE_HAUPTFORDERUNG:
+            hauptforderung_historie.append(zeile)
+        else:
+            kosten_historie.append(zeile)
 
     # Codex-Abnahme 20.10.2026, P2: das tatsächliche Rückgabedatum kommt
     # aus der gebundenen Rücklastschrift-OP-Zeile (`belegdatum`), NICHT
@@ -612,7 +633,126 @@ def erstelle_kontoblatt(
         kosten_historie=kosten_historie,
         zahlungen_zeilen=zahlungen_zeilen, zahlungen_saldo_cent=zahlungen_saldo_cent,
         dokumentierte_bankaufwaende=dokumentierte_bankaufwaende, ausstehende_mahnlaeufe=ausstehende_mahnlaeufe,
+        hauptforderung_historie=hauptforderung_historie,
     )
+
+
+#: Anzeige-Bezeichnung je Buchungsart im Journal (Auftrag HV-20261022-
+#: EIN-KONTOBLATT) - rein deskriptiv, KEINE neue Typisierung: beruht
+#: ausschließlich auf dem bereits vorhandenen `OPTyp` + derselben
+#: Kategorie-Zuordnung, die `kosten_zeilen`/`hauptforderung_zeilen` schon
+#: verwenden.
+_BUCHUNGSART_KOSTEN_LABEL = {
+    KATEGORIE_VERZUGSZINSEN: "Zinsen",
+    KATEGORIE_MAHNSPESEN: "Mahnspesen (§458 UGB)",
+    KATEGORIE_MAHNPAUSCHALE: "Mahngebühr (§1333 Abs 2 ABGB)",
+    KATEGORIE_RUECKLASTSCHRIFTKOSTEN: "Bankkosten (Rücklastschrift-Entgelt)",
+}
+
+
+def _buchungsart_label(position: OPPositionTable, kategorie: str) -> str:
+    typ = position.typ
+    if typ == OPTyp.EROEFFNUNG.value:
+        return "Eröffnung"
+    if typ == OPTyp.ZAHLUNG.value:
+        return "Zahlung"
+    if typ == OPTyp.GUTSCHRIFT.value:
+        return "Gutschrift"
+    if typ == OPTyp.RUECKLASTSCHRIFT.value:
+        return "Retourkapital (Rücklastschrift)"
+    if typ == OPTyp.KORREKTUR.value:
+        return "Korrektur"
+    if typ == OPTyp.SOLL.value:
+        return _BUCHUNGSART_KOSTEN_LABEL.get(kategorie, "Miete/Vorschreibung")
+    return typ
+
+
+def _forderungsbezug(zeile: KontoblattZeile) -> str:
+    """Beleg-/Forderungszuordnung EINER Journalzeile - für eine Kosten-
+    zeile mit Ledger die zugrunde liegenden Forderungs-`op_position_id`s
+    (identisch zu `_kontoblatt_ledger_html`), sonst die eigene OP-Id."""
+
+    if zeile.ledger is not None and zeile.ledger.forderung_op_position_ids:
+        return ", ".join(f"#{i}" for i in zeile.ledger.forderung_op_position_ids)
+    return f"OP #{zeile.position.id}"
+
+
+@dataclass(frozen=True)
+class JournalZeile:
+    """EINE Zeile des gemeinsamen, chronologischen Kontoblatt-Journals
+    (Auftrag HV-20261022-EIN-KONTOBLATT) - reine Anzeige-Umformung der
+    bereits in `Kontoblatt` zusammengeführten/saldierten Zeilen zu EINER
+    nach Datum sortierten Tabelle mit laufendem Saldo. KEINE neue
+    Buchungslogik, KEINE zweite Berechnung: `laufender_saldo_cent` endet
+    nach der letzten `beeinflusst_saldo=True`-Zeile exakt bei `Kontoblatt.
+    saldo_cent` (siehe `test_kontoblatt.py`). Eine Zeile aus `kosten_
+    historie` (storniert/ersetzt) erscheint chronologisch eingeordnet,
+    aber mit `beeinflusst_saldo=False` und unverändertem `laufender_
+    saldo_cent` - sie bleibt sichtbar (Nachvollziehbarkeit), verändert
+    aber nie den fortlaufenden Saldo."""
+
+    datum: date
+    buchungsart: str
+    soll_cent: int
+    haben_cent: int
+    laufender_saldo_cent: int
+    beleg_referenz: str
+    forderungsbezug: str
+    kategorie: str
+    status: str | None
+    beeinflusst_saldo: bool
+    zeile: KontoblattZeile
+
+
+def erstelle_journal(kontoblatt: Kontoblatt) -> list[JournalZeile]:
+    """Fasst Hauptforderung/Kosten/Zahlungen EINES bereits geladenen
+    `Kontoblatt` zu EINER gemeinsamen, chronologischen Tabelle mit
+    laufendem Saldo zusammen (Auftrag HV-20261022-EIN-KONTOBLATT: "Miete,
+    Zahlung, Gutschrift, Retourkapital, Mahngebühren, Bankkosten und
+    Zinsen in EINER Tabelle"). Reine Funktion ohne eigenen I/O/Rechenweg -
+    verwendet ausschließlich bereits in `Kontoblatt` vorhandene Werte
+    (`_effect_cent`, dieselbe Vorzeichenregel wie `op/service.py`), damit
+    niemals eine zweite, vom etablierten Saldo abweichende Engine
+    entsteht."""
+
+    aktiv = [
+        (z, False) for z in (
+            list(kontoblatt.hauptforderung_zeilen) + list(kontoblatt.kosten_zeilen) + list(kontoblatt.zahlungen_zeilen)
+        )
+    ]
+    historie = [(z, True) for z in kontoblatt.kosten_historie] + [(z, True) for z in kontoblatt.hauptforderung_historie]
+    alle = sorted(aktiv + historie, key=lambda t: (t[0].position.belegdatum, t[0].position.id, t[1]))
+
+    ergebnis: list[JournalZeile] = []
+    laufend = 0
+    for zeile, ist_historie in alle:
+        p = zeile.position
+        if ist_historie:
+            # Der ursprüngliche Betrag bleibt SICHTBAR (Nachvollziehbarkeit,
+            # "Altdaten/Stornos erhalten") - nur `laufend` wird NICHT
+            # fortgeschrieben, damit eine stornierte/ersetzte Zeile den
+            # laufenden Saldo nie verändert.
+            historie_effekt = _effect_cent(p)
+            buchungsart = _buchungsart_label(p, zeile.kategorie) + " (" + STATUS_LABEL.get(zeile.status, zeile.status or "") + ")"
+            ergebnis.append(JournalZeile(
+                datum=p.belegdatum, buchungsart=buchungsart,
+                soll_cent=historie_effekt if historie_effekt > 0 else 0,
+                haben_cent=-historie_effekt if historie_effekt < 0 else 0,
+                laufender_saldo_cent=laufend, beleg_referenz=p.beleg_referenz or p.aenderungsgrund or "",
+                forderungsbezug=_forderungsbezug(zeile), kategorie=zeile.kategorie, status=zeile.status,
+                beeinflusst_saldo=False, zeile=zeile,
+            ))
+            continue
+        effekt = _effect_cent(p)
+        laufend += effekt
+        ergebnis.append(JournalZeile(
+            datum=p.belegdatum, buchungsart=_buchungsart_label(p, zeile.kategorie),
+            soll_cent=effekt if effekt > 0 else 0, haben_cent=-effekt if effekt < 0 else 0,
+            laufender_saldo_cent=laufend, beleg_referenz=p.beleg_referenz or p.aenderungsgrund or "",
+            forderungsbezug=_forderungsbezug(zeile), kategorie=zeile.kategorie, status=zeile.status,
+            beeinflusst_saldo=True, zeile=zeile,
+        ))
+    return ergebnis
 
 
 def lade_kontoblatt(

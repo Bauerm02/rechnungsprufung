@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from mietinkasso.auth.service import require_gesellschaft_access
+from mietinkasso.backoffice.kontoblatt_render import render_kontoblatt_html
 from mietinkasso.backoffice.views import csrf_feld, eur, flash_error, flash_ok, parse_eur_betrag, sperrgrund_label
 from mietinkasso.domain.enums import OPTyp
 from mietinkasso.domain.exceptions import MietinkassoError
@@ -22,14 +23,7 @@ from mietinkasso.index.service import UNTERSTUETZTE_BERECHNUNGSPROFILE
 from mietinkasso.mahnwesen.brief_pdf import Absender as _BriefAbsender
 from mietinkasso.op.eroeffnung_import import importiere_eroeffnung_csv_atomar, parse_eroeffnung_csv
 from mietinkasso.op.kontoauszug_pdf import erzeuge_kontoauszug_pdf
-from mietinkasso.op.kontoblatt import (
-    KATEGORIE_LABEL,
-    KATEGORIE_MAHNPAUSCHALE,
-    KATEGORIE_MAHNSPESEN,
-    KATEGORIE_VERZUGSZINSEN,
-    STATUS_LABEL,
-    lade_kontoblatt,
-)
+from mietinkasso.op.kontoblatt import lade_kontoblatt
 from mietinkasso.vorschreibung.service import faelligkeitsdatum
 
 from mietinkasso.backoffice import dependencies as deps
@@ -88,211 +82,6 @@ def _rechenweg_html(positionen) -> str:
     return formel
 
 
-def _kontoblatt_status_html(zeile) -> str:
-    """Codex-Abnahme 20.10.2026, P3: `status` löst die bisherige
-    Mehrdeutigkeit auf (`rest_cent is None` konnte "bezahlt" UND "keine
-    Forderung" bedeuten) - `None` (z. B. GUTSCHRIFT/ZAHLUNG/KORREKTUR,
-    die keinen eigenen Forderungscharakter haben) wird als "—" gezeigt,
-    nie als bezahlt/offen behauptet."""
-
-    if zeile.status is None:
-        return '<span class="muted">—</span>'
-    warn = zeile.status in ("OFFEN", "STORNIERT")
-    css = "warn" if warn else "ok" if zeile.status == "BEZAHLT" else ""
-    return f'<span class="{css}">{h(STATUS_LABEL.get(zeile.status, zeile.status))}</span>'
-
-
-def _segment_text_roh(s: dict) -> str:
-    """EIN Zinssegment als ROHER (noch NICHT escapter) Text - der
-    Aufrufer escapt den gesamten zusammengesetzten Satz EINMAL (siehe
-    `_kontoblatt_ledger_html`), deshalb hier bewusst KEIN `h()`.
-    Unabhängige Prüfung Commit 8ae0406, (1): `rest_cent` (die tatsächlich
-    verzinste Außenstandsbasis - kann sich zwischen Teilzahlungen
-    ändern) fehlte bisher komplett; ohne sie ist nicht nachvollziehbar,
-    WELCHER Außenstand mit `satz_prozent` verzinst wurde."""
-
-    von, bis = s.get("von", "?"), s.get("bis", "?")
-    satz = s.get("satz_prozent")
-    satz_text = f"{satz} %" if satz else "Basis ungeklärt"
-    quelle = s.get("quelle") or "?"
-    rest_cent = s.get("rest_cent")
-    basis_text = eur(rest_cent) if isinstance(rest_cent, int) else "unbekannt"
-    zinsen_cent = s.get("zinsen_cent")
-    zinsen_text = eur(zinsen_cent) if isinstance(zinsen_cent, int) else "unbekannt"
-    return f"{von}–{bis}: {satz_text} ({quelle}) auf Basis {basis_text} → {zinsen_text} kumulativ"
-
-
-def _kontoblatt_ledger_html(zeile) -> str:
-    """Zusatz Zinszuordnung (Folgeschritt zu Commit 239e33c): zeigt die
-    bereits bestehenden `MahnkostenBuchungTable`-Ledgerdetails EINER
-    Verzugszinsen-/Mahnspesen-/Mahnpauschale-Zeile - rein lesend. Fehlt
-    `ledger` (z. B. eine fremd/manuell gebuchte Kostenzeile ohne
-    `MahnkostenBuchungTable`-Bezug), wird das ausdrücklich als "fehlend"
-    gezeigt, NIE als leeres Feld/erfundener Beleg. Für Verzugszinsen
-    zusätzlich je zugrunde liegender Forderung GETRENNT das kumulative
-    Segment-Bild (rein deskriptiv/Audit) und das an DIESEM Tag
-    tatsächlich NEU gebuchte Delta - diese beiden dürfen NIE verwechselt
-    werden (siehe `kontoblatt.py`-Moduldoc)."""
-
-    if zeile.kategorie not in (KATEGORIE_VERZUGSZINSEN, KATEGORIE_MAHNSPESEN, KATEGORIE_MAHNPAUSCHALE):
-        return ""
-    ledger = zeile.ledger
-    if ledger is None:
-        return '<div class="muted">Mahnbeleg/Ledger: fehlend</div>'
-
-    teile = [
-        f"Mahnbeleg: {h(ledger.versandnachweis_referenz)}",
-        "zugrunde liegende Forderungen: " + (", ".join(f"#{i}" for i in ledger.forderung_op_position_ids) or "—"),
-    ]
-    html = f'<div class="muted">{" · ".join(teile)}</div>'
-
-    if zeile.kategorie == KATEGORIE_VERZUGSZINSEN:
-        if ledger.zins_nachweis_unvollstaendig:
-            html += '<div class="warn">Zinsnachweis unvollständig/beschädigt - Originaldaten prüfen.</div>'
-        zeilen_html = []
-        for zuordnung in ledger.zins_zuordnung:
-            # Unabhängige Prüfung Commit 8ae0406, (1)+(2): `rest_cent`
-            # (die tatsächlich verzinste Außenstandsbasis je Segment -
-            # kann sich zwischen Teilzahlungen ändern) fehlte bisher
-            # ganz; der gesamte Segmenttext wird jetzt EINMAL am Ende mit
-            # `h()` escaped, statt einzelne rohe JSON-Werte (von/bis/
-            # satz_prozent) ungeschützt direkt zu interpolieren, während
-            # nur `quelle` escaped war - kein Doppel-Escaping, da die
-            # rohen Werte selbst hier an KEINER Stelle einzeln durch
-            # `h()` laufen.
-            segmente_text_roh = "; ".join(_segment_text_roh(s) for s in zuordnung.segmente) or "keine Segmente erfasst"
-            delta_text_roh = (
-                eur(zuordnung.delta_cent) if zuordnung.delta_cent is not None
-                # Unabhängige Prüfung Commit 8ae0406, (4): "nicht gebucht"
-                # behauptete fälschlich, dass FÜR DIESE FORDERUNG gar
-                # keine Zinsen gebucht wurden - tatsächlich kann die
-                # Zinsbuchung insgesamt sehr wohl erfolgt sein, nur OHNE
-                # nachvollziehbare Zuordnung/Delta zu GENAU dieser
-                # Forderung (z. B. beschädigtes/unvollständiges JSON).
-                else "Zuordnung/Betrag nicht belegt"
-            )
-            zeile_text = (
-                f"Forderung #{zuordnung.op_position_id} — kumulatives Zinsbild: {segmente_text_roh} "
-                f"· tatsächlich an diesem Tag neu gebucht: {delta_text_roh}"
-            )
-            zeilen_html.append(f"<li>{h(zeile_text)}</li>")
-        if zeilen_html:
-            html += f'<ul class="muted">{"".join(zeilen_html)}</ul>'
-    return html
-
-
-def _kontoblatt_zeile_html(zeile, *, kategorie_spalte: bool) -> str:
-    p = zeile.position
-    rest_html = eur(zeile.rest_cent) if zeile.rest_cent is not None else '<span class="muted">—</span>'
-    kategorie_html = f"<td>{h(KATEGORIE_LABEL.get(zeile.kategorie, zeile.kategorie))}</td>" if kategorie_spalte else ""
-    return (
-        "<tr>"
-        f"<td>{p.belegdatum.isoformat()}</td><td>{h(p.typ)}</td>{kategorie_html}"
-        f"<td>{eur(p.betrag_cent)}</td><td>{rest_html}</td><td>{_kontoblatt_status_html(zeile)}</td>"
-        f"<td>{h(p.beleg_referenz or p.aenderungsgrund or '')}{_kontoblatt_ledger_html(zeile)}</td>"
-        "</tr>"
-    )
-
-
-def _kontoblatt_historie_zeile_html(zeile) -> str:
-    p = zeile.position
-    return (
-        "<tr>"
-        f"<td>{p.belegdatum.isoformat()}</td><td>{h(KATEGORIE_LABEL.get(zeile.kategorie, zeile.kategorie))}</td>"
-        f"<td>{eur(p.betrag_cent)}</td><td>{_kontoblatt_status_html(zeile)}</td>"
-        f"<td>{h(p.beleg_referenz or p.aenderungsgrund or '')}{_kontoblatt_ledger_html(zeile)}</td>"
-        "</tr>"
-    )
-
-
-def _kontoblatt_html(kontoblatt, *, konto_id: str) -> str:
-    """Auftrag HV-20261020-KONTOBLATT-KOSTEN: getrennte Hauptforderung/
-    gebuchte Kosten/Zahlungs-Stornostand/Gesamtsaldo PLUS dokumentierte,
-    nicht belastete Bankaufwände und ausstehende (noch nicht
-    kostenverarbeitete) Mahnläufe - siehe `op/kontoblatt.py`-Moduldoc für
-    die fachliche Begründung (insbesondere: KEINE Verdopplung, der
-    Gesamtsaldo bleibt exakt `OPService.berechne_saldo(...).saldo_cent`)."""
-
-    hauptforderung_zeilen = "".join(_kontoblatt_zeile_html(z, kategorie_spalte=False) for z in kontoblatt.hauptforderung_zeilen)
-    kosten_zeilen = "".join(_kontoblatt_zeile_html(z, kategorie_spalte=True) for z in kontoblatt.kosten_zeilen)
-    zahlungen_zeilen = "".join(_kontoblatt_zeile_html(z, kategorie_spalte=False) for z in kontoblatt.zahlungen_zeilen)
-    kosten_historie_zeilen = "".join(_kontoblatt_historie_zeile_html(z) for z in kontoblatt.kosten_historie)
-    kosten_historie_karte = ""
-    if kontoblatt.kosten_historie:
-        kosten_historie_karte = f"""
-        <div class="card"><h3>Kosten-Historie (storniert/ersetzt)</h3>
-          <p class="muted">Nicht mehr gültige Kostenbuchungen - bleiben zur Nachvollziehbarkeit sichtbar,
-             verändern WEDER die aktuelle Kostensumme NOCH den Gesamtsaldo.</p>
-          <table><tr><th>Datum</th><th>Kategorie</th><th>Betrag</th><th>Status</th><th>Beleg/Grund</th></tr>
-          {kosten_historie_zeilen}</table>
-        </div>"""
-
-    _unbekanntes_datum_html = '<span class="muted">Datum unbekannt</span>'
-    bankaufwand_zeilen = "".join(
-        f"<tr><td>{b.rueckgabe_datum.isoformat() if b.rueckgabe_datum else _unbekanntes_datum_html}</td>"
-        f"<td>{b.row.gebucht_am.strftime('%Y-%m-%d') if b.row.gebucht_am else ''}</td>"
-        f"<td>{eur(b.row.bankentgelt_cent)}</td><td>{h(b.row.beleg_referenz)}</td>"
-        f"<td>RLS-OP #{b.row.ruecklastschrift_op_position_id}"
-        f"{' / Bank-Tx #' + str(b.row.bank_transaktion_id) if b.row.bank_transaktion_id is not None else ''}</td>"
-        f"<td><span class='warn'>{h(b.status_text)}</span></td></tr>"
-        for b in kontoblatt.dokumentierte_bankaufwaende
-    )
-    bankaufwand_karte = ""
-    if kontoblatt.dokumentierte_bankaufwaende:
-        bankaufwand_summe = sum(b.row.bankentgelt_cent for b in kontoblatt.dokumentierte_bankaufwaende)
-        bankaufwand_karte = f"""
-        <div class="card"><h3>Dokumentierte, (noch) nicht belastete Bankaufwände</h3>
-          <p class="muted">Erfasst, aber NICHT als Forderung gebucht - NICHT im Gesamtsaldo enthalten. Summe:
-             <strong>{eur(bankaufwand_summe)}</strong></p>
-          <table><tr><th>Rückgabe (Bankereignistag)</th><th>Erfasst am</th><th>Bankentgelt</th><th>Beleg</th><th>Bezug</th><th>Status</th></tr>
-          {bankaufwand_zeilen}</table>
-        </div>"""
-
-    mahnlauf_zeilen = "".join(
-        f"<tr><td>{m.geplant_am.strftime('%Y-%m-%d') if m.geplant_am else ''}</td><td>{m.stufe}</td>"
-        f"<td>{h(m.kanal)}</td><td>{h(m.status)}</td></tr>"
-        for m in kontoblatt.ausstehende_mahnlaeufe
-    )
-    ausstehend_karte = ""
-    if kontoblatt.ausstehende_mahnlaeufe:
-        ausstehend_karte = f"""
-        <div class="card"><h3>Ausstehende Mahnläufe (Kosten noch nicht gebucht)</h3>
-          <p class="warn">Die Kostenverarbeitung ist für diese Mahnläufe noch NICHT abgeschlossen - das
-             bedeutet "nicht gebucht", NICHT "nichts offen".</p>
-          <table><tr><th>Geplant am</th><th>Stufe</th><th>Kanal</th><th>Status</th></tr>
-          {mahnlauf_zeilen}</table>
-        </div>"""
-
-    return f"""
-    <div class="card"><h2>Kostenübersicht</h2>
-      <p>Hauptforderung gebucht (Sollsumme vor Zahlungen): <strong>{eur(kontoblatt.hauptforderung_cent)}</strong>
-         &nbsp;· davon noch offen: <strong>{eur(kontoblatt.hauptforderung_offener_rest_cent)}</strong></p>
-      <p>Kosten gebucht (Sollsumme vor Zahlungen): <strong>{eur(kontoblatt.kosten_cent)}</strong>
-         &nbsp;· davon noch offen: <strong>{eur(kontoblatt.kosten_offener_rest_cent)}</strong></p>
-      <p>Zahlungs-/Stornostand: <strong>{eur(kontoblatt.zahlungen_saldo_cent)}</strong> &nbsp;|&nbsp;
-         Gesamtsaldo: <strong>{eur(kontoblatt.saldo_cent)}</strong></p>
-      <p><a href="/backoffice/konto/{h(konto_id)}/kontoauszug.pdf">PDF-Kontoauszug herunterladen</a></p>
-      <details open><summary>Hauptforderung ({len(kontoblatt.hauptforderung_zeilen)})</summary>
-        <table><tr><th>Datum</th><th>Typ</th><th>Betrag</th><th>Offener Rest</th><th>Status</th><th>Beleg/Grund</th></tr>
-        {hauptforderung_zeilen if kontoblatt.hauptforderung_zeilen else '<tr><td colspan=6 class="muted">Keine Hauptforderungszeilen.</td></tr>'}
-        </table>
-      </details>
-      <details open><summary>Tatsächlich gebuchte Kosten ({len(kontoblatt.kosten_zeilen)}) - bereits im Gesamtsaldo enthalten</summary>
-        <table><tr><th>Datum</th><th>Typ</th><th>Kategorie</th><th>Betrag</th><th>Offener Rest</th><th>Status</th><th>Beleg/Grund</th></tr>
-        {kosten_zeilen if kontoblatt.kosten_zeilen else '<tr><td colspan=7 class="muted">Keine gebuchten Mahngebühren/-pauschale, Verzugszinsen oder Rücklastschriftkosten.</td></tr>'}
-        </table>
-      </details>
-      <details><summary>Zahlungen / Rücklastschriften - Stornostand ({len(kontoblatt.zahlungen_zeilen)})</summary>
-        <table><tr><th>Datum</th><th>Typ</th><th>Betrag</th><th>Offener Rest</th><th>Status</th><th>Beleg/Grund</th></tr>
-        {zahlungen_zeilen if kontoblatt.zahlungen_zeilen else '<tr><td colspan=6 class="muted">Keine Zahlungen/Rücklastschriften.</td></tr>'}
-        </table>
-      </details>
-    </div>
-    {kosten_historie_karte}
-    {bankaufwand_karte}
-    {ausstehend_karte}"""
-
-
 @router.get("/konto/{konto_id}", response_class=HTMLResponse)
 def kontoauszug(request: Request, konto_id: str, session=Depends(_current_session)) -> HTMLResponse:
     konto = deps._stammdaten_repo.get_konto(konto_id)
@@ -346,7 +135,8 @@ def kontoauszug(request: Request, konto_id: str, session=Depends(_current_sessio
             mahnkosten_repo=deps._hv_mail.mahnkosten_repo, ruecklastschriftkosten_repo=deps._ruecklastschriftkosten_repo,
             mahnlauf_repo=deps._hv_mail.mahnlauf_repo,
         )
-        kontoblatt_karte = _kontoblatt_html(kontoblatt, konto_id=konto_id)
+        zinsabrechnung_link_html = f' &nbsp;|&nbsp; <a href="/backoffice/vertrag/{h(vertrag.id)}/zinsabrechnung">Zinsabrechnung</a>'
+        kontoblatt_karte = render_kontoblatt_html(kontoblatt, konto_id=konto_id, zinsabrechnung_link_html=zinsabrechnung_link_html)
 
     sperren_zeilen = "".join(
         f"<tr><td>{h(sperrgrund_label(s.grund))} <span class='muted'>({h(s.grund)})</span></td>"
@@ -449,6 +239,111 @@ def kontoauszug_pdf(konto_id: str, session=Depends(_current_session)):
         content=pdf_bytes, media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{dateiname}"'},
     )
+
+
+# -- Zinsabrechnung: Preview -> Bestätigen (Auftrag HV-20261022-EIN-KONTOBLATT) --
+
+
+def _zinsabrechnung_vorschau_html(vorschau, *, vertrag_id: str, konto_id: str, session) -> str:
+    satz_text = f"{vorschau.zinssatz_prozent} % p.a." if vorschau.zinssatz_prozent is not None else "siehe Zinssegmente (Halbjahreswechsel/Basiszinssatz)"
+    zeitraum_text = (
+        f"{vorschau.zins_von.isoformat()} – {vorschau.zins_bis.isoformat()}"
+        if vorschau.zins_von and vorschau.zins_bis else "kein verzinsbarer Zeitraum"
+    )
+    hinweis_ungeklaert = (
+        '<p class="warn">Mindestens ein Zeitsegment hat eine (noch) ungeklärte Zinsbasis - für dieses '
+        "Segment wird KEIN Zins angesetzt, bis die Basis geklärt/belegt ist.</p>"
+    ) if vorschau.zins_teilweise_ungeklaert else ""
+    gebuehr_hinweis = ""
+    if vorschau.gebuehr_cent or vorschau.mahnpauschale_cent:
+        gebuehr_hinweis = (
+            '<p class="warn">Diese Vorschau würde bei einem tatsächlichen Mahnversand zusätzlich Mahnspesen/'
+            "-pauschale auslösen - die Zinsabrechnung selbst bucht davon NICHTS, Gebühren/Pauschale bleiben "
+            "ausschließlich an einen tatsächlichen, nachgewiesenen Mahnversand gebunden.</p>"
+        )
+    kein_delta_hinweis = (
+        '<p class="ok">Kein neues Zinsdelta seit der letzten Buchung - eine Bestätigung wäre ein reiner No-Op.</p>'
+    ) if vorschau.neue_zinsen_delta_cent <= 0 else ""
+    bestaetigen_form = f"""
+    <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/zinsabrechnung/bestaetigen">
+      {csrf_feld(session.csrf_token)}
+      <button type="submit">Zinsabrechnung jetzt verbuchen (nur Delta, keine Gebühren)</button>
+    </form>"""
+    return f"""
+    <div class="card" style="max-width:720px;">
+      <h1>Zinsabrechnung — Vertrag {h(vertrag_id)}</h1>
+      <p class="muted">Reine Vorschau (GET, bucht nichts). Eine Buchung erfolgt ausschließlich über "Bestätigen"
+         unten (POST) - niemals automatisch.</p>
+      <table>
+        <tr><th>Satz</th><td>{h(satz_text)}</td></tr>
+        <tr><th>Zeitraum</th><td>{h(zeitraum_text)}</td></tr>
+        <tr><th>Verzinste Kapitalbasis</th><td>{eur(vorschau.hauptforderung_cent)}</td></tr>
+        <tr><th>Bereits gebucht (gesamt, alle Stufen/Abrechnungen)</th><td>{eur(vorschau.bereits_gebuchte_zinsen_cent)}</td></tr>
+        <tr><th>Neu zu buchendes Delta</th><td><strong>{eur(vorschau.neue_zinsen_delta_cent)}</strong></td></tr>
+      </table>
+      {hinweis_ungeklaert}
+      {gebuehr_hinweis}
+      {kein_delta_hinweis}
+      {bestaetigen_form if vorschau.neue_zinsen_delta_cent > 0 else ''}
+      <p><a href="/backoffice/konto/{h(konto_id)}">&larr; zurück zum Kontoauszug</a></p>
+    </div>"""
+
+
+@router.get("/vertrag/{vertrag_id}/zinsabrechnung", response_class=HTMLResponse)
+def zinsabrechnung_vorschau_route(request: Request, vertrag_id: str, session=Depends(_current_session)) -> HTMLResponse:
+    """Reine Lesevorschau (GET, mutationsfrei) einer eigenständigen
+    Zinsabrechnung - zeigt Satz/Zeitraum/Kapital/bereits gebucht/Delta,
+    bucht NICHTS (siehe `MahnkostenService.zinsabrechnung_vorschau`)."""
+
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Zinsabrechnung", f"Unbekannter Vertrag {vertrag_id}.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    if _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Zinsabrechnung", "Objekt ist von der Pilotphase ausgeschlossen - keine Zinsabrechnung.")
+    konto = deps._stammdaten_repo.get_konto_by_vertrag(vertrag_id)
+    if konto is None:
+        return _fehlerseite(session, "Zinsabrechnung", "Kein Konto für diesen Vertrag gefunden.")
+
+    vorschau = deps._hv_mail.mahnkosten_service.zinsabrechnung_vorschau(vertrag_id=vertrag_id, heute=date.today())
+    if vorschau is None:
+        return _fehlerseite(session, "Zinsabrechnung", "Keine Vorschau möglich (Kontodaten unvollständig).", f"/backoffice/konto/{konto.id}")
+    inhalt = _zinsabrechnung_vorschau_html(vorschau, vertrag_id=vertrag_id, konto_id=konto.id, session=session)
+    return _layout(request, session, "Zinsabrechnung", inhalt)
+
+
+@router.post("/vertrag/{vertrag_id}/zinsabrechnung/bestaetigen")
+def zinsabrechnung_bestaetigen(
+    request: Request, vertrag_id: str, csrf_token: str = Form(...), session=Depends(_current_session),
+):
+    """Einzige Buchungsstelle einer eigenständigen Zinsabrechnung -
+    AUSSCHLIESSLICH per POST erreichbar (nie über GET/PDF). Bucht NIE
+    Gebühren/Mahnpauschale (siehe `MahnkostenService.
+    buche_zinsabrechnung`), NUR das tatsächlich neue Zinsdelta."""
+
+    _verify_csrf(session, csrf_token)
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None:
+        return _fehlerseite(session, "Zinsabrechnung", f"Unbekannter Vertrag {vertrag_id}.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    if _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Zinsabrechnung", "Objekt ist von der Pilotphase ausgeschlossen - keine Zinsabrechnung.")
+    konto = deps._stammdaten_repo.get_konto_by_vertrag(vertrag_id)
+    if konto is None:
+        return _fehlerseite(session, "Zinsabrechnung", "Kein Konto für diesen Vertrag gefunden.")
+
+    try:
+        ledger = deps._hv_mail.mahnkosten_service.buche_zinsabrechnung(
+            ctx=_ctx(session), vertrag_id=vertrag_id, heute=date.today(), akteur=session.user_id,
+        )
+        if ledger is not None:
+            deps._audit_service.log(
+                entity_typ="mahnkosten_buchung", entity_id=str(ledger.id), akteur=session.user_id,
+                aktion="ZINSABRECHNUNG", payload={"vertrag_id": vertrag_id},
+            )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Zinsabrechnung", str(exc), f"/backoffice/vertrag/{vertrag_id}/zinsabrechnung")
+    return RedirectResponse(url=f"/backoffice/konto/{konto.id}?zinsabrechnung=1", status_code=303)
 
 
 # -- Nachbuchung ----------------------------------------------------------------

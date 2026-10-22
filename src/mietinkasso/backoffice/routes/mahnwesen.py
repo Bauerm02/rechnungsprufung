@@ -31,9 +31,12 @@ from mietinkasso.mahnwesen.brief_pdf import (
     Zinssegment as _BriefZinssegment,
     erzeuge_mahnbrief_pdf as _erzeuge_mahnbrief_pdf,
 )
+from mietinkasso.mahnwesen.kontoauszug_anhang import haenge_kontoauszug_pdf_an
 from mietinkasso.mahnwesen.kosten import _profil_wirksam_am as _mahn_profil_wirksam_am
 from mietinkasso.mahnwesen.kosten import forderungsgruppe_schluessel as _forderungsgruppe_schluessel
 from mietinkasso.mahnwesen.kosten import zins_bis_einschliesslich as _zins_bis_einschliesslich
+from mietinkasso.op.kontoauszug_pdf import erzeuge_kontoauszug_pdf as _erzeuge_kontoauszug_pdf
+from mietinkasso.op.kontoblatt import lade_kontoblatt as _lade_kontoblatt
 from mietinkasso.op.service import compute_content_hash as _compute_content_hash
 
 from mietinkasso.backoffice import dependencies as deps
@@ -613,6 +616,34 @@ async def mahnpauschale_freigabe_absenden(request: Request, vertrag_id: str, ses
                 "hauptforderung_cent": vorschau.hauptforderung_cent, "betrag_cent": betrag_cent,
             },
         )
+        # Auftrag HV-20261022-EIN-KONTOBLATT, Punkt 3 (verbindlicher Teil
+        # des Auftrags, keine spätere TODO): eine Freigabe, die NACH einem
+        # bereits tatsächlich erfolgten Versand/Manualimport für GENAU
+        # diese Forderungsgruppe erteilt wird, löst HIER die genau EINE
+        # fällige Nachbuchung aus - NIE stillschweigend offen bleibend.
+        # Idempotent über `freigabe.id` (siehe `MahnkostenService.
+        # nachbuche_offene_kosten`-Docstring) - ein Retry dieser Route
+        # (z. B. Doppelklick) bucht NIE ein zweites Mal.
+        try:
+            nachgebuchte = deps._hv_mail.manueller_mahnversand_service.nachbuche_fuer_vertrag_stufe(
+                ctx=_ctx(session), vertrag_id=vertrag_id, stufe=stufe, forderungsgruppe_schluessel_neu=schluessel,
+                heute=heute_datum, akteur=session.user_id, freigabe_id=freigabe.id,
+            )
+            for ledger in nachgebuchte:
+                deps._audit_service.log(
+                    entity_typ="mahnkosten_nachbuchung", entity_id=str(ledger.id), akteur=session.user_id,
+                    aktion="NACHBUCHUNG_NACH_FREIGABE",
+                    payload={"vertrag_id": vertrag_id, "stufe": stufe, "freigabe_id": freigabe.id},
+                )
+        except (MietinkassoError, ValueError) as exc:
+            # Eine fehlgeschlagene Nachbuchung darf die bereits erteilte
+            # Freigabe NICHT rückgängig machen (die steht bereits fest) -
+            # sie wird aber NIE verschluckt, sondern sichtbar gemeldet.
+            return _fehlerseite(
+                session, "Mahnpauschale-Freigabe",
+                f"Freigabe erteilt, aber Nachbuchung fehlgeschlagen: {exc}. Bitte Kontoblatt prüfen/erneut auslösen.",
+                f"/backoffice/vertrag/{vertrag_id}/mahnpauschale-freigabe?stufe={stufe}&heute={heute_datum.isoformat()}",
+            )
     except (MietinkassoError, ValueError, IntegrityError) as exc:
         return _fehlerseite(
             session, "Mahnpauschale-Freigabe",
@@ -710,6 +741,23 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
         )
     except _BriefAdressfehlerError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+
+    # Auftrag HV-20261022-EIN-KONTOBLATT, Nachbesserung Markus 22.10.2026:
+    # diese PREVIEW zeigt GENAU das Dokument, das ein tatsächlicher Versand
+    # erzeugen würde (siehe `mailversand_service.py::_sende_brief`) - der
+    # kanonische Kontoauszug ist daher auch HIER angehängt, nicht nur als
+    # separater Download. Bleibt eine reine Live-Vorschau (kein Nachweis,
+    # kein Versand) - exakt wie der Rest dieser Route.
+    kontoauszug_pdf_bytes = _erzeuge_kontoauszug_pdf(
+        absender=absender, objekt_bezeichnung=objekt.bezeichnung, einheit_bezeichnung=einheit.bezeichnung,
+        debitor_name=debitor.name, vertrag_id=vertrag_id, konto_id=konto.id, heute=heute_datum,
+        kontoblatt=_lade_kontoblatt(
+            konto_id=konto.id, vertrag_id=vertrag_id, op_service=deps._op_service,
+            mahnkosten_repo=deps._hv_mail.mahnkosten_repo, ruecklastschriftkosten_repo=deps._ruecklastschriftkosten_repo,
+            mahnlauf_repo=deps._hv_mail.mahnlauf_repo,
+        ),
+    )
+    pdf_bytes = haenge_kontoauszug_pdf_an(pdf_bytes, kontoauszug_pdf_bytes)
 
     version = _compute_content_hash({
         "vertrag_id": vertrag_id, "stufe": stufe, "empfaenger_name": debitor.name, "empfaenger_adresse": debitor.adresse,
@@ -885,6 +933,131 @@ async def mahnbrief_archiv_beleg_importieren(
     except (MietinkassoError, ValueError) as exc:
         return _fehlerseite(session, "Mahnbrief-Archiv", str(exc), rueck_href)
     return RedirectResponse(url=rueck_href, status_code=303)
+
+
+# -- Manualimport tatsächlich manuell versendeter Mahnungen -----------------
+# (Auftrag HV-20261022-EIN-KONTOBLATT) - siehe `manueller_mahnversand_
+# service.py`-Moduldoc: EIGENSTÄNDIG von `mahnbrief_archiv.py`, weil hier
+# ein Vorgang dokumentiert wird, von dem das System vorher NICHTS wusste
+# (kein eingefrorener Mahnlauf, kein Providerkontakt dieses Systems).
+
+
+def _manueller_mahnversand_zeile_html(vertrag_id: str, row) -> str:
+    gebucht_html = (
+        f'<span class="ok">Kostenbuchung #{row.mahnkosten_buchung_id}</span>' if row.mahnkosten_buchung_id is not None
+        else '<span class="warn">keine Kostenbuchung (z. B. Mahnpauschale noch nicht freigegeben) - in Prüfung</span>'
+    )
+    return f"""
+    <div class="card">
+      <h3>Stufe {row.stufe} - {h(row.versanddatum.isoformat())} ({h(row.kanal)})</h3>
+      <p>Empfänger: {h(row.empfaenger_name)}, {h(row.empfaenger_adresse)}</p>
+      <p>Belegreferenz: {h(row.beleg_referenz)} &nbsp;|&nbsp; {gebucht_html}</p>
+      <p><a href="/backoffice/vertrag/{h(vertrag_id)}/manueller-mahnversand/{row.id}/beleg.pdf">Beleg-PDF herunterladen</a></p>
+    </div>"""
+
+
+@router.get("/vertrag/{vertrag_id}/manueller-mahnversand", response_class=HTMLResponse)
+def manueller_mahnversand_liste(request: Request, vertrag_id: str, session=Depends(_current_session)) -> HTMLResponse:
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Manualimport", "Vertrag nicht verfügbar.", "/backoffice/vertraege")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+
+    zeilen = deps._hv_mail.manueller_mahnversand_repo.list_fuer_vertrag(vertrag_id)
+    zeilen_html = "".join(_manueller_mahnversand_zeile_html(vertrag_id, z) for z in zeilen) or "<p>Noch kein Manualimport erfasst.</p>"
+    form = f"""
+    <div class="card" style="max-width:640px;">
+      <h1>Manuell versendete Mahnung importieren — {h(vertrag_id)}</h1>
+      <p class="muted">Dokumentiert einen tatsächlich AUSSERHALB dieses Systems versendeten Mahnbrief/-email -
+         löst KEINEN neuen Versand und KEINE Aktivierung aus, verhindert aber eine spätere automatische
+         Bündelung für dieselbe Stufe (kein Doppelversand).</p>
+      <form method="post" action="/backoffice/vertrag/{h(vertrag_id)}/manueller-mahnversand" enctype="multipart/form-data">
+        {csrf_feld(session.csrf_token)}
+        <label>Stufe</label>
+        <select name="stufe" required>
+          <option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option>
+        </select>
+        <label>Betroffene Forderungs-OP-Ids (kommagetrennt, Pflicht - Forderungsbindung)</label>
+        <input name="forderung_op_position_ids" placeholder="z. B. 101,102" required>
+        <label>Tatsächliches Versanddatum</label>
+        <input type="date" name="versanddatum" required>
+        <label>Kanal</label>
+        <select name="kanal" required>
+          <option value="BRIEF">BRIEF</option><option value="EMAIL">EMAIL</option><option value="PERSOENLICH">PERSOENLICH</option>
+        </select>
+        <label>Empfänger Name</label>
+        <input name="empfaenger_name" required>
+        <label>Empfänger Adresse/Zugang</label>
+        <input name="empfaenger_adresse" required>
+        <label>Belegreferenz</label>
+        <input name="beleg_referenz" required>
+        <label>Beleg (tatsächliches Dokument als PDF, Pflicht)</label>
+        <input type="file" name="beleg_datei" accept="application/pdf" required>
+        <button type="submit">Importieren</button>
+      </form>
+    </div>"""
+    return _layout(request, session, "Manualimport Mahnversand", form + zeilen_html)
+
+
+@router.post("/vertrag/{vertrag_id}/manueller-mahnversand")
+async def manueller_mahnversand_absenden(request: Request, vertrag_id: str, session=Depends(_current_session)):
+    form = await request.form()
+    _verify_csrf(session, str(form.get("csrf_token", "")))
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        return _fehlerseite(session, "Manualimport", "Vertrag nicht verfügbar.", "/backoffice/vertraege")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    require_schreibrecht(_ctx(session))
+
+    rueck_href = f"/backoffice/vertrag/{vertrag_id}/manueller-mahnversand"
+    try:
+        stufe = int(str(form.get("stufe", "")))
+        forderung_ids_roh = str(form.get("forderung_op_position_ids", "")).strip()
+        forderung_op_position_ids = [int(teil.strip()) for teil in forderung_ids_roh.split(",") if teil.strip()]
+        versanddatum = date.fromisoformat(str(form.get("versanddatum", "")).strip())
+    except ValueError:
+        return _fehlerseite(session, "Manualimport", "Ungültige Stufe/Forderungs-Ids/Versanddatum.", rueck_href)
+
+    beleg_datei = form.get("beleg_datei")
+    if beleg_datei is None or not hasattr(beleg_datei, "read"):
+        return _fehlerseite(session, "Manualimport", "Beleg-PDF ist Pflicht.", rueck_href)
+    try:
+        beleg_pdf_bytes = await _lese_beleg_begrenzt(beleg_datei)
+    except ValueError as exc:
+        return _fehlerseite(session, "Manualimport", str(exc), rueck_href)
+
+    try:
+        row = deps._hv_mail.manueller_mahnversand_service.importieren(
+            ctx=_ctx(session), vertrag_id=vertrag_id, stufe=stufe, forderung_op_position_ids=forderung_op_position_ids,
+            versanddatum=versanddatum, kanal=str(form.get("kanal", "")).strip(),
+            empfaenger_name=str(form.get("empfaenger_name", "")).strip(),
+            empfaenger_adresse=str(form.get("empfaenger_adresse", "")).strip(),
+            beleg_referenz=str(form.get("beleg_referenz", "")).strip(), beleg_pdf_bytes=beleg_pdf_bytes,
+            erfasst_von=session.user_id,
+        )
+        deps._audit_service.log(
+            entity_typ="manueller_mahnversand", entity_id=str(row.id), akteur=session.user_id,
+            aktion="IMPORTIERT",
+            payload={"vertrag_id": vertrag_id, "stufe": stufe, "forderung_op_position_ids": forderung_op_position_ids},
+        )
+    except (MietinkassoError, ValueError) as exc:
+        return _fehlerseite(session, "Manualimport", str(exc), rueck_href)
+    return RedirectResponse(url=rueck_href, status_code=303)
+
+
+@router.get("/vertrag/{vertrag_id}/manueller-mahnversand/{row_id}/beleg.pdf")
+def manueller_mahnversand_beleg_pdf(vertrag_id: str, row_id: int, session=Depends(_current_session)):
+    vertrag = deps._stammdaten_repo.get_vertrag(vertrag_id)
+    if vertrag is None or _objekt_fuer_vertrag_gesperrt(vertrag_id):
+        raise HTTPException(status_code=404, detail="Vertrag nicht verfügbar.")
+    require_gesellschaft_access(_ctx(session), vertrag.gesellschaft_id)
+    row = deps._hv_mail.manueller_mahnversand_repo.get(row_id)
+    if row is None or row.vertrag_id != vertrag_id:
+        raise HTTPException(status_code=404, detail="Unbekannte Manualimport-Zeile.")
+    return Response(
+        content=row.beleg_pdf_bytes, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="ManuellerMahnversand-{row_id}.pdf"'},
+    )
 
 
 @router.post("/mahnfall/{mahnfall_id}/sendebereitschaft", response_class=HTMLResponse)

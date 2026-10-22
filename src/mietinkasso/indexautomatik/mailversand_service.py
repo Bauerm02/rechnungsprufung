@@ -28,7 +28,13 @@ from mietinkasso.mahnwesen.kosten import snapshot_aus_json, zins_bis_einschliess
 from mietinkasso.mahnwesen.mahntexte import text_fuer_stufe
 from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
 from mietinkasso.mahnwesen.kosten_service import MahnkostenService
+from mietinkasso.mahnwesen.kontoauszug_anhang import haenge_kontoauszug_pdf_an, journal_als_text
 from mietinkasso.mahnwesen.mahnbrief_archiv import MahnbriefArchivRepository
+from mietinkasso.mahnwesen.manueller_mahnversand_repository import ManuellerMahnversandRepository
+from mietinkasso.mahnwesen.manueller_mahnversand_service import ManuellerMahnversandService
+from mietinkasso.op.kontoauszug_pdf import erzeuge_kontoauszug_pdf
+from mietinkasso.op.kontoblatt import lade_kontoblatt
+from mietinkasso.bank.ruecklastschriftkosten_service import RuecklastschriftkostenRepository
 from mietinkasso.mahnwesen.repository import (
     BriefAnbieterProfilRepository, MahnEmpfaengerZugangRepository, MahnFallRepository, MahnKanalregelRepository,
     MahnLaufRepository, MahnPolicyRepository, MahnTageslaufRepository, VertragMitmieterRepository,
@@ -290,6 +296,21 @@ class HVMailversandService:
         # _naechste_stufe_fuer_forderung`/`_pruefe_vorstufe_abstand`).
         self.mitmieter_repo = VertragMitmieterRepository(session_factory)
         self.empfaenger_zugang_repo = MahnEmpfaengerZugangRepository(session_factory)
+        # Auftrag HV-20261022-EIN-KONTOBLATT: kontrollierter Backoffice-
+        # Import tatsächlich manuell versendeter Mahnungen - IMMER
+        # verdrahtet (wie Kanalregel/Mitmieter oben), siehe
+        # `manueller_mahnversand_repository.py`/`manueller_mahnversand_
+        # service.py`-Moduldoc.
+        self.manueller_mahnversand_repo = ManuellerMahnversandRepository(session_factory)
+        # Auftrag HV-20261022-EIN-KONTOBLATT, Nachbesserung Markus
+        # 22.10.2026 ("bisherige Mail-/Briefpipeline nutzt noch keinen
+        # kanonischen Kontoauszug"): der EINE kanonische Kontoauszug wird
+        # direkt in diesen Service eingebunden (`_sende_brief`/`_baue_
+        # email_mahntext`), nicht nur als separater Backoffice-Download
+        # angeboten - `ruecklastschriftkosten_repo` ist dafür eine der
+        # drei Zutaten von `lade_kontoblatt` (neben `mahnkosten_repo`/
+        # `mahnlauf_repo`, die bereits oben verdrahtet sind).
+        self.ruecklastschriftkosten_repo = RuecklastschriftkostenRepository(session_factory)
         # Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026,
         # reproduzierter Fehler): DB-seitiger, über den UNIQUE-Constraint
         # abgesicherter Claim "höchstens ein tatsächlicher Versandversuch
@@ -312,7 +333,12 @@ class HVMailversandService:
             mahnkosten_service=self.mahnkosten_service, mahnlauf_repository=self.mahnlauf_repo,
             kanalregel_repository=self.kanalregel_repo, brief_anbieterprofil_repository=self.brief_anbieterprofil_repo,
             brief_transport_verfuegbar=self.brief_sftp_adapter is not None,
-            mitmieter_repository=self.mitmieter_repo, empfaenger_zugang_repository=self.empfaenger_zugang_repo)
+            mitmieter_repository=self.mitmieter_repo, empfaenger_zugang_repository=self.empfaenger_zugang_repo,
+            manueller_mahnversand_repository=self.manueller_mahnversand_repo)
+        self.manueller_mahnversand_service = ManuellerMahnversandService(
+            repository=self.manueller_mahnversand_repo, stammdaten_repository=bundle.stammdaten_repository,
+            op_service=self.op_service, mahnkosten_service=self.mahnkosten_service,
+        )
 
     def owner_senden(self, auftrag):
         if self.client is None or not self.settings.hv_mail_allowlist_bestaetigt:
@@ -457,6 +483,21 @@ class HVMailversandService:
                 "\n\nBitte begleichen Sie den Gesamtbetrag binnen 14 Tagen ab Zugang dieser Nachricht auf "
                 "das Ihnen für dieses Mietverhältnis bekannt gegebene Konto."
             )
+        # Auftrag HV-20261022-EIN-KONTOBLATT, Nachbesserung Markus
+        # 22.10.2026: der E-Mail-Kanal kennt KEINE Dateianhänge
+        # (`mailops_client.py::MailOpsAuftrag` ist reiner Text) - statt
+        # eine nicht existierende Anhangsfähigkeit vorzutäuschen, wird
+        # DIESELBE kanonische Journal-Quelle (`lade_kontoblatt`, identisch
+        # zu Kontoansicht/Mieterakte/Briefanhang) als Text-Kurzfassung
+        # eingebettet. Zeigt NUR den zum Versandzeitpunkt BEREITS
+        # gebuchten Stand (die neuen Zinsen/Gebühren DIESES Mahnlaufs
+        # werden erst NACH dem Versand gebucht, siehe `MahnwesenService.
+        # versende_mahnlauf` - keine erfundene Vorwegnahme).
+        kontoauszug_text = journal_als_text(lade_kontoblatt(
+            konto_id=account.id, vertrag_id=mahnlauf.vertrag_id, op_service=self.op_service,
+            mahnkosten_repo=self.mahnkosten_repo, ruecklastschriftkosten_repo=self.ruecklastschriftkosten_repo,
+            mahnlauf_repo=self.mahnlauf_repo,
+        ))
         text = (
             f"Guten Tag {empfaenger_name},\n\n"
             f"{mahntext.einleitung} {mahntext.kerntext}\n\n"
@@ -470,6 +511,7 @@ class HVMailversandService:
             + zahlungsziel_text +
             "\n\nBei einer inzwischen erfolgten Zahlung senden Sie uns bitte den Zahlungsbeleg. "
             "Bei Fragen zur Forderung antworten Sie bitte auf diese Nachricht."
+            + f"\n\n---\nKontoauszug (Stand vor dieser Mahnung):\n\n{kontoauszug_text}"
         )
         return subject, text, empfaenger_name, anker.snapshot["empfaenger_email"], anker.policy_version
 
@@ -779,6 +821,26 @@ class HVMailversandService:
             kontext=kontext, mahnlauf=mahnlauf, heute=heute, vorschau=vorschau,
             empfaenger_name=empfaenger_name, empfaenger_adresse=(debitor.adresse or "").replace(", ", "\n"),
         )
+        # Auftrag HV-20261022-EIN-KONTOBLATT, Nachbesserung Markus
+        # 22.10.2026: der EINE kanonische Kontoauszug wird den Seiten DES
+        # TATSÄCHLICHEN Mahnbriefs angehängt, BEVOR er archiviert/
+        # übertragen wird - kein bloßer separater Download neben dem
+        # echten Schreiben, sondern GENAU DASSELBE physische Dokument,
+        # das danach unveränderlich archiviert wird (siehe
+        # `kontoauszug_anhang.py`-Moduldoc). Dieselbe GENERISCHE
+        # `lade_kontoblatt`-Quelle wie Kontoansicht/Mieterakte - KEINE
+        # zweite, abweichende Berechnung.
+        kontoauszug_pdf_bytes = erzeuge_kontoauszug_pdf(
+            absender=kontext.absender, objekt_bezeichnung=kontext.obj.bezeichnung,
+            einheit_bezeichnung=kontext.unit.bezeichnung, debitor_name=debitor.name,
+            vertrag_id=mahnlauf.vertrag_id, konto_id=account.id, heute=heute,
+            kontoblatt=lade_kontoblatt(
+                konto_id=account.id, vertrag_id=mahnlauf.vertrag_id, op_service=self.op_service,
+                mahnkosten_repo=self.mahnkosten_repo, ruecklastschriftkosten_repo=self.ruecklastschriftkosten_repo,
+                mahnlauf_repo=self.mahnlauf_repo,
+            ),
+        )
+        pdf_bytes = haenge_kontoauszug_pdf_an(pdf_bytes, kontoauszug_pdf_bytes)
 
         try:
             archiv_zeile = self.mahnbrief_archiv_repo.archivieren(
@@ -844,6 +906,11 @@ class HVMailversandService:
                     kontext=kontext, mahnlauf=mahnlauf, heute=heute, vorschau=vorschau,
                     empfaenger_name=mitmieter.name, empfaenger_adresse=(mitmieter.adresse or "").replace(", ", "\n"),
                 )
+                # Dieselbe kanonische Kontoauszug-Kopie wie der Hauptbrief
+                # (siehe oben) - EIN Konto hat EINEN Kontoauszug,
+                # unabhängig davon, an wie viele bestätigte Mitmieter eine
+                # eigene Briefkopie geht.
+                mitmieter_pdf_bytes = haenge_kontoauszug_pdf_an(mitmieter_pdf_bytes, kontoauszug_pdf_bytes)
             except AdressfehlerError:
                 continue  # ungültige/zu lange Adresse - kein Versand, kein Absturz der Gruppe
             except Exception:

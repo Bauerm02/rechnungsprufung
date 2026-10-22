@@ -12,6 +12,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from html import escape as h
 from uuid import uuid4
 
+from mietinkasso.backoffice.kontoblatt_render import render_kontoblatt_html
 from mietinkasso.backoffice.views import csrf_feld, eur, option, parse_eur_betrag, sperrgrund_label
 from mietinkasso.domain.enums import (
     Befristungsstatus,
@@ -1175,6 +1176,7 @@ def detail_ansicht(
     kontostatus,
     unbekannte_faelligkeit_positionen: list,
     zahlungen_positionen: list,
+    kontoblatt=None,
     sperren: list,
     mahnfaelle: list,
     mahnlaeufe: list,
@@ -1422,23 +1424,22 @@ def detail_ansicht(
         unbekannt_html = f"""
       <p class="warn">Offene Position(en) ohne erfasste Fälligkeit:</p>
       <table><tr><th>Beleg</th><th>Art</th><th>Rest</th><th>Belegdatum</th></tr>{unbekannt_zeilen}</table>"""
-    zahlungen_zeilen = "".join(
-        f"<tr><td>{p.belegdatum.isoformat()}</td><td>{h(p.typ)}</td><td>{eur(p.betrag_cent)}</td>"
-        f"<td>{h(p.leistungsperiode or '')}</td><td>{h(p.beleg_referenz or '')}</td></tr>"
-        for p in zahlungen_positionen
-    )
+    # Auftrag HV-20261022-EIN-KONTOBLATT: EIN gemeinsames, chronologisches
+    # Kontoblatt-Journal - identisch zur Kontoansicht/zum PDF
+    # (`backoffice/kontoblatt_render.py::render_kontoblatt_html`), keine
+    # eigene, abweichende zweite "Alle Buchungen"-Tabelle mehr hier.
+    if kontoblatt is not None:
+        kontoblatt_html = render_kontoblatt_html(
+            kontoblatt, konto_id=konto_id,
+            zinsabrechnung_link_html=f' &nbsp;|&nbsp; <a href="/backoffice/vertrag/{h(vertrag.id)}/zinsabrechnung">Zinsabrechnung</a>',
+        )
+    else:
+        kontoblatt_html = '<div class="card"><h2>Kontoblatt</h2><p class="muted">Kein Mietkonto vorhanden.</p></div>'
     zahlungen_karte = f"""
     <div class="card" id="zahlungen"><h2>Offene Positionen &amp; Zahlungen/Buchungen</h2>
       {unbekannt_html}
-      <details {"open" if not unbekannte_faelligkeit_positionen else ""}>
-        <summary>Alle Buchungen ({len(zahlungen_positionen)})</summary>
-        <table><tr><th>Datum</th><th>Typ</th><th>Betrag</th><th>Periode</th><th>Beleg/Quelle</th></tr>
-        {zahlungen_zeilen or '<tr><td colspan=5 class="muted">Keine Buchungen.</td></tr>'}</table>
-      </details>
-      {f'<p><a href="/backoffice/konto/{h(konto_id)}">Vollständigen Kontoauszug öffnen</a> (mit Kostenübersicht: '
-       f'Hauptforderung, gebuchte Mahngebühren/-pauschale, Verzugszinsen und Rücklastschriftkosten getrennt) · '
-       f'<a href="/backoffice/konto/{h(konto_id)}/kontoauszug.pdf">PDF-Kontoauszug herunterladen</a></p>' if konto_id else ''}
-    </div>"""
+    </div>
+    {kontoblatt_html}"""
 
     # -- Sperren (id="sperren") - reine Statusanzeige, KEINE ----------------
     # -- Aufforderung zum Entsperren (Rückprüfung 14.09.2026). --------------

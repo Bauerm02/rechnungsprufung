@@ -24,12 +24,12 @@ from fpdf.enums import MethodReturnValue
 
 from mietinkasso.mahnwesen.brief_pdf import _FALLBACK_FONT_BOLD, _FALLBACK_FONT_REGULAR, Absender, _hex_to_rgb
 from mietinkasso.op.kontoblatt import (
-    KATEGORIE_LABEL,
     KATEGORIE_MAHNPAUSCHALE,
     KATEGORIE_MAHNSPESEN,
     KATEGORIE_VERZUGSZINSEN,
     STATUS_LABEL,
     Kontoblatt,
+    erstelle_journal,
 )
 
 
@@ -267,64 +267,51 @@ def erzeuge_kontoauszug_pdf(
     )
     pdf.ln(2)
 
-    _abschnitt_titel(pdf, "Hauptforderung")
-    if kontoblatt.hauptforderung_zeilen:
-        for z in kontoblatt.hauptforderung_zeilen:
-            p = z.position
-            rest_text = _eur(z.rest_cent) if z.rest_cent is not None else ""
-            bezeichnung = f"{p.typ} · {p.beleg_referenz or p.aenderungsgrund or ''}{_status_text(z)}"
-            _zeile(pdf, datum_text=p.belegdatum.strftime("%d.%m.%Y"), bezeichnung=bezeichnung, betrag_cent=p.betrag_cent, rest_text=rest_text)
-    else:
-        pdf.cell(0, 5, "Keine Hauptforderungszeilen.", new_x="LMARGIN", new_y="NEXT")
-    # Codex-Abnahme 20.10.2026, P3: "gebucht" (Sollsumme VOR Zahlungen)
-    # und "davon noch offen" (tatsächlicher Rückstand NACH Zahlungen)
-    # werden ausdrücklich GETRENNT gezeigt - sonst wird die Bruttosumme
-    # als Rückstand missverstanden.
-    _zeile(pdf, datum_text="", bezeichnung="Hauptforderung gebucht (Sollsumme vor Zahlungen)", betrag_cent=kontoblatt.hauptforderung_cent, fett=True)
-    _zeile(pdf, datum_text="", bezeichnung="davon tatsächlich noch offen", betrag_cent=kontoblatt.hauptforderung_offener_rest_cent, fett=True)
+    # Auftrag HV-20261022-EIN-KONTOBLATT: EIN gemeinsames, chronologisches
+    # Journal (Miete/Zahlung/Gutschrift/Retourkapital/Mahngebühren/
+    # Bankkosten/Zinsen in EINER Tabelle mit laufendem Saldo) statt
+    # getrennter Kategorie-Abschnitte - identisch zur HTML-Ansicht
+    # (`backoffice/kontoblatt_render.py::render_kontoblatt_html`) und zur
+    # Mieterakte. Kurze Summen zuerst, dann das vollständige Journal -
+    # darf über mehrere Druckseiten laufen (automatischer Seitenumbruch
+    # über `_zeile`/`will_page_break`), es gibt aber bewusst KEIN
+    # separates zweites Kosten-/Zinsblatt.
+    pdf.set_font("Konto", "", 9.5)
+    pdf.multi_cell(
+        0, 5,
+        f"Hauptforderung gebucht: {_eur(kontoblatt.hauptforderung_cent)} (offen: {_eur(kontoblatt.hauptforderung_offener_rest_cent)}) · "
+        f"Kosten gebucht: {_eur(kontoblatt.kosten_cent)} (offen: {_eur(kontoblatt.kosten_offener_rest_cent)}) · "
+        f"Zahlungs-/Stornostand: {_eur(kontoblatt.zahlungen_saldo_cent)}",
+    )
+    pdf.ln(1)
 
-    _abschnitt_titel(pdf, "Tatsächlich gebuchte Kosten (Mahngebühr/-pauschale, Verzugszinsen, Rücklastschriftkosten)")
-    if kontoblatt.kosten_zeilen:
-        for z in kontoblatt.kosten_zeilen:
-            p = z.position
-            rest_text = _eur(z.rest_cent) if z.rest_cent is not None else ""
-            label = KATEGORIE_LABEL.get(z.kategorie, z.kategorie)
-            bezeichnung = f"{label} · {p.beleg_referenz or ''}{_status_text(z)}{_ledger_text(z)}"
-            _zeile(pdf, datum_text=p.belegdatum.strftime("%d.%m.%Y"), bezeichnung=bezeichnung, betrag_cent=p.betrag_cent, rest_text=rest_text)
+    _abschnitt_titel(pdf, "Kontoblatt — chronologisches Journal")
+    journal = erstelle_journal(kontoblatt)
+    if journal:
+        for jz in journal:
+            status_text = _status_text(jz.zeile)
+            if not jz.beeinflusst_saldo:
+                status_text += " · wirkt sich NICHT auf den laufenden Saldo aus"
+            bezeichnung = (
+                f"{jz.buchungsart} · {jz.beleg_referenz}{status_text}{_ledger_text(jz.zeile)} · "
+                f"Forderungsbezug: {jz.forderungsbezug}"
+            )
+            effekt_cent = jz.soll_cent - jz.haben_cent
+            _zeile(
+                pdf, datum_text=jz.datum.strftime("%d.%m.%Y"), bezeichnung=bezeichnung, betrag_cent=effekt_cent,
+                rest_text=_eur(jz.laufender_saldo_cent),
+            )
             pdf.set_font("Konto", "", 8.5)
-            for zuordnung_text in _zins_zuordnung_zeilen_text(z):
+            for zuordnung_text in _zins_zuordnung_zeilen_text(jz.zeile):
                 # Unabhängige Prüfung Commit 8ae0406, optionaler Hinweis:
                 # "↳" (U+21B3) fehlt im Zeichensatz der Fallback-Schrift
                 # (LiberationSerif) - ein einfacher, in jeder Schrift
                 # vorhandener Einzug ("- ") statt eines möglichen
                 # Platzhalter-/Fehlzeichens.
                 pdf.multi_cell(0, 4.5, "    - " + zuordnung_text, new_x="LMARGIN", new_y="NEXT")
-        _zeile(pdf, datum_text="", bezeichnung="Kosten gebucht (Sollsumme vor Zahlungen, bereits im Saldo enthalten)", betrag_cent=kontoblatt.kosten_cent, fett=True)
-        _zeile(pdf, datum_text="", bezeichnung="davon tatsächlich noch offen", betrag_cent=kontoblatt.kosten_offener_rest_cent, fett=True)
+            pdf.set_font("Konto", "", 9.5)
     else:
-        pdf.cell(0, 5, "Keine gebuchten Kosten.", new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(5)
-
-    if kontoblatt.kosten_historie:
-        _abschnitt_titel(pdf, "Kosten-Historie (storniert/ersetzt)")
-        pdf.set_font("Konto", "", 9)
-        pdf.multi_cell(0, 5, "Nicht mehr gültige Kostenbuchungen - zur Nachvollziehbarkeit erhalten, OHNE die aktuelle Kostensumme oder den Gesamtsaldo zu verändern.")
-        pdf.ln(1)
-        for z in kontoblatt.kosten_historie:
-            p = z.position
-            label = KATEGORIE_LABEL.get(z.kategorie, z.kategorie)
-            bezeichnung = f"{label} · {p.beleg_referenz or ''}{_status_text(z)}{_ledger_text(z)}"
-            _zeile(pdf, datum_text=p.belegdatum.strftime("%d.%m.%Y"), bezeichnung=bezeichnung, betrag_cent=p.betrag_cent)
-
-    _abschnitt_titel(pdf, "Zahlungen / Rücklastschriften (Stornostand)")
-    if kontoblatt.zahlungen_zeilen:
-        for z in kontoblatt.zahlungen_zeilen:
-            p = z.position
-            bezeichnung = f"{p.typ} · {p.beleg_referenz or p.aenderungsgrund or ''}"
-            _zeile(pdf, datum_text=p.belegdatum.strftime("%d.%m.%Y"), bezeichnung=bezeichnung, betrag_cent=p.betrag_cent)
-        _zeile(pdf, datum_text="", bezeichnung="Zahlungs-/Stornostand gesamt", betrag_cent=kontoblatt.zahlungen_saldo_cent, fett=True)
-    else:
-        pdf.cell(0, 5, "Keine Zahlungen/Rücklastschriften.", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 5, "Keine Buchungen.", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(5)
 
     pdf.ln(2)

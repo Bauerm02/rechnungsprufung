@@ -32,6 +32,7 @@ from mietinkasso.indexautomatik.zeit import heute_wien
 from mietinkasso.intake.apply import wende_an as _intake_wende_an
 from mietinkasso.intake.parser import IntakeFormatFehlerError, parse_json_paket as _intake_parse_json_paket
 from mietinkasso.intake.planner import erstelle_plan as _intake_erstelle_plan
+from mietinkasso.op.kontoblatt import lade_kontoblatt
 from mietinkasso.rueckstaende.service import berechne_rueckstandsuebersicht
 from mietinkasso.stammdaten.telefon import normalisiere_telefon
 from mietinkasso.vertragsanlage.ablage import (
@@ -324,6 +325,17 @@ def vertragsanlage_detail(
     mahnfaelle = [m for m in uebersicht.mahnfaelle if m.vertrag_id == vertrag_id]
 
     zahlungen_positionen = deps._op_service.berechne_saldo(konto.id).positionen if konto else []
+    # Auftrag HV-20261022-EIN-KONTOBLATT: die Mieterakte verwendet
+    # GENAU dasselbe `Kontoblatt`/chronologische Journal wie Kontoansicht
+    # und PDF (`lade_kontoblatt`, `backoffice/kontoblatt_render.py`) -
+    # keine eigene, abweichende zweite Buchungsübersicht mehr.
+    kontoblatt = (
+        lade_kontoblatt(
+            konto_id=konto.id, vertrag_id=vertrag_id, op_service=deps._op_service,
+            mahnkosten_repo=deps._hv_mail.mahnkosten_repo, ruecklastschriftkosten_repo=deps._ruecklastschriftkosten_repo,
+            mahnlauf_repo=deps._hv_mail.mahnlauf_repo,
+        ) if konto else None
+    )
     sperren = deps._stammdaten_repo.aktive_sperren(vertrag_id)
     mahnlaeufe = deps._hv_mail.mahnlauf_repo.list_fuer_vertrag(vertrag_id)
     erhoehungsschreiben = deps._indexautomatik.outbox_repository.liste_fuer_vertrag(vertrag_id)
@@ -342,7 +354,7 @@ def vertragsanlage_detail(
         aktueller_monat=aktueller_monat, vorschreibungen=vorschreibungen,
         vorschreibung_positionen_je_id=vorschreibung_positionen_je_id,
         kontostatus=kontostatus, unbekannte_faelligkeit_positionen=unbekannte_faelligkeit_positionen,
-        zahlungen_positionen=zahlungen_positionen, sperren=sperren, mahnfaelle=mahnfaelle,
+        zahlungen_positionen=zahlungen_positionen, kontoblatt=kontoblatt, sperren=sperren, mahnfaelle=mahnfaelle,
         mahnlaeufe=mahnlaeufe, erhoehungsschreiben=erhoehungsschreiben,
         vertragsende_erinnerungen=vertragsende_erinnerungen, von_objekt=von_objekt,
         mitmieter=mitmieter,

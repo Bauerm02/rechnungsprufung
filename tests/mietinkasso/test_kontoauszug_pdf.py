@@ -231,13 +231,19 @@ def test_viele_zeilen_erzeugen_mehrseitiges_pdf_ohne_abgeschnittenen_inhalt():
         assert f"{i:03d}" in gesamter_text
 
 
-def test_zahlungen_und_stornostand_werden_separat_gezeigt():
+def test_zahlung_und_retourkapital_erscheinen_im_gemeinsamen_journal():
+    """Auftrag HV-20261022-EIN-KONTOBLATT: Zahlung und Retourkapital
+    (Rücklastschrift) erscheinen als eigene Buchungsarten im EINEN
+    chronologischen Journal - keine separate Kategorie-Überschrift mehr."""
+
     zahlung = KontoblattZeile(position=_op(1, "ZAHLUNG", 50_000, referenz="Banküberweisung"), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=None)
     ruecklastschrift = KontoblattZeile(position=_op(2, "RUECKLASTSCHRIFT", 50_000, referenz="Rückbuchung"), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=None)
     kontoblatt = _leeres_kontoblatt(zahlungen_zeilen=[zahlung, ruecklastschrift], zahlungen_saldo_cent=0)
     pdf_bytes = _erzeugen(kontoblatt)
     text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages)
-    assert "Zahlungen" in text and "Stornostand" in text
+    assert "Kontoblatt" in text and "chronologisches Journal" in text
+    assert "Zahlung" in text
+    assert "Retourkapital" in text and "Rücklastschrift" in text
     assert "Banküberweisung" in text
     assert "Rückbuchung" in text
 
@@ -259,12 +265,17 @@ def test_kostenzeile_zeigt_status_offen_teilbezahlt_bezahlt():
     # mitten im "Status: <Wort>"-Text umbrechen - kein Verlust, nur Umbruch,
     # siehe Mehrseiten-Regressionstest oben für die "nicht abgeschnitten"-
     # Garantie selbst).
-    text = " ".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages).replace("\n", " ")
+    # Auftrag HV-20261022-EIN-KONTOBLATT: die neue zusammengefasste
+    # Summenzeile ("Hauptforderung gebucht: ... · Kosten gebucht: ...")
+    # wird von `multi_cell` per Wortabstand gesetzt - `pypdf.extract_text`
+    # fügt dabei vereinzelt zusätzliche Leerzeichen zwischen Wörtern ein;
+    # zusätzlich zu Zeilenumbrüchen werden daher auch mehrfache
+    # Leerzeichen auf eines normalisiert (kein Inhaltsverlust).
+    text = " ".join(" ".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages).replace("\n", " ").split())
     assert "Status: offen" in text
     assert "Status: teilbezahlt" in text
     assert "Status: bezahlt" in text
-    assert "Sollsumme vor Zahlungen" in text
-    assert "davon tatsächlich noch offen" in text
+    assert "Kosten gebucht" in text
     assert "60,00 EUR" in text  # gebuchte Sollsumme
     assert "28,00 EUR" in text  # tatsächlich noch offener Rest
 
@@ -281,10 +292,17 @@ def test_kosten_historie_zeigt_stornierte_und_ersetzte_zeilen_getrennt_von_aktue
         saldo_cent=1000, faelliger_unstrittiger_rest_cent=1000,
     )
     pdf_bytes = _erzeugen(kontoblatt)
-    text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages).replace("\n", " ")
-    assert "Kosten-Historie" in text
+    # Siehe Kommentar im vorigen Test: mehrfache Leerzeichen aus der neuen
+    # Summenzeile werden zusätzlich zu Zeilenumbrüchen normalisiert.
+    text = " ".join("".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages).replace("\n", " ").split())
+    # Auftrag HV-20261022-EIN-KONTOBLATT: keine eigene "Kosten-Historie"-
+    # Überschrift mehr - die stornierte/ersetzte Zeile erscheint
+    # chronologisch im EINEN Journal, ausdrücklich als saldo-neutral
+    # markiert.
+    assert "wirkt sich NICHT auf den laufenden Saldo aus" in text
     assert "Status: ersetzt" in text
     assert "Alte Mahnspesenberechnung" in text
+    assert "Kosten gebucht" in text
     assert "10,00 EUR" in text  # korrigierter, aktueller Betrag (Kosten gesamt)
     assert "20,00 EUR" in text  # historischer (nicht mehr gültiger) Betrag taucht trotzdem auf
 

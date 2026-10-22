@@ -6482,7 +6482,11 @@ def test_kontoauszug_zeigt_status_und_historie_korrigierter_kostenzeile(backoffi
 
     seite = client.get(f"/backoffice/konto/{konto.id}")
     assert seite.status_code == 200
-    assert "Kosten-Historie" in seite.text
+    # Auftrag HV-20261022-EIN-KONTOBLATT: keine eigene "Kosten-Historie"-
+    # Karte mehr - die stornierte/ersetzte Zeile erscheint chronologisch
+    # im EINEN Journal, als saldo-neutral markiert (grau, erklärender
+    # Hinweistext).
+    assert "storniert/ersetzt" in seite.text
     assert "ersetzt" in seite.text
     assert "offen" in seite.text or "bezahlt" in seite.text  # Status der korrigierten (aktiven) Zeile
     assert "2,00" in seite.text  # der korrigierte Betrag (200 Cent)
@@ -6526,7 +6530,10 @@ def test_kontoauszug_zeigt_kostenstatus_offen_teilbezahlt_bezahlt(backoffice_cli
     )
     seite_bezahlt = client.get(f"/backoffice/konto/{konto.id}")
     assert "bezahlt" in seite_bezahlt.text
-    assert "Gebucht (Sollsumme vor Zahlungen)" in seite_bezahlt.text or "Sollsumme vor Zahlungen" in seite_bezahlt.text
+    # Auftrag HV-20261022-EIN-KONTOBLATT: die separate Kostenkarte mit
+    # "Sollsumme vor Zahlungen"-Parenthese entfällt zugunsten der
+    # kurzen, gemeinsamen Summenzeile über dem EINEN Journal.
+    assert "Kosten gebucht" in seite_bezahlt.text
 
 
 def test_kontoauszug_offene_ruecklastschrift_zaehlt_in_hauptforderung_offener_rest(backoffice_client):
@@ -6557,7 +6564,13 @@ def test_kontoauszug_offene_ruecklastschrift_zaehlt_in_hauptforderung_offener_re
 
     seite = client.get(f"/backoffice/konto/{konto.id}")
     assert seite.status_code == 200
-    assert "davon noch offen: <strong>1.207,90 €</strong>" in seite.text
+    # Auftrag HV-20261022-EIN-KONTOBLATT: die neue gemeinsame Summenzeile
+    # zeigt den offenen Rest in Klammern hinter dem gebuchten Betrag
+    # ("Hauptforderung gebucht: X (offen: Y)") statt einer eigenen
+    # "davon noch offen"-Zeile - der fachliche Kern des Tests (der echte
+    # Reststand der Rücklastschrift wird mitgezählt, nicht als 0,00 €
+    # gezeigt) bleibt unverändert geprüft.
+    assert "(offen: 1.207,90 €)" in seite.text
 
 
 def test_kontoauszug_zeigt_versandnachweis_und_zinszuordnung_bei_echter_mahnkostenbuchung(backoffice_client):
@@ -6823,7 +6836,10 @@ def test_mieterakte_zeigt_link_auf_pdf_kontoauszug(backoffice_client):
     seite = client.get(f"/backoffice/vertrag/{_vertrag.id}")
     assert seite.status_code == 200
     assert f"/backoffice/konto/{konto.id}/kontoauszug.pdf" in seite.text
-    assert "Kostenübersicht" in seite.text
+    # Auftrag HV-20261022-EIN-KONTOBLATT: die Mieterakte bettet dasselbe
+    # gemeinsame Kontoblatt-Journal ein ("Kontoblatt"-Überschrift) statt
+    # der bisherigen separaten "Kostenübersicht"-Karte.
+    assert "Kontoblatt" in seite.text
 
 
 def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
