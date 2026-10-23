@@ -32,6 +32,7 @@ from mietinkasso.op.kontoblatt import (
     STATUS_OFFEN,
     STATUS_STORNIERT,
     STATUS_TEILBEZAHLT,
+    _hauptforderung_komponente_text,
     _satz_text,
     erstelle_einfache_tabelle,
     erstelle_journal,
@@ -1077,3 +1078,103 @@ def test_verzugszinsen_vorschau_zeile_ohne_strukturierte_segmente_faellt_auf_ska
     )
     vorschau_zeile = next(z for z in erweitert if z.ist_vorschau)
     assert vorschau_zeile.buchung == "Verzugszinsen 04.09.2026–07.09.2026, 4% (mit diesem Schreiben)"
+
+
+def test_hauptforderung_komponente_erkennt_altimport_schema_hauptmiete():
+    """Nachtrag Markus 23.10.2026 (Sichtabnahme fdda658): der bekannte
+    Altimport-Schematyp "HV VS 9/2026; Hauptmietzins 10 % Mwst; J.12345"
+    muss als "Hauptmiete" erkannt werden, OHNE die rohe Belegreferenz
+    (Präfix "HV VS 9/2026", Steuerhinweis, Belegkennung "J.12345")
+    irgendwo im Ergebnis zu zeigen."""
+
+    p = _op(1, "SOLL", 100_000, beleg_referenz="HV VS 9/2026; Hauptmietzins 10 % Mwst; J.12345")
+    p.leistungsperiode = "2026-09"
+    assert _hauptforderung_komponente_text(p) == "Hauptmiete September 2026"
+
+
+def test_hauptforderung_komponente_erkennt_bekannte_whitelist_komponenten():
+    """Originalauftrag: "Miete/BK/Küche/Parkplatz fachlich erkennbar" -
+    jede der sechs benannten Komponenten wird über die feste Whitelist
+    erkannt, inklusive der Sonderregel "BK Garage" VOR der generischen
+    Betriebskosten-Erkennung (deren Muster sonst bereits innerhalb von
+    "BK Garage" selbst anschlagen würde)."""
+
+    faelle = {
+        "Betriebskosten 09/2026": "Betriebskosten",
+        "BK Garage 09/2026": "BK Garage",
+        "Betriebskosten Garage 09/2026": "BK Garage",
+        "Heizkosten 09/2026": "Heizkosten",
+        "Wasser-Nachverrechnung 09/2026": "Wasser",
+        "Küche 09/2026": "Küche",
+        "Stellplatz 09/2026": "Stellplatz",
+        "Parkplatz 09/2026": "Stellplatz",
+    }
+    for beleg_referenz, erwartete_komponente in faelle.items():
+        p = _op(1, "SOLL", 1_000, beleg_referenz=beleg_referenz)
+        p.leistungsperiode = "2026-09"
+        assert _hauptforderung_komponente_text(p) == f"{erwartete_komponente} September 2026", beleg_referenz
+
+
+def test_hauptforderung_komponente_erhaelt_explizites_abrechnungsjahr_statt_buchungsmonat():
+    """"Explizites 'Abrechnung 2025' als Abrechnungsjahr erhalten" - eine
+    Heizkostenabrechnung 2025, deren OP-Position erst im September 2026
+    gebucht wurde, darf NICHT als "Heizkosten September 2026" erscheinen
+    (Buchungsmonat != Abrechnungsjahr) - das genannte Abrechnungsjahr hat
+    Vorrang vor der `leistungsperiode` des Buchungsmonats."""
+
+    p = _op(1, "SOLL", 50_000, beleg_referenz="Heizkostenabrechnung 2025")
+    p.leistungsperiode = "2026-09"  # Buchungsmonat - bewusst ABWEICHEND vom Abrechnungsjahr
+    assert _hauptforderung_komponente_text(p) == "Heizkostenabrechnung 2025"
+
+
+def test_hauptforderung_komponente_generische_abrechnung_bleibt_neutral_ohne_grundlage():
+    """"generisches Abrechnungsergebnis nicht ohne Grundlage als BK
+    umdeuten" - ein bloßes "Abrechnung 2025" ohne erkennbare Komponente
+    bleibt neutral, wird NIE als Betriebskosten/Heizkosten erraten."""
+
+    p = _op(1, "SOLL", 20_000, beleg_referenz="Abrechnung 2025")
+    assert _hauptforderung_komponente_text(p) == "Abrechnung 2025"
+
+
+def test_hauptforderung_komponente_entfernt_korrektur_praefix_ohne_ihn_auszugeben():
+    """Der bestehende Korrektur-Präfix (`op/service.py::storniere_und_
+    korrigiere`: "Korrektur zu #<id>: <ursprüngliche beleg_referenz>")
+    muss sicher erkannt/entfernt werden, OHNE selbst im Ergebnis zu
+    erscheinen (keine rohe OP-Id im Kundentext)."""
+
+    p = _op(1, "SOLL", 50_000, beleg_referenz="Korrektur zu #42: Heizkostenabrechnung 2025")
+    ergebnis = _hauptforderung_komponente_text(p)
+    assert ergebnis == "Heizkostenabrechnung 2025"
+    assert "#42" not in ergebnis
+    assert "Korrektur" not in ergebnis
+
+
+def test_hauptforderung_komponente_unbekannte_quelle_bleibt_neutral():
+    """Eine unbekannte/technische Quelle (keine Whitelist-Komponente,
+    kein Abrechnungsjahr) liefert `None` - der Aufrufer fällt dann
+    unverändert auf "Mietvorschreibung ..." zurück, NIE eine erfundene
+    Komponente UND NIE ein roher Ausschnitt der Quelle selbst."""
+
+    p = _op(1, "SOLL", 1_000, beleg_referenz="J.998877")
+    assert _hauptforderung_komponente_text(p) is None
+
+    p_ohne_referenz = _op(2, "SOLL", 1_000, beleg_referenz=None)
+    assert _hauptforderung_komponente_text(p_ohne_referenz) is None
+
+
+def test_einfache_buchung_text_zeigt_fachliche_komponente_statt_pauschaler_mietvorschreibung():
+    """Ende-zu-Ende über die tatsächliche Journal-Textquelle
+    (`erstelle_einfache_tabelle`): eine Heizkostenabrechnung 2025 heißt
+    NICHT "Mietvorschreibung September 2026", sondern erkennbar
+    "Heizkostenabrechnung 2025" - Saldo/Betrag bleiben dabei exakt
+    unverändert (reine Textkorrektur)."""
+
+    heizkosten = _op(1, "SOLL", 50_000, belegdatum=date(2026, 9, 5), beleg_referenz="Heizkostenabrechnung 2025")
+    heizkosten.leistungsperiode = "2026-09"
+    blatt = _leer(saldo_cent=50_000, positionen_aktiv=[heizkosten], positionen_alle=[heizkosten])
+
+    zeilen = erstelle_einfache_tabelle(blatt)
+    zeile = next(z for z in zeilen if z.betrag_cent == 50_000)
+    assert zeile.buchung == "Heizkostenabrechnung 2025"
+    assert "Mietvorschreibung" not in zeile.buchung
+    assert zeile.offen_cent == 50_000

@@ -8184,3 +8184,69 @@ Suiten `test_kontoblatt.py`, `test_brief_pdf.py`,
 `test_backoffice.py` grün (keine Regression durch die neuen, optionalen
 Parameter). Ausschließlich synthetische Testdaten, keine
 Produktivaktionen, `SEND_ENABLED=false` unverändert.
+
+## HV-20261023-MAHNUNG-EINFACH: dritter Folgecommit (fachliche Komponente statt pauschaler "Mietvorschreibung", Sichtabnahme auf Commit fdda658)
+
+Echte Sichtabnahme von Commit `fdda658` (Markus, 23.10.2026, bereits
+technisch online/veröffentlicht durch Codex) fand einen echten
+Fachfehler in der kurzen Hauptforderungs-Zeile: `_einfache_buchung_text`
+nannte JEDE nicht als Kosten klassifizierte SOLL-Zeile pauschal
+"Mietvorschreibung {Buchungsmonat}", unabhängig von ihrer tatsächlichen
+fachlichen Komponente - eine Heizkostenabrechnung 2025 erschien dadurch
+irreführend als "Mietvorschreibung September 2026" (Buchungsmonat statt
+Abrechnungsjahr, falsche Komponente). Der Originalauftrag verlangt
+bereits, dass Miete/BK/Küche/Parkplatz fachlich erkennbar bleiben.
+
+Behoben über einen neuen, strikt begrenzten, deterministischen
+Whitelist-Erkenner (`_hauptforderung_komponente_text`, `op/
+kontoblatt.py`), der AUSSCHLIESSLICH das bereits vorhandene
+`OPPositionTable.beleg_referenz`-Freitextfeld (Altimport-Schema, z. B.
+"HV VS 9/2026; Hauptmietzins 10 % Mwst; J.12345") auf sieben bekannte
+Begriffe prüft - Hauptmiete, Betriebskosten, BK Garage (VOR der
+generischen Betriebskosten-Erkennung geprüft, da deren Muster sonst
+bereits innerhalb von "BK Garage" selbst anschlägt), Heizkosten, Wasser,
+Küche, Stellplatz - und NIE einen Rohausschnitt der Quelle selbst
+(IDs/Hashes/Belegnummern wie "J.12345") zurückgibt, sondern ausschließlich
+eine der sieben fest definierten Kurzbezeichnungen. Ein erkannter
+Korrektur-Präfix (`op/service.py::storniere_und_korrigiere`: "Korrektur
+zu #<id>: ...") wird dabei sicher entfernt, ohne selbst auszugeben. Ein
+explizites "Abrechnung <Jahr>" (z. B. "Heizkostenabrechnung 2025")
+ersetzt den sonst aus dem Buchungsmonat (`leistungsperiode`) gebildeten
+Zeitbezug durch das genannte Abrechnungsjahr; ein generisches
+Abrechnungsergebnis OHNE erkennbare Komponente bleibt bewusst neutral
+("Abrechnung 2025"), wird NICHT ohne Grundlage als Betriebskosten
+umgedeutet. Liefert der Erkenner `None` (unbekannte/technische Quelle,
+kein Treffer), fällt `_einfache_buchung_text` unverändert auf die
+bisherige "Mietvorschreibung {Monat}"-Darstellung zurück - keine
+erfundene Komponente ohne Grundlage.
+
+Keine Änderung an Fälligkeit, Zahlungen, Rückgaben, Summen, der
+Rechenengine, der Datenbank oder dem Versand - reine Textkorrektur der
+einen kurzen Hauptforderungs-Kurzbeschreibung. Keine Aggregation/
+Zeilenlöschung, keine neuen Dateien außerhalb von `op/kontoblatt.py` und
+dessen Test.
+
+### Geänderte Dateien
+
+`src/mietinkasso/op/kontoblatt.py` (`_KOMPONENTEN_MUSTER`,
+`_KORREKTUR_PRAEFIX_MUSTER`, `_ABRECHNUNGSJAHR_MUSTER`,
+`_hauptforderung_komponente_text`, `_einfache_buchung_text`s SOLL-Zweig
+umgestellt).
+
+### Tests
+
+Gezielte neue Tests in `tests/mietinkasso/test_kontoblatt.py`: der
+wörtliche Altimport-Schemafall ("HV VS 9/2026; Hauptmietzins 10 % Mwst;
+J.12345"), alle sieben Whitelist-Komponenten (inkl. "BK Garage" vs.
+generische Betriebskosten), Abrechnungsjahr vs. abweichender
+Buchungsmonat, generische "Abrechnung 2025" ohne Komponente, sicher
+entfernter Korrektur-Präfix, unbekannte/technische Quelle bleibt neutral
+(`None`), sowie ein Ende-zu-Ende-Test über die tatsächliche
+Journal-Textquelle (`erstelle_einfache_tabelle`) mit unverändertem
+Saldo/Betrag. Breiter Regressionslauf (`test_kontoblatt`,
+`test_brief_pdf`, `test_kontoauszug_pdf`, `test_kontoauszug_anhang`,
+`test_hv_mailversand`, `test_hv_mailversand_vier_stufen`,
+`test_backoffice`, `test_vertragsanlage*` - 453 Tests) grün, volle
+Suite `tests/mietinkasso` zusätzlich angestoßen. Ausschließlich
+synthetische Testdaten, keine Produktivaktionen, `SEND_ENABLED=false`
+unverändert.

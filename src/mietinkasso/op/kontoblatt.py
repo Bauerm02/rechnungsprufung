@@ -117,6 +117,7 @@ dann ausdrücklich "fehlend", nie ein erfundener Beleg."""
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
@@ -846,6 +847,74 @@ def _monat_jahr_text(leistungsperiode: str) -> str:
         return leistungsperiode
 
 
+# Nachtrag Markus 23.10.2026 (Abnahme-Hinweis zu Commit fdda658): bisher
+# nannte `_einfache_buchung_text` JEDE nicht als Kosten klassifizierte
+# SOLL-Zeile pauschal "Mietvorschreibung", unabhängig von ihrer
+# tatsächlichen fachlichen Komponente - eine Heizkostenabrechnung 2025
+# erschien dadurch irreführend als "Mietvorschreibung September 2026".
+# `_KOMPONENTEN_MUSTER`/`_komponente_aus_beleg_referenz` lesen dafür
+# AUSSCHLIESSLICH bekannte, fest verdrahtete Schemafelder aus dem
+# bereits vorhandenen `beleg_referenz`-Freitext (Altimport-Schema, z. B.
+# "HV VS 9/2026; Hauptmietzins 10 % Mwst; J.12345") über eine strikt
+# begrenzte, deterministische Whitelist - es wird NIE ein Rohausschnitt
+# des Freitexts selbst (IDs/Hashes/Belegnummern wie "J.12345") in den
+# Kundentext kopiert, sondern ausschließlich eine der hier fest
+# definierten, bekannten Kurzbezeichnungen zurückgegeben. "BK Garage"
+# wird VOR der generischen "Betriebskosten"/"BK"-Erkennung geprüft, da
+# deren Muster sonst bereits innerhalb von "BK Garage" selbst anschlägt.
+_KOMPONENTEN_MUSTER: tuple[tuple[str, re.Pattern], ...] = (
+    ("BK Garage", re.compile(r"(?i)(?:BK|Betriebskosten)\s*Garage|Garage\s*(?:BK|Betriebskosten)")),
+    ("Betriebskosten", re.compile(r"(?i)Betriebskosten|\bBK\b")),
+    ("Heizkosten", re.compile(r"(?i)Heizkosten|\bHK\b")),
+    ("Wasser", re.compile(r"(?i)Wasser")),
+    ("Küche", re.compile(r"(?i)K(?:ü|ue)che")),
+    ("Stellplatz", re.compile(r"(?i)Stellplatz|Parkplatz")),
+    ("Hauptmiete", re.compile(r"(?i)Hauptmietzins|Hauptmiete|\bHMZ\b")),
+)
+_KORREKTUR_PRAEFIX_MUSTER = re.compile(r"^Korrektur zu #\d+:\s*")
+_ABRECHNUNGSJAHR_MUSTER = re.compile(r"(?i)abrechnung\D{0,3}(\d{4})\b")
+
+
+def _hauptforderung_komponente_text(p: OPPositionTable) -> str | None:
+    """Liefert die fachliche Kurzbezeichnung einer SOLL-Hauptforderung
+    (z. B. "Heizkosten", "Hauptmiete"), WENN `beleg_referenz` eines der
+    bekannten Whitelist-Schemafelder erkennen lässt - sonst `None` (der
+    Aufrufer fällt dann unverändert auf "Mietvorschreibung ..." zurück,
+    NIE eine erfundene Komponente ohne Grundlage).
+
+    Ein bekannter, bereits vorhandener "Korrektur zu #<id>: ..."-Präfix
+    (`op/service.py::storniere_und_korrigiere`) wird dabei zuerst sicher
+    entfernt - er selbst wird NIE ausgegeben.
+
+    Ein explizites "Abrechnung <Jahr>" (z. B. "Heizkostenabrechnung
+    2025") ersetzt den sonst aus `leistungsperiode`/Buchungsmonat
+    gebildeten Zeitbezug durch das genannte Abrechnungsjahr - ein
+    generisches Abrechnungsergebnis OHNE erkennbare Komponente wird
+    NICHT ohne Grundlage als Betriebskosten umgedeutet, sondern bleibt
+    neutral "Abrechnung <Jahr>"."""
+
+    text = p.beleg_referenz or ""
+    while True:
+        ohne_praefix = _KORREKTUR_PRAEFIX_MUSTER.sub("", text)
+        if ohne_praefix == text:
+            break
+        text = ohne_praefix
+    if not text:
+        return None
+
+    komponente = next((name for name, muster in _KOMPONENTEN_MUSTER if muster.search(text)), None)
+    jahr_treffer = _ABRECHNUNGSJAHR_MUSTER.search(text)
+    jahr = jahr_treffer.group(1) if jahr_treffer else None
+
+    if komponente and jahr:
+        return f"{komponente}abrechnung {jahr}"
+    if komponente:
+        return f"{komponente} {_monat_jahr_text(p.leistungsperiode)}" if p.leistungsperiode else komponente
+    if jahr:
+        return f"Abrechnung {jahr}"
+    return None
+
+
 def _eur_basis_text(cent: int) -> str:
     return f"{cent / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
@@ -1066,8 +1135,16 @@ def _einfache_buchung_text(jz: "JournalZeile", p: OPPositionTable, positionen_by
         return "Rückbuchung einer Zahlung"
     if p.typ == OPTyp.KORREKTUR.value:
         return "Korrektur"
-    # SOLL - die tatsächliche Mietvorschreibung.
-    basis = f"Mietvorschreibung {_monat_jahr_text(p.leistungsperiode)}" if p.leistungsperiode else "Mietvorschreibung"
+    # SOLL - die tatsächliche Mietvorschreibung. `_hauptforderung_
+    # komponente_text` liefert, WENN erkennbar, die fachliche Komponente
+    # (Hauptmiete/Betriebskosten/BK Garage/Heizkosten/Wasser/Küche/
+    # Stellplatz bzw. ein explizites Abrechnungsjahr) statt der
+    # pauschalen "Mietvorschreibung" - `None` fällt unverändert auf das
+    # bisherige Verhalten zurück.
+    komponente = _hauptforderung_komponente_text(p)
+    basis = komponente if komponente is not None else (
+        f"Mietvorschreibung {_monat_jahr_text(p.leistungsperiode)}" if p.leistungsperiode else "Mietvorschreibung"
+    )
     if p.faelligkeit_bekannt and p.faelligkeit is not None:
         basis += f", fällig {p.faelligkeit.strftime('%d.%m.%Y')}"
     return basis
