@@ -40,15 +40,25 @@ def test_stufe3_ist_nachdruecklich():
 
 
 def test_stufe4_letzte_zahlungsaufforderung_mit_ra_uebergabe_und_keine_kuendigung():
+    """Auftrag HV-20261023-MAHNUNG-EINFACH (23.10.2026): der Kundentext
+    bleibt kurz und KONDITIONAL, OHNE Paragraphen-Nennung ("Rechts-
+    grundlagen... gehören in interne Prüfung, nicht lange Quellenblöcke
+    an Mieter") - die konkrete §-Herleitung lebt jetzt ausschließlich in
+    `hinweis_intern` (siehe eigener Test unten)."""
+
     text = text_fuer_stufe(stufe=4, rechtsordnung=Rechtsordnung.OESTERREICH_MRG_VOLL.value, zahlungsfrist_bis=date(2026, 11, 1))
     assert "binnen 14 Tagen ab Zugang" in text.kerntext
     assert "vollständig" in text.kerntext
     assert "Rechtsanwalt" in text.rechtlicher_kern
-    assert "§ 30 Abs 2 Z 1 MRG" in text.rechtlicher_kern
-    assert "§ 1118 zweiter Fall ABGB" in text.rechtlicher_kern
+    assert "Räumung" in text.rechtlicher_kern
+    assert "gesetzlichen Voraussetzungen" in text.rechtlicher_kern  # konditional, keine Tatsachenbehauptung
     assert "KEINE Kündigung" in text.rechtlicher_kern
-    assert "KEIN Ersatz" in text.rechtlicher_kern  # § 1118-Fristhinweis
     assert "NICHT die gesondert ausgewiesenen Verzugszinsen" in text.rechtlicher_kern
+    # Kein Paragraph mehr im Kundentext - gehört jetzt ausschließlich
+    # intern dokumentiert.
+    assert "§" not in text.rechtlicher_kern
+    assert "MRG" not in text.rechtlicher_kern
+    assert "ABGB" not in text.rechtlicher_kern
     # Korrektur (Codex-Abnahme 20.10.2026): der Mitmieter-Zustellprüf-
     # hinweis ist ein interner Prozesshinweis und darf NIE im Kundentext
     # stehen - er wird jetzt ausschließlich über `hinweis_intern`
@@ -56,23 +66,29 @@ def test_stufe4_letzte_zahlungsaufforderung_mit_ra_uebergabe_und_keine_kuendigun
     assert "Mitmieter" not in text.rechtlicher_kern
     assert text.hinweis_intern is not None
     assert "Mitmieter" in text.hinweis_intern
+    # Die konkrete §-Herleitung ist weiterhin vollständig, nur intern.
+    assert "§ 30 Abs 2 Z 1 MRG" in text.hinweis_intern
+    assert "§ 1118 zweiter Fall ABGB" in text.hinweis_intern
+    assert "KEIN Ersatz" in text.hinweis_intern  # § 1118-Fristhinweis
 
 
-def test_stufe4_mrg_teilanwendung_nennt_gehedgten_paragraf_30_mrg():
+def test_stufe4_mrg_teilanwendung_nennt_gehedgten_paragraf_30_mrg_intern():
     """Korrektur (Codex-Abnahme 20.10.2026, Primärquelle RIS § 1 MRG):
     § 1 Abs 4 MRG erklärt die §§ 29-36 MRG (also auch § 30) im
     Teilanwendungsbereich grundsätzlich für anwendbar - die vorherige
     Fassung behauptete fälschlich das Gegenteil. Der Hinweis bleibt aber
     AUSDRÜCKLICH gehedgt ("soweit... anwendbar ist"), keine unbedingte
-    Behauptung wie bei MRG_VOLL."""
+    Behauptung wie bei MRG_VOLL. Seit HV-20261023-MAHNUNG-EINFACH lebt
+    diese Herleitung ausschließlich intern, nicht mehr im Kundentext."""
 
     text = text_fuer_stufe(stufe=4, rechtsordnung=Rechtsordnung.OESTERREICH_MRG_TEIL.value, zahlungsfrist_bis=date(2026, 11, 1))
-    assert "§ 30 Abs 2 Z 1 MRG" in text.rechtlicher_kern
-    assert "soweit" in text.rechtlicher_kern
-    assert "§ 1 Abs 4 MRG" in text.rechtlicher_kern
-    assert "§ 1118 zweiter Fall ABGB" in text.rechtlicher_kern
-    assert "Mitmieter" not in text.rechtlicher_kern
+    assert "§" not in text.rechtlicher_kern
     assert text.hinweis_intern is not None
+    assert "§ 30 Abs 2 Z 1 MRG" in text.hinweis_intern
+    assert "soweit" in text.hinweis_intern
+    assert "§ 1 Abs 4 MRG" in text.hinweis_intern
+    assert "§ 1118 zweiter Fall ABGB" in text.hinweis_intern
+    assert "Mitmieter" not in text.rechtlicher_kern
 
 
 @pytest.mark.parametrize("rechtsordnung", [
@@ -80,10 +96,11 @@ def test_stufe4_mrg_teilanwendung_nennt_gehedgten_paragraf_30_mrg():
 ])
 def test_stufe4_weitere_oesterreichische_rechtsordnungen_nur_abgb(rechtsordnung):
     text = text_fuer_stufe(stufe=4, rechtsordnung=rechtsordnung, zahlungsfrist_bis=date(2026, 11, 1))
-    assert "§ 30" not in text.rechtlicher_kern
-    assert "§ 1118 zweiter Fall ABGB" in text.rechtlicher_kern
+    assert "§" not in text.rechtlicher_kern  # kein Paragraph mehr im Kundentext (HV-20261023-MAHNUNG-EINFACH)
     assert "Mitmieter" not in text.rechtlicher_kern
     assert text.hinweis_intern is not None
+    assert "§ 30" not in text.hinweis_intern
+    assert "§ 1118 zweiter Fall ABGB" in text.hinweis_intern
 
 
 def test_gewerbe_legacy_hinweis_nur_intern_und_keine_automatische_mrg_ausnahme():

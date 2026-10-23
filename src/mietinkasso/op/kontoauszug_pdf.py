@@ -23,13 +23,16 @@ from fpdf import FPDF
 from fpdf.enums import MethodReturnValue
 
 from mietinkasso.mahnwesen.brief_pdf import _FALLBACK_FONT_BOLD, _FALLBACK_FONT_REGULAR, Absender, _hex_to_rgb
+from mietinkasso.op.einfache_tabelle_pdf import zeichne_einfache_tabelle
 from mietinkasso.op.kontoblatt import (
     KATEGORIE_MAHNPAUSCHALE,
     KATEGORIE_MAHNSPESEN,
     KATEGORIE_VERZUGSZINSEN,
     STATUS_LABEL,
     Kontoblatt,
+    erstelle_einfache_tabelle,
     erstelle_journal,
+    erweitere_um_vorschau,
 )
 
 
@@ -221,7 +224,7 @@ def _zeile(pdf: FPDF, *, datum_text: str, bezeichnung: str, betrag_cent: int, re
     pdf.set_y(max(y1, y0 + 5))
 
 
-def _journal_tabellenkopf(pdf: FPDF) -> None:
+def _journal_tabellenkopf(pdf: FPDF, *, betrag_label: str = "Betrag (+Soll,-Haben)", saldo_label: str = "Saldo") -> None:
     """Spaltenköpfe des chronologischen Journals (Fix7, unabhängige
     Rückprüfung Codex 22.10.2026, Sichtprüfung des kanonischen PDFs:
     "zwei Beträge nebeneinander ohne Kennzeichnung, welcher
@@ -231,7 +234,10 @@ def _journal_tabellenkopf(pdf: FPDF) -> None:
     nach jedem Seitenumbruch INNERHALB des Journals gezeichnet (siehe
     Aufrufer) - KEIN neues separates Blatt, nur eine wiederholte
     Kopfzeile derselben Tabelle; Logo/mehrseitiges Layout bleiben
-    unverändert (`header()` oben wird dadurch nicht berührt)."""
+    unverändert (`header()` oben wird dadurch nicht berührt).
+    `betrag_label`/`saldo_label` erlauben der Empfänger-Ansicht (Auftrag
+    HV-20261023-MAHNUNG-EINFACH) die vereinfachten Kopfzeilen "Betrag"/
+    "Offen" statt der internen "Betrag (+Soll,-Haben)"/"Saldo"."""
 
     datum_breite = 24.0
     label_breite = (_INHALT_RECHTS - _RAND - datum_breite) - _BETRAG_SPALTE_BREITE - _REST_SPALTE_BREITE
@@ -243,9 +249,9 @@ def _journal_tabellenkopf(pdf: FPDF) -> None:
     pdf.set_xy(x0 + datum_breite, y0)
     pdf.cell(label_breite, 5, "Buchung", align="L")
     pdf.set_xy(x0 + datum_breite + label_breite, y0)
-    pdf.cell(_BETRAG_SPALTE_BREITE, 5, "Betrag (+Soll,-Haben)", align="R")
+    pdf.cell(_BETRAG_SPALTE_BREITE, 5, betrag_label, align="R")
     pdf.set_xy(x0 + datum_breite + label_breite + _BETRAG_SPALTE_BREITE, y0)
-    pdf.cell(_REST_SPALTE_BREITE, 5, "Saldo", align="R")
+    pdf.cell(_REST_SPALTE_BREITE, 5, saldo_label, align="R")
     pdf.set_y(y0 + 5)
     pdf.set_draw_color(*pdf.farbe_gold)
     pdf.line(_RAND, pdf.get_y(), _INHALT_RECHTS, pdf.get_y())
@@ -268,7 +274,34 @@ def _abschnitt_titel(pdf: FPDF, text: str) -> None:
 def erzeuge_kontoauszug_pdf(
     *, absender: Absender, objekt_bezeichnung: str, einheit_bezeichnung: str, debitor_name: str,
     vertrag_id: str, konto_id: str, heute: date, kontoblatt: Kontoblatt,
+    empfaenger_ansicht: bool = False,
+    neue_zinsen_delta_cent: int = 0, zins_von: date | None = None, zins_bis: date | None = None,
+    zinssatz_prozent=None, gebuehr_cent: int | None = None, mahnpauschale_cent: int | None = None,
 ) -> bytes:
+    """`empfaenger_ansicht` (Auftrag HV-20261023-MAHNUNG-EINFACH,
+    verbindlicher Darstellungsauftrag): `False` (Standard) ist die
+    bisherige, vollständige interne Ansicht (Backoffice-Download/
+    -Vorschau, Mieterakte) - UNVERÄNDERT. `True` ist die kurze,
+    menschlich verständliche Fassung, die tatsächlich an den Mieter
+    geht (Brief-Anhang/E-Mail-Anhang): Datum | Buchung | Betrag | Offen,
+    OHNE OP-IDs/Beleg-/Importschlüssel/Ledger-Interna, OHNE die rein
+    internen Abschnitte (dokumentierte Bankaufwände/ausstehende
+    Mahnläufe/ausstehende Manualimport-Ansätze - "nicht freigegebene
+    Kosten dürfen nicht in Zahlungsaufforderung/Saldo geraten"), OHNE
+    konkurrierende Summen (nur EIN "Gesamt offen"/"Gesamt Guthaben").
+
+    `neue_zinsen_delta_cent`/`zins_von`/`zins_bis`/`zinssatz_prozent`/
+    `gebuehr_cent`/`mahnpauschale_cent` (nur in der Empfänger-Ansicht
+    wirksam, Nachtrag Markus 23.10.2026): dieselben, dem Briefkörper
+    bereits bekannten neuen, noch NICHT gebuchten Posten (`MahnkosteN
+    Vorschau`) werden über `erweitere_um_vorschau` angehängt, damit
+    dieser Anhang und der Briefkörper NIE unterschiedliche "Gesamt
+    offen"-Beträge zeigen - ohne vorherige DB-Buchung (reine
+    Darstellung, EIN eingefrorener Snapshot). Der reine, mahnlauf-
+    unabhängige Kontoblatt-Download (`backoffice/routes/konten.py::
+    kontoauszug_pdf`) übergibt diese Parameter NICHT und bleibt beim
+    tatsächlich gebuchten Stand."""
+
     anthrazit = _hex_to_rgb(absender.farbe_anthrazit)
     gold = _hex_to_rgb(absender.farbe_gold)
 
@@ -290,14 +323,35 @@ def erzeuge_kontoauszug_pdf(
     pdf.add_page()
     pdf.set_font("Konto", "", 10)
     pdf.set_text_color(0, 0, 0)
-    pdf.multi_cell(
-        0, 5.5,
+    # Empfänger-Ansicht: keine rohen Datenbank-Identifikatoren
+    # (Vertrag-/Konto-Id) - "keine Datenbank-/Beleg-Referenzketten".
+    kopf_text = (
+        f"Mieter: {debitor_name}\nObjekt/Einheit: {objekt_bezeichnung}, {einheit_bezeichnung}\n"
+        f"Erstellt am: {heute.strftime('%d.%m.%Y')}"
+        if empfaenger_ansicht else
         f"Vertrag {vertrag_id} · Konto {konto_id}\n"
         f"Mieter: {debitor_name}\n"
         f"Objekt/Einheit: {objekt_bezeichnung}, {einheit_bezeichnung}\n"
-        f"Erstellt am: {heute.strftime('%d.%m.%Y')}",
+        f"Erstellt am: {heute.strftime('%d.%m.%Y')}"
     )
+    pdf.multi_cell(0, 5.5, kopf_text)
     pdf.ln(2)
+
+    if empfaenger_ansicht:
+        # Nachtrag Markus 23.10.2026: kundenverständliche Überschrift
+        # ("Ihre Kontoaufstellung" statt des technischen "chronologisches
+        # Journal") UND derselbe Tabellenrenderer (`einfache_tabelle_pdf.
+        # zeichne_einfache_tabelle`), den auch der Mahnbrief SELBST auf
+        # seiner ersten Seite verwendet (`brief_pdf.erzeuge_mahnbrief_
+        # pdf`) - EIN Renderer, keine zweite, unabhängig gepflegte
+        # Darstellungs-/Rechenlogik.
+        einfache_zeilen = erweitere_um_vorschau(
+            erstelle_einfache_tabelle(kontoblatt), heute=heute, neue_zinsen_delta_cent=neue_zinsen_delta_cent,
+            zins_von=zins_von, zins_bis=zins_bis, zinssatz_prozent=zinssatz_prozent,
+            gebuehr_cent=gebuehr_cent, mahnpauschale_cent=mahnpauschale_cent,
+        )
+        zeichne_einfache_tabelle(pdf, einfache_zeilen, familie="Konto", anthrazit=anthrazit, gold=gold)
+        return bytes(pdf.output())
 
     # Auftrag HV-20261022-EIN-KONTOBLATT: EIN gemeinsames, chronologisches
     # Journal (Miete/Zahlung/Gutschrift/Retourkapital/Mahngebühren/

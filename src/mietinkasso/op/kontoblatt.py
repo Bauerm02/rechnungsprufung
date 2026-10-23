@@ -823,6 +823,199 @@ def erstelle_journal(kontoblatt: Kontoblatt) -> list[JournalZeile]:
     return ergebnis
 
 
+#: Österreichische Monatsnamen ("Jänner", nicht "Januar") für die kurze,
+#: menschlich verständliche Empfänger-Tabelle (Auftrag HV-20261023-
+#: MAHNUNG-EINFACH).
+_MONATSNAMEN = {
+    "01": "Jänner", "02": "Februar", "03": "März", "04": "April", "05": "Mai", "06": "Juni",
+    "07": "Juli", "08": "August", "09": "September", "10": "Oktober", "11": "November", "12": "Dezember",
+}
+
+
+def _monat_jahr_text(leistungsperiode: str) -> str:
+    """`leistungsperiode` ist das strukturierte `OPPositionTable`-Feld
+    (z. B. "2026-01", NICHT geraten/geparst aus `beleg_referenz`) -
+    liefert "Jänner 2026". Bei unerwartetem Format wird der Rohwert
+    unverändert zurückgegeben (NIE ein erfundenes Datum)."""
+
+    try:
+        jahr, monat_nr = leistungsperiode.split("-")
+        return f"{_MONATSNAMEN.get(monat_nr, monat_nr)} {jahr}"
+    except (ValueError, AttributeError):
+        return leistungsperiode
+
+
+def _einfache_buchung_text(jz: "JournalZeile", p: OPPositionTable) -> str:
+    """Kurze, für einen Laien verständliche Beschreibung EINER
+    Journalzeile (Auftrag HV-20261023-MAHNUNG-EINFACH) - AUSSCHLIESSLICH
+    aus bereits vorhandenen, strukturierten Feldern (`leistungsperiode`,
+    `belegdatum`, `faelligkeit`, die direkten Skalarfelder des Zins-
+    Ledgers `zins_von`/`zins_bis`/`zinssatz_prozent`) - NIE eine interne
+    OP-Id, ein Import-/Beleg-Schlüssel, ein Hash oder eine rohe
+    `versandnachweis_referenz` (die bleiben ausschließlich im internen
+    Backoffice-Kontoblatt sichtbar, siehe `KontoblattZeile.ledger`/
+    `_forderungsbezug`)."""
+
+    datum_text = p.belegdatum.strftime("%d.%m.%Y")
+    if jz.kategorie == KATEGORIE_VERZUGSZINSEN:
+        buchung = jz.zeile.ledger.buchung if jz.zeile.ledger is not None else None
+        if buchung is not None and buchung.zins_von and buchung.zins_bis and buchung.zinssatz_prozent is not None:
+            return (
+                f"Verzugszinsen {buchung.zins_von.strftime('%d.%m.%Y')}–{buchung.zins_bis.strftime('%d.%m.%Y')}, "
+                f"{buchung.zinssatz_prozent}%"
+            )
+        return f"Verzugszinsen ({datum_text})"
+    if jz.kategorie in (KATEGORIE_MAHNSPESEN, KATEGORIE_MAHNPAUSCHALE):
+        return f"Mahngebühr ({datum_text})"
+    if jz.kategorie == KATEGORIE_RUECKLASTSCHRIFTKOSTEN:
+        return f"Bankspesen Rückbuchung ({datum_text})"
+    # KATEGORIE_HAUPTFORDERUNG - je tatsächlichem OP-Typ.
+    if p.typ == OPTyp.EROEFFNUNG.value:
+        return "Ausgangssaldo"
+    if p.typ == OPTyp.ZAHLUNG.value:
+        return "Zahlung"
+    if p.typ == OPTyp.GUTSCHRIFT.value:
+        return "Gutschrift"
+    if p.typ == OPTyp.RUECKLASTSCHRIFT.value:
+        return f"Rückbuchung dieser Zahlung ({datum_text})"
+    if p.typ == OPTyp.KORREKTUR.value:
+        return "Korrektur"
+    # SOLL - die tatsächliche Mietvorschreibung.
+    basis = f"Mietvorschreibung {_monat_jahr_text(p.leistungsperiode)}" if p.leistungsperiode else "Mietvorschreibung"
+    if p.faelligkeit_bekannt and p.faelligkeit is not None:
+        basis += f", fällig {p.faelligkeit.strftime('%d.%m.%Y')}"
+    return basis
+
+
+@dataclass(frozen=True)
+class EinfacheZeile:
+    """EINE Zeile der kurzen, menschlich verständlichen Empfänger-Tabelle
+    (Auftrag HV-20261023-MAHNUNG-EINFACH, verbindlicher Darstellungs-
+    auftrag) - abgeleitet AUSSCHLIESSLICH aus `erstelle_journal` (keine
+    zweite Berechnung/Engine), aber auf das für einen Laien verständliche
+    Minimum reduziert: keine OP-IDs, keine Beleg-/Import-/Hash-Ketten,
+    keine Ledger-/Gate-Interna. `betrag_cent` ist VORZEICHENBEHAFTET (+
+    erhöht den offenen Betrag, - vermindert ihn - identisch zur
+    Erklärung im Anschreiben); `offen_cent` ist der laufende Saldo NACH
+    dieser Zeile, IDENTISCH zu `JournalZeile.laufender_saldo_cent` (keine
+    zweite Saldoberechnung). `ist_storno` markiert eine Historie-Zeile
+    (storniert/ersetzt) - bleibt sichtbar ("keine verlorene Historie"),
+    ändert `offen_cent` aber NICHT gegenüber der Vorzeile. Fälligkeit
+    einer eingemahnten Hauptposition steht - wo vorhanden - bereits
+    direkt in `buchung` (z. B. "Mietvorschreibung Jänner 2026, fällig
+    05.01.2026"), keine eigene Spalte nötig."""
+
+    datum: date
+    buchung: str
+    betrag_cent: int
+    offen_cent: int
+    ist_storno: bool = False
+    #: Nachtrag Markus 23.10.2026 (Abnahme-Hinweis): eine über
+    #: `erweitere_um_vorschau` angehängte Zeile für einen mit DIESEM
+    #: Versand tatsächlich zulässigen, aber ZUM RENDERZEITPUNKT noch
+    #: NICHT gebuchten Posten (Zinsdelta/Mahngebühr) - Buchung erfolgt
+    #: weiterhin ausschließlich NACH dem tatsächlichen Versand. Erlaubt
+    #: einem Renderer eine optische Kennzeichnung ("Vorschauwerte als
+    #: Vorschau kennzeichnen"), OHNE dass der kurze Empfängertext dafür
+    #: interne Fachbegriffe nennen müsste.
+    ist_vorschau: bool = False
+
+
+def erstelle_einfache_tabelle(kontoblatt: Kontoblatt) -> list[EinfacheZeile]:
+    """Die kurze, chronologische Empfänger-Tabelle (Datum | Buchung |
+    Betrag | Offen, ältestes Ereignis oben) - Grundlage für den
+    tatsächlichen Mahnbrief-/E-Mail-Anhang (`mahnwesen/
+    kontoauszug_anhang.py::journal_als_text`, `op/kontoauszug_pdf.py::
+    erzeuge_kontoauszug_pdf(..., empfaenger_ansicht=True)`). Reine Um-
+    formung von `erstelle_journal` - KEINE zweite Berechnung/Engine, KEIN
+    abweichender Saldo. `None`/leere Liste nur, wenn es wirklich NOCH
+    KEINE Buchung gibt.
+
+    **Ausgangssaldo (wörtliche Vorgabe):** "Ausgangssaldo stets als erste
+    Zeile korrekt aus dem Datenmodell, ggf. 0,00" - existiert bereits
+    eine echte `EROEFFNUNG`-Buchung als erste Journalzeile, IST sie
+    bereits dieser Ausgangssaldo (keine doppelte Zeile). Fehlt eine
+    solche Buchung (z. B. ein Konto, das direkt mit der ersten
+    Vorschreibung beginnt), wird eine synthetische "Ausgangssaldo"-Zeile
+    MIT 0,00 EUR vorangestellt - NIE eine verlorene/weggelassene
+    Ausgangslage."""
+
+    journal = erstelle_journal(kontoblatt)
+    if not journal:
+        return []
+    zeilen: list[EinfacheZeile] = []
+    erste = journal[0]
+    if not (erste.beeinflusst_saldo and erste.zeile.position.typ == OPTyp.EROEFFNUNG.value):
+        zeilen.append(EinfacheZeile(datum=erste.datum, buchung="Ausgangssaldo", betrag_cent=0, offen_cent=0))
+    for jz in journal:
+        p = jz.zeile.position
+        buchung = _einfache_buchung_text(jz, p)
+        if not jz.beeinflusst_saldo:
+            buchung += " (storniert)"
+        zeilen.append(EinfacheZeile(
+            datum=jz.datum, buchung=buchung, betrag_cent=jz.soll_cent - jz.haben_cent,
+            offen_cent=jz.laufender_saldo_cent, ist_storno=not jz.beeinflusst_saldo,
+        ))
+    return zeilen
+
+
+def erweitere_um_vorschau(
+    zeilen: list[EinfacheZeile], *, heute: date,
+    neue_zinsen_delta_cent: int = 0, zins_von: date | None = None, zins_bis: date | None = None,
+    zinssatz_prozent=None, gebuehr_cent: int | None = None, mahnpauschale_cent: int | None = None,
+) -> list[EinfacheZeile]:
+    """Nachtrag Markus 23.10.2026 (Abnahme-Hinweis zu edb0417-Nachfolgern):
+    "Brief-Tabelle und beigefügtes kanonisches Kontoblatt dürfen keine
+    verschiedenen 'Gesamt offen'-Beträge zeigen" - der Briefkörper zeigt
+    bereits HEUTE die mit DIESEM Versand tatsächlich zulässigen neuen
+    Zinsen/Gebühren (`MahnkostenVorschau`), BEVOR sie tatsächlich gebucht
+    werden (Buchung erfolgt weiterhin ausschließlich NACH dem Versand,
+    `MahnwesenService.versende_mahnlauf`). Ohne diese Funktion zeigte das
+    beigefügte Kontoblatt (gebaut aus dem tatsächlich bereits gebuchten
+    Stand) deshalb einen NIEDRIGEREN Gesamtbetrag als der Briefkörper -
+    zwei widersprüchliche Summen im selben Schreiben.
+
+    Hängt deshalb GENAU dieselben, dem Briefkörper bereits bekannten
+    Posten (dasselbe `MahnkostenVorschau`-Objekt, keine zweite
+    Berechnung) als zusätzliche Zeilen an die bereits erzeugte
+    `erstelle_einfache_tabelle`-Liste an, OHNE irgendetwas in die DB zu
+    schreiben ("ohne vorherige DB-Buchung beim GET/Export") - rein
+    darstellungsseitig, EIN eingefrorener Snapshot. Ein Posten mit
+    Betrag 0/`None` wird NICHT angehängt (kein erfundener 0,00-Posten).
+    Der laufende `offen_cent` setzt die letzte Zeile der übergebenen
+    Liste fort (0, wenn die Liste leer ist) - danach stimmen Brief-
+    Gesamtbetrag und das `offen_cent` der letzten angehängten Zeile
+    GARANTIERT überein, weil beide aus derselben Vorschau stammen.
+
+    Nur für einen Versand-Snapshot gedacht (Haupt-Mahnbrief/-Vorschau,
+    `_sende_brief`) - der reine, mahnlaufunabhängige Kontoblatt-Download
+    (`backoffice/routes/konten.py::kontoauszug_pdf`) ruft diese Funktion
+    NICHT auf und bleibt beim tatsächlich gebuchten Stand."""
+
+    laufend = zeilen[-1].offen_cent if zeilen else 0
+    ergebnis = list(zeilen)
+    if neue_zinsen_delta_cent:
+        laufend += neue_zinsen_delta_cent
+        if zins_von is not None and zins_bis is not None and zinssatz_prozent is not None:
+            text = f"Verzugszinsen {zins_von.strftime('%d.%m.%Y')}–{zins_bis.strftime('%d.%m.%Y')}, {zinssatz_prozent}% (mit diesem Schreiben)"
+        else:
+            text = f"Verzugszinsen (mit diesem Schreiben, {heute.strftime('%d.%m.%Y')})"
+        ergebnis.append(EinfacheZeile(datum=heute, buchung=text, betrag_cent=neue_zinsen_delta_cent, offen_cent=laufend, ist_vorschau=True))
+    if gebuehr_cent:
+        laufend += gebuehr_cent
+        ergebnis.append(EinfacheZeile(
+            datum=heute, buchung=f"Mahngebühr (mit diesem Schreiben, {heute.strftime('%d.%m.%Y')})",
+            betrag_cent=gebuehr_cent, offen_cent=laufend, ist_vorschau=True,
+        ))
+    if mahnpauschale_cent:
+        laufend += mahnpauschale_cent
+        ergebnis.append(EinfacheZeile(
+            datum=heute, buchung=f"Mahngebühr (mit diesem Schreiben, {heute.strftime('%d.%m.%Y')})",
+            betrag_cent=mahnpauschale_cent, offen_cent=laufend, ist_vorschau=True,
+        ))
+    return ergebnis
+
+
 def lade_kontoblatt(
     *, konto_id: str, vertrag_id: str, op_service, mahnkosten_repo, ruecklastschriftkosten_repo, mahnlauf_repo,
     manueller_mahnversand_repo=None,

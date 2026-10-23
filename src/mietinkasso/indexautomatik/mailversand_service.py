@@ -65,6 +65,26 @@ def _eur_text(cent: int) -> str:
     return f"{cent/100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def _vorschau_kontoauszug_kwargs(vorschau) -> dict:
+    """Nachtrag Markus 23.10.2026 (Abnahme-Hinweis): extrahiert aus
+    GENAU demselben `MahnkostenVorschau`-Objekt, das bereits den
+    Briefkörper/die E-Mail speist, die Kwargs für `erzeuge_kontoauszug_
+    pdf(..., empfaenger_ansicht=True)`/`journal_als_text(...)` - damit
+    der tatsächlich an den Mieter gehende Anhang GENAU dieselben, noch
+    nicht gebuchten neuen Posten zeigt wie der Briefkörper selbst (keine
+    zweite, abweichende Berechnung, keine konkurrierenden Summen).
+    `vorschau is None` (z. B. kein `MahnkostenService` konfiguriert)
+    liefert alle Felder leer/0 - der Anhang zeigt dann einfach nur den
+    tatsächlich bereits gebuchten Stand."""
+
+    if vorschau is None:
+        return dict(neue_zinsen_delta_cent=0, zins_von=None, zins_bis=None, zinssatz_prozent=None, gebuehr_cent=None, mahnpauschale_cent=None)
+    return dict(
+        neue_zinsen_delta_cent=vorschau.neue_zinsen_delta_cent, zins_von=vorschau.zins_von, zins_bis=vorschau.zins_bis,
+        zinssatz_prozent=vorschau.zinssatz_prozent, gebuehr_cent=vorschau.gebuehr_cent, mahnpauschale_cent=vorschau.mahnpauschale_cent,
+    )
+
+
 def bank_konto_fuer_gesellschaft_eindeutig(bank_repo, gesellschaft_id: str):
     """Liefert das EINE Bankkonto dieser Gesellschaft, wenn (und nur wenn)
     es eindeutig ist - `None` sowohl bei FEHLENDER (kein Konto hinterlegt)
@@ -260,6 +280,13 @@ class _BriefKontext(NamedTuple):
     zinssatz_einheitlich_text: str | None
     deadline: date
     zahlungsziel: object
+    # Nachtrag Markus 23.10.2026 (HV-20261023-MAHNUNG-EINFACH,
+    # Abnahmegrenze): derselbe kanonische Kontoauszug, den auch der
+    # Brief-/Mitmieter-Anhang verwendet - EINMAL je Mahnlauf geladen
+    # (empfängerunabhängig, ein Konto hat EINEN Kontoauszug), direkt
+    # auf die erste Briefseite gerendert (`brief_pdf.erzeuge_mahnbrief_
+    # pdf(..., kontoblatt=...)`) statt nur als angehängte zweite PDF-Seite.
+    kontoblatt: object
 
 
 class HVMailversandService:
@@ -488,16 +515,33 @@ class HVMailversandService:
         # (`mailops_client.py::MailOpsAuftrag` ist reiner Text) - statt
         # eine nicht existierende Anhangsfähigkeit vorzutäuschen, wird
         # DIESELBE kanonische Journal-Quelle (`lade_kontoblatt`, identisch
-        # zu Kontoansicht/Mieterakte/Briefanhang) als Text-Kurzfassung
-        # eingebettet. Zeigt NUR den zum Versandzeitpunkt BEREITS
-        # gebuchten Stand (die neuen Zinsen/Gebühren DIESES Mahnlaufs
-        # werden erst NACH dem Versand gebucht, siehe `MahnwesenService.
-        # versende_mahnlauf` - keine erfundene Vorwegnahme).
-        kontoauszug_text = journal_als_text(lade_kontoblatt(
-            konto_id=account.id, vertrag_id=mahnlauf.vertrag_id, op_service=self.op_service,
-            mahnkosten_repo=self.mahnkosten_repo, ruecklastschriftkosten_repo=self.ruecklastschriftkosten_repo,
-            mahnlauf_repo=self.mahnlauf_repo, manueller_mahnversand_repo=self.manueller_mahnversand_repo,
-        ))
+        # zu Kontoansicht/Mieterakte/Briefanhang) als kurze, menschlich
+        # verständliche Text-Tabelle eingebettet (Auftrag HV-20261023-
+        # MAHNUNG-EINFACH). Nachtrag Markus 23.10.2026 (Abnahme-Hinweis):
+        # `_vorschau_kontoauszug_kwargs(vorschau)` hängt GENAU dieselben,
+        # dem übrigen E-Mail-Text bereits bekannten neuen Zinsen/Gebühren
+        # an - OHNE vorherige DB-Buchung (die erfolgt weiterhin erst NACH
+        # dem Versand, siehe `MahnwesenService.versende_mahnlauf`) -
+        # damit dieser Block und der restliche E-Mail-Text NIE
+        # unterschiedliche Gesamtbeträge zeigen.
+        kontoauszug_text = journal_als_text(
+            lade_kontoblatt(
+                konto_id=account.id, vertrag_id=mahnlauf.vertrag_id, op_service=self.op_service,
+                mahnkosten_repo=self.mahnkosten_repo, ruecklastschriftkosten_repo=self.ruecklastschriftkosten_repo,
+                mahnlauf_repo=self.mahnlauf_repo, manueller_mahnversand_repo=self.manueller_mahnversand_repo,
+            ),
+            heute=heute, **_vorschau_kontoauszug_kwargs(vorschau),
+        )
+        # Auftrag HV-20261023-MAHNUNG-EINFACH (23.10.2026, verbindlicher
+        # Darstellungsauftrag): fester, kurzer Abschluss - "JLB" ist
+        # dieselbe bestehende Marke wie der volle Firmenname (keine
+        # Umfirmierung), KEINE persönliche Unterschrift. Der vom
+        # eigentlichen Mailtransport (`mailops_client.py`) separat
+        # vorgeschriebene technische Signatur-/Rechtshinweis-Block wird
+        # davon NICHT berührt - der bleibt Sache des Versandclients,
+        # nicht dieses Textbausteins (siehe dessen Moduldoc: "the fixed
+        # sender, original JLB signature").
+        abschluss = "\n\nMit freundlichen Grüßen\nJLB\nDie Hausverwaltung"
         text = (
             f"Guten Tag {empfaenger_name},\n\n"
             f"{mahntext.einleitung} {mahntext.kerntext}\n\n"
@@ -511,6 +555,7 @@ class HVMailversandService:
             + zahlungsziel_text +
             "\n\nBei einer inzwischen erfolgten Zahlung senden Sie uns bitte den Zahlungsbeleg. "
             "Bei Fragen zur Forderung antworten Sie bitte auf diese Nachricht."
+            + abschluss
             + f"\n\n---\nKontoauszug (Stand vor dieser Mahnung):\n\n{kontoauszug_text}"
         )
         return subject, text, empfaenger_name, anker.snapshot["empfaenger_email"], anker.policy_version
@@ -723,29 +768,59 @@ class HVMailversandService:
             fenster_links_mm=self.settings.brief_fenster_links_mm, fenster_oben_mm=self.settings.brief_fenster_oben_mm,
             fenster_breite_mm=self.settings.brief_fenster_breite_mm, fenster_hoehe_mm=self.settings.brief_fenster_hoehe_mm,
         )
+        kontoblatt = lade_kontoblatt(
+            konto_id=account.id, vertrag_id=mahnlauf.vertrag_id, op_service=self.op_service,
+            mahnkosten_repo=self.mahnkosten_repo, ruecklastschriftkosten_repo=self.ruecklastschriftkosten_repo,
+            mahnlauf_repo=self.mahnlauf_repo, manueller_mahnversand_repo=self.manueller_mahnversand_repo,
+        )
         return _BriefKontext(
             contract=contract, obj=obj, unit=unit, absender=absender, forderungszeilen=forderungszeilen,
             zins_segmente=zins_segmente, gesamtbetrag_cent=gesamtbetrag_cent,
             zinssatz_einheitlich_text=zinssatz_einheitlich_text, deadline=deadline, zahlungsziel=zahlungsziel,
+            kontoblatt=kontoblatt,
         )
 
-    def _rendere_brief_pdf(self, *, kontext: _BriefKontext, mahnlauf, heute, vorschau, empfaenger_name: str, empfaenger_adresse: str) -> bytes:
+    def _rendere_brief_pdf(
+        self, *, kontext: _BriefKontext, mahnlauf, heute, vorschau, empfaenger_name: str, empfaenger_adresse: str,
+        vorschau_mergen: bool = True,
+    ) -> bytes:
         """Rendert EIN Mahnbrief-PDF für EINEN konkreten Empfänger aus dem
         gemeinsamen, empfängerunabhängigen `_BriefKontext` - verwendet von
         Hauptbrief, Mitmieter-Briefen UND einer Einzel-Nachsendung, damit
-        der finanzielle Inhalt nie auseinanderlaufen kann."""
+        der finanzielle Inhalt nie auseinanderlaufen kann.
 
+        `vorschau_mergen=False` (Nachtrag Markus 23.10.2026, dieselbe
+        Asymmetrie wie der Kontoauszug-Anhang): bei einer Nachsendung ist
+        `vorschau` aus `MahnLaufTable.mahnkosten_snapshot_json`
+        REKONSTRUIERT und kann zum Nachsendezeitpunkt bereits gebucht
+        sein - ein zusätzliches Anhängen desselben Deltas an die ohnehin
+        schon aktualisierte `kontext.kontoblatt`-Historie würde doppelt
+        zählen (siehe `_nachsenden_brief`/`kontoauszug_anhang.py`-
+        Moduldoc). `_sende_brief` übergibt dafür IMMER eine frische, noch
+        nicht gebuchte `vorschau` - dort bleibt der Standard `True`."""
+
+        vorschau_kwargs = _vorschau_kontoauszug_kwargs(vorschau) if vorschau_mergen else _vorschau_kontoauszug_kwargs(None)
         return erzeuge_mahnbrief_pdf(
             absender=kontext.absender, empfaenger_name=empfaenger_name, empfaenger_adresse=empfaenger_adresse,
             objekt_bezeichnung=kontext.obj.bezeichnung, einheit_bezeichnung=kontext.unit.bezeichnung,
             stufe=mahnlauf.stufe, rechtsordnung=kontext.contract.rechtsordnung,
             heute=heute, zahlungsfrist_bis=kontext.deadline, forderungszeilen=kontext.forderungszeilen,
             bereits_offene_mahnkosten_cent=(vorschau.bereits_offene_mahnkosten_cent if vorschau is not None else 0),
-            neue_zinsen_delta_cent=(vorschau.neue_zinsen_delta_cent if vorschau is not None else 0),
+            # Nachtrag Markus 23.10.2026: diese zwei kommen bewusst aus
+            # `vorschau_kwargs` (bei `vorschau_mergen=False` auf 0/None
+            # gezwungen) statt direkt aus `vorschau` - sie steuern NICHT
+            # nur die (bei aktivem `kontoblatt` tote) alte Forderungsliste
+            # unten, sondern GENAU DENSELBEN Vorschau-Merge wie der
+            # Kontoauszug-Anhang (`erweitere_um_vorschau` in `brief_pdf.
+            # erzeuge_mahnbrief_pdf`) - eine Nachsendung darf dieses
+            # Delta NICHT zusätzlich draufrechnen (siehe Docstring oben).
+            neue_zinsen_delta_cent=vorschau_kwargs["neue_zinsen_delta_cent"],
             zins_segmente=kontext.zins_segmente, zinssatz_einheitlich_text=kontext.zinssatz_einheitlich_text,
-            neue_gebuehr_cent=((vorschau.gebuehr_cent or 0) if vorschau is not None else 0),
+            neue_gebuehr_cent=(vorschau_kwargs["gebuehr_cent"] or 0),
             gebuehr_rechtsgrundlage=(vorschau.gebuehr_rechtsgrundlage if vorschau is not None else None),
             gesamtbetrag_cent=kontext.gesamtbetrag_cent, zahlungsziel=kontext.zahlungsziel,
+            kontoblatt=kontext.kontoblatt, zins_von=vorschau_kwargs["zins_von"], zins_bis=vorschau_kwargs["zins_bis"],
+            zinssatz_prozent=vorschau_kwargs["zinssatz_prozent"], mahnpauschale_cent=vorschau_kwargs["mahnpauschale_cent"],
         )
 
     def _sende_brief(self, *, mahnlauf, mitglieder, heute, vorschau_slot, bestaetigte_mitmieter, empfaenger_zugang_je_mitmieter) -> None:
@@ -830,15 +905,24 @@ class HVMailversandService:
         # `kontoauszug_anhang.py`-Moduldoc). Dieselbe GENERISCHE
         # `lade_kontoblatt`-Quelle wie Kontoansicht/Mieterakte - KEINE
         # zweite, abweichende Berechnung.
+        # Auftrag HV-20261023-MAHNUNG-EINFACH (23.10.2026): der tatsächlich
+        # an den Mieter gehende Anhang nutzt die kurze Empfänger-Ansicht
+        # (`empfaenger_ansicht=True`) statt der internen Vollansicht - UND
+        # erhält GENAU dieselbe, dem Briefkörper bereits bekannte neue
+        # Zins-/Gebührenvorschau (`_vorschau_kontoauszug_kwargs`), damit
+        # Briefkörper und Anhang NIE unterschiedliche "Gesamt offen"-
+        # Beträge zeigen (Abnahme-Hinweis Markus 23.10.2026) - OHNE
+        # vorherige DB-Buchung, Buchung erfolgt weiterhin ausschließlich
+        # NACH dem tatsächlichen Versand.
         kontoauszug_pdf_bytes = erzeuge_kontoauszug_pdf(
             absender=kontext.absender, objekt_bezeichnung=kontext.obj.bezeichnung,
             einheit_bezeichnung=kontext.unit.bezeichnung, debitor_name=debitor.name,
             vertrag_id=mahnlauf.vertrag_id, konto_id=account.id, heute=heute,
-            kontoblatt=lade_kontoblatt(
-                konto_id=account.id, vertrag_id=mahnlauf.vertrag_id, op_service=self.op_service,
-                mahnkosten_repo=self.mahnkosten_repo, ruecklastschriftkosten_repo=self.ruecklastschriftkosten_repo,
-                mahnlauf_repo=self.mahnlauf_repo, manueller_mahnversand_repo=self.manueller_mahnversand_repo,
-            ),
+            # Nachtrag Markus 23.10.2026: dasselbe bereits in `kontext`
+            # geladene Kontoblatt wie der Briefkörper selbst (siehe
+            # `_baue_brief_kontext`) - kein zweiter, redundanter Ladevorgang.
+            kontoblatt=kontext.kontoblatt,
+            empfaenger_ansicht=True, **_vorschau_kontoauszug_kwargs(vorschau),
         )
         pdf_bytes = haenge_kontoauszug_pdf_an(pdf_bytes, kontoauszug_pdf_bytes)
 
@@ -1255,6 +1339,7 @@ class HVMailversandService:
                 pdf_bytes = self._rendere_brief_pdf(
                     kontext=kontext, mahnlauf=mahnlauf, heute=heute, vorschau=vorschau,
                     empfaenger_name=mitmieter.name, empfaenger_adresse=(mitmieter.adresse or "").replace(", ", "\n"),
+                    vorschau_mergen=False,
                 )
             except AdressfehlerError as exc:
                 raise ValueError(f"Ungültige Postadresse: {exc}") from exc
@@ -1276,15 +1361,25 @@ class HVMailversandService:
             # (Fix5): ein defekter Anhang blockiert HIER, VOR jedem
             # Archivierungs-/SFTP-Kontakt, denselben Weg wie beim
             # Erstversand.
+            # Auftrag HV-20261023-MAHNUNG-EINFACH: auch hier die kurze
+            # Empfänger-Ansicht statt der internen Vollansicht. KEIN
+            # Vorschau-Delta angehängt (anders als `_sende_brief`) - zum
+            # Zeitpunkt einer Nachsendung ist die Gruppenbuchung des
+            # Hauptlaufs bereits entweder abgeschlossen (dann zeigt der
+            # tatsächlich gebuchte Stand bereits den korrekten Endbetrag)
+            # oder noch offen (dann bleibt die Nachsendung ohnehin ohne
+            # jede neue Buchung, siehe Moduldoc) - ein ZUSÄTZLICHES
+            # Anhängen des eingefrorenen Snapshot-Deltas würde hier bei
+            # bereits erfolgter Buchung zu einer Doppelzählung führen.
             kontoauszug_pdf_bytes = erzeuge_kontoauszug_pdf(
                 absender=kontext.absender, objekt_bezeichnung=kontext.obj.bezeichnung,
                 einheit_bezeichnung=kontext.unit.bezeichnung, debitor_name=debitor.name,
                 vertrag_id=mahnlauf.vertrag_id, konto_id=account.id, heute=heute,
-                kontoblatt=lade_kontoblatt(
-                    konto_id=account.id, vertrag_id=mahnlauf.vertrag_id, op_service=self.op_service,
-                    mahnkosten_repo=self.mahnkosten_repo, ruecklastschriftkosten_repo=self.ruecklastschriftkosten_repo,
-                    mahnlauf_repo=self.mahnlauf_repo, manueller_mahnversand_repo=self.manueller_mahnversand_repo,
-                ),
+                # Nachtrag Markus 23.10.2026: dasselbe bereits in `kontext`
+                # geladene Kontoblatt wie der Briefkörper selbst - kein
+                # zweiter, redundanter Ladevorgang.
+                kontoblatt=kontext.kontoblatt,
+                empfaenger_ansicht=True,
             )
             pdf_bytes = haenge_kontoauszug_pdf_an(pdf_bytes, kontoauszug_pdf_bytes)
 

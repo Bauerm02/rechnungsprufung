@@ -53,6 +53,8 @@ from fpdf.enums import MethodReturnValue
 
 from mietinkasso.mahnwesen.kosten import zins_bis_einschliesslich
 from mietinkasso.mahnwesen.mahntexte import text_fuer_stufe
+from mietinkasso.op.einfache_tabelle_pdf import zeichne_einfache_tabelle
+from mietinkasso.op.kontoblatt import Kontoblatt, erstelle_einfache_tabelle, erweitere_um_vorschau
 
 _FALLBACK_FONT_REGULAR = "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"
 _FALLBACK_FONT_BOLD = "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf"
@@ -264,7 +266,32 @@ def erzeuge_mahnbrief_pdf(
     gebuehr_rechtsgrundlage: str | None,
     gesamtbetrag_cent: int,
     zahlungsziel: Zahlungsziel | None = None,
+    kontoblatt: Kontoblatt | None = None,
+    zins_von: date | None = None,
+    zins_bis: date | None = None,
+    zinssatz_prozent=None,
+    mahnpauschale_cent: int | None = None,
 ) -> bytes:
+    """`kontoblatt` (Nachtrag Markus 23.10.2026 zum Auftrag HV-20261023-
+    MAHNUNG-EINFACH, Abnahmegrenze nach Sichtprüfung der ersten Fassung:
+    "nur das Kontoblatt als zweite PDF-Seite anzuhängen und vorne die
+    alte Forderungsliste zu lassen erfüllt den Nutzerauftrag nicht - der
+    eigentliche Mahnbrief braucht die chronologische Tabelle bereits auf
+    seiner ersten Briefseite"): ist es gesetzt, ersetzt die kurze,
+    chronologische Empfänger-Tabelle (`erstelle_einfache_tabelle`/
+    `erweitere_um_vorschau`, derselbe Renderer wie der separate
+    Kontoauszug-Anhang - `op/einfache_tabelle_pdf.zeichne_einfache_
+    tabelle`, KEINE zweite Rechenlogik) die bisherige, nach Kategorien
+    aufgeschlüsselte Forderungsliste (`forderungszeilen`/
+    `bereits_offene_mahnkosten_cent`/`zins_segmente`/`neue_gebuehr_cent`
+    unten, dann ignoriert). `kontoblatt=None` (Standard) belässt die
+    bisherige Forderungslisten-Darstellung unverändert - bestehende
+    Aufrufer/Tests ohne `kontoblatt` sind davon nicht betroffen.
+    `zins_von`/`zins_bis`/`zinssatz_prozent`/`mahnpauschale_cent` sind
+    nur zusammen mit `kontoblatt` wirksam (dieselben, dem Briefkörper
+    bereits bekannten noch NICHT gebuchten Posten wie beim Kontoauszug-
+    Anhang, `neue_zinsen_delta_cent`/`neue_gebuehr_cent` werden dafür
+    wiederverwendet - keine doppelten Parameter)."""
     empfaenger_zeilen = pruefe_empfaengeradresse(empfaenger_adresse)
     empfaenger_alle_zeilen = [empfaenger_name.strip(), *empfaenger_zeilen] if empfaenger_name.strip() else empfaenger_zeilen
     if len(empfaenger_alle_zeilen) > _MAX_EMPFAENGER_ZEILEN:
@@ -373,40 +400,60 @@ def erzeuge_mahnbrief_pdf(
     )
     pdf.ln(2)
 
-    hauptforderung_cent = sum(f.betrag_cent for f in forderungszeilen)
-    for f in forderungszeilen:
-        faelligkeit_text = f"fällig seit {f.faelligkeit.strftime('%d.%m.%Y')}" if f.faelligkeit else "Fälligkeit ungeklärt"
-        _zeile(pdf, f"{f.bezeichnung}, {faelligkeit_text}", f.betrag_cent)
-        if f.urspruenglicher_betrag_cent is not None and f.urspruenglicher_betrag_cent != f.betrag_cent:
-            angerechnet_cent = f.urspruenglicher_betrag_cent - f.betrag_cent
-            _notizzeile(pdf, f"Ursprünglich {_eur(f.urspruenglicher_betrag_cent)}, davon bereits angerechnet {_eur(angerechnet_cent)}, Rest {_eur(f.betrag_cent)}.")
-    _zeile(pdf, "Hauptforderung gesamt", hauptforderung_cent, fett=True)
+    if kontoblatt is not None:
+        # Auftrag HV-20261023-MAHNUNG-EINFACH, Abnahmegrenze 23.10.2026:
+        # die kurze, chronologische Empfänger-Tabelle direkt auf dieser
+        # ersten Briefseite - derselbe Renderer wie der separate
+        # Kontoauszug-Anhang, KEINE zweite Rechenlogik/kein abweichender
+        # Schlusssaldo.
+        einfache_zeilen = erweitere_um_vorschau(
+            erstelle_einfache_tabelle(kontoblatt), heute=heute, neue_zinsen_delta_cent=neue_zinsen_delta_cent,
+            zins_von=zins_von, zins_bis=zins_bis, zinssatz_prozent=zinssatz_prozent,
+            gebuehr_cent=(neue_gebuehr_cent or None), mahnpauschale_cent=mahnpauschale_cent,
+        )
+        # `gesamtbetrag_cent` bleibt unverwendet: die Tabelle zeigt die
+        # VOLLSTÄNDIGE Kontohistorie (identisch zum angehängten
+        # kanonischen Kontoauszug) - ihr "Gesamt offen" ist der echte
+        # Gesamtsaldo des Kontos, NICHT auf die in diesem Mahnlauf
+        # konkret eingemahnte Teilmenge der Forderungen verengt (ein
+        # Konto kann weitere, noch nicht mahnbare Forderungen tragen -
+        # ein Soll-Ungleich wäre dort KEIN Fehler, siehe Moduldoc oben).
+        zeichne_einfache_tabelle(pdf, einfache_zeilen, familie="Brief", anthrazit=anthrazit, gold=gold)
+    else:
+        hauptforderung_cent = sum(f.betrag_cent for f in forderungszeilen)
+        for f in forderungszeilen:
+            faelligkeit_text = f"fällig seit {f.faelligkeit.strftime('%d.%m.%Y')}" if f.faelligkeit else "Fälligkeit ungeklärt"
+            _zeile(pdf, f"{f.bezeichnung}, {faelligkeit_text}", f.betrag_cent)
+            if f.urspruenglicher_betrag_cent is not None and f.urspruenglicher_betrag_cent != f.betrag_cent:
+                angerechnet_cent = f.urspruenglicher_betrag_cent - f.betrag_cent
+                _notizzeile(pdf, f"Ursprünglich {_eur(f.urspruenglicher_betrag_cent)}, davon bereits angerechnet {_eur(angerechnet_cent)}, Rest {_eur(f.betrag_cent)}.")
+        _zeile(pdf, "Hauptforderung gesamt", hauptforderung_cent, fett=True)
 
-    if bereits_offene_mahnkosten_cent:
-        _zeile(pdf, "Noch offene Kosten aus früheren Mahnläufen", bereits_offene_mahnkosten_cent)
+        if bereits_offene_mahnkosten_cent:
+            _zeile(pdf, "Noch offene Kosten aus früheren Mahnläufen", bereits_offene_mahnkosten_cent)
 
-    if neue_zinsen_delta_cent:
-        satz_text = f" ({zinssatz_einheitlich_text})" if zinssatz_einheitlich_text else ""
-        _zeile(pdf, f"Neu anzusetzende Verzugszinsen{satz_text}", neue_zinsen_delta_cent)
-        for segment in zins_segmente:
-            if segment.zinsen_cent <= 0:
-                continue
-            satz = f"{segment.satz_prozent} % p.a." if segment.satz_prozent is not None else "Satz ungeklärt"
-            # `segment.bis` ist EXKLUSIV (siehe `kosten.py::ZinsSegment`) -
-            # angezeigt wird der tatsächlich letzte verzinste Tag.
-            bis_einschliesslich = zins_bis_einschliesslich(segment.bis)
-            _zeile(
-                pdf, f"{segment.von.strftime('%d.%m.%Y')}–{bis_einschliesslich.strftime('%d.%m.%Y')} (einschließlich): {satz}",
-                segment.zinsen_cent, einzug=6,
-            )
+        if neue_zinsen_delta_cent:
+            satz_text = f" ({zinssatz_einheitlich_text})" if zinssatz_einheitlich_text else ""
+            _zeile(pdf, f"Neu anzusetzende Verzugszinsen{satz_text}", neue_zinsen_delta_cent)
+            for segment in zins_segmente:
+                if segment.zinsen_cent <= 0:
+                    continue
+                satz = f"{segment.satz_prozent} % p.a." if segment.satz_prozent is not None else "Satz ungeklärt"
+                # `segment.bis` ist EXKLUSIV (siehe `kosten.py::ZinsSegment`) -
+                # angezeigt wird der tatsächlich letzte verzinste Tag.
+                bis_einschliesslich = zins_bis_einschliesslich(segment.bis)
+                _zeile(
+                    pdf, f"{segment.von.strftime('%d.%m.%Y')}–{bis_einschliesslich.strftime('%d.%m.%Y')} (einschließlich): {satz}",
+                    segment.zinsen_cent, einzug=6,
+                )
 
-    if neue_gebuehr_cent:
-        _zeile(pdf, gebuehr_rechtsgrundlage or "Mahnspesen/Versandkosten", neue_gebuehr_cent)
+        if neue_gebuehr_cent:
+            _zeile(pdf, gebuehr_rechtsgrundlage or "Mahnspesen/Versandkosten", neue_gebuehr_cent)
 
-    pdf.set_draw_color(*gold)
-    pdf.line(_RAND, pdf.get_y() + 1, _INHALT_RECHTS, pdf.get_y() + 1)
-    pdf.ln(3)
-    _zeile(pdf, "Gesamtbetrag", gesamtbetrag_cent, fett=True)
+        pdf.set_draw_color(*gold)
+        pdf.line(_RAND, pdf.get_y() + 1, _INHALT_RECHTS, pdf.get_y() + 1)
+        pdf.ln(3)
+        _zeile(pdf, "Gesamtbetrag", gesamtbetrag_cent, fett=True)
     pdf.ln(4)
 
     # Korrektur nach unabhängiger Abnahme (Codex, 20.10.2026): KEIN
@@ -452,7 +499,16 @@ def erzeuge_mahnbrief_pdf(
         pdf.ln(3)
         pdf.multi_cell(0, 5.5, mahntext.rechtlicher_kern)
     pdf.ln(6)
+    # Auftrag HV-20261023-MAHNUNG-EINFACH (23.10.2026, verbindlicher
+    # Darstellungsauftrag): der Briefabschluss ist jetzt FEST auf genau
+    # diese drei Zeilen begrenzt ("Mit freundlichen Grüßen / JLB / Die
+    # Hausverwaltung") - NICHT mehr `absender.name` (die volle
+    # Firmenbezeichnung, z. B. "JLB Projects GmbH"), die weiterhin
+    # vollständig im Fußzeilen-/Kontaktfooter steht (siehe `footer()`
+    # oben). "JLB" ist dieselbe bestehende Marke wie `absender.name`,
+    # keine Umfirmierung - KEINE persönliche Unterschrift.
     pdf.cell(0, 5, "Mit freundlichen Grüßen", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 5, absender.name, new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, "JLB", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, "Die Hausverwaltung", new_x="LMARGIN", new_y="NEXT")
 
     return bytes(pdf.output())

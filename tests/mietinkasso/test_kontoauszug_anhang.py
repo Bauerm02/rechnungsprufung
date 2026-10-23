@@ -30,19 +30,27 @@ def _kontoblatt(*positionen: OPPositionTable):
     )
 
 
-def test_journal_als_text_zeigt_belegreferenz_und_forderungsbezug_nicht_nur_buchungsart():
-    """Fix4: die bisherige Fassung zeigte je Zeile NUR die generische
-    Buchungsart ("Miete/Vorschreibung" + Datum) - der tatsächliche
-    Belegbezug (hier "SYNRENT") ging unter. Das ist jetzt lesbar
-    enthalten, keine stille Kürzung."""
+def test_journal_als_text_zeigt_menschliche_buchungsbeschreibung_ohne_interne_referenzen():
+    """Nachfolger-Test zu Fix4 (22.10.2026): jene Fassung zeigte je Zeile
+    zusätzlich die rohe `beleg_referenz`/ein `OP #<id>`-Forderungsbezug an.
+    Auftrag HV-20261023-MAHNUNG-EINFACH (23.10.2026) fordert das GENAUE
+    GEGENTEIL für einen Empfängertext: keine OP-IDs, keine Beleg-/
+    Importschlüssel, keine DB-Referenzketten - stattdessen eine kurze,
+    menschlich verständliche Buchungsbeschreibung
+    (`erstelle_einfache_tabelle`/`_einfache_buchung_text`)."""
 
-    hauptforderung = _op(1, "SOLL", 100_000, belegdatum=date(2026, 1, 1), beleg_referenz="SYNRENT-2026-01")
+    hauptforderung = _op(
+        1, "SOLL", 100_000, belegdatum=date(2026, 1, 1), beleg_referenz="SYNRENT-2026-01",
+    )
+    hauptforderung.leistungsperiode = "2026-01"
     kontoblatt = _kontoblatt(hauptforderung)
 
-    text = journal_als_text(kontoblatt)
+    text = journal_als_text(kontoblatt, heute=date(2026, 1, 15))
 
-    assert "SYNRENT-2026-01" in text
-    assert "OP #1" in text  # forderungsbezug einer reinen Hauptforderungszeile ohne Ledger
+    assert "Mietvorschreibung Jänner 2026" in text
+    assert "SYNRENT-2026-01" not in text
+    assert "OP #1" not in text
+    assert "Gesamt offen: 1.000,00 EUR" in text
 
 
 def test_haenge_kontoauszug_pdf_an_fail_closed_statt_fehler_schlucken():

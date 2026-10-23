@@ -30,7 +30,9 @@ import io
 
 from pypdf import PdfReader, PdfWriter
 
-from mietinkasso.op.kontoblatt import Kontoblatt, erstelle_journal
+from datetime import date
+
+from mietinkasso.op.kontoblatt import Kontoblatt, erstelle_einfache_tabelle, erweitere_um_vorschau
 
 
 def haenge_kontoauszug_pdf_an(brief_pdf_bytes: bytes, kontoauszug_pdf_bytes: bytes) -> bytes:
@@ -68,7 +70,7 @@ def haenge_kontoauszug_pdf_an(brief_pdf_bytes: bytes, kontoauszug_pdf_bytes: byt
         ) from exc
 
 
-_BUCHUNGSART_SPALTE = 32
+_BUCHUNGSART_SPALTE = 46
 
 
 def _eur_text(cent: int) -> str:
@@ -77,40 +79,59 @@ def _eur_text(cent: int) -> str:
     dieses Moduls), kein modulübergreifender Import eines privaten
     Helfers."""
 
-    return f"{cent / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    vorzeichen = "-" if cent < 0 else ""
+    return vorzeichen + f"{abs(cent) / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def journal_als_text(kontoblatt: Kontoblatt) -> str:
-    """Plain-Text-Kurzfassung DESSELBEN kanonischen Journals
-    (`erstelle_journal`) für den Kanal EMAIL (kein PDF-Anhang möglich,
-    siehe Moduldoc) - identische Zeilen/Reihenfolge/Beträge wie die
-    HTML-/PDF-Darstellung, nur als reiner Text. Storno-/Historie-Zeilen
-    sind als solche markiert und verändern den gezeigten laufenden Saldo
-    nicht.
+def journal_als_text(
+    kontoblatt: Kontoblatt, *, heute: date,
+    neue_zinsen_delta_cent: int = 0, zins_von: date | None = None, zins_bis: date | None = None,
+    zinssatz_prozent=None, gebuehr_cent: int | None = None, mahnpauschale_cent: int | None = None,
+) -> str:
+    """Kurze, menschlich verständliche Kontoauszug-Tabelle für den
+    Kanal EMAIL (Auftrag HV-20261023-MAHNUNG-EINFACH, kein PDF-Anhang
+    möglich, siehe Moduldoc) - Datum | Buchung | Betrag | Offen,
+    chronologisch (ältestes Ereignis oben), abgeleitet AUSSCHLIESSLICH
+    aus `erstelle_einfache_tabelle` (keine zweite Berechnung/Engine).
+    KEINE OP-IDs/Beleg-/Importschlüssel/Ledger-Interna - diese bleiben
+    ausschließlich im internen Backoffice-Kontoblatt sichtbar.
 
-    **Korrektur nach unabhängiger Rückprüfung Codex 22.10.2026, echter
-    Bug:** jede Zeile zeigte bisher NUR die generische `buchungsart`
-    (z. B. "Miete/Vorschreibung" + Datum) - der tatsächliche Beleg-/
-    Forderungsbezug (`jz.beleg_referenz`, z. B. eine konkrete
-    Belegnummer/Referenz wie "SYNRENT", und `jz.forderungsbezug`, die
-    Perioden-/Forderungsbeschreibung) ging dabei unter. Das ist keine
-    stille Kürzung mehr: beide werden jetzt lesbar in einer zweiten
-    Zeile je Buchung mitgeliefert, sofern vorhanden."""
+    **Korrektur zu Fix4 (22.10.2026):** jene Fassung zeigte zusätzlich
+    `beleg_referenz`/`forderungsbezug` roh an - nach dem ausdrücklichen
+    neuen Auftrag HV-20261023-MAHNUNG-EINFACH darf ein Empfängertext
+    GENAU das NICHT mehr zeigen (keine Datenbank-/Beleg-Referenzketten).
+    Die menschliche Kurzbeschreibung (`erstelle_einfache_tabelle`)
+    ersetzt das - fachlich nachvollziehbar (Periode/Zeitraum/Satz/
+    Fälligkeit), ohne jede interne Kennung.
 
-    journal = erstelle_journal(kontoblatt)
-    if not journal:
+    **Nachtrag Markus 23.10.2026 (Abnahme-Hinweis):** die optionalen
+    `neue_zinsen_delta_cent`/`gebuehr_cent`/`mahnpauschale_cent`-Parameter
+    hängen GENAU dieselben, dem E-Mail-Text bereits bekannten neuen
+    Posten (`MahnkostenVorschau`, noch nicht gebucht) an, damit dieser
+    Kontoauszug-Block und der übrige E-Mail-Text NIE unterschiedliche
+    Gesamtbeträge zeigen (siehe `erweitere_um_vorschau`)."""
+
+    zeilen_daten = erstelle_einfache_tabelle(kontoblatt)
+    zeilen_daten = erweitere_um_vorschau(
+        zeilen_daten, heute=heute, neue_zinsen_delta_cent=neue_zinsen_delta_cent,
+        zins_von=zins_von, zins_bis=zins_bis, zinssatz_prozent=zinssatz_prozent,
+        gebuehr_cent=gebuehr_cent, mahnpauschale_cent=mahnpauschale_cent,
+    )
+    if not zeilen_daten:
         return "Keine Buchungen vorhanden."
-    zeilen = ["Datum       Buchungsart" + " " * (_BUCHUNGSART_SPALTE - len("Buchungsart")) + "   Betrag        Saldo"]
-    for jz in journal:
-        betrag_cent = jz.soll_cent if jz.soll_cent else -jz.haben_cent
-        markierung = " (storniert/ersetzt - nicht im Saldo)" if not jz.beeinflusst_saldo else ""
-        buchungsart = jz.buchungsart[: _BUCHUNGSART_SPALTE].ljust(_BUCHUNGSART_SPALTE)
+    zeilen = [
+        "+ erhöht den offenen Betrag, - vermindert ihn.", "",
+        "Datum       Buchung" + " " * (_BUCHUNGSART_SPALTE - len("Buchung")) + "   Betrag        Offen",
+    ]
+    for z in zeilen_daten:
+        buchung_text = z.buchung.ljust(_BUCHUNGSART_SPALTE)
         zeilen.append(
-            f"{jz.datum.isoformat()}  {buchungsart}   {_eur_text(betrag_cent):>10} EUR  "
-            f"{_eur_text(jz.laufender_saldo_cent):>10} EUR{markierung}"
+            f"{z.datum.strftime('%d.%m.%Y')}  {buchung_text}   {_eur_text(z.betrag_cent):>10} EUR  "
+            f"{_eur_text(z.offen_cent):>10} EUR"
         )
-        bezug_teile = [teil for teil in (jz.forderungsbezug, jz.beleg_referenz) if teil]
-        if bezug_teile:
-            zeilen.append("            Beleg/Bezug: " + " - ".join(bezug_teile))
-    zeilen.append(f"\nSchlussaldo: {_eur_text(kontoblatt.saldo_cent)} EUR")
+    letzter_saldo = zeilen_daten[-1].offen_cent
+    if letzter_saldo >= 0:
+        zeilen.append(f"\nGesamt offen: {_eur_text(letzter_saldo)} EUR")
+    else:
+        zeilen.append(f"\nGesamt Guthaben: {_eur_text(-letzter_saldo)} EUR")
     return "\n".join(zeilen)

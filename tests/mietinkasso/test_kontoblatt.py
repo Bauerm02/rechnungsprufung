@@ -18,6 +18,7 @@ from mietinkasso.infrastructure.db.tables import (
 import json
 
 from mietinkasso.op.kontoblatt import (
+    EinfacheZeile,
     KATEGORIE_HAUPTFORDERUNG,
     KATEGORIE_MAHNPAUSCHALE,
     KATEGORIE_MAHNSPESEN,
@@ -28,8 +29,10 @@ from mietinkasso.op.kontoblatt import (
     STATUS_OFFEN,
     STATUS_STORNIERT,
     STATUS_TEILBEZAHLT,
+    erstelle_einfache_tabelle,
     erstelle_journal,
     erstelle_kontoblatt,
+    erweitere_um_vorschau,
 )
 
 
@@ -744,3 +747,81 @@ def test_journal_html_und_pdf_zeigen_identischen_schlussaldo_und_reihenfolge():
     # strikt NACH dem vorigen.
     positionen = [pdf_text.index(m) for m in ("SYNRENT", "SYNPAY", "SYNFEE", "SYNBANK", "SYNINT")]
     assert positionen == sorted(positionen)
+
+
+# -- Auftrag HV-20261023-MAHNUNG-EINFACH: `erstelle_einfache_tabelle`/ ----
+# `erweitere_um_vorschau` - wörtliches Zahlenbeispiel aus dem Auftrag.
+
+
+def test_erstelle_einfache_tabelle_woertliches_zahlenbeispiel_gesamt_offen_1029():
+    """Wörtliches Beispiel: Ausgangssaldo 0; Miete 1000; Zahlung -1000;
+    Rückbuchung +1000; geprüfte, bereits GEBUCHTE Bankspesen +7
+    (`ruecklastschriftkosten_zeilen`); zulässige, bereits GEBUCHTE
+    Mahngebühr +20 und Verzugszinsen +2 (`mahnkosten_buchungen`) ->
+    Gesamt offen 1.029,00 EUR - reine Umformung von `erstelle_journal`,
+    keine zweite Berechnung/Engine."""
+
+    miete = _op(1, "SOLL", 100_000, belegdatum=date(2026, 1, 1))
+    zahlung = _op(2, "ZAHLUNG", 100_000, belegdatum=date(2026, 1, 5))
+    rueckbuchung = _op(3, "RUECKLASTSCHRIFT", 100_000, belegdatum=date(2026, 1, 10))
+    bankspesen = _op(4, "SOLL", 700, belegdatum=date(2026, 1, 11))
+    gebuehr = _op(5, "SOLL", 2_000, belegdatum=date(2026, 1, 12))
+    zinsen = _op(6, "SOLL", 200, belegdatum=date(2026, 1, 12))
+    buchung = _buchung(gebuehr_op_position_id=5, zinsen_op_position_id=6)
+    bank_kosten = _ruecklastschrift_kosten(kosten_op_position_id=4, ruecklastschrift_op_position_id=3, bankentgelt_cent=700)
+
+    blatt = _leer(
+        saldo_cent=102_900, positionen_aktiv=[miete, zahlung, rueckbuchung, bankspesen, gebuehr, zinsen],
+        positionen_alle=[miete, zahlung, rueckbuchung, bankspesen, gebuehr, zinsen],
+        mahnkosten_buchungen=[buchung], ruecklastschriftkosten_zeilen=[bank_kosten],
+    )
+    zeilen = erstelle_einfache_tabelle(blatt)
+
+    # Ausgangssaldo als erste Zeile (keine EROEFFNUNG-Buchung vorhanden ->
+    # synthetische 0,00-Zeile, "keine verlorene Ausgangslage").
+    assert zeilen[0].buchung == "Ausgangssaldo" and zeilen[0].betrag_cent == 0 and zeilen[0].offen_cent == 0
+    assert [z.offen_cent for z in zeilen] == [0, 100_000, 0, 100_000, 100_700, 102_700, 102_900]
+    assert zeilen[-1].offen_cent == 102_900  # 1.029,00 EUR
+    assert zeilen[-1].offen_cent == blatt.saldo_cent  # keine zweite, abweichende Summe
+    # Miete/Rückbuchung/Bankspesen/Gebühr/Zinsen bleiben jeweils als
+    # eigene, menschlich benannte Zeile erkennbar - KEINE Verschmelzung
+    # zu einer einzigen Sammelzeile.
+    buchungstexte = [z.buchung for z in zeilen]
+    assert any("Mietvorschreibung" in b for b in buchungstexte)
+    assert any(b == "Zahlung" for b in buchungstexte)
+    assert any("Rückbuchung dieser Zahlung" in b for b in buchungstexte)
+    assert any("Bankspesen Rückbuchung" in b for b in buchungstexte)
+    assert any("Mahngebühr" in b for b in buchungstexte)
+    assert any("Verzugszinsen" in b for b in buchungstexte)
+
+
+def test_erweitere_um_vorschau_haengt_neue_zinsen_und_gebuehr_einmal_an_ohne_db_schreibung():
+    """Nachtrag Markus 23.10.2026 (Abnahme-Hinweis): hängt GENAU EINMAL
+    einen noch NICHT gebuchten Zinsen-/Gebührenposten an - rein
+    darstellungsseitig (reine Python-Funktion, es gibt hier keine DB,
+    die Prüfung "ohne DB-Buchung" ist also durch die reine Signatur
+    selbst belegt: weder `erstelle_einfache_tabelle` noch
+    `erweitere_um_vorschau` nehmen ein Session-/Repository-Objekt
+    entgegen)."""
+
+    basis = [EinfacheZeile(datum=date(2026, 1, 1), buchung="Mietvorschreibung Jänner 2026", betrag_cent=100_000, offen_cent=100_000)]
+
+    erweitert = erweitere_um_vorschau(
+        basis, heute=date(2026, 1, 20), neue_zinsen_delta_cent=200, zins_von=date(2026, 1, 6), zins_bis=date(2026, 1, 20),
+        zinssatz_prozent=4, gebuehr_cent=2_000,
+    )
+
+    # Die ursprüngliche Liste bleibt unverändert (reine Funktion).
+    assert basis == [EinfacheZeile(datum=date(2026, 1, 1), buchung="Mietvorschreibung Jänner 2026", betrag_cent=100_000, offen_cent=100_000)]
+    assert len(erweitert) == 3  # Basis + Zinsen + Gebühr
+    neue = erweitert[1:]
+    assert all(z.ist_vorschau for z in neue)
+    assert erweitert[-1].offen_cent == 102_200  # 100.000 + 200 + 2.000
+    assert neue[0].betrag_cent == 200 and neue[1].betrag_cent == 2_000
+
+
+def test_erweitere_um_vorschau_ohne_neue_posten_liefert_liste_unveraendert():
+    basis = [EinfacheZeile(datum=date(2026, 1, 1), buchung="Mietvorschreibung Jänner 2026", betrag_cent=100_000, offen_cent=100_000)]
+    erweitert = erweitere_um_vorschau(basis, heute=date(2026, 1, 20))
+    assert erweitert == basis
+    assert not any(z.ist_vorschau for z in erweitert)

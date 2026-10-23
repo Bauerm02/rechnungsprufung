@@ -7883,3 +7883,114 @@ unverändert). Gegenprobe durchgeführt: mit der alten Render-Fassung
 Ausschließlich synthetische Testdaten, keine Produktivaktionen,
 `SEND_ENABLED=false` unverändert. Produktion bleibt unverändert bei
 Commit `54f8f59`.
+
+## HV-20261023-MAHNUNG-EINFACH: verbindlicher Darstellungsauftrag (Empfänger-Ansicht)
+
+Neuer, verbindlicher Darstellungsauftrag Markus 23.10.2026: Mahnbrief-PDF,
+E-Mail-Anhang und eigenständiger Kontoauszug-Download müssen für den
+Mieter als Laien verständlich sein - EINE kurze chronologische Tabelle
+(Datum | Buchung | Betrag | Offen, "+ erhöht den offenen Betrag, -
+vermindert ihn"), korrekter Ausgangssaldo als erste Zeile, GENAU EIN
+"Gesamt offen"/"Gesamt Guthaben" ohne konkurrierende Summen, KEINE
+internen OP-IDs/Beleg-/Importschlüssel/Ledger-Interna, KEINE nicht
+freigegebenen Kosten in der Zahlungsaufforderung. Bereits gebuchte
+Verzugszinsen erscheinen genau einmal; ein mit diesem Versand noch NICHT
+gebuchtes, aber bereits zulässiges Zins-/Gebührendelta wird als
+EINGEFRORENER Darstellungssnapshot angehängt (`erweitere_um_vorschau`),
+OHNE vorherige DB-Buchung. Fester Briefabschluss "Mit freundlichen
+Grüßen / JLB / Die Hausverwaltung". Stufe4-Kundentext kurz, rechtsordnungs-
+agnostisch, OHNE §-Zitate (Details intern). Keine neue KI-Laufzeit-
+abhängigkeit, kein Produktivversand (`SEND_ENABLED=false` unverändert).
+
+### Umsetzung in zwei Runden
+
+**Runde 1 (Grundauftrag):** `op/kontoblatt.py` bekam `EinfacheZeile`/
+`erstelle_einfache_tabelle`/`erweitere_um_vorschau` als reine Umformung
+von `erstelle_journal` (keine zweite Berechnung). `op/kontoauszug_pdf.py`
+bekam `empfaenger_ansicht: bool = False` (Standard unverändert, `True`
+die neue kurze Ansicht). `mahnwesen/kontoauszug_anhang.py::
+journal_als_text` auf dieselbe Quelle umgestellt (ersetzt die seit Fix4
+zusätzlich gezeigte rohe `beleg_referenz`/`OP #<id>` durch die
+menschliche Beschreibung - bewusste Supersession, kein Rückschritt).
+`mahnwesen/mahntexte.py`: Stufe4-Rechtstext in `hinweis_intern`
+verschoben, `rechtlicher_kern` ein fixer kurzer Text. `mahnwesen/
+brief_pdf.py`/`indexautomatik/mailversand_service.py`: fester Abschluss
+"JLB/Die Hausverwaltung".
+
+**Runde 2 (Abnahme-Hinweis + Nachtrag während der Umsetzung):**
+1. Vorschau-Merge (`erweitere_um_vorschau`) in `_sende_brief`/der
+   Backoffice-Vorschau angewendet (frische, noch nicht gebuchte
+   `vorschau`), bewusst NICHT in `_nachsenden_brief` (rekonstruierte
+   Snapshot-Vorschau kann bereits gebucht sein - sonst Doppelzählung).
+2. **Konkrete Abnahmegrenzen (Nachtrag während der Umsetzung, ohne neue
+   Planungsrunde direkt umgesetzt):**
+   - Der eigenständige Kontoauszug-Download (`backoffice/routes/
+     konten.py::kontoauszug_pdf`) lieferte noch die interne Vollansicht -
+     jetzt `empfaenger_ansicht=True` (die vollständige interne
+     Auditansicht bleibt auf der HTML-Seite darüber unverändert
+     aufklappbar/sichtbar, `kontoblatt_karte`/`render_kontoblatt_html`).
+   - Der Mahnbrief SELBST zeigte auf seiner ersten Seite weiterhin die
+     alte, nach Kategorien aufgeschlüsselte Forderungsliste - nur der
+     separat angehängte Kontoauszug (zweite PDF-Seite) nutzte die neue
+     Tabelle. Behoben über einen neuen gemeinsamen Renderer `op/
+     einfache_tabelle_pdf.py::zeichne_einfache_tabelle` (keine zweite
+     Rechenlogik, nur parametrisiert nach Fontfamilie/Farben, um
+     Zirkelimporte zwischen `brief_pdf.py` und `kontoauszug_pdf.py` zu
+     vermeiden). `erzeuge_mahnbrief_pdf` bekam einen neuen, additiven
+     Parameter `kontoblatt: Kontoblatt | None = None` (plus `zins_von`/
+     `zins_bis`/`zinssatz_prozent`/`mahnpauschale_cent`) - ist er
+     gesetzt, ersetzt die kurze Tabelle die alte Forderungsliste BEREITS
+     AUF SEITE 1; `kontoblatt=None` (Standard) lässt bestehende Aufrufer/
+     Tests unverändert (keine 37 bestehenden Tests mussten umgeschrieben
+     werden). `mailversand_service.py`/die Backoffice-Vorschau-Route
+     übergeben jetzt beide `kontoblatt=...` - Vorschau und tatsächlicher
+     Versand zeigen garantiert dieselbe Kontenhistorie.
+   - Überschrift von "Kontoblatt — chronologisches Journal" (technisch)
+     auf "Ihre Kontoaufstellung" (kundenverständlich) geändert - NUR für
+     die Empfänger-Ansicht, die interne Vollansicht bleibt technisch
+     beschriftet.
+
+### Geänderte/neue Dateien
+
+Neu: `src/mietinkasso/op/einfache_tabelle_pdf.py` (gemeinsamer
+PDF-Tabellenrenderer für Brief UND eigenständigen Kontoauszug).
+Geändert: `src/mietinkasso/op/kontoblatt.py`, `src/mietinkasso/op/
+kontoauszug_pdf.py`, `src/mietinkasso/mahnwesen/brief_pdf.py`,
+`src/mietinkasso/mahnwesen/kontoauszug_anhang.py`, `src/mietinkasso/
+mahnwesen/mahntexte.py`, `src/mietinkasso/indexautomatik/
+mailversand_service.py`, `src/mietinkasso/backoffice/routes/konten.py`,
+`src/mietinkasso/backoffice/routes/mahnwesen.py`.
+Tests geändert/ergänzt: `tests/mietinkasso/test_kontoblatt.py`,
+`tests/mietinkasso/test_kontoauszug_pdf.py`, `tests/mietinkasso/
+test_kontoauszug_anhang.py`, `tests/mietinkasso/test_brief_pdf.py`,
+`tests/mietinkasso/test_hv_mailversand.py`, `tests/mietinkasso/
+test_mahnwesen_mahntexte.py`, `tests/mietinkasso/test_backoffice.py`.
+
+### Tests
+
+Gesamtsuite `tests/mietinkasso` grün (1633 Tests), restliche Suite
+(`invoice_automation`, synthetisch) unberührt grün (105 Tests). Neue
+gezielte Tests u. a.: wörtliches Zahlenbeispiel (Ausgangssaldo 0, Miete
+1000, Zahlung −1000, Rückbuchung +1000, Bankspesen +7, Mahngebühr +20,
+Verzugszinsen +2 → Gesamt offen 1.029,00 EUR) als `erstelle_
+einfache_tabelle`/`erzeuge_mahnbrief_pdf`/`erzeuge_kontoauszug_pdf`-Test;
+`erweitere_um_vorschau` hängt Vorschau-Posten exakt einmal an, reine
+Funktion (keine DB-Signatur); Mahnbrief-Seite 1 zeigt bei nur einer Miete
+bereits Ausgangssaldo/Tabelle; Empfänger-Ansicht blendet interne
+Abschnitte (dokumentierte Bankaufwände, ausstehender Manualimport,
+Beleg-Referenzen) nachweislich aus, interne Vollansicht zeigt sie
+weiterhin; drei bestehende Backoffice-HTTP-Tests auf das neue,
+bewusst geänderte Verhalten des Downloads angepasst (interne
+Details jetzt NUR noch in der HTML-Seite, nicht mehr im PDF-Download).
+Ausschließlich synthetische Testdaten, keine Produktivaktionen,
+`SEND_ENABLED=false` unverändert.
+
+### Offene Punkte (nicht Teil dieses Auftrags)
+
+- Die E-Mail-Textkomposition (`_baue_email_mahntext`) zeigt die alte
+  Forderungszeilen-Prosa weiterhin VOR dem angehängten
+  `journal_als_text`-Block, statt die kurze Tabelle direkt zu Beginn zu
+  verwenden wie jetzt im PDF-Brief. Der Nutzerauftrag dieser Runde nannte
+  explizit nur "der eigentliche Mahnbrief" (das PDF) - eine analoge
+  Umstellung des E-Mail-Texts wäre eine eigene, bewusste Entscheidung
+  (eigener Rahmen), keine automatische Ausweitung.

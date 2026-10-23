@@ -170,22 +170,49 @@ _OESTERREICHISCHE_RECHTSORDNUNGEN_NUR_ABGB = frozenset(
 )
 
 
+#: Auftrag HV-20261023-MAHNUNG-EINFACH (23.10.2026, verbindlicher
+#: Darstellungsauftrag): der an den Mieter gehende Stufe-4-Kern nennt
+#: KEINE Paragraphen mehr (§30 MRG/§1118 ABGB) - "Rechtsgrundlagen/
+#: Frist-/nächster-Zinstermin-Prüfung gehören in interne Prüfung, nicht
+#: lange Quellenblöcke an Mieter". Bleibt DURCHGEHEND KONDITIONAL
+#: ("sofern/bei Vorliegen der gesetzlichen Voraussetzungen"), kündigt
+#: Aufkündigung/Auflösung/Räumung nur ALS MÖGLICHKEIT an (NIE als
+#: bereits erfolgt), und benennt weiterhin ausdrücklich, dass
+#: ausschließlich der rückständige Mietzins - NICHT Zinsen/Mahnkosten -
+#: Grundlage dafür ist ("Kündigung nicht allein mit Gebühren oder Zinsen
+#: begründen"). EIN Text für JEDE Rechtsordnung (keine unterschiedliche
+#: Kundenformulierung je Rechtsordnung mehr nötig, weil kein Paragraph
+#: mehr genannt wird) - die bisherige, rechtsordnungsabhängige §-
+#: Herleitung bleibt fachlich UNVERÄNDERT, wandert aber vollständig nach
+#: `hinweis_intern` (siehe `rechtlicher_kern_stufe4`).
+_STUFE4_KUNDENTEXT = (
+    "Erfolgt innerhalb dieser Frist keine vollständige Zahlung, übergeben wir den Fall einem "
+    "Rechtsanwalt zur gerichtlichen Geltendmachung. Dabei kommt bei Vorliegen der gesetzlichen "
+    "Voraussetzungen auch eine gerichtliche Aufkündigung bzw. die vorzeitige Auflösung des "
+    "Mietverhältnisses und im äußersten Fall die Räumung in Betracht - Grundlage dafür ist "
+    "ausschließlich der oben gesondert ausgewiesene rückständige Mietzins, NICHT die gesondert "
+    f"ausgewiesenen Verzugszinsen oder Mahnkosten. {_MAHNSCHREIBEN_IST_KEINE_KUENDIGUNG}"
+)
+
+
 def rechtlicher_kern_stufe4(*, rechtsordnung: str) -> tuple[str, str | None]:
     """Liefert `(rechtlicher_kern_text, hinweis_intern)` für die
-    Stufe-4-Mahnung - NIE geraten, siehe Moduldoc "Unbekanntes nicht
-    erfinden". `hinweis_intern` ist IMMER gesetzt (mindestens der
-    Mitmieter-Zustellprüfhinweis, siehe `_MITMIETER_HINWEIS_INTERN`) -
-    NIE Teil des an den Mieter gehenden Textes. Für eine Rechtsordnung
-    OHNE hinterlegten österreichischen Gesetzesbaustein (z. B.
-    `DEUTSCHLAND`) ist `rechtlicher_kern_text` bewusst ALLGEMEIN gehalten
-    (keine erfundene ausländische Norm). Wird NIE für `UNGEKLAERT`
-    aufgerufen - diese Rechtsordnung ist bereits strukturell von jeder
-    Mahnung ausgeschlossen (`rechtsordnung_geklaert`)."""
+    Stufe-4-Mahnung. `rechtlicher_kern_text` ist jetzt IMMER
+    `_STUFE4_KUNDENTEXT` (Auftrag HV-20261023-MAHNUNG-EINFACH) - kurz,
+    konditional, OHNE Paragraphen-Nennung, identisch für jede
+    Rechtsordnung. `hinweis_intern` ist IMMER gesetzt (mindestens der
+    Mitmieter-Zustellprüfhinweis, siehe `_MITMIETER_HINWEIS_INTERN`) und
+    trägt jetzt ZUSÄTZLICH die vollständige, rechtsordnungsabhängige
+    §-Herleitung (§30 Abs 2 Z1 MRG bzw. §1118 ABGB, je nach
+    Rechtsordnung) - NIE geraten, siehe Moduldoc "Unbekanntes nicht
+    erfinden"; NIE Teil des an den Mieter gehenden Textes. Für eine
+    Rechtsordnung OHNE hinterlegten österreichischen Gesetzesbaustein
+    (z. B. `DEUTSCHLAND`) bleibt auch der interne Hinweis bewusst
+    ALLGEMEIN gehalten (keine erfundene ausländische Norm). Wird NIE für
+    `UNGEKLAERT` aufgerufen - diese Rechtsordnung ist bereits
+    strukturell von jeder Mahnung ausgeschlossen
+    (`rechtsordnung_geklaert`)."""
 
-    satz_folgen = (
-        "Erfolgt innerhalb der oben genannten Frist keine vollständige Zahlung, werden wir diesen Fall "
-        "einem Rechtsanwalt zur gerichtlichen Geltendmachung übergeben."
-    )
     hinweise_intern = [_MITMIETER_HINWEIS_INTERN]
 
     if rechtsordnung in _RECHTSORDNUNGEN_MIT_PARAGRAPH_30:
@@ -197,42 +224,36 @@ def rechtlicher_kern_stufe4(*, rechtsordnung: str) -> tuple[str, str | None]:
                 "Mietverhältnis im Teilanwendungsbereich anwendbar ist - eine gerichtliche Aufkündigung "
                 "wegen qualifizierten Zahlungsrückstands gemäß § 30 Abs 2 Z 1 MRG oder"
             )
-        kern = (
-            f"{satz_folgen} Dabei kommt gegebenenfalls {paragraph_30_einleitung} die vorzeitige "
-            "Vertragsauflösung gemäß § 1118 zweiter Fall ABGB in Betracht, sofern die dafür "
-            f"jeweils erforderlichen gesetzlichen Voraussetzungen vorliegen. {_1118_FRIST_HINWEIS} "
-            f"Grundlage einer solchen Kündigung/Auflösung ist ausschließlich der oben gesondert "
-            f"ausgewiesene RÜCKSTÄNDIGE MIETZINS - NICHT die gesondert ausgewiesenen Verzugszinsen "
-            f"oder Mahnkosten. {_MAHNSCHREIBEN_IST_KEINE_KUENDIGUNG}"
+        konkrete_rechtsgrundlage = (
+            f"Dabei kommt gegebenenfalls {paragraph_30_einleitung} die vorzeitige Vertragsauflösung "
+            "gemäß § 1118 zweiter Fall ABGB in Betracht, sofern die dafür jeweils erforderlichen "
+            f"gesetzlichen Voraussetzungen vorliegen. {_1118_FRIST_HINWEIS}"
         )
-        return kern, "\n".join(hinweise_intern)
+        hinweise_intern.append(f"Konkrete Rechtsgrundlage (intern, NIE Kundentext): {konkrete_rechtsgrundlage}")
+        return _STUFE4_KUNDENTEXT, "\n".join(hinweise_intern)
 
     if rechtsordnung in _OESTERREICHISCHE_RECHTSORDNUNGEN_NUR_ABGB:
-        kern = (
-            f"{satz_folgen} Dabei kommt gegebenenfalls die vorzeitige Vertragsauflösung gemäß "
-            f"§ 1118 zweiter Fall ABGB in Betracht, sofern die dafür erforderlichen gesetzlichen "
-            f"Voraussetzungen vorliegen. {_1118_FRIST_HINWEIS} Grundlage einer solchen Auflösung "
-            f"ist ausschließlich der oben gesondert ausgewiesene RÜCKSTÄNDIGE MIETZINS - NICHT die "
-            f"gesondert ausgewiesenen Verzugszinsen oder Mahnkosten. {_MAHNSCHREIBEN_IST_KEINE_KUENDIGUNG}"
+        konkrete_rechtsgrundlage = (
+            "Dabei kommt gegebenenfalls die vorzeitige Vertragsauflösung gemäß § 1118 zweiter Fall "
+            f"ABGB in Betracht, sofern die dafür erforderlichen gesetzlichen Voraussetzungen vorliegen. "
+            f"{_1118_FRIST_HINWEIS}"
         )
+        hinweise_intern.append(f"Konkrete Rechtsgrundlage (intern, NIE Kundentext): {konkrete_rechtsgrundlage}")
         if rechtsordnung == Rechtsordnung.OESTERREICH_GEWERBE.value:
             hinweise_intern.append(_GEWERBE_LEGACY_HINWEIS_INTERN)
-        return kern, "\n".join(hinweise_intern)
+        return _STUFE4_KUNDENTEXT, "\n".join(hinweise_intern)
 
     # Keine hinterlegte österreichische Rechtsgrundlage (z. B. eine
     # ausländische Rechtsordnung wie DEUTSCHLAND) - NIE eine Norm
-    # erfinden, stattdessen allgemein formulieren und intern markieren.
-    kern = (
-        f"{satz_folgen} Die weiteren rechtlichen Schritte richten sich nach den für dieses "
-        f"Mietverhältnis anwendbaren gesetzlichen Bestimmungen. {_MAHNSCHREIBEN_IST_KEINE_KUENDIGUNG}"
-    )
+    # erfinden, stattdessen intern markieren; der Kundentext bleibt
+    # ohnehin bereits allgemein/paragraphenfrei (`_STUFE4_KUNDENTEXT`).
     hinweise_intern.append(
         f"Rechtsordnung {rechtsordnung!r} hat KEINEN hinterlegten österreichischen MRG/ABGB-"
-        "Gesetzestextbaustein (z. B. ausländische Rechtsordnung) - der Stufe-4-Text bleibt bewusst "
-        "allgemein. Vor einer tatsächlichen RA-Übergabe/Kündigung ist die konkrete Rechtsgrundlage "
-        "fachlich gesondert zu prüfen (NIE automatisch aus dieser Stufe abgeleitet)."
+        "Gesetzestextbaustein (z. B. ausländische Rechtsordnung). Vor einer tatsächlichen "
+        "RA-Übergabe/Kündigung ist die konkrete Rechtsgrundlage fachlich gesondert zu prüfen "
+        "(NIE automatisch aus dieser Stufe abgeleitet)."
     )
-    return kern, "\n".join(hinweise_intern)
+    return _STUFE4_KUNDENTEXT, "\n".join(hinweise_intern)
 
 
 def text_fuer_stufe(*, stufe: int, rechtsordnung: str, zahlungsfrist_bis: date) -> MahnstufeText:

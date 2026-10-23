@@ -6339,15 +6339,22 @@ def test_kontoauszug_zeigt_beispiel_1000_hauptsaldo_plus_undokumentierte_bankent
     assert "14,00" in seite.text  # Summe der beiden nicht belasteten Bankentgelte, separat sichtbar
     assert "dokumentiert" in seite.text and "nicht belastet" in seite.text
 
+    # Nachtrag Markus 23.10.2026 (HV-20261023-MAHNUNG-EINFACH): dieser
+    # Download liefert jetzt die kurze, kundenverständliche Aufstellung
+    # (`empfaenger_ansicht=True`) - die rein dokumentarischen, NICHT
+    # belasteten Bankentgelte (kein eigener Forderungs-OP, "dokumentiert
+    # - nicht belastet") sind ein rein interner Abschnitt und erscheinen
+    # hier bewusst NICHT mehr (bleiben aber auf der HTML-Seite oben
+    # vollständig sichtbar, siehe Prüfung darüber). Der Gesamtsaldo
+    # bleibt unverändert korrekt bei 1.000,00 EUR.
     pdf_antwort = client.get(f"/backoffice/konto/{konto.id}/kontoauszug.pdf")
     assert pdf_antwort.status_code == 200
     assert pdf_antwort.headers["content-type"] == "application/pdf"
     from pypdf import PdfReader
     import io
     text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_antwort.content)).pages)
-    assert "1.000,00 EUR" in text  # Gesamtsaldo exakt 1.000,00
-    assert "14,00 EUR" in text  # die beiden Bankentgelte zusammen, separat sichtbar
-    assert "dokumentiert" in text and "nicht belastet" in text
+    assert "Gesamt offen" in text and "1.000,00 EUR" in text
+    assert "dokumentiert" not in text and "nicht belastet" not in text
 
 
 def test_kontoauszug_zeigt_gebuchte_kosten_getrennt_nach_kategorie(backoffice_client):
@@ -6428,13 +6435,21 @@ def test_kontoauszug_zeigt_rueckgabedatum_nicht_erfassungsdatum(backoffice_clien
     assert "2026-04-10" in seite.text  # Rückgabe (Bankereignistag)
     assert heute_text in seite.text  # Erfasst am (tatsächliches Erfassungsdatum)
 
+    # Nachtrag Markus 23.10.2026 (HV-20261023-MAHNUNG-EINFACH): dieser
+    # Download liefert jetzt die kurze, kundenverständliche Aufstellung
+    # (`empfaenger_ansicht=True`) - der interne Abschnitt "dokumentierte
+    # Bankaufwände" (Rückgabe-/Erfassungsdatum, hier NICHT belastet) ist
+    # bewusst nur noch auf der internen HTML-Seite sichtbar (siehe Prüfung
+    # darüber), nicht mehr im Kundendownload. Die Rücklastschrift SELBST
+    # (die tatsächliche OP-Buchung) erscheint weiterhin in der kurzen
+    # Kontoaufstellung, mit ihrem echten Bankereignisdatum.
     pdf_antwort = client.get(f"/backoffice/konto/{konto.id}/kontoauszug.pdf")
     assert pdf_antwort.status_code == 200
     from pypdf import PdfReader
     import io
     text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_antwort.content)).pages)
-    assert "Rückgabe 10.04.2026" in text
-    assert f"Erfasst am {date.today().strftime('%d.%m.%Y')}" in text
+    assert "Rückbuchung dieser Zahlung" in text and "10.04.2026" in text
+    assert "Erfasst am" not in text
 
 
 def test_kontoauszug_zeigt_status_und_historie_korrigierter_kostenzeile(backoffice_client):
@@ -6944,14 +6959,21 @@ def test_kontoblatt_zeigt_unverbindlichen_ansatz_fuer_ausstehenden_manualimport_
     assert "20,00" in html_seite.text
     assert "in Prüfung" in html_seite.text
 
+    # Nachtrag Markus 23.10.2026 (HV-20261023-MAHNUNG-EINFACH, "nicht
+    # freigegebene Kosten dürfen NIE in Zahlungsaufforderung/Saldo
+    # geraten"): dieser Download liefert jetzt die kurze, kundenver-
+    # ständliche Aufstellung (`empfaenger_ansicht=True`) - der unverbind-
+    # liche, noch NICHT freigegebene Manualimport-Ansatz ("in Prüfung")
+    # ist ein rein interner Abschnitt und darf hier gerade NICHT
+    # erscheinen (bleibt vollständig auf der internen HTML-Seite
+    # sichtbar, siehe Prüfung darüber).
     pdf_antwort = client.get(f"/backoffice/konto/{konto.id}/kontoauszug.pdf")
     assert pdf_antwort.status_code == 200
     from pypdf import PdfReader
     import io
     pdf_text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_antwort.content)).pages)
-    assert "SYN-PENDING-LETTER" in pdf_text
-    assert "20,00" in pdf_text
-    assert "in Prüfung" in pdf_text
+    assert "SYN-PENDING-LETTER" not in pdf_text
+    assert "in Prüfung" not in pdf_text
 
     # Weiterhin NICHT gebucht/im Saldo - rein unverbindliche Anzeige.
     assert row.pauschale_abgegolten is False

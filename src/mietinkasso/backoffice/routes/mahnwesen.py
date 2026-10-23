@@ -802,6 +802,15 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
         fenster_links_mm=deps._settings.brief_fenster_links_mm, fenster_oben_mm=deps._settings.brief_fenster_oben_mm,
         fenster_breite_mm=deps._settings.brief_fenster_breite_mm, fenster_hoehe_mm=deps._settings.brief_fenster_hoehe_mm,
     )
+    # Auftrag HV-20261023-MAHNUNG-EINFACH, Abnahmegrenze 23.10.2026:
+    # EINMAL geladen, für Briefkörper UND Anhang - derselbe kanonische
+    # Kontoauszug, dieselbe Vorschau, kein zweiter, abweichend
+    # berechneter Stand.
+    kontoblatt = _lade_kontoblatt(
+        konto_id=konto.id, vertrag_id=vertrag_id, op_service=deps._op_service,
+        mahnkosten_repo=deps._hv_mail.mahnkosten_repo, ruecklastschriftkosten_repo=deps._ruecklastschriftkosten_repo,
+        mahnlauf_repo=deps._hv_mail.mahnlauf_repo, manueller_mahnversand_repo=deps._hv_mail.manueller_mahnversand_repo,
+    )
     try:
         pdf_bytes = _erzeuge_mahnbrief_pdf(
             absender=absender, empfaenger_name=debitor.name, empfaenger_adresse=(debitor.adresse or "").replace(", ", "\n"),
@@ -816,6 +825,14 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
                 deps._bank_repo, deps._stammdaten_repo, gesellschaft_id=vertrag.gesellschaft_id, vertrag_id=vertrag_id, stufe=stufe,
                 zuordnung_repo=deps._hv_mail.zahlungsziel_bindung_repo,
             ),
+            # Nachtrag Markus 23.10.2026 (Abnahmegrenze): die kurze,
+            # chronologische Empfänger-Tabelle direkt auf der ersten
+            # Briefseite - dieselbe `vorschau` wie der Rest dieser
+            # Vorschau-Route, Vorschauseite und tatsächlicher Versand
+            # (`mailversand_service.py::_sende_brief`) zeigen dadurch
+            # garantiert dieselbe Kontenhistorie/denselben Gesamtbetrag.
+            kontoblatt=kontoblatt, zins_von=vorschau.zins_von, zins_bis=vorschau.zins_bis,
+            zinssatz_prozent=vorschau.zinssatz_prozent, mahnpauschale_cent=vorschau.mahnpauschale_cent,
         )
     except _BriefAdressfehlerError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -826,14 +843,20 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
     # kanonische Kontoauszug ist daher auch HIER angehängt, nicht nur als
     # separater Download. Bleibt eine reine Live-Vorschau (kein Nachweis,
     # kein Versand) - exakt wie der Rest dieser Route.
+    # Auftrag HV-20261023-MAHNUNG-EINFACH, Nachtrag Markus 23.10.2026
+    # (Abnahme-Hinweis): dieselbe kurze Empfänger-Ansicht WIE der
+    # tatsächliche Versand, GENAU mit demselben, hier bereits für den
+    # Briefkörper verwendeten `vorschau`-Objekt - Vorschauseite und
+    # tatsächliche Sendung müssen dieselbe Kontenhistorie/dieselben
+    # Beträge zeigen, kein "Gesamt offen" nur in der Vorschau anders als
+    # im echten Versand.
     kontoauszug_pdf_bytes = _erzeuge_kontoauszug_pdf(
         absender=absender, objekt_bezeichnung=objekt.bezeichnung, einheit_bezeichnung=einheit.bezeichnung,
         debitor_name=debitor.name, vertrag_id=vertrag_id, konto_id=konto.id, heute=heute_datum,
-        kontoblatt=_lade_kontoblatt(
-            konto_id=konto.id, vertrag_id=vertrag_id, op_service=deps._op_service,
-            mahnkosten_repo=deps._hv_mail.mahnkosten_repo, ruecklastschriftkosten_repo=deps._ruecklastschriftkosten_repo,
-            mahnlauf_repo=deps._hv_mail.mahnlauf_repo, manueller_mahnversand_repo=deps._hv_mail.manueller_mahnversand_repo,
-        ),
+        kontoblatt=kontoblatt,
+        empfaenger_ansicht=True, neue_zinsen_delta_cent=vorschau.neue_zinsen_delta_cent,
+        zins_von=vorschau.zins_von, zins_bis=vorschau.zins_bis, zinssatz_prozent=vorschau.zinssatz_prozent,
+        gebuehr_cent=vorschau.gebuehr_cent, mahnpauschale_cent=vorschau.mahnpauschale_cent,
     )
     pdf_bytes = haenge_kontoauszug_pdf_an(pdf_bytes, kontoauszug_pdf_bytes)
 

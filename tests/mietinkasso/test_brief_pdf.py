@@ -13,11 +13,13 @@ from decimal import Decimal
 import pytest
 from pypdf import PdfReader
 
+from mietinkasso.infrastructure.db.tables import OPPositionTable
 from mietinkasso.mahnwesen.brief_pdf import (
     Absender, AdressfehlerError, Forderungszeile, Zahlungsziel, Zinssegment, _MahnbriefPDF, _zeile,
     _INHALT_RECHTS, _LOGO_BREITE, _LOGO_X, _LOGO_Y, _RAND, _SEITE_BREITE, _SPERRBEREICH_BREITE,
     _SPERRBEREICH_HOEHE, erzeuge_mahnbrief_pdf, pruefe_empfaengeradresse,
 )
+from mietinkasso.op.kontoblatt import erstelle_kontoblatt
 
 
 def _absender(**overrides) -> Absender:
@@ -148,10 +150,14 @@ def test_erste_stufe_heisst_zahlungserinnerung_nicht_mahnung():
 
 
 def test_vierte_stufe_zeigt_letzte_zahlungsaufforderung_mit_gesetzlichem_kern():
-    """Auftrag HV-20261020-VIER-MAHNSTUFEN: die Stufe-4-Mahnung muss den
-    gesetzlichen Kern (RA-Übergabe, § 30 Abs 2 Z 1 MRG/§ 1118 ABGB, 'KEINE
-    Kündigung') tatsächlich im gerenderten PDF zeigen - nicht nur in der
-    reinen Textbaustein-Funktion (siehe test_mahnwesen_mahntexte.py)."""
+    """Auftrag HV-20261020-VIER-MAHNSTUFEN, gekürzt durch Auftrag
+    HV-20261023-MAHNUNG-EINFACH (23.10.2026): die Stufe-4-Mahnung muss
+    weiterhin den kurzen, konditionalen rechtlichen Kern (RA-Übergabe,
+    mögliche Aufkündigung/Auflösung/Räumung NUR bei Vorliegen der
+    gesetzlichen Voraussetzungen, 'KEINE Kündigung') im gerenderten PDF
+    zeigen - OHNE Paragraphen-Nennung (die konkrete §-Herleitung bleibt
+    seit HV-20261023-MAHNUNG-EINFACH ausschließlich intern, siehe
+    test_mahnwesen_mahntexte.py)."""
 
     pdf_bytes = _erzeugen(
         stufe=4, rechtsordnung="OESTERREICH_MRG_VOLL",
@@ -162,9 +168,11 @@ def test_vierte_stufe_zeigt_letzte_zahlungsaufforderung_mit_gesetzlichem_kern():
     text = " ".join(p.extract_text() for p in reader.pages).replace("\n", " ")
     assert "Letzte Zahlungsaufforderung" in text
     assert "Rechtsanwalt" in text
-    assert "MRG" in text
-    assert "ABGB" in text
+    assert "Räumung" in text
+    assert "gesetzlichen Voraussetzungen" in text
     assert "KEINE Kündigung" in text
+    assert "MRG" not in text
+    assert "ABGB" not in text
 
 
 def test_vierte_stufe_auslaendische_rechtsordnung_zeigt_keine_oesterreichische_norm():
@@ -681,3 +689,95 @@ def test_zu_lange_einzelne_empfaengerzeile_die_trotz_umbruch_nicht_passt_wird_ab
                 "Fensterbreite passen 12-14/5/22\n1010 Wien"
             ),
         )
+
+
+# -- Auftrag HV-20261023-MAHNUNG-EINFACH, Abnahmegrenze 23.10.2026: -------
+# "nur das Kontoblatt als zweite PDF-Seite anzuhängen und vorne die alte
+# Forderungsliste zu lassen erfüllt den Nutzerauftrag nicht - der
+# eigentliche Mahnbrief braucht die chronologische Tabelle bereits auf
+# seiner ersten Briefseite." `kontoblatt=None` (Standard, siehe alle
+# bisherigen Tests oben) lässt die alte Forderungsliste unverändert -
+# erst `kontoblatt=<echtes Kontoblatt>` schaltet auf die neue, kurze
+# Empfänger-Tabelle um.
+
+
+def _op(id: int, typ: str, betrag_cent: int, *, belegdatum: date, leistungsperiode: str | None = None, faelligkeit=None) -> OPPositionTable:
+    return OPPositionTable(
+        id=id, konto_id="K-1", typ=typ, betrag_cent=betrag_cent, belegdatum=belegdatum, buchungsdatum=belegdatum,
+        faelligkeit=faelligkeit, faelligkeit_bekannt=faelligkeit is not None, status="AKTIV", quelle_system=None,
+        storniert_durch_id=None, beleg_referenz=None, leistungsperiode=leistungsperiode,
+    )
+
+
+def _kontoblatt(*positionen: OPPositionTable):
+    saldo = sum((p.betrag_cent if p.typ in ("SOLL", "EROEFFNUNG", "RUECKLASTSCHRIFT") else -p.betrag_cent) for p in positionen)
+    return erstelle_kontoblatt(
+        konto_id="K-1", saldo_cent=saldo, faelliger_unstrittiger_rest_cent=saldo,
+        positionen_aktiv=list(positionen), positionen_alle=list(positionen),
+        offene_forderungen_rest_je_id={}, mahnkosten_buchungen=[], ruecklastschriftkosten_zeilen=[], mahnlaeufe=[],
+    )
+
+
+def test_kontoblatt_ersetzt_forderungsliste_mit_kurzer_tabelle_bereits_auf_erster_briefseite():
+    """Wörtliche Abnahmevorgabe: ein synthetischer Brief mit NUR einer
+    Miete muss bereits auf seiner ERSTEN Briefseite Ausgangssaldo und
+    Tabelle zeigen - nicht nur als angehängte zweite PDF-Seite."""
+
+    miete = _op(1, "SOLL", 100_000, belegdatum=date(2026, 1, 1), leistungsperiode="2026-01", faelligkeit=date(2026, 1, 5))
+    kontoblatt = _kontoblatt(miete)
+
+    pdf_bytes = _erzeugen(
+        forderungszeilen=[], bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0, neue_gebuehr_cent=0,
+        gesamtbetrag_cent=100_000, heute=date(2026, 1, 20), kontoblatt=kontoblatt,
+    )
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    erste_seite = reader.pages[0].extract_text()
+    text = _normalisiert(erste_seite)
+
+    assert "Ihre Kontoaufstellung" in text
+    assert "Ausgangssaldo" in text
+    assert "Mietvorschreibung Jänner 2026, fällig 05.01.2026" in text
+    assert "Gesamt offen" in text and "1.000,00 EUR" in text
+    # Die alte, nach Kategorien aufgeschlüsselte Forderungsliste ist
+    # vollständig ersetzt, nicht nur ergänzt.
+    assert "Hauptforderung gesamt" not in text
+    # Keine internen Referenzen/IDs im Empfängertext.
+    assert "OP #" not in text and "K-1" not in text
+
+
+def test_kontoblatt_none_belaesst_alte_forderungsliste_unveraendert():
+    """Rückwärtskompatibilität: bestehende Aufrufer OHNE `kontoblatt`
+    (Standard `None`) sind von der neuen Tabelle nicht betroffen - die
+    alte Forderungsliste bleibt unverändert (siehe alle Tests oben)."""
+
+    pdf_bytes = _erzeugen()
+    text = _normalisiert(PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text())
+    assert "Hauptforderung gesamt" in text
+    assert "Ihre Kontoaufstellung" not in text
+
+
+def test_kontoblatt_mit_vorschau_merge_zeigt_woertliches_zahlenbeispiel_1029():
+    """Wörtliches Zahlenbeispiel aus dem Auftrag (synthetisch):
+    Ausgangssaldo 0; Miete 1000; Zahlung -1000; Rückbuchung +1000;
+    geprüfte Bankspesen +7; zulässige, noch NICHT gebuchte Mahngebühr
+    +20; noch NICHT gebuchte Verzugszinsen +2 -> Gesamt offen 1029,00 EUR
+    - angehängt über `erweitere_um_vorschau` (`zins_von`/`zins_bis`/
+    `zinssatz_prozent`/`neue_gebuehr_cent`), OHNE jede DB-Buchung (reine
+    Darstellung)."""
+
+    miete = _op(1, "SOLL", 100_000, belegdatum=date(2026, 1, 1), leistungsperiode="2026-01")
+    zahlung = _op(2, "ZAHLUNG", 100_000, belegdatum=date(2026, 1, 5))
+    ruecklastschrift = _op(3, "RUECKLASTSCHRIFT", 100_000, belegdatum=date(2026, 1, 10))
+    bankspesen = _op(4, "SOLL", 700, belegdatum=date(2026, 1, 11))
+    kontoblatt = _kontoblatt(miete, zahlung, ruecklastschrift, bankspesen)
+
+    pdf_bytes = _erzeugen(
+        forderungszeilen=[], bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=200, neue_gebuehr_cent=2_000,
+        gesamtbetrag_cent=102_900, heute=date(2026, 1, 20), kontoblatt=kontoblatt,
+        zins_von=date(2026, 1, 6), zins_bis=date(2026, 1, 20), zinssatz_prozent=Decimal("4.0"),
+    )
+    text = _normalisiert(PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text())
+    assert "Gesamt offen" in text and "1.029,00 EUR" in text
+    # Zinsen und Gebühr erscheinen GENAU EINMAL (keine konkurrierende
+    # zweite Summe/kein doppelter Ansatz).
+    assert text.count("Gesamt offen") == 1

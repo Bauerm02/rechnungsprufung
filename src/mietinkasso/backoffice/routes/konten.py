@@ -230,9 +230,21 @@ def kontoauszug_pdf(konto_id: str, session=Depends(_current_session)):
         logo_pfad=deps._settings.brief_logo_pfad, font_regular_pfad=deps._settings.brief_font_regular_pfad, font_bold_pfad=deps._settings.brief_font_bold_pfad,
         font_headline_pfad=deps._settings.brief_font_headline_pfad,
     )
+    # Nachtrag Markus 23.10.2026 (HV-20261023-MAHNUNG-EINFACH): dieser
+    # eigenständige PDF-Download ist für den Mieter/dessen Vertreter
+    # bestimmt - bekommt deshalb jetzt dieselbe kurze, menschlich
+    # verständliche Kontoaufstellung wie der Brief-/E-Mail-Anhang
+    # (`empfaenger_ansicht=True`), KEINE OP-IDs/Beleg-/Importschlüssel/
+    # Ledger-Interna. Die vollständige interne Auditansicht bleibt
+    # separat/aufklappbar auf DIESER Seite erhalten (`kontoblatt_karte`
+    # oben, `render_kontoblatt_html` - unverändert die volle Fassung),
+    # ohne vorherige DB-Buchung/Vorschau-Merge (reiner GET, bleibt beim
+    # tatsächlich gebuchten Stand, siehe `erzeuge_kontoauszug_pdf`-
+    # Docstring).
     pdf_bytes = erzeuge_kontoauszug_pdf(
         absender=absender, objekt_bezeichnung=objekt.bezeichnung, einheit_bezeichnung=einheit.bezeichnung,
         debitor_name=debitor.name, vertrag_id=vertrag.id, konto_id=konto_id, heute=date.today(), kontoblatt=kontoblatt,
+        empfaenger_ansicht=True,
     )
     dateiname = f"Kontoauszug_{konto_id}_{date.today().isoformat()}.pdf"
     return Response(

@@ -599,3 +599,96 @@ def test_pdf_zeigt_unverbindlichen_ansatz_fuer_ausstehenden_manualimport():
     assert "SYN-PENDING-LETTER" in text
     assert "20,00" in text
     assert "in Prüfung" in text
+
+
+# -- Auftrag HV-20261023-MAHNUNG-EINFACH: `empfaenger_ansicht=True` -------
+# (kurze, kundenverständliche Kontoaufstellung statt der internen
+# Vollansicht) - eigener Abschnitt, bisher ungetestet in dieser Datei.
+
+
+def test_empfaenger_ansicht_zeigt_kundenverstaendliche_ueberschrift_statt_journal():
+    """Nachtrag Markus 23.10.2026: "Überschrift kundenverständlich, etwa
+    'Ihre Kontoaufstellung', nicht technisches 'chronologisches
+    Journal'" - gilt NUR für `empfaenger_ansicht=True`, die interne
+    Vollansicht (Standard `False`, siehe übrige Tests dieser Datei)
+    bleibt unverändert technisch beschriftet."""
+
+    miete = KontoblattZeile(position=_op(1, "SOLL", 100_000, referenz="SYNRENT"), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=100_000)
+    kontoblatt = _leeres_kontoblatt(
+        hauptforderung_zeilen=[miete], hauptforderung_cent=100_000, hauptforderung_offener_rest_cent=100_000,
+        saldo_cent=100_000, faelliger_unstrittiger_rest_cent=100_000,
+    )
+    pdf_bytes = _erzeugen(kontoblatt, empfaenger_ansicht=True)
+    text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages)
+    assert "Ihre Kontoaufstellung" in text
+    assert "chronologisches Journal" not in text
+    assert "Gesamt offen" in text and "1.000,00" in text
+    # Keine internen Referenzketten/Kontoblatt-IDs im Empfängertext.
+    assert "Vertrag V-601-1" not in text and "Konto K-1" not in text
+
+
+def test_empfaenger_ansicht_blendet_interne_abschnitte_und_belegreferenzen_aus():
+    """"keine Datenbank-/Beleg-Referenzketten" UND "nicht freigegebene
+    Kosten dürfen NIE in Zahlungsaufforderung/Saldo geraten" - die
+    rein internen Abschnitte (dokumentierte Bankaufwände, ausstehende
+    Mahnläufe, ausstehender Manualimport-Ansatz) sowie die rohe
+    Beleg-Referenz bleiben in `empfaenger_ansicht=True` vollständig
+    ausgeblendet, erscheinen aber weiterhin unverändert in der internen
+    Vollansicht (Standard `False`)."""
+
+    miete = KontoblattZeile(position=_op(1, "SOLL", 100_000, referenz="SYNRENT-INTERNAL-REF"), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=100_000)
+    kontoblatt = _leeres_kontoblatt(
+        hauptforderung_zeilen=[miete], hauptforderung_cent=100_000, hauptforderung_offener_rest_cent=100_000,
+        saldo_cent=100_000, faelliger_unstrittiger_rest_cent=100_000,
+        dokumentierte_bankaufwaende=[DokumentierterBankaufwand(
+            row=RuecklastschriftkostenTable(
+                vertrag_id="V-601-1", ruecklastschrift_op_position_id=99, bankentgelt_cent=700,
+                rueckgabeursache="Mangels Deckung", dem_zahlungspflichtigen_zurechenbar=False,
+                zurechenbarkeit_begruendung="synthetisch", beleg_referenz="BANKBELEG-INTERN", kosten_op_position_id=None,
+                erstellt_von="codex-test",
+            ),
+            rueckgabe_datum=date(2026, 1, 11),
+        )],
+        ausstehende_manuelle_mahnversand=[AusstehenderManuellerMahnversand(
+            row=_manualimport_zeile(id=2, beleg_referenz="SYN-PENDING-INTERN"), vorschlag_cent=2_000,
+        )],
+    )
+
+    text_intern = "".join(p.extract_text() for p in PdfReader(io.BytesIO(_erzeugen(kontoblatt))).pages)
+    assert "SYNRENT-INTERNAL-REF" in text_intern
+    assert "BANKBELEG-INTERN" in text_intern
+    assert "SYN-PENDING-INTERN" in text_intern
+
+    text_empfaenger = "".join(p.extract_text() for p in PdfReader(io.BytesIO(_erzeugen(kontoblatt, empfaenger_ansicht=True))).pages)
+    assert "SYNRENT-INTERNAL-REF" not in text_empfaenger
+    assert "BANKBELEG-INTERN" not in text_empfaenger
+    assert "SYN-PENDING-INTERN" not in text_empfaenger
+    assert "Mietvorschreibung" in text_empfaenger or "SOLL" not in text_empfaenger  # menschliche Beschreibung statt Rohdaten
+
+
+def test_empfaenger_ansicht_merge_vorschau_zeigt_gesamt_offen_einmal_ohne_konkurrierende_summe():
+    """Wörtliches Zahlenbeispiel aus dem Auftrag (synthetisch):
+    Ausgangssaldo 0; Miete 1000; Zahlung -1000; Rückbuchung +1000;
+    geprüfte Bankspesen +7 (bereits gebucht, über eine zweite
+    Hauptforderungs-Position modelliert) = Gesamt offen 1.007,00 EUR
+    gebucht; + zulässige, noch NICHT gebuchte Mahngebühr 20,00 und
+    Verzugszinsen 2,00 (`erweitere_um_vorschau`) -> Gesamt offen
+    1.029,00 EUR, GENAU EINMAL, ohne DB-Buchung."""
+
+    miete = KontoblattZeile(position=_op(1, "SOLL", 100_000, belegdatum=date(2026, 1, 1), referenz="SYNRENT"), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=100_000)
+    zahlung = KontoblattZeile(position=_op(2, "ZAHLUNG", 100_000, belegdatum=date(2026, 1, 5), referenz="SYNPAY"), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=None)
+    rueckbuchung = KontoblattZeile(position=_op(3, "RUECKLASTSCHRIFT", 100_000, belegdatum=date(2026, 1, 10), referenz="SYNRLS"), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=100_000)
+    bankspesen = KontoblattZeile(position=_op(4, "SOLL", 700, belegdatum=date(2026, 1, 11), referenz="SYNBANK"), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=700)
+    kontoblatt = _leeres_kontoblatt(
+        hauptforderung_zeilen=[miete, zahlung, rueckbuchung, bankspesen],
+        hauptforderung_cent=100_000 + 100_000 + 700, hauptforderung_offener_rest_cent=100_000 + 700,
+        zahlungen_zeilen=[zahlung, rueckbuchung], zahlungen_saldo_cent=0,
+        saldo_cent=100_700, faelliger_unstrittiger_rest_cent=100_700,
+    )
+    pdf_bytes = _erzeugen(
+        kontoblatt, empfaenger_ansicht=True, neue_zinsen_delta_cent=200, gebuehr_cent=2_000,
+        zins_von=date(2026, 1, 6), zins_bis=date(2026, 1, 20), zinssatz_prozent=4,
+    )
+    text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages)
+    assert text.count("Gesamt offen") == 1
+    assert "1.029,00 EUR" in text

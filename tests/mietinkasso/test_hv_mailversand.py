@@ -1807,7 +1807,11 @@ def test_nachsendung_brief_enthaelt_kanonischen_kontoauszug_in_tatsaechlich_uebe
     seiten = PdfReader(io.BytesIO(uebertragene_bytes)).pages
     assert len(seiten) > 1, "Nachgesendetes Mitmieter-PDF muss den kanonischen Kontoauszug als weitere Seite(n) enthalten."
     text = " ".join(p.extract_text() for p in seiten)
-    assert "Kontoblatt" in text and "chronologisches Journal" in text
+    # Nachtrag Markus 23.10.2026 (HV-20261023-MAHNUNG-EINFACH): die
+    # kundenverständliche Überschrift "Ihre Kontoaufstellung" ersetzt das
+    # frühere technische "Kontoblatt — chronologisches Journal" - sowohl
+    # auf der ersten Briefseite selbst als auch im angehängten Kontoauszug.
+    assert "Ihre Kontoaufstellung" in text
 
 
 def test_nachsendung_brief_defekter_kontoauszug_blockiert_vor_archivierung_und_sftp(hv, basis_vertrag, admin_ctx, monkeypatch):
