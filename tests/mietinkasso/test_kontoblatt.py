@@ -1092,27 +1092,51 @@ def test_hauptforderung_komponente_erkennt_altimport_schema_hauptmiete():
     assert _hauptforderung_komponente_text(p) == "Hauptmiete September 2026"
 
 
-def test_hauptforderung_komponente_erkennt_bekannte_whitelist_komponenten():
+def test_hauptforderung_komponente_erkennt_bekannte_whitelist_komponenten_im_hv_vs_bezeichnungsfeld():
     """Originalauftrag: "Miete/BK/Küche/Parkplatz fachlich erkennbar" -
-    jede der sechs benannten Komponenten wird über die feste Whitelist
-    erkannt, inklusive der Sonderregel "BK Garage" VOR der generischen
-    Betriebskosten-Erkennung (deren Muster sonst bereits innerhalb von
-    "BK Garage" selbst anschlagen würde)."""
+    jede der sieben benannten Komponenten wird über die feste Whitelist
+    erkannt, aber AUSSCHLIESSLICH innerhalb des dafür bestimmten
+    Bezeichnungsfelds des bekannten HV-VS-Altimport-Schemas ("HV VS
+    <Monat>/<Jahr>; <Bezeichnung>; <Referenz>") - inklusive der
+    Sonderregel "BK Garage" (auch mit Bindestrich "BK-Garage") VOR der
+    generischen Betriebskosten-Erkennung (deren Muster sonst bereits
+    innerhalb von "BK Garage" selbst anschlagen würde) und dem bekannten
+    Alias "Abstellplatz" für "Stellplatz". Nachtrag Markus 23.10.2026,
+    Quellabnahme 329b1fc: eine bloße freie Stichwortsuche über BELIEBIGEN
+    Text (ohne das strukturelle HV-VS-Schema) ist NICHT mehr zulässig -
+    siehe `test_hauptforderung_komponente_ignoriert_unbekannte_referenz_
+    trotz_zufaelliger_whitelist_woerter` unten."""
 
     faelle = {
-        "Betriebskosten 09/2026": "Betriebskosten",
-        "BK Garage 09/2026": "BK Garage",
-        "Betriebskosten Garage 09/2026": "BK Garage",
-        "Heizkosten 09/2026": "Heizkosten",
-        "Wasser-Nachverrechnung 09/2026": "Wasser",
-        "Küche 09/2026": "Küche",
-        "Stellplatz 09/2026": "Stellplatz",
-        "Parkplatz 09/2026": "Stellplatz",
+        "HV VS 9/2026; Betriebskosten 20%; J.1": "Betriebskosten",
+        "HV VS 9/2026; BK Garage 20%; J.1": "BK Garage",
+        "HV VS 9/2026; BK-Garage 20%; J.12345": "BK Garage",
+        "HV VS 9/2026; Betriebskosten Garage 20%; J.1": "BK Garage",
+        "HV VS 9/2026; Heizkosten 20%; J.1": "Heizkosten",
+        "HV VS 9/2026; Wasser-Nachverrechnung 20%; J.1": "Wasser",
+        "HV VS 9/2026; Küche 20%; J.1": "Küche",
+        "HV VS 9/2026; Stellplatz 20%; J.1": "Stellplatz",
+        "HV VS 9/2026; Parkplatz 20%; J.1": "Stellplatz",
+        "HV VS 9/2026; Abstellplatz 20%; J.12346": "Stellplatz",
     }
     for beleg_referenz, erwartete_komponente in faelle.items():
         p = _op(1, "SOLL", 1_000, beleg_referenz=beleg_referenz)
         p.leistungsperiode = "2026-09"
         assert _hauptforderung_komponente_text(p) == f"{erwartete_komponente} September 2026", beleg_referenz
+
+
+def test_hauptforderung_komponente_ignoriert_unbekannte_referenz_trotz_zufaelliger_whitelist_woerter():
+    """Echter Fachfehler aus Quellabnahme 329b1fc: `.search()` über den
+    GESAMTEN Freitext ist KEINE Schemafeld-Whitelist - eine völlig
+    unabhängige, nicht als HV-VS-Altimport erkannte Referenz darf NICHT
+    fälschlich klassifiziert werden, nur weil irgendwo im Text ein
+    Whitelist-Wort ("Wasser") vorkommt. Da der Text auch NICHT mit
+    "<...>abrechnung <Jahr>" endet, darf er AUCH NICHT fälschlich als
+    Abrechnungsfeld (z. B. "Wasserabrechnung 2025") gelesen werden."""
+
+    p = _op(1, "SOLL", 1_000, beleg_referenz="Sonderforderung Familie Wasser; HASH1234abcd")
+    p.leistungsperiode = "2026-09"
+    assert _hauptforderung_komponente_text(p) is None
 
 
 def test_hauptforderung_komponente_erhaelt_explizites_abrechnungsjahr_statt_buchungsmonat():

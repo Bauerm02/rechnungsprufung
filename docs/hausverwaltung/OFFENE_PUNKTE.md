@@ -8250,3 +8250,65 @@ Saldo/Betrag. Breiter Regressionslauf (`test_kontoblatt`,
 Suite `tests/mietinkasso` zusätzlich angestoßen. Ausschließlich
 synthetische Testdaten, keine Produktivaktionen, `SEND_ENABLED=false`
 unverändert.
+
+## HV-20261023-MAHNUNG-EINFACH: vierter Folgecommit (strikte Schemafeld-Bindung statt freier Stichwortsuche, Quellabnahme auf Commit 329b1fc)
+
+Quellabnahme von Commit `329b1fc` (Markus, 23.10.2026) fand drei weitere
+konkrete Fehler in `_hauptforderung_komponente_text`:
+
+1. **"BK-Garage" mit Bindestrich wurde nur als "Betriebskosten"
+   erkannt** - die Sonderregel "BK Garage" prüfte bisher nur ein
+   Leerzeichen zwischen "BK"/"Betriebskosten" und "Garage", nicht die
+   ebenfalls bekannte Bindestrich-Schreibung. Behoben: `[\s-]*` statt
+   `\s*` in `_KOMPONENTEN_MUSTER`.
+2. **"Abstellplatz" wurde gar nicht erkannt** - fehlender Alias für
+   "Stellplatz". Behoben: `_KOMPONENTEN_MUSTER` erkennt jetzt
+   "Stellplatz|Abstellplatz|Parkplatz".
+3. **Echter struktureller Fachfehler:** `muster.search(text)` über den
+   GESAMTEN `beleg_referenz`-Freitext ist KEINE Schemafeld-Whitelist,
+   sondern eine freie Stichwortsuche - eine völlig unabhängige Referenz
+   wie "Sonderforderung Familie Wasser; HASH..." wurde dadurch fälschlich
+   als "Wasser" (bzw. in Kombination mit einer zufälligen Ziffernfolge im
+   Hash sogar als "Wasserabrechnung <Jahr>") klassifiziert. Behoben über
+   eine STRIKTE strukturelle Bindung an genau zwei bekannte Schemata:
+   - Der bekannte HV-VS-Altimport wird jetzt über `_HV_VS_MUSTER` in
+     exakt drei durch ";" getrennte Felder zerlegt (Periodenmarker,
+     Bezeichnungsfeld, Referenzfeld) - die Komponenten-Whitelist wird
+     AUSSCHLIESSLICH innerhalb des Bezeichnungsfelds gesucht, NIE im
+     Referenzfeld (IDs/Hashes wie "J.12345") und NIE in einer nicht als
+     HV-VS erkannten Zeichenkette.
+   - Ein Abrechnungsjahr wird nur akzeptiert, wenn der GESAMTE (vom
+     Korrektur-Präfix befreite) Text als eigenständiges Abrechnungsfeld
+     endet (`_ABRECHNUNGSFELD_MUSTER.fullmatch`, kein Teiltreffer mitten
+     in längerem, unbekanntem Text).
+   - Jede andere, nicht als eines dieser beiden Schemata erkannte
+     Zeichenkette liefert jetzt `None` (neutraler Fallback auf
+     "Mietvorschreibung ..."), unabhängig davon, ob zufällig ein
+     Whitelist-Wort darin vorkommt.
+
+Keine Änderung an Beträgen, Perioden, Datensätzen oder der Rechenengine
+- reine Korrektur der Erkennungslogik dieser einen Kurzbeschreibung.
+
+### Geänderte Dateien
+
+`src/mietinkasso/op/kontoblatt.py` (`_KOMPONENTEN_MUSTER` BK-Garage/
+Abstellplatz-Fix, neue `_HV_VS_MUSTER`/`_ABRECHNUNGSFELD_MUSTER`,
+`_hauptforderung_komponente_text` auf strikte Schemabindung umgestellt).
+
+### Tests
+
+`tests/mietinkasso/test_kontoblatt.py`:
+`test_hauptforderung_komponente_erkennt_bekannte_whitelist_komponenten_
+im_hv_vs_bezeichnungsfeld` (alle sieben Komponenten jetzt im
+HV-VS-Bezeichnungsfeld, inkl. "BK-Garage" mit Bindestrich und
+"Abstellplatz"-Alias) ersetzt die vorherige, zu lose Fassung;
+`test_hauptforderung_komponente_ignoriert_unbekannte_referenz_trotz_
+zufaelliger_whitelist_woerter` (neuer Regressionstest für den
+wörtlichen "Sonderforderung Familie Wasser"-Fall). Breiter
+Regressionslauf (`test_kontoblatt`, `test_brief_pdf`,
+`test_kontoauszug_pdf`, `test_kontoauszug_anhang`,
+`test_hv_mailversand`, `test_hv_mailversand_vier_stufen`,
+`test_backoffice`, `test_vertragsanlage*` - 454 Tests) grün, volle
+Suite `tests/mietinkasso` zusätzlich angestoßen. Ausschließlich
+synthetische Testdaten, keine Produktivaktionen, `SEND_ENABLED=false`
+unverändert.
