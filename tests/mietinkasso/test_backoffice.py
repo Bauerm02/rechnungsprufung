@@ -6448,7 +6448,13 @@ def test_kontoauszug_zeigt_rueckgabedatum_nicht_erfassungsdatum(backoffice_clien
     from pypdf import PdfReader
     import io
     text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_antwort.content)).pages)
-    assert "Rückbuchung dieser Zahlung" in text and "10.04.2026" in text
+    # Korrektur (Codex 23.10.2026, Gegenlesen von d52948f): diese
+    # Rücklastschrift hat KEINE `bezieht_sich_auf_id` (keine im Test
+    # gebuchte ursprüngliche Zahlung) - der Buchungstext bleibt deshalb
+    # bewusst NEUTRAL statt ein falsches Bezugsdatum zu erfinden. Die
+    # Datumsspalte der Zeile zeigt weiterhin unverändert das echte
+    # Rückbuchungsdatum 10.04.2026.
+    assert "Rückbuchung einer Zahlung" in text and "10.04.2026" in text
     assert "Erfasst am" not in text
 
 

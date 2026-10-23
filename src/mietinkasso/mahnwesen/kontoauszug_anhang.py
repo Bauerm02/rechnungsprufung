@@ -87,6 +87,7 @@ def journal_als_text(
     kontoblatt: Kontoblatt, *, heute: date,
     neue_zinsen_delta_cent: int = 0, zins_von: date | None = None, zins_bis: date | None = None,
     zinssatz_prozent=None, gebuehr_cent: int | None = None, mahnpauschale_cent: int | None = None,
+    faelliger_betrag_cent: int | None = None,
 ) -> str:
     """Kurze, menschlich verständliche Kontoauszug-Tabelle für den
     Kanal EMAIL (Auftrag HV-20261023-MAHNUNG-EINFACH, kein PDF-Anhang
@@ -109,7 +110,19 @@ def journal_als_text(
     hängen GENAU dieselben, dem E-Mail-Text bereits bekannten neuen
     Posten (`MahnkostenVorschau`, noch nicht gebucht) an, damit dieser
     Kontoauszug-Block und der übrige E-Mail-Text NIE unterschiedliche
-    Gesamtbeträge zeigen (siehe `erweitere_um_vorschau`)."""
+    Gesamtbeträge zeigen (siehe `erweitere_um_vorschau`).
+
+    **Korrektur nach unabhängiger Rückprüfung (Codex, 23.10.2026,
+    Gegenlesen von Commit d52948f, echter Fachfehler):** die Tabelle
+    zeigt die VOLLSTÄNDIGE Kontohistorie, die auch NICHT mahnbare/noch
+    nicht fällige Positionen enthalten kann (z. B. eine spätere
+    Folgeperiode) - ihr "Gesamt offen" ist deshalb NICHT automatisch der
+    tatsächlich jetzt einforderbare Betrag. `faelliger_betrag_cent` (der
+    bereits geprüfte, aus dem bestehenden Mahnkosten-Snapshot stammende
+    Teilbetrag, identisch zum Brief) wird - weicht er vom vollen
+    Schlusssaldo ab - als zusätzliche, klar benannte Zeile "Davon jetzt
+    zu zahlen" angehängt; stimmen beide überein, entfällt die
+    Zusatzzeile. `None` (Standard) zeigt sie nie."""
 
     zeilen_daten = erstelle_einfache_tabelle(kontoblatt)
     zeilen_daten = erweitere_um_vorschau(
@@ -134,4 +147,6 @@ def journal_als_text(
         zeilen.append(f"\nGesamt offen: {_eur_text(letzter_saldo)} EUR")
     else:
         zeilen.append(f"\nGesamt Guthaben: {_eur_text(-letzter_saldo)} EUR")
+    if faelliger_betrag_cent is not None and faelliger_betrag_cent != letzter_saldo:
+        zeilen.append(f"Davon jetzt zu zahlen: {_eur_text(faelliger_betrag_cent)} EUR")
     return "\n".join(zeilen)

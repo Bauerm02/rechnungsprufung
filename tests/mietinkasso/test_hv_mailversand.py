@@ -163,10 +163,42 @@ def test_konfiguriertes_zahlungsziel_erscheint_im_mahntext_mit_periode_ursprung_
     text = body["text"]
     assert "AT611904300234573201" in text
     assert "7D Immobilien GmbH" in text
-    assert "ursprünglich 830,00 EUR" in text
-    assert "bereits angerechnet 200,00 EUR" in text
-    assert "Rest 630,00 EUR" in text
+    # Nachtrag Markus 23.10.2026 (HV-20261023-MAHNUNG-EINFACH): die alte
+    # Prosa-Zeile "ursprünglich/bereits angerechnet/Rest" ist durch die
+    # kurze chronologische Tabelle ersetzt - Ursprungsbetrag (830,00),
+    # die angerechnete Zahlung (-200,00) und der daraus laufende Rest
+    # (630,00) erscheinen jetzt als eigene Zeilen/Spalten DIESER Tabelle,
+    # keine zweite, parallele Aufstellung.
+    assert "830,00 EUR" in text
+    assert "-200,00 EUR" in text
+    assert "630,00 EUR" in text
     assert "auf das Ihnen für dieses Mietverhältnis bekannt gegebene Konto" not in text
+
+
+def test_email_mahntext_ist_kurz_eine_tabelle_ohne_alte_forderungsprosa(hv, basis_vertrag, admin_ctx):
+    """Auftrag HV-20261023-MAHNUNG-EINFACH, jetzt fertiggestellt für den
+    E-Mail-Kanal: kurze Einleitung, GENAU EIN chronologisches Journal mit
+    "Gesamt offen", konkrete Zahlungsaufforderung/Zahlungskonto, kurzer
+    Rechtsfolgetext, fester Abschluss "JLB/Die Hausverwaltung" - die
+    vormalige, separat formulierte Forderungsprosa ("Hauptforderung
+    gesamt", "Gesamtbetrag (Hauptforderung inkl. ...)", der nachgestellte
+    "Kontoauszug (Stand vor dieser Mahnung)"-Block) ist vollständig
+    entfernt, keine zweite parallele Aufstellung."""
+
+    service, state = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+
+    result = service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    assert result["geplant"] == 1
+    text = json.loads(state["calls"][0].content)["text"]
+
+    assert "Hauptforderung gesamt" not in text
+    assert "Gesamtbetrag (Hauptforderung" not in text
+    assert "Kontoauszug (Stand vor dieser Mahnung)" not in text
+    assert "Gesamt offen" in text
+    assert "Ausgangssaldo" in text or "Mietvorschreibung" in text  # chronologisches Journal vorhanden
+    assert text.rstrip().endswith("Mit freundlichen Grüßen\nJLB\nDie Hausverwaltung")
 
 
 @pytest.mark.parametrize("receipt", [None, MailOpsErgebnis("ANGENOMMEN", "TEST", "TEST")])

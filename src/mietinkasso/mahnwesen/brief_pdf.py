@@ -411,14 +411,23 @@ def erzeuge_mahnbrief_pdf(
             zins_von=zins_von, zins_bis=zins_bis, zinssatz_prozent=zinssatz_prozent,
             gebuehr_cent=(neue_gebuehr_cent or None), mahnpauschale_cent=mahnpauschale_cent,
         )
-        # `gesamtbetrag_cent` bleibt unverwendet: die Tabelle zeigt die
-        # VOLLSTÄNDIGE Kontohistorie (identisch zum angehängten
-        # kanonischen Kontoauszug) - ihr "Gesamt offen" ist der echte
-        # Gesamtsaldo des Kontos, NICHT auf die in diesem Mahnlauf
-        # konkret eingemahnte Teilmenge der Forderungen verengt (ein
-        # Konto kann weitere, noch nicht mahnbare Forderungen tragen -
-        # ein Soll-Ungleich wäre dort KEIN Fehler, siehe Moduldoc oben).
-        zeichne_einfache_tabelle(pdf, einfache_zeilen, familie="Brief", anthrazit=anthrazit, gold=gold)
+        # Korrektur nach unabhängiger Rückprüfung (Codex, 23.10.2026,
+        # Gegenlesen von Commit d52948f, echter Fachfehler): die Tabelle
+        # zeigt bewusst die VOLLSTÄNDIGE Kontohistorie (identisch zum
+        # angehängten kanonischen Kontoauszug) - ihr "Gesamt offen" kann
+        # dadurch Positionen enthalten, die (noch) NICHT Teil DIESES
+        # geprüften Mahnlaufs/-snapshots sind (z. B. eine später fällige
+        # Folgeperiode). `gesamtbetrag_cent` - der tatsächlich geprüfte,
+        # aus dem bestehenden Mahnkosten-Snapshot stammende, JETZT
+        # einforderbare Betrag - wird deshalb als `faelliger_betrag_cent`
+        # an den Renderer gereicht: weicht er vom vollen Saldo ab, zeigt
+        # die Tabelle zusätzlich klar "Davon jetzt zu zahlen: X EUR" -
+        # NIEMALS wird ein unbekannter/noch nicht fälliger Posten
+        # eingefordert.
+        zeichne_einfache_tabelle(
+            pdf, einfache_zeilen, familie="Brief", anthrazit=anthrazit, gold=gold,
+            faelliger_betrag_cent=gesamtbetrag_cent,
+        )
     else:
         hauptforderung_cent = sum(f.betrag_cent for f in forderungszeilen)
         for f in forderungszeilen:
@@ -468,15 +477,14 @@ def erzeuge_mahnbrief_pdf(
     # KONKRET genannt statt des bisherigen vagen Verweises; ohne
     # auflösbare Bindung bleibt der bisherige Text unverändert (kein
     # erfundener Platzhalter).
+    # Nachtrag Markus 23.10.2026 (Gegenlesen von d52948f): die 14-Tage-
+    # Frist steht bereits EINMAL in `mahntext.kerntext` (siehe oben) -
+    # dieser Abschnitt nennt deshalb nur noch schlicht das Zahlungskonto,
+    # OHNE die Frist/Zahlungsaufforderung ein zweites Mal zu wiederholen.
     pdf.set_font("Brief", "", 10)
     if zahlungsziel is not None and zahlungsziel.iban and zahlungsziel.kontoinhaber:
-        pdf.multi_cell(
-            0, 5.5,
-            "Bitte begleichen Sie den Gesamtbetrag binnen 14 Tagen ab Zugang dieses Schreibens auf "
-            "folgendes Konto:",
-        )
-        pdf.ln(1)
         pdf.set_font("Brief", "B", 10)
+        pdf.cell(0, 5, "Zahlungskonto:", new_x="LMARGIN", new_y="NEXT")
         pdf.cell(0, 5, f"IBAN: {zahlungsziel.iban}", new_x="LMARGIN", new_y="NEXT")
         pdf.cell(0, 5, f"Kontoinhaber: {zahlungsziel.kontoinhaber}", new_x="LMARGIN", new_y="NEXT")
         pdf.cell(0, 5, f"Verwendungszweck: {zahlungsziel.verwendungszweck}", new_x="LMARGIN", new_y="NEXT")
@@ -490,10 +498,9 @@ def erzeuge_mahnbrief_pdf(
     else:
         pdf.multi_cell(
             0, 5.5,
-            "Bitte begleichen Sie den Gesamtbetrag binnen 14 Tagen ab Zugang dieses Schreibens auf das "
-            "Ihnen für dieses Mietverhältnis bekannt gegebene Konto. Bei einer inzwischen erfolgten "
-            "Zahlung senden Sie uns bitte den Zahlungsbeleg. Bei Fragen zur Forderung wenden Sie sich "
-            "bitte an untenstehende Kontaktdaten.",
+            "Die Zahlung erfolgt auf das Ihnen für dieses Mietverhältnis bekannt gegebene Konto. Bei "
+            "einer inzwischen erfolgten Zahlung senden Sie uns bitte den Zahlungsbeleg. Bei Fragen zur "
+            "Forderung wenden Sie sich bitte an untenstehende Kontaktdaten.",
         )
     if mahntext.rechtlicher_kern:
         pdf.ln(3)

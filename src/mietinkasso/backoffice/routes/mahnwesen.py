@@ -857,6 +857,9 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
         empfaenger_ansicht=True, neue_zinsen_delta_cent=vorschau.neue_zinsen_delta_cent,
         zins_von=vorschau.zins_von, zins_bis=vorschau.zins_bis, zinssatz_prozent=vorschau.zinssatz_prozent,
         gebuehr_cent=vorschau.gebuehr_cent, mahnpauschale_cent=vorschau.mahnpauschale_cent,
+        # Nachtrag Markus 23.10.2026 (Gegenlesen von d52948f): derselbe
+        # geprüfte, jetzt fällige Betrag wie der Briefkörper oben.
+        faelliger_betrag_cent=gesamtbetrag_cent,
     )
     pdf_bytes = haenge_kontoauszug_pdf_an(pdf_bytes, kontoauszug_pdf_bytes)
 

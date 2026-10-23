@@ -81,13 +81,42 @@ def _tabellenkopf(pdf: FPDF, *, familie: str, anthrazit: tuple[int, int, int], g
     pdf.set_font(familie, "", 9.5)
 
 
-def _zeile(
-    pdf: FPDF, *, familie: str, datum_text: str, bezeichnung: str, betrag_cent: int, offen_text: str, fett: bool = False,
+def _sichere_seite_vor_zeile(
+    pdf: FPDF, *, familie: str, bezeichnung: str, fett: bool, anthrazit: tuple[int, int, int], gold: tuple[int, int, int],
 ) -> None:
+    """Berechnet die tatsächliche (ggf. mehrzeilige) Höhe der GLEICH
+    folgenden Zeile per Dry-Run und bricht VOR dem Zeichnen kontrolliert
+    um, inklusive sofort wiederholtem Tabellenkopf.
+
+    **Korrektur nach unabhängiger Rückprüfung (Codex, 23.10.2026,
+    Gegenlesen von Commit d52948f, echter Layoutfehler):** die vorherige
+    Fassung prüfte `will_page_break`/zeichnete die neue Seite ERST
+    INNERHALB von `_zeile` selbst, NACHDEM `_zeile` bereits begonnen
+    hatte, die Zeile zu zeichnen - der Aufrufer prüfte danach nur noch
+    `page_no() != vorher`, um GEGEBENENFALLS den Tabellenkopf
+    nachzuziehen. Das brachte auf der neuen Seite die bereits gezeichnete
+    (umgebrochene) Zeile OBEN und den Tabellenkopf ERST DARUNTER - exakt
+    umgekehrte Reihenfolge. Jetzt entscheidet der Aufrufer VOR dem
+    Zeichnen der Zeile, zeichnet den Seitenumbruch UND den Tabellenkopf
+    bei Bedarf selbst, und erst DANACH wird `_zeile` (die selbst KEINEN
+    Seitenumbruch mehr prüft) aufgerufen - Kopf steht garantiert vor der
+    ersten Zeile jeder Seite."""
+
     pdf.set_font(familie, "B" if fett else "", 9.5)
     hoehe = max(pdf.multi_cell(_LABEL_SPALTE_BREITE, 5, bezeichnung, align="L", dry_run=True, output=MethodReturnValue.HEIGHT), 5)
     if pdf.will_page_break(hoehe):
         pdf.add_page()
+        _tabellenkopf(pdf, familie=familie, anthrazit=anthrazit, gold=gold)
+
+
+def _zeile(
+    pdf: FPDF, *, familie: str, datum_text: str, bezeichnung: str, betrag_cent: int, offen_text: str, fett: bool = False,
+) -> None:
+    """Zeichnet GENAU eine Zeile an der aktuellen Position - prüft
+    SELBST keinen Seitenumbruch mehr (siehe `_sichere_seite_vor_zeile`,
+    die das VOR diesem Aufruf übernimmt)."""
+
+    pdf.set_font(familie, "B" if fett else "", 9.5)
     x0, y0 = _RAND, pdf.get_y()
     pdf.set_xy(x0, y0)
     pdf.cell(_DATUM_SPALTE_BREITE, 5, datum_text, align="L")
@@ -103,23 +132,41 @@ def _zeile(
 
 def zeichne_einfache_tabelle(
     pdf: FPDF, zeilen: list[EinfacheZeile], *, familie: str, anthrazit: tuple[int, int, int], gold: tuple[int, int, int],
-    ueberschrift: str = UEBERSCHRIFT,
+    ueberschrift: str = UEBERSCHRIFT, faelliger_betrag_cent: int | None = None,
 ) -> int:
     """Zeichnet die kurze Empfänger-Tabelle direkt auf die laufende
     Seite des übergebenen `pdf` - Überschrift, +/- Erklärung,
     Spaltenköpfe, Zeilen mit automatischem Seitenumbruch samt
-    wiederholtem Spaltenkopf (`will_page_break`/erneutes `_tabellenkopf`
-    je Folgeseite, identisch zum bisherigen Fix7-Mechanismus), Trennlinie,
-    fette Gesamt-/Guthaben-Zeile. `familie` ist der Fontfamilienname, den
-    der Aufrufer bereits per `pdf.add_font(...)` registriert hat
-    ("Brief" im Mahnbrief, "Konto" im eigenständigen Kontoauszug) -
-    dieser Renderer registriert selbst KEINE Fonts.
+    wiederholtem Spaltenkopf (siehe `_sichere_seite_vor_zeile` - Kopf
+    wird VOR der jeweils umbrechenden Zeile gezeichnet, nicht danach),
+    Trennlinie, fette Gesamt-/Guthaben-Zeile. `familie` ist der
+    Fontfamilienname, den der Aufrufer bereits per `pdf.add_font(...)`
+    registriert hat ("Brief" im Mahnbrief, "Konto" im eigenständigen
+    Kontoauszug) - dieser Renderer registriert selbst KEINE Fonts.
 
-    Liefert den tatsächlich gezeigten Schlusssaldo zurück (identisch zur
-    letzten `EinfacheZeile.offen_cent`, 0 bei einer leeren Liste) -
-    `brief_pdf.erzeuge_mahnbrief_pdf` verwendet ihn 1:1 als
-    `gesamtbetrag_cent`, KEINE zweite, womöglich abweichende
-    Summenberechnung."""
+    `faelliger_betrag_cent` (Nachtrag Markus 23.10.2026, Gegenlesen von
+    d52948f, echter Fachfehler): die Tabelle zeigt bewusst die
+    VOLLSTÄNDIGE Kontohistorie inkl. bereits gebuchter, aber ZUM
+    HEUTIGEN Zeitpunkt noch NICHT fälliger Positionen (ein Konto kann
+    mehrere Perioden mit unterschiedlichen Fälligkeiten tragen) - ihr
+    "Gesamt offen" ist deshalb NICHT automatisch der tatsächlich jetzt
+    einforderbare Betrag. Weicht `faelliger_betrag_cent` (der bereits
+    geprüfte, aus dem bestehenden Mahnkosten-Snapshot stammende,
+    tatsächlich mahnbare Betrag) vom vollen Schlusssaldo ab, wird direkt
+    darunter eine zusätzliche, deutlich gekennzeichnete Zeile "Davon
+    jetzt zu zahlen: X EUR" gezeichnet - NIE ein unbekannter/noch nicht
+    fälliger Posten eingefordert. Stimmen beide Beträge überein, entfällt
+    die Zusatzzeile (keine redundante Wiederholung derselben Zahl).
+    `None` (Standard) zeigt sie nie - für Aufrufer ohne einen
+    konkreten, geprüften Mahnlauf-Snapshot (z. B. der reine,
+    mahnlaufunabhängige Kontoblatt-Download).
+
+    Liefert den tatsächlich gezeigten VOLLEN Schlusssaldo zurück
+    (identisch zur letzten `EinfacheZeile.offen_cent`, 0 bei einer leeren
+    Liste) - NICHT `faelliger_betrag_cent`; `brief_pdf.erzeuge_mahnbrief_
+    pdf` prüft diesen Rückgabewert separat gegen den vollen Kontostand,
+    der fällige Teilbetrag bleibt davon unabhängig durch den Aufrufer
+    (`gesamtbetrag_cent`) bestimmt."""
 
     if pdf.will_page_break(20):
         pdf.add_page()
@@ -142,13 +189,11 @@ def zeichne_einfache_tabelle(
 
     _tabellenkopf(pdf, familie=familie, anthrazit=anthrazit, gold=gold)
     for z in zeilen:
-        seite_vor_zeile = pdf.page_no()
+        _sichere_seite_vor_zeile(pdf, familie=familie, bezeichnung=z.buchung, fett=False, anthrazit=anthrazit, gold=gold)
         _zeile(
             pdf, familie=familie, datum_text=z.datum.strftime("%d.%m.%Y"), bezeichnung=z.buchung,
             betrag_cent=z.betrag_cent, offen_text=_eur(z.offen_cent),
         )
-        if pdf.page_no() != seite_vor_zeile:
-            _tabellenkopf(pdf, familie=familie, anthrazit=anthrazit, gold=gold)
     letzter_saldo = zeilen[-1].offen_cent
 
     pdf.ln(2)
@@ -156,5 +201,10 @@ def zeichne_einfache_tabelle(
     pdf.line(_RAND, pdf.get_y(), _INHALT_RECHTS, pdf.get_y())
     pdf.ln(3)
     gesamt_text = "Gesamt offen" if letzter_saldo >= 0 else "Gesamt Guthaben"
+    _sichere_seite_vor_zeile(pdf, familie=familie, bezeichnung=gesamt_text, fett=True, anthrazit=anthrazit, gold=gold)
     _zeile(pdf, familie=familie, datum_text="", bezeichnung=gesamt_text, betrag_cent=abs(letzter_saldo), offen_text="", fett=True)
+    if faelliger_betrag_cent is not None and faelliger_betrag_cent != letzter_saldo:
+        jetzt_text = "Davon jetzt zu zahlen"
+        _sichere_seite_vor_zeile(pdf, familie=familie, bezeichnung=jetzt_text, fett=True, anthrazit=anthrazit, gold=gold)
+        _zeile(pdf, familie=familie, datum_text="", bezeichnung=jetzt_text, betrag_cent=abs(faelliger_betrag_cent), offen_text="", fett=True)
     return letzter_saldo

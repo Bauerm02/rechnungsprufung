@@ -692,3 +692,20 @@ def test_empfaenger_ansicht_merge_vorschau_zeigt_gesamt_offen_einmal_ohne_konkur
     text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages)
     assert text.count("Gesamt offen") == 1
     assert "1.029,00 EUR" in text
+
+
+def test_empfaenger_ansicht_zeigt_davon_jetzt_zu_zahlen_bei_abweichendem_faelligem_teilbetrag():
+    """Gegenlesen von d52948f, P1: derselbe "Davon jetzt zu zahlen"-
+    Mechanismus wie im Mahnbrief selbst, hier für den eigenständigen
+    Kontoauszug-Anhang."""
+
+    miete_faellig = KontoblattZeile(position=_op(1, "SOLL", 10_000, referenz="FAELLIG"), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=10_000)
+    miete_spaeter = KontoblattZeile(position=_op(2, "SOLL", 90_000, referenz="SPAETER"), kategorie=KATEGORIE_HAUPTFORDERUNG, rest_cent=90_000)
+    kontoblatt = _leeres_kontoblatt(
+        hauptforderung_zeilen=[miete_faellig, miete_spaeter], hauptforderung_cent=100_000, hauptforderung_offener_rest_cent=100_000,
+        saldo_cent=100_000, faelliger_unstrittiger_rest_cent=100_000,
+    )
+    pdf_bytes = _erzeugen(kontoblatt, empfaenger_ansicht=True, faelliger_betrag_cent=10_000)
+    text = "".join(p.extract_text() for p in PdfReader(io.BytesIO(pdf_bytes)).pages)
+    assert "Gesamt offen" in text and "1.000,00" in text
+    assert "Davon jetzt zu zahlen" in text and "100,00" in text

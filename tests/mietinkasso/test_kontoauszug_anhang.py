@@ -90,3 +90,26 @@ def _echtes_minimal_pdf() -> bytes:
     puffer = io.BytesIO()
     writer.write(puffer)
     return puffer.getvalue()
+
+
+def test_journal_als_text_zeigt_davon_jetzt_zu_zahlen_bei_abweichendem_faelligem_teilbetrag():
+    """Gegenlesen von d52948f, P1: derselbe "Davon jetzt zu zahlen"-
+    Mechanismus wie im Brief-PDF, hier für die E-Mail-Tabelle."""
+
+    faellig = _op(1, "SOLL", 10_000, belegdatum=date(2026, 1, 1))
+    spaeter = _op(2, "SOLL", 90_000, belegdatum=date(2026, 2, 1))
+    kontoblatt = _kontoblatt(faellig, spaeter)
+
+    text = journal_als_text(kontoblatt, heute=date(2026, 1, 20), faelliger_betrag_cent=10_000)
+
+    assert "Gesamt offen: 1.000,00 EUR" in text
+    assert "Davon jetzt zu zahlen: 100,00 EUR" in text
+
+
+def test_journal_als_text_ohne_abweichung_zeigt_keine_zusatzzeile():
+    miete = _op(1, "SOLL", 10_000, belegdatum=date(2026, 1, 1))
+    kontoblatt = _kontoblatt(miete)
+
+    text = journal_als_text(kontoblatt, heute=date(2026, 1, 20), faelliger_betrag_cent=10_000)
+
+    assert "Davon jetzt zu zahlen" not in text

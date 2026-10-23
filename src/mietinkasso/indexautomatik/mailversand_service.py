@@ -24,7 +24,7 @@ from mietinkasso.mahnwesen.brief_pdf import Forderungszeile as BriefForderungsze
 from mietinkasso.mahnwesen.brief_pdf import Zahlungsziel as BriefZahlungsziel
 from mietinkasso.mahnwesen.brief_pdf import Zinssegment as BriefZinssegment
 from mietinkasso.mahnwesen.brief_pdf import erzeuge_mahnbrief_pdf
-from mietinkasso.mahnwesen.kosten import snapshot_aus_json, zins_bis_einschliesslich
+from mietinkasso.mahnwesen.kosten import snapshot_aus_json
 from mietinkasso.mahnwesen.mahntexte import text_fuer_stufe
 from mietinkasso.mahnwesen.kosten_repository import MahnkostenRepository
 from mietinkasso.mahnwesen.kosten_service import MahnkostenService
@@ -189,64 +189,6 @@ def zahlungsziel_geklaert(bank_repo, zuordnung_repo, stammdaten_repo, *, gesells
         bank_repo, stammdaten_repo, gesellschaft_id=gesellschaft_id, vertrag_id=vertrag_id, stufe=0,
         zuordnung_repo=zuordnung_repo,
     ).iban is not None
-
-
-def _mahnkosten_text_baustein(vorschau) -> str:
-    """Baut den Kosten-/Zinsnachweis-Absatz für den TATSÄCHLICH gesendeten
-    Mahntext - GENAU aus der übergebenen `MahnkostenVorschau`, die
-    unmittelbar danach 1:1 an `MahnkostenService.buche_vorschau` übergeben
-    wird (siehe `kosten_service.py`-Moduldoc). Es wird hier NICHTS neu
-    berechnet, nur formatiert - Text und Buchung können dadurch nie
-    auseinanderlaufen. Liefert einen leeren String, wenn es nichts
-    Neues zu vermerken gibt (kein Delta, keine neue Gebühr)."""
-
-    if vorschau is None:
-        return ""
-    zeilen: list[str] = []
-    if vorschau.bereits_offene_mahnkosten_cent > 0:
-        zeilen.append(f"Noch offene Kosten aus früheren Mahnläufen: {_eur_text(vorschau.bereits_offene_mahnkosten_cent)} EUR.")
-    if vorschau.bereits_gebuchte_zinsen_cent > 0:
-        zeilen.append(f"Bereits verrechnete Verzugszinsen aus früheren Mahnläufen: {_eur_text(vorschau.bereits_gebuchte_zinsen_cent)} EUR.")
-    neu_zinsen = vorschau.neue_zinsen_delta_cent
-    if neu_zinsen > 0:
-        satz_text = f"{vorschau.zinssatz_prozent} % p.a." if vorschau.zinssatz_prozent is not None else "mehreren Sätzen (siehe Zeiträume unten)"
-        # `zins_bis`/`segment.bis` sind EXKLUSIV (siehe `kosten.py::
-        # ZinsSegment`-Docstring) - für den Mieter wird der tatsächlich
-        # letzte verzinste Tag ausgewiesen (`zins_bis_einschliesslich`),
-        # nie das exklusive Enddatum selbst.
-        zeitraum_text = (
-            f"{vorschau.zins_von.strftime('%d.%m.%Y')} bis {zins_bis_einschliesslich(vorschau.zins_bis).strftime('%d.%m.%Y')} (einschließlich)"
-            if vorschau.zins_von and vorschau.zins_bis else ""
-        )
-        zeilen.append(f"Neu anzusetzende Verzugszinsen: {_eur_text(neu_zinsen)} EUR ({satz_text}, Zeitraum {zeitraum_text}).")
-        if len(vorschau.zins_segmente) > 1:
-            for segment in vorschau.zins_segmente:
-                if segment.zinsen_cent <= 0:
-                    continue
-                zeilen.append(
-                    f"  - {segment.von.strftime('%d.%m.%Y')} bis {zins_bis_einschliesslich(segment.bis).strftime('%d.%m.%Y')} "
-                    f"(einschließlich): {_eur_text(segment.zinsen_cent)} EUR ({segment.satz_prozent} % p.a.)."
-                )
-    if vorschau.zins_teilweise_ungeklaert:
-        zeilen.append(
-            "Für einen Teil des Verzugszeitraums ist die Zinsberechnungsgrundlage noch nicht abschließend "
-            "geklärt; dieser Anteil wird gesondert nachgetragen, sobald sie vorliegt, und berührt die "
-            "Hauptforderung nicht."
-        )
-    gebuehr_gesamt = sum(s.betrag_cent for s in vorschau.gebuehr_segmente)
-    if gebuehr_gesamt > 0:
-        zeilen.append(
-            f"Neue Mahnspesen ({vorschau.gebuehr_rechtsgrundlage}): {_eur_text(gebuehr_gesamt)} EUR "
-            f"für {len(vorschau.gebuehr_segmente)} bislang noch nicht bepauschalte Forderung(en)."
-        )
-    if vorschau.mahnpauschale_cent:
-        zeilen.append(
-            f"Mahnkostenpauschale ({vorschau.mahnpauschale_rechtsgrundlage}): "
-            f"{_eur_text(vorschau.mahnpauschale_cent)} EUR für dieses Mahnschreiben."
-        )
-    if not zeilen:
-        return ""
-    return "\n".join(zeilen) + "\n\n"
 
 
 #: Auftrag HV-20261020-VIER-MAHNSTUFEN, Nutzervorgabe wörtlich: "Zwei
@@ -435,7 +377,7 @@ class HVMailversandService:
             }
         return bestaetigte_mitmieter, empfaenger_zugang_je_mitmieter
 
-    def _baue_email_mahntext(self, *, mahnlauf, mitglieder, heute, vorschau):
+    def _baue_email_mahntext(self, *, mahnlauf, mitglieder, heute, vorschau, vorschau_mergen: bool = True):
         """Komponiert GENAU denselben Mahn-E-Mail-Inhalt für eine
         gegebene, eingefrorene Mitgliedergruppe UND eine gegebene
         (frisch berechnete ODER aus `MahnLaufTable.
@@ -454,7 +396,38 @@ class HVMailversandService:
         Gibt `(subject, text, empfaenger_name, empfaenger_email,
         policy_version)` zurück - `text` ist IMMER an den Hauptdebitor
         adressiert ("Guten Tag {empfaenger_name},..."); eine Mitmieter-
-        Kopie ersetzt diese eine Zeile (siehe Aufrufer)."""
+        Kopie ersetzt diese eine Zeile (siehe Aufrufer).
+
+        **Nachtrag Markus 23.10.2026 (HV-20261023-MAHNUNG-EINFACH,
+        Originalauftrag "zusammengehörige Ansichten: echter Mailinhalt
+        kurz und dieselbe Tabelle", jetzt fertiggestellt):** die
+        vormalige, separat formulierte Forderungs-/Kostenprosa
+        (`posten_zeilen`/"Hauptforderung gesamt"/`_mahnkosten_text_
+        baustein`/"Gesamtbetrag (...)" sowie der nachgestellte Block
+        "---\\nKontoauszug (Stand vor dieser Mahnung)") ist VOLLSTÄNDIG
+        entfernt - der E-Mail-Text besteht jetzt aus: kurzer Einleitung
+        (`mahntext.einleitung`/`kerntext`), GENAU EINEM chronologischen
+        Journal mit "Gesamt offen" (`journal_als_text`, dieselbe Quelle
+        wie der PDF-Brief/-Anhang), konkreter Zahlungsaufforderung
+        (Zahlungskonto/Referenz), kurzem stufengerechtem Rechtsfolgetext
+        und dem festen Abschluss "JLB/Die Hausverwaltung". Keine
+        zweite, parallele Aufstellung, keine Wiederholung der 14-Tage-
+        Frist im Bankabschnitt (die steht bereits einmal im Kerntext).
+        Hauptmietrückstand/Nebenkosten bleiben über die chronologischen
+        Journalzeilen selbst erkennbar (strukturell gibt es in diesem
+        Modell ohnehin KEINE Aufspaltung einer Sollstellung in Miete/BK/
+        Küche/Parkplatz auf OP-Ebene, siehe `op/kontoblatt.py`-Moduldoc).
+
+        `vorschau_mergen=False` (dieselbe Asymmetrie wie der Brief-/
+        Kontoauszug-Anhang, siehe `_rendere_brief_pdf`): bei einer
+        Nachsendung ist `vorschau` aus `MahnLaufTable.mahnkosten_
+        snapshot_json` REKONSTRUIERT und kann zum Nachsendezeitpunkt
+        bereits gebucht sein - ein zusätzliches Anhängen desselben
+        Deltas an die ohnehin schon aktualisierte Kontohistorie würde
+        doppelt zählen. `faelliger_betrag_cent` (der tatsächlich
+        geprüfte, JETZT einforderbare Betrag) bleibt davon UNABHÄNGIG
+        IMMER gesetzt - er gilt unverändert, ob frisch berechnet oder
+        rekonstruiert."""
 
         st = self.bundle.stammdaten_repository
         contract = st.get_vertrag(mahnlauf.vertrag_id)
@@ -463,29 +436,13 @@ class HVMailversandService:
         account = st.get_konto_by_vertrag(mahnlauf.vertrag_id)
         offene = {f.op_position_id: f for f in self.op_service.offene_forderungen(account.id, heute=heute)}
 
-        posten_zeilen = []
         gesamt_cent = 0
         for mitglied in mitglieder:
             debt = offene.get(mitglied.forderung_op_position_id)
             if debt is None or debt.rest_cent != mitglied.snapshot["betrag_cent"] or debt.faelligkeit is None:
                 raise ValueError("Offene Forderung hat sich verändert.")
             gesamt_cent += debt.rest_cent
-            periode_text = f"{debt.leistungsperiode}: " if debt.leistungsperiode else ""
-            zeile = f"- {periode_text}{_eur_text(debt.rest_cent)} EUR, fällig seit {debt.faelligkeit.strftime('%d.%m.%Y')}"
-            # Abnahme-Folgefix (Codex 20.10.2026): "keine vollständige
-            # Periode/Position/Ursprungsbetrag/angerechnete Zahlungen/
-            # Rest-Tabelle" - bei einer bereits teilweise angerechneten
-            # Zahlung wird das HIER explizit genannt, statt nur den
-            # (für den Mieter sonst unerklärten) Restbetrag zu zeigen.
-            if debt.betrag_cent != debt.rest_cent:
-                angerechnet = debt.betrag_cent - debt.rest_cent
-                zeile += (
-                    f" (ursprünglich {_eur_text(debt.betrag_cent)} EUR, davon bereits angerechnet "
-                    f"{_eur_text(angerechnet)} EUR, Rest {_eur_text(debt.rest_cent)} EUR)"
-                )
-            posten_zeilen.append(zeile)
 
-        kosten_text = _mahnkosten_text_baustein(vorschau)
         gesamtbetrag_cent = gesamt_cent + (
             (vorschau.bereits_offene_mahnkosten_cent + vorschau.zusaetzlicher_betrag_cent) if vorschau is not None else 0
         )
@@ -499,17 +456,18 @@ class HVMailversandService:
             self.bank_repo, st, gesellschaft_id=contract.gesellschaft_id, vertrag_id=mahnlauf.vertrag_id, stufe=mahnlauf.stufe,
             zuordnung_repo=self.zahlungsziel_bindung_repo,
         )
+        # Nachtrag Markus 23.10.2026: die 14-Tage-Frist steht bereits
+        # EINMAL in `mahntext.kerntext` (siehe `mahntexte.py::
+        # _PFLICHTAUFFORDERUNG`) - dieser Abschnitt nennt deshalb nur
+        # noch das Zahlungskonto, OHNE die Frist ein zweites Mal zu
+        # wiederholen (dieselbe Kürzung wie im Mahnbrief-PDF).
         if zahlungsziel.iban and zahlungsziel.kontoinhaber:
             zahlungsziel_text = (
-                "\n\nBitte überweisen Sie den Gesamtbetrag binnen 14 Tagen ab Zugang dieser Nachricht auf "
-                f"folgendes Konto: IBAN {zahlungsziel.iban}, Kontoinhaber {zahlungsziel.kontoinhaber}, "
+                f"\n\nZahlungskonto: IBAN {zahlungsziel.iban}, Kontoinhaber {zahlungsziel.kontoinhaber}, "
                 f"Verwendungszweck: {zahlungsziel.verwendungszweck}."
             )
         else:
-            zahlungsziel_text = (
-                "\n\nBitte begleichen Sie den Gesamtbetrag binnen 14 Tagen ab Zugang dieser Nachricht auf "
-                "das Ihnen für dieses Mietverhältnis bekannt gegebene Konto."
-            )
+            zahlungsziel_text = "\n\nDie Zahlung erfolgt auf das Ihnen für dieses Mietverhältnis bekannt gegebene Konto."
         # Auftrag HV-20261022-EIN-KONTOBLATT, Nachbesserung Markus
         # 22.10.2026: der E-Mail-Kanal kennt KEINE Dateianhänge
         # (`mailops_client.py::MailOpsAuftrag` ist reiner Text) - statt
@@ -517,20 +475,19 @@ class HVMailversandService:
         # DIESELBE kanonische Journal-Quelle (`lade_kontoblatt`, identisch
         # zu Kontoansicht/Mieterakte/Briefanhang) als kurze, menschlich
         # verständliche Text-Tabelle eingebettet (Auftrag HV-20261023-
-        # MAHNUNG-EINFACH). Nachtrag Markus 23.10.2026 (Abnahme-Hinweis):
-        # `_vorschau_kontoauszug_kwargs(vorschau)` hängt GENAU dieselben,
-        # dem übrigen E-Mail-Text bereits bekannten neuen Zinsen/Gebühren
-        # an - OHNE vorherige DB-Buchung (die erfolgt weiterhin erst NACH
-        # dem Versand, siehe `MahnwesenService.versende_mahnlauf`) -
-        # damit dieser Block und der restliche E-Mail-Text NIE
-        # unterschiedliche Gesamtbeträge zeigen.
+        # MAHNUNG-EINFACH) - jetzt DIREKT im Text, nicht mehr als
+        # nachgestellter "Stand vor dieser Mahnung"-Anhang. `vorschau_
+        # mergen=False` unterdrückt den Vorschau-Merge bei einer
+        # Nachsendung (siehe Docstring oben); `faelliger_betrag_cent`
+        # bleibt davon unabhängig immer gesetzt.
         kontoauszug_text = journal_als_text(
             lade_kontoblatt(
                 konto_id=account.id, vertrag_id=mahnlauf.vertrag_id, op_service=self.op_service,
                 mahnkosten_repo=self.mahnkosten_repo, ruecklastschriftkosten_repo=self.ruecklastschriftkosten_repo,
                 mahnlauf_repo=self.mahnlauf_repo, manueller_mahnversand_repo=self.manueller_mahnversand_repo,
             ),
-            heute=heute, **_vorschau_kontoauszug_kwargs(vorschau),
+            heute=heute, **_vorschau_kontoauszug_kwargs(vorschau if vorschau_mergen else None),
+            faelliger_betrag_cent=gesamtbetrag_cent,
         )
         # Auftrag HV-20261023-MAHNUNG-EINFACH (23.10.2026, verbindlicher
         # Darstellungsauftrag): fester, kurzer Abschluss - "JLB" ist
@@ -546,17 +503,12 @@ class HVMailversandService:
             f"Guten Tag {empfaenger_name},\n\n"
             f"{mahntext.einleitung} {mahntext.kerntext}\n\n"
             f"Für {obj.bezeichnung}, {unit.bezeichnung}, ist folgende Forderung offen:\n\n"
-            + "\n".join(posten_zeilen) +
-            f"\n\nHauptforderung gesamt: {_eur_text(gesamt_cent)} EUR.\n\n"
-            + kosten_text +
-            f"Gesamtbetrag (Hauptforderung inkl. noch offener früherer Kosten und neuer zulässiger "
-            f"Zinsen/Gebühr): {_eur_text(gesamtbetrag_cent)} EUR."
-            + rechtlicher_absatz
-            + zahlungsziel_text +
+            f"{kontoauszug_text}"
+            + zahlungsziel_text
+            + rechtlicher_absatz +
             "\n\nBei einer inzwischen erfolgten Zahlung senden Sie uns bitte den Zahlungsbeleg. "
             "Bei Fragen zur Forderung antworten Sie bitte auf diese Nachricht."
             + abschluss
-            + f"\n\n---\nKontoauszug (Stand vor dieser Mahnung):\n\n{kontoauszug_text}"
         )
         return subject, text, empfaenger_name, anker.snapshot["empfaenger_email"], anker.policy_version
 
@@ -923,6 +875,13 @@ class HVMailversandService:
             # `_baue_brief_kontext`) - kein zweiter, redundanter Ladevorgang.
             kontoblatt=kontext.kontoblatt,
             empfaenger_ansicht=True, **_vorschau_kontoauszug_kwargs(vorschau),
+            # Nachtrag Markus 23.10.2026 (Gegenlesen von d52948f): derselbe
+            # geprüfte, jetzt tatsächlich fällige Betrag wie der Briefkörper
+            # (`kontext.gesamtbetrag_cent`) - die Tabelle kann weitere, noch
+            # nicht mahnbare Positionen des Kontos zeigen; "Davon jetzt zu
+            # zahlen" macht klar, welcher Teilbetrag tatsächlich einzufordern
+            # ist, NIE ein unbekannter/noch nicht fälliger Posten.
+            faelliger_betrag_cent=kontext.gesamtbetrag_cent,
         )
         pdf_bytes = haenge_kontoauszug_pdf_an(pdf_bytes, kontoauszug_pdf_bytes)
 
@@ -1297,6 +1256,11 @@ class HVMailversandService:
         vorschau = snapshot_aus_json(mahnlauf.mahnkosten_snapshot_json)
         subject, text, empfaenger_name, _email, policy_version = self._baue_email_mahntext(
             mahnlauf=mahnlauf, mitglieder=mitglieder, heute=heute, vorschau=vorschau,
+            # Nachtrag Markus 23.10.2026: dieselbe Asymmetrie wie die
+            # Briefkanal-Nachsendung (`_rendere_brief_pdf`) - der
+            # rekonstruierte Snapshot kann bereits gebucht sein, ein
+            # erneutes Anhängen desselben Deltas würde doppelt zählen.
+            vorschau_mergen=False,
         )
         mitmieter_text = text.replace(f"Guten Tag {empfaenger_name},", f"Guten Tag {mitmieter.name},", 1)
         try:
@@ -1380,6 +1344,12 @@ class HVMailversandService:
                 # zweiter, redundanter Ladevorgang.
                 kontoblatt=kontext.kontoblatt,
                 empfaenger_ansicht=True,
+                # Nachtrag Markus 23.10.2026 (Gegenlesen von d52948f): der
+                # tatsächlich fällige Teilbetrag (aus dem rekonstruierten
+                # Snapshot, identisch zum Briefkörper) - UNABHÄNGIG von der
+                # oben bewusst unterlassenen Vorschau-Merge-Frage (keine
+                # Doppelzählung).
+                faelliger_betrag_cent=kontext.gesamtbetrag_cent,
             )
             pdf_bytes = haenge_kontoauszug_pdf_an(pdf_bytes, kontoauszug_pdf_bytes)
 

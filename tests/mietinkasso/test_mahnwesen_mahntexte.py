@@ -27,11 +27,20 @@ def test_stufe1_ist_freundlich_aber_konkret_mit_frist():
 
 
 def test_stufe2_bietet_klaerung_ohne_automatischen_aufschub():
+    """Nachtrag Markus 23.10.2026 (Gegenlesen von d52948f): die
+    bisherige Fassung enthielt eine unnötige Rechts-/Verfahrensbelehrung
+    ("KEIN Zahlungsaufschub zugesagt", Stundung/Ratenvereinbarung) -
+    jetzt kurz: EIN Einleitungssatz mit Kontaktangebot bei
+    Zahlungsschwierigkeiten, dieselbe gemeinsame 14-Tage-
+    Pflichtaufforderung wie jede andere Stufe."""
+
     text = text_fuer_stufe(stufe=2, rechtsordnung=Rechtsordnung.OESTERREICH_MRG_VOLL.value, zahlungsfrist_bis=date(2026, 11, 1))
-    assert "Zahlungsschwierigkeiten" in text.kerntext
-    assert "zur Klärung" in text.kerntext
-    assert "KEIN Zahlungsaufschub zugesagt" in text.kerntext
+    assert "Zahlungsschwierigkeiten" in text.einleitung
+    assert "sprechen Sie bitte mit uns" in text.einleitung
     assert "binnen 14 Tagen ab Zugang" in text.kerntext  # auch Stufe 2 bleibt konkret/ernst
+    # Die frühere Verfahrensbelehrung ist bewusst entfallen.
+    assert "Zahlungsaufschub" not in text.kerntext and "Zahlungsaufschub" not in text.einleitung
+    assert "Stundung" not in text.kerntext and "Ratenvereinbarung" not in text.kerntext
 
 
 def test_stufe3_ist_nachdruecklich():
@@ -48,7 +57,7 @@ def test_stufe4_letzte_zahlungsaufforderung_mit_ra_uebergabe_und_keine_kuendigun
 
     text = text_fuer_stufe(stufe=4, rechtsordnung=Rechtsordnung.OESTERREICH_MRG_VOLL.value, zahlungsfrist_bis=date(2026, 11, 1))
     assert "binnen 14 Tagen ab Zugang" in text.kerntext
-    assert "vollständig" in text.kerntext
+    assert "letzte Zahlungsaufforderung" in text.einleitung
     assert "Rechtsanwalt" in text.rechtlicher_kern
     assert "Räumung" in text.rechtlicher_kern
     assert "gesetzlichen Voraussetzungen" in text.rechtlicher_kern  # konditional, keine Tatsachenbehauptung

@@ -277,6 +277,7 @@ def erzeuge_kontoauszug_pdf(
     empfaenger_ansicht: bool = False,
     neue_zinsen_delta_cent: int = 0, zins_von: date | None = None, zins_bis: date | None = None,
     zinssatz_prozent=None, gebuehr_cent: int | None = None, mahnpauschale_cent: int | None = None,
+    faelliger_betrag_cent: int | None = None,
 ) -> bytes:
     """`empfaenger_ansicht` (Auftrag HV-20261023-MAHNUNG-EINFACH,
     verbindlicher Darstellungsauftrag): `False` (Standard) ist die
@@ -300,7 +301,18 @@ def erzeuge_kontoauszug_pdf(
     Darstellung, EIN eingefrorener Snapshot). Der reine, mahnlauf-
     unabhängige Kontoblatt-Download (`backoffice/routes/konten.py::
     kontoauszug_pdf`) übergibt diese Parameter NICHT und bleibt beim
-    tatsächlich gebuchten Stand."""
+    tatsächlich gebuchten Stand.
+
+    `faelliger_betrag_cent` (Nachtrag Markus 23.10.2026, Gegenlesen von
+    d52948f, echter Fachfehler): die Tabelle zeigt die volle
+    Kontohistorie, die auch NICHT mahnbare/noch nicht fällige Positionen
+    enthalten kann - `faelliger_betrag_cent` ist der tatsächlich aus dem
+    geprüften Mahnkosten-Snapshot stammende, JETZT einforderbare
+    Teilbetrag (identisch zum Briefkörper, `brief_pdf.erzeuge_mahnbrief_
+    pdf`'s `gesamtbetrag_cent`) - weicht er vom vollen Saldo ab, zeigt
+    die Tabelle zusätzlich "Davon jetzt zu zahlen: X EUR" (siehe
+    `einfache_tabelle_pdf.zeichne_einfache_tabelle`). `None` (Standard,
+    wie beim reinen Kontoblatt-Download) zeigt diese Zeile nie."""
 
     anthrazit = _hex_to_rgb(absender.farbe_anthrazit)
     gold = _hex_to_rgb(absender.farbe_gold)
@@ -350,7 +362,10 @@ def erzeuge_kontoauszug_pdf(
             zins_von=zins_von, zins_bis=zins_bis, zinssatz_prozent=zinssatz_prozent,
             gebuehr_cent=gebuehr_cent, mahnpauschale_cent=mahnpauschale_cent,
         )
-        zeichne_einfache_tabelle(pdf, einfache_zeilen, familie="Konto", anthrazit=anthrazit, gold=gold)
+        zeichne_einfache_tabelle(
+            pdf, einfache_zeilen, familie="Konto", anthrazit=anthrazit, gold=gold,
+            faelliger_betrag_cent=faelliger_betrag_cent,
+        )
         return bytes(pdf.output())
 
     # Auftrag HV-20261022-EIN-KONTOBLATT: EIN gemeinsames, chronologisches

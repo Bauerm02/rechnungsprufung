@@ -39,11 +39,12 @@ from mietinkasso.op.kontoblatt import (
 def _op(
     id: int, typ: str, betrag_cent: int, *, status: str = "AKTIV", quelle_system: str | None = None,
     storniert_durch_id: int | None = None, belegdatum: date = date(2026, 9, 1), beleg_referenz: str | None = None,
+    bezieht_sich_auf_id: int | None = None,
 ) -> OPPositionTable:
     return OPPositionTable(
         id=id, konto_id="K-1", typ=typ, betrag_cent=betrag_cent, belegdatum=belegdatum, buchungsdatum=belegdatum,
         faelligkeit=None, faelligkeit_bekannt=False, status=status, quelle_system=quelle_system,
-        storniert_durch_id=storniert_durch_id, beleg_referenz=beleg_referenz,
+        storniert_durch_id=storniert_durch_id, beleg_referenz=beleg_referenz, bezieht_sich_auf_id=bezieht_sich_auf_id,
     )
 
 
@@ -52,11 +53,12 @@ def _buchung(
     gebuehr_op_position_id: int | None = None, mahnpauschale_op_position_id: int | None = None,
     versandnachweis_referenz: str = "mahnung:X", forderung_op_position_ids: str = "[]",
     zins_segmente_json: str = "[]", zinsen_delta_je_op_json: str = "{}",
+    zins_von: date = date(2026, 9, 1), zins_bis: date = date(2026, 9, 30), zinssatz_prozent=0,
 ) -> MahnkostenBuchungTable:
     return MahnkostenBuchungTable(
         vertrag_id=vertrag_id, stufe=stufe, mahnlauf_schluessel="HASH", forderung_op_position_ids=forderung_op_position_ids,
-        hauptforderung_cent=0, zinsbasis="VEREINBART_GEPRUEFT", zinssatz_prozent=0, zins_von=date(2026, 9, 1),
-        zins_bis=date(2026, 9, 30), zinsen_cent=0, versandnachweis_referenz=versandnachweis_referenz, erstellt_von="codex-test",
+        hauptforderung_cent=0, zinsbasis="VEREINBART_GEPRUEFT", zinssatz_prozent=zinssatz_prozent, zins_von=zins_von,
+        zins_bis=zins_bis, zinsen_cent=0, versandnachweis_referenz=versandnachweis_referenz, erstellt_von="codex-test",
         zinsen_op_position_id=zinsen_op_position_id, gebuehr_op_position_id=gebuehr_op_position_id,
         mahnpauschale_op_position_id=mahnpauschale_op_position_id,
         zins_segmente_json=zins_segmente_json, zinsen_delta_je_op_json=zinsen_delta_je_op_json,
@@ -763,7 +765,10 @@ def test_erstelle_einfache_tabelle_woertliches_zahlenbeispiel_gesamt_offen_1029(
 
     miete = _op(1, "SOLL", 100_000, belegdatum=date(2026, 1, 1))
     zahlung = _op(2, "ZAHLUNG", 100_000, belegdatum=date(2026, 1, 5))
-    rueckbuchung = _op(3, "RUECKLASTSCHRIFT", 100_000, belegdatum=date(2026, 1, 10))
+    # `bezieht_sich_auf_id` bindet die Rücklastschrift an die ursprüngliche
+    # Zahlung (05.01.) - der Buchungstext muss DIESES Datum nennen, nicht
+    # ihr eigenes Rückbuchungsdatum (10.01., siehe Gegenprobe unten).
+    rueckbuchung = _op(3, "RUECKLASTSCHRIFT", 100_000, belegdatum=date(2026, 1, 10), bezieht_sich_auf_id=2)
     bankspesen = _op(4, "SOLL", 700, belegdatum=date(2026, 1, 11))
     gebuehr = _op(5, "SOLL", 2_000, belegdatum=date(2026, 1, 12))
     zinsen = _op(6, "SOLL", 200, belegdatum=date(2026, 1, 12))
@@ -789,8 +794,17 @@ def test_erstelle_einfache_tabelle_woertliches_zahlenbeispiel_gesamt_offen_1029(
     buchungstexte = [z.buchung for z in zeilen]
     assert any("Mietvorschreibung" in b for b in buchungstexte)
     assert any(b == "Zahlung" for b in buchungstexte)
-    assert any("Rückbuchung dieser Zahlung" in b for b in buchungstexte)
-    assert any("Bankspesen Rückbuchung" in b for b in buchungstexte)
+    # Korrektur (Codex 23.10.2026, Gegenlesen von d52948f): der Text
+    # nennt jetzt das Datum der ZAHLUNG (05.01.), auf die sich die
+    # Rücklastschrift über `bezieht_sich_auf_id` bezieht - NICHT ihr
+    # eigenes Rückbuchungsdatum (10.01.). Die Zeilen-eigene Datumsspalte
+    # bleibt unverändert das Rückbuchungsdatum.
+    assert any(b == "Rückbuchung der Zahlung vom 05.01.2026" for b in buchungstexte)
+    rueckbuchungs_zeile = next(z for z in zeilen if z.buchung.startswith("Rückbuchung der Zahlung"))
+    assert rueckbuchungs_zeile.datum == date(2026, 1, 10)
+    # Die gebuchte Rücklastschriftkosten-Zeile behauptet KEIN eigenes
+    # Buchungsdatum mehr als Rückbuchungsdatum (siehe Moduldoc-Korrektur).
+    assert any(b == "Bankspesen Rücklastschrift" for b in buchungstexte)
     assert any("Mahngebühr" in b for b in buchungstexte)
     assert any("Verzugszinsen" in b for b in buchungstexte)
 
@@ -825,3 +839,129 @@ def test_erweitere_um_vorschau_ohne_neue_posten_liefert_liste_unveraendert():
     erweitert = erweitere_um_vorschau(basis, heute=date(2026, 1, 20))
     assert erweitert == basis
     assert not any(z.ist_vorschau for z in erweitert)
+
+
+# -- Gegenlesen von Commit d52948f (Codex, 23.10.2026): drei echte --------
+# Fachfehler in den neuen `erstelle_einfache_tabelle`/`erweitere_um_
+# vorschau`-Hilfsfunktionen - gezielte Gegenproben.
+
+
+def test_verzugszinsen_zeitraum_zeigt_letzten_verzinsten_tag_nicht_exklusives_enddatum():
+    """`zins_bis` ist EXKLUSIV (siehe `kosten.py::zins_bis_einschliesslich`-
+    Docstring) - ein Zeitraum 04.–08. (exklusiv) verzinst tatsächlich NUR
+    bis einschließlich 07. Die vorherige Fassung zeigte das exklusive
+    Enddatum unverändert (fälschlich "...–08."). Gilt für BEIDE Quellen:
+    eine bereits GEBUCHTE Zinszeile (Ledger) UND einen noch NICHT
+    gebuchten Vorschau-Posten (`erweitere_um_vorschau`)."""
+
+    miete = _op(1, "SOLL", 100_000, belegdatum=date(2026, 1, 1))
+    zinsen = _op(2, "SOLL", 300, belegdatum=date(2026, 1, 9))
+    buchung = _buchung(zinsen_op_position_id=2, zins_von=date(2026, 1, 4), zins_bis=date(2026, 1, 8), zinssatz_prozent=4)
+    blatt = _leer(
+        saldo_cent=100_300, positionen_aktiv=[miete, zinsen], positionen_alle=[miete, zinsen],
+        mahnkosten_buchungen=[buchung],
+    )
+    zeilen = erstelle_einfache_tabelle(blatt)
+    zins_zeile = next(z for z in zeilen if "Verzugszinsen" in z.buchung)
+    assert "04.01.2026–07.01.2026" in zins_zeile.buchung
+    assert "04.01.2026–08.01.2026" not in zins_zeile.buchung
+
+    # Dieselbe Korrektur für den noch NICHT gebuchten Vorschau-Posten.
+    erweitert = erweitere_um_vorschau(
+        zeilen, heute=date(2026, 1, 20), neue_zinsen_delta_cent=50,
+        zins_von=date(2026, 1, 9), zins_bis=date(2026, 1, 13), zinssatz_prozent=4,
+    )
+    vorschau_zeile = next(z for z in erweitert if z.ist_vorschau)
+    assert "09.01.2026–12.01.2026" in vorschau_zeile.buchung
+    assert "09.01.2026–13.01.2026" not in vorschau_zeile.buchung
+
+
+def test_ruecklastschrift_ohne_bezieht_sich_auf_id_bleibt_neutral_statt_falsches_datum():
+    """Fehlt die `bezieht_sich_auf_id`-Bindung (z. B. eine isoliert
+    gebuchte Rücklastschrift ohne nachvollziehbare ursprüngliche
+    Zahlung), bleibt der Buchungstext NEUTRAL - NIE ein erfundenes/
+    falsches Bezugsdatum. Die Datumsspalte der Zeile bleibt trotzdem
+    korrekt das tatsächliche Rückbuchungsdatum."""
+
+    rueckbuchung = _op(1, "RUECKLASTSCHRIFT", 50_000, belegdatum=date(2026, 4, 10), bezieht_sich_auf_id=None)
+    blatt = _leer(saldo_cent=50_000, positionen_aktiv=[rueckbuchung], positionen_alle=[rueckbuchung])
+    zeilen = erstelle_einfache_tabelle(blatt)
+    zeile = next(z for z in zeilen if "Rückbuchung" in z.buchung)
+    assert zeile.buchung == "Rückbuchung einer Zahlung"
+    assert zeile.datum == date(2026, 4, 10)
+
+
+def test_ruecklastschrift_mit_nicht_aufloesbarer_bezieht_sich_auf_id_bleibt_neutral():
+    """Die Bindung verweist auf eine ID, die im Kontoblatt gar nicht
+    vorkommt (z. B. eine andere, hier nicht geladene Position) -
+    bleibt ebenfalls neutral statt mit einer falschen Position zu raten."""
+
+    rueckbuchung = _op(1, "RUECKLASTSCHRIFT", 50_000, belegdatum=date(2026, 4, 10), bezieht_sich_auf_id=999)
+    blatt = _leer(saldo_cent=50_000, positionen_aktiv=[rueckbuchung], positionen_alle=[rueckbuchung])
+    zeilen = erstelle_einfache_tabelle(blatt)
+    zeile = next(z for z in zeilen if "Rückbuchung" in z.buchung)
+    assert zeile.buchung == "Rückbuchung einer Zahlung"
+
+
+def test_verzugszinsen_zeile_zeigt_zinsbasis_satz_und_zeitraum():
+    """Ergänzender fachlicher Abnahmehinweis Markus 23.10.2026: die kurze
+    Zinszeile muss neben Zeitraum/Satz auch die tatsächliche Zinsbasis
+    erkennen lassen, z. B. "4% aus 1.000,00 EUR Miete September 2026,
+    04.–07.09.2026" - ausschließlich aus bereits vorhandenen,
+    strukturierten Zinssegmenten/Restbeträgen/Forderungsperioden
+    (`MahnkostenBuchungTable.zins_segmente_json`/`zinsen_delta_je_op_
+    json`), keine neue Berechnung, keine erfundene Zuordnung, keine OP-Id
+    im Text."""
+
+    miete = _op(1, "SOLL", 100_000, belegdatum=date(2026, 9, 1))
+    miete.leistungsperiode = "2026-09"
+    zinsen = _op(2, "SOLL", 40, belegdatum=date(2026, 9, 8))
+    segmente = [{
+        "op_position_id": 1, "von": "2026-09-04", "bis": "2026-09-08",
+        "satz_prozent": 4, "rest_cent": 100_000, "zinsen_cent": 40,
+    }]
+    buchung = _buchung(
+        zinsen_op_position_id=2, zins_segmente_json=json.dumps(segmente),
+        zinsen_delta_je_op_json=json.dumps({"1": 40}),
+    )
+    blatt = _leer(
+        saldo_cent=100_040, positionen_aktiv=[miete, zinsen], positionen_alle=[miete, zinsen],
+        mahnkosten_buchungen=[buchung],
+    )
+    zeilen = erstelle_einfache_tabelle(blatt)
+    zins_zeile = next(z for z in zeilen if "Verzugszinsen" in z.buchung)
+    assert zins_zeile.buchung == "Verzugszinsen 4% aus 1.000,00 EUR Miete September 2026, 04.09.2026–07.09.2026"
+    assert "#" not in zins_zeile.buchung and "op_position" not in zins_zeile.buchung.lower()
+
+
+def test_verzugszinsen_zeile_zeigt_mehrere_unterschiedliche_grundlagen_getrennt():
+    """"Bei mehreren unterschiedlichen Grundlagen kurz getrennt je
+    Basis/Zeitraum innerhalb derselben Tabelle ausweisen, Summe
+    unverändert" - zwei verschiedene Mietperioden tragen zu DERSELBEN
+    Zinsbuchung bei, mit unterschiedlichem Satz/Zeitraum/Restbetrag -
+    beide erscheinen als getrennte Klauseln in EINER Zeile, die Summe
+    (Betrag-Spalte) bleibt unverändert die tatsächlich gebuchte Summe."""
+
+    miete_august = _op(1, "SOLL", 50_000, belegdatum=date(2026, 8, 1))
+    miete_august.leistungsperiode = "2026-08"
+    miete_september = _op(2, "SOLL", 100_000, belegdatum=date(2026, 9, 1))
+    miete_september.leistungsperiode = "2026-09"
+    zinsen = _op(3, "SOLL", 70, belegdatum=date(2026, 9, 8))
+    segmente = [
+        {"op_position_id": 1, "von": "2026-09-01", "bis": "2026-09-08", "satz_prozent": 4, "rest_cent": 50_000, "zinsen_cent": 30},
+        {"op_position_id": 2, "von": "2026-09-04", "bis": "2026-09-08", "satz_prozent": 4, "rest_cent": 100_000, "zinsen_cent": 40},
+    ]
+    buchung = _buchung(
+        zinsen_op_position_id=3, zins_segmente_json=json.dumps(segmente),
+        zinsen_delta_je_op_json=json.dumps({"1": 30, "2": 40}),
+    )
+    blatt = _leer(
+        saldo_cent=150_070, positionen_aktiv=[miete_august, miete_september, zinsen],
+        positionen_alle=[miete_august, miete_september, zinsen], mahnkosten_buchungen=[buchung],
+    )
+    zeilen = erstelle_einfache_tabelle(blatt)
+    zins_zeile = next(z for z in zeilen if "Verzugszinsen" in z.buchung)
+    assert "500,00 EUR Miete August 2026" in zins_zeile.buchung
+    assert "1.000,00 EUR Miete September 2026" in zins_zeile.buchung
+    assert zins_zeile.buchung.count(";") == 1  # genau zwei getrennte Klauseln
+    assert zins_zeile.betrag_cent == 70  # Summe unverändert, keine zweite Berechnung

@@ -132,7 +132,7 @@ from mietinkasso.infrastructure.db.tables import (
 #: mahnwesen.py::mahnpauschale_freigabe_formular` (reine Funktion über
 #: einer bereits gelesenen Historie, kein eigener DB-Zugriff) - siehe
 #: `lade_kontoblatt`/`AusstehenderManuellerMahnversand`.
-from mietinkasso.mahnwesen.kosten import _profil_wirksam_am
+from mietinkasso.mahnwesen.kosten import _profil_wirksam_am, zins_bis_einschliesslich
 
 KATEGORIE_HAUPTFORDERUNG = "HAUPTFORDERUNG"
 KATEGORIE_VERZUGSZINSEN = "VERZUGSZINSEN"
@@ -845,30 +845,139 @@ def _monat_jahr_text(leistungsperiode: str) -> str:
         return leistungsperiode
 
 
-def _einfache_buchung_text(jz: "JournalZeile", p: OPPositionTable) -> str:
+def _eur_basis_text(cent: int) -> str:
+    return f"{cent / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _verzugszinsen_basis_klauseln(
+    ledger: "MahnkostenLedgerEintrag", positionen_by_id: dict[int, OPPositionTable],
+) -> list[str]:
+    """Nachtrag Markus 23.10.2026 (ergänzender fachlicher Abnahmehinweis):
+    die kurze Zinszeile muss neben Zeitraum/Satz auch die tatsächliche
+    ZINSBASIS erkennen lassen (z. B. "4% aus 1.000,00 EUR Miete
+    September 2026, 04.–07.09.2026") - AUSSCHLIESSLICH aus bereits
+    vorhandenen, strukturierten Daten (`ledger.zins_zuordnung`, selbst
+    wiederum reine Umformung von `zins_segmente_json`/`zinsen_delta_
+    je_op_json`, siehe `_parse_zins_zuordnung`): KEINE neue Berechnung,
+    KEINE erfundene Zuordnung, KEINE OP-Id im Text (nur zum internen
+    Nachschlagen des Periodenlabels verwendet).
+
+    EIN zugrunde liegender Forderungs-`op_position_id` gilt nur, wenn er
+    an DIESER Buchung tatsächlich ein Delta (`delta_cent`) beigetragen
+    hat - sonst wäre er nur historischer Kontext einer früheren Buchung,
+    keine Grundlage für DIESE Zeile. Pro solchem Zuordnungseintrag wird
+    JEDES seiner Segmente mit tatsächlich positivem `zinsen_cent`
+    GETRENNT ausgewiesen ("bei mehreren unterschiedlichen Grundlagen
+    kurz getrennt je Basis/Zeitraum ausweisen") - keine Zusammenfassung/
+    Mittelwertbildung über mehrere Sätze/Zeiträume/Basisbeträge. Ein
+    Segment mit fehlendem/unklarem Satz, Zeitraum oder Restbetrag wird
+    STILL übersprungen (nie ein unbekannter Wert erfunden) - die Summe
+    im Betrag der Zeile bleibt davon unberührt, nur die Textbeschreibung
+    kann dadurch unvollständig bleiben (der vollständige Nachweis bleibt
+    intern über `MahnkostenLedgerEintrag` abrufbar).
+
+    Das Periodenlabel ("Miete {Monat Jahr}") wird NUR gezeigt, wenn die
+    referenzierte Position tatsächlich eine `leistungsperiode` trägt
+    (typisch für eine Mietvorschreibung) - sonst bleibt es bei einer
+    neutralen Datumsangabe ("Forderung vom ..."), NIE eine erfundene
+    Bezeichnung "Miete" für eine andere Forderungsart (z. B. eine
+    Mahngebühr, die selbst Zinsen trägt)."""
+
+    klauseln: list[str] = []
+    for zuordnung in ledger.zins_zuordnung:
+        if not zuordnung.delta_cent:
+            continue
+        basis_position = positionen_by_id.get(zuordnung.op_position_id)
+        if basis_position is not None and basis_position.leistungsperiode:
+            basis_label = f" Miete {_monat_jahr_text(basis_position.leistungsperiode)}"
+        elif basis_position is not None:
+            basis_label = f" Forderung vom {basis_position.belegdatum.strftime('%d.%m.%Y')}"
+        else:
+            basis_label = ""
+        for segment in zuordnung.segmente:
+            if not isinstance(segment, dict):
+                continue
+            zinsen_cent = segment.get("zinsen_cent")
+            rest_cent = segment.get("rest_cent")
+            satz = segment.get("satz_prozent")
+            if not (isinstance(zinsen_cent, int) and zinsen_cent > 0 and isinstance(rest_cent, int) and satz is not None):
+                continue
+            try:
+                von = date.fromisoformat(segment.get("von"))
+                bis = date.fromisoformat(segment.get("bis"))
+            except (TypeError, ValueError):
+                continue
+            bis_einschliesslich = zins_bis_einschliesslich(bis)
+            klauseln.append(
+                f"{satz}% aus {_eur_basis_text(rest_cent)} EUR{basis_label}, "
+                f"{von.strftime('%d.%m.%Y')}–{bis_einschliesslich.strftime('%d.%m.%Y')}"
+            )
+    return klauseln
+
+
+def _einfache_buchung_text(jz: "JournalZeile", p: OPPositionTable, positionen_by_id: dict[int, OPPositionTable]) -> str:
     """Kurze, für einen Laien verständliche Beschreibung EINER
     Journalzeile (Auftrag HV-20261023-MAHNUNG-EINFACH) - AUSSCHLIESSLICH
     aus bereits vorhandenen, strukturierten Feldern (`leistungsperiode`,
     `belegdatum`, `faelligkeit`, die direkten Skalarfelder des Zins-
-    Ledgers `zins_von`/`zins_bis`/`zinssatz_prozent`) - NIE eine interne
-    OP-Id, ein Import-/Beleg-Schlüssel, ein Hash oder eine rohe
-    `versandnachweis_referenz` (die bleiben ausschließlich im internen
-    Backoffice-Kontoblatt sichtbar, siehe `KontoblattZeile.ledger`/
-    `_forderungsbezug`)."""
+    Ledgers `zins_von`/`zins_bis`/`zinssatz_prozent`, `bezieht_sich_auf_id`)
+    - NIE eine interne OP-Id, ein Import-/Beleg-Schlüssel, ein Hash oder
+    eine rohe `versandnachweis_referenz` (die bleiben ausschließlich im
+    internen Backoffice-Kontoblatt sichtbar, siehe `KontoblattZeile.
+    ledger`/`_forderungsbezug`).
+
+    **Korrektur nach unabhängiger Rückprüfung (Codex, 23.10.2026,
+    Gegenlesen von Commit d52948f):**
+    1. `zins_bis`/`buchung.zins_bis` sind EXKLUSIV (siehe `kosten.py::
+       zins_bis_einschliesslich`-Docstring) - vorher wurde das exklusive
+       Enddatum unverändert angezeigt (ein am 08. endender Zeitraum
+       zeigte fälschlich "...–08.", tatsächlich verzinst ist nur bis
+       07.). Jetzt wie überall sonst im Kundentext über
+       `zins_bis_einschliesslich` in den tatsächlich letzten verzinsten
+       Tag umgerechnet - NUR die Anzeige, NIE der Betrag selbst.
+    2. Eine RUECKLASTSCHRIFT-Zeile nannte bisher ihr EIGENES Belegdatum
+       als "Rückbuchung dieser Zahlung ({datum})" - das ist das Datum
+       DER RÜCKBUCHUNG SELBST, nicht das der ursprünglich zurückgebuchten
+       Zahlung, und damit ein falscher Bezug. Jetzt wird über die
+       bereits bestehende `bezieht_sich_auf_id`-Bindung (siehe `bank/
+       service.py`, RUECKLASTSCHRIFT -> ursprüngliche ZAHLUNG) das
+       tatsächliche Zahlungsdatum aufgelöst und benannt ("Rückbuchung
+       der Zahlung vom {datum der Zahlung}"); die DATUMS-SPALTE der
+       Tabellenzeile bleibt UNVERÄNDERT das Rückbuchungsdatum selbst
+       (`jz.datum`/`p.belegdatum`, siehe `erstelle_einfache_tabelle`) -
+       nur der Beschreibungstext bekommt den korrekten Bezug. Ist die
+       Bindung nicht auflösbar (fehlt/Ziel nicht gefunden), bleibt der
+       Text bewusst NEUTRAL ("Rückbuchung einer Zahlung") statt ein
+       falsches Datum zu erfinden.
+    3. Eine gebuchte Rücklastschriftkosten-Zeile nannte bisher IHR
+       EIGENES Buchungsdatum (wann das Bankentgelt selbst erfasst wurde)
+       fälschlich ALS Rückbuchungsdatum ("Bankspesen Rückbuchung
+       ({datum})") - dieses Datum ist aber laut `bank/
+       ruecklastschriftkosten_service.py` NICHT an die Rücklastschrift
+       gebunden (`heute` beim Erfassen, siehe dort: "KEINE
+       bezieht_sich_auf_id auf die Rücklastschrift"). Der Text behauptet
+       das Rückbuchungsdatum deshalb jetzt NICHT mehr - die Datums-Spalte
+       der Zeile zeigt weiterhin korrekt das (eigene) Buchungsdatum
+       dieser Kostenzeile."""
 
     datum_text = p.belegdatum.strftime("%d.%m.%Y")
     if jz.kategorie == KATEGORIE_VERZUGSZINSEN:
-        buchung = jz.zeile.ledger.buchung if jz.zeile.ledger is not None else None
+        ledger = jz.zeile.ledger
+        klauseln = _verzugszinsen_basis_klauseln(ledger, positionen_by_id) if ledger is not None else []
+        if klauseln:
+            return "Verzugszinsen " + "; ".join(klauseln)
+        buchung = ledger.buchung if ledger is not None else None
         if buchung is not None and buchung.zins_von and buchung.zins_bis and buchung.zinssatz_prozent is not None:
+            bis_einschliesslich = zins_bis_einschliesslich(buchung.zins_bis)
             return (
-                f"Verzugszinsen {buchung.zins_von.strftime('%d.%m.%Y')}–{buchung.zins_bis.strftime('%d.%m.%Y')}, "
+                f"Verzugszinsen {buchung.zins_von.strftime('%d.%m.%Y')}–{bis_einschliesslich.strftime('%d.%m.%Y')}, "
                 f"{buchung.zinssatz_prozent}%"
             )
         return f"Verzugszinsen ({datum_text})"
     if jz.kategorie in (KATEGORIE_MAHNSPESEN, KATEGORIE_MAHNPAUSCHALE):
         return f"Mahngebühr ({datum_text})"
     if jz.kategorie == KATEGORIE_RUECKLASTSCHRIFTKOSTEN:
-        return f"Bankspesen Rückbuchung ({datum_text})"
+        return "Bankspesen Rücklastschrift"
     # KATEGORIE_HAUPTFORDERUNG - je tatsächlichem OP-Typ.
     if p.typ == OPTyp.EROEFFNUNG.value:
         return "Ausgangssaldo"
@@ -877,7 +986,10 @@ def _einfache_buchung_text(jz: "JournalZeile", p: OPPositionTable) -> str:
     if p.typ == OPTyp.GUTSCHRIFT.value:
         return "Gutschrift"
     if p.typ == OPTyp.RUECKLASTSCHRIFT.value:
-        return f"Rückbuchung dieser Zahlung ({datum_text})"
+        zahlung = positionen_by_id.get(p.bezieht_sich_auf_id) if p.bezieht_sich_auf_id is not None else None
+        if zahlung is not None:
+            return f"Rückbuchung der Zahlung vom {zahlung.belegdatum.strftime('%d.%m.%Y')}"
+        return "Rückbuchung einer Zahlung"
     if p.typ == OPTyp.KORREKTUR.value:
         return "Korrektur"
     # SOLL - die tatsächliche Mietvorschreibung.
@@ -943,13 +1055,24 @@ def erstelle_einfache_tabelle(kontoblatt: Kontoblatt) -> list[EinfacheZeile]:
     journal = erstelle_journal(kontoblatt)
     if not journal:
         return []
+    # Nachtrag Markus 23.10.2026 (Gegenlesen von d52948f): Lookup ALLER
+    # im Kontoblatt vorkommenden Positionen über ihre Id - ausschließlich
+    # dafür, dass eine RUECKLASTSCHRIFT-Zeile die über `bezieht_sich_
+    # auf_id` gebundene ursprüngliche ZAHLUNG korrekt benennen kann
+    # (siehe `_einfache_buchung_text`), KEINE zweite Berechnung/Query.
+    positionen_by_id = {
+        z.position.id: z.position for z in (
+            list(kontoblatt.hauptforderung_zeilen) + list(kontoblatt.kosten_zeilen) + list(kontoblatt.zahlungen_zeilen)
+            + list(kontoblatt.hauptforderung_historie) + list(kontoblatt.kosten_historie)
+        )
+    }
     zeilen: list[EinfacheZeile] = []
     erste = journal[0]
     if not (erste.beeinflusst_saldo and erste.zeile.position.typ == OPTyp.EROEFFNUNG.value):
         zeilen.append(EinfacheZeile(datum=erste.datum, buchung="Ausgangssaldo", betrag_cent=0, offen_cent=0))
     for jz in journal:
         p = jz.zeile.position
-        buchung = _einfache_buchung_text(jz, p)
+        buchung = _einfache_buchung_text(jz, p, positionen_by_id)
         if not jz.beeinflusst_saldo:
             buchung += " (storniert)"
         zeilen.append(EinfacheZeile(
@@ -997,7 +1120,11 @@ def erweitere_um_vorschau(
     if neue_zinsen_delta_cent:
         laufend += neue_zinsen_delta_cent
         if zins_von is not None and zins_bis is not None and zinssatz_prozent is not None:
-            text = f"Verzugszinsen {zins_von.strftime('%d.%m.%Y')}–{zins_bis.strftime('%d.%m.%Y')}, {zinssatz_prozent}% (mit diesem Schreiben)"
+            # `zins_bis` ist EXKLUSIV (siehe Docstring/`_einfache_
+            # buchung_text`-Korrektur oben) - angezeigt wird der
+            # tatsächlich letzte verzinste Tag, NIE das exklusive Enddatum.
+            bis_einschliesslich = zins_bis_einschliesslich(zins_bis)
+            text = f"Verzugszinsen {zins_von.strftime('%d.%m.%Y')}–{bis_einschliesslich.strftime('%d.%m.%Y')}, {zinssatz_prozent}% (mit diesem Schreiben)"
         else:
             text = f"Verzugszinsen (mit diesem Schreiben, {heute.strftime('%d.%m.%Y')})"
         ergebnis.append(EinfacheZeile(datum=heute, buchung=text, betrag_cent=neue_zinsen_delta_cent, offen_cent=laufend, ist_vorschau=True))

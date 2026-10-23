@@ -7987,10 +7987,116 @@ Ausschließlich synthetische Testdaten, keine Produktivaktionen,
 
 ### Offene Punkte (nicht Teil dieses Auftrags)
 
-- Die E-Mail-Textkomposition (`_baue_email_mahntext`) zeigt die alte
-  Forderungszeilen-Prosa weiterhin VOR dem angehängten
-  `journal_als_text`-Block, statt die kurze Tabelle direkt zu Beginn zu
-  verwenden wie jetzt im PDF-Brief. Der Nutzerauftrag dieser Runde nannte
-  explizit nur "der eigentliche Mahnbrief" (das PDF) - eine analoge
-  Umstellung des E-Mail-Texts wäre eine eigene, bewusste Entscheidung
-  (eigener Rahmen), keine automatische Ausweitung.
+- **Korrektur 23.10.2026 (nachträglich erledigt):** die unten zunächst
+  als "nicht Teil dieses Auftrags" vermerkte E-Mail-Textumstellung war
+  tatsächlich bereits ausdrücklich Teil des Originalauftrags (Abschnitt
+  "Zusammengehörige Ansichten: echter Mailinhalt kurz und dieselbe
+  Tabelle") - der Vermerk war also sachlich falsch, kein tatsächlich
+  offener/bewusst abgegrenzter Punkt. Im direkt folgenden Commit
+  nachgeholt und fertiggestellt (siehe Abschnitt "HV-20261023-MAHNUNG-
+  EINFACH: Folgecommit" unten, Punkt 6) - `_baue_email_mahntext` nutzt
+  jetzt dieselbe kurze Tabelle direkt im Text, keine vorangestellte
+  Prosa, kein nachgestellter Anhang mehr.
+
+## HV-20261023-MAHNUNG-EINFACH: Folgecommit (E-Mail fertiggestellt, drei echte Fachfehler aus unabhängiger Rückprüfung behoben)
+
+Unabhängige Quellprüfung von Commit `d52948f` (Codex, 23.10.2026) fand
+drei echte Fachfehler plus einen offenen Punkt aus dem Originalauftrag:
+
+1. **P1 (schwerwiegend):** der neue `kontoblatt`-Zweig in `erzeuge_
+   mahnbrief_pdf` zeigte die VOLLE Kontohistorie (inkl. noch nicht
+   fälliger Positionen) als "Gesamt offen" und die Pflichtaufforderung
+   bezog sich darauf - ein Konto mit z. B. 100 EUR fälliger und 900 EUR
+   erst später fälliger Miete hätte so fälschlich 1.000 EUR sofort
+   eingefordert. Behoben über eine neue, GENAU dann gezeigte Zusatzzeile
+   "Davon jetzt zu zahlen: X EUR" (`faelliger_betrag_cent`, der
+   tatsächlich aus dem bestehenden, geprüften Mahnkosten-Snapshot
+   stammende Betrag) - durchgezogen über `op/einfache_tabelle_pdf.py`,
+   `op/kontoauszug_pdf.py`, `mahnwesen/kontoauszug_anhang.py`
+   (E-Mail-Tabelle) und alle Aufrufer. Niemals ein unbekannter/noch
+   nicht fälliger Posten eingefordert; Hauptmietrückstand bleibt über
+   `rechtlicher_kern_stufe4` weiterhin alleinige Kündigungsgrundlage.
+2. **P2 (Zinsenzeitraum):** `zins_bis` ist EXKLUSIV - die kurze Zeile
+   zeigte das exklusive Enddatum unverändert (z. B. fälschlich "...–08."
+   statt korrekt "...–07."). Jetzt über das bestehende `zins_bis_
+   einschliesslich` korrigiert, in BEIDEN Quellen (bereits gebuchte
+   Ledgerzeile UND noch nicht gebuchter Vorschau-Posten).
+3. **P2 (Zahlungsbezug):** eine Rücklastschrift-Zeile nannte ihr EIGENES
+   Rückbuchungsdatum als "Rückbuchung dieser Zahlung ({datum})" - das
+   ist das Datum der Rückbuchung selbst, nicht der ursprünglich
+   zurückgebuchten Zahlung. Jetzt über die bestehende `bezieht_sich_
+   auf_id`-Bindung aufgelöst ("Rückbuchung der Zahlung vom {echtes
+   Zahlungsdatum}"); fehlt die Bindung, bleibt der Text NEUTRAL
+   ("Rückbuchung einer Zahlung") statt ein falsches Datum zu erfinden.
+   Eine gebuchte Rücklastschriftkosten-Zeile behauptet ihr eigenes
+   Buchungsdatum nicht mehr als Rückbuchungsdatum ("Bankspesen
+   Rücklastschrift" statt "Bankspesen Rückbuchung ({datum})").
+4. **PDF-Layout:** bei einer umbrechenden Zeile zeichnete die vorherige
+   Fassung zuerst die Zeile auf der neuen Seite und ERST DANACH den
+   wiederholten Tabellenkopf darunter (Seitenumbruch-Entscheidung lag
+   bisher INNERHALB der Zeilenfunktion selbst). Jetzt entscheidet der
+   Aufrufer VOR dem Zeichnen jeder Zeile (`_sichere_seite_vor_zeile`),
+   der Kopf steht garantiert vor der ersten Zeile jeder Folgeseite.
+5. **Ergänzender fachlicher Abnahmehinweis:** die kurze Zinszeile zeigt
+   jetzt zusätzlich die tatsächliche Zinsbasis (z. B. "4% aus 1.000,00
+   EUR Miete September 2026, 04.–07.09.2026"), ausschließlich aus
+   bereits vorhandenen strukturierten Zinssegmenten/Restbeträgen
+   (`ledger.zins_zuordnung`), keine neue Berechnung. Bei mehreren
+   unterschiedlichen Grundlagen (verschiedene Perioden/Restbeträge im
+   selben Zinsposten) erscheinen sie als getrennte, semikolon-separierte
+   Klauseln in derselben Zeile, Summe unverändert.
+6. **Ursprünglicher offener Punkt, jetzt fertiggestellt:** `_baue_email_
+   mahntext` ist auf dieselbe kurze Struktur wie der PDF-Brief umgestellt
+   - kurze Einleitung, GENAU EIN chronologisches Journal mit "Gesamt
+   offen" (`journal_als_text`, identisch zum Brief/Anhang), konkrete
+   Zahlungsaufforderung/Zahlungskonto (ohne die 14-Tage-Frist ein
+   zweites Mal zu wiederholen), kurzer stufengerechter Rechtsfolgetext,
+   fester Abschluss "JLB/Die Hausverwaltung". Die vormalige, separat
+   formulierte Forderungsprosa (`posten_zeilen`/"Hauptforderung
+   gesamt"/`_mahnkosten_text_baustein`/"Gesamtbetrag (...)" sowie der
+   nachgestellte "Kontoauszug (Stand vor dieser Mahnung)"-Block) ist
+   vollständig entfernt - `_mahnkosten_text_baustein` wurde als toter
+   Code gelöscht. Dieselbe `vorschau_mergen`-Asymmetrie wie beim
+   Brief-/Kontoauszug-Anhang (`_rendere_brief_pdf`) verhindert eine
+   Doppelzählung bei einer Mitmieter-Nachsendung mit rekonstruiertem
+   Snapshot.
+
+Die bereits zuvor umgesetzte Kürzung der Stufe1-4-Einleitungstexte
+(`mahntexte.py::text_fuer_stufe`, GENAU EIN gemeinsamer
+Pflichtaufforderungssatz `_PFLICHTAUFFORDERUNG` statt der vormals
+längeren, teils belehrenden Stufe2-Formulierung "KEIN Zahlungsaufschub
+zugesagt"/Stundung/Ratenvereinbarung) wurde bei dieser Rückprüfung
+erneut gezielt bestätigt - unverändert korrekt, keine weitere Anpassung
+nötig.
+
+### Geänderte Dateien
+
+`src/mietinkasso/op/kontoblatt.py` (Zinsbasis-Text, `bezieht_sich_
+auf_id`-Auflösung, `zins_bis_einschliesslich`-Korrektur),
+`src/mietinkasso/op/einfache_tabelle_pdf.py` (Seitenumbruch-Reihenfolge,
+"Davon jetzt zu zahlen"), `src/mietinkasso/op/kontoauszug_pdf.py`
+(`faelliger_betrag_cent`-Parameter), `src/mietinkasso/mahnwesen/
+brief_pdf.py` (`faelliger_betrag_cent` verdrahtet, Bankabschnitt ohne
+Fristwiederholung), `src/mietinkasso/mahnwesen/kontoauszug_anhang.py`
+(`faelliger_betrag_cent`-Parameter), `src/mietinkasso/indexautomatik/
+mailversand_service.py` (E-Mail-Text neu zusammengesetzt,
+`_mahnkosten_text_baustein` entfernt, `vorschau_mergen`-Parameter),
+`src/mietinkasso/backoffice/routes/mahnwesen.py` (Vorschau-Route
+verdrahtet `faelliger_betrag_cent`).
+
+### Tests
+
+Gezielte neue/angepasste Tests in `tests/mietinkasso/test_kontoblatt.py`
+(Zinsbasis-Klauseln, Zahlungsbezug neutral/aufgelöst, zins_bis-Korrektur),
+`tests/mietinkasso/test_brief_pdf.py` (100+900-Gegenprobe "Davon jetzt zu
+zahlen", Mehrseitenkopf-Reihenfolge), `tests/mietinkasso/
+test_kontoauszug_pdf.py`, `tests/mietinkasso/test_kontoauszug_anhang.py`,
+`tests/mietinkasso/test_hv_mailversand.py` (neue kurze E-Mail-Struktur,
+drei bestehende Tests an die neue, bewusst geänderte Darstellung
+angepasst), `tests/mietinkasso/test_backoffice.py` (zwei bestehende
+Tests an die korrigierte Rücklastschrift-Textdarstellung angepasst).
+Gesamtsuite `tests/mietinkasso` grün (1642 Tests) vor diesem gezielten
+Nachtrag; seither nur die oben genannten, gezielt nachgeprüften Dateien
+geändert, keine erneute komplette Suite allein für diese Abnahme
+wiederholt (Nutzervorgabe). Ausschließlich synthetische Testdaten, keine
+Produktivaktionen, `SEND_ENABLED=false` unverändert.

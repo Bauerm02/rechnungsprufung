@@ -781,3 +781,85 @@ def test_kontoblatt_mit_vorschau_merge_zeigt_woertliches_zahlenbeispiel_1029():
     # Zinsen und Gebühr erscheinen GENAU EINMAL (keine konkurrierende
     # zweite Summe/kein doppelter Ansatz).
     assert text.count("Gesamt offen") == 1
+
+
+# -- Gegenlesen von Commit d52948f (Codex, 23.10.2026): P1, echter --------
+# Fachfehler - der Brief durfte den VOLLEN Kontostand nicht unbesehen als
+# "jetzt zu zahlen" einfordern, wenn das Konto weitere, noch nicht
+# mahnbare Positionen trägt.
+
+
+def test_davon_jetzt_zu_zahlen_zeigt_nur_den_geprueften_faelligen_teilbetrag():
+    """Repro aus dem Abnahmehinweis: 100 EUR fällige Miete + 900 EUR
+    erst später fällige Miete, Kontosaldo 1.000 EUR. Der volle Saldo darf
+    sichtbar sein, verbindlich einzufordern (und über `gesamtbetrag_cent`
+    aus dem bestehenden, geprüften Mahnkosten-Snapshot vorgegeben) sind
+    aber NUR die 100 EUR - niemals ein unbekannter/noch nicht fälliger
+    Posten."""
+
+    faellige_miete = _op(1, "SOLL", 10_000, belegdatum=date(2026, 1, 1), leistungsperiode="2026-01", faelligkeit=date(2026, 1, 5))
+    spaetere_miete = _op(2, "SOLL", 90_000, belegdatum=date(2026, 2, 1), leistungsperiode="2026-02", faelligkeit=date(2026, 2, 5))
+    kontoblatt = _kontoblatt(faellige_miete, spaetere_miete)
+
+    pdf_bytes = _erzeugen(
+        forderungszeilen=[], bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0, neue_gebuehr_cent=0,
+        gesamtbetrag_cent=10_000, heute=date(2026, 1, 20), kontoblatt=kontoblatt,
+    )
+    text = _normalisiert(PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text())
+    assert "Gesamt offen" in text and "1.000,00 EUR" in text  # voller Kontostand bleibt sichtbar
+    assert "Davon jetzt zu zahlen" in text and "100,00 EUR" in text  # nur der geprüfte fällige Teil
+    # Die Pflichtaufforderung im Fließtext bezieht sich auf "den ...
+    # fälligen Rückstand" (siehe `mahntexte.py`) - nicht auf "den
+    # Gesamtbetrag"/den vollen Kontostand.
+    assert "fälligen Rückstand" in text
+
+
+def test_davon_jetzt_zu_zahlen_entfaellt_wenn_voller_saldo_bereits_faellig_ist():
+    """Stimmen voller Kontostand und geprüfter fälliger Betrag überein
+    (keine weitere, noch nicht mahnbare Position), entfällt die
+    Zusatzzeile - keine redundante Wiederholung derselben Zahl."""
+
+    nur_faellige_miete = _op(1, "SOLL", 10_000, belegdatum=date(2026, 1, 1), leistungsperiode="2026-01", faelligkeit=date(2026, 1, 5))
+    kontoblatt = _kontoblatt(nur_faellige_miete)
+
+    pdf_bytes = _erzeugen(
+        forderungszeilen=[], bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0, neue_gebuehr_cent=0,
+        gesamtbetrag_cent=10_000, heute=date(2026, 1, 20), kontoblatt=kontoblatt,
+    )
+    text = PdfReader(io.BytesIO(pdf_bytes)).pages[0].extract_text()
+    assert "Davon jetzt zu zahlen" not in text
+
+
+# -- Gegenlesen von Commit d52948f: Mehrseitenkopf-Reihenfolge -----------
+
+
+def test_mehrseitenkopf_steht_vor_der_umbrechenden_zeile_nicht_danach():
+    """Echter Layoutfehler: die vorherige Fassung zeichnete bei einer
+    umbrechenden Zeile zuerst die Zeile auf der neuen Seite und ERST
+    DANACH den wiederholten Tabellenkopf darunter - exakt umgekehrte
+    Reihenfolge. Viele Positionen erzwingen hier mehrere Seiten; auf
+    JEDER Folgeseite muss "Datum"/"Buchung" vor der ersten Buchungszeile
+    dieser Seite im extrahierten Text erscheinen."""
+
+    positionen = [
+        _op(i, "SOLL", 1_000 + i, belegdatum=date(2026, 1, 1), leistungsperiode=f"2025-{(i % 12) + 1:02d}")
+        for i in range(1, 60)
+    ]
+    letzte_markierung_periode = "2030-12"
+    positionen.append(_op(999, "SOLL", 12_345, belegdatum=date(2026, 1, 2), leistungsperiode=letzte_markierung_periode))
+    kontoblatt = _kontoblatt(*positionen)
+
+    pdf_bytes = _erzeugen(
+        forderungszeilen=[], bereits_offene_mahnkosten_cent=0, neue_zinsen_delta_cent=0, neue_gebuehr_cent=0,
+        gesamtbetrag_cent=kontoblatt.saldo_cent, heute=date(2026, 1, 20), kontoblatt=kontoblatt,
+    )
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    assert len(reader.pages) > 2, "Testaufbau muss tatsächlich mehrere Folgeseiten erzwingen."
+    for seite in reader.pages[1:]:
+        seiten_text = seite.extract_text()
+        if "Mietvorschreibung" not in seiten_text:
+            continue
+        kopf_pos = seiten_text.find("Datum")
+        erste_zeile_pos = seiten_text.find("Mietvorschreibung")
+        assert kopf_pos != -1, "Jede Folgeseite mit Buchungszeilen muss ihren eigenen Tabellenkopf zeigen."
+        assert kopf_pos < erste_zeile_pos, "Tabellenkopf muss VOR der ersten Buchungszeile dieser Seite stehen."

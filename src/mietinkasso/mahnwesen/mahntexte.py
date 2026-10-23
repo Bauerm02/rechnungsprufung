@@ -6,24 +6,28 @@ Netzwerkzugriff, GEMEINSAM von HTML (Backoffice-Vorschau), E-Mail-Text
 Stellen unabhängig voneinander formuliert wird und auseinanderlaufen
 kann.
 
-**Ton je Stufe (wörtliche Nutzervorgabe 20.10.2026, präzisiert durch
-Nutzerkorrektur 20.10.2026: "Auch Stufe1/2 müssen den Ernst der
-Zahlungsaufforderung erkennen lassen ... bloß Vielleicht-übersehen reicht
-allein nicht"):**
+**Ton je Stufe (Nutzervorgabe 20.10.2026, seit Nachtrag 23.10.2026
+bewusst auf GENAU einen kurzen Einleitungssatz je Stufe plus EINEN
+gemeinsamen Pflichtaufforderungssatz gekürzt, siehe `_PFLICHTAUFFORDERUNG`
+- "unnötige Belehrungen" wie Hinweise zu Stundung/Ratenvereinbarung
+entfallen, der ERNST steckt ausschließlich in der stufenweise
+steigenden `einleitung`):**
 
-- Stufe 1 - freundlich, ABER mit konkreter fälliger Forderung und
-  14-Tage-Frist ab Zugang ("Vielleicht haben Sie die Zahlung übersehen"
-  als Einstieg, NICHT als einzige Aussage).
-- Stufe 2 - bietet eine Klärungsmöglichkeit bei Zahlungsschwierigkeiten
-  an, OHNE dabei automatisch einen Zahlungsaufschub zuzusagen (das bleibt
-  eine gesonderte, von einem Menschen zu treffende Entscheidung) - UND
-  ebenfalls mit konkreter Forderung/Frist.
-- Stufe 3 - nachdrückliche Zahlungsaufforderung.
-- Stufe 4 - letzte Zahlungsaufforderung MIT dem gesetzlichen Kern aus der
-  Nutzervorlage (siehe `rechtlicher_kern_stufe4`): §30 Abs 2 Z1 MRG
-  (NUR wo das MRG tatsächlich im Vollanwendungsbereich gilt) bzw. §1118
-  zweiter Fall ABGB, Übergabe an einen Rechtsanwalt nach fruchtloser
-  Frist - AUSDRÜCKLICH KEINE Kündigung/Auflösung selbst, siehe
+- Stufe 1 - "Vielleicht haben Sie die Zahlung übersehen."
+- Stufe 2 - "Der Rückstand ist weiterhin offen. Falls Sie
+  Zahlungsschwierigkeiten haben, sprechen Sie bitte mit uns." (bietet
+  Kontakt an, sagt aber KEINEN Zahlungsaufschub zu - das bleibt
+  implizit eine gesonderte, von einem Menschen zu treffende
+  Entscheidung, ohne das im Kundentext selbst auszuformulieren).
+- Stufe 3 - "Trotz unserer bisherigen Mahnungen ist der Rückstand noch
+  offen. Wir fordern Sie nachdrücklich zur Zahlung auf."
+- Stufe 4 - "Dies ist unsere letzte Zahlungsaufforderung." PLUS der
+  gesetzliche Kern aus der Nutzervorlage (siehe
+  `rechtlicher_kern_stufe4`): kurz, konditional, OHNE Paragraphen im
+  Kundentext (die konkrete §-Herleitung - §30 Abs 2 Z1 MRG bzw. §1118
+  zweiter Fall ABGB - lebt ausschließlich in `hinweis_intern`),
+  Übergabe an einen Rechtsanwalt nach fruchtloser Frist - AUSDRÜCKLICH
+  KEINE Kündigung/Auflösung selbst, siehe
   `_MAHNSCHREIBEN_IST_KEINE_KUENDIGUNG`.
 
 **Grundsatz "Zinsen/Mahnkosten ≠ Mietkapital/Kündigungsvoraussetzung"
@@ -194,6 +198,25 @@ _STUFE4_KUNDENTEXT = (
     f"ausgewiesenen Verzugszinsen oder Mahnkosten. {_MAHNSCHREIBEN_IST_KEINE_KUENDIGUNG}"
 )
 
+#: Nachtrag Markus 23.10.2026 (Gegenlesen von Commit d52948f, wörtliche
+#: Textkorrektur): die bisherigen Stufe1-3-`kerntext`-Bausteine
+#: wiederholten die 14-Tage-Frist JE Stufe in unterschiedlicher, teils
+#: verschachtelter Formulierung und Stufe 2 enthielt eine unnötige
+#: Rechts-/Verfahrensbelehrung ("KEIN Zahlungsaufschub zugesagt", "eine
+#: etwaige Stundung/Ratenvereinbarung bedarf einer gesonderten,
+#: ausdrücklichen Vereinbarung") - genau solche Belehrungen sollen laut
+#: Markus nicht an den Mieter gehen. JETZT: GENAU EIN gemeinsamer,
+#: kurzer Pflichtaufforderungssatz für ALLE vier Stufen (die Frist wird
+#: dadurch auch NICHT mehr zusätzlich im Bankabschnitt wiederholt, siehe
+#: `brief_pdf.py`/`mailversand_service.py` - "Zahlungskonto:" statt
+#: "Bitte überweisen Sie ... binnen 14 Tagen ... auf folgendes Konto").
+#: Der unterschiedliche ERNST je Stufe steckt ausschließlich in
+#: `einleitung` (unten).
+_PFLICHTAUFFORDERUNG = (
+    "Bitte begleichen Sie den unten ausgewiesenen fälligen Rückstand binnen 14 Tagen ab Zugang "
+    "dieses Schreibens."
+)
+
 
 def rechtlicher_kern_stufe4(*, rechtsordnung: str) -> tuple[str, str | None]:
     """Liefert `(rechtlicher_kern_text, hinweis_intern)` für die
@@ -281,13 +304,7 @@ def text_fuer_stufe(*, stufe: int, rechtsordnung: str, zahlungsfrist_bis: date) 
             stufe=1,
             betreff="Zahlungserinnerung",
             einleitung="Vielleicht haben Sie die Zahlung übersehen.",
-            kerntext=(
-                f"Für das unten genannte Mietverhältnis ist die unten aufgeschlüsselte Forderung "
-                f"fällig und noch nicht bei uns eingelangt. Wir ersuchen Sie, den Gesamtbetrag "
-                "binnen 14 Tagen ab Zugang dieses Schreibens vollständig zu begleichen. Sollte die "
-                "Zahlung bereits erfolgt sein, betrachten Sie dieses Schreiben bitte als "
-                "gegenstandslos und senden uns den Zahlungsbeleg."
-            ),
+            kerntext=_PFLICHTAUFFORDERUNG,
         )
     if stufe == MahnStufe.STUFE_2.value:
         return MahnstufeText(
@@ -295,41 +312,25 @@ def text_fuer_stufe(*, stufe: int, rechtsordnung: str, zahlungsfrist_bis: date) 
             # Betreff bewusst UNVERÄNDERT "Zweite Mahnung" (bisherige
             # Formulierung in `brief_pdf.py`/`mailversand_service.py`
             # vor diesem Auftrag) - keine Rückschritte/kein Bruch
-            # bestehender Tests/Vorlagen allein wegen des Betreffs; die
-            # inhaltliche Verschärfung (konkrete Frist, kein bloßes
-            # "vielleicht übersehen") steckt im Fließtext.
+            # bestehender Tests/Vorlagen allein wegen des Betreffs.
             betreff="Zweite Mahnung",
-            einleitung="Die mit unserem vorangegangenen Schreiben angeführte Forderung ist weiterhin offen.",
-            kerntext=(
-                "Wir ersuchen Sie neuerlich, den unten aufgeschlüsselten Gesamtbetrag binnen 14 "
-                "Tagen ab Zugang dieses Schreibens vollständig zu begleichen; eine weitere "
-                "Verzögerung über diese Nachfrist hinaus können wir nicht in Aussicht stellen. "
-                "Falls es Zahlungsschwierigkeiten gibt, melden Sie sich bitte umgehend zur Klärung "
-                "bei uns - damit ist noch KEIN Zahlungsaufschub zugesagt; eine etwaige Stundung/"
-                "Ratenvereinbarung bedarf einer gesonderten, ausdrücklichen Vereinbarung mit uns."
-            ),
+            einleitung="Der Rückstand ist weiterhin offen. Falls Sie Zahlungsschwierigkeiten haben, sprechen Sie bitte mit uns.",
+            kerntext=_PFLICHTAUFFORDERUNG,
         )
     if stufe == MahnStufe.STUFE_3.value:
         return MahnstufeText(
             stufe=3,
             betreff="Nachdrückliche Zahlungsaufforderung",
-            einleitung="Die unten aufgeschlüsselte Forderung ist trotz zweier vorangegangener Schreiben weiterhin unbeglichen.",
-            kerntext=(
-                "Wir fordern Sie hiermit nachdrücklich auf, den Gesamtbetrag binnen 14 Tagen ab "
-                "Zugang dieses Schreibens vollständig zu begleichen. Eine weitere Nichtzahlung wird "
-                "weitere, auch rechtliche Schritte zur Folge haben."
-            ),
+            einleitung="Trotz unserer bisherigen Mahnungen ist der Rückstand noch offen. Wir fordern Sie nachdrücklich zur Zahlung auf.",
+            kerntext=_PFLICHTAUFFORDERUNG,
         )
     if stufe == MahnStufe.STUFE_4.value:
         rechtlicher_kern, hinweis_intern = rechtlicher_kern_stufe4(rechtsordnung=rechtsordnung)
         return MahnstufeText(
             stufe=4,
             betreff="Letzte Zahlungsaufforderung",
-            einleitung="Die unten aufgeschlüsselte Forderung ist trotz mehrerer vorangegangener Schreiben weiterhin unbeglichen.",
-            kerntext=(
-                "Wir fordern Sie hiermit LETZTMALIG auf, den Gesamtbetrag binnen 14 Tagen ab Zugang "
-                "dieses Schreibens vollständig zu begleichen."
-            ),
+            einleitung="Dies ist unsere letzte Zahlungsaufforderung.",
+            kerntext=_PFLICHTAUFFORDERUNG,
             rechtlicher_kern=rechtlicher_kern,
             hinweis_intern=hinweis_intern,
         )
