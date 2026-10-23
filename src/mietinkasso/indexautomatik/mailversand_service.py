@@ -75,13 +75,25 @@ def _vorschau_kontoauszug_kwargs(vorschau) -> dict:
     zweite, abweichende Berechnung, keine konkurrierenden Summen).
     `vorschau is None` (z. B. kein `MahnkostenService` konfiguriert)
     liefert alle Felder leer/0 - der Anhang zeigt dann einfach nur den
-    tatsächlich bereits gebuchten Stand."""
+    tatsächlich bereits gebuchten Stand.
+
+    **Ergänzung Markus 23.10.2026 (Abnahme-Hinweis zu Commit 3c6c175):**
+    `zins_segmente`/`neue_zinsen_delta_je_op_position` sind dieselben
+    bereits vorhandenen strukturierten Vorschau-Felder (siehe `kosten.py::
+    MahnkostenVorschau`) - zusätzlich zu den bisherigen Skalarwerten
+    durchgereicht, damit `erweitere_um_vorschau` dieselbe kumulativ/
+    bereits-gebucht/neu-Aufschlüsselung wie die spätere gebuchte Zeile
+    zeigen kann (keine zweite Berechnung, reine Durchreichung)."""
 
     if vorschau is None:
-        return dict(neue_zinsen_delta_cent=0, zins_von=None, zins_bis=None, zinssatz_prozent=None, gebuehr_cent=None, mahnpauschale_cent=None)
+        return dict(
+            neue_zinsen_delta_cent=0, zins_von=None, zins_bis=None, zinssatz_prozent=None,
+            gebuehr_cent=None, mahnpauschale_cent=None, zins_segmente=(), neue_zinsen_delta_je_op_position={},
+        )
     return dict(
         neue_zinsen_delta_cent=vorschau.neue_zinsen_delta_cent, zins_von=vorschau.zins_von, zins_bis=vorschau.zins_bis,
         zinssatz_prozent=vorschau.zinssatz_prozent, gebuehr_cent=vorschau.gebuehr_cent, mahnpauschale_cent=vorschau.mahnpauschale_cent,
+        zins_segmente=vorschau.zins_segmente, neue_zinsen_delta_je_op_position=dict(vorschau.neue_zinsen_delta_je_op_position),
     )
 
 
@@ -773,6 +785,8 @@ class HVMailversandService:
             gesamtbetrag_cent=kontext.gesamtbetrag_cent, zahlungsziel=kontext.zahlungsziel,
             kontoblatt=kontext.kontoblatt, zins_von=vorschau_kwargs["zins_von"], zins_bis=vorschau_kwargs["zins_bis"],
             zinssatz_prozent=vorschau_kwargs["zinssatz_prozent"], mahnpauschale_cent=vorschau_kwargs["mahnpauschale_cent"],
+            vorschau_zins_segmente=vorschau_kwargs["zins_segmente"],
+            neue_zinsen_delta_je_op_position=vorschau_kwargs["neue_zinsen_delta_je_op_position"],
         )
 
     def _sende_brief(self, *, mahnlauf, mitglieder, heute, vorschau_slot, bestaetigte_mitmieter, empfaenger_zugang_je_mitmieter) -> None:

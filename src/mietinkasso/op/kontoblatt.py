@@ -119,6 +119,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import Decimal
 
 from mietinkasso.domain.enums import OPTyp
 from mietinkasso.infrastructure.db.tables import (
@@ -849,6 +850,74 @@ def _eur_basis_text(cent: int) -> str:
     return f"{cent / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def _satz_text(satz_prozent) -> str:
+    """Menschlich lesbare Prozent-Darstellung (Nachtrag Markus
+    23.10.2026, Gegenlesen der tatsächlichen Mock-Mail zu Commit
+    3c6c175): `satz_prozent` ist ein `Decimal` mit fester DB-
+    Nachkommastellen-Skala (z. B. `Decimal('4.000')`) - unverändert
+    interpoliert ergab das fälschlich "4.000%", was als "viertausend
+    Prozent" missverstanden werden könnte. Reine Darstellungskorrektur
+    (feste Nachkommanotation statt Exponentialschreibweise, unnötige
+    Nachkommanullen entfernt, Dezimalkomma statt Punkt) - der
+    ZAHLENWERT selbst bleibt unverändert, es wird NICHTS neu
+    berechnet."""
+
+    text = f"{Decimal(satz_prozent):f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text.replace(".", ",")
+
+
+def _zinsklausel_aus_segmenten(segmente, delta_cent: int, basis_label: str) -> str | None:
+    """Gemeinsamer Kern für die kurze Zinsklausel - genutzt SOWOHL für
+    eine bereits GEBUCHTE Ledgerzeile (`_verzugszinsen_basis_klauseln`,
+    Segmente als rohe Dicts aus `zins_segmente_json`) ALS AUCH für einen
+    noch NICHT gebuchten Vorschau-Posten (`erweitere_um_vorschau`,
+    Segmente als `kosten.py::ZinsSegment`-Instanzen) - `segment.get(...)`
+    wird dafür für BEIDE Formen unterstützt (ein Dict hat `.get`
+    nativ; bei einer `ZinsSegment`-Instanz wird stattdessen per
+    `getattr` zugegriffen). `von`/`bis` dürfen entweder ISO-Strings
+    (Ledger-JSON) oder bereits echte `date`-Objekte (`ZinsSegment`)
+    sein. KEINE neue Berechnung - reine Aggregation/Subtraktion
+    bereits vorhandener Werte (Summe der Segment-Beträge minus dem
+    bereits bekannten `delta_cent`)."""
+
+    def _feld(segment, name):
+        return segment.get(name) if isinstance(segment, dict) else getattr(segment, name, None)
+
+    basis_teile: list[str] = []
+    kumulativ_cent = 0
+    for segment in segmente:
+        zinsen_cent = _feld(segment, "zinsen_cent")
+        rest_cent = _feld(segment, "rest_cent")
+        satz = _feld(segment, "satz_prozent")
+        if not (isinstance(zinsen_cent, int) and zinsen_cent > 0 and isinstance(rest_cent, int) and satz is not None):
+            continue
+        von_roh, bis_roh = _feld(segment, "von"), _feld(segment, "bis")
+        try:
+            von = von_roh if isinstance(von_roh, date) else date.fromisoformat(von_roh)
+            bis = bis_roh if isinstance(bis_roh, date) else date.fromisoformat(bis_roh)
+        except (TypeError, ValueError):
+            continue
+        kumulativ_cent += zinsen_cent
+        bis_einschliesslich = zins_bis_einschliesslich(bis)
+        basis_teile.append(
+            f"{_satz_text(satz)}% aus {_eur_basis_text(rest_cent)} EUR{basis_label}, "
+            f"{von.strftime('%d.%m.%Y')}–{bis_einschliesslich.strftime('%d.%m.%Y')}"
+        )
+    if not basis_teile:
+        return None
+    basis_text = "; ".join(basis_teile)
+    bereits_gebucht_cent = kumulativ_cent - delta_cent
+    if bereits_gebucht_cent > 0:
+        return (
+            f"Zinsnachtrag: insgesamt {_eur_basis_text(kumulativ_cent)} EUR, davon "
+            f"{_eur_basis_text(bereits_gebucht_cent)} EUR bereits gebucht; neu "
+            f"{_eur_basis_text(delta_cent)} EUR ({basis_text})"
+        )
+    return basis_text
+
+
 def _verzugszinsen_basis_klauseln(
     ledger: "MahnkostenLedgerEintrag", positionen_by_id: dict[int, OPPositionTable],
 ) -> list[str]:
@@ -881,7 +950,27 @@ def _verzugszinsen_basis_klauseln(
     (typisch für eine Mietvorschreibung) - sonst bleibt es bei einer
     neutralen Datumsangabe ("Forderung vom ..."), NIE eine erfundene
     Bezeichnung "Miete" für eine andere Forderungsart (z. B. eine
-    Mahngebühr, die selbst Zinsen trägt)."""
+    Mahngebühr, die selbst Zinsen trägt).
+
+    **Korrektur nach unabhängiger Rückprüfung (Codex, 23.10.2026,
+    konkreter Zinsanzeigefehler):** `zuordnung.segmente` ist das
+    VOLLSTÄNDIGE, KUMULATIVE Segment-Bild (siehe `ZinsZuordnungZeile`-
+    Docstring) - bei einer ZWEITEN (oder späteren) Zinsbuchung für
+    dieselbe Forderung deckt ein Segment bereits den GESAMTEN Zeitraum
+    seit Beginn ab (z. B. "04.–08.09., 0,55 EUR kumulativ"), während
+    `delta_cent` nur den an DIESER Buchung NEU hinzugekommenen Anteil
+    nennt (hier 0,11 EUR, weil 0,44 EUR bereits bei einer früheren
+    Buchung gebucht wurden). Die vorherige Fassung beschrieb die Zeile
+    schlicht als "4% aus 1.000 EUR, 04.–08." mit dem Betrag 0,11 EUR -
+    das behauptet fälschlich, der GESAMTE kumulative Zeitraum/Betrag
+    gehöre zu DIESER (viel kleineren) Buchung. Jetzt: ist die Summe der
+    tatsächlich einbezogenen Segmente (`kumulativ_cent`) GRÖSSER als
+    `delta_cent`, wird die Zeile als "Zinsnachtrag: insgesamt X EUR,
+    davon Y EUR bereits gebucht; neu Z EUR (<Basis/Satz/Zeitraum>)"
+    ausgewiesen - `Y = kumulativ_cent - delta_cent`, `Z = delta_cent`,
+    beides reine Subtraktion bereits vorhandener Werte, KEINE neue
+    Engine. Bei der ERSTEN Buchung ohne Vorbetrag (`kumulativ_cent ==
+    delta_cent`) bleibt die bisherige kurze Basiszeile unverändert."""
 
     klauseln: list[str] = []
     for zuordnung in ledger.zins_zuordnung:
@@ -894,24 +983,9 @@ def _verzugszinsen_basis_klauseln(
             basis_label = f" Forderung vom {basis_position.belegdatum.strftime('%d.%m.%Y')}"
         else:
             basis_label = ""
-        for segment in zuordnung.segmente:
-            if not isinstance(segment, dict):
-                continue
-            zinsen_cent = segment.get("zinsen_cent")
-            rest_cent = segment.get("rest_cent")
-            satz = segment.get("satz_prozent")
-            if not (isinstance(zinsen_cent, int) and zinsen_cent > 0 and isinstance(rest_cent, int) and satz is not None):
-                continue
-            try:
-                von = date.fromisoformat(segment.get("von"))
-                bis = date.fromisoformat(segment.get("bis"))
-            except (TypeError, ValueError):
-                continue
-            bis_einschliesslich = zins_bis_einschliesslich(bis)
-            klauseln.append(
-                f"{satz}% aus {_eur_basis_text(rest_cent)} EUR{basis_label}, "
-                f"{von.strftime('%d.%m.%Y')}–{bis_einschliesslich.strftime('%d.%m.%Y')}"
-            )
+        klausel = _zinsklausel_aus_segmenten(zuordnung.segmente, zuordnung.delta_cent, basis_label)
+        if klausel:
+            klauseln.append(klausel)
     return klauseln
 
 
@@ -971,7 +1045,7 @@ def _einfache_buchung_text(jz: "JournalZeile", p: OPPositionTable, positionen_by
             bis_einschliesslich = zins_bis_einschliesslich(buchung.zins_bis)
             return (
                 f"Verzugszinsen {buchung.zins_von.strftime('%d.%m.%Y')}–{bis_einschliesslich.strftime('%d.%m.%Y')}, "
-                f"{buchung.zinssatz_prozent}%"
+                f"{_satz_text(buchung.zinssatz_prozent)}%"
             )
         return f"Verzugszinsen ({datum_text})"
     if jz.kategorie in (KATEGORIE_MAHNSPESEN, KATEGORIE_MAHNPAUSCHALE):
@@ -1086,6 +1160,7 @@ def erweitere_um_vorschau(
     zeilen: list[EinfacheZeile], *, heute: date,
     neue_zinsen_delta_cent: int = 0, zins_von: date | None = None, zins_bis: date | None = None,
     zinssatz_prozent=None, gebuehr_cent: int | None = None, mahnpauschale_cent: int | None = None,
+    zins_segmente=(), neue_zinsen_delta_je_op_position: dict | None = None,
 ) -> list[EinfacheZeile]:
     """Nachtrag Markus 23.10.2026 (Abnahme-Hinweis zu edb0417-Nachfolgern):
     "Brief-Tabelle und beigefügtes kanonisches Kontoblatt dürfen keine
@@ -1113,18 +1188,43 @@ def erweitere_um_vorschau(
     Nur für einen Versand-Snapshot gedacht (Haupt-Mahnbrief/-Vorschau,
     `_sende_brief`) - der reine, mahnlaufunabhängige Kontoblatt-Download
     (`backoffice/routes/konten.py::kontoauszug_pdf`) ruft diese Funktion
-    NICHT auf und bleibt beim tatsächlich gebuchten Stand."""
+    NICHT auf und bleibt beim tatsächlich gebuchten Stand.
+
+    **Ergänzung Markus 23.10.2026 (Abnahmehinweis zu Commit 3c6c175):**
+    `zins_segmente`/`neue_zinsen_delta_je_op_position` sind dieselben
+    bereits vorhandenen strukturierten `MahnkostenVorschau`-Felder, die
+    `_verzugszinsen_basis_klauseln` für eine bereits GEBUCHTE Zeile
+    nutzt - hier werden sie GENAUSO ausgewertet (derselbe gemeinsame
+    `_zinsklausel_aus_segmenten`-Kern, keine zweite Rechenlogik), damit
+    eine noch nicht gebuchte Vorschau denselben Fall (kumulativ/bereits
+    gebucht/neu, Basis/Satz/Zeitraum) wie die spätere gebuchte Zeile
+    erklärt. Fehlen diese strukturierten Daten (älterer Aufrufer), greift
+    unverändert der bisherige Skalar-Fallback (`zins_von`/`zins_bis`/
+    `zinssatz_prozent`)."""
 
     laufend = zeilen[-1].offen_cent if zeilen else 0
     ergebnis = list(zeilen)
     if neue_zinsen_delta_cent:
         laufend += neue_zinsen_delta_cent
-        if zins_von is not None and zins_bis is not None and zinssatz_prozent is not None:
+        klauseln: list[str] = []
+        if neue_zinsen_delta_je_op_position:
+            segmente_by_op: dict[int, list] = {}
+            for segment in zins_segmente:
+                segmente_by_op.setdefault(segment.op_position_id, []).append(segment)
+            for op_position_id, delta in neue_zinsen_delta_je_op_position.items():
+                if not delta:
+                    continue
+                klausel = _zinsklausel_aus_segmenten(segmente_by_op.get(op_position_id, ()), delta, "")
+                if klausel:
+                    klauseln.append(klausel)
+        if klauseln:
+            text = "Verzugszinsen " + "; ".join(klauseln) + " (mit diesem Schreiben)"
+        elif zins_von is not None and zins_bis is not None and zinssatz_prozent is not None:
             # `zins_bis` ist EXKLUSIV (siehe Docstring/`_einfache_
             # buchung_text`-Korrektur oben) - angezeigt wird der
             # tatsächlich letzte verzinste Tag, NIE das exklusive Enddatum.
             bis_einschliesslich = zins_bis_einschliesslich(zins_bis)
-            text = f"Verzugszinsen {zins_von.strftime('%d.%m.%Y')}–{bis_einschliesslich.strftime('%d.%m.%Y')}, {zinssatz_prozent}% (mit diesem Schreiben)"
+            text = f"Verzugszinsen {zins_von.strftime('%d.%m.%Y')}–{bis_einschliesslich.strftime('%d.%m.%Y')}, {_satz_text(zinssatz_prozent)}% (mit diesem Schreiben)"
         else:
             text = f"Verzugszinsen (mit diesem Schreiben, {heute.strftime('%d.%m.%Y')})"
         ergebnis.append(EinfacheZeile(datum=heute, buchung=text, betrag_cent=neue_zinsen_delta_cent, offen_cent=laufend, ist_vorschau=True))

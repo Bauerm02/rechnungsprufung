@@ -271,6 +271,8 @@ def erzeuge_mahnbrief_pdf(
     zins_bis: date | None = None,
     zinssatz_prozent=None,
     mahnpauschale_cent: int | None = None,
+    vorschau_zins_segmente=(),
+    neue_zinsen_delta_je_op_position: dict | None = None,
 ) -> bytes:
     """`kontoblatt` (Nachtrag Markus 23.10.2026 zum Auftrag HV-20261023-
     MAHNUNG-EINFACH, Abnahmegrenze nach Sichtprüfung der ersten Fassung:
@@ -291,7 +293,17 @@ def erzeuge_mahnbrief_pdf(
     nur zusammen mit `kontoblatt` wirksam (dieselben, dem Briefkörper
     bereits bekannten noch NICHT gebuchten Posten wie beim Kontoauszug-
     Anhang, `neue_zinsen_delta_cent`/`neue_gebuehr_cent` werden dafür
-    wiederverwendet - keine doppelten Parameter)."""
+    wiederverwendet - keine doppelten Parameter).
+
+    `vorschau_zins_segmente`/`neue_zinsen_delta_je_op_position`
+    (Ergänzung Markus 23.10.2026, Abnahme-Hinweis zu Commit 3c6c175):
+    dieselben bereits vorhandenen strukturierten `MahnkostenVorschau`-
+    Felder wie beim Kontoauszug-Anhang, nur für die NEUE `kontoblatt`-
+    Tabelle wirksam (`erweitere_um_vorschau`) - bewusst ANDERS benannt
+    als das bestehende `zins_segmente` oben, das ausschließlich zur
+    alten, bei aktivem `kontoblatt` ohnehin ignorierten Forderungsliste
+    gehört und ein anderer Typ (`Zinssegment`, nicht `kosten.py::
+    ZinsSegment`) ist."""
     empfaenger_zeilen = pruefe_empfaengeradresse(empfaenger_adresse)
     empfaenger_alle_zeilen = [empfaenger_name.strip(), *empfaenger_zeilen] if empfaenger_name.strip() else empfaenger_zeilen
     if len(empfaenger_alle_zeilen) > _MAX_EMPFAENGER_ZEILEN:
@@ -410,6 +422,7 @@ def erzeuge_mahnbrief_pdf(
             erstelle_einfache_tabelle(kontoblatt), heute=heute, neue_zinsen_delta_cent=neue_zinsen_delta_cent,
             zins_von=zins_von, zins_bis=zins_bis, zinssatz_prozent=zinssatz_prozent,
             gebuehr_cent=(neue_gebuehr_cent or None), mahnpauschale_cent=mahnpauschale_cent,
+            zins_segmente=vorschau_zins_segmente, neue_zinsen_delta_je_op_position=neue_zinsen_delta_je_op_position,
         )
         # Korrektur nach unabhängiger Rückprüfung (Codex, 23.10.2026,
         # Gegenlesen von Commit d52948f, echter Fachfehler): die Tabelle

@@ -17,6 +17,9 @@ from mietinkasso.infrastructure.db.tables import (
 )
 import json
 
+from decimal import Decimal
+
+from mietinkasso.mahnwesen.kosten import ZinsSegment
 from mietinkasso.op.kontoblatt import (
     EinfacheZeile,
     KATEGORIE_HAUPTFORDERUNG,
@@ -29,6 +32,7 @@ from mietinkasso.op.kontoblatt import (
     STATUS_OFFEN,
     STATUS_STORNIERT,
     STATUS_TEILBEZAHLT,
+    _satz_text,
     erstelle_einfache_tabelle,
     erstelle_journal,
     erstelle_kontoblatt,
@@ -965,3 +969,111 @@ def test_verzugszinsen_zeile_zeigt_mehrere_unterschiedliche_grundlagen_getrennt(
     assert "1.000,00 EUR Miete September 2026" in zins_zeile.buchung
     assert zins_zeile.buchung.count(";") == 1  # genau zwei getrennte Klauseln
     assert zins_zeile.betrag_cent == 70  # Summe unverändert, keine zweite Berechnung
+
+
+def test_verzugszinsen_zeile_zeigt_zinsnachtrag_bei_kumulativem_segment_ueber_bereits_gebuchtem_delta():
+    """Quellabnahme 3c6c175 (echter Fachfehler): das KUMULATIVE Segment-
+    Bild (hier 0,44 EUR für 04.–07., danach 0,55 EUR für 04.–08.) darf
+    NICHT so dargestellt werden, als gehörte die gesamte Periode zur
+    NEUEN Delta-Buchung (hier nur 0,11 EUR). Erwartet: "Zinsnachtrag:
+    insgesamt 0,55 EUR, davon 0,44 EUR bereits gebucht; neu 0,11 EUR"
+    plus Basis/Satz/Zeitraum - alle Werte aus dem vorhandenen Snapshot,
+    keine neue Berechnung."""
+
+    miete = _op(1, "SOLL", 100_000, belegdatum=date(2026, 9, 1))
+    miete.leistungsperiode = "2026-09"
+    zinsen = _op(2, "SOLL", 11, belegdatum=date(2026, 9, 9))
+    segmente = [{
+        "op_position_id": 1, "von": "2026-09-04", "bis": "2026-09-08",
+        "satz_prozent": "4.000", "rest_cent": 100_000, "zinsen_cent": 55,
+    }]
+    buchung = _buchung(
+        zinsen_op_position_id=2, zins_segmente_json=json.dumps(segmente),
+        zinsen_delta_je_op_json=json.dumps({"1": 11}),
+    )
+    blatt = _leer(
+        saldo_cent=100_011, positionen_aktiv=[miete, zinsen], positionen_alle=[miete, zinsen],
+        mahnkosten_buchungen=[buchung],
+    )
+    zeilen = erstelle_einfache_tabelle(blatt)
+    zins_zeile = next(z for z in zeilen if "Verzugszinsen" in z.buchung)
+    assert zins_zeile.buchung == (
+        "Verzugszinsen Zinsnachtrag: insgesamt 0,55 EUR, davon 0,44 EUR bereits gebucht; neu 0,11 EUR "
+        "(4% aus 1.000,00 EUR Miete September 2026, 04.09.2026–07.09.2026)"
+    )
+    assert zins_zeile.betrag_cent == 11  # tatsächlich gebuchtes Delta, keine zweite Berechnung
+
+
+def test_satz_text_formatiert_decimal_menschlich_lesbar_ohne_unnoetige_nachkommastellen():
+    """Nachtrag Markus 23.10.2026: `Decimal`-Zinssätze mit fester DB-
+    Nachkommaskala (`Decimal('4.000')`) dürfen NICHT unverändert als
+    "4.000%" angezeigt werden (liesse sich als "viertausend Prozent"
+    missverstehen) - Zahlenwert bleibt unverändert, nur die Darstellung
+    wird korrigiert (Dezimalkomma, keine unnötigen Nachkommanullen,
+    keine Exponentialschreibweise für runde Werte)."""
+
+    assert _satz_text(Decimal("4.000")) == "4"
+    assert _satz_text(Decimal("4.300")) == "4,3"
+    assert _satz_text(Decimal("100.00")) == "100"
+    assert _satz_text(4) == "4"
+
+
+def test_verzugszinsen_vorschau_zeile_zeigt_denselben_zinsnachtrag_wie_gebuchte_zeile():
+    """"Gebuchte und neue Vorschau müssen denselben Fall korrekt
+    erklären": derselbe 44/55/11-Cent-Fall wie oben, aber noch NICHT
+    gebucht (`erweitere_um_vorschau` mit den strukturierten Vorschau-
+    Feldern `zins_segmente`/`neue_zinsen_delta_je_op_position`, exakt
+    wie `MahnkostenVorschau` sie bereits liefert) - muss denselben
+    "Zinsnachtrag"-Text wie die gebuchte Ledgerzeile zeigen, keine zweite
+    Berechnung."""
+
+    segmente = (
+        ZinsSegment(
+            op_position_id=1, von=date(2026, 9, 4), bis=date(2026, 9, 8),
+            rest_cent=100_000, satz_prozent=Decimal("4.000"), quelle="VEREINBART_GEPRUEFT", zinsen_cent=55,
+        ),
+    )
+    erweitert = erweitere_um_vorschau(
+        [], heute=date(2026, 9, 9), neue_zinsen_delta_cent=11,
+        zins_segmente=segmente, neue_zinsen_delta_je_op_position={1: 11},
+    )
+    vorschau_zeile = next(z for z in erweitert if z.ist_vorschau)
+    assert vorschau_zeile.buchung == (
+        "Verzugszinsen Zinsnachtrag: insgesamt 0,55 EUR, davon 0,44 EUR bereits gebucht; neu 0,11 EUR "
+        "(4% aus 1.000,00 EUR, 04.09.2026–07.09.2026) (mit diesem Schreiben)"
+    )
+    assert vorschau_zeile.betrag_cent == 11
+
+
+def test_verzugszinsen_vorschau_zeile_ohne_vorbetrag_bleibt_einfache_basiszeile():
+    """"Bei erster Buchung ohne Vorbetrag reicht die kurze Basiszeile":
+    kumulativ == Delta (keine Vorbuchung) -> unverändert die einfache
+    Basiszeile, kein erzwungener "Zinsnachtrag"-Text."""
+
+    segmente = (
+        ZinsSegment(
+            op_position_id=1, von=date(2026, 9, 4), bis=date(2026, 9, 8),
+            rest_cent=100_000, satz_prozent=Decimal("4.000"), quelle="VEREINBART_GEPRUEFT", zinsen_cent=44,
+        ),
+    )
+    erweitert = erweitere_um_vorschau(
+        [], heute=date(2026, 9, 9), neue_zinsen_delta_cent=44,
+        zins_segmente=segmente, neue_zinsen_delta_je_op_position={1: 44},
+    )
+    vorschau_zeile = next(z for z in erweitert if z.ist_vorschau)
+    assert vorschau_zeile.buchung == "Verzugszinsen 4% aus 1.000,00 EUR, 04.09.2026–07.09.2026 (mit diesem Schreiben)"
+    assert "Zinsnachtrag" not in vorschau_zeile.buchung
+
+
+def test_verzugszinsen_vorschau_zeile_ohne_strukturierte_segmente_faellt_auf_skalar_zurueck():
+    """Fehlen die neuen strukturierten Felder (älterer Aufrufer, nur die
+    bisherigen Skalare), bleibt der bisherige Skalar-Fallback wirksam -
+    inklusive der korrigierten, menschlich lesbaren Prozent-Darstellung
+    (`_satz_text`, kein "4.000%" mehr)."""
+
+    erweitert = erweitere_um_vorschau(
+        [], heute=date(2026, 9, 9), neue_zinsen_delta_cent=44,
+        zins_von=date(2026, 9, 4), zins_bis=date(2026, 9, 8), zinssatz_prozent=Decimal("4.000"),
+    )
+    vorschau_zeile = next(z for z in erweitert if z.ist_vorschau)
+    assert vorschau_zeile.buchung == "Verzugszinsen 04.09.2026–07.09.2026, 4% (mit diesem Schreiben)"

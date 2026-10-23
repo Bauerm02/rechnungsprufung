@@ -833,6 +833,8 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
             # garantiert dieselbe Kontenhistorie/denselben Gesamtbetrag.
             kontoblatt=kontoblatt, zins_von=vorschau.zins_von, zins_bis=vorschau.zins_bis,
             zinssatz_prozent=vorschau.zinssatz_prozent, mahnpauschale_cent=vorschau.mahnpauschale_cent,
+            vorschau_zins_segmente=vorschau.zins_segmente,
+            neue_zinsen_delta_je_op_position=vorschau.neue_zinsen_delta_je_op_position,
         )
     except _BriefAdressfehlerError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -857,6 +859,7 @@ def mahnbrief_pdf(vertrag_id: str, stufe: int, heute: str | None = None, session
         empfaenger_ansicht=True, neue_zinsen_delta_cent=vorschau.neue_zinsen_delta_cent,
         zins_von=vorschau.zins_von, zins_bis=vorschau.zins_bis, zinssatz_prozent=vorschau.zinssatz_prozent,
         gebuehr_cent=vorschau.gebuehr_cent, mahnpauschale_cent=vorschau.mahnpauschale_cent,
+        zins_segmente=vorschau.zins_segmente, neue_zinsen_delta_je_op_position=vorschau.neue_zinsen_delta_je_op_position,
         # Nachtrag Markus 23.10.2026 (Gegenlesen von d52948f): derselbe
         # geprüfte, jetzt fällige Betrag wie der Briefkörper oben.
         faelliger_betrag_cent=gesamtbetrag_cent,

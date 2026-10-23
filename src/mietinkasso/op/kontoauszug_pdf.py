@@ -278,6 +278,7 @@ def erzeuge_kontoauszug_pdf(
     neue_zinsen_delta_cent: int = 0, zins_von: date | None = None, zins_bis: date | None = None,
     zinssatz_prozent=None, gebuehr_cent: int | None = None, mahnpauschale_cent: int | None = None,
     faelliger_betrag_cent: int | None = None,
+    zins_segmente=(), neue_zinsen_delta_je_op_position: dict | None = None,
 ) -> bytes:
     """`empfaenger_ansicht` (Auftrag HV-20261023-MAHNUNG-EINFACH,
     verbindlicher Darstellungsauftrag): `False` (Standard) ist die
@@ -312,7 +313,14 @@ def erzeuge_kontoauszug_pdf(
     pdf`'s `gesamtbetrag_cent`) - weicht er vom vollen Saldo ab, zeigt
     die Tabelle zusätzlich "Davon jetzt zu zahlen: X EUR" (siehe
     `einfache_tabelle_pdf.zeichne_einfache_tabelle`). `None` (Standard,
-    wie beim reinen Kontoblatt-Download) zeigt diese Zeile nie."""
+    wie beim reinen Kontoblatt-Download) zeigt diese Zeile nie.
+
+    `zins_segmente`/`neue_zinsen_delta_je_op_position` (Ergänzung Markus
+    23.10.2026, Abnahme-Hinweis zu Commit 3c6c175): dieselben bereits
+    vorhandenen strukturierten `MahnkostenVorschau`-Felder wie beim
+    Briefkörper - durchgereicht an `erweitere_um_vorschau`, damit dieser
+    Anhang denselben kumulativ/bereits-gebucht/neu-Fall erklärt wie der
+    Mahnbrief und die spätere gebuchte Zeile (keine zweite Berechnung)."""
 
     anthrazit = _hex_to_rgb(absender.farbe_anthrazit)
     gold = _hex_to_rgb(absender.farbe_gold)
@@ -361,6 +369,7 @@ def erzeuge_kontoauszug_pdf(
             erstelle_einfache_tabelle(kontoblatt), heute=heute, neue_zinsen_delta_cent=neue_zinsen_delta_cent,
             zins_von=zins_von, zins_bis=zins_bis, zinssatz_prozent=zinssatz_prozent,
             gebuehr_cent=gebuehr_cent, mahnpauschale_cent=mahnpauschale_cent,
+            zins_segmente=zins_segmente, neue_zinsen_delta_je_op_position=neue_zinsen_delta_je_op_position,
         )
         zeichne_einfache_tabelle(
             pdf, einfache_zeilen, familie="Konto", anthrazit=anthrazit, gold=gold,

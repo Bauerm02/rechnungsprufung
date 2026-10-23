@@ -88,6 +88,7 @@ def journal_als_text(
     neue_zinsen_delta_cent: int = 0, zins_von: date | None = None, zins_bis: date | None = None,
     zinssatz_prozent=None, gebuehr_cent: int | None = None, mahnpauschale_cent: int | None = None,
     faelliger_betrag_cent: int | None = None,
+    zins_segmente=(), neue_zinsen_delta_je_op_position: dict | None = None,
 ) -> str:
     """Kurze, menschlich verständliche Kontoauszug-Tabelle für den
     Kanal EMAIL (Auftrag HV-20261023-MAHNUNG-EINFACH, kein PDF-Anhang
@@ -122,13 +123,21 @@ def journal_als_text(
     Teilbetrag, identisch zum Brief) wird - weicht er vom vollen
     Schlusssaldo ab - als zusätzliche, klar benannte Zeile "Davon jetzt
     zu zahlen" angehängt; stimmen beide überein, entfällt die
-    Zusatzzeile. `None` (Standard) zeigt sie nie."""
+    Zusatzzeile. `None` (Standard) zeigt sie nie.
+
+    `zins_segmente`/`neue_zinsen_delta_je_op_position` (Ergänzung Markus
+    23.10.2026, Abnahme-Hinweis zu Commit 3c6c175): dieselben bereits
+    vorhandenen strukturierten `MahnkostenVorschau`-Felder wie Brief/
+    Mailtext - durchgereicht an `erweitere_um_vorschau`, damit dieser
+    Anhang denselben kumulativ/bereits-gebucht/neu-Fall erklärt wie Brief
+    und Mailtext (keine zweite Berechnung)."""
 
     zeilen_daten = erstelle_einfache_tabelle(kontoblatt)
     zeilen_daten = erweitere_um_vorschau(
         zeilen_daten, heute=heute, neue_zinsen_delta_cent=neue_zinsen_delta_cent,
         zins_von=zins_von, zins_bis=zins_bis, zinssatz_prozent=zinssatz_prozent,
         gebuehr_cent=gebuehr_cent, mahnpauschale_cent=mahnpauschale_cent,
+        zins_segmente=zins_segmente, neue_zinsen_delta_je_op_position=neue_zinsen_delta_je_op_position,
     )
     if not zeilen_daten:
         return "Keine Buchungen vorhanden."

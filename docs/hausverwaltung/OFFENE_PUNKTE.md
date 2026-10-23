@@ -8100,3 +8100,87 @@ Nachtrag; seither nur die oben genannten, gezielt nachgeprüften Dateien
 geändert, keine erneute komplette Suite allein für diese Abnahme
 wiederholt (Nutzervorgabe). Ausschließlich synthetische Testdaten, keine
 Produktivaktionen, `SEND_ENABLED=false` unverändert.
+
+## HV-20261023-MAHNUNG-EINFACH: zweiter Folgecommit (Zinsnachtrag-Darstellung + Prozent-Formatierung, Quellabnahme auf Commit 3c6c175)
+
+Unabhängige Quellabnahme von Commit `3c6c175` (Markus, 23.10.2026)
+bestätigte die kurzen Stufentexte und die P1/P2-Korrekturen, fand aber
+zwei weitere, eng begrenzte Anzeigefehler in genau derselben kurzen
+Zinszeile:
+
+1. **Zinsnachtrag kumulativ/bereits gebucht/neu:**
+   `_verzugszinsen_basis_klauseln` zeigte das KUMULATIVE Segment-Bild
+   (`ledger.zins_zuordnung[].segmente`) unverändert als Erklärung einer
+   bloß an diesem Tag NEU gebuchten DELTA-Buchung
+   (`...[].delta_cent`) - Beispiel: erste Zinsbuchung 0,44 EUR für
+   04.–07., zweite kumulative Buchung 0,55 EUR für 04.–08. mit nur 0,11
+   EUR tatsächlich neu. Die Zeile behauptete fälschlich "4% aus 1.000
+   EUR für 04.–08." mit 0,11 EUR. Behoben über einen neuen gemeinsamen
+   Kern `_zinsklausel_aus_segmenten` (reine Aggregation/Subtraktion
+   bereits vorhandener Werte, keine neue Berechnung): ist
+   `bereits_gebucht_cent = kumulativ_cent - delta_cent` > 0, lautet die
+   Zeile jetzt "Zinsnachtrag: insgesamt 0,55 EUR, davon 0,44 EUR bereits
+   gebucht; neu 0,11 EUR (4% aus 1.000,00 EUR ..., 04.–07.09.2026)";
+   bei einer ersten Buchung ohne Vorbetrag (kumulativ == delta) bleibt
+   unverändert die bisherige einfache Basiszeile. Derselbe Kern wird
+   jetzt AUCH für den noch nicht gebuchten Vorschau-Fall verwendet
+   (`erweitere_um_vorschau`, neue Parameter `zins_segmente`/
+   `neue_zinsen_delta_je_op_position` - dieselben bereits vorhandenen
+   strukturierten `MahnkostenVorschau`-Felder wie beim gebuchten Fall),
+   durchgereicht über `_vorschau_kontoauszug_kwargs`
+   (`mailversand_service.py`) an Mahnbrief-PDF, Kontoauszug-PDF
+   (Empfänger-Ansicht) UND den E-Mail-Text (`journal_als_text`) - alle
+   drei zeigen jetzt denselben Fall identisch. Fehlen die strukturierten
+   Felder (älterer Aufrufer), greift unverändert der bisherige
+   Skalar-Fallback. Bei `vorschau_mergen=False` (Mitmieter-Nachsendung
+   mit rekonstruiertem, ggf. bereits gebuchtem Snapshot) werden die
+   neuen Felder konsequent NICHT mitgegeben - dieselbe bestehende
+   Asymmetrie wie beim bisherigen Skalar-Delta, keine Doppelzählung.
+2. **Prozent-Darstellung:** `Decimal`-Zinssätze mit fester DB-
+   Nachkommaskala (z. B. `Decimal('4.000')`) erschienen unverändert als
+   "4.000%" - ließe sich als "viertausend Prozent" missverstehen. Neuer
+   Helfer `_satz_text` (`kontoblatt.py`) formatiert fest-kommastellig
+   (keine Exponentialschreibweise für runde Werte wie 100), entfernt
+   unnötige Nachkommanullen und verwendet das deutsche Dezimalkomma
+   (`Decimal('4.000')` -> "4", `Decimal('4.300')` -> "4,3",
+   `Decimal('100.00')` -> "100") - der Zahlenwert selbst bleibt
+   unverändert. Angewendet überall in der kurzen Zinszeile (gebuchter
+   Fall, Vorschau-Fall, Skalar-Fallback).
+
+Keine Betrags-/DB-/Versandänderung - reine Darstellungskorrektur in
+genau dieser einen kurzen Zinszeile, auf allen drei Ausgabewegen
+(Brief, Kontoauszug-Anhang, E-Mail-Text) identisch.
+
+### Geänderte Dateien
+
+`src/mietinkasso/op/kontoblatt.py` (`_satz_text`, `_zinsklausel_aus_
+segmenten`, `_verzugszinsen_basis_klauseln`/`_einfache_buchung_text`
+auf den neuen gemeinsamen Kern umgestellt, `erweitere_um_vorschau` um
+`zins_segmente`/`neue_zinsen_delta_je_op_position` erweitert),
+`src/mietinkasso/indexautomatik/mailversand_service.py`
+(`_vorschau_kontoauszug_kwargs` reicht die zwei neuen Felder durch),
+`src/mietinkasso/mahnwesen/brief_pdf.py` (neue Parameter
+`vorschau_zins_segmente`/`neue_zinsen_delta_je_op_position` - bewusst
+anders benannt als das bestehende, unverändert eigenständige
+`zins_segmente`-Parameter der alten Forderungsliste), `src/mietinkasso/
+op/kontoauszug_pdf.py` und `src/mietinkasso/mahnwesen/
+kontoauszug_anhang.py` (beide um `zins_segmente`/`neue_zinsen_delta_
+je_op_position` erweitert), `src/mietinkasso/backoffice/routes/
+mahnwesen.py` (Vorschau-Route verdrahtet beide neuen Felder an Brief
+UND Kontoauszug-PDF).
+
+### Tests
+
+Gezielte neue Tests in `tests/mietinkasso/test_kontoblatt.py`
+(Zinsnachtrag-Fall gebucht, `_satz_text`-Formatierung, Zinsnachtrag-Fall
+Vorschau identisch zum gebuchten Fall, erste Buchung ohne Vorbetrag
+bleibt einfache Basiszeile, Skalar-Fallback ohne strukturierte Felder)
+und `tests/mietinkasso/test_kontoauszug_anhang.py` (derselbe
+Zinsnachtrag-Fall über die tatsächliche E-Mail-Textquelle
+`journal_als_text`, menschlich lesbares "4%" statt "4.000%"). Bestehende
+Suiten `test_kontoblatt.py`, `test_brief_pdf.py`,
+`test_kontoauszug_pdf.py`, `test_kontoauszug_anhang.py`,
+`test_hv_mailversand.py`, `test_hv_mailversand_vier_stufen.py`,
+`test_backoffice.py` grün (keine Regression durch die neuen, optionalen
+Parameter). Ausschließlich synthetische Testdaten, keine
+Produktivaktionen, `SEND_ENABLED=false` unverändert.

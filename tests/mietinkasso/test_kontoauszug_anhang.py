@@ -8,8 +8,11 @@ from datetime import date
 
 import pytest
 
+from decimal import Decimal
+
 from mietinkasso.infrastructure.db.tables import OPPositionTable
 from mietinkasso.mahnwesen.kontoauszug_anhang import haenge_kontoauszug_pdf_an, journal_als_text
+from mietinkasso.mahnwesen.kosten import ZinsSegment
 from mietinkasso.op.kontoblatt import erstelle_kontoblatt
 
 
@@ -113,3 +116,30 @@ def test_journal_als_text_ohne_abweichung_zeigt_keine_zusatzzeile():
     text = journal_als_text(kontoblatt, heute=date(2026, 1, 20), faelliger_betrag_cent=10_000)
 
     assert "Davon jetzt zu zahlen" not in text
+
+
+def test_journal_als_text_zins_vorschau_zeigt_zinsnachtrag_menschlich_lesbar():
+    """"Gebuchte und neue Vorschau müssen denselben Fall korrekt
+    erklären": GENAU der 44/55/11-Cent-Fall aus `test_kontoblatt.py`,
+    hier über die tatsächliche E-Mail-Textquelle (`journal_als_text`) -
+    derselbe "Zinsnachtrag"-Text, menschlich lesbarer Satz ("4%", NIE
+    "4.000%"), keine OP-IDs."""
+
+    konto = _op(1, "SOLL", 100_000, belegdatum=date(2026, 9, 1))
+    kontoblatt = _kontoblatt(konto)
+    segmente = (
+        ZinsSegment(
+            op_position_id=1, von=date(2026, 9, 4), bis=date(2026, 9, 8),
+            rest_cent=100_000, satz_prozent=Decimal("4.000"), quelle="VEREINBART_GEPRUEFT", zinsen_cent=55,
+        ),
+    )
+
+    text = journal_als_text(
+        kontoblatt, heute=date(2026, 9, 9), neue_zinsen_delta_cent=11,
+        zins_segmente=segmente, neue_zinsen_delta_je_op_position={1: 11},
+    )
+
+    assert "Zinsnachtrag: insgesamt 0,55 EUR, davon 0,44 EUR bereits gebucht; neu 0,11 EUR" in text
+    assert "4%" in text
+    assert "4.000%" not in text
+    assert "#1" not in text
