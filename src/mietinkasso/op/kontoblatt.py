@@ -848,53 +848,95 @@ def _monat_jahr_text(leistungsperiode: str) -> str:
 
 
 # Nachtrag Markus 23.10.2026 (Abnahme-Hinweis zu Commit fdda658, danach
-# KORRIGIERT nach Quellabnahme 329b1fc): bisher nannte `_einfache_
-# buchung_text` JEDE nicht als Kosten klassifizierte SOLL-Zeile pauschal
-# "Mietvorschreibung", unabhängig von ihrer tatsächlichen fachlichen
-# Komponente - eine Heizkostenabrechnung 2025 erschien dadurch
-# irreführend als "Mietvorschreibung September 2026".
+# ZWEIMAL KORRIGIERT nach Quellabnahme 329b1fc/0c5343c): bisher nannte
+# `_einfache_buchung_text` JEDE nicht als Kosten klassifizierte
+# SOLL-Zeile pauschal "Mietvorschreibung", unabhängig von ihrer
+# tatsächlichen fachlichen Komponente - eine Heizkostenabrechnung 2025
+# erschien dadurch irreführend als "Mietvorschreibung September 2026".
 #
-# **Korrektur nach Quellabnahme 329b1fc (echter Fachfehler):** die
-# ERSTE Fassung suchte die Whitelist-Begriffe per `.search()` im
-# GESAMTEN `beleg_referenz`-Freitext - das ist KEINE Schemafeld-
-# Whitelist, sondern eine freie Stichwortsuche, die z. B. eine völlig
-# unabhängige Referenz "Sonderforderung Familie Wasser; HASH..."
-# fälschlich als "Wasser" klassifizierte. Jetzt wird AUSSCHLIESSLICH
-# der bekannte, strukturell erkannte HV-VS-Altimport
-# ("HV VS <Monat>/<Jahr>; <Bezeichnung>; <Referenz>", siehe
-# `_HV_VS_MUSTER`) in seine drei Felder zerlegt, und die Komponenten-
-# Whitelist wird NUR innerhalb des dafür bestimmten Bezeichnungsfelds
-# gesucht - NIE im Referenzfeld (IDs/Hashes wie "J.12345") und NIE in
-# einer beliebigen, nicht als HV-VS erkannten Zeichenkette. Ebenso wird
-# ein Abrechnungsjahr nur akzeptiert, wenn der GESAMTE (vom Korrektur-
-# Präfix befreite) Text als eigenständiges "Abrechnungsfeld"
-# (`_ABRECHNUNGSFELD_MUSTER`, vollständiger String, kein Teiltreffer)
-# endet - nie aus einer beliebigen Fundstelle mitten in einem längeren,
-# unbekannten Text. "BK Garage" wird VOR der generischen
-# "Betriebskosten"/"BK"-Erkennung geprüft (inkl. Bindestrich-Schreibung
-# "BK-Garage"), da deren Muster sonst bereits innerhalb von "BK Garage"
-# selbst anschlägt; "Stellplatz" erkennt zusätzlich die bekannte
-# Synonymschreibung "Abstellplatz".
-_KOMPONENTEN_MUSTER: tuple[tuple[str, re.Pattern], ...] = (
-    ("BK Garage", re.compile(r"(?i)(?:BK|Betriebskosten)[\s-]*Garage|Garage[\s-]*(?:BK|Betriebskosten)")),
-    ("Betriebskosten", re.compile(r"(?i)Betriebskosten|\bBK\b")),
-    ("Heizkosten", re.compile(r"(?i)Heizkosten|\bHK\b")),
-    ("Wasser", re.compile(r"(?i)Wasser")),
-    ("Küche", re.compile(r"(?i)K(?:ü|ue)che")),
-    ("Stellplatz", re.compile(r"(?i)Stellplatz|Abstellplatz|Parkplatz")),
-    ("Hauptmiete", re.compile(r"(?i)Hauptmietzins|Hauptmiete|\bHMZ\b")),
-)
+# **Korrektur nach Quellabnahme 0c5343c (echter struktureller
+# Fachfehler, zweite Runde):** die Vorfassung erlaubte innerhalb des
+# erkannten HV-VS-Referenzfelds beliebigen Resttext (`referenz: str`
+# ungeprüft) - dadurch wurde z. B. "J.123; Abrechnung2025" komplett als
+# EIN Referenzfeld verschluckt und das Abrechnungsjahr ignoriert. Und
+# das eigenständige Abrechnungsfeld erlaubte eine beliebige `.*?`-
+# Vorsilbe - dadurch akzeptierte es weiterhin JEDE fremde Zeichenkette,
+# solange sie zufällig mit "Abrechnung<Jahr>" endete (z. B. die völlig
+# unabhängige Familie-Wasser-Referenz). Jetzt eine einfache, EXAKTE
+# Grammatik OHNE neue `.*`-Vorsilben:
+#
+# (A) Nach Entfernen eines bekannten Korrektur-Präfix wird der Text an
+#     ";" in getrimmte Felder zerlegt. Das HV-VS-Schema ist NUR bei
+#     GENAU 3 oder 4 Feldern zulässig: Feld 0 muss vollständig "HV VS
+#     <Monat>/<Jahr>" sein (Monat 1-12), Feld 1 ist das Fachbezeichnungs-
+#     feld, Feld 2 muss vollständig "J." plus Ziffern sein, ein
+#     optionales Feld 3 muss vollständig "Abrechnung <vierstelliges
+#     Jahr>" sein. NUR Feld 1 liefert die Komponente (per exaktem
+#     Whitelist-Vergleich, NIE Wortsuche), NUR Feld 3 liefert das
+#     Abrechnungsjahr. Erfüllt irgendein Pflichtfeld sein eigenes Muster
+#     NICHT, ist die GESAMTE Zeichenkette unbekannt (`None`).
+# (B) Enthält der Text KEIN Semikolon, ist NUR ein vollständiger
+#     Literal-Treffer auf eine der bekannten Formen "<Komponente>
+#     abrechnung <Jahr>" bzw. "Abrechnung <Jahr>" zulässig
+#     (`_EINZELFELD_ABRECHNUNG_MUSTER`, `fullmatch`) - kein beliebiger
+#     Vorsilbentext, keine Wortsuche.
+# (C) Das Fachbezeichnungsfeld (Feld 1) wird dafür zuerst um einen
+#     bekannten Mwst-/Prozent-Zusatz gekürzt (`_MWST_SUFFIX_MUSTER`,
+#     z. B. "10 % Mwst"/"20%") und danach EXAKT (nicht als Teilstring)
+#     gegen die bekannte Bezeichnungs-Whitelist verglichen
+#     (`_BEZEICHNUNG_WHITELIST`) - keine Suche nach einzelnen Wörtern
+#     oder Namen irgendwo im Feld.
+_MWST_SUFFIX_MUSTER = re.compile(r"(?i)\s*\d{1,3}(?:[.,]\d+)?\s*%\s*(?:Mwst|USt)?\.?\s*$")
+#: Bekannte, EXAKTE Bezeichnungsfeld-Werte (nach Entfernen des Mwst-/
+#: Prozent-Zusatzes) -> Kurzbezeichnung für den Kundentext. Schlüssel
+#: liegen normalisiert vor (klein geschrieben, Mehrfach-Leerzeichen auf
+#: eines reduziert) - der Vergleich selbst ist IMMER ein exakter
+#: Dict-Lookup, NIE ein Teiltreffer/eine Wortsuche.
+_BEZEICHNUNG_WHITELIST: dict[str, str] = {
+    "hauptmietzins": "Hauptmiete", "hauptmiete": "Hauptmiete", "hmz": "Hauptmiete",
+    "betriebskosten": "Betriebskosten", "bk": "Betriebskosten",
+    "bk-einnahmen": "Betriebskosten", "bk einnahmen": "Betriebskosten",
+    "bk garage": "BK Garage", "bk-garage": "BK Garage",
+    "betriebskosten garage": "BK Garage", "betriebskosten-garage": "BK Garage",
+    "heizkosten": "Heizkosten", "hk": "Heizkosten",
+    "hk-einnahmen": "Heizkosten", "hk einnahmen": "Heizkosten",
+    "wasser": "Wasser", "wasser-einnahmen": "Wasser", "wasser einnahmen": "Wasser",
+    "küche": "Küche", "kueche": "Küche",
+    "küchen-einnahmen": "Küche", "kuechen-einnahmen": "Küche",
+    "küchen einnahmen": "Küche", "kuechen einnahmen": "Küche",
+    "stellplatz": "Stellplatz", "abstellplatz": "Stellplatz", "parkplatz": "Stellplatz",
+}
 _KORREKTUR_PRAEFIX_MUSTER = re.compile(r"^Korrektur zu #\d+:\s*")
-#: Bekanntes Altimport-Schema, EXAKT drei durch ";" getrennte Felder:
-#: Periodenmarker ("HV VS 9/2026"), fachliches Bezeichnungsfeld
-#: ("Hauptmietzins 10 % Mwst"/"BK-Garage 20%"/"Abstellplatz 20%", ...)
-#: und ein reines Referenzfeld ("J.12345") - NUR das Bezeichnungsfeld
-#: wird auf die Komponenten-Whitelist geprüft, das Referenzfeld NIE.
-_HV_VS_MUSTER = re.compile(r"(?i)^HV\s*VS\s+\d{1,2}/\d{4}\s*;\s*(?P<bezeichnung>[^;]+?)\s*;\s*(?P<referenz>.+)$")
-#: Eigenständiges Abrechnungsfeld - der GESAMTE (vom Korrektur-Präfix
-#: befreite) Text muss mit "<optionale Vorsilbe>abrechnung <Jahr>"
-#: enden (`fullmatch`, kein Teiltreffer mitten in längerem Text).
-_ABRECHNUNGSFELD_MUSTER = re.compile(r"(?i)^(?P<praefix>.*?)abrechnung\s*(?P<jahr>\d{4})$")
+#: Feld 0 des HV-VS-Schemas: "HV VS <Monat 1-12>/<Jahr>" - vollständig,
+#: kein Teiltreffer.
+_HV_VS_FELD0_MUSTER = re.compile(r"(?i)^HV\s*VS\s+(?:0?[1-9]|1[0-2])/\d{4}$")
+#: Feld 2 des HV-VS-Schemas: reines Referenzfeld "J." plus Ziffern.
+_HV_VS_FELD2_MUSTER = re.compile(r"(?i)^J\.\d+$")
+#: Optionales Feld 3 des HV-VS-Schemas: vollständig "Abrechnung
+#: <vierstelliges Jahr>".
+_HV_VS_FELD3_MUSTER = re.compile(r"(?i)^Abrechnung\s*(\d{4})$")
+#: Einzelfeldformat (B) - KEIN Semikolon im Text, vollständiger Treffer
+#: auf eine der bekannten Literalformen; die Komponenten-Vorsilbe ist
+#: eine feste Alternative aus genau den sechs bekannten Grundbegriffen,
+#: KEIN beliebiger `.*`-Platzhalter.
+_EINZELFELD_ABRECHNUNG_MUSTER = re.compile(
+    r"(?i)^(?P<komponente>Hauptmiete|Betriebskosten|Heizkosten|Wasser|K(?:ü|ue)che|Stellplatz)?"
+    r"Abrechnung\s*(?P<jahr>\d{4})$"
+)
+
+
+def _komponente_aus_bezeichnungsfeld(feld: str) -> str | None:
+    """Exakter (NICHT durchsuchender) Whitelist-Vergleich des
+    Fachbezeichnungsfelds - entfernt zuerst einen bekannten Mwst-/
+    Prozent-Zusatz, normalisiert dann Groß-/Kleinschreibung und
+    Mehrfach-Leerzeichen, und vergleicht das Ergebnis EXAKT gegen
+    `_BEZEICHNUNG_WHITELIST`. Liefert `None` bei jedem Nicht-Treffer -
+    es wird NIE nach einem einzelnen bekannten Wort irgendwo im Feld
+    gesucht (z. B. ein zufällig enthaltener Familienname)."""
+
+    ohne_suffix = _MWST_SUFFIX_MUSTER.sub("", feld).strip()
+    schluessel = " ".join(ohne_suffix.split()).lower()
+    return _BEZEICHNUNG_WHITELIST.get(schluessel)
 
 
 def _hauptforderung_komponente_text(p: OPPositionTable) -> str | None:
@@ -904,25 +946,22 @@ def _hauptforderung_komponente_text(p: OPPositionTable) -> str | None:
     `None` (der Aufrufer fällt dann unverändert auf "Mietvorschreibung
     ..." zurück, NIE eine erfundene Komponente ohne Grundlage).
 
-    (1) Der bekannte HV-VS-Altimport (`_HV_VS_MUSTER`): die
-        Komponenten-Whitelist wird AUSSCHLIESSLICH innerhalb des dafür
-        bestimmten Bezeichnungsfelds gesucht, nie im Referenzfeld.
-    (2) Ein eigenständiges Abrechnungsfeld (`_ABRECHNUNGSFELD_MUSTER`,
-        GESAMTER Text, kein Teiltreffer): ein explizites "Abrechnung
-        <Jahr>" (z. B. "Heizkostenabrechnung 2025") ersetzt den sonst
-        aus `leistungsperiode`/Buchungsmonat gebildeten Zeitbezug durch
-        das genannte Abrechnungsjahr; eine erkennbare Komponente in der
-        Vorsilbe wird übernommen, ein generisches Abrechnungsergebnis
-        OHNE erkennbare Komponente wird NICHT ohne Grundlage als
-        Betriebskosten umgedeutet, sondern bleibt neutral "Abrechnung
-        <Jahr>".
+    (A) Der bekannte HV-VS-Altimport: nach ";" in GENAU 3 oder 4
+        getrimmte Felder zerlegt, jedes Pflichtfeld muss sein eigenes
+        strenges Muster VOLLSTÄNDIG erfüllen (siehe Moduldoc oben) -
+        andernfalls `None` für die GESAMTE Zeichenkette. NUR Feld 1
+        liefert die Komponente, NUR ein vorhandenes Feld 3 liefert das
+        Abrechnungsjahr.
+    (B) Enthält der Text KEIN Semikolon: nur ein vollständiger
+        Literal-Treffer auf "<Komponente>abrechnung <Jahr>" bzw.
+        "Abrechnung <Jahr>" (`_EINZELFELD_ABRECHNUNG_MUSTER`).
 
     Ein bekannter, bereits vorhandener "Korrektur zu #<id>: ..."-Präfix
     (`op/service.py::storniere_und_korrigiere`) wird davor sicher
     entfernt - er selbst wird NIE ausgegeben. Jede andere, nicht als
     eines dieser beiden Schemata erkannte Zeichenkette (z. B. eine
     völlig unabhängige Referenz) bleibt BEWUSST neutral - keine freie
-    Stichwortsuche über beliebigen Freitext."""
+    Stichwortsuche/kein beliebiger Vorsilbentext über Freitext."""
 
     text = p.beleg_referenz or ""
     while True:
@@ -930,27 +969,40 @@ def _hauptforderung_komponente_text(p: OPPositionTable) -> str | None:
         if ohne_praefix == text:
             break
         text = ohne_praefix
+    text = text.strip()
     if not text:
         return None
 
-    hv_vs_treffer = _HV_VS_MUSTER.match(text)
-    if hv_vs_treffer is not None:
-        bezeichnung = hv_vs_treffer.group("bezeichnung")
-        komponente = next((name for name, muster in _KOMPONENTEN_MUSTER if muster.search(bezeichnung)), None)
+    if ";" in text:
+        felder = [f.strip() for f in text.split(";")]
+        if len(felder) not in (3, 4):
+            return None
+        if not _HV_VS_FELD0_MUSTER.fullmatch(felder[0]):
+            return None
+        if not _HV_VS_FELD2_MUSTER.fullmatch(felder[2]):
+            return None
+        komponente = _komponente_aus_bezeichnungsfeld(felder[1])
+        if len(felder) == 4:
+            feld3_treffer = _HV_VS_FELD3_MUSTER.fullmatch(felder[3])
+            if feld3_treffer is None:
+                return None
+            jahr = feld3_treffer.group(1)
+            return f"{komponente}abrechnung {jahr}" if komponente else f"Abrechnung {jahr}"
+        # Genau 3 Felder, kein Abrechnungsjahr - ohne erkannte Komponente
+        # ist die Zeichenkette als Ganzes unbekannt.
         if komponente is None:
             return None
         return f"{komponente} {_monat_jahr_text(p.leistungsperiode)}" if p.leistungsperiode else komponente
 
-    abrechnung_treffer = _ABRECHNUNGSFELD_MUSTER.fullmatch(text)
-    if abrechnung_treffer is not None:
-        jahr = abrechnung_treffer.group("jahr")
-        praefix = abrechnung_treffer.group("praefix").strip()
-        komponente = next((name for name, muster in _KOMPONENTEN_MUSTER if muster.search(praefix)), None) if praefix else None
-        if komponente:
-            return f"{komponente}abrechnung {jahr}"
+    einzelfeld_treffer = _EINZELFELD_ABRECHNUNG_MUSTER.fullmatch(text)
+    if einzelfeld_treffer is None:
+        return None
+    jahr = einzelfeld_treffer.group("jahr")
+    komponente_roh = einzelfeld_treffer.group("komponente")
+    if not komponente_roh:
         return f"Abrechnung {jahr}"
-
-    return None
+    komponente = _komponente_aus_bezeichnungsfeld(komponente_roh)
+    return f"{komponente}abrechnung {jahr}"
 
 
 def _eur_basis_text(cent: int) -> str:

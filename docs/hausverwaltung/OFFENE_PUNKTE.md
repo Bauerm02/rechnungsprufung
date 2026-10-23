@@ -8312,3 +8312,76 @@ Regressionslauf (`test_kontoblatt`, `test_brief_pdf`,
 Suite `tests/mietinkasso` zusätzlich angestoßen. Ausschließlich
 synthetische Testdaten, keine Produktivaktionen, `SEND_ENABLED=false`
 unverändert.
+
+## HV-20261023-MAHNUNG-EINFACH: fünfter Folgecommit (einfache, exakte Grammatik statt `.*`-Vorsilben, Quellabnahme auf Commit 0c5343c)
+
+Quellabnahme von Commit `0c5343c` (Markus, 23.10.2026) fand zwei weitere
+echte strukturelle Fehler in `_hauptforderung_komponente_text`:
+
+1. **HV-VS-Referenzfeld verschluckte ein Abrechnungsjahr:** `_HV_VS_
+   MUSTER` fasste alles nach dem Bezeichnungsfeld ungeprüft als EIN
+   Referenzfeld auf (`referenz: str`) - ein echter 4-Felder-Datensatz
+   "HV VS 9/2026; Heizkosten 20%; J.12345; Abrechnung2025" wurde dadurch
+   als "J.12345; Abrechnung2025" (EIN Feld) gelesen und das
+   Abrechnungsjahr ignoriert (Ergebnis fälschlich "Heizkosten September
+   2026" statt "Heizkostenabrechnung 2025").
+2. **`_ABRECHNUNGSFELD_MUSTER` mit `.*?`-Vorsilbe akzeptierte weiterhin
+   jede fremde Zeichenkette:** solange ein Text zufällig mit
+   "Abrechnung<Jahr>" endete, wurde er akzeptiert - die unabhängige
+   Referenz "Sonderforderung Familie Wasser; HASH...; Abrechnung2025"
+   wurde dadurch weiterhin fälschlich als "Wasserabrechnung 2025"
+   gelesen.
+
+Behoben über eine einfache, EXAKTE Grammatik ohne neue `.*`-Vorsilben:
+
+- Nach Entfernen eines bekannten Korrektur-Präfix wird der Text an ";"
+  in getrimmte Felder zerlegt. Das HV-VS-Schema ist NUR bei GENAU 3 oder
+  4 Feldern zulässig: Feld 0 muss VOLLSTÄNDIG "HV VS <Monat 1-12>/<Jahr>"
+  sein, Feld 1 ist das Fachbezeichnungsfeld, Feld 2 muss VOLLSTÄNDIG
+  "J." plus Ziffern sein, ein optionales Feld 3 muss VOLLSTÄNDIG
+  "Abrechnung <vierstelliges Jahr>" sein. Erfüllt ein Pflichtfeld sein
+  eigenes Muster nicht, ist die GESAMTE Zeichenkette unbekannt (`None`)
+  - NUR Feld 1 liefert die Komponente, NUR ein vorhandenes Feld 3
+  liefert das Abrechnungsjahr.
+- Enthält der Text KEIN Semikolon, ist NUR ein vollständiger
+  Literal-Treffer auf "<Komponente>abrechnung <Jahr>" bzw. "Abrechnung
+  <Jahr>" zulässig (`_EINZELFELD_ABRECHNUNG_MUSTER`, feste
+  Sechser-Alternative als Komponenten-Vorsilbe, kein `.*`-Platzhalter).
+- Das Fachbezeichnungsfeld (Feld 1 bzw. die Einzelfeld-Vorsilbe) wird
+  zuerst um einen bekannten Mwst-/Prozent-Zusatz gekürzt
+  (`_MWST_SUFFIX_MUSTER`) und danach EXAKT (per Dict-Lookup, NICHT als
+  Teilstring/Wortsuche) gegen die bekannte Bezeichnungs-Whitelist
+  (`_BEZEICHNUNG_WHITELIST`, u. a. "BK-Garage", "BK-Einnahmen",
+  "HK-Einnahmen", "Küchen-Einnahmen", "Abstellplatz") verglichen.
+
+Keine Änderung an Beträgen, Perioden, Datensätzen oder der Rechenengine.
+
+### Geänderte Dateien
+
+`src/mietinkasso/op/kontoblatt.py` (`_HV_VS_MUSTER`/
+`_ABRECHNUNGSFELD_MUSTER` entfernt, ersetzt durch
+`_HV_VS_FELD0_MUSTER`/`_HV_VS_FELD2_MUSTER`/`_HV_VS_FELD3_MUSTER`/
+`_EINZELFELD_ABRECHNUNG_MUSTER`/`_MWST_SUFFIX_MUSTER`/
+`_BEZEICHNUNG_WHITELIST`/`_komponente_aus_bezeichnungsfeld`,
+`_hauptforderung_komponente_text` komplett auf die feldbasierte
+Grammatik umgestellt).
+
+### Tests
+
+`tests/mietinkasso/test_kontoblatt.py`: neue Regressionstests für genau
+die beiden gefundenen Fehler (4-Felder-Datensatz mit Referenz UND
+Abrechnungsjahr, 3-Felder-Fremdreferenz mit angehängtem Abrechnungsfeld
+bleibt unbekannt), plus 4-Felder mit unbekannter Komponente (neutral
+"Abrechnung <Jahr>"), 4-Felder mit ungültigem viertem Feld (gesamt
+unbekannt), Einzelfeld-Literal-Treffer (mit/ohne Leerzeichen vor der
+Jahreszahl) und Ablehnung eines beliebigen Vorsilbentextes im
+Einzelfeldformat. Bestehende Whitelist-Tests auf exakte
+Bezeichnungsfeld-Werte angepasst ("Wasser-Nachverrechnung" war unter
+der neuen exakten Grammatik nie ein gültiger Whitelist-Wert). Breiter
+Regressionslauf (`test_kontoblatt`, `test_brief_pdf`,
+`test_kontoauszug_pdf`, `test_kontoauszug_anhang`,
+`test_hv_mailversand`, `test_hv_mailversand_vier_stufen`,
+`test_backoffice`, `test_vertragsanlage*` - 460 Tests) grün, volle
+Suite `tests/mietinkasso` zusätzlich angestoßen. Ausschließlich
+synthetische Testdaten, keine Produktivaktionen, `SEND_ENABLED=false`
+unverändert.

@@ -1113,8 +1113,10 @@ def test_hauptforderung_komponente_erkennt_bekannte_whitelist_komponenten_im_hv_
         "HV VS 9/2026; BK-Garage 20%; J.12345": "BK Garage",
         "HV VS 9/2026; Betriebskosten Garage 20%; J.1": "BK Garage",
         "HV VS 9/2026; Heizkosten 20%; J.1": "Heizkosten",
-        "HV VS 9/2026; Wasser-Nachverrechnung 20%; J.1": "Wasser",
+        "HV VS 9/2026; HK-Einnahmen 20%; J.1": "Heizkosten",
+        "HV VS 9/2026; Wasser 20%; J.1": "Wasser",
         "HV VS 9/2026; Küche 20%; J.1": "Küche",
+        "HV VS 9/2026; Küchen-Einnahmen 20%; J.1": "Küche",
         "HV VS 9/2026; Stellplatz 20%; J.1": "Stellplatz",
         "HV VS 9/2026; Parkplatz 20%; J.1": "Stellplatz",
         "HV VS 9/2026; Abstellplatz 20%; J.12346": "Stellplatz",
@@ -1130,12 +1132,88 @@ def test_hauptforderung_komponente_ignoriert_unbekannte_referenz_trotz_zufaellig
     GESAMTEN Freitext ist KEINE Schemafeld-Whitelist - eine völlig
     unabhängige, nicht als HV-VS-Altimport erkannte Referenz darf NICHT
     fälschlich klassifiziert werden, nur weil irgendwo im Text ein
-    Whitelist-Wort ("Wasser") vorkommt. Da der Text auch NICHT mit
-    "<...>abrechnung <Jahr>" endet, darf er AUCH NICHT fälschlich als
-    Abrechnungsfeld (z. B. "Wasserabrechnung 2025") gelesen werden."""
+    Whitelist-Wort ("Wasser") vorkommt."""
 
     p = _op(1, "SOLL", 1_000, beleg_referenz="Sonderforderung Familie Wasser; HASH1234abcd")
     p.leistungsperiode = "2026-09"
+    assert _hauptforderung_komponente_text(p) is None
+
+
+def test_hauptforderung_komponente_ignoriert_unbekannte_drei_felder_referenz_trotz_abrechnungsfeld():
+    """Echter Fachfehler aus Quellabnahme 0c5343c: der vormalige
+    `_ABRECHNUNGSFELD_MUSTER` mit `.*?`-Vorsilbe akzeptierte JEDEN Text,
+    solange er zufällig mit "Abrechnung<Jahr>" endete - die völlig
+    unabhängige Referenz "Sonderforderung Familie Wasser; HASH...;
+    Abrechnung2025" wurde dadurch weiterhin fälschlich als
+    "Wasserabrechnung 2025" gelesen. Feld 0 dieser 3-Felder-Zeichenkette
+    erfüllt das strenge HV-VS-Muster "HV VS <Monat>/<Jahr>" NICHT - die
+    GESAMTE Zeichenkette bleibt deshalb unbekannt (`None`), unabhängig
+    vom dritten Feld."""
+
+    p = _op(1, "SOLL", 1_000, beleg_referenz="Sonderforderung Familie Wasser; HASH1234abcd; Abrechnung2025")
+    p.leistungsperiode = "2026-09"
+    assert _hauptforderung_komponente_text(p) is None
+
+
+def test_hauptforderung_komponente_vier_felder_mit_referenz_und_abrechnungsjahr():
+    """Echter Fachfehler aus Quellabnahme 0c5343c: der vormalige
+    `_HV_VS_MUSTER` fasste den gesamten Rest nach dem Bezeichnungsfeld
+    ungeprüft als EIN Referenzfeld auf (`referenz: str`) - bei einem
+    ECHTEN 4-Felder-Datensatz ("HV VS 9/2026; Heizkosten 20%; J.12345;
+    Abrechnung2025") wurde "J.12345; Abrechnung2025" komplett als
+    Referenz verschluckt und das Abrechnungsjahr IGNORIERT (Ergebnis
+    fälschlich "Heizkosten September 2026" statt "Heizkostenabrechnung
+    2025"). Jetzt werden Feld 2 (reine Referenz "J.12345") und Feld 3
+    (eigenständiges Abrechnungsfeld) getrennt geprüft."""
+
+    p = _op(1, "SOLL", 50_000, beleg_referenz="HV VS 9/2026; Heizkosten 20%; J.12345; Abrechnung2025")
+    p.leistungsperiode = "2026-09"  # Buchungsmonat - bewusst ABWEICHEND vom Abrechnungsjahr
+    assert _hauptforderung_komponente_text(p) == "Heizkostenabrechnung 2025"
+
+
+def test_hauptforderung_komponente_vier_felder_mit_unbekannter_komponente_bleibt_neutraler_abrechnungstext():
+    """Dieselbe 4-Felder-Struktur, aber ein NICHT in der Whitelist
+    erfasstes Bezeichnungsfeld - das Abrechnungsjahr aus Feld 3 bleibt
+    trotzdem wirksam ("generisches Abrechnungsergebnis nicht ohne
+    Grundlage als BK umdeuten"), die unbekannte Komponente wird NICHT
+    erfunden."""
+
+    p = _op(1, "SOLL", 50_000, beleg_referenz="HV VS 9/2026; Sonstiges; J.12345; Abrechnung2025")
+    assert _hauptforderung_komponente_text(p) == "Abrechnung 2025"
+
+
+def test_hauptforderung_komponente_vier_felder_mit_ungueltigem_abrechnungsfeld_bleibt_unbekannt():
+    """Ein viertes Feld, das NICHT dem strengen "Abrechnung <Jahr>"-Muster
+    entspricht, macht die GESAMTE Zeichenkette unbekannt - es wird NICHT
+    stillschweigend auf die 3-Felder-Logik zurückgefallen."""
+
+    p = _op(1, "SOLL", 50_000, beleg_referenz="HV VS 9/2026; Heizkosten 20%; J.12345; Sonstiger Zusatz")
+    assert _hauptforderung_komponente_text(p) is None
+
+
+def test_hauptforderung_komponente_einzelfeld_literal_match_ohne_semikolon():
+    """Einzelfeldformat (B, nach Quellabnahme 0c5343c): KEIN Semikolon
+    im Text - nur ein VOLLSTÄNDIGER Literal-Treffer auf eine der
+    bekannten Formen ist zulässig, kein beliebiger Vorsilbentext."""
+
+    faelle = {
+        "Heizkostenabrechnung2025": "Heizkostenabrechnung 2025",
+        "Heizkostenabrechnung 2025": "Heizkostenabrechnung 2025",
+        "Betriebskostenabrechnung2025": "Betriebskostenabrechnung 2025",
+        "Wasserabrechnung2025": "Wasserabrechnung 2025",
+        "Abrechnung2025": "Abrechnung 2025",
+    }
+    for beleg_referenz, erwartetes_ergebnis in faelle.items():
+        p = _op(1, "SOLL", 1_000, beleg_referenz=beleg_referenz)
+        assert _hauptforderung_komponente_text(p) == erwartetes_ergebnis, beleg_referenz
+
+
+def test_hauptforderung_komponente_einzelfeld_lehnt_beliebigen_vorsilbentext_ab():
+    """Eine beliebige, nicht in der festen Sechser-Alternative enthaltene
+    Vorsilbe darf NICHT als Komponente durchgehen, auch wenn der Rest
+    des Textes formal wie ein Abrechnungsfeld aussieht."""
+
+    p = _op(1, "SOLL", 1_000, beleg_referenz="SonderforderungAbrechnung2025")
     assert _hauptforderung_komponente_text(p) is None
 
 
