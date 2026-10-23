@@ -900,6 +900,7 @@ _BEZEICHNUNG_WHITELIST: dict[str, str] = {
     "betriebskosten garage": "BK Garage", "betriebskosten-garage": "BK Garage",
     "heizkosten": "Heizkosten", "hk": "Heizkosten",
     "hk-einnahmen": "Heizkosten", "hk einnahmen": "Heizkosten",
+    "heizkostenabrechnung": "Heizkosten",
     "wasser": "Wasser", "wasser-einnahmen": "Wasser", "wasser einnahmen": "Wasser",
     "küche": "Küche", "kueche": "Küche",
     "küchen-einnahmen": "Küche", "kuechen-einnahmen": "Küche",

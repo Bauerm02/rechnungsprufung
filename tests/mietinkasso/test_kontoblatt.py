@@ -1171,6 +1171,27 @@ def test_hauptforderung_komponente_vier_felder_mit_referenz_und_abrechnungsjahr(
     assert _hauptforderung_komponente_text(p) == "Heizkostenabrechnung 2025"
 
 
+def test_hauptforderung_komponente_vier_felder_mit_bezeichnungsfeld_heizkostenabrechnung():
+    """Quellabnahme cc3a28d: GENAU der wörtliche 4-Felder-Originalschema-
+    fall "HV VS 9/2026; Heizkostenabrechnung 20 %; J.900008; Abrechnung
+    2025" - das Bezeichnungsfeld selbst lautet hier "Heizkostenabrechnung"
+    (nicht bloß "Heizkosten"), was nach Entfernen des Mwst-/Prozent-
+    Suffixes zum Schlüssel "heizkostenabrechnung" normalisiert. Fehlte
+    dieser Alias in `_BEZEICHNUNG_WHITELIST`, blieb die Komponente
+    unerkannt und das Ergebnis fiel auf das neutrale "Abrechnung 2025"
+    zurück, statt korrekt "Heizkostenabrechnung 2025" zu zeigen. Ein
+    bekannter Korrektur-Präfix davor ändert daran nichts."""
+
+    p = _op(1, "SOLL", 50_000, beleg_referenz="HV VS 9/2026; Heizkostenabrechnung 20 %; J.900008; Abrechnung 2025")
+    assert _hauptforderung_komponente_text(p) == "Heizkostenabrechnung 2025"
+
+    p_mit_korrektur = _op(
+        2, "SOLL", 50_000,
+        beleg_referenz="Korrektur zu #7: HV VS 9/2026; Heizkostenabrechnung 20 %; J.900008; Abrechnung 2025",
+    )
+    assert _hauptforderung_komponente_text(p_mit_korrektur) == "Heizkostenabrechnung 2025"
+
+
 def test_hauptforderung_komponente_vier_felder_mit_unbekannter_komponente_bleibt_neutraler_abrechnungstext():
     """Dieselbe 4-Felder-Struktur, aber ein NICHT in der Whitelist
     erfasstes Bezeichnungsfeld - das Abrechnungsjahr aus Feld 3 bleibt
