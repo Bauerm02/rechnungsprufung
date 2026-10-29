@@ -21,6 +21,7 @@ import hashlib
 import json
 import re
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 
@@ -239,6 +240,28 @@ def _hash(fields: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def inhalt_hash(bank_konto_id: str, roh: RohTransaktion) -> str:
+    """Inhaltshash, der als `BankTransaktionTable.quelle_hash` gespeichert
+    wird - Grundlage des import_id-Konfliktvergleichs in
+    `BankRepository._insert_transaktion` (gleiche native ID, anderer
+    Inhalt -> `ImportConflictError`). Öffentlich, damit eine Vorschau
+    (`bank/ebics_ingest.py`) exakt denselben Vergleich vorab treffen kann."""
+
+    return _hash(
+        {
+            "bank_konto_id": bank_konto_id,
+            "betrag_cent": roh.betrag_cent,
+            "waehrung": roh.waehrung,
+            "buchungsdatum": str(roh.buchungsdatum),
+            "valuta": str(roh.valuta) if roh.valuta else None,
+            "referenz": roh.referenz,
+            "gegenkonto_iban": roh.gegenkonto_iban,
+            "gegenkonto_name": roh.gegenkonto_name,
+            "native_id": roh.native_id,
+        }
+    )
+
+
 def _fingerprint(bank_konto_id: str, roh: RohTransaktion) -> str:
     """Formatierungsunabhängiger, konto-gescopter Fingerabdruck der
     wirtschaftlich relevanten Felder - für Zeilen OHNE bankseitig
@@ -372,24 +395,8 @@ class BankImportService:
         siehe `infrastructure/db/sqlite_write_lock.py`)."""
 
         with schreibgesperrte_session(self._session_factory) as session:
-            ergebnisse: list[BankTransaktionTable] = []
             try:
-                for index, roh in enumerate(rohdaten):
-                    try:
-                        ergebnisse.append(self._speichere_roh(bank_konto, roh, quelle_typ, session=session))
-                    except Exception as exc:
-                        # Ursprünglichen Fehlertyp NICHT verschlucken (Aufrufer
-                        # unterscheiden z. B. MehrfachbuchungsKonfliktError von
-                        # CamtUnvollstaendigError) - nur mit Zeilenkontext
-                        # anreichern und weiterreichen. Die Transaktion wird
-                        # trotzdem vollständig zurückgerollt (siehe unten):
-                        # NICHTS aus diesem Aufruf bleibt hängen.
-                        exc.args = (
-                            f"Import von Bankkonto {bank_konto.id} ({quelle_typ}) abgebrochen bei Zeile "
-                            f"{index + 1} von {len(rohdaten)}: {exc}. Die gesamte Datei wurde NICHT gebucht "
-                            "(atomarer Import); nach Korrektur kann der volle Lauf gefahrlos wiederholt werden.",
-                        )
-                        raise
+                ergebnisse = self._speichere_alle(rohdaten, bank_konto, quelle_typ, session=session)
                 session.commit()
             except Exception:
                 session.rollback()
@@ -398,26 +405,120 @@ class BankImportService:
                 session.refresh(row)
             return ergebnisse
 
+    def importiere_ausgewaehlt_atomar(
+        self,
+        *,
+        ctx: AuthContext,
+        bank_konto_id: str,
+        quelle_typ: str,
+        auswahl: Callable[[Session, BankKontoTable], list[tuple[RohTransaktion, str | None]]],
+    ) -> list[BankTransaktionTable]:
+        """Kompatible Erweiterung für vorgeprüfte Importe (Auftrag
+        HV-20261029-EBICS-INTEGRATION, siehe `bank/ebics_ingest.py`):
+        dieselbe Schreibsperre (`schreibgesperrte_session`), dieselbe
+        Speicherung (`_speichere_roh`) und dieselbe Atomarität wie
+        `_importiere_atomar` - zusätzlich wird `auswahl` INNERHALB der
+        bereits gesperrten Transaktion aufgerufen. Damit kann der Aufrufer
+        seinen Plan unter der Sperre neu berechnen/vergleichen und genau die
+        zu schreibenden Rohzeilen samt optionalem `positions_schluessel`
+        (siehe `_speichere_roh`) zurückgeben; ein Fehler in `auswahl`
+        (z. B. abweichender Planhash) rollt alles zurück, bevor irgendetwas
+        geschrieben wurde. Bankkonto und Berechtigung werden ebenfalls in
+        dieser Session frisch gelesen/geprüft. Bucht keine OP-Positionen und
+        legt keine Zuordnungen an."""
+
+        with schreibgesperrte_session(self._session_factory) as session:
+            try:
+                bank_konto = session.get(BankKontoTable, bank_konto_id)
+                if bank_konto is None:
+                    raise ValueError(f"Unbekanntes Bankkonto {bank_konto_id}.")
+                require_gesellschaft_access(ctx, bank_konto.gesellschaft_id)
+                require_schreibrecht(ctx)
+                auswahl_zeilen = auswahl(session, bank_konto)
+                ergebnisse = self._speichere_alle(
+                    [roh for roh, _schluessel in auswahl_zeilen], bank_konto, quelle_typ, session=session,
+                    positions_schluessel=[schluessel for _roh, schluessel in auswahl_zeilen],
+                )
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            for row in ergebnisse:
+                session.refresh(row)
+            return ergebnisse
+
+    def _speichere_alle(
+        self,
+        rohdaten: list[RohTransaktion],
+        bank_konto: BankKontoTable,
+        quelle_typ: str,
+        *,
+        session: Session,
+        positions_schluessel: list[str | None] | None = None,
+    ) -> list[BankTransaktionTable]:
+        schluessel_liste = positions_schluessel if positions_schluessel is not None else [None] * len(rohdaten)
+        if len(schluessel_liste) != len(rohdaten):
+            raise ValueError("positions_schluessel muss genau eine Angabe je Rohzeile enthalten.")
+        ergebnisse: list[BankTransaktionTable] = []
+        for index, (roh, schluessel) in enumerate(zip(rohdaten, schluessel_liste)):
+            try:
+                if schluessel is None:
+                    ergebnisse.append(self._speichere_roh(bank_konto, roh, quelle_typ, session=session))
+                else:
+                    ergebnisse.append(
+                        self._speichere_roh(
+                            bank_konto, roh, quelle_typ, session=session, positions_schluessel=schluessel
+                        )
+                    )
+            except Exception as exc:
+                # Ursprünglichen Fehlertyp NICHT verschlucken (Aufrufer
+                # unterscheiden z. B. MehrfachbuchungsKonfliktError von
+                # CamtUnvollstaendigError) - nur mit Zeilenkontext
+                # anreichern und weiterreichen. Die Transaktion wird
+                # trotzdem vollständig zurückgerollt (Aufrufer): NICHTS
+                # aus diesem Aufruf bleibt hängen.
+                exc.args = (
+                    f"Import von Bankkonto {bank_konto.id} ({quelle_typ}) abgebrochen bei Zeile "
+                    f"{index + 1} von {len(rohdaten)}: {exc}. Die gesamte Datei wurde NICHT gebucht "
+                    "(atomarer Import); nach Korrektur kann der volle Lauf gefahrlos wiederholt werden.",
+                )
+                raise
+        return ergebnisse
+
     def _speichere_roh(
-        self, bank_konto: BankKontoTable, roh: RohTransaktion, quelle_typ: str, *, session: Session | None = None
+        self,
+        bank_konto: BankKontoTable,
+        roh: RohTransaktion,
+        quelle_typ: str,
+        *,
+        session: Session | None = None,
+        positions_schluessel: str | None = None,
     ) -> BankTransaktionTable:
-        content_hash = _hash(
-            {
-                "bank_konto_id": bank_konto.id,
-                "betrag_cent": roh.betrag_cent,
-                "waehrung": roh.waehrung,
-                "buchungsdatum": str(roh.buchungsdatum),
-                "valuta": str(roh.valuta) if roh.valuta else None,
-                "referenz": roh.referenz,
-                "gegenkonto_iban": roh.gegenkonto_iban,
-                "gegenkonto_name": roh.gegenkonto_name,
-                "native_id": roh.native_id,
-            }
-        )
+        """`positions_schluessel` (nur `importiere_ausgewaehlt_atomar`, Auftrag
+        HV-20261029-EBICS-INTEGRATION): eine aus originaler Statement-ID und
+        Ntry-/TxDtls-Position gebildete, belegte Identität für eine Zeile
+        OHNE native ID. Dann wird die import_id stabil daraus gebildet
+        (`...:NOID:<schluessel>`, UNIQUE-geschützt, Replay -> bestehende
+        Zeile bzw. `ImportConflictError` bei anderem Inhalt) statt per
+        UUID; die Fingerprint-Sperre entfällt, weil der Aufrufer die
+        Dublettenprüfung bereits unter derselben Schreibsperre getroffen
+        hat und zwei positionsverschiedene, identisch aussehende Zahlungen
+        getrennt erhalten bleiben müssen. `fingerprint_hash` und
+        `hat_native_id=False` bleiben unverändert gesetzt, damit ein
+        späterer CSV-/Datei-Upload derselben Zeile weiterhin auf die
+        bisherige Fingerprint-Sperre trifft."""
+
+        content_hash = inhalt_hash(bank_konto.id, roh)
         if roh.native_id:
+            if positions_schluessel is not None:
+                raise ValueError("positions_schluessel nur für Zeilen ohne native ID zulässig.")
             hat_native_id = True
             fingerprint_hash = None
             import_id = f"{bank_konto.id}:{quelle_typ}:{roh.native_id}"
+        elif positions_schluessel is not None:
+            hat_native_id = False
+            fingerprint_hash = _fingerprint(bank_konto.id, roh)
+            import_id = f"{bank_konto.id}:{quelle_typ}:NOID:{positions_schluessel}"
         else:
             hat_native_id = False
             fingerprint_hash = _fingerprint(bank_konto.id, roh)

@@ -8385,3 +8385,54 @@ Regressionslauf (`test_kontoblatt`, `test_brief_pdf`,
 Suite `tests/mietinkasso` zusätzlich angestoßen. Ausschließlich
 synthetische Testdaten, keine Produktivaktionen, `SEND_ENABLED=false`
 unverändert.
+
+## HV-20261029-EBICS-INTEGRATION: generischer EBICS-CAMT.053-Importadapter
+
+Kontrollierte Übernahme vorab (vorgelagerter lokaler Transport) abgeholter,
+je IBAN getrennter CAMT.053-Dateien in den bestehenden Bankimport, über
+Plan/Apply mit Planhash unter der SQLite-Schreibsperre. Schnittstelle und
+Regeln: `docs/hausverwaltung/EBICS_INGEST.md`. Keine OP-Buchung, keine
+Zuordnung, kein Scheduler, keine Bankverbindung, kein Schemawechsel.
+
+Offen / bewusst nicht umgesetzt:
+
+- Salden-/Abdeckungskontrolle (`Bal`, Lücken zwischen Auszügen) fehlt -
+  separate Transportdaten, nicht erfunden.
+- Kein Backoffice-Klärungsweg für UNKLAR-Zeilen; kein Audit-Eintrag je
+  Apply (Nachweis über Plan-/Ergebnis-JSON).
+- Strenger Referenzvergleich: Altexporte mit anders formatiertem
+  Verwendungszweck landen als UNKLAR; ggf. nach realer Abnahme
+  quellspezifische Normalisierung ergänzen (nur mit Freigabe).
+- Sammelbuchungs-Teilsummenprüfung begrenzt auf Datumsfenster und 18
+  Kandidaten (darüber konservativ alles UNKLAR).
+- Nicht gegen echte Bankdateien gehärtet; reale Abnahme durch Codex.
+
+### Geänderte Dateien
+
+`src/mietinkasso/bank/ebics_ingest.py` (neu), `scripts/ebics_ingest.py`
+(neu), `src/mietinkasso/bank/service.py` (kompatibel:
+`importiere_ausgewaehlt_atomar`, `_speichere_alle`, öffentliches
+`inhalt_hash`; Verhalten von `_importiere_atomar` unverändert),
+`tests/mietinkasso/test_ebics_ingest.py` (neu),
+`docs/hausverwaltung/EBICS_INGEST.md` (neu).
+
+### Tests
+
+Siehe Abschlussbericht des Auftrags (synthetische Daten).
+
+### Rückprüfung 2 (zusammengesetzte Originalidentität, Regelversion EBICS-INGEST-2)
+
+Befunde der unabhängigen Erstabnahme (`tests/mietinkasso/test_independent_ebics_review.py`)
+behoben: mehrfach vergebene AcctSvcrRef in verschiedenen Ntry wird über
+originale Statement-Id + Ntry-/TxDtls-Position eindeutig statt als Konflikt
+gesperrt; eine bestätigt andere CAMT-AcctSvcrRef wird nie per
+wirtschaftlichem Exact-Match als VORHANDEN abgetan; Zeilen ohne
+AcctSvcrRef erhalten bei eindeutiger Statement-Id einen stabilen
+Positionsschlüssel (Wiederholung -> VORHANDEN, identische Zahlungen
+getrennt erhalten, geänderter Beleg -> KONFLIKT). Ohne eindeutige
+Statement-Id bleibt es bei UNKLAR bzw. dem bisherigen Fingerprint-Weg.
+Kein Schema-/UI-Wechsel. Service: `_speichere_roh(positions_schluessel=...)`
+(nur über `importiere_ausgewaehlt_atomar`). Neue Grenzen siehe
+`EBICS_INGEST.md` (späte Wiederverwendung einer einmaligen Referenz,
+instabile Statement-Ids, manueller Upload qualifizierter Dateien).
+Tests: von Codex im Linux-Testimage auszuführen (lokal kein Python freigegeben).
