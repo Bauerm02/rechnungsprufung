@@ -127,9 +127,36 @@ def _uebersicht_details_html(z: dict) -> str:
        <a href="/backoffice/vertrag/{h(vertrag.id)}/mietvertragsprofil/bearbeiten">Profil bearbeiten</a></p>"""
 
 
+#: Anzeigeoptionen des Bestandfilters; die Filterung selbst passiert in der Route.
+_BESTAND_FILTER_LABEL = (("aktiv", "Aktiver Bestand"), ("beendet", "Beendet / ausgeschieden"), ("alle", "Alle (inkl. Historie)"))
+_BESTAND_STATUS_LABEL = {
+    "AKTIV": "laufend", "KUENFTIG": "künftig", "BEENDET": "Vertrag beendet", "VERWALTUNG_BEENDET": "Verwaltung beendet",
+}
+
+
+def _verwaltungsende_html(einheit) -> str:
+    verwaltet_bis = getattr(einheit, "verwaltet_bis", None)
+    if verwaltet_bis is None:
+        return ""
+    grund = getattr(einheit, "verwaltungsende_grund", None)
+    zusatz = f" ({h(grund)})" if grund else ""
+    return f'<br><span class="muted">Verwaltung bis {verwaltet_bis.isoformat()}{zusatz}</span>'
+
+
+def _bestand_status_html(z: dict) -> str:
+    """Status aus der Route; ältere Aufrufer ohne Status behalten die Bestandsart."""
+
+    from mietinkasso.backoffice.views import nutzungsstatus_label
+
+    status = z.get("bestand_status")
+    if status is None:
+        return h(nutzungsstatus_label(z["einheit"].nutzungsstatus))
+    return f"{h(_BESTAND_STATUS_LABEL.get(status, status))}{_verwaltungsende_html(z['einheit'])}"
+
+
 def vertraege_liste_formular(
     zeilen: list[dict], csrf: str, *, leerstand_zeilen: list[dict] | None = None,
-    objekte: list | None = None, filter_objekt_id: str = "", filter_q: str = "",
+    objekte: list | None = None, filter_objekt_id: str = "", filter_q: str = "", filter_bestand: str = "aktiv",
 ) -> str:
     """`zeilen`: Liste von {vertrag, objekt, einheit, debitor, profil?}.
     `profil` ist optional (nicht jeder Aufrufer lädt es mit) - fehlt es,
@@ -152,17 +179,19 @@ def vertraege_liste_formular(
     objekt_filter_optionen = option("", "— alle Objekte —", selected=not filter_objekt_id) + "".join(
         option(o.id, o.bezeichnung, selected=o.id == filter_objekt_id) for o in (objekte or [])
     )
+    bestand_optionen = "".join(option(wert, label, selected=wert == filter_bestand) for wert, label in _BESTAND_FILTER_LABEL)
     filter_formular = f"""
     <form method="get" action="/backoffice/vertraege" style="max-width:640px;">
       <label>Objekt</label><select name="objekt_id">{objekt_filter_optionen}</select>
       <label>Mieter (Namensteil)</label><input name="q" value="{h(filter_q)}" placeholder="z. B. Musterfrau">
+      <label>Bestand</label><select name="bestand">{bestand_optionen}</select>
       <button type="submit" class="secondary">Filtern</button>
-      {f'<a href="/backoffice/vertraege">Filter zurücksetzen</a>' if (filter_objekt_id or filter_q) else ''}
+      {f'<a href="/backoffice/vertraege">Filter zurücksetzen</a>' if (filter_objekt_id or filter_q or filter_bestand != "aktiv") else ''}
     </form>"""
     tabellenzeilen = "".join(
         f"<tr><td>{h(z['debitor'].name)}<br><span class='muted'>{h(z['objekt'].bezeichnung)} / "
         f"{h(z['einheit'].bezeichnung)}</span></td>"
-        f"<td>{h(nutzungsstatus_label(z['einheit'].nutzungsstatus))}</td>"
+        f"<td>{_bestand_status_html(z)}</td>"
         f"<td><a href='/backoffice/vertrag/{h(z['vertrag'].id)}'>Akte öffnen</a>"
         f"<details><summary>Kurzdetails</summary>{_uebersicht_details_html(z)}</details></td></tr>"
         for z in zeilen
@@ -171,7 +200,7 @@ def vertraege_liste_formular(
     leerstand_zeilen = leerstand_zeilen or []
     leerstand_html = "".join(
         f"<tr><td>{h(z['objekt'].bezeichnung)} / {h(z['einheit'].bezeichnung)}</td>"
-        f"<td>{h(nutzungsstatus_label(z['einheit'].nutzungsstatus))}</td></tr>"
+        f"<td>{h(nutzungsstatus_label(z['einheit'].nutzungsstatus))}{_verwaltungsende_html(z['einheit'])}</td></tr>"
         for z in leerstand_zeilen
     )
     leerstand_karte = f"""
@@ -194,7 +223,7 @@ def vertraege_liste_formular(
     <div class="card"><h2>Mieter</h2>
       {filter_formular}
       <div class="tabelle-scroll">
-      <table><tr><th>Mieter / Objekt / Einheit</th><th>Bestandsart</th><th></th></tr>
+      <table><tr><th>Mieter / Objekt / Einheit</th><th>Status</th><th></th></tr>
       {tabellenzeilen}</table>
       </div>
     </div>

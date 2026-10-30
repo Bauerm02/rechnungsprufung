@@ -66,6 +66,7 @@ from mietinkasso.rueckstaende.service import (
     UnbekanntesObjektFilterError,
     berechne_rueckstandsuebersicht,
 )
+from mietinkasso.stammdaten.bestand import einheit_in_verwaltung_am
 from mietinkasso.stammdaten.repository import StammdatenRepository
 from mietinkasso.variableabrechnung.komponenten_freigabe import KomponentenNettoMietFreigabeService
 from mietinkasso.variableabrechnung.service import VariableAbrechnungService
@@ -163,6 +164,10 @@ class MieterZeile:
     gueltig_von: date
     gueltig_bis: date | None
     status: str  # "AKTIV" | "KUENFTIG" | "BEENDET"
+    # `verwaltung_beendet`: Status BEENDET stammt aus dem Verwaltungsende, die
+    # Vertragslaufzeit (`gueltig_bis`) bleibt unverändert.
+    verwaltung_beendet: bool = False
+    verwaltet_bis: date | None = None
 
 
 @dataclass(frozen=True)
@@ -219,6 +224,11 @@ def berechne_mieterliste(
                 vertrag_status = "KUENFTIG"
             else:
                 vertrag_status = "AKTIV"
+            # Ausgeschiedene Einheit: Mieter gehört nicht mehr zum aktiven
+            # Bestand, bleibt aber unter "beendet"/"alle" als Historie sichtbar.
+            verwaltung_beendet = not einheit_in_verwaltung_am(einheit, heute)
+            if verwaltung_beendet:
+                vertrag_status = "BEENDET"
             zeilen.append(MieterZeile(
                 vertrag_id=vertrag.id, debitor_id=debitor.id, debitor_name=debitor.name,
                 objekt_id=objekt.id, objekt_bezeichnung=objekt.bezeichnung,
@@ -230,6 +240,7 @@ def berechne_mieterliste(
                 telefon=_text_oder_none(debitor.telefon),
                 email=_text_oder_none(debitor.email),
                 gueltig_von=vertrag.gueltig_von, gueltig_bis=vertrag.gueltig_bis, status=vertrag_status,
+                verwaltung_beendet=verwaltung_beendet, verwaltet_bis=getattr(einheit, "verwaltet_bis", None),
             ))
 
     zeilen = [
@@ -388,6 +399,10 @@ def berechne_zinsliste(
             vertraege_je_einheit.setdefault(vertrag.einheit_id, []).append(vertrag)
 
         for einheit in stammdaten_repository.list_einheiten_fuer_objekt(option.id):
+            # Erst ignoriert, wenn `verwaltet_bis` vor dem Monatsanfang liegt -
+            # historische Monate bleiben dadurch unverändert.
+            if not einheit_in_verwaltung_am(einheit, monatsanfang):
+                continue
             alle_vertraege = sorted(vertraege_je_einheit.get(einheit.id, []), key=lambda v: (v.gueltig_von, v.id))
             im_monat = [
                 v for v in alle_vertraege

@@ -70,6 +70,12 @@ class EinheitTable(Base):
     nutzungsstatus: Mapped[str] = mapped_column(String(32))
     flaeche_qm: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     miteigentumsanteile: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
+    # Auftrag HV-20261030-AKTIVER-BESTAND: letzter Verwaltungstag (inklusive).
+    # Additiv und nullable; NULL = weiterhin im Bestand. Die Einheit wird nie
+    # gelöscht, Vertragslaufzeiten bleiben unberührt.
+    verwaltet_bis: Mapped[date | None] = mapped_column(Date, nullable=True)
+    verwaltungsende_grund: Mapped[str | None] = mapped_column(Text, nullable=True)
+    verwaltungsende_quelle: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class DebitorTable(Base):

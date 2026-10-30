@@ -128,7 +128,13 @@ _MIETER_STATUS_LABEL = (
 
 
 def _mieter_zeile_html(z, objekt_filter: str | None) -> str:
-    if z.status == "BEENDET":
+    verwaltung_beendet = getattr(z, "verwaltung_beendet", False)
+    verwaltet_bis = getattr(z, "verwaltet_bis", None)
+    if verwaltung_beendet:
+        # Das Verwaltungsende ist kein Vertragsende: Mietvertrag nicht als beendet ausgeben.
+        ende_text = f" am {verwaltet_bis.isoformat()}" if verwaltet_bis is not None else ""
+        status_html = f'<span class="badge badge-muted">Verwaltung beendet{ende_text}</span>'
+    elif z.status == "BEENDET":
         status_html = f'<span class="badge badge-warn">beendet am {z.gueltig_bis.isoformat()}</span>'
     elif z.status == "KUENFTIG":
         # Ein künftiger Mieter ist noch NICHT aktiv - eigenes Etikett.
@@ -142,7 +148,7 @@ def _mieter_zeile_html(z, objekt_filter: str | None) -> str:
     ehemalig = {
         "BEENDET": " <span class='muted'>(ehemaliger Mieter)</span>",
         "KUENFTIG": " <span class='muted'>(künftiger Mieter)</span>",
-    }.get(z.status, "")
+    }.get("" if verwaltung_beendet else z.status, "")
     return (
         "<tr>"
         f"<td><strong>{h(z.debitor_name)}</strong>{ehemalig}</td>"

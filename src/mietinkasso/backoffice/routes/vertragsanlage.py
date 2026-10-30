@@ -34,6 +34,14 @@ from mietinkasso.intake.parser import IntakeFormatFehlerError, parse_json_paket 
 from mietinkasso.intake.planner import erstelle_plan as _intake_erstelle_plan
 from mietinkasso.op.kontoblatt import lade_kontoblatt
 from mietinkasso.rueckstaende.service import berechne_rueckstandsuebersicht
+from mietinkasso.stammdaten.bestand import (
+    bestand_status,
+    einheit_in_verwaltung_am,
+    einheit_passt_zu_bestandfilter,
+    normalisiere_bestand_filter,
+    status_passt_zu_bestandfilter,
+    vertrag_status_am,
+)
 from mietinkasso.stammdaten.telefon import normalisiere_telefon
 from mietinkasso.vertragsanlage.ablage import (
     UploadAbgelehntError as _VertragsanlageUploadAbgelehntError,
@@ -105,13 +113,21 @@ def _hat_gesellschaft_zugriff(ctx: AuthContext, gesellschaft_id: str) -> bool:
 
 @router.get("/vertraege", response_class=HTMLResponse)
 def vertragsanlage_liste(
-    request: Request, objekt_id: str = "", q: str = "", session=Depends(_current_session),
+    request: Request, objekt_id: str = "", q: str = "", session=Depends(_current_session), bestand: str = "aktiv",
 ) -> HTMLResponse:
     ctx = _ctx(session)
+    bestand_filter = normalisiere_bestand_filter(bestand)
+    heute = heute_wien()
     alle_objekte = []
     zeilen = []
     einheiten_mit_vertrag: set[str] = set()
+    einheiten_mit_offenem_vertrag: set[str] = set()
     for vertrag in deps._stammdaten_repo.list_alle_vertraege():
+        # Vor der Zugriffsprüfung: auch eine Einheit mit fremdem Vertrag ist
+        # nie "vertragslos" (gleiche Regel wie `rueckstaende.service`).
+        einheiten_mit_vertrag.add(vertrag.einheit_id)
+        if vertrag_status_am(vertrag, heute) != "BEENDET":
+            einheiten_mit_offenem_vertrag.add(vertrag.einheit_id)
         if not _hat_gesellschaft_zugriff(ctx, vertrag.gesellschaft_id):
             continue
         einheit = deps._stammdaten_repo.get_einheit(vertrag.einheit_id)
@@ -119,31 +135,45 @@ def vertragsanlage_liste(
         debitor = deps._stammdaten_repo.get_debitor(vertrag.debitor_id)
         if einheit is None or objekt is None or debitor is None:
             continue
-        einheiten_mit_vertrag.add(einheit.id)
+        if objekt.ausgeschlossen or not _hat_gesellschaft_zugriff(ctx, objekt.gesellschaft_id):
+            continue
         if objekt_id and objekt.id != objekt_id:
             continue
         if q and q.strip().lower() not in debitor.name.lower():
+            continue
+        status = bestand_status(vertrag, einheit, heute)
+        if not status_passt_zu_bestandfilter(status, bestand_filter):
             continue
         # Auftrag HV-20261020-VERTRAGSDATENBASIS: zentrale Übersicht zeigt
         # je Zeile aufklappbare Kurzdetails - braucht dafür das Profil mit,
         # KEIN zweiter Rechenweg, nur Anzeige bereits gespeicherter Felder.
         profil = deps._stammdaten_repo.neuestes_mietvertragsprofil(vertrag.id)
-        zeilen.append({"vertrag": vertrag, "objekt": objekt, "einheit": einheit, "debitor": debitor, "profil": profil})
+        zeilen.append({"vertrag": vertrag, "objekt": objekt, "einheit": einheit, "debitor": debitor, "profil": profil, "bestand_status": status})
 
-    # Leerstände/sonstige Einheiten OHNE Vertrag bleiben sichtbar (Auftrag
-    # HV-20260914-UI-EINFACH) - Bestandsart kommt direkt aus dem
-    # gepflegten `Einheit.nutzungsstatus`, NIE aus einem erratenen
-    # Nullsaldo/Fehlen eines Kontos. Der Objekt-/Mieterfilter oben wirkt
-    # NUR auf die Mieterliste, Leerstände bleiben immer vollständig
-    # sichtbar (sonst würde ein Mieterfilter versehentlich Leerstände
-    # ausblenden, die er gar nicht betreffen soll).
+    # Einheiten OHNE jeden Vertrag (Auftrag HV-20260914-UI-EINFACH) - die
+    # Bestandsart kommt aus dem gepflegten `Einheit.nutzungsstatus`, NIE aus
+    # Nullsaldo/fehlendem Konto. Objekt- und Bestandfilter gelten auch hier,
+    # der Mieter-Namensfilter nicht (Einheit ohne Vertrag hat keinen Mieter).
+    # Eine Einheit mit beendetem Vertrag kommt nur hierher, wenn sie noch in
+    # Verwaltung ist, ausdrücklich LEERSTAND gepflegt ist und keinen laufenden/
+    # künftigen Vertrag hat: Vertragsende allein beweist keinen Leerstand.
     leerstand_zeilen = []
     for objekt in deps._stammdaten_repo.list_objekte():
         if objekt.ausgeschlossen or not _hat_gesellschaft_zugriff(ctx, objekt.gesellschaft_id):
             continue
         alle_objekte.append(objekt)
+        if objekt_id and objekt.id != objekt_id:
+            continue
         for einheit in deps._stammdaten_repo.list_einheiten_fuer_objekt(objekt.id):
             if einheit.id in einheiten_mit_vertrag:
+                # Nur Objekt und Einheit werden angezeigt, keine Vertragsdaten.
+                if (
+                    einheit.id in einheiten_mit_offenem_vertrag
+                    or getattr(einheit.nutzungsstatus, "value", einheit.nutzungsstatus) != "LEERSTAND"
+                    or not einheit_in_verwaltung_am(einheit, heute)
+                ):
+                    continue
+            if not einheit_passt_zu_bestandfilter(einheit, bestand_filter, heute):
                 continue
             leerstand_zeilen.append({"objekt": objekt, "einheit": einheit})
 
@@ -152,7 +182,7 @@ def vertragsanlage_liste(
         f'<div class="card">{listen_links_html()}</div>'
         + _vertragsanlage_liste_formular(
             zeilen, session.csrf_token, leerstand_zeilen=leerstand_zeilen,
-            objekte=alle_objekte, filter_objekt_id=objekt_id, filter_q=q,
+            objekte=alle_objekte, filter_objekt_id=objekt_id, filter_q=q, filter_bestand=bestand_filter,
         ),
     )
 
