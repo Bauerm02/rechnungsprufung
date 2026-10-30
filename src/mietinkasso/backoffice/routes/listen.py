@@ -25,10 +25,16 @@ from mietinkasso.portallisten.service import (
     berechne_saldenliste,
     berechne_zinsliste,
 )
+from mietinkasso.portallisten.zinsdetails import berechne_zinsdetails
 
 from mietinkasso.backoffice import dependencies as deps
 from mietinkasso.backoffice.auth import _ctx, _current_session, _fehlerseite, _layout
 from mietinkasso.backoffice.routes.shared import listen_links_html
+from mietinkasso.backoffice.zinsliste_ansicht import (
+    logo_html,
+    rendere_zinsliste_ansicht,
+    rendere_zinsliste_druck,
+)
 
 
 #: Ohne eigenes Prefix - das gemeinsame `/backoffice`-Prefix wird GENAU
@@ -320,7 +326,7 @@ def _zins_zeile_html(z, liste) -> str:
 
 @router.get("/zinsliste", response_class=HTMLResponse)
 def zinsliste(
-    request: Request, monat: str | None = None, objekt_id: str | None = None, q: str | None = None,
+    request: Request, monat: str | None = None, objekt_id: str | None = None, q: str | None = None, druck: bool = False,
     session=Depends(_current_session),
 ) -> HTMLResponse:
     heute = heute_wien()
@@ -331,8 +337,18 @@ def zinsliste(
             stammdaten_repository=deps._stammdaten_repo, variable_service=deps._variableabrechnung.service,
             komponenten_freigabe_service=deps._variableabrechnung.komponenten_freigabe_service, suche=q,
         )
+        details = berechne_zinsdetails(
+            liste=liste, stammdaten_repository=deps._stammdaten_repo, index_repository=getattr(deps, "_index_repo", None),
+        )
     except (MietinkassoError, ValueError) as exc:
         return _fehlerseite(session, "Zinsliste", str(exc), "/backoffice/zinsliste")
+
+    logo = logo_html(getattr(getattr(deps, "_settings", None), "brief_logo_pfad", None))
+    if druck:
+        zurueck_href = _pfad_mit_query(
+            "/backoffice/zinsliste", monat=liste.monat, objekt_id=liste.objekt_filter, q=liste.suche,
+        )
+        return HTMLResponse(rendere_zinsliste_druck(details, logo=logo, zurueck_href=zurueck_href))
 
     monatslinks = []
     for schritt, text in ((-1, "&larr; Vormonat"), (1, "Folgemonat &rarr;")):
@@ -340,23 +356,11 @@ def zinsliste(
         if nachbar is not None:
             href = _pfad_mit_query("/backoffice/zinsliste", monat=nachbar, objekt_id=liste.objekt_filter, q=liste.suche)
             monatslinks.append(f'<a href="{h(href)}">{text}</a>')
-    zeilen_html = "".join(_zins_zeile_html(z, liste) for z in liste.zeilen) or (
-        '<tr><td colspan=10 class="muted">Keine Einheiten für diesen Filter.</td></tr>'
-    )
-    s = liste.summen
-    aenderung_html = (
-        f'<span class="warn">{s.anzahl_aenderung_im_monat} davon mit Änderung im Monat '
-        f"({eur(s.brutto_aenderung_im_monat_cent)}, Stand Monatserster)</span>"
-        if s.anzahl_aenderung_im_monat else ""
-    )
     monat_feld = (
         f'<input id="filter-monat" type="month" name="monat" value="{h(liste.monat)}" placeholder="2026-09"'
         ' pattern="[0-9]{4}-(0[1-9]|1[0-2])" required>'
     )
-    inhalt = f"""
-    <div class="card">
-      <h1>Zinsliste {h(liste.monat)}</h1>
-      {listen_links_html(aktiver_pfad="/backoffice/zinsliste", objekt_id=liste.objekt_filter)}
+    filter_html = f"""
       <form method="get" action="/backoffice/zinsliste" class="listen-filter">
         {_filter_feld("filter-monat", "Monat", monat_feld)}
         {_objekt_filter_feld(liste.objekt_optionen, liste.objekt_filter)}
@@ -366,60 +370,20 @@ def zinsliste(
             ' placeholder="Mieter, Objekt, Einheit">',
         )}
         <button type="submit">Anzeigen</button>
-      </form>
-      <p class="status-zeile">
-        <span>Brutto gesamt: <strong>{eur(s.brutto_gesamt_cent)}</strong> aus {s.anzahl_mit_betrag} Zeile(n)</span>
-        <span>{s.anzahl_ohne_betrag} ohne Betrag (nicht als 0 gezählt)</span>
-        {aenderung_html}
-        {''.join(f'<span>{link}</span>' for link in monatslinks)}
-      </p>
-      {_zeitstempel_html(f"Vertragsstand am {liste.monatsanfang.isoformat()} · keine Zahlungsdaten")}
-      <details>
-        <summary>Was zeigt diese Liste?</summary>
-        <ul>
-          <li>Beginnt oder endet ein Vertrag oder ein Bestandteil mitten im Monat, steht beim Betrag
-              „Stand Monatserster“: gezeigt wird, was am Monatsersten galt - es wird nichts anteilig
-              gerechnet. Diese Zeilen sind in der Summe enthalten und oben getrennt ausgewiesen.</li>
-          <li>Monatliche <strong>vertragliche</strong> Beträge aus den gespeicherten Vertragskomponenten, die am
-              Monatsersten gelten. Es entsteht <strong>keine Vorschreibung</strong> und keine Sollstellung; ob
-              gezahlt wurde, steht unter „Salden“.</li>
-          <li>Beträge sind die gespeicherten Komponentenbeträge (Brutto laut Vorschreibung). Eine Netto-/USt-Aufteilung
-              wird nur gezeigt, wo für alle Mietkomponenten eine geprüfte Netto-Mietanteil-Freigabe vorliegt -
-              sonst „Aufteilung unbekannt“.</li>
-          <li>„–“ heißt: dieser Bestandteil ist nicht hinterlegt. „Betrag unbekannt“ heißt: Vertrag gültig,
-              aber keine am Monatsersten gültige Komponente - das ist nie 0 € und fließt in keine Summe ein.</li>
-          <li>Die Nutzung (vermietet, Leerstand, Kurzzeitvermietung, Selfstorage, Eigennutzung) ist der
-              <strong>aktuell gepflegte</strong> Nutzungsstatus der Einheit, nicht aus Beträgen oder Namen
-              abgeleitet und ohne Historie. Ein beendeter Vertrag beweist keinen Leerstand - dann steht
-              „prüfen“.</li>
-          <li>Kurzzeitvermietung/Selfstorage ohne festen Vertrag haben variable Erlöse; sie stehen im
-              Monatsbericht und werden hier nicht als Mietzins summiert.</li>
-          <li>Eine noch nicht umgesetzte Indexanpassung ist nicht enthalten: maßgeblich ist allein die
-              gespeicherte Komponente.</li>
-          <li>Die Seite wird bei jedem Aufruf neu aus dem aktuellen Datenbestand berechnet; sie enthält
-              keine Bank- oder Zahlungsdaten.</li>
-        </ul>
-      </details>
-    </div>
-    <div class="card">
-      <div class="tabelle-scroll">
-      <table style="min-width: 1080px">
-        <tr><th>Objekt / Einheit</th><th>Nutzung</th><th>Mieter / Vertrag</th><th class="nowrap">Miete</th>
-            <th class="nowrap">Küche</th><th class="nowrap">Stellplatz</th><th class="nowrap">BK / Sonstige</th>
-            <th class="nowrap">Brutto gesamt</th><th class="nowrap">Netto-Miete (geprüft)</th><th>Hinweise</th></tr>
-        {zeilen_html}
-        <tr><th colspan=3>Summe der {s.anzahl_mit_betrag} Zeile(n) mit Betrag
-              ({s.anzahl_ohne_betrag} ohne Betrag nicht enthalten{
-                  f"; {s.anzahl_aenderung_im_monat} mit Stand Monatserster" if s.anzahl_aenderung_im_monat else ""
-              })</th>
-            <th class="nowrap">{eur(s.miete_cent)}</th><th class="nowrap">{eur(s.kueche_cent)}</th>
-            <th class="nowrap">{eur(s.stellplatz_cent)}</th><th class="nowrap">{eur(s.nebenkosten_cent)}</th>
-            <th class="nowrap">{eur(s.brutto_gesamt_cent)}</th><th></th><th></th></tr>
-      </table>
-      </div>
-    </div>
-    {_AUTO_AKTUALISIERUNG_HTML}
-    <p><a href="/backoffice/">&larr; zur Übersicht</a></p>"""
+      </form>"""
+    druck_href = _pfad_mit_query(
+        "/backoffice/zinsliste", monat=liste.monat, objekt_id=liste.objekt_filter, q=liste.suche, druck="1",
+    )
+    inhalt = rendere_zinsliste_ansicht(
+        details,
+        logo=logo,
+        listen_links=listen_links_html(aktiver_pfad="/backoffice/zinsliste", objekt_id=liste.objekt_filter),
+        filter_html=filter_html,
+        monatslinks=tuple(monatslinks),
+        zeitstempel_html=_zeitstempel_html(f"Vertragsstand am {liste.monatsanfang.isoformat()} · keine Zahlungsdaten"),
+        druck_href=druck_href,
+    )
+    inhalt += _AUTO_AKTUALISIERUNG_HTML
     return _layout(request, session, f"Zinsliste {liste.monat}", inhalt)
 
 

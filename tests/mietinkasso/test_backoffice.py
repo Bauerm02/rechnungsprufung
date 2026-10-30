@@ -5690,20 +5690,23 @@ def test_portal_zinsliste_monat_nutzung_betraege_und_summe_ohne_erfundene_null(b
     assert 'href="/backoffice/variable-abrechnung?monat=2026-09"' in september.text
     assert "endet am 2026-09-15" in september.text
     # Vertragsende im Monat: Betrag bleibt stehen, aber ausdrücklich nur als Stand am Monatsersten.
-    assert "Stand Monatserster - Änderung im Monat, nicht anteilig" in september.text
-    assert "1 davon mit Änderung im Monat (333,00 €, Stand Monatserster)" in september.text
+    assert "Stand Monatserster – nicht anteilig" in september.text
+    assert "davon 1 mit Stand Monatserster (333,00 €)" in september.text
     for feld_id in ("filter-monat", "filter-objekt", "filter-q"):
         assert f'<label for="{feld_id}">' in september.text and f'id="{feld_id}"' in september.text
     assert 'class="listen-filter"' in september.text and 'class="kpi-grid"' not in september.text
     assert 'href="/backoffice/vertrag/V-PL1-1?von_objekt=PL1"' in september.text
     assert 'href="/backoffice/zinsliste?monat=2026-08&amp;objekt_id=PL1"' in september.text
     assert 'href="/backoffice/zinsliste?monat=2026-10&amp;objekt_id=PL1"' in september.text
-    assert "Aufteilung unbekannt" in september.text  # keine geprüfte Netto-Freigabe
+    # Informationswerte werden aus den bestehenden Bruttokomponenten berechnet,
+    # ohne eine neue Netto-Freigabe oder Sollstellung anzulegen.
+    assert "Miete &amp; Kosten (netto)" in september.text
+    assert "Netto / USt / Brutto" in september.text
 
     oktober = client.get("/backoffice/zinsliste", params={"objekt_id": "PL1", "monat": "2026-10"})
     assert "beweist keinen Leerstand" in oktober.text  # beendeter Vertrag, Einheit weiterhin "vermietet"
     assert "1.066,00 €" not in oktober.text and "733,00 €" in oktober.text
-    assert "Stand Monatserster - Änderung im Monat" not in oktober.text and "davon mit Änderung im Monat" not in oktober.text
+    assert "Stand Monatserster – nicht anteilig" not in oktober.text and "davon 1 mit Stand Monatserster" not in oktober.text
 
     heute = heute_wien()
     standard = client.get("/backoffice/zinsliste")

@@ -70,6 +70,9 @@ class EinheitTable(Base):
     nutzungsstatus: Mapped[str] = mapped_column(String(32))
     flaeche_qm: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     miteigentumsanteile: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
+    # Auftrag HV-20261030-ZINSLISTE: additiv und nullable; wird nie aus der
+    # Top-Bezeichnung geraten, NULL bedeutet nicht hinterlegt.
+    geschoss: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # Auftrag HV-20261030-AKTIVER-BESTAND: letzter Verwaltungstag (inklusive).
     # Additiv und nullable; NULL = weiterhin im Bestand. Die Einheit wird nie
     # gelöscht, Vertragslaufzeiten bleiben unberührt.
