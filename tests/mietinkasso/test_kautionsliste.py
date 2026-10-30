@@ -235,12 +235,12 @@ def _html(liste):
 
 def test_fuenf_spalten_ohne_tabellensummen(monkeypatch):
     html = _html(_liste(monkeypatch, _basis(_mieter()), FakeRepo()))
-    kopf = html.split("<thead>")[1].split("</thead>")[0]
+    kopf = html.split('class="kaut-tabelle"')[1].split("<thead>")[1].split("</thead>")[0]
     for titel in ("Mieter / Objekt / Einheit", "Kaution laut Vertrag", "Bestätigter Eingang", "Einordnung", "Akte / Details"):
         assert titel in kopf
     assert kopf.count("</th>") == 5
-    assert html.count("</td>") == 5
-    assert "<tfoot" not in html
+    assert html.split('class="kaut-tabelle"')[1].split("</table>")[0].count("</td>") == 5
+    assert "<tfoot" not in html.split('class="kaut-tabelle"')[1].split("</table>")[0]
     assert 'colspan="5"' in _html(_liste(monkeypatch, _basis(), FakeRepo()))
 
 
@@ -319,7 +319,8 @@ def test_beendet_leitet_nichts_ab_und_keine_rohcodes(monkeypatch):
     html = _html(_liste(monkeypatch, _basis(beendet, unbekannt), repo))
     assert '<span class="kaut-marke kaut-marke-neutral">Beendet</span>' in html
     assert '<span class="kaut-marke kaut-marke-ok">Eingang bestätigt</span>' in html
-    assert "auszahl" not in html.casefold() and "erledig" not in html.casefold()
+    assert "auszahl" not in html.casefold()
+    assert "Zurückbezahlt / erledigt" not in html  # Kein Abschluss allein aus Vertragsende.
     assert "Status unbekannt" in html
     assert html.count("XYZ_ROH") == 1
     assert "<div>Vertragsstatus: XYZ_ROH</div>" in html
@@ -376,3 +377,84 @@ def test_objektname_bleibt_in_details_ohne_doppelte_adresszeile(monkeypatch):
     assert html.count('>Beispielweg 1, Wien</span>') == 1
     assert '>Hausname</span>' not in html
     assert '<label>Verträge<select name="status">' in html
+
+
+def test_erledigter_fall_nur_im_archiv(monkeypatch):
+    module = _kautionen()
+    done = _kaution(100000, stichtag=date(2026,10,1))
+    done.abgeschlossen_am = date(2026, 10, 28)
+    done.abschluss_referenz = "Bankbeleg 1"
+    done.abschluss_rueckzahlung_cent = 100000
+    done.abgeschlossen_durch = "Testperson"
+    basis = _basis(_mieter("V1", status="BEENDET"), _mieter("V2", status="BEENDET"))
+    monkeypatch.setattr(module, "berechne_mieterliste", lambda **_: basis)
+    repo = FakeRepo(kautionen={"V1": done})
+    current = module.berechne_kautionsliste("ctx", None, repo)
+    assert [z.mieter.vertrag_id for z in current.zeilen] == ["V2"]
+    assert current.erledigte_ausgeblendet == 1
+    archived = module.berechne_kautionsliste("ctx", None, repo, abschluss="erledigt")
+    assert len(archived.zeilen) == 1
+    assert archived.zeilen[0].status_label == "Zurückbezahlt / erledigt"
+    assert "Bankbeleg 1" in _html(archived)
+    assert len(module.berechne_kautionsliste("ctx", None, repo, abschluss="alle").zeilen) == 2
+
+
+@pytest.mark.parametrize("abschluss,beleg,status", [(date(2026,11,1), "Beleg", "BEENDET"), (date(2026,10,28), None, "BEENDET"), (date(2026,10,28), "Beleg", "AKTIV")])
+def test_keine_unbelegte_oder_kuenftige_ausblendung(monkeypatch, abschluss, beleg, status):
+    record = _kaution(100)
+    record.abgeschlossen_am, record.abschluss_referenz = abschluss, beleg
+    record.abschluss_rueckzahlung_cent = 100
+    record.abgeschlossen_durch = "Testperson"
+    result = _liste(monkeypatch, _basis(_mieter(status=status)), FakeRepo(kautionen={"V1": record}))
+    assert len(result.zeilen) == 1 and result.zeilen[0].abgeschlossen_am is None
+
+
+def test_gruppen_und_firmenfilter_verwenden_nur_sichtbare_daten(monkeypatch):
+    module = _kautionen()
+    basis = _basis(_mieter("V1"), _mieter("V2", objekt_id="O2"), _mieter("V3", objekt_id="O3"))
+    basis.objekt_optionen += (NS(id="O2", gesellschaft_id="G1", gesellschaft_name="Test GmbH"), NS(id="O3", gesellschaft_id="G2", gesellschaft_name="Andere GmbH"))
+    monkeypatch.setattr(module, "berechne_mieterliste", lambda **_: basis)
+    repo = FakeRepo(profile={"V1": _profil(100), "V2": _profil(200), "V3": _profil(300)}, kautionen={"V1": _kaution(100), "V3": _kaution(300)})
+    result = module.berechne_kautionsliste("ctx", None, repo)
+    assert len(result.gruppensummen) == 2
+    assert sum(g.vereinbart_cent for g in result.gruppensummen) == 600
+    assert sum(g.eingang_cent or 0 for g in result.gruppensummen) == 400
+    assert sum(g.nachweis_fehlend for g in result.gruppensummen) == 1
+    filtered = module.berechne_kautionsliste("ctx", None, repo, gesellschaft_id="G1", gruppierung="objekt")
+    assert len(filtered.zeilen) == len(filtered.gruppensummen) == 2
+    assert filtered.vereinbart_summe_cent == 300 and filtered.eingang_summe_cent == 100
+    repo.aufrufe.clear()
+    with pytest.raises(ValueError, match="nicht zugänglich"):
+        module.berechne_kautionsliste("ctx", None, repo, gesellschaft_id="UNBEFUGT")
+    assert repo.aufrufe == []
+
+
+@pytest.mark.parametrize("kw", [{"abschluss":"falsch"},{"gruppierung":"falsch"}])
+def test_neue_filter_validiert(monkeypatch, kw):
+    with pytest.raises(ValueError):
+        _kautionen().berechne_kautionsliste("ctx", None, FakeRepo(), **kw)
+
+
+def test_unvollstaendige_und_kuenftige_gruppensummen_sind_gekennzeichnet(monkeypatch):
+    future = _kaution(100, stichtag=date(2026,11,1))
+    result = _liste(monkeypatch, _basis(_mieter()), FakeRepo(kautionen={"V1": future}))
+    g = result.gruppensummen[0]
+    assert g.eingang_cent is None and g.eingang_zukuenftig == 1 and g.vereinbarung_fehlend == 1
+    html = _html(result)
+    assert "1 Vereinbarung(en) fehlen" in html and "1 Eingang/Eingänge künftig" in html
+
+
+def test_abschluss_vor_eingang_oder_mit_teilzahlung_bleibt_sichtbar(monkeypatch):
+    for amount, incoming in ((99,date(2026,10,1)), (100,date(2026,11,1))):
+        record = _kaution(100, stichtag=incoming)
+        record.abgeschlossen_am = date(2026,10,28)
+        record.abschluss_referenz = "Bankbeleg"
+        record.abgeschlossen_durch = "Testperson"
+        record.abschluss_rueckzahlung_cent = amount
+        result = _liste(monkeypatch, _basis(_mieter(status="BEENDET")), FakeRepo(kautionen={"V1":record}))
+        assert len(result.zeilen) == 1 and result.zeilen[0].abgeschlossen_am is None
+
+
+def test_unbekannte_objektzuordnung_ist_kontrollierter_fehler(monkeypatch):
+    with pytest.raises(ValueError, match="Objektzuordnung"):
+        _liste(monkeypatch, _basis(_mieter(objekt_id="UNBEKANNT")), FakeRepo())

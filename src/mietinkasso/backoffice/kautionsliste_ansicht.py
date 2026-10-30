@@ -32,6 +32,14 @@ _CSS = """
 .kaut-erlaeuterung{margin:10px 0;max-width:85ch}
 .kaut-erlaeuterung summary{cursor:pointer}
 .kaut-summen{margin:8px 0}
+.kaut-gruppen{margin:20px 0}
+.kaut-gruppen h2{font:600 19px Cambria,Georgia,serif;margin:0 0 6px}
+.kaut-gruppen p{margin:0 0 8px}
+.kaut-summentabelle{border-collapse:collapse;width:100%;font-size:14px}
+.kaut-summentabelle th,.kaut-summentabelle td{padding:8px;text-align:left;border-bottom:1px solid #d9d4ca}
+.kaut-summentabelle thead,.kaut-summentabelle tfoot{background:#ECE9E2}
+.kaut-summentabelle .kaut-betrag{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.kaut-summentabelle tfoot{font-weight:700}
 .kaut-summen dt{font-weight:600;margin-top:8px}
 .kaut-summen dd{margin:2px 0 0}
 .kaut-nur-druck{display:none}
@@ -44,6 +52,7 @@ _CSS = """
 @media screen and (max-width:700px){
 .kaut-filter label,.kaut-filter input,.kaut-filter select{width:100%;box-sizing:border-box}
 .kaut-tabellenrahmen{overflow:visible}
+.kaut-gruppen .kaut-tabellenrahmen{overflow-x:auto}
 .kaut-tabelle,.kaut-tabelle tbody,.kaut-tabelle tr,.kaut-tabelle td{display:block}
 .kaut-tabelle thead{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
 .kaut-tabelle tr{border-bottom:2px solid #C9A86A;padding:6px 0}
@@ -97,7 +106,8 @@ def _akte_url(mieter: Any) -> str:
     return f"/backoffice/vertrag/{vertrag}?von_objekt={objekt}"
 
 
-def _filter_html(basis: Any) -> str:
+def _filter_html(liste: Any) -> str:
+    basis = liste.basis
     objekte = ['<option value="">Alle Objekte</option>']
     for option in basis.objekt_optionen:
         gewaehlt = " selected" if str(option.id) == str(basis.objekt_filter) else ""
@@ -105,13 +115,29 @@ def _filter_html(basis: Any) -> str:
             f'<option value="{_text(option.id)}"{gewaehlt}>'
             f"{_text(option.bezeichnung)} ({_text(option.gesellschaft_name)})</option>"
         )
+    firmen = {str(o.gesellschaft_id): o.gesellschaft_name for o in basis.objekt_optionen}
+    firma_optionen = ['<option value="">Alle Firmen</option>']
+    for key, name in sorted(firmen.items(), key=lambda pair: pair[1].casefold()):
+        selected = " selected" if key == liste.gesellschaft_filter else ""
+        firma_optionen.append(f'<option value="{_text(key)}"{selected}>{_text(name)}</option>')
+    fall_optionen = []
+    for key, name in (("offen", "Laufende Kautionsfälle"), ("erledigt", "Erledigte Kautionsfälle"), ("alle", "Alle mit Historie")):
+        selected = " selected" if key == liste.abschluss_filter else ""
+        fall_optionen.append(f'<option value="{key}"{selected}>{name}</option>')
+    gruppen_optionen = []
+    for key, name in (("gesamt", "Gesamt"), ("gesellschaft", "Je Firma"), ("objekt", "Je Liegenschaft")):
+        selected = " selected" if key == liste.gruppierung else ""
+        gruppen_optionen.append(f'<option value="{key}"{selected}>{name}</option>')
     stati = []
     for wert, label in (("alle", "Alle"), ("aktiv", "Aktiv"), ("beendet", "Beendet")):
         gewaehlt = " selected" if wert == basis.status_filter else ""
         stati.append(f'<option value="{wert}"{gewaehlt}>{label}</option>')
     return (
         '<form class="kaut-filter" method="get" action="/backoffice/kautionen">'
-        f'<label>Objekt<select name="objekt_id">{"".join(objekte)}</select></label>'
+        f'<label>Liegenschaft<select name="objekt_id">{"".join(objekte)}</select></label>'
+        f'<label>Firma<select name="gesellschaft_id">{"".join(firma_optionen)}</select></label>'
+        f'<label>Kautionsfälle<select name="abschluss">{"".join(fall_optionen)}</select></label>'
+        f'<label>Summen<select name="gruppierung">{"".join(gruppen_optionen)}</select></label>'
         f'<label>Suche<input type="search" name="q" value="{_text(basis.suche or "")}"></label>'
         f'<label>Verträge<select name="status">{"".join(stati)}</select></label>'
         '<button type="submit">Filtern</button>'
@@ -126,6 +152,11 @@ def _quellen_html(zeile: Any) -> str:
     if zeile.eingang_referenz:
         teile.append(f"<div>Eingang: {_text(zeile.eingang_referenz)}</div>")
     inhalt = "".join(teile) or "<div>Keine Quelle erfasst</div>"
+    if zeile.abgeschlossen_am:
+        if not teile:
+            teile.append("<div>Keine Eingangsquelle erfasst</div>")
+        teile.append(f"<div>Kaution {_betrag(zeile.abschluss_rueckzahlung_cent)} erledigt am {_datum(zeile.abgeschlossen_am)} durch {_text(zeile.abgeschlossen_durch or "")}: {_text(zeile.abschluss_referenz or '')}</div>")
+        inhalt = "".join(teile)
     status = _text(_status_wert(zeile.mieter.status))
     return (
         '<details class="kaut-details"><summary>Details</summary>'
@@ -172,6 +203,7 @@ _EINORDNUNG_KLASSEN = {
     "Keine Kaution vereinbart": "kaut-marke-neutral",
     "Eingang nicht belegt": "kaut-marke-offen",
     "Kautionsvereinbarung fehlt": "kaut-marke-offen",
+    "Zurückbezahlt / erledigt": "kaut-marke-neutral",
 }
 
 
@@ -250,6 +282,33 @@ def _zaehler_html(liste: Any) -> str:
     return f'<p class="kaut-zaehler">{inhalt}</p>'
 
 
+def _offene_nachweise(vereinbarung: int, eingang: int, zukuenftig: int) -> str:
+    teile = []
+    if vereinbarung: teile.append(f"{vereinbarung} Vereinbarung(en) fehlen")
+    if eingang: teile.append(f"{eingang} Eingang/Eingänge fehlen")
+    if zukuenftig: teile.append(f"{zukuenftig} Eingang/Eingänge künftig")
+    return "; ".join(teile) or "vollständig"
+
+
+def _gruppensummen_html(liste: Any) -> str:
+    zeilen = "".join(
+        f'<tr><th scope="row">{_text(g.bezeichnung)}</th><td>{g.anzahl}</td>'
+        f'<td class="kaut-betrag">{_summe(g.vereinbart_cent)}</td>'
+        f'<td class="kaut-betrag">{_summe(g.eingang_cent)}</td><td>{_offene_nachweise(g.vereinbarung_fehlend, g.nachweis_fehlend, g.eingang_zukuenftig)}</td></tr>'
+        for g in liste.gruppensummen
+    ) or '<tr><td colspan="5">Keine Kautionsfälle für diese Auswahl.</td></tr>'
+    footer = ""
+    if liste.gruppierung != "gesamt" and liste.zeilen:
+        footer = (f'<tfoot><tr><th scope="row">Gesamt</th><td>{len(liste.zeilen)}</td>'
+                  f'<td class="kaut-betrag">{_summe(liste.vereinbart_summe_cent)}</td>'
+                  f'<td class="kaut-betrag">{_summe(liste.eingang_summe_cent)}</td><td>{_offene_nachweise(liste.vereinbart_fehlend, liste.eingang_fehlend, liste.eingang_zukuenftig)}</td></tr></tfoot>')
+    return ('<section class="kaut-gruppen"><h2>Summen der Auswahl</h2>'
+            '<p>Die Summen berücksichtigen die gewählten Filter. Historische Eingänge sind kein aktueller Bankbestand. Fehlende Beträge sind nicht enthalten.</p>'
+            '<div class="kaut-tabellenrahmen"><table class="kaut-summentabelle"><thead><tr>'
+            '<th>Firma / Liegenschaft</th><th>Fälle</th><th>Vereinbart</th><th>Historischer Eingang</th><th>Offene Nachweise</th>'
+            f'</tr></thead><tbody>{zeilen}</tbody>{footer}</table></div></section>')
+
+
 def rendere_kautionsliste(liste: Any, *, logo: str, navigation: str) -> str:
     """Rendert ein HTML-Fragment; logo und navigation sind bereits sicheres HTML."""
     basis = liste.basis
@@ -266,7 +325,9 @@ def rendere_kautionsliste(liste: Any, *, logo: str, navigation: str) -> str:
         f"<p>Listenstichtag: {_datum(basis.stichtag)}</p>"
         '<p class="kaut-hinweis">Die Beträge zeigen die vorhandenen Unterlagen – nicht den heutigen Kontostand.</p>'
         f"{_zaehler_html(liste)}"
-        f"{_filter_html(basis)}"
+        + (f'<p>{liste.erledigte_ausgeblendet} {"erledigter Kautionsfall" if liste.erledigte_ausgeblendet == 1 else "erledigte Kautionsfälle"} ausgeblendet. Über „Kautionsfälle“ bleibt die Historie abrufbar.</p>' if liste.erledigte_ausgeblendet else "")
+        + f"{_filter_html(liste)}"
+        f"{_gruppensummen_html(liste)}"
         '<button type="button" class="kaut-druck" onclick="window.print()">Drucken</button>'
         '<div class="kaut-tabellenrahmen"><table class="kaut-tabelle"><thead><tr>'
         "<th>Mieter / Objekt / Einheit</th>"

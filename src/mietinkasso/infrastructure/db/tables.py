@@ -161,6 +161,12 @@ class KautionTable(Base):
     betrag_cent: Mapped[int] = mapped_column(Integer)
     stichtag: Mapped[date] = mapped_column(Date)
     referenz: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Expliziter Abschlussnachweis, unabhängig vom Mietsaldo. Der ursprüngliche
+    # Eingang bleibt als Historie erhalten; ein Vertragsende allein genügt nicht.
+    abgeschlossen_am: Mapped[date | None] = mapped_column(Date, nullable=True)
+    abschluss_referenz: Mapped[str | None] = mapped_column(Text, nullable=True)
+    abschluss_rueckzahlung_cent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    abgeschlossen_durch: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class MietvertragsprofilTable(Base):

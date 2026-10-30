@@ -22,6 +22,9 @@ def kautionen_seite(
     objekt_id: Optional[str] = None,
     q: Optional[str] = None,
     status: str = "alle",
+    gesellschaft_id: Optional[str] = None,
+    abschluss: str = "offen",
+    gruppierung: str = "gesellschaft",
     session=Depends(_current_session),
 ):
     try:
@@ -31,6 +34,9 @@ def kautionen_seite(
             stammdaten_repository=deps._stammdaten_repo,
             status=status,
             suche=q or None,
+            gesellschaft_id=gesellschaft_id or None,
+            abschluss=abschluss,
+            gruppierung=gruppierung,
         )
     except (MietinkassoError, ValueError) as exc:
         return _fehlerseite(session, "Kautionsübersicht", str(exc), "/backoffice/kautionen")

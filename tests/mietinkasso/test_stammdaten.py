@@ -191,3 +191,29 @@ def test_vertragskomponente_ist_unveraenderlich(stammdaten_repo, basis_vertrag):
         )
     komponente = stammdaten_repo.get_komponente("K-UNVERAENDERLICH")
     assert komponente.betrag_cent == 50_000  # unverändert
+
+
+def test_kautionsabschluss_erhaelt_eingang_und_mietsaldo(stammdaten_repo, op_service, basis_vertrag, ctx_factory):
+    vertrag, konto = basis_vertrag
+    stammdaten_repo.set_kaution(id="KAUT-ENDE", vertrag_id=vertrag.id, betrag_cent=100000, stichtag=date(2026, 1, 1), referenz="Synthetischer Eingang")
+    vorher = op_service.berechne_saldo(konto.id)
+    with stammdaten_repo._session_factory() as session:
+        session.get(type(vertrag), vertrag.id).gueltig_bis = date(2026, 10, 27)
+        session.commit()
+    for _ in range(2):
+        stammdaten_repo.schliesse_kaution_ab(vertrag_id=vertrag.id, abgeschlossen_am=date(2026, 10, 28), referenz=" Synthetischer Auszahlungsbeleg ", rueckzahlung_cent=100000, akteur="Testperson", heute=date(2026,10,30))
+    row = stammdaten_repo.get_kaution(vertrag.id)
+    assert row.betrag_cent == 100000 and row.referenz == "Synthetischer Eingang"
+    assert row.abgeschlossen_am == date(2026, 10, 28)
+    assert row.abschluss_referenz == "Synthetischer Auszahlungsbeleg"
+    assert op_service.berechne_saldo(konto.id) == vorher
+    with pytest.raises(ValueError, match="Abweichender Abschluss"):
+        stammdaten_repo.schliesse_kaution_ab(vertrag_id=vertrag.id, abgeschlossen_am=date(2026, 10, 29), referenz="Anders", rueckzahlung_cent=100000, akteur="Testperson", heute=date(2026,10,30))
+    assert stammdaten_repo.get_kaution(vertrag.id).abgeschlossen_am == date(2026, 10, 28)
+
+
+def test_kautionsabschluss_ohne_nachweis_oder_eingang_abgelehnt(stammdaten_repo):
+    with pytest.raises(ValueError, match="Abschlussnachweis"):
+        stammdaten_repo.schliesse_kaution_ab(vertrag_id="NONE", abgeschlossen_am=date(2026, 10, 28), referenz=" ", rueckzahlung_cent=0, akteur="Testperson", heute=date(2026,10,30))
+    with pytest.raises(ValueError, match="Kautionsnachweis"):
+        stammdaten_repo.schliesse_kaution_ab(vertrag_id="NONE", abgeschlossen_am=date(2026, 10, 28), referenz="Beleg", rueckzahlung_cent=0, akteur="Testperson", heute=date(2026,10,30))

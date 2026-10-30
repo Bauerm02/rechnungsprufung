@@ -901,3 +901,17 @@ def test_ensure_additive_columns_bei_frischer_db_no_op():
             # Ohne dispose() bleibt die Datei-Handle unter Windows offen und
             # blockiert TemporaryDirectory beim Aufräumen (PermissionError).
             engine.dispose()
+
+
+def test_kautionsabschluss_additiv_auf_befuelltem_altschema():
+    engine = sa.create_engine("sqlite:///:memory:")
+    with engine.begin() as c:
+        c.exec_driver_sql("CREATE TABLE kautionen (id TEXT PRIMARY KEY, vertrag_id TEXT, betrag_cent INTEGER, stichtag DATE, referenz TEXT)")
+        c.exec_driver_sql("INSERT INTO kautionen VALUES ('K1','V1',10000,'2026-01-01','Altbeleg')")
+    changes = ensure_additive_columns(engine)
+    assert len(changes) == 4
+    with engine.connect() as c:
+        row = c.exec_driver_sql("SELECT * FROM kautionen").one()
+        assert tuple(row[:5]) == ('K1','V1',10000,'2026-01-01','Altbeleg')
+        assert tuple(row[5:]) == (None,None,None,None)
+    assert ensure_additive_columns(engine) == []

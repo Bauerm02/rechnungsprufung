@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from mietinkasso.domain.exceptions import ObjektAusgeschlossenError
@@ -602,6 +603,45 @@ class StammdatenRepository:
             return session.execute(select(KautionTable).where(KautionTable.vertrag_id == vertrag_id)).scalar_one_or_none()
         with self._session_factory() as owned_session:
             return owned_session.execute(select(KautionTable).where(KautionTable.vertrag_id == vertrag_id)).scalar_one_or_none()
+
+    def schliesse_kaution_ab(self, *, vertrag_id: str, abgeschlossen_am: date,
+                             referenz: str, rueckzahlung_cent: int, akteur: str,
+                             heute: date | None = None, session: Session | None = None) -> None:
+        """Expliziter Abschluss nach vollständiger Rückzahlung; kein Eingriff in OP/Bank."""
+        if not referenz or not referenz.strip() or not akteur or not akteur.strip():
+            raise ValueError("Abschlussnachweis oder Bearbeiter fehlt.")
+        referenz, akteur = referenz.strip(), akteur.strip()
+        if abgeschlossen_am > (heute or datetime.now(ZoneInfo("Europe/Vienna")).date()):
+            raise ValueError("Künftiger Abschluss ist nicht zulässig.")
+        def schreiben(s: Session) -> None:
+            row = self.get_kaution(vertrag_id, session=s)
+            if row is None:
+                raise ValueError("Kautionsnachweis fehlt.")
+            vertrag = s.get(VertragTable, vertrag_id)
+            if vertrag is None or vertrag.gueltig_bis is None or vertrag.gueltig_bis > abgeschlossen_am:
+                raise ValueError("Mietvertrag ist zum Abschluss noch nicht beendet.")
+            if abgeschlossen_am < row.stichtag or rueckzahlung_cent != row.betrag_cent:
+                raise ValueError("Vollständige Rückzahlung nach dem Eingang muss belegt sein.")
+            ziel = (abgeschlossen_am, referenz, rueckzahlung_cent, akteur)
+            ist = (row.abgeschlossen_am, row.abschluss_referenz, row.abschluss_rueckzahlung_cent, row.abgeschlossen_durch)
+            if ist == ziel:
+                return
+            if any(v is not None for v in ist):
+                raise ValueError("Abweichender Abschluss ist bereits erfasst.")
+            result = s.execute(update(KautionTable).where(
+                KautionTable.vertrag_id == vertrag_id,
+                KautionTable.abgeschlossen_am.is_(None), KautionTable.abschluss_referenz.is_(None),
+                KautionTable.abschluss_rueckzahlung_cent.is_(None), KautionTable.abgeschlossen_durch.is_(None),
+            ).values(abgeschlossen_am=abgeschlossen_am, abschluss_referenz=referenz,
+                     abschluss_rueckzahlung_cent=rueckzahlung_cent, abgeschlossen_durch=akteur))
+            if result.rowcount != 1:
+                raise ValueError("Kautionsabschluss wurde zwischenzeitlich geändert.")
+        if session is not None:
+            schreiben(session)
+        else:
+            with self._session_factory() as s:
+                schreiben(s)
+                s.commit()
 
     # -- Mietvertragsprofil (Auftrag HV-20260913-VERTRAGSANLAGE) ---------------
     def add_mietvertragsprofil(
