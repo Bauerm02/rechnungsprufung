@@ -51,68 +51,30 @@ def _rueckstaende_objekt_filter_form(uebersicht, *, action: str = "/backoffice/"
     </div>"""
 
 
-#: Lokales CSS nur für die Startseite (HV-20261030-UEBERSICHT-EINFACH), Farben werden geerbt.
-_HV_START_CSS = """
-.hv-start > h1 { margin: 0 0 12px; }
-.hv-start .hv-summary {
-  display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 24px;
-  margin: 0 0 12px; font-size: 15px; font-variant-numeric: tabular-nums;
-}
-.hv-start .hv-summary-label { font-size: 14px; }
-.hv-start .hv-summary-wert { white-space: nowrap; }
-.hv-start .hv-start-links { margin: 0 0 12px; font-size: 14px; }
-.hv-start > div.card:first-of-type { padding: 12px 16px; }
-.hv-start > div.card:first-of-type form { display: flex; gap: 12px; align-items: center; }
-.hv-start > div.card:first-of-type label { margin: 0; white-space: nowrap; }
-.hv-start > div.card:first-of-type select { flex: 1; min-width: 0; width: auto; }
-.hv-start > details.card { padding: 10px 16px; }
-.hv-start #abgleichstand { padding: 12px 16px; }
-.hv-start #abgleichstand p { margin: 6px 0; }
-.hv-start #abgleichstand .status-zeile { font-size: 13px; }
-.hv-start #mietkonten-uebersicht h2 { margin: 0 0 12px; font-size: 18px; }
-"""
-
-
-def _startseite_html(*abschnitte: str) -> str:
-    """Reiner Darstellungsrahmen der Startseite: Überschrift, lokales CSS
-    und die unveränderten Abschnitte in der übergebenen Reihenfolge."""
-
-    return (
-        f'<style>{_HV_START_CSS}</style><div class="hv-start"><h1>Übersicht</h1>'
-        f'{"".join(abschnitte)}</div>'
-    )
-
-
 def _rueckstaende_kpi_html(k) -> str:
-    """Ruhige Zahlenzeile (Auftrag HV-20261030-UEBERSICHT-EINFACH): oben
-    nur "Offene Beträge" und "Guthaben der Mieter", die übrigen Summen
-    aufklappbar - dieselben bereits vorhandenen Zahlen aus
-    `RueckstandsKennzahlen`, NUR anders gruppiert. "Davon fällig" ist die Summe der
+    """Vier verständliche Kennzahlen für den Alltag (Auftrag
+    HV-20260914-UI-EINFACH) statt fünf technisch benannter Summen -
+    dieselben bereits vorhandenen Zahlen aus `RueckstandsKennzahlen`,
+    NUR neu beschriftet/gruppiert. "Davon fällig" ist die Summe der
     EINZELPOSITIONEN mit bekannter, verstrichener Fälligkeit (nicht
     identisch mit der Kontosaldo-Rechnung - siehe Erklärung), eine
     unbekannte Fälligkeit heißt "Fälligkeit prüfen" (NICHT "strittig"),
-    und ein Guthaben wird nie gegen einen Rückstand verrechnet. Alle fünf
-    Zahlen bleiben auf der Seite vorhanden, damit keine Information
-    verloren geht."""
+    und ein Guthaben wird nie gegen einen Rückstand verrechnet. Die
+    bisherige fünfte Zahl ("Noch nicht fällig") bleibt unter "weitere
+    Kennzahlen" erreichbar, damit keine Information verloren geht."""
 
-    def _summe(label: str, cent: int) -> str:
-        return (
-            f'<span class="hv-summary-wert"><span class="hv-summary-label">{h(label)}</span> '
-            f"<strong>{eur(cent)}</strong></span>"
-        )
+    def _kpi(label: str, cent: int) -> str:
+        return f'<div class="kpi"><span class="zahl">{eur(cent)}</span><span class="kpi-label">{h(label)}</span></div>'
 
     return f"""
-    <p class="hv-summary">
-      {_summe("Offene Beträge", k.summe_positiver_kontostaende_cent)}
-      {_summe("Guthaben der Mieter", k.summe_guthaben_cent)}
-    </p>
+    <div class="kpi-grid">
+      {_kpi("Offene Beträge", k.summe_positiver_kontostaende_cent)}
+      {_kpi("Davon fällig", k.ueberfaellig_cent)}
+      {_kpi("Fälligkeit prüfen", k.faelligkeit_unbekannt_cent)}
+      {_kpi("Guthaben der Mieter", k.summe_guthaben_cent)}
+    </div>
     <details class="card">
-      <summary>Weitere Summen und Erklärung</summary>
-      <p class="hv-summary">
-        {_summe("Davon fällig", k.ueberfaellig_cent)}
-        {_summe("Fälligkeit prüfen", k.faelligkeit_unbekannt_cent)}
-        {_summe("Noch nicht fällig", k.nicht_faellig_cent)}
-      </p>
+      <summary>Was bedeutet das? / weitere Kennzahlen</summary>
       <ul>
         <li><strong>Offene Beträge</strong>: Summe aller positiven Mietkonten (Rückstände) - ein Guthaben
             eines anderen Mieters wird NIE davon abgezogen.</li>
@@ -123,6 +85,7 @@ def _rueckstaende_kpi_html(k) -> str:
             NICHT automatisch "strittig", sondern nur: das Datum fehlt noch in den Stammdaten.</li>
         <li><strong>Guthaben der Mieter</strong>: Summe aller negativen Mietkonten - eigenes Geld der Mieter,
             wird nicht automatisch verrechnet.</li>
+        <li class="muted">Weitere Kennzahl: Noch nicht fällig {eur(k.nicht_faellig_cent)}.</li>
       </ul>
     </details>"""
 
@@ -463,13 +426,16 @@ def _abgleich_nachweis_satz(status) -> str:
 
 def _abgleich_karte_html(status) -> str:
     return f"""
-    <div class="card" id="abgleichstand" aria-label="Bankabgleich">
-      <p><strong>Bankabgleich:</strong> {_abgleich_nachweis_satz(status)}</p>
+    <div class="card" id="abgleichstand">
+      <h2>Zahlungs- und Abgleichstand</h2>
       <p class="status-zeile">
+        <span>Offene Beträge: <strong>{eur(status.summe_offen_cent)}</strong></span>
+        <span>Guthaben der Mieter: <strong>{eur(status.summe_guthaben_cent)}</strong></span>
         <span>Eingereicht, Bankeingang noch offen: <strong>{eur(status.einzuege_offen_cent)}</strong>
           ({status.einzuege_offen_anzahl})</span>
-        <a href="{h(_abgleich_link(status.objekt_filter))}">Abgleichstand im Detail &rarr;</a>
       </p>
+      <p>{_abgleich_nachweis_satz(status)}</p>
+      <p><a href="{h(_abgleich_link(status.objekt_filter))}">Abgleichstand im Detail &rarr;</a></p>
     </div>"""
 
 
@@ -573,7 +539,7 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
     # sind direkt von der Übersicht erreichbar, der aktive Objektfilter
     # wird mitgenommen - reine Verlinkung.
     auswahl_form = _rueckstaende_objekt_filter_form(uebersicht) + (
-        f'<div class="hv-start-links">{listen_links_html(objekt_id=uebersicht.objekt_filter)}</div>'
+        f'<div class="card">{listen_links_html(objekt_id=uebersicht.objekt_filter)}</div>'
     )
     kpi_html = _rueckstaende_kpi_html(uebersicht.kennzahlen)
     abgleich_html = _abgleich_karte_html(berechne_abgleichstatus(
@@ -718,13 +684,12 @@ def dashboard(request: Request, objekt_id: str | None = None, session=Depends(_c
 
     return _layout(
         request, session, "Übersicht",
-        # Auftrag HV-20261030-UEBERSICHT-EINFACH: offene Mietkonten vor den
-        # längeren Aufgabenlisten - reine Reihenfolgeänderung, alle
-        # Werte/Berechnungen bleiben unverändert.
-        _startseite_html(
-            auswahl_form, kpi_html, abgleich_html, kompakt_tabelle, erledigen_html,
-            mietkonten_tabelle, positionen_tabelle, mahnfaelle_tabelle, bestand_tabelle,
-        ),
+        # Auftrag HV-20260914-UI-LESBAR: die vier Kennzahlen stehen VOR
+        # "Das ist zu erledigen" (Reihenfolge aus dem Auftrag), unmittelbar
+        # nach dem kompakten Objektfilter - reine Reihenfolgeänderung,
+        # alle Werte/Berechnungen bleiben unverändert.
+        auswahl_form + kpi_html + abgleich_html + erledigen_html + kompakt_tabelle
+        + mietkonten_tabelle + positionen_tabelle + mahnfaelle_tabelle + bestand_tabelle,
     )
 
 
