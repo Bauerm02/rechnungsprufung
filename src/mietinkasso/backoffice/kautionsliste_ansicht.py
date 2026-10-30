@@ -155,7 +155,7 @@ def _quellen_html(zeile: Any) -> str:
     if zeile.abgeschlossen_am:
         if not teile:
             teile.append("<div>Keine Eingangsquelle erfasst</div>")
-        teile.append(f"<div>Kaution {_betrag(zeile.abschluss_rueckzahlung_cent)} erledigt am {_datum(zeile.abgeschlossen_am)} durch {_text(zeile.abgeschlossen_durch or "")}: {_text(zeile.abschluss_referenz or '')}</div>")
+        teile.append(f"<div>Kaution {_betrag(zeile.abschluss_rueckzahlung_cent)} erledigt am {_datum(zeile.abgeschlossen_am)} durch {_text(zeile.abgeschlossen_durch or '')}: {_text(zeile.abschluss_referenz or '')}</div>")
         inhalt = "".join(teile)
     status = _text(_status_wert(zeile.mieter.status))
     return (
