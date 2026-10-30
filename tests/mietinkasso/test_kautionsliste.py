@@ -227,3 +227,143 @@ def test_route_fehlerseite(monkeypatch):
     monkeypatch.setattr(route, "_fehlerseite", lambda *args: args)
     antwort = route.kautionen_seite(request="req", objekt_id=None, q=None, status="alle", session="s")
     assert antwort == ("s", "Kautionsübersicht", "ungültig", "/backoffice/kautionen")
+
+
+def _html(liste):
+    return _ansicht().rendere_kautionsliste(liste, logo="", navigation="")
+
+
+def test_fuenf_spalten_ohne_tabellensummen(monkeypatch):
+    html = _html(_liste(monkeypatch, _basis(_mieter()), FakeRepo()))
+    kopf = html.split("<thead>")[1].split("</thead>")[0]
+    for titel in ("Mieter / Objekt / Einheit", "Kaution laut Vertrag", "Bestätigter Eingang", "Einordnung", "Akte / Details"):
+        assert titel in kopf
+    assert kopf.count("</th>") == 5
+    assert html.count("</td>") == 5
+    assert "<tfoot" not in html
+    assert 'colspan="5"' in _html(_liste(monkeypatch, _basis(), FakeRepo()))
+
+
+def test_responsive_markup_und_druck(monkeypatch):
+    html = _html(_liste(monkeypatch, _basis(_mieter()), FakeRepo()))
+    assert "@media screen and (max-width:700px)" in html
+    assert "min-width:1100px" not in html
+    assert html.count(' data-label="') == 5
+    assert 'data-label="Einordnung"' in html
+    druck = html.split("@media print")[1]
+    assert ".kaut-erlaeuterung,.kaut-akte,.kaut-details:not([open]){display:none}" in druck
+    assert ".kaut-nur-druck{display:block}" in druck
+
+
+def test_zeilenzustaende_und_anzahlen(monkeypatch):
+    repo = FakeRepo(
+        profile={
+            "V1": _profil(100000),
+            "V2": _profil(None),
+            "V3": _profil(0),
+            "V4": _profil(0),
+            "V5": _profil(50000),
+            "V6": _profil(100000),
+            "V7": _profil(100000),
+        },
+        kautionen={
+            "V4": _kaution(0),
+            "V5": _kaution(0),
+            "V6": _kaution(90000),
+            "V7": _kaution(70000, date(2026, 11, 1)),
+        },
+    )
+    mieter = [_mieter(f"V{nummer}") for nummer in range(1, 8)]
+    html = _html(_liste(monkeypatch, _basis(*mieter), repo))
+    for teil in (
+        "<span>Mietverhältnisse: 7</span>",
+        "<span>Eingänge bestätigt: 2</span>",
+        "<span>Nachweis fehlt: 2</span>",
+        "<span>Keine Kaution: 2</span>",
+        "<span>Zukünftig datiert: 1</span>",
+        '<span class="kaut-marke kaut-marke-offen">Eingang nicht belegt</span>',
+        '<span class="kaut-marke kaut-marke-offen">Kautionsvereinbarung fehlt</span>',
+        '<span class="kaut-marke kaut-marke-neutral">Keine Kaution vereinbart</span>',
+        '<span class="kaut-marke kaut-marke-ok">Eingang bestätigt</span>',
+        "entfällt",
+        "nicht belegt",
+        "unter bekannt: 1 Eingang 0,00 € ohne vereinbarte Kaution",
+    ):
+        assert teil in html
+    assert "unbezahlt" not in html.casefold()
+
+
+def test_zukuenftige_bestaetigung_bleibt_ausserhalb_der_summe(monkeypatch):
+    repo = FakeRepo(profile={"V1": _profil(100000)}, kautionen={"V1": _kaution(70000, date(2026, 11, 1))})
+    liste = _liste(monkeypatch, _basis(_mieter()), repo)
+    html = _html(liste)
+    assert liste.eingang_summe_cent is None
+    assert html.count("700,00 €") == 1
+    assert "Zukünftig: Datum 01.11.2026 liegt nach dem Listenstichtag" in html
+    assert "Eingang nach Listenstichtag, nicht summiert" in html
+    assert "<span>Eingänge bestätigt: 0</span>" in html
+    assert "<span>Nachweis fehlt: 0</span>" in html
+
+
+def test_eingangsdatum_sichtbar_und_fehlender_stichtag_bricht_nicht(monkeypatch):
+    repo = FakeRepo(kautionen={"V1": _kaution(100), "V2": _kaution(200, None)})
+    html = _html(_liste(monkeypatch, _basis(_mieter(), _mieter("V2")), repo))
+    assert "Stichtag 30.10.2026" in html
+    assert "Stichtag nicht erfasst" in html
+
+
+def test_beendet_leitet_nichts_ab_und_keine_rohcodes(monkeypatch):
+    beendet = _mieter(status="BEENDET")
+    unbekannt = _mieter("V2", status="XYZ_ROH")
+    repo = FakeRepo(profile={"V1": _profil(100000)}, kautionen={"V1": _kaution(100000)})
+    html = _html(_liste(monkeypatch, _basis(beendet, unbekannt), repo))
+    assert '<span class="kaut-marke kaut-marke-neutral">Beendet</span>' in html
+    assert '<span class="kaut-marke kaut-marke-ok">Eingang bestätigt</span>' in html
+    assert "auszahl" not in html.casefold() and "erledig" not in html.casefold()
+    assert "Status unbekannt" in html
+    assert html.count("XYZ_ROH") == 1
+    assert "<div>Vertragsstatus: XYZ_ROH</div>" in html
+
+
+def test_quellen_und_akte_bleiben_erhalten(monkeypatch):
+    repo = FakeRepo(
+        profile={"V/1": _profil(100, "Vertrag S. 3")},
+        kautionen={"V/1": _kaution(100, referenz="Beleg 7")},
+    )
+    html = _html(_liste(monkeypatch, _basis(_mieter("V/1"), _mieter("V2")), repo))
+    assert "<summary>Details</summary>" in html
+    assert "<div>Vertrag: Vertrag S. 3</div>" in html
+    assert "<div>Eingang: Beleg 7</div>" in html
+    assert "<div>Keine Quelle erfasst</div>" in html
+    assert "<div>Vertragsstatus: AKTIV</div>" in html
+    assert html.count("Akte öffnen") == 2
+    assert "/backoffice/vertrag/V%2F1?von_objekt=O1" in html
+
+
+def test_summen_und_erlaeuterung_unveraendert_aufklappbar(monkeypatch):
+    repo = FakeRepo(profile={"V1": _profil(100000)}, kautionen={"V1": _kaution(90000)})
+    liste = _liste(monkeypatch, _basis(_mieter(), _mieter("V2"), _mieter("V3")), repo)
+    html = _html(liste)
+    assert (liste.vereinbart_summe_cent, liste.eingang_summe_cent) == (100000, 90000)
+    assert "Die Beträge zeigen die vorhandenen Unterlagen – nicht den heutigen Kontostand." in html
+    aufklappbar = html.split("<summary>Summen und Erläuterung</summary>")[1].split("</details>")[0]
+    druck = html.split('<div class="kaut-nur-druck">')[1].split("</div>")[0]
+    for teil in (
+        "Summe vertraglich vereinbarter Kautionen (kein Geldbestand)",
+        "Summe bestätigter Eingänge bis Listenstichtag (kein Geldbestand)",
+        "1.000,00 €",
+        "900,00 €",
+        "Umfang: 3 sichtbare Zeilen; 1 bekannt, 2 fehlend",
+        "1 bekannt, 2 fehlend, 0 zukünftig (nicht summiert), 0 ohne Kaution",
+        "Fehlende Angaben bedeuten weder 0 noch einen Zahlungsrückstand.",
+    ):
+        assert teil in aufklappbar and teil in druck
+
+
+def test_xss_in_neuen_darstellungsfeldern(monkeypatch):
+    boese = "<script>alert(1)</script>"
+    mieter = _mieter(status=boese, objekt_bezeichnung=boese, objekt_adresse=boese, einheit_bezeichnung=boese)
+    repo = FakeRepo(profile={"V1": _profil(100, boese)}, kautionen={"V1": _kaution(100, referenz=boese)})
+    html = _html(_liste(monkeypatch, _basis(mieter), repo))
+    assert boese not in html
+    assert "&lt;script&gt;" in html

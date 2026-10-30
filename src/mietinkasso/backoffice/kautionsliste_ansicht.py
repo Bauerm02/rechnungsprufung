@@ -21,14 +21,37 @@ _CSS = """
 .kaut-filter input,.kaut-filter select,.kaut-filter button,.kaut-druck{font-size:13px;padding:5px 8px}
 .kaut-filter button,.kaut-druck{background:#1F2125;color:#F5F2EC;border:1px solid #1F2125;cursor:pointer}
 .kaut-tabellenrahmen{overflow-x:auto;background:#fff}
-.kaut-tabelle{border-collapse:collapse;min-width:1100px;width:100%;font-size:13px}
+.kaut-tabelle{border-collapse:collapse;width:100%;font-size:14px}
 .kaut-tabelle th,.kaut-tabelle td{border-bottom:1px solid #d9d4ca;padding:6px 8px;text-align:left;vertical-align:top}
 .kaut-tabelle thead th{background:#1F2125;color:#F5F2EC}
-.kaut-tabelle tfoot th,.kaut-tabelle tfoot td{border-top:2px solid #C9A86A;font-weight:600}
 .kaut-tabelle .kaut-betrag{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .kaut-klein{display:block;font-size:13px;color:#555;font-weight:400}
 .kaut-zukunft{display:block;font-size:13px;color:#8a5a00;font-weight:600;white-space:normal}
 .kaut-fuss{margin-top:14px;font-size:13px}
+.kaut-zaehler{display:flex;flex-wrap:wrap;gap:4px 18px;margin:10px 0;font-weight:600}
+.kaut-erlaeuterung{margin:10px 0;max-width:85ch}
+.kaut-erlaeuterung summary{cursor:pointer}
+.kaut-summen{margin:8px 0}
+.kaut-summen dt{font-weight:600;margin-top:8px}
+.kaut-summen dd{margin:2px 0 0}
+.kaut-nur-druck{display:none}
+.kaut-name{display:block;font-weight:600}
+.kaut-marke{display:inline-block;margin:2px 0;padding:1px 6px;border:1px solid #8b8578;font-size:13px;font-weight:600}
+.kaut-marke-ok{background:#E8F1EA;border-color:#2F6B45;color:#1F4D31}
+.kaut-marke-offen{background:#FBF0DA;border-color:#8A5A00;color:#6B4600}
+.kaut-marke-neutral{background:#ECE9E2;color:#1F2125}
+.kaut-akte{display:block;font-weight:600;margin-bottom:4px}
+@media screen and (max-width:700px){
+.kaut-filter label,.kaut-filter input,.kaut-filter select{width:100%;box-sizing:border-box}
+.kaut-tabellenrahmen{overflow:visible}
+.kaut-tabelle,.kaut-tabelle tbody,.kaut-tabelle tr,.kaut-tabelle td{display:block}
+.kaut-tabelle thead{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+.kaut-tabelle tr{border-bottom:2px solid #C9A86A;padding:6px 0}
+.kaut-tabelle td{border-bottom:0;overflow-wrap:anywhere}
+.kaut-tabelle td[data-label]::before{content:attr(data-label);display:block;font-size:13px;font-weight:600;color:#555}
+.kaut-tabelle .kaut-betrag{text-align:left;white-space:normal}
+.kaut-tabelle details{max-width:none}
+}
 @media print{
 @page{size:A4 landscape;margin:12mm}
 nav,header,form,button,.kaut-navigation{display:none!important}
@@ -39,6 +62,8 @@ nav,header,form,button,.kaut-navigation{display:none!important}
 .kaut-tabelle .kaut-betrag{white-space:nowrap}
 .kaut-tabelle thead{display:table-header-group}
 .kaut-tabelle tr{break-inside:avoid}
+.kaut-erlaeuterung,.kaut-akte,.kaut-details:not([open]){display:none}
+.kaut-nur-druck{display:block}
 }
 </style>
 """
@@ -101,12 +126,18 @@ def _quellen_html(zeile: Any) -> str:
     if zeile.eingang_referenz:
         teile.append(f"<div>Eingang: {_text(zeile.eingang_referenz)}</div>")
     inhalt = "".join(teile) or "<div>Keine Quelle erfasst</div>"
-    return f"<details><summary>Quellen</summary>{inhalt}</details>"
+    status = _text(_status_wert(zeile.mieter.status))
+    return (
+        '<details class="kaut-details"><summary>Details</summary>'
+        f"<div>Vertragsstatus: {status}</div>{inhalt}</details>"
+    )
 
 
 def _eingang_html(zeile: Any) -> str:
     if zeile.eingang_cent is None:
         return "entfällt" if zeile.vereinbart_cent == 0 else "nicht belegt"
+    if zeile.eingang_stichtag is None:
+        return f'{_euro(zeile.eingang_cent)}<span class="kaut-klein">Stichtag nicht erfasst</span>'
     datum = _datum(zeile.eingang_stichtag)
     if zeile.eingang_zukuenftig:
         return (
@@ -118,10 +149,36 @@ def _eingang_html(zeile: Any) -> str:
 
 def _mietverhaeltnis_html(mieter: Any) -> str:
     wert = _status_wert(mieter.status)
-    html = _text({"AKTIV":"Aktiv", "BEENDET":"Beendet", "KUENFTIG":"Künftig"}.get(wert, wert))
+    label = {"AKTIV": "Aktiv", "BEENDET": "Beendet", "KUENFTIG": "Künftig"}.get(wert, "Status unbekannt")
+    html = f'<span class="kaut-marke kaut-marke-neutral">{label}</span>'
     if mieter.verwaltung_beendet:
         bis = f" zum {_datum(mieter.verwaltet_bis)}" if mieter.verwaltet_bis else ""
         html += f'<span class="kaut-klein">Verwaltung beendet{bis}</span>'
+    return html
+
+
+def _mieter_html(mieter: Any) -> str:
+    angaben = (mieter.objekt_bezeichnung, mieter.objekt_adresse, mieter.einheit_bezeichnung)
+    zeilen = "".join(f'<span class="kaut-klein">{_text(wert)}</span>' for wert in angaben if wert)
+    return (
+        f'<span class="kaut-name">{_text(mieter.debitor_name)}</span>'
+        f"{_mietverhaeltnis_html(mieter)}{zeilen}"
+    )
+
+
+_EINORDNUNG_KLASSEN = {
+    "Eingang bestätigt": "kaut-marke-ok",
+    "Keine Kaution vereinbart": "kaut-marke-neutral",
+    "Eingang nicht belegt": "kaut-marke-offen",
+    "Kautionsvereinbarung fehlt": "kaut-marke-offen",
+}
+
+
+def _einordnung_html(zeile: Any) -> str:
+    klasse = _EINORDNUNG_KLASSEN.get(zeile.status_label, "kaut-marke-neutral")
+    html = f'<span class="kaut-marke {klasse}">{_text(zeile.status_label)}</span>'
+    if zeile.eingang_zukuenftig:
+        html += '<span class="kaut-klein">Eingang nach Listenstichtag, nicht summiert</span>'
     return html
 
 
@@ -129,16 +186,12 @@ def _zeile_html(zeile: Any) -> str:
     mieter = zeile.mieter
     return (
         "<tr>"
-        f"<td>{_text(mieter.debitor_name)}</td>"
-        f"<td>{_text(mieter.objekt_bezeichnung)}"
-        f'<span class="kaut-klein">{_text(mieter.objekt_adresse or "")}</span>'
-        f'<span class="kaut-klein">{_text(mieter.einheit_bezeichnung or "")}</span></td>'
-        f"<td>{_mietverhaeltnis_html(mieter)}</td>"
-        f'<td class="kaut-betrag">{_betrag(zeile.vereinbart_cent)}</td>'
-        f'<td class="kaut-betrag">{_eingang_html(zeile)}</td>'
-        f"<td>{_text(zeile.status_label)}</td>"
-        f"<td>{_quellen_html(zeile)}</td>"
-        f'<td><a href="{_text(_akte_url(mieter))}">Akte öffnen</a></td>'
+        f'<td data-label="Mieter / Objekt / Einheit">{_mieter_html(mieter)}</td>'
+        f'<td class="kaut-betrag" data-label="Kaution laut Vertrag">{_betrag(zeile.vereinbart_cent)}</td>'
+        f'<td class="kaut-betrag" data-label="Bestätigter Eingang">{_eingang_html(zeile)}</td>'
+        f'<td data-label="Einordnung">{_einordnung_html(zeile)}</td>'
+        f'<td data-label="Akte / Details"><a class="kaut-akte" href="{_text(_akte_url(mieter))}">Akte öffnen</a>'
+        f"{_quellen_html(zeile)}</td>"
         "</tr>"
     )
 
@@ -147,31 +200,62 @@ def _summe(cent: int | None) -> str:
     return "keine bekannten Werte" if cent is None else _euro(cent)
 
 
+def _nullfaelle(liste: Any) -> int:
+    return sum(
+        z.eingang_cent == 0 and z.vereinbart_cent == 0 and not z.eingang_zukuenftig
+        for z in liste.zeilen
+    )
+
+
 def _summen_html(liste: Any) -> str:
     anzahl = len(liste.zeilen)
     entfaellt = sum(z.eingang_cent is None and z.vereinbart_cent == 0 for z in liste.zeilen)
+    nullfaelle = _nullfaelle(liste)
+    null_hinweis = f"; unter bekannt: {nullfaelle} Eingang 0,00 € ohne vereinbarte Kaution" if nullfaelle else ""
     return (
-        "<tfoot><tr>"
-        '<th colspan="3">Summe vertraglich vereinbarter Kautionen (kein Geldbestand)</th>'
-        f'<td class="kaut-betrag">{_summe(liste.vereinbart_summe_cent)}</td>'
-        f'<td colspan="4">Umfang: {anzahl} sichtbare Zeilen; '
-        f"{liste.vereinbart_bekannt} bekannt, {liste.vereinbart_fehlend} fehlend</td>"
-        "</tr><tr>"
-        '<th colspan="4">Summe bestätigter Eingänge bis Listenstichtag (kein Geldbestand)</th>'
-        f'<td class="kaut-betrag">{_summe(liste.eingang_summe_cent)}</td>'
-        f'<td colspan="3">Umfang: {anzahl} sichtbare Zeilen; '
+        '<dl class="kaut-summen">'
+        "<dt>Summe vertraglich vereinbarter Kautionen (kein Geldbestand)</dt>"
+        f"<dd>{_summe(liste.vereinbart_summe_cent)}"
+        f'<span class="kaut-klein">Umfang: {anzahl} sichtbare Zeilen; '
+        f"{liste.vereinbart_bekannt} bekannt, {liste.vereinbart_fehlend} fehlend</span></dd>"
+        "<dt>Summe bestätigter Eingänge bis Listenstichtag (kein Geldbestand)</dt>"
+        f"<dd>{_summe(liste.eingang_summe_cent)}"
+        f'<span class="kaut-klein">Umfang: {anzahl} sichtbare Zeilen; '
         f"{liste.eingang_bekannt} bekannt, {liste.eingang_fehlend} fehlend, "
-        f"{liste.eingang_zukuenftig} zukünftig (nicht summiert), {entfaellt} ohne Kaution</td>"
-        "</tr></tfoot>"
+        f"{liste.eingang_zukuenftig} zukünftig (nicht summiert), {entfaellt} ohne Kaution{null_hinweis}</span></dd>"
+        "</dl>"
     )
+
+
+_ERLAEUTERUNG = (
+    "<p>Kautionen sind strikt vom Mietsaldo getrennt. Ein bestätigter Eingang ist kein aktueller "
+    "Bank- oder Kautionsbestand. Rückzahlungen und Zinsen werden hier nicht mit dem Eingang "
+    "verrechnet. Fehlende Angaben bedeuten weder 0 noch einen Zahlungsrückstand.</p>"
+)
+
+
+def _zaehler_html(liste: Any) -> str:
+    nullfaelle = _nullfaelle(liste)
+    entfaellt = sum(z.eingang_cent is None and z.vereinbart_cent == 0 for z in liste.zeilen)
+    teile = [
+        ("Mietverhältnisse", len(liste.zeilen)),
+        ("Eingänge bestätigt", liste.eingang_bekannt - nullfaelle),
+        ("Nachweis fehlt", liste.eingang_fehlend),
+        ("Keine Kaution", entfaellt + nullfaelle),
+    ]
+    if liste.eingang_zukuenftig:
+        teile.append(("Zukünftig datiert", liste.eingang_zukuenftig))
+    inhalt = "".join(f"<span>{label}: {wert}</span>" for label, wert in teile)
+    return f'<p class="kaut-zaehler">{inhalt}</p>'
 
 
 def rendere_kautionsliste(liste: Any, *, logo: str, navigation: str) -> str:
     """Rendert ein HTML-Fragment; logo und navigation sind bereits sicheres HTML."""
     basis = liste.basis
     zeilen = "".join(_zeile_html(zeile) for zeile in liste.zeilen) or (
-        '<tr><td colspan="8">Keine Mietverhältnisse für diese Auswahl.</td></tr>'
+        '<tr><td colspan="5">Keine Mietverhältnisse für diese Auswahl.</td></tr>'
     )
+    summen = _summen_html(liste)
     return (
         f"{_CSS}"
         '<section class="kaut-seite">'
@@ -179,17 +263,19 @@ def rendere_kautionsliste(liste: Any, *, logo: str, navigation: str) -> str:
         f'<div class="kaut-logo">{logo}</div></div>'
         f'<div class="kaut-navigation">{navigation}</div>'
         f"<p>Listenstichtag: {_datum(basis.stichtag)}</p>"
-        '<p class="kaut-hinweis">Kautionen sind strikt vom Mietsaldo getrennt. Ein bestätigter '
-        "Eingang ist kein aktueller Bank- oder Kautionsbestand. Rückzahlungen und Zinsen werden "
-        "hier nicht mit dem Eingang verrechnet. Fehlende Angaben bedeuten weder 0 noch einen Zahlungsrückstand.</p>"
+        '<p class="kaut-hinweis">Die Beträge zeigen die vorhandenen Unterlagen – nicht den heutigen Kontostand.</p>'
+        f"{_zaehler_html(liste)}"
         f"{_filter_html(basis)}"
         '<button type="button" class="kaut-druck" onclick="window.print()">Drucken</button>'
         '<div class="kaut-tabellenrahmen"><table class="kaut-tabelle"><thead><tr>'
-        "<th>Mieter</th><th>Objekt/Einheit</th><th>Mietverhältnisstatus</th>"
-        '<th class="kaut-betrag">Vertraglich vereinbart</th>'
+        "<th>Mieter / Objekt / Einheit</th>"
+        '<th class="kaut-betrag">Kaution laut Vertrag</th>'
         '<th class="kaut-betrag">Bestätigter Eingang</th>'
-        "<th>Kautionsstatus</th><th>Quellen</th><th>Akte</th>"
-        f"</tr></thead><tbody>{zeilen}</tbody>{_summen_html(liste)}</table></div>"
+        "<th>Einordnung</th><th>Akte / Details</th>"
+        f"</tr></thead><tbody>{zeilen}</tbody></table></div>"
+        '<details class="kaut-erlaeuterung"><summary>Summen und Erläuterung</summary>'
+        f"{summen}{_ERLAEUTERUNG}</details>"
+        f'<div class="kaut-nur-druck">{summen}{_ERLAEUTERUNG}</div>'
         '<footer class="kaut-fuss">JLB Projects GmbH, hausverwaltung@jlb-immo.at</footer>'
         "</section>"
     )
