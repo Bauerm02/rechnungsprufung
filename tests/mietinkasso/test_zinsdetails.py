@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse
 
 from mietinkasso.backoffice.routes import listen
 from mietinkasso.backoffice.views import eur
-from mietinkasso.backoffice.zinsliste_ansicht import _details_html, _vpi_html, logo_html, rendere_zinsliste_ansicht, rendere_zinsliste_druck
+from mietinkasso.backoffice.zinsliste_ansicht import _details_html, _satz_html, _vpi_html, logo_html, rendere_zinsliste_ansicht, rendere_zinsliste_druck
 from mietinkasso.domain.money import zerlege_brutto_cent
 from mietinkasso.portallisten.service import berechne_zinsliste
 from mietinkasso.portallisten.zinsdetails import berechne_zinsdetails
@@ -432,3 +432,138 @@ def test_druck_layout_und_ci_fuss():
     assert "min-width: 404mm" in druck and "minmax(min(420px, 100%), 1fr)" in druck and "max-width: 639.98px" in druck
     assert "box-sizing: border-box" in druck and "overflow-wrap: anywhere" not in druck and "zins-teilmenge" in druck
     assert "Marc-Aurel-Straße 4/16, 1010 Wien" in druck and "FN 631126b" in druck and "UID ATU81269707" in druck and "+43 1 4351011" in druck
+
+
+def _aufteilung(dokument):
+    return dokument.split('<table class="zins-aufteilung">', 1)[1].split("</table>", 1)[0]
+
+
+def _gesamtzeile(dokument):
+    return _aufteilung(dokument).split('<tfoot class="zins-gesamt">', 1)[1].split("</tfoot>", 1)[0]
+
+
+def _betrag_zelle(cent):
+    return f'<td class="zins-zahl">{eur(cent)}</td>'
+
+
+def test_aufteilung_zeigt_jede_position_mit_zusammengefasster_kategorie_und_mehreren_saetzen():
+    _, details = _details(_repo(
+        _komponente("K-1", "HMZ", 11_000, bezeichnung="HMZ"),
+        _komponente("K-2", "BK_VZ", 2_200, bezeichnung="BK Wohnung"),
+        _komponente("K-3", "BK_PARKPLATZ", 1_200, 20_000, bezeichnung="BK Stellplatz"),
+        _komponente("K-4", "GARAGE", 6_000, 20_000, bezeichnung="Garage 7"),
+    ))
+    tabelle = _aufteilung(_ansicht(details))
+    assert 'rowspan="5"' in tabelle and tabelle.count('<tr class="zins-position">') == 4
+    assert tabelle.count("Betriebskosten") == 2 and "BK Wohnung" in tabelle and "BK Stellplatz" in tabelle
+    assert "Hauptmietzins" in tabelle and "Park/Garage" in tabelle and "Garage 7" in tabelle
+    assert "10 %" in tabelle and "20 %" in tabelle and "gemischt" in tabelle
+    for cent in (11_000, 10_000, 1_000, 2_200, 2_000, 200, 1_200, 6_000, 5_000):
+        assert _betrag_zelle(cent) in tabelle
+    assert "Mietersumme" in tabelle and _betrag_zelle(18_000) in tabelle and _betrag_zelle(2_400) in tabelle
+    assert f"<strong>{eur(20_400)}</strong>" in tabelle
+    assert eur(22_440) not in tabelle
+
+
+def test_aufteilung_zeigt_bekannte_null():
+    _, details = _details(_repo(_komponente("K-1", "BK", 0, 0)))
+    tabelle = _aufteilung(_ansicht(details))
+    assert tabelle.count(_betrag_zelle(0)) >= 3 and "0 %" in tabelle and "unbekannt" not in tabelle
+
+
+def test_aufteilung_zeigt_unbekannte_ust_und_teilsumme():
+    _, details = _details(_repo(_komponente("K-1", "HMZ", 1_100), _komponente("K-2", "BK", 500, 7_000)))
+    dokument = _ansicht(details)
+    tabelle = _aufteilung(dokument)
+    assert tabelle.count('<span class="zins-warn">unbekannt</span>') == 3
+    assert "teilweise unbekannt" in tabelle and _betrag_zelle(500) in tabelle and _betrag_zelle(0) not in tabelle
+    assert f"<strong>{eur(1_600)}</strong>" in tabelle and f"{eur(500)} brutto ohne Aufteilung" in tabelle
+    teilsumme = f'{eur(1_000)}<span class="zins-klein zins-warn">Teilsumme</span>'
+    assert teilsumme in tabelle and teilsumme in _gesamtzeile(dokument)
+    assert "Prüffall" in tabelle
+
+
+def test_aufteilung_ohne_komponenten_erfindet_keine_summe():
+    _, details = _details(_repo())
+    tabelle = _aufteilung(_ansicht(details))
+    assert "Keine Komponenten hinterlegt" in tabelle and "Betrag unbekannt" in tabelle
+    assert "rowspan" not in tabelle and "Mietersumme" not in tabelle
+    assert eur(0) not in tabelle and "Teilsumme" not in tabelle
+    assert "1 Zeile(n) mit fehlendem" in tabelle
+
+
+@pytest.mark.parametrize(
+    ("status", "text"),
+    [
+        ("LEERSTAND", "Keine Mietbestandteile (Leerstand)"),
+        ("KURZZEITVERMIETUNG", "Variabel – kein fester Betrag"),
+        ("SELFSTORAGE", "Selfstorage"),
+    ],
+)
+def test_aufteilung_bildet_status_ohne_scheinsumme_ab(status, text):
+    _, details = _details(FakeRepo(einheiten=[_einheit(status=status)]))
+    tabelle = _aufteilung(_ansicht(details))
+    assert text in tabelle and eur(0) not in tabelle and "Mietersumme" not in tabelle
+
+
+def test_aufteilung_gesamtsumme_und_teilsumme_bei_fehlendem_vertragsbetrag():
+    debitoren = {f"D-{i}": SimpleNamespace(name=f"Mieter {i}") for i in (1, 2, 3)}
+    repo = FakeRepo(
+        einheiten=[_einheit("E-1"), _einheit("E-2")],
+        vertraege=[_vertrag(), _vertrag("V-2", "E-2", "D-2")],
+        komponenten=[_komponente("K-1", "HMZ", 1_100), _komponente("K-2", "HMZ", 2_200, vertrag_id="V-2")],
+        debitoren=debitoren,
+    )
+    _, vollstaendig = _details(repo)
+    dokument = _ansicht(vollstaendig)
+    fuss = _gesamtzeile(dokument)
+    assert _aufteilung(dokument).count("Gesamtsumme") == 1 and _aufteilung(dokument).count('class="zins-objektzeile"') == 1
+    assert _betrag_zelle(3_000) in fuss and _betrag_zelle(300) in fuss and _betrag_zelle(3_300) in fuss
+    assert "Teilsumme" not in fuss
+
+    repo.einheiten.append(_einheit("E-3"))
+    repo.vertraege.append(_vertrag("V-3", "E-3", "D-3"))
+    _, teilweise = _details(repo)
+    fuss = _gesamtzeile(_ansicht(teilweise))
+    assert f'{eur(3_300)}<span class="zins-klein zins-warn">Teilsumme</span>' in fuss
+    assert "1 Zeile(n) mit fehlendem" in fuss
+
+
+def test_aufteilung_escaped_fremdwerte_in_ansicht_und_druck():
+    boese = "<script>alert(1)</script>"
+    repo = _repo(_komponente("K-1", boese, 100, bezeichnung=boese), name=boese)
+    repo.einheiten[0].bezeichnung = boese
+    _, details = _details(repo)
+    for dokument in (_ansicht(details), _druck(details)):
+        tabelle = _aufteilung(dokument)
+        assert boese not in dokument and html.escape(boese) in tabelle
+
+
+def test_ansicht_zeigt_aufteilung_zuerst_und_behaelt_uebersicht():
+    _, details = _details(_repo(_komponente("K-1", "HMZ", 1_100)))
+    ansicht = _ansicht(details)
+    assert ansicht.index('<table class="zins-aufteilung">') < ansicht.index('<details class="zins-uebersicht">')
+    assert "<summary>Vertrags- und Indexübersicht</summary>" in ansicht
+    assert "Akte öffnen" in _aufteilung(ansicht) and 'tabindex="0"' in ansicht
+    assert '<table class="zins-tabelle">' in ansicht.split('<details class="zins-uebersicht">', 1)[1]
+
+
+def test_druck_enthaelt_aufteilung_und_vertragsuebersicht():
+    _, details = _details(_repo(_komponente("K-1", "HMZ", 1_100)))
+    druck = _druck(details)
+    assert '<table class="zins-aufteilung">' in druck and '<table class="zins-tabelle">' in druck
+    assert "Vertrags- und Indexübersicht" in druck and "Mietbeginn" in druck and "Reihe, Basismonat" in druck
+    assert '<details class="zins-uebersicht">' not in druck and "Akte öffnen" not in druck
+    assert "Mietersumme" in druck and "size: A3 landscape" in druck
+
+
+@pytest.mark.parametrize(
+    ("satz", "text"),
+    [(0, "0 %"), (10_000, "10 %"), (20_000, "20 %"), (12_500, "12,5 %")],
+)
+def test_satz_wird_als_prozent_angezeigt(satz, text):
+    assert _satz_html(satz) == text
+
+
+def test_unbekannter_satz_wird_nicht_zu_null():
+    assert "unbekannt" in _satz_html(None) and "0 %" not in _satz_html(None)
