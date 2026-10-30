@@ -28,6 +28,7 @@ _LISTEN_LINKS = (
     ("/backoffice/mieterliste", "Mieterliste"),
     ("/backoffice/zinsliste", "Zinsliste"),
     ("/backoffice/salden", "Salden"),
+    ("/backoffice/kautionen", "Kautionen"),
 )
 
 

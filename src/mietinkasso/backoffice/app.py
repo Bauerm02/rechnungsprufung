@@ -18,6 +18,7 @@ from mietinkasso.backoffice.routes import (
     indexbetrieb as indexbetrieb_routes,
     indexprofile as indexprofile_routes,
     konten as konten_routes,
+    kautionen as kautionen_routes,
     listen as listen_routes,
     mahnwesen as mahnwesen_routes,
     mailversand as mailversand_routes,
@@ -40,6 +41,7 @@ router.include_router(eigentuemerzahlungen.router)
 # Drei einsegmentige, statische GET-Pfade (/mieterliste, /zinsliste,
 # /salden) - überlappen mit keinem Platzhalter.
 router.include_router(listen_routes.router)
+router.include_router(kautionen_routes.router)
 router.include_router(konten_routes.router)
 router.include_router(bank_routes.router)
 router.include_router(mahnwesen_routes.router)

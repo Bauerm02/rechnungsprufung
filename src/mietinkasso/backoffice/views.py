@@ -96,7 +96,7 @@ _BEREICHE = (
 _BEREICH_PFADPRAEFIXE = {
     "mieter": (
         "/backoffice/vertraege", "/backoffice/vertrag/", "/backoffice/konto/", "/backoffice/op/",
-        "/backoffice/mieterliste",
+        "/backoffice/mieterliste", "/backoffice/kautionen",
     ),
     "zahlungen": (
         "/backoffice/zahlungen", "/backoffice/bank", "/backoffice/mahnwesen", "/backoffice/mailversand",

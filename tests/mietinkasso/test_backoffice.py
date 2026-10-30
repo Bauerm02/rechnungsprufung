@@ -26,6 +26,42 @@ from pathlib import Path
 import pytest
 
 
+def test_kautionsliste_echte_route_rein_lesend_und_scope(backoffice_client):
+    import hashlib
+    from sqlalchemy import text
+    import mietinkasso.backoffice.dependencies as deps
+    from mietinkasso.indexautomatik.zeit import heute_wien
+
+    client, _, _, op_service = backoffice_client
+    client.cookies.clear()
+    assert client.get('/backoffice/kautionen', follow_redirects=False).status_code == 303
+    _login(client)
+    _portal_listen_bestand(op_service)
+    deps._stammdaten_repo.add_mietvertragsprofil(
+        vertrag_id='V-PL1-1', nutzungsart='WOHNUNG', quelle_typ='TEST', erstellt_von='test',
+        vertragliche_kaution_cent=150000,
+    )
+    deps._stammdaten_repo.set_kaution(
+        id='KAUT-LISTE-TEST', vertrag_id='V-PL1-1', betrag_cent=100000,
+        stichtag=heute_wien(), referenz='Synthetische Eingangsbestätigung',
+    )
+
+    def fingerprint():
+        with deps._session_factory() as s:
+            tables=[row[0] for row in s.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))]
+            return {t:hashlib.sha256(repr(sorted(s.execute(text('SELECT * FROM "'+t+'"')).fetchall(),key=repr)).encode()).hexdigest() for t in tables}
+
+    before=fingerprint()
+    response=client.get('/backoffice/kautionen', params={'objekt_id':'PL1'})
+    assert response.status_code == 200
+    assert '1.500,00 €' in response.text and '1.000,00 €' in response.text
+    assert 'kein aktueller Bank- oder Kautionsbestand' in response.text
+    assert 'href="/backoffice/vertrag/V-PL1-1?von_objekt=PL1"' in response.text
+    assert client.get('/backoffice/kautionen', params={'objekt_id':'107'}).status_code == 400
+    assert client.get('/backoffice/kautionen', params={'status':'erfunden'}).status_code == 400
+    assert before == fingerprint()
+
+
 @pytest.fixture(scope="module")
 def backoffice_client():
     from mietinkasso.infrastructure.config import get_settings
