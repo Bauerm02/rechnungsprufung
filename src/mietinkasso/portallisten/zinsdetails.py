@@ -137,6 +137,7 @@ class ZinsDetailZeile:
     variabel_ohne_fix: bool
     vpi: VpiAngabe | None
     hinweise: tuple[str, ...]
+    bk_hk_inklusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -311,6 +312,7 @@ def _zeile(zeile: ZinsZeile, stammdaten_repository, index_repository, einheiten:
         variabel_ohne_fix=zeile.variabel and not positionen,
         vpi=_vpi(zeile.vertrag_id, profil, index_repository) if zeile.vertrag_id is not None else None,
         hinweise=tuple(hinweise),
+        bk_hk_inklusive=getattr(profil, "bk_hk_abrechnungsart", None) == "PAUSCHALE_INKLUSIVMIETE",
     )
 
 

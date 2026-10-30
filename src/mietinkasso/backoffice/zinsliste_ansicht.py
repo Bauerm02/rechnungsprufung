@@ -15,6 +15,7 @@ from urllib.parse import quote, urlencode
 from mietinkasso.backoffice.views import eur
 from mietinkasso.indexautomatik.zeit import WIEN
 from mietinkasso.portallisten.zinsdetails import KATEGORIEN, Betraege, ZinsDetailListe, ZinsDetailZeile
+from mietinkasso.portallisten.zinsvergleich import ART_BETRAG, ZinsAenderung, vergleiche_zinsdetails
 
 _LOGO_MAX_BYTES = 1024 * 1024
 _KEIN_WERT = '<span class="zins-fehlt">—</span>'
@@ -60,9 +61,27 @@ ZINS_CSS = """
 .zins-summen .zins-tabelle { min-width: 0; }
 .zins-summen section { min-width: 0; overflow-x: auto; }
 .zins-summen .zins-tabelle thead { position: static; }
+.zins-mobil { display: none; }
+.zins-mobil-objekt { font-family: Forum, Cambria, Georgia, serif; font-weight: 400; font-size: 16px; margin: 12px 0 4px; }
+.zins-mobil-mieter { background: #fff; border: 1px solid #d8d3c9; margin-bottom: 4px; overflow-wrap: break-word; }
+.zins-mobil-mieter > summary { cursor: pointer; padding: 8px; }
+.zins-mobil-kopf { display: inline-flex; justify-content: space-between; gap: 8px; width: calc(100% - 24px); vertical-align: top; }
+.zins-mobil-name { min-width: 0; }
+.zins-mobil-brutto { flex: 0 0 auto; max-width: 48%; text-align: right; font-variant-numeric: tabular-nums; }
+.zins-mobil-brutto strong { white-space: nowrap; }
+.zins-mobil-inhalt { padding: 0 8px 8px; }
+.zins-mobil-positionen { list-style: none; margin: 8px 0 0; padding: 0; }
+.zins-mobil-positionen li { border-top: 1px solid #d8d3c9; padding: 6px 0; }
+.zins-mobil-werte { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px 12px; margin: 4px 0 0; }
+.zins-mobil-werte div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 6px; }
+.zins-mobil-werte dt { color: #5c5c5c; }
+.zins-mobil-werte dd { margin: 0; font-variant-numeric: tabular-nums; }
+.zins-vergleich-liste { margin: 0; padding: 6px 12px 10px 28px; font-size: 13px; overflow-wrap: break-word; }
 @media screen and (max-width: 639.98px) {
   body:not(.zins-druckseite) .zins-summen { grid-template-columns: 1fr; }
   body:not(.zins-druckseite) .zins-summen .zins-teilmenge { display: none; }
+  body:not(.zins-druckseite) .zins-mobil { display: block; }
+  body:not(.zins-druckseite) .zins-aufteilung-rahmen { display: none; }
 }
 .zins-legende, .zins-fuss { font-size: 12px; margin-top: 12px; }
 .zins-fuss { border-top: 1px solid #C9A86A; padding-top: 6px; }
@@ -129,6 +148,7 @@ ZINS_CSS = """
   .zins-aufteilung tr { break-inside: avoid; page-break-inside: avoid; }
   .zins-aufteilung .zins-position, .zins-aufteilung .zins-objektzeile { break-after: avoid; page-break-after: avoid; }
   .zins-uebersicht-druck { break-before: page; page-break-before: always; }
+  .zins-mobil { display: none !important; }
   * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 }
 """
@@ -419,16 +439,12 @@ def _summen_html(details: ZinsDetailListe) -> str:
 
 
 _LEGENDE = (
-    '<p class="zins-legende">— = nicht hinterlegt oder unbekannt, nie 0 · 0,00 € = bekannte Null · „unbekannt“ = Aufteilung fehlt · '
-    "variabel = kein fester Betrag, nicht in Summen · Komponenten netto; Gesamtbrutto unverändert laut Vorschreibung, USt herausgerechnet · "
+    '<p class="zins-legende">— = nicht hinterlegt oder unbekannt, nie 0 · 0,00 € = bekannte Null · „unbekannt“ = Aufteilung oder Satz fehlt · '
+    "Teilsumme = mindestens ein Betrag fehlt · variabel = kein fester Betrag, nicht in Summen · "
+    "Netto, USt und Brutto aus den hinterlegten Komponenten; Brutto unverändert laut Vorschreibung, USt herausgerechnet, nie aufgeschlagen · "
     "„erfasster Beginn“ = kein gesonderter ursprünglicher Mietbeginn belegt; kann Verwaltungsübernahme sein · Nutzung = aktueller Status · "
-    "VPI = heutiger Stand, „erfasst / ungeprüft“ = unverbindlicher Profilwert.</p>"
-)
-_AUFTEILUNG_LEGENDE = (
-    '<p class="zins-legende">Mietbestandteile: Netto, USt und Brutto je Position aus den hinterlegten Komponenten; '
-    "Brutto ist der hinterlegte Betrag, USt wird nie erneut aufgeschlagen · 0,00 € = bekannte Null · "
-    "— = nicht hinterlegt, nie 0 · „unbekannt“ = Aufteilung oder Satz fehlt · "
-    "Teilsumme = mindestens ein Betrag fehlt in dieser Summe.</p>"
+    "VPI = heutiger Stand, kein historischer Monatswert, „erfasst / ungeprüft“ = unverbindlicher Profilwert · "
+    "Hauptmietzins ohne getrennte Betriebskosten ist kein Beleg für eine Pauschale; gezeigt wird nur die vorhandene Aufteilung.</p>"
 )
 _TEILSUMME = '<span class="zins-klein zins-warn">Teilsumme</span>'
 
@@ -468,7 +484,9 @@ def _betrag_offen(zeile: ZinsDetailZeile) -> bool:
     return zeile.basis.vertrag_id is not None or zeile.anzeige_art not in _OHNE_SOLLBETRAG
 
 
-def _bestandteil_html(position) -> str:
+def _bestandteil_html(position, bk_hk_inklusive: bool = False) -> str:
+    if bk_hk_inklusive and position.art == "HMZ":
+        return 'Pauschalmiete<span class="zins-klein">inkl. Betriebs- und Heizkosten</span>'
     name = _KATEGORIE_NAMEN.get(position.kategorie, position.kategorie)
     bezeichnung = (position.bezeichnung or "").strip()
     if bezeichnung and bezeichnung.casefold() not in (position.art.casefold(), name.casefold()):
@@ -487,6 +505,8 @@ def _bestandteil_html(position) -> str:
 
 def _mieter_zelle(zeile, objekt_filter, druck) -> str:
     teile = [f"<strong>{h(zeile.anzeige_name)}</strong>"]
+    if zeile.bk_hk_inklusive:
+        teile.append('<span class="zins-klein">BK und Heizung in der Pauschalmiete enthalten</span>')
     if zeile.vertragspartner:
         teile.append(f'<span class="zins-klein">Vertrag: {h(zeile.vertragspartner)}</span>')
     vertrag_id = zeile.basis.vertrag_id
@@ -525,7 +545,7 @@ def _aufteilung_zeilen(zeile: ZinsDetailZeile, objekt_filter: str | None, druck:
     reihen = []
     for nummer, position in enumerate(zeile.positionen):
         reihen.append(
-            f'<tr class="zins-position">{kopf if nummer == 0 else ""}<td>{_bestandteil_html(position)}</td>'
+            f'<tr class="zins-position">{kopf if nummer == 0 else ""}<td>{_bestandteil_html(position, zeile.bk_hk_inklusive)}</td>'
             f'<td class="zins-zahl">{_aufteilung_zeile(position.netto_cent, gesamt)}</td>'
             f'<td class="zins-zahl">{_satz_html(position.ust_satz_promille)}</td>'
             f'<td class="zins-zahl">{_aufteilung_zeile(position.ust_cent, gesamt)}</td>'
@@ -547,21 +567,36 @@ def _aufteilung_zeilen(zeile: ZinsDetailZeile, objekt_filter: str | None, druck:
     return "".join(reihen)
 
 
-def _aufteilung_fuss_html(details: ZinsDetailListe) -> str:
+def _offen_grund(zeile: ZinsDetailZeile) -> str:
+    if zeile.gesamt is not None:
+        return "variabler Anteil"
+    return "variabel" if zeile.variabel_ohne_fix else "Betrag fehlt"
+
+
+def _feste_summe(details: ZinsDetailListe) -> tuple[str, str, int]:
+    """Hinweise, Bruttowert und Anzahl offener Zeilen für Tabelle und Mobilansicht."""
+
     gesamt = details.summen.gesamt
     basis = details.basis.summen
-    offen = sum(1 for zeile in details.zeilen if _betrag_offen(zeile))
+    offene = [zeile for zeile in details.zeilen if _betrag_offen(zeile)]
     hinweise = f'<span class="zins-klein">{basis.anzahl_mit_betrag} von {basis.anzahl_zeilen} Zeile(n) mit festem Betrag</span>'
     if not gesamt.vollstaendig:
         hinweise += f'<span class="zins-klein">{_teilmenge(gesamt)}</span>'
-    if offen:
-        hinweise += f'<span class="zins-klein zins-warn">{offen} Zeile(n) mit fehlendem oder variablem Betrag nicht oder nur teilweise enthalten</span>'
+    if offene:
+        namen = " · ".join(f"{h(zeile.top)}: {_offen_grund(zeile)}" for zeile in offene)
+        hinweise += f'<span class="zins-klein zins-warn">{len(offene)} Zeile(n) mit fehlendem oder variablem Betrag nicht oder nur teilweise enthalten: {namen}</span>'
     brutto = _geld(gesamt.brutto_cent if gesamt.anzahl_positionen else None)
-    if offen and gesamt.anzahl_positionen:
+    if offene and gesamt.anzahl_positionen:
         brutto += _TEILSUMME
+    return hinweise, brutto, len(offene)
+
+
+def _aufteilung_fuss_html(details: ZinsDetailListe) -> str:
+    gesamt = details.summen.gesamt
+    hinweise, brutto, offen = _feste_summe(details)
     alle = [position for zeile in details.zeilen for position in zeile.positionen]
     return (
-        f'<tfoot class="zins-gesamt"><tr><th colspan="3" scope="row">Gesamtsumme{hinweise}</th>'
+        f'<tfoot class="zins-gesamt"><tr><th colspan="3" scope="row">Summe feste Monatsvorschreibungen{hinweise}</th>'
         f'<td class="zins-zahl">{_summenwert(gesamt.netto_bekannt_cent, gesamt, bool(offen))}</td>'
         f'<td class="zins-zahl">{_summen_satz_html(alle)}</td>'
         f'<td class="zins-zahl">{_summenwert(gesamt.ust_bekannt_cent, gesamt, bool(offen))}</td>'
@@ -599,6 +634,98 @@ def _aufteilung_html(details: ZinsDetailListe, druck: bool) -> str:
     )
 
 
+def _mobil_wert(name: str, wert: str) -> str:
+    return f"<div><dt>{name}</dt><dd>{wert}</dd></div>"
+
+
+def _mobil_position(position, gesamt: Betraege, bk_hk_inklusive: bool = False) -> str:
+    return (
+        f'<li>{_bestandteil_html(position, bk_hk_inklusive)}<dl class="zins-mobil-werte">'
+        f'{_mobil_wert("Netto", _aufteilung_zeile(position.netto_cent, gesamt))}'
+        f'{_mobil_wert("USt-Satz", _satz_html(position.ust_satz_promille))}'
+        f'{_mobil_wert("USt", _aufteilung_zeile(position.ust_cent, gesamt))}'
+        f'{_mobil_wert("Brutto", eur(position.brutto_cent))}</dl></li>'
+    )
+
+
+def _mobil_zeile(zeile: ZinsDetailZeile, objekt_filter: str | None, monat: str) -> str:
+    gesamt = zeile.gesamt
+    if gesamt is None:
+        positionen = f"<p>{_ohne_positionen_text(zeile)}</p>{_brutto_html(zeile, monat, False)}"
+        teilsumme = ""
+    else:
+        eintraege = "".join(_mobil_position(position, gesamt, zeile.bk_hk_inklusive) for position in zeile.positionen)
+        positionen = f'<ul class="zins-mobil-positionen">{eintraege}</ul>'
+        teilsumme = _TEILSUMME if zeile.basis.variabel else ""
+    return (
+        '<details class="zins-mobil-mieter"><summary><span class="zins-mobil-kopf">'
+        f'<span class="zins-mobil-name">{h(zeile.top)} · <strong>{h(zeile.anzeige_name)}</strong></span>'
+        f'<span class="zins-mobil-brutto">{_brutto_html(zeile, monat, True)}{teilsumme}</span></span></summary>'
+        f'<div class="zins-mobil-inhalt">{_mieter_zelle(zeile, objekt_filter, False)}{positionen}</div></details>'
+    )
+
+
+def _mobil_html(details: ZinsDetailListe) -> str:
+    objekt_filter, monat = details.basis.objekt_filter, details.basis.monat
+    teile: list[str] = []
+    letztes_objekt: object = object()
+    for zeile in details.zeilen:
+        if zeile.basis.objekt_id != letztes_objekt:
+            letztes_objekt = zeile.basis.objekt_id
+            teile.append(f'<h3 class="zins-mobil-objekt">{h(zeile.basis.objekt_bezeichnung)}</h3>')
+        teile.append(_mobil_zeile(zeile, objekt_filter, monat))
+    hinweise, brutto, _ = _feste_summe(details)
+    inhalt = "".join(teile) or "<p>Keine Einheiten für diesen Filter.</p>"
+    return (
+        f'<section class="zins-mobil" aria-label="Mietbeträge je Mieter"><h2 class="zins-abschnitt">Mietbeträge {h(monat)}</h2>{inhalt}'
+        f"<p><strong>Summe feste Monatsvorschreibungen</strong> {brutto}{hinweise}</p></section>"
+    )
+
+
+_VERGLEICH_FEHLT = '<p class="zins-klein">Vergleich nicht verfügbar.</p>'
+_VERGLEICH_GRENZE = (
+    '<p class="zins-klein">Vergleich je Monatserster im gleichen Filter; keine Aussage, ob eine Änderung erlaubt oder beschlossen ist. '
+    "Nutzungsstatus und VPI werden nicht historisiert.</p>"
+)
+
+
+def _delta_html(delta: int | None) -> str:
+    if delta is None:
+        return '<span class="zins-warn">nicht berechenbar</span>'
+    return f"{'+' if delta > 0 else '-'}{eur(abs(delta))}"
+
+
+def _aenderung_html(aenderung: ZinsAenderung) -> str:
+    kopf = f"<strong>{h(aenderung.top)}</strong> · {h(aenderung.mieter)}: {h(aenderung.bereich)}"
+    if aenderung.art == ART_BETRAG:
+        werte = f": alt {_geld(aenderung.alt_cent)}, neu {_geld(aenderung.neu_cent)}, Differenz {_delta_html(aenderung.delta_cent)}"
+    elif aenderung.alt_text is None and aenderung.neu_text is None:
+        werte = ""
+    else:
+        werte = f": alt {_text(aenderung.alt_text)}, neu {_text(aenderung.neu_text)}"
+    return f"<li>{kopf}{werte}</li>"
+
+
+def _vergleich_inhalt(details: ZinsDetailListe, vormonat_details: ZinsDetailListe | None) -> str:
+    if vormonat_details is None:
+        return _VERGLEICH_FEHLT
+    try:
+        aenderungen = vergleiche_zinsdetails(vormonat_details, details)
+    except Exception:  # Darstellung bleibt nutzbar; nie eine falsche Leermeldung.
+        return _VERGLEICH_FEHLT
+    if not aenderungen:
+        return f'<p class="zins-klein">Keine Änderungen zum Vormonat im gleichen Filter.</p>{_VERGLEICH_GRENZE}'
+    eintraege = "".join(_aenderung_html(aenderung) for aenderung in aenderungen)
+    return f'<ul class="zins-vergleich-liste">{eintraege}</ul>{_VERGLEICH_GRENZE}'
+
+
+def _vergleich_html(details: ZinsDetailListe, vormonat_details: ZinsDetailListe | None, druck: bool) -> str:
+    inhalt = _vergleich_inhalt(details, vormonat_details)
+    if druck:
+        return f'<section class="zins-vergleich-druck"><h2 class="zins-abschnitt">Änderungen zum Vormonat</h2>{inhalt}</section>'
+    return f'<details class="zins-uebersicht zins-vergleich"><summary>Änderungen zum Vormonat</summary>{inhalt}</details>'
+
+
 def _fuss_html() -> str:
     jetzt = datetime.now(WIEN)
     return (
@@ -609,7 +736,7 @@ def _fuss_html() -> str:
 
 def rendere_zinsliste_ansicht(
     details: ZinsDetailListe, *, logo: str, listen_links: str, filter_html: str, monatslinks: tuple[str, ...],
-    zeitstempel_html: str, druck_href: str,
+    zeitstempel_html: str, druck_href: str, vormonat_details: ZinsDetailListe | None = None,
 ) -> str:
     liste = details.basis
     links = "".join(f"<span>{link}</span>" for link in monatslinks)
@@ -627,6 +754,8 @@ def rendere_zinsliste_ansicht(
         {links}
       </div>
       {_aufteilung_html(details, druck=False)}
+      {_mobil_html(details)}
+      {_vergleich_html(details, vormonat_details, druck=False)}
       <details class="zins-uebersicht">
         <summary>Vertrags- und Indexübersicht</summary>
         <p class="zins-klein">Alle {_SPALTEN} Spalten: waagrecht scrollen; Top und Mieter bleiben fixiert.</p>
@@ -634,13 +763,14 @@ def rendere_zinsliste_ansicht(
       </details>
       {_summen_html(details)}
       {_LEGENDE}
-      {_AUFTEILUNG_LEGENDE}
       {_fuss_html()}
     </div>
     <p><a href="/backoffice/">&larr; zur Übersicht</a></p>"""
 
 
-def rendere_zinsliste_druck(details: ZinsDetailListe, *, logo: str, zurueck_href: str) -> str:
+def rendere_zinsliste_druck(
+    details: ZinsDetailListe, *, logo: str, zurueck_href: str, vormonat_details: ZinsDetailListe | None = None,
+) -> str:
     liste = details.basis
     objekt = next((o.bezeichnung for o in liste.objekt_optionen if o.id == liste.objekt_filter), "Alle Objekte")
     suche = f" · Suche: {h(liste.suche)}" if liste.suche else ""
@@ -658,10 +788,10 @@ def rendere_zinsliste_druck(details: ZinsDetailListe, *, logo: str, zurueck_href
       <a href="{h(zurueck_href)}">Zurück zur Zinsliste</a>
     </p>
     {_aufteilung_html(details, druck=True)}
+    {_vergleich_html(details, vormonat_details, druck=True)}
     <section class="zins-uebersicht-druck"><h2 class="zins-abschnitt">Vertrags- und Indexübersicht</h2>{_tabelle_html(details, druck=True)}</section>
     {_summen_html(details)}
     {_LEGENDE}
-    {_AUFTEILUNG_LEGENDE}
     {_fuss_html()}
   </div>
 </body>

@@ -9,6 +9,7 @@ Rückstandsübersicht (`routes/dashboard.py`)."""
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from html import escape as h
 from urllib.parse import urlencode
@@ -40,6 +41,7 @@ from mietinkasso.backoffice.zinsliste_ansicht import (
 #: Ohne eigenes Prefix - das gemeinsame `/backoffice`-Prefix wird GENAU
 #: EINMAL in `backoffice/app.py` gesetzt.
 router = APIRouter()
+_log = logging.getLogger(__name__)
 
 
 _NICHT_HINTERLEGT = '<span class="muted">Nicht hinterlegt</span>'
@@ -324,6 +326,26 @@ def _zins_zeile_html(z, liste) -> str:
     )
 
 
+def _vormonat_details(ctx, monat: str, objekt_id: str | None, q: str | None):
+    """Gleiche Pipeline mit gleichem Scope; ohne Vormonat oder bei Fehler `None`, nie eine Leermeldung."""
+
+    try:
+        vormonat = _nachbarmonat(monat, -1)
+        if vormonat is None:
+            return None
+        liste = berechne_zinsliste(
+            ctx=ctx, monat=vormonat, objekt_id=objekt_id or None,
+            stammdaten_repository=deps._stammdaten_repo, variable_service=deps._variableabrechnung.service,
+            komponenten_freigabe_service=deps._variableabrechnung.komponenten_freigabe_service, suche=q,
+        )
+        return berechne_zinsdetails(
+            liste=liste, stammdaten_repository=deps._stammdaten_repo, index_repository=getattr(deps, "_index_repo", None),
+        )
+    except Exception as exc:  # Vergleich ist optional; die aktuelle Liste bleibt nutzbar.
+        _log.warning("Vormonatsvergleich nicht verfügbar: %s", type(exc).__name__)
+        return None
+
+
 @router.get("/zinsliste", response_class=HTMLResponse)
 def zinsliste(
     request: Request, monat: str | None = None, objekt_id: str | None = None, q: str | None = None, druck: bool = False,
@@ -332,8 +354,9 @@ def zinsliste(
     heute = heute_wien()
     gewaehlter_monat = (monat or "").strip() or f"{heute.year:04d}-{heute.month:02d}"
     try:
+        ctx = _ctx(session)
         liste = berechne_zinsliste(
-            ctx=_ctx(session), monat=gewaehlter_monat, objekt_id=objekt_id or None,
+            ctx=ctx, monat=gewaehlter_monat, objekt_id=objekt_id or None,
             stammdaten_repository=deps._stammdaten_repo, variable_service=deps._variableabrechnung.service,
             komponenten_freigabe_service=deps._variableabrechnung.komponenten_freigabe_service, suche=q,
         )
@@ -343,12 +366,13 @@ def zinsliste(
     except (MietinkassoError, ValueError) as exc:
         return _fehlerseite(session, "Zinsliste", str(exc), "/backoffice/zinsliste")
 
+    vormonat_details = _vormonat_details(ctx, liste.monat, objekt_id, q)
     logo = logo_html(getattr(getattr(deps, "_settings", None), "brief_logo_pfad", None))
     if druck:
         zurueck_href = _pfad_mit_query(
             "/backoffice/zinsliste", monat=liste.monat, objekt_id=liste.objekt_filter, q=liste.suche,
         )
-        return HTMLResponse(rendere_zinsliste_druck(details, logo=logo, zurueck_href=zurueck_href))
+        return HTMLResponse(rendere_zinsliste_druck(details, logo=logo, zurueck_href=zurueck_href, vormonat_details=vormonat_details))
 
     monatslinks = []
     for schritt, text in ((-1, "&larr; Vormonat"), (1, "Folgemonat &rarr;")):
@@ -382,6 +406,7 @@ def zinsliste(
         monatslinks=tuple(monatslinks),
         zeitstempel_html=_zeitstempel_html(f"Vertragsstand am {liste.monatsanfang.isoformat()} · keine Zahlungsdaten"),
         druck_href=druck_href,
+        vormonat_details=vormonat_details,
     )
     inhalt += _AUTO_AKTUALISIERUNG_HTML
     return _layout(request, session, f"Zinsliste {liste.monat}", inhalt)

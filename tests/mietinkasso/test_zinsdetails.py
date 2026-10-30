@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import inspect
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from mietinkasso.backoffice.zinsliste_ansicht import _details_html, _satz_html, 
 from mietinkasso.domain.money import zerlege_brutto_cent
 from mietinkasso.portallisten.service import berechne_zinsliste
 from mietinkasso.portallisten.zinsdetails import berechne_zinsdetails
+from mietinkasso.portallisten.zinsvergleich import vergleiche_zinsdetails
 
 MONAT = "2026-09"
 ANFANG = date(2026, 9, 1)
@@ -517,7 +519,8 @@ def test_aufteilung_gesamtsumme_und_teilsumme_bei_fehlendem_vertragsbetrag():
     _, vollstaendig = _details(repo)
     dokument = _ansicht(vollstaendig)
     fuss = _gesamtzeile(dokument)
-    assert _aufteilung(dokument).count("Gesamtsumme") == 1 and _aufteilung(dokument).count('class="zins-objektzeile"') == 1
+    assert _aufteilung(dokument).count("Summe feste Monatsvorschreibungen") == 1 and _aufteilung(dokument).count('class="zins-objektzeile"') == 1
+    assert "Gesamtsumme" not in _aufteilung(dokument)
     assert _betrag_zelle(3_000) in fuss and _betrag_zelle(300) in fuss and _betrag_zelle(3_300) in fuss
     assert "Teilsumme" not in fuss
 
@@ -565,5 +568,212 @@ def test_satz_wird_als_prozent_angezeigt(satz, text):
     assert _satz_html(satz) == text
 
 
+VORMONAT = "2026-08"
+
+
+def _vergleichsliste(repo, monat=VORMONAT, suche=None):
+    _, details = _details(repo, suche=suche)
+    return replace(details, basis=replace(details.basis, monat=monat))
+
+
+def _vergleich(alt_repo, neu_repo, suche=None):
+    return vergleiche_zinsdetails(_vergleichsliste(alt_repo, suche=suche), _vergleichsliste(neu_repo, MONAT, suche))
+
+
+def _repo_mit(vertrag_id, debitor_id, name, *komponenten):
+    return FakeRepo(
+        einheiten=[_einheit()], vertraege=[_vertrag(vertrag_id, "E-1", debitor_id)], komponenten=komponenten,
+        debitoren={debitor_id: SimpleNamespace(name=name)},
+    )
+
+
+def _mobil(dokument):
+    return dokument.split('<section class="zins-mobil"', 1)[1].split("</section>", 1)[0]
+
+
+def _ansicht_mit(details, vormonat_details):
+    return rendere_zinsliste_ansicht(
+        details, logo="", listen_links="", filter_html="", monatslinks=(), zeitstempel_html="", druck_href="/druck",
+        vormonat_details=vormonat_details,
+    )
+
+
+def test_feste_summe_nennt_offene_zeilen_ohne_geld_zu_erfinden():
+    repo = FakeRepo(
+        einheiten=[_einheit("E-1"), _einheit("E-2"), _einheit("E-3", status="KURZZEITVERMIETUNG")],
+        vertraege=[_vertrag(), _vertrag("V-2", "E-2", "D-2")], komponenten=[_komponente("K-1", "HMZ", 1_100)],
+        debitoren={"D-1": SimpleNamespace(name="Anna"), "D-2": SimpleNamespace(name="Bert")},
+    )
+    _, details = _details(repo)
+    fuss = _gesamtzeile(_ansicht(details))
+    assert "Summe feste Monatsvorschreibungen" in fuss and "Top E-2: Betrag fehlt" in fuss and "Top E-3: variabel" in fuss
+    assert f'{eur(1_100)}<span class="zins-klein zins-warn">Teilsumme</span>' in fuss
+
+
+def test_hauptmietzins_ohne_bk_wird_nicht_zerlegt():
+    _, details = _details(_repo(_komponente("K-1", "HMZ", 1_100)))
+    ansicht = _ansicht(details)
+    assert _kategorie(details.zeilen[0], "BK") is None and len(details.zeilen[0].positionen) == 1
+    assert "kein Beleg für eine Pauschale" in ansicht and "Mietbestandteile: Netto" not in ansicht
+    assert "kein historischer Monatswert" in ansicht and "bekannte Null" in ansicht and "variabel = " in ansicht
+
+
+def test_mobile_ansicht_zeigt_positionen_und_fehlt_im_druck():
+    _, details = _details(_repo(_komponente("K-1", "HMZ", 1_100), _komponente("K-2", "BK", 500, 7_000)))
+    ansicht = _ansicht(details)
+    mobil = _mobil(ansicht)
+    assert '<details class="zins-mobil-mieter">' in mobil and f"<strong>{eur(1_600)}</strong>" in mobil
+    for text in ("<dt>Netto</dt>", "<dt>USt-Satz</dt>", "<dt>USt</dt>", "<dt>Brutto</dt>", eur(1_000), "10 %", eur(100), eur(500)):
+        assert text in mobil
+    assert '<span class="zins-warn">unbekannt</span>' in mobil and "<script" not in ansicht
+    assert "body:not(.zins-druckseite) .zins-aufteilung-rahmen { display: none; }" in ansicht
+    druck = _druck(details)
+    assert '<section class="zins-mobil"' not in druck and '<table class="zins-aufteilung">' in druck
+    assert ".zins-mobil { display: none !important; }" in druck
+
+
+def test_vergleich_unveraendert_und_komponententausch_ohne_meldung():
+    ende = date(2028, 12, 31)
+    alt = _repo(_komponente("K-1", "BK_VZ", 1_000))
+    neu = _repo(_komponente("K-9", "BK", 1_000))
+    alt.vertraege = [_vertrag(bis=ende)]
+    neu.vertraege = [_vertrag(bis=ende)]
+    assert _vergleich(alt, neu) == ()
+    assert "Keine Änderungen zum Vormonat" in _ansicht_mit(_vergleichsliste(neu, MONAT), _vergleichsliste(alt))
+
+
+def test_vergleich_brutto_bk_anhebung():
+    aenderungen = _vergleich(_repo(_komponente("K-1", "BK", 1_000)), _repo(_komponente("K-1", "BK", 1_200)))
+    assert [(a.art, a.bereich, a.alt_cent, a.neu_cent, a.delta_cent) for a in aenderungen] == [("BETRAG", "Brutto Betriebskosten", 1_000, 1_200, 200)]
+
+
+def test_vergleich_trennt_fehlend_von_null():
+    basis = _komponente("K-1", "HMZ", 1_000)
+    null = _komponente("K-2", "BK", 0)
+    hinzu = _vergleich(_repo(basis), _repo(basis, null))
+    weg = _vergleich(_repo(basis, null), _repo(basis))
+    anhebung = _vergleich(_repo(null), _repo(_komponente("K-2", "BK", 500)))
+    assert [(a.alt_cent, a.neu_cent, a.delta_cent) for a in hinzu] == [(None, 0, None)]
+    assert [(a.alt_cent, a.neu_cent, a.delta_cent) for a in weg] == [(0, None, None)]
+    assert [(a.alt_cent, a.neu_cent, a.delta_cent) for a in anhebung] == [(0, 500, 500)]
+
+
+def test_vergleich_mieter_und_vertragswechsel():
+    aenderungen = _vergleich(
+        _repo_mit("V-1", "D-1", "Anna Test", _komponente("K-1", "HMZ", 1_000)),
+        _repo_mit("V-2", "D-2", "Bert Test", _komponente("K-2", "HMZ", 1_000, vertrag_id="V-2")),
+    )
+    assert [a.art for a in aenderungen] == ["VERTRAG"]
+    assert "Anna Test" in aenderungen[0].alt_text and "Bert Test" in aenderungen[0].neu_text
+    komponente = _komponente("K-1", "HMZ", 1_000)
+    gleicher = _vergleich(_repo(komponente, name="Anna Test"), _repo(komponente, name="Bert Test"))
+    assert [(a.art, a.alt_text, a.neu_text) for a in gleicher] == [("MIETER", "Anna Test", "Bert Test")]
+
+
+def test_vergleich_nutzungswechsel():
+    komponente = _komponente("K-1", "HMZ", 1_000)
+    aenderungen = _vergleich(_repo(komponente), _repo(komponente, status="KURZZEITVERMIETUNG"))
+    assert [(a.art, a.alt_text, a.neu_text) for a in aenderungen] == [("NUTZUNG", "DAUERVERMIETUNG", "KURZZEITVERMIETUNG")]
+
+
+def test_vergleich_monatswechsel_januar():
+    repo = _repo(_komponente("K-1", "HMZ", 1_000))
+    januar = _vergleichsliste(repo, "2026-01")
+    assert vergleiche_zinsdetails(_vergleichsliste(repo, "2025-12"), januar) == ()
+    with pytest.raises(ValueError):
+        vergleiche_zinsdetails(_vergleichsliste(repo, "2025-11"), januar)
+
+
+def test_vergleich_verlangt_gleichen_scope():
+    repo = _repo(_komponente("K-1", "HMZ", 1_000))
+    aktuell = _vergleichsliste(repo, MONAT)
+    vormonat = _vergleichsliste(repo)
+    for anderer in (replace(vormonat, basis=replace(vormonat.basis, objekt_filter="O-2")), replace(vormonat, basis=replace(vormonat.basis, suche="Test"))):
+        with pytest.raises(ValueError):
+            vergleiche_zinsdetails(anderer, aktuell)
+        dokument = _ansicht_mit(aktuell, anderer)
+        assert "Vergleich nicht verfügbar" in dokument and "Keine Änderungen" not in dokument
+
+
+def test_vergleich_bei_suche_behauptet_keinen_wechsel():
+    anna = _repo_mit("V-1", "D-1", "Anna Test")
+    bert = _repo_mit("V-2", "D-2", "Bert Test")
+    assert [a.bereich for a in _vergleich(anna, bert, suche="Anna")] == ["Im gefilterten aktuellen Monat nicht enthalten"]
+    assert [a.bereich for a in _vergleich(bert, anna, suche="Anna")] == ["Im gefilterten Vormonat nicht enthalten"]
+    assert [a.art for a in _vergleich(anna, bert, suche="Test")] == ["NICHT_IM_AKTUELLEN_MONAT", "NICHT_IM_VORMONAT"]
+
+
+def test_vergleich_reihenfolge_ist_stabil():
+    def repo(cent):
+        return FakeRepo(
+            einheiten=[_einheit("E-2"), _einheit("E-1")], vertraege=[_vertrag("V-2", "E-2", "D-2"), _vertrag()],
+            komponenten=[_komponente("K-2", "HMZ", cent, vertrag_id="V-2"), _komponente("K-1", "HMZ", cent)],
+            debitoren={"D-1": SimpleNamespace(name="Anna"), "D-2": SimpleNamespace(name="Bert")},
+        )
+
+    assert [a.einheit_id for a in _vergleich(repo(1_000), repo(1_100))] == ["E-1", "E-2"]
+
+
+def test_vergleich_im_druck_und_escaped():
+    boese = "<script>alert(1)</script>"
+    vormonat = _vergleichsliste(_repo_mit("V-1", "D-1", "Anna Test"))
+    aktuell = _vergleichsliste(_repo_mit("V-2", "D-2", boese), MONAT)
+    druck = rendere_zinsliste_druck(aktuell, logo="", zurueck_href="/z", vormonat_details=vormonat)
+    assert '<section class="zins-vergleich-druck">' in druck
+    for dokument in (_ansicht_mit(aktuell, vormonat), druck):
+        assert "Änderungen zum Vormonat" in dokument and boese not in dokument and html.escape(boese) in dokument
+
+
+def test_route_vergleicht_einmal_mit_gleichem_scope(route_umgebung, monkeypatch):
+    original = listen.berechne_zinsliste
+    aufrufe = []
+
+    def spion(**kwargs):
+        aufrufe.append((kwargs["monat"], kwargs["objekt_id"], kwargs["suche"]))
+        return original(**kwargs)
+
+    monkeypatch.setattr(listen, "berechne_zinsliste", spion)
+    dokument = _route(objekt_id="O-1", q="Testmieter").body.decode()
+    assert aufrufe == [(MONAT, "O-1", "Testmieter"), (VORMONAT, "O-1", "Testmieter")]
+    assert "Keine Änderungen zum Vormonat" in dokument
+
+
+def test_route_fehler_im_vergleich_laesst_liste_nutzbar(route_umgebung, monkeypatch):
+    original = listen.berechne_zinsliste
+
+    def teilweise(**kwargs):
+        if kwargs["monat"] == VORMONAT:
+            raise RuntimeError("geheimer Fehler")
+        return original(**kwargs)
+
+    monkeypatch.setattr(listen, "berechne_zinsliste", teilweise)
+    dokument = _route().body.decode()
+    assert "Vergleich nicht verfügbar" in dokument and "Keine Änderungen" not in dokument
+    assert '<table class="zins-aufteilung">' in dokument and "geheimer Fehler" not in dokument
+
+
+def test_route_grenzmonat_ohne_vormonat(route_umgebung, monkeypatch):
+    monkeypatch.setattr(listen, "_nachbarmonat", lambda monat, schritt: None)
+    assert "Vergleich nicht verfügbar" in _route().body.decode()
+
+
 def test_unbekannter_satz_wird_nicht_zu_null():
     assert "unbekannt" in _satz_html(None) and "0 %" not in _satz_html(None)
+
+
+def test_belegte_inklusive_pauschalmiete_aendert_keinen_betrag():
+    repo = _repo(_komponente("K-1", "HMZ", 12_000, 20_000), profile={"V-1": SimpleNamespace(bk_hk_abrechnungsart="PAUSCHALE_INKLUSIVMIETE")})
+    _, details = _details(repo)
+    assert details.zeilen[0].bk_hk_inklusive
+    assert details.summen.gesamt.brutto_cent == 12_000
+    for document in (_ansicht(details), _druck(details)):
+        assert "Pauschalmiete" in _aufteilung(document)
+        assert "inkl. Betriebs- und Heizkosten" in _aufteilung(document)
+        assert eur(12_000) in document
+    assert "Pauschalmiete" in _mobil(_ansicht(details))
+
+
+def test_pauschalmiete_nicht_aus_fehlenden_bk_geraten():
+    _, details = _details(_repo(_komponente("K-1", "HMZ", 12_000, 20_000)))
+    assert not details.zeilen[0].bk_hk_inklusive
+    assert "Pauschalmiete" not in _aufteilung(_ansicht(details))
