@@ -367,3 +367,12 @@ def test_xss_in_neuen_darstellungsfeldern(monkeypatch):
     html = _html(_liste(monkeypatch, _basis(mieter), repo))
     assert boese not in html
     assert "&lt;script&gt;" in html
+
+
+def test_objektname_bleibt_in_details_ohne_doppelte_adresszeile(monkeypatch):
+    mieter = _mieter(objekt_bezeichnung="Hausname", objekt_adresse="Beispielweg 1, Wien")
+    html = _html(_liste(monkeypatch, _basis(mieter), FakeRepo()))
+    assert '<div>Objekt: Hausname</div>' in html
+    assert html.count('>Beispielweg 1, Wien</span>') == 1
+    assert '>Hausname</span>' not in html
+    assert '<label>Verträge<select name="status">' in html

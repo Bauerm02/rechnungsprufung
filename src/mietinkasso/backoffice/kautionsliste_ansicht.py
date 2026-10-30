@@ -35,7 +35,7 @@ _CSS = """
 .kaut-summen dt{font-weight:600;margin-top:8px}
 .kaut-summen dd{margin:2px 0 0}
 .kaut-nur-druck{display:none}
-.kaut-name{display:block;font-weight:600}
+.kaut-name{display:inline-block;font-weight:600;margin-right:8px}
 .kaut-marke{display:inline-block;margin:2px 0;padding:1px 6px;border:1px solid #8b8578;font-size:13px;font-weight:600}
 .kaut-marke-ok{background:#E8F1EA;border-color:#2F6B45;color:#1F4D31}
 .kaut-marke-offen{background:#FBF0DA;border-color:#8A5A00;color:#6B4600}
@@ -113,7 +113,7 @@ def _filter_html(basis: Any) -> str:
         '<form class="kaut-filter" method="get" action="/backoffice/kautionen">'
         f'<label>Objekt<select name="objekt_id">{"".join(objekte)}</select></label>'
         f'<label>Suche<input type="search" name="q" value="{_text(basis.suche or "")}"></label>'
-        f'<label>Mietverhältnisstatus<select name="status">{"".join(stati)}</select></label>'
+        f'<label>Verträge<select name="status">{"".join(stati)}</select></label>'
         '<button type="submit">Filtern</button>'
         "</form>"
     )
@@ -129,7 +129,8 @@ def _quellen_html(zeile: Any) -> str:
     status = _text(_status_wert(zeile.mieter.status))
     return (
         '<details class="kaut-details"><summary>Details</summary>'
-        f"<div>Vertragsstatus: {status}</div>{inhalt}</details>"
+        f"<div>Vertragsstatus: {status}</div>"
+        f"<div>Objekt: {_text(zeile.mieter.objekt_bezeichnung)}</div>{inhalt}</details>"
     )
 
 
@@ -158,7 +159,7 @@ def _mietverhaeltnis_html(mieter: Any) -> str:
 
 
 def _mieter_html(mieter: Any) -> str:
-    angaben = (mieter.objekt_bezeichnung, mieter.objekt_adresse, mieter.einheit_bezeichnung)
+    angaben = (mieter.objekt_adresse or mieter.objekt_bezeichnung, mieter.einheit_bezeichnung)
     zeilen = "".join(f'<span class="kaut-klein">{_text(wert)}</span>' for wert in angaben if wert)
     return (
         f'<span class="kaut-name">{_text(mieter.debitor_name)}</span>'

@@ -62,10 +62,14 @@ _HV_START_CSS = """
 .hv-start .hv-summary-wert { white-space: nowrap; }
 .hv-start .hv-start-links { margin: 0 0 12px; font-size: 14px; }
 .hv-start > div.card:first-of-type { padding: 12px 16px; }
+.hv-start > div.card:first-of-type form { display: flex; gap: 12px; align-items: center; }
+.hv-start > div.card:first-of-type label { margin: 0; white-space: nowrap; }
+.hv-start > div.card:first-of-type select { flex: 1; min-width: 0; width: auto; }
 .hv-start > details.card { padding: 10px 16px; }
 .hv-start #abgleichstand { padding: 12px 16px; }
-.hv-start #abgleichstand h2 { margin: 0 0 6px; font-size: 16px; }
 .hv-start #abgleichstand p { margin: 6px 0; }
+.hv-start #abgleichstand .status-zeile { font-size: 13px; }
+.hv-start #mietkonten-uebersicht h2 { margin: 0 0 12px; font-size: 18px; }
 """
 
 
@@ -459,14 +463,13 @@ def _abgleich_nachweis_satz(status) -> str:
 
 def _abgleich_karte_html(status) -> str:
     return f"""
-    <div class="card" id="abgleichstand">
-      <h2>Zahlungs- und Abgleichstand</h2>
+    <div class="card" id="abgleichstand" aria-label="Bankabgleich">
+      <p><strong>Bankabgleich:</strong> {_abgleich_nachweis_satz(status)}</p>
       <p class="status-zeile">
         <span>Eingereicht, Bankeingang noch offen: <strong>{eur(status.einzuege_offen_cent)}</strong>
           ({status.einzuege_offen_anzahl})</span>
+        <a href="{h(_abgleich_link(status.objekt_filter))}">Abgleichstand im Detail &rarr;</a>
       </p>
-      <p>{_abgleich_nachweis_satz(status)}</p>
-      <p><a href="{h(_abgleich_link(status.objekt_filter))}">Abgleichstand im Detail &rarr;</a></p>
     </div>"""
 
 
