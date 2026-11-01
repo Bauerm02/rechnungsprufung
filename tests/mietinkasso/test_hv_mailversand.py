@@ -1,4 +1,5 @@
 """Real business services and HTTP protocol, exclusively synthetic in-memory data."""
+import base64
 import hashlib
 import io
 import json
@@ -20,7 +21,9 @@ from mietinkasso.infrastructure.db.tables import (
     AuditEventTable, MahnFallTable, MahnkostenBuchungTable, MahnkostenGebuehrTable, MahnLaufTable,
 )
 from mietinkasso.mahnwesen import brief_sftp
+from mietinkasso.mahnwesen.brief_rest import PostRestTransportadapter, RestKonfiguration
 from mietinkasso.mahnwesen.brief_sftp import PostSftpTransportadapter, SftpKonfiguration
+from tests.mietinkasso._brief_rest_test_helpers import STATUS, UPLOAD, VERARBEITEN, FakeEinfachBrief
 
 
 @pytest.fixture
@@ -2029,3 +2032,349 @@ def test_nachsendung_brief_sendet_nicht_erneut_bei_veralteter_bankbestaetigung(h
     # Netzkontakt) läuft weiterhin - NUR der tatsächliche SFTP-Upload ist
     # gesperrt, siehe `geschriebene_dateien` oben.
     assert eintrag_nach.brief_status == "VORBEREITET"
+
+
+# -- REST-Transportoption (`mahnwesen/brief_rest.py`), rein synthetisch ---
+
+
+def _richte_rest_brief_kanal_ein(service, contract, account, *, fake=None):
+    """Dieselbe Kanal-/Profil-/Adressvorbereitung wie SFTP; als Transport
+    läuft ausschließlich ein `httpx.MockTransport`, nie ein echter Endpoint."""
+
+    _richte_brief_kanal_ein(service, contract, account)
+    fake = fake or FakeEinfachBrief()
+    service.brief_sftp_adapter = None
+    service.brief_rest_adapter = PostRestTransportadapter(RestKonfiguration(
+        basis_url="https://abn-www.einfach-brief.at/be_t", registered_mail_type="Einschreiben",
+        preisobergrenze=Decimal("10"), api_key="SYNTHETIC-KEY",
+    ), transport_factory=fake.transport)
+    return fake
+
+
+def _rest_claims(session_factory):
+    with session_factory() as s:
+        return list(s.execute(select(AuditEventTable).where(AuditEventTable.aktion == "BRIEF_REST_VERSAND_CLAIM")).scalars())
+
+
+def _lauf_und_archiv(service, contract):
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    archiv = service.mahnbrief_archiv_repo.fuer_mahnlauf(
+        vertrag_id=contract.id, stufe=1, mahnlauf_schluessel=mahnlauf.outbox_key,
+    )
+    return mahnlauf, archiv
+
+
+def _rest_mitmieter(service, contract):
+    mitmieter = service.mitmieter_repo.anlegen(
+        vertrag_id=contract.id, name="Mitmieterin A", email=None, adresse="Nebenstraße 2, 1010 Wien",
+        erstellt_von="test", rolle="MITMIETER", zustand="BESTAETIGT")
+    service.mitmieter_repo.setze_postadresse_geprueft(mitmieter.id, geprueft=True)
+    return mitmieter
+
+
+def test_rest_brief_uebermittelt_dieselben_bytes_und_laesst_mahnstatus_offen(hv, basis_vertrag, admin_ctx, session_factory):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+
+    mahnlauf, archiv = _lauf_und_archiv(service, contract)
+    assert fake.methoden() == [UPLOAD, STATUS, VERARBEITEN]
+    dokument = fake.bodies(UPLOAD)[0]["documentPayloadList"][0]
+    assert base64.b64decode(dokument["payload"]) == archiv.pdf_bytes
+    assert dokument["foreignId"] == archiv.sende_schluessel
+    assert fake.bodies(UPLOAD)[0]["printOnly"] is True
+    # Quittung = höchstens Annahme: UEBERMITTELT/UNSICHER, keine Buchung, kein GESENDET.
+    assert archiv.status == "UEBERMITTELT"
+    assert archiv.status_beleg_referenz == f"einfachbrief:{archiv.sende_schluessel}:order:ORDER-1:delivery:DELIVERY-1"
+    assert archiv.anbieterbeleg_referenz is None
+    assert mahnlauf.status == "UNSICHER" and mahnlauf.mahnkosten_verarbeitet_am is None
+    assert service.mahn_repo.list_fuer_vertrag(contract.id)[0].status == "UNSICHER"
+    with session_factory() as s:
+        assert list(s.execute(select(MahnkostenBuchungTable)).scalars()) == []
+        assert list(s.execute(select(AuditEventTable).where(AuditEventTable.aktion == "MAILVERSAND_BESTAETIGT")).scalars()) == []
+    assert [c.entity_id for c in _rest_claims(session_factory)] == [archiv.sende_schluessel]
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 14))
+    assert len(fake.anfragen) == 3  # kein zweiter Versuch im Folgelauf
+
+
+def test_rest_anbieterbeleg_bleibt_der_einzige_abschluss(hv, basis_vertrag, admin_ctx):
+    service, _ = hv
+    contract, account = basis_vertrag
+    heute = date.today()
+    _seed_debt(hv, contract, account, admin_ctx, day=heute)
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+    service.mahnlauf(ctx=admin_ctx, heute=heute)
+    mahnlauf, archiv = _lauf_und_archiv(service, contract)
+    assert mahnlauf.status == "UNSICHER"
+
+    service.vervollstaendige_mahnlauf_aus_anbieterbeleg(
+        ctx=admin_ctx, archiv_id=archiv.id, anbieterbeleg_pdf_bytes=_echter_beleg_pdf("Synthetischer Beleg"),
+        anbieterbeleg_referenz="SYNTHETIC-BELEG-1", postaufgabe_datum=heute, importiert_von="test", heute=heute,
+    )
+    assert service.mahnlauf_repo.get(mahnlauf.id).status == "GESENDET"
+    assert len(fake.anfragen) == 3  # der Abschluss sendet nie erneut
+
+
+@pytest.mark.parametrize("methode,erwartet", [
+    (UPLOAD, [UPLOAD]), (STATUS, [UPLOAD, STATUS]), (VERARBEITEN, [UPLOAD, STATUS, VERARBEITEN]),
+])
+def test_rest_timeout_bleibt_unsicher_ohne_replay(hv, basis_vertrag, admin_ctx, session_factory, methode, erwartet):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+    fake.stoerung[methode] = httpx.ReadTimeout("synthetisch")
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+
+    mahnlauf, archiv = _lauf_und_archiv(service, contract)
+    assert mahnlauf.status == "UNSICHER" and archiv.status == "VORBEREITET"
+    assert service.mahn_repo.list_fuer_vertrag(contract.id)[0].status == "UNSICHER"
+    assert fake.methoden() == erwartet
+    assert len(_rest_claims(session_factory)) == 1
+
+    del fake.stoerung[methode]
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 14))
+    assert fake.methoden() == erwartet
+
+
+@pytest.mark.parametrize("ziel,feld,wert", [
+    ("upload", "infected", True), ("upload", "warningExist", True), ("upload", "errorFileList", ["x.pdf"]),
+    ("lieferung", "ebrief", True), ("dokument", "foreignId", "falsch"),
+])
+def test_rest_anbieterablehnung_wird_nie_blockiert_und_nie_neu_geplant(hv, basis_vertrag, admin_ctx, ziel, feld, wert):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+    getattr(fake, ziel)[feld] = wert
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+
+    mahnlauf, archiv = _lauf_und_archiv(service, contract)
+    assert mahnlauf.status == "UNSICHER" and archiv.status == "VORBEREITET"
+    assert VERARBEITEN not in fake.methoden()
+    anzahl = len(fake.anfragen)
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 14))
+    assert len(fake.anfragen) == anzahl
+
+
+def test_rest_lokaler_pdf_fehler_blockiert_ohne_claim_und_ohne_request(hv, basis_vertrag, admin_ctx, session_factory):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+
+    def _abgelehnt(**_kwargs):
+        raise brief_sftp.PostSendevoraussetzungError("Synthetisch abgelehnt.")
+
+    service.brief_rest_adapter.pruefe_vorab = _abgelehnt
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+
+    assert fake.anfragen == [] and _rest_claims(session_factory) == []
+    assert service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0].status not in ("UNSICHER", "GESENDET", "IN_VERSAND")
+
+
+def test_rest_nachsendung_nach_ungewissem_versuch_sendet_nie_erneut(hv, basis_vertrag, admin_ctx):
+    """Kern der REST-Abweichung: SFTP erkennt eine Dublette remote über das
+    exklusive Anlegen, REST nicht - der dauerhafte Claim verhindert hier,
+    dass eine Nachsendung denselben Brief ein zweites Mal hochlädt."""
+
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx, day=date(2026, 9, 14))
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+    mitmieter = _rest_mitmieter(service, contract)
+    uploads = {"anzahl": 0}
+
+    def _zweiter_upload_haengt(_request):
+        uploads["anzahl"] += 1
+        return httpx.ReadTimeout("synthetisch") if uploads["anzahl"] == 2 else None
+
+    fake.stoerung[UPLOAD] = _zweiter_upload_haengt
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    eintrag = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert eintrag.brief_status == "VORBEREITET" and eintrag.brief_sende_schluessel
+    anzahl = len(fake.anfragen)
+
+    del fake.stoerung[UPLOAD]
+    for _ in range(2):
+        ergebnis = service.nachsenden_einzelempfaenger(
+            ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 14),
+        )
+        assert ergebnis == "UNKLAR"
+    assert len(fake.anfragen) == anzahl
+
+
+def test_rest_absturz_nach_claim_sendet_bei_nachsendung_nie(hv, basis_vertrag, admin_ctx):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx, day=date(2026, 9, 14))
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+    mitmieter = _rest_mitmieter(service, contract)
+    original_sende = service.brief_rest_adapter.sende
+    aufrufe = {"anzahl": 0}
+
+    def _absturz_beim_mitmieter(**kwargs):
+        aufrufe["anzahl"] += 1
+        if aufrufe["anzahl"] == 2:
+            raise RuntimeError("Synthetischer Absturz nach dem Claim.")
+        return original_sende(**kwargs)
+
+    service.brief_rest_adapter.sende = _absturz_beim_mitmieter
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    service.brief_rest_adapter.sende = original_sende
+    anzahl = len(fake.anfragen)
+
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    ergebnis = service.nachsenden_einzelempfaenger(
+        ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 14),
+    )
+    assert ergebnis == "UNKLAR" and len(fake.anfragen) == anzahl
+
+
+def test_rest_mitmieter_bekommt_eigene_bytes_und_eigenen_schluessel(hv, basis_vertrag, admin_ctx):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+    mitmieter = _rest_mitmieter(service, contract)
+
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+
+    mahnlauf, archiv = _lauf_und_archiv(service, contract)
+    eintrag = next(e for e in service.empfaenger_zugang_repo.fuer_mahnlauf(mahnlauf.id) if e.mitmieter_id == mitmieter.id)
+    assert [d["foreignId"] for d in fake.hochgeladen] == [archiv.sende_schluessel, eintrag.brief_sende_schluessel]
+    assert base64.b64decode(fake.hochgeladen[1]["payload"]) == eintrag.brief_pdf_bytes
+    assert eintrag.brief_status == "UEBERMITTELT"
+    assert fake.methoden().count(VERARBEITEN) == 2  # je Brief genau eine Lieferung, nie gesammelt
+    assert all(len(body["deliveries"]) == 1 for body in fake.bodies(VERARBEITEN))
+    # Bereits übermittelt: Nachsendung bleibt ein No-Op ohne Request.
+    anzahl = len(fake.anfragen)
+    assert service.nachsenden_einzelempfaenger(
+        ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 9, 13),
+    ) == "BEREITS_GESENDET"
+    assert len(fake.anfragen) == anzahl
+
+
+def test_rest_nachsendung_haelt_das_frische_versandgate(hv, basis_vertrag, admin_ctx, session_factory):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)  # Bankbestätigung NUR bis 13.09.2026
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+    mitmieter = _rest_mitmieter(service, contract)
+    original = service.empfaenger_zugang_repo.archiviere_brief
+
+    def _kaputt(*_args, **_kwargs):
+        raise RuntimeError("Synthetischer Archivierungsfehler.")
+
+    service.empfaenger_zugang_repo.archiviere_brief = _kaputt
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    service.empfaenger_zugang_repo.archiviere_brief = original
+    anzahl, claims = len(fake.anfragen), len(_rest_claims(session_factory))
+
+    mahnlauf = service.mahnlauf_repo.list_fuer_vertrag(contract.id)[0]
+    assert service.nachsenden_einzelempfaenger(
+        ctx=admin_ctx, mahnlauf_id=mahnlauf.id, mitmieter_id=mitmieter.id, heute=date(2026, 10, 21),
+    ) == "BLOCKIERT"
+    assert len(fake.anfragen) == anzahl and len(_rest_claims(session_factory)) == claims
+
+
+def test_rest_send_enabled_aus_macht_keinen_request(hv, basis_vertrag, admin_ctx, session_factory):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+    service.settings.send_enabled = False
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    assert fake.anfragen == [] and _rest_claims(session_factory) == []
+
+
+def test_rest_veraltete_bankbestaetigung_macht_keinen_request(hv, basis_vertrag, admin_ctx, session_factory):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx, day=date(2026, 9, 1))
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 12, 13))
+    assert fake.anfragen == [] and _rest_claims(session_factory) == []
+
+
+def test_rest_ohne_freigegebenes_anbieterprofil_macht_keinen_request(hv, basis_vertrag, admin_ctx, session_factory, monkeypatch):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+    monkeypatch.setattr(service.brief_anbieterprofil_repo, "aktuelle_freigegebene", lambda *a, **k: None)
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    assert fake.anfragen == [] and _rest_claims(session_factory) == []
+
+
+def test_rest_ohne_geprueften_empfaenger_macht_keinen_request(hv, basis_vertrag, admin_ctx, session_factory):
+    service, _ = hv
+    contract, account = basis_vertrag
+    _seed_debt(hv, contract, account, admin_ctx)
+    fake = _richte_rest_brief_kanal_ein(service, contract, account)
+    service.bundle.stammdaten_repository.upsert_debitor(
+        id=account.debitor_id, name="Max Mustermieter", email=None,
+        adresse="Musterstraße 1, 1010 Wien", postadresse_geprueft=False,
+    )
+    service.mahnlauf(ctx=admin_ctx, heute=date(2026, 9, 13))
+    assert fake.anfragen == [] and _rest_claims(session_factory) == []
+
+
+def _transport_service(session_factory, tmp_path, **overrides):
+    key = tmp_path / "post-api-key"
+    key.write_text("SYNTHETIC-KEY", encoding="utf-8")
+    sftp_user, sftp_pass = tmp_path / "sftp-user", tmp_path / "sftp-pass"
+    sftp_user.write_text("synthetic", encoding="utf-8")
+    sftp_pass.write_text("synthetic", encoding="utf-8")
+    werte = dict(
+        owner_email="mb@jlb-immo.at",
+        brief_sftp_host="transfer.post-business-solutions.at", brief_sftp_username_datei=str(sftp_user),
+        brief_sftp_password_datei=str(sftp_pass), brief_sftp_host_key_fingerprint="SHA256:synthetic",
+        brief_rest_basis_url="https://abn-www.einfach-brief.at/be_t", brief_rest_api_key_datei=str(key),
+        brief_rest_registered_mail_type="Einschreiben", brief_rest_preisobergrenze=Decimal("10"),
+    )
+    werte.update(overrides)
+    settings = Settings(_env_file=None, **werte)
+    return HVMailversandService(session_factory, bauen(session_factory, settings), settings)
+
+
+def test_transport_ohne_auswahl_bleibt_unveraendert_sftp(session_factory, tmp_path):
+    service = _transport_service(session_factory, tmp_path)
+    assert isinstance(service.brief_sftp_adapter, PostSftpTransportadapter)
+    assert service.brief_rest_adapter is None
+    assert service.mahn_service._brief_transport_verfuegbar is True
+
+
+def test_transport_rest_explizit_und_vollstaendig_schliesst_sftp_aus(session_factory, tmp_path):
+    service = _transport_service(session_factory, tmp_path, brief_transport="rest")
+    assert isinstance(service.brief_rest_adapter, PostRestTransportadapter)
+    assert service.brief_sftp_adapter is None
+    assert service.mahn_service._brief_transport_verfuegbar is True
+
+
+@pytest.mark.parametrize("overrides", [
+    {"brief_transport": "rest", "brief_rest_api_key_datei": None},
+    {"brief_transport": "rest", "brief_rest_registered_mail_type": None},
+    {"brief_transport": "rest", "brief_rest_preisobergrenze": None},
+    {"brief_transport": "rest", "brief_rest_basis_url": "https://example.invalid/be"},
+    {"brief_transport": "REST"},
+    {"brief_transport": ""},
+])
+def test_transport_ohne_gueltige_auswahl_faellt_nie_auf_sftp_zurueck(session_factory, tmp_path, overrides):
+    service = _transport_service(session_factory, tmp_path, **overrides)
+    assert service.brief_sftp_adapter is None and service.brief_rest_adapter is None
+    assert service.mahn_service._brief_transport_verfuegbar is False
+
+
+def test_transport_sftp_ausgewaehlt_aber_unvollstaendig_faellt_nie_auf_rest_zurueck(session_factory, tmp_path):
+    service = _transport_service(session_factory, tmp_path, brief_sftp_host=None)
+    assert service.brief_sftp_adapter is None and service.brief_rest_adapter is None
+    assert service.mahn_service._brief_transport_verfuegbar is False

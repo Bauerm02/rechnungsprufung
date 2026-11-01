@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from functools import lru_cache
 
 from pydantic import Field
@@ -220,6 +221,19 @@ class Settings(BaseSettings):
     brief_sftp_username_datei: str | None = None
     brief_sftp_password_datei: str | None = None
     brief_sftp_host_key_fingerprint: str | None = None
+
+    # EinfachBrief-REST statt SFTP (siehe `mahnwesen/brief_rest.py`): erst
+    # `brief_transport="rest"` wählt REST aus, jeder andere Wert als "sftp"
+    # wählt GAR KEINEN Transport - kein stilles Ausweichen in eine Richtung.
+    # Ohne vollständige, gültige REST-Werte bleibt der Briefkanal zu. Der
+    # API-Schlüssel kommt nur aus einer privaten Datei. `registered_mail_
+    # type` und `preisobergrenze` haben bewusst keinen Default: beide sind
+    # eine ausdrückliche Festlegung, keine Annahme des Codes.
+    brief_transport: str = "sftp"
+    brief_rest_basis_url: str | None = None
+    brief_rest_api_key_datei: str | None = None
+    brief_rest_registered_mail_type: str | None = None
+    brief_rest_preisobergrenze: Decimal | None = None
 
 
 class ProduktionskonfigurationUngueltigError(RuntimeError):

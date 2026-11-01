@@ -17,7 +17,7 @@ from mietinkasso.indexautomatik.mailops_transport import MailOpsTransportadapter
 from mietinkasso.infrastructure.db.tables import (
     AuditEventTable, ErhoehungsschreibenTable, MahnFallTable, MahnLaufTable, VertragsendeErinnerungTable,
 )
-from mietinkasso.mahnwesen import brief_sftp
+from mietinkasso.mahnwesen import brief_rest, brief_sftp
 from mietinkasso.mahnwesen.brief_pdf import AdressfehlerError
 from mietinkasso.mahnwesen.brief_pdf import Absender as BriefAbsender
 from mietinkasso.mahnwesen.brief_pdf import Forderungszeile as BriefForderungszeile
@@ -300,11 +300,22 @@ class HVMailversandService:
         # Exklusivität ist eine allgemeine Korrektheitseigenschaft, nicht
         # auf das Vier-Stufen-Profil beschränkt.
         self.tageslauf_repo = MahnTageslaufRepository(session_factory)
-        self._brief_sftp_konfiguration = brief_sftp.konfiguration_aus_settings(settings)
+        # Genau EIN Transport je explizit gewählter Art - unvollständiges
+        # REST fällt NIE auf ein konfiguriertes SFTP zurück (und umgekehrt).
+        self._brief_sftp_konfiguration = (
+            brief_sftp.konfiguration_aus_settings(settings)
+            if brief_rest.transport_auswahl(settings) == brief_rest.TRANSPORT_SFTP else None
+        )
         self.brief_sftp_adapter = (
             brief_sftp.PostSftpTransportadapter(self._brief_sftp_konfiguration)
             if self._brief_sftp_konfiguration is not None else None
         )
+        self._brief_rest_konfiguration = brief_rest.konfiguration_aus_settings(settings)
+        self.brief_rest_adapter = (
+            brief_rest.PostRestTransportadapter(self._brief_rest_konfiguration)
+            if self._brief_rest_konfiguration is not None else None
+        )
+        self.brief_rest_claim = brief_rest.BriefRestVersandClaim(session_factory)
         self.mahnkosten_service = MahnkostenService(
             self.mahnkosten_repo, self.op_service, bundle.stammdaten_repository,
             brief_anbieterprofil_repository=self.brief_anbieterprofil_repo,
@@ -313,7 +324,7 @@ class HVMailversandService:
             self.op_service, self.policy_repo, bank_stand_max_age_days=settings.bank_stand_max_age_days,
             mahnkosten_service=self.mahnkosten_service, mahnlauf_repository=self.mahnlauf_repo,
             kanalregel_repository=self.kanalregel_repo, brief_anbieterprofil_repository=self.brief_anbieterprofil_repo,
-            brief_transport_verfuegbar=self.brief_sftp_adapter is not None,
+            brief_transport_verfuegbar=self.brief_sftp_adapter is not None or self.brief_rest_adapter is not None,
             mitmieter_repository=self.mitmieter_repo, empfaenger_zugang_repository=self.empfaenger_zugang_repo,
             manueller_mahnversand_repository=self.manueller_mahnversand_repo)
         self.manueller_mahnversand_service = ManuellerMahnversandService(
@@ -789,6 +800,23 @@ class HVMailversandService:
             neue_zinsen_delta_je_op_position=vorschau_kwargs["neue_zinsen_delta_je_op_position"],
         )
 
+    def _brief_uebertragen(self, *, pdf_bytes, dateiname, pdf_sha256, sende_schluessel, erstellt_von):
+        """Einziger Transportkontakt der Briefstrecke. SFTP schützt sich über
+        das exklusive Anlegen von `dateiname`; REST hat kein Remote-Gegenstück
+        und reserviert den Schlüssel deshalb VOR dem ersten Request dauerhaft.
+        Besteht der Claim schon, bleibt der Vorgang ungewiss, ohne Request."""
+
+        if self.brief_rest_adapter is None:
+            return self.brief_sftp_adapter.sende(pdf_bytes=pdf_bytes, dateiname=dateiname)
+        self.brief_rest_adapter.pruefe_vorab(pdf_bytes=pdf_bytes, pdf_sha256=pdf_sha256, sende_schluessel=sende_schluessel)
+        if not self.brief_rest_claim.beanspruche(
+            sende_schluessel=sende_schluessel, pdf_sha256=pdf_sha256, erstellt_von=erstellt_von,
+        ):
+            raise brief_rest.PostRestBereitsVersuchtError(
+                "Für diesen Sende-Schlüssel gab es bereits einen REST-Versuch - kein weiterer Request."
+            )
+        return self.brief_rest_adapter.sende(pdf_bytes=pdf_bytes, pdf_sha256=pdf_sha256, sende_schluessel=sende_schluessel)
+
     def _sende_brief(self, *, mahnlauf, mitglieder, heute, vorschau_slot, bestaetigte_mitmieter, empfaenger_zugang_je_mitmieter) -> None:
         """Kanal-BRIEF-Gegenstück zu `_dispatch_mahnlauf`s E-Mail-
         `versand_fn` (Auftrag HV-20261019-VERSAND-KOSTEN-ABSCHLUSS, Teil 3)
@@ -834,7 +862,7 @@ class HVMailversandService:
         bleiben `ValueError`/BLOCKIERT - dort ist sicher, dass nichts
         gesendet wurde."""
 
-        if self.brief_sftp_adapter is None:
+        if self.brief_sftp_adapter is None and self.brief_rest_adapter is None:
             raise ValueError("Brief-SFTP-Transport ist nicht eingerichtet.")
 
         st = self.bundle.stammdaten_repository
@@ -910,7 +938,10 @@ class HVMailversandService:
 
         dateiname = brief_sftp.baue_dateiname(sende_schluessel=archiv_zeile.sende_schluessel)
         try:
-            ergebnis = self.brief_sftp_adapter.sende(pdf_bytes=archiv_zeile.pdf_bytes, dateiname=dateiname)
+            ergebnis = self._brief_uebertragen(
+                pdf_bytes=archiv_zeile.pdf_bytes, dateiname=dateiname, pdf_sha256=archiv_zeile.pdf_sha256,
+                sende_schluessel=archiv_zeile.sende_schluessel, erstellt_von="hv-mailversand",
+            )
         except brief_sftp.PostSftpDateiKonfliktError:
             # Siehe Docstring: ein Dateikonflikt unter dem permanent
             # reservierten Schlüssel ist NICHT "sauber nichts gesendet" -
@@ -986,8 +1017,10 @@ class HVMailversandService:
 
             mitmieter_dateiname = brief_sftp.baue_dateiname(sende_schluessel=mitmieter_archiv.brief_sende_schluessel)
             try:
-                mitmieter_ergebnis = self.brief_sftp_adapter.sende(
+                mitmieter_ergebnis = self._brief_uebertragen(
                     pdf_bytes=mitmieter_archiv.brief_pdf_bytes, dateiname=mitmieter_dateiname,
+                    pdf_sha256=mitmieter_archiv.brief_pdf_sha256,
+                    sende_schluessel=mitmieter_archiv.brief_sende_schluessel, erstellt_von="hv-mailversand",
                 )
             except brief_sftp.PostSftpDateiKonfliktError:
                 continue  # ungewiss (siehe Docstring oben) - nie ein zweiter Versuch unter demselben Schlüssel
@@ -1107,7 +1140,9 @@ class HVMailversandService:
           bei der Abfrage selbst) bleibt `UNKLAR`, NIE automatisch erneut
           gesendet. Beim BRIEF-Kanal übernimmt die exklusive Anlage des
           bereits reservierten `brief_sende_schluessel`-Dateinamens genau
-          diese Rolle (ein Konflikt dort bedeutet "war schon da").
+          diese Rolle (ein Konflikt dort bedeutet "war schon da"); bei REST
+          der dauerhafte `brief_rest_claim`: bestand schon ein Versuch,
+          bleibt es `UNKLAR`, ohne weiteren Request.
         - Reine Wiederverwendung des bereits eingefrorenen
           `MahnLaufTable.mahnkosten_snapshot_json` - NIE eine eigene,
           neue Kostenberechnung/-buchung ("keine doppelte
@@ -1295,7 +1330,7 @@ class HVMailversandService:
         return "GESENDET"
 
     def _nachsenden_brief(self, *, mahnlauf, eintrag, mitmieter, heute, versandbereit=True, versandbereit_grund="") -> str:
-        if self.brief_sftp_adapter is None:
+        if self.brief_sftp_adapter is None and self.brief_rest_adapter is None:
             raise ValueError("Brief-SFTP-Transport ist nicht eingerichtet.")
         if eintrag.brief_status == "UEBERMITTELT":
             return "BEREITS_GESENDET"
@@ -1388,7 +1423,10 @@ class HVMailversandService:
 
         dateiname = brief_sftp.baue_dateiname(sende_schluessel=eintrag.brief_sende_schluessel)
         try:
-            ergebnis = self.brief_sftp_adapter.sende(pdf_bytes=eintrag.brief_pdf_bytes, dateiname=dateiname)
+            ergebnis = self._brief_uebertragen(
+                pdf_bytes=eintrag.brief_pdf_bytes, dateiname=dateiname, pdf_sha256=eintrag.brief_pdf_sha256,
+                sende_schluessel=eintrag.brief_sende_schluessel, erstellt_von="hv-mailversand-nachsendung",
+            )
         except brief_sftp.PostSftpDateiKonfliktError:
             # Datei existiert remote bereits unter dem permanent
             # reservierten Schlüssel - war wahrscheinlich bereits

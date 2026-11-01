@@ -8436,3 +8436,21 @@ Kein Schema-/UI-Wechsel. Service: `_speichere_roh(positions_schluessel=...)`
 `EBICS_INGEST.md` (späte Wiederverwendung einer einmaligen Referenz,
 instabile Statement-Ids, manueller Upload qualifizierter Dateien).
 Tests: von Codex im Linux-Testimage auszuführen (lokal kein Python freigegeben).
+
+## EinfachBrief-REST statt SFTP (`mahnwesen/brief_rest.py`)
+
+Integriert, nicht aktiv, nie gegen einen echten Endpoint gelaufen. Ohne
+`MIETINKASSO_BRIEF_TRANSPORT=rest` und vollständige Werte bleibt REST zu,
+ohne Ausweichen auf SFTP. Offen:
+
+- Anbieter: API-Key; Bestätigung von Base64 in `payload`, Upload ohne
+  `receiver` samt Adresslesung aus dem PDF (Probe mit eigener Adresse nötig,
+  die Antwort enthält keine Adresse), `finished=true` beim Upload, ID-Formate,
+  Einheit und Brutto/Netto von `totalPrice`.
+- Markus: `registeredMailType` für das bisherige Produkt "Einschreiben
+  Einwurf" (in keiner Quelle belegt, ohne Wert gesperrt) und Preisobergrenze.
+- Bewusst nicht gebaut: maschineller Postaufgabe-/Zugangsnachweis aus
+  `printJobStatusType`/`orderDetails`, automatisches Klären ungewisser Versuche,
+  Löschen aus dem Warenkorb, Freigabe eines Versand-Claims.
+- Backoffice zeigt einen ungewissen Mitmieter-Brief weiter als "noch nicht
+  übermittelt" mit Nachsende-Knopf; der Knopf liefert `UNKLAR` ohne Request.
