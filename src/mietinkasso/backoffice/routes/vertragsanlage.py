@@ -10,6 +10,8 @@ bleiben, sonst verschluckt der Platzhalter den Literalpfad."""
 
 from __future__ import annotations
 
+from html import escape as h
+
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -58,6 +60,7 @@ from mietinkasso.vertragsanlage.pdf_extraktion import (
 )
 from mietinkasso.vertragsanlage.vorschlaege import (
     mehrdeutigkeiten_aus_extraktion as _vertragsanlage_mehrdeutigkeiten_aus_extraktion,
+    quellenstand as _vertragsanlage_quellenstand,
     vorschlaege_aus_extraktion as _vertragsanlage_vorschlaege_aus_extraktion,
 )
 
@@ -397,6 +400,11 @@ def vertragsanlage_detail(
         f'<p><a href="/backoffice/vertrag/{vertrag_id}/mahnbrief-archiv">Archivierte Mahnbriefe, '
         "Original-PDF-Download und Anbieterbeleg-Import ansehen</a></p></div>"
     )
+    inhalt += (
+        f'<div class="card"><h3>Prüfen und antworten</h3>'
+        f'<p><a href="/backoffice/vertrag/{h(vertrag_id)}/kontoabdeckung">Kontoabdeckung und Prüfstand</a> · '
+        f'<a href="/backoffice/vertrag/{h(vertrag_id)}/antwortentwurf">Mieterantwort-Entwurf</a></p></div>'
+    )
     return _layout(request, session, f"Mieterakte {debitor.name}", inhalt)
 
 
@@ -603,6 +611,8 @@ async def vertragsanlage_pdf_hochladen(
     warnungen: tuple = ()
     quelle_typ = "MANUELL"
     quelle_referenz: str | None = None
+    ergebnis = None
+    quellenstand = None
     if pdf_datei is not None and pdf_datei.filename:
         try:
             rohbytes = await _lese_begrenzt(pdf_datei, deps._settings.vertragsanlage_max_upload_bytes)
@@ -627,6 +637,11 @@ async def vertragsanlage_pdf_hochladen(
         warnungen = ergebnis.warnungen
         quelle_typ = "PDF_EXTRAKTION"
         quelle_referenz = f"pdf-sha256:{dokument.ablage_id}"
+        if not ist_neu:
+            quellenstand = _vertragsanlage_quellenstand(
+                quelle_referenz,
+                [p.quelle_referenz for p in deps._stammdaten_repo.liste_mietvertragsprofil_versionen(vertrag_id)],
+            )
 
         # Abnahme-Folgefix (Codex, zweiter Praxistest, "DOPPELANLAGE"):
         # Vertrag-ID/neue Debitor-ID werden beim PDF-zuerst-Weg intern
@@ -656,6 +671,7 @@ async def vertragsanlage_pdf_hochladen(
     _REINE_HINWEISE = (
         "mieter_name_hinweis", "mieter_email_hinweis", "mieter_telefon_hinweis", "mieter_adresse_hinweis",
         "vermieter_name_hinweis", "mitmieter_name_hinweis", "mitmieter_telefon_hinweis", "mitmieter_email_hinweis",
+        "einheit_hinweis",
     )
     for feld, vorschlag in vorschlaege.items():
         if feld in _REINE_HINWEISE:
@@ -679,7 +695,8 @@ async def vertragsanlage_pdf_hochladen(
         vorschlag = vorschlaege.get(feld)
         beleg_feld = f"{feld}_quellenbeleg"
         if vorschlag is not None and not werte.get(beleg_feld):
-            werte[beleg_feld] = f"Seite {vorschlag.seite}: {vorschlag.auszug}"
+            herkunft = " (Formular)" if vorschlag.quellart == "FORMULAR" else ""
+            werte[beleg_feld] = f"Seite {vorschlag.seite}{herkunft}: {vorschlag.auszug}"
 
     # Index-/Verzugszins-Klauseltext+Seite sind je EIN gemeinsames
     # Feldpaar für die GESAMTE Klausel (nicht je Einzelwert) - befüllt
@@ -807,6 +824,7 @@ async def vertragsanlage_pdf_hochladen(
         warnungen=warnungen, csrf=session.csrf_token, aktion_url="/backoffice/vertragsanlage/vorschau",
         zurueck_href="/backoffice/vertraege/neu" if ist_neu else f"/backoffice/vertrag/{vertrag_id}",
         kaution_bereits_vorhanden=kaution_bereits_vorhanden, eckdaten=eckdaten, mehrdeutigkeiten=mehrdeutigkeiten,
+        extraktion=ergebnis, quellenstand=quellenstand,
     )
     return _layout(request, session, "Mietvertragsprofil prüfen", inhalt)
 

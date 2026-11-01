@@ -7110,3 +7110,108 @@ def test_login_sperrt_nach_wiederholten_fehlversuchen(backoffice_client):
 
 # -- Variable Monatsabrechnung (KURZZEITVERMIETUNG/SELFSTORAGE) --------------
 # Auftrag 13.09., HV-20260913-DASHBOARD.
+
+
+def test_formular_pdf_durch_die_bestehende_anlagestrecke_mit_herkunft_und_offenen_stellen(backoffice_client):
+    """Auftrag 01.11.2026: Form-only-PDF läuft über denselben Upload wie jedes
+    andere PDF; Herkunft, Konflikte, Unbekanntes und Signaturfelder sind im Review
+    sichtbar, Dokumentinhalt nur escaped."""
+
+    from tests.mietinkasso._pdf_test_helpers import build_form_pdf
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    pdf = build_form_pdf([{"felder": [
+        ("kaution", "1.500,00", "Tx"), ("mietbeginn", "01.06.2015", "Tx"), ("hauptmietzins", "500,00", "Tx"),
+        ("mieter_1", "Anna Beispiel", "Tx"), ("mieter_2", "Bernd Beispiel", "Tx"),
+        ("<img src=x>", "EUR 999,00", "Tx"), ("Signature1", "x", "Sig"),
+    ]}])
+    antwort = client.post(
+        "/backoffice/vertragsanlage/pdf-hochladen",
+        data={
+            "modus": "NEU", "csrf_token": csrf, "vertrag_id": "V-601-FORM1", "einheit_id": "601-TOP2", "debitor_id": "DEB-1",
+            "gesellschaft_id": "7DI", "rechtsordnung": "OESTERREICH_MRG_VOLL", "gueltig_von": "", "gueltig_bis": "",
+        },
+        files={"pdf_datei": ("formular.pdf", pdf, "application/pdf")},
+    )
+    assert antwort.status_code == 200
+    text = antwort.text
+    assert "Vorschlag aus Dokument (Formularfeld), Seite 1" in text
+    assert "2015-06-01" in text and 'value="500,00"' in text
+    assert "Textlayer: <strong>nicht vorhanden</strong>" in text
+    assert "mehrere Angaben im Dokument, alle erhalten, keine ausgewählt" in text
+    assert "Anna Beispiel" in text and "Bernd Beispiel" in text
+    assert "Unbekannte Formularfelder" in text and "<img src=x>" not in text and "&lt;img src=x&gt;" in text
+    assert "EUR 999,00" not in text
+    assert "kein Nachweis einer Unterschrift" in text
+    assert "ausschließlich aus Formularfeldern" in text
+
+    # Der Formular-Beleg läuft unverändert durch die bestehende Übernahme.
+    import html as _html
+    import re as _re
+
+    form_csrf = _re.search(r'name="csrf_token" value="([^"]+)"', text).group(1)
+    vorschau = client.post(
+        "/backoffice/vertragsanlage/vorschau",
+        data={
+            "csrf_token": form_csrf, "modus": "NEU", "vertrag_id": "V-601-FORM1", "einheit_id": "601-TOP2", "debitor_id": "DEB-1",
+            "gesellschaft_id": "7DI", "rechtsordnung": "OESTERREICH_MRG_VOLL", "gueltig_von": "2015-06-01", "gueltig_bis": "",
+            "quelle_typ": "PDF_EXTRAKTION", "nutzungsart": "UNGEKLAERT", "urspruenglicher_mietbeginn": "2015-06-01",
+            "vertragliche_kaution_cent": _re.search(r'name="vertragliche_kaution_cent"[^>]*value="([^"]*)"', text).group(1),
+            "komponente_hmz": "500,00", "mahngebuehr_cent": "",
+            "quelle_referenz": _re.search(r'name="quelle_referenz" value="([^"]+)"', text).group(1),
+        },
+    )
+    assert vorschau.status_code == 200 and "Jetzt übernehmen" in vorschau.text
+    marker = 'name="paket_json" hidden>'
+    start = vorschau.text.index(marker) + len(marker)
+    paket = _html.unescape(vorschau.text[start:vorschau.text.index("</textarea>", start)])
+    uebernommen = client.post(
+        "/backoffice/vertragsanlage/uebernehmen", data={"csrf_token": form_csrf, "paket_json": paket}, follow_redirects=False,
+    )
+    assert uebernommen.status_code == 303
+
+    import hashlib
+
+    import mietinkasso.backoffice.dependencies as deps
+
+    profil = deps._stammdaten_repo.neuestes_mietvertragsprofil("V-601-FORM1")
+    assert profil.vertragliche_kaution_cent == 150000
+    assert profil.quelle_referenz == f"pdf-sha256:{hashlib.sha256(pdf).hexdigest()}"
+    akte = client.get("/backoffice/vertrag/V-601-FORM1")
+    assert "/backoffice/vertrag/V-601-FORM1/kontoabdeckung" in akte.text
+    assert "/backoffice/vertrag/V-601-FORM1/antwortentwurf" in akte.text
+
+
+def test_erneuter_upload_bestehender_vertrag_unterscheidet_wiederholung_und_neue_version(backoffice_client):
+    from tests.mietinkasso._pdf_test_helpers import build_text_pdf
+
+    client, _konto_id, _konto_gesperrt_id, _op_service = backoffice_client
+    _login(client)
+    csrf = _csrf_token(client)
+    vertrag_id = "V-601-1"
+
+    def hochladen(zeilen):
+        return client.post(
+            "/backoffice/vertragsanlage/pdf-hochladen", data={"modus": "BESTEHEND", "csrf_token": csrf, "vertrag_id": vertrag_id},
+            files={"pdf_datei": ("v.pdf", build_text_pdf(zeilen), "application/pdf")},
+        )
+
+    import hashlib
+
+    import mietinkasso.backoffice.dependencies as deps
+
+    alt = ["Wohnungsmietvertrag Version alt", "Kaution: 1.000,00 EUR"]
+    profil_vor = deps._stammdaten_repo.neuestes_mietvertragsprofil(vertrag_id)
+    assert hochladen(alt).status_code == 200
+    # Upload allein legt keine Version an (der Review bleibt der einzige Weg).
+    assert deps._stammdaten_repo.neuestes_mietvertragsprofil(vertrag_id) == profil_vor or (
+        profil_vor is None and deps._stammdaten_repo.neuestes_mietvertragsprofil(vertrag_id) is None
+    )
+    deps._stammdaten_repo.add_mietvertragsprofil(
+        vertrag_id=vertrag_id, nutzungsart="WOHNUNG", quelle_typ="PDF_EXTRAKTION", erstellt_von="t",
+        quelle_referenz=f"pdf-sha256:{hashlib.sha256(build_text_pdf(alt)).hexdigest()}",
+    )
+    assert "Unveränderte Wiederholung" in hochladen(alt).text
+    assert "Neue Dokumentversion" in hochladen(["Wohnungsmietvertrag Version neu", "Kaution: 1.200,00 EUR"]).text

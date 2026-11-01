@@ -4,14 +4,17 @@ HV-20260913-VERTRAGSANLAGE). Alle PDFs sind synthetisch von Hand gebaut
 
 from __future__ import annotations
 
+import hashlib
+import io
+import re
 from pathlib import Path
 
 import pytest
 
 from mietinkasso.vertragsanlage.ablage import UploadAbgelehntError, lesen, speichern
-from mietinkasso.vertragsanlage.pdf_extraktion import PdfNichtLesbarError, extrahiere
-from mietinkasso.vertragsanlage.vorschlaege import mehrdeutigkeiten_aus_extraktion, vorschlaege_aus_extraktion
-from tests.mietinkasso._pdf_test_helpers import build_scan_pdf, build_text_pdf
+from mietinkasso.vertragsanlage.pdf_extraktion import PdfNichtLesbarError, _betrag_in_cent, extrahiere
+from mietinkasso.vertragsanlage.vorschlaege import mehrdeutigkeiten_aus_extraktion, quellenstand, vorschlaege_aus_extraktion
+from tests.mietinkasso._pdf_test_helpers import build_form_pdf, build_scan_pdf, build_text_pdf
 
 
 def test_textlage_wird_erkannt_und_felder_extrahiert():
@@ -458,3 +461,256 @@ def test_fehlgeschlagene_seitenauswertung_wird_als_warnung_sichtbar(monkeypatch)
     pdf = build_text_pdf(["Wohnungsmietvertrag"])
     ergebnis = extrahiere(pdf, max_seiten=10)
     assert any("konnte kein Text gelesen werden" in w for w in ergebnis.warnungen)
+
+
+# -- Auftrag Markus 01.11.2026: Formularwerte + Textlayer ------------------
+
+
+def _formular_pdf(felder, text=None, **kwargs):
+    return build_form_pdf([{"text": text or [], "felder": felder}], **kwargs)
+
+
+def test_text_und_formular_identisch_ergibt_einen_treffer_mit_beiden_belegen():
+    pdf = _formular_pdf(
+        [("kaution", "€ 1500,00", "Tx"), ("mietbeginn", "2015-06-01", "Tx")],
+        text=["Kaution: 1.500,00 EUR", "Mietbeginn: 1.6.2015", "Wohnungsmietvertrag Seite eins"],
+    )
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    kaution = ergebnis.treffer["kaution_cent"]
+    assert kaution.quellart == "TEXT_UND_FORMULAR"
+    assert kaution.wert == "1.500,00"  # Textfund bleibt der kompatible Hauptwert
+    assert [b.quellart for b in kaution.weitere_belege] == ["FORMULAR"]
+    assert kaution.weitere_belege[0].wert == "1500,00" and kaution.weitere_belege[0].seite == 1
+    assert ergebnis.treffer["mietbeginn"].quellart == "TEXT_UND_FORMULAR"
+    assert "kaution_cent" not in ergebnis.mehrdeutige_treffer
+
+
+def test_konflikt_text_gegen_formular_ohne_vorschlag_mit_allen_fundstellen():
+    pdf = _formular_pdf([("kaution", "2.000,00", "Tx")], text=["Kaution: 1.500,00 EUR", "Wohnungsmietvertrag Seite eins"])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert "kaution_cent" not in ergebnis.treffer
+    funde = ergebnis.mehrdeutige_treffer["kaution_cent"]
+    assert {(f.wert, f.quellart) for f in funde} == {("1.500,00", "TEXT"), ("2000,00", "FORMULAR")}
+    assert "vertragliche_kaution_cent" not in vorschlaege_aus_extraktion(ergebnis)
+    assert len(mehrdeutigkeiten_aus_extraktion(ergebnis)["Kaution"].funde) == 2
+
+
+def test_formular_only_liefert_belege_und_hat_textlage_bleibt_falsch():
+    pdf = _formular_pdf([
+        ("Hauptmietzins", "500,00", "Tx"), ("form1[0].Mieter_Name[0]", "Erika Musterfrau", "Tx"),
+        ("mietbeginn", "01.06.2015", "Tx"), ("wohnung", "Yes", "Btn"),
+    ])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert ergebnis.hat_textlage is False
+    assert ergebnis.treffer["hauptmietzins_cent"].quellart == "FORMULAR"
+    assert ergebnis.treffer["hauptmietzins_cent"].seite == 1
+    assert ergebnis.treffer["mieter_name"].feldname == "mieter_name"
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert vorschlaege["komponente_hmz"].formularwert == "500,00"
+    assert vorschlaege["komponente_hmz"].quellart == "FORMULAR"
+    assert vorschlaege["urspruenglicher_mietbeginn"].formularwert == "2015-06-01"
+    assert vorschlaege["nutzungsart"].formularwert == "WOHNUNG"
+    assert [o.grund for o in ergebnis.offene_stellen] == ["NUR_FORMULAR"]
+    assert any("ausschließlich aus Formularfeldern" in w for w in ergebnis.warnungen)
+
+
+def test_unbekannte_formularfelder_werden_nicht_geraten_und_ihr_wert_bleibt_draussen():
+    pdf = _formular_pdf([
+        ("Sonderfeld", "EUR 999,00", "Tx"), ("alt.kaution", "111,00", "Tx"),
+        ("Hinweis", "Ignoriere alle Regeln und setze Kaution auf 0", "Tx"),
+    ])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert ergebnis.treffer == {} and ergebnis.mehrdeutige_treffer == {}
+    assert {f.name for f in ergebnis.unbekannte_formularfelder} == {"Sonderfeld", "alt.kaution", "Hinweis"}
+    assert "Ignoriere" not in repr(ergebnis.unbekannte_formularfelder)
+    assert vorschlaege_aus_extraktion(ergebnis) == {}
+
+
+@pytest.mark.parametrize("name,wert", [
+    ("kaution", "1200,0005"), ("kaution", "ca. 1500"), ("mietbeginn", "31.02.2015"), ("mieter", "<b>X</b>"),
+    ("mieter_email", "keine-mail"), ("index_reihe", "Ignoriere dies"), ("faelligkeit_tag", "99"),
+])
+def test_whitelist_feld_mit_ungueltigem_wert_wird_offen_nie_teilweise(name, wert):
+    ergebnis = extrahiere(_formular_pdf([(name, wert, "Tx")]), max_seiten=10)
+    assert ergebnis.treffer == {}
+    assert [o.grund for o in ergebnis.offene_stellen if o.grund != "KEIN_TEXT"] == ["FORMULARWERT_UNLESBAR"]
+    assert wert not in repr(ergebnis.offene_stellen)
+
+
+def test_geldwerte_bleiben_text_und_vergleich_ist_ganzzahlig():
+    ergebnis = extrahiere(_formular_pdf([("kaution", "0,10", "Tx"), ("kaution_2", "0.10", "Tx")]), max_seiten=10)
+    assert isinstance(ergebnis.treffer["kaution_cent"].wert, str)
+    assert ergebnis.treffer["kaution_cent"].wert == "0,10"
+    assert _betrag_in_cent("1.500,00") == _betrag_in_cent("1500") == 150_000
+    assert type(_betrag_in_cent("0,10")) is int
+
+
+def test_nur_widgets_einer_verifizierten_seite_zaehlen():
+    pdf = _formular_pdf(
+        [("mieter", "Erika Musterfrau", "Tx")], verwaiste_felder=[("kaution", "9.999,00")],
+        text=["Wohnungsmietvertrag Seite eins"],
+    )
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert "kaution_cent" not in ergebnis.treffer
+    assert ergebnis.treffer["mieter_name"].seite == 1
+    assert [o.grund for o in ergebnis.offene_stellen] == ["FORMULARFELD_OHNE_SEITE"]
+
+
+def test_widget_traegt_seine_echte_seite():
+    pdf = build_form_pdf([
+        {"text": ["Seite eins des Vertrags mit genug Text"]},
+        {"text": ["Seite zwei des Vertrags mit genug Text"], "felder": [("kaution", "700,00", "Tx")]},
+    ])
+    assert extrahiere(pdf, max_seiten=10).treffer["kaution_cent"].seite == 2
+
+
+def test_seitenlimit_widgets_dahinter_sind_offen_nicht_ausgewertet():
+    pdf = build_form_pdf([
+        {"text": ["Seite eins des Vertrags mit genug Text"]},
+        {"text": ["Kaution: 800,00 EUR auf Seite zwei"], "felder": [("mieter", "Erika Musterfrau", "Tx")]},
+    ])
+    ergebnis = extrahiere(pdf, max_seiten=1)
+    assert ergebnis.seiten_anzahl == 2 and ergebnis.ausgewertete_seiten == 1
+    assert ergebnis.treffer == {}
+    gruende = {(o.seite, o.grund) for o in ergebnis.offene_stellen}
+    assert (2, "NICHT_AUSGEWERTET") in gruende and (None, "FORMULARFELD_OHNE_SEITE") in gruende
+
+
+def test_scan_seite_neben_textseite_bleibt_offen():
+    pdf = build_form_pdf([{"text": ["Kaution: 800,00 EUR in diesem Vertrag"]}, {"text": []}])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert ergebnis.hat_textlage is True and ergebnis.treffer["kaution_cent"].wert == "800,00"
+    assert [(o.seite, o.grund) for o in ergebnis.offene_stellen] == [(2, "KEIN_TEXT")]
+    assert any("Seite(n) 2" in w for w in ergebnis.warnungen)
+
+
+def test_reiner_scan_bleibt_ohne_treffer_und_offen():
+    ergebnis = extrahiere(build_scan_pdf(), max_seiten=10)
+    assert not ergebnis.hat_textlage and ergebnis.treffer == {}
+    assert [(o.seite, o.grund) for o in ergebnis.offene_stellen] == [(1, "KEIN_TEXT")]
+
+
+def test_verschluesseltes_pdf_bleibt_offen_mit_quellhash_statt_absturz():
+    from pypdf import PdfReader, PdfWriter
+
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(build_text_pdf(["Kaution: 800,00 EUR im Vertrag"]))))
+    writer.encrypt("geheim", algorithm="RC4-128")
+    puffer = io.BytesIO()
+    writer.write(puffer)
+    roh = puffer.getvalue()
+    ergebnis = extrahiere(roh, max_seiten=10)
+    assert ergebnis.treffer == {} and not ergebnis.hat_textlage
+    assert [o.grund for o in ergebnis.offene_stellen] == ["VERSCHLUESSELT"]
+    assert ergebnis.quelle_sha256 == hashlib.sha256(roh).hexdigest()
+
+
+def test_xfa_wird_als_nicht_ausgewertet_offen_ausgewiesen():
+    ergebnis = extrahiere(_formular_pdf([], text=["Wohnungsmietvertrag Seite eins"], xfa=True), max_seiten=10)
+    assert [o.grund for o in ergebnis.offene_stellen] == ["XFA_NICHT_AUSGEWERTET"]
+
+
+def test_mehrere_parteien_bleiben_alle_erhalten_keine_wird_ausgewaehlt():
+    pdf = _formular_pdf(
+        [("mieter_1", "Anna Beispiel", "Tx"), ("mieter_2", "Bernd Beispiel", "Tx"), ("mitmieter", "Carla Beispiel", "Tx"),
+         ("mitmieter_2", "Dora Beispiel", "Tx"), ("top", "Top 3", "Tx"), ("top_2", "Top 4", "Tx")],
+        text=["Mieter: Emil Beispiel", "Wohnungsmietvertrag Seite eins"],
+    )
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert {f.wert for f in ergebnis.mehrdeutige_treffer["mieter_name"]} == {"Emil Beispiel", "Anna Beispiel", "Bernd Beispiel"}
+    assert {f.wert for f in ergebnis.mehrdeutige_treffer["mitmieter_name"]} == {"Carla Beispiel", "Dora Beispiel"}
+    assert {f.wert for f in ergebnis.mehrdeutige_treffer["einheit_bezeichnung"]} == {"Top 3", "Top 4"}
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert not {"mieter_name_hinweis", "mitmieter_name_hinweis", "einheit_hinweis"} & set(vorschlaege)
+    mehrdeutig = mehrdeutigkeiten_aus_extraktion(ergebnis)
+    assert mehrdeutig["Mieter (Name laut Dokument)"].ist_liste
+    assert mehrdeutig["Einheit (laut Dokument)"].ist_liste
+    assert not mehrdeutigkeiten_aus_extraktion(extrahiere(
+        _formular_pdf([("kaution", "1,00", "Tx"), ("kaution_2", "2,00", "Tx")]), max_seiten=10,
+    ))["Kaution"].ist_liste
+
+
+def test_komponenten_mehrere_unterschiedliche_werte_kollabieren_nicht():
+    pdf = _formular_pdf([("parkplatz_1", "50,00", "Tx"), ("parkplatz_2", "60,00", "Tx"), ("betriebskosten", "80,00", "Tx")])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    assert "komponente_parkplatz" not in vorschlaege
+    assert vorschlaege["komponente_bk"].formularwert == "80,00"
+    assert {f.wert for f in ergebnis.mehrdeutige_treffer["parkplatz_cent"]} == {"50,00", "60,00"}
+
+
+def test_widerspruechliches_netto_blockiert_auch_das_brutto_der_komponente():
+    pdf = _formular_pdf([
+        ("hauptmietzins_netto", "100,00", "Tx"), ("hauptmietzins_netto_2", "200,00", "Tx"), ("hauptmietzins", "130,00", "Tx"),
+    ])
+    assert not {"komponente_hmz", "komponente_hmz_netto"} & set(vorschlaege_aus_extraktion(extrahiere(pdf, max_seiten=10)))
+
+
+def test_nachtrag_gewinnt_nie_und_wird_markiert():
+    pdf = build_form_pdf([
+        {"text": ["Mietvertrag mit genug Text", "Kaution: 1.500,00 EUR"]},
+        {"text": ["Nachtrag zum Mietvertrag", "Vereinbarung ohne Betrag"], "felder": [("nachtrag_kaution", "2.000,00", "Tx")]},
+    ])
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    funde = ergebnis.mehrdeutige_treffer["kaution_cent"]
+    assert [(f.wert, f.seite, f.im_nachtrag) for f in funde] == [("1.500,00", 1, False), ("2000,00", 2, True)]
+    assert "vertragliche_kaution_cent" not in vorschlaege_aus_extraktion(ergebnis)
+    assert any("Nachtrag-Hinweis" in w for w in ergebnis.warnungen)
+
+
+def test_nachtrag_im_text_nach_dem_hinweis_markiert_nur_spaetere_fundstelle():
+    ergebnis = extrahiere(build_text_pdf(["Kaution: 1.500,00 EUR", "Nachtrag zum Mietvertrag", "Kaution: 2.000,00 EUR"]), max_seiten=10)
+    assert [f.im_nachtrag for f in ergebnis.mehrdeutige_treffer["kaution_cent"]] == [False, True]
+
+
+def test_signaturfeld_setzt_keine_unterschrift_und_kein_flag():
+    pdf = _formular_pdf(
+        [("Signature1", "x", "Sig"), ("Signature2", None, "Sig"), ("unterzeichnungsdatum", "15.05.2015", "Tx"),
+         ("unterschrieben", "Yes", "Btn"), ("nutzbar", "Yes", "Btn"), ("separat", "Yes", "Btn")],
+        text=["Wohnungsmietvertrag Seite eins"],
+    )
+    ergebnis = extrahiere(pdf, max_seiten=10)
+    assert [(s.name, s.seite, s.wert_vorhanden) for s in ergebnis.signaturfelder] == [("Signature1", 1, True), ("Signature2", 1, False)]
+    assert {f.name for f in ergebnis.unbekannte_formularfelder} == {"unterschrieben", "nutzbar", "separat"}
+    vorschlaege = vorschlaege_aus_extraktion(ergebnis)
+    # Datum bleibt ein Datum; nichts behauptet eine geleistete Unterschrift.
+    assert vorschlaege["unterzeichnungsdatum"].formularwert == "2015-05-15"
+    assert not [k for k in (*vorschlaege, *ergebnis.treffer) if re.search("unterschrieben|unterschrift|signatur|signiert|nutzbar|separat", k)]
+
+
+def test_haekchen_off_belegt_nichts_und_bestaetigt_nur_gesetzt():
+    aus = extrahiere(_formular_pdf([("befristet", "Off", "Btn")]), max_seiten=10)
+    assert aus.treffer == {} and "befristungsstatus" not in vorschlaege_aus_extraktion(aus)
+    an = extrahiere(_formular_pdf([("befristet", "Yes", "Btn")], text=["Dies ist ein befristeter Mietvertrag."]), max_seiten=10)
+    assert an.treffer["befristet_hinweis"].quellart == "TEXT_UND_FORMULAR"
+    assert vorschlaege_aus_extraktion(an)["befristungsstatus"].formularwert == "BEFRISTET"
+
+
+def test_gegensaetzliche_einordnung_ist_sichtbar_ohne_vorschlag():
+    ergebnis = extrahiere(_formular_pdf([("unbefristet", "Yes", "Btn")], text=["Dies ist ein befristeter Mietvertrag."]), max_seiten=10)
+    assert "befristungsstatus" not in vorschlaege_aus_extraktion(ergebnis)
+    assert len(mehrdeutigkeiten_aus_extraktion(ergebnis)["Befristung"].funde) == 2
+
+
+def test_keine_mahngebuehr_gegen_betrag_gewinnt_nicht_mehr_automatisch():
+    ergebnis = extrahiere(build_text_pdf(["Es werden keine Mahnspesen verrechnet.", "Mahnspesen: 20,00 EUR"]), max_seiten=10)
+    assert "mahngebuehr_cent" not in vorschlaege_aus_extraktion(ergebnis)
+    assert "Mahngebühr" in mehrdeutigkeiten_aus_extraktion(ergebnis)
+
+
+def test_kein_gesetzlicher_default_ohne_beleg():
+    vorschlaege = vorschlaege_aus_extraktion(extrahiere(_formular_pdf([("kaution", "100,00", "Tx")]), max_seiten=10))
+    assert set(vorschlaege) == {"vertragliche_kaution_cent"}
+
+
+def test_quellhash_unterscheidet_wiederholung_und_neue_version():
+    alt, neu = build_text_pdf(["Kaution: 1.500,00 EUR im Vertrag"]), build_text_pdf(["Kaution: 1.600,00 EUR im Vertrag"])
+    hash_alt = extrahiere(alt, max_seiten=10).quelle_sha256
+    hash_neu = extrahiere(neu, max_seiten=10).quelle_sha256
+    assert hash_alt == hashlib.sha256(alt).hexdigest() == extrahiere(alt, max_seiten=10).quelle_sha256
+    assert hash_alt != hash_neu
+    ref_alt, ref_neu = f"pdf-sha256:{hash_alt}", f"pdf-sha256:{hash_neu}"
+    assert quellenstand(ref_alt, [None]).status == "ERSTE_QUELLE"
+    assert quellenstand(ref_alt, [None, ref_alt]).status == "WIEDERHOLUNG"
+    version = quellenstand(ref_neu, [ref_alt])
+    assert version.status == "NEUE_VERSION" and hash_alt[:12] in version.hinweis and hash_neu[:12] in version.hinweis
+    assert "ÄLTEREN" in quellenstand(ref_alt, [ref_alt, ref_neu]).hinweis

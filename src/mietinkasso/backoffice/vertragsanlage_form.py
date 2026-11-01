@@ -63,10 +63,68 @@ def _beleg_hinweis(vorschlaege: dict, feld: str) -> str:
     v = vorschlaege.get(feld)
     if v is None:
         return ""
+    herkunft = _QUELLART_LABEL.get(v.quellart)
     return (
-        f'<p class="muted">Vorschlag aus Dokument, Seite {v.seite}: '
+        f'<p class="muted">Vorschlag aus Dokument{f" ({herkunft})" if herkunft else ""}, Seite {v.seite}: '
         f'&bdquo;&hellip;{h(v.auszug)}&hellip;&ldquo; — bitte prüfen.</p>'
     )
+
+
+#: Der reine Textfund behält seinen bisherigen Wortlaut.
+_QUELLART_LABEL = {"FORMULAR": "Formularfeld", "TEXT_UND_FORMULAR": "Text und Formularfeld gleichlautend"}
+
+
+def _fundstelle_html(f) -> str:
+    art = {"TEXT": "Text", "FORMULAR": "Formular", "TEXT_UND_FORMULAR": "Text+Formular"}.get(f.quellart, f.quellart)
+    nachtrag = ", nach Nachtrag-Hinweis" if f.im_nachtrag else ""
+    return f"„{h(f.wert)}“ ({h(art)}, Seite {f.seite}{nachtrag})"
+
+
+def _dokumentquellen_block(extraktion, quellenstand) -> str:
+    """Zeigt Herkunft und alles Offene des hochgeladenen PDFs. Dokument-
+    inhalte sind hier reine, escapte Daten."""
+
+    if extraktion is None:
+        return ""
+    teile = [
+        f"<p>Textlayer: <strong>{'vorhanden' if extraktion.hat_textlage else 'nicht vorhanden'}</strong> · "
+        f"ausgewertet {extraktion.ausgewertete_seiten} von {extraktion.seiten_anzahl} Seite(n)"
+        + (f" · Prüfsumme {h(extraktion.quelle_sha256[:12])}…" if extraktion.quelle_sha256 else "")
+        + "</p>"
+    ]
+    if quellenstand is not None:
+        klasse = "muted" if quellenstand.status == "ERSTE_QUELLE" else "warn"
+        teile.append(f'<p class="{klasse}">{h(quellenstand.hinweis)}</p>')
+    belegt = [
+        (feld, tr) for feld, tr in sorted(extraktion.treffer.items())
+        if tr.quellart != "TEXT" or tr.weitere_belege
+    ]
+    if belegt:
+        zeilen = "".join(
+            f"<li>{h(feld)}: {'; '.join(_fundstelle_html(f) for f in (tr, *tr.weitere_belege))}</li>" for feld, tr in belegt
+        )
+        teile.append(f"<details><summary>Belege aus Formularfeldern und Mehrfachfunden</summary><ul>{zeilen}</ul></details>")
+    if extraktion.offene_stellen:
+        zeilen = "".join(
+            f"<li>{'Dokument' if o.seite is None else f'Seite {o.seite}'}: {h(o.text)}</li>" for o in extraktion.offene_stellen
+        )
+        teile.append(f'<div class="warn"><strong>Offen, nicht ausgewertet:</strong><ul>{zeilen}</ul></div>')
+    if extraktion.unbekannte_formularfelder:
+        zeilen = "".join(f"<li>„{h(f.name)}“ (Seite {f.seite})</li>" for f in extraktion.unbekannte_formularfelder)
+        teile.append(
+            '<div class="warn"><strong>Unbekannte Formularfelder - Werte nicht übernommen, bitte im Dokument '
+            f"prüfen:</strong><ul>{zeilen}</ul></div>"
+        )
+    if extraktion.signaturfelder:
+        zeilen = "".join(
+            f"<li>„{h(f.name)}“ (Seite {f.seite}): {'befüllt' if f.wert_vorhanden else 'leer'}</li>"
+            for f in extraktion.signaturfelder
+        )
+        teile.append(
+            "<div><strong>Signaturfelder (nicht validiert, kein Nachweis einer Unterschrift):</strong>"
+            f"<ul>{zeilen}</ul></div>"
+        )
+    return f'<div class="card"><h2>Dokumentquelle</h2>{"".join(teile)}</div>'
 
 
 def telefon_html(telefon: str | None) -> str:
@@ -545,8 +603,11 @@ def _mehrdeutigkeit_block(mehrdeutigkeiten: dict) -> str:
         return ""
     zeilen = []
     for label, eintrag in mehrdeutigkeiten.items():
-        fundstellen = "; ".join(f"„{h(f.wert)}“ (Seite {f.seite})" for f in eintrag.funde)
-        zeilen.append(f"<li><strong>{h(label)}</strong>: mehrere unterschiedliche Fundstellen im Dokument — {fundstellen}. Bitte manuell entscheiden.</li>")
+        fundstellen = "; ".join(_fundstelle_html(f) for f in eintrag.funde)
+        if eintrag.ist_liste:
+            zeilen.append(f"<li><strong>{h(label)}</strong>: mehrere Angaben im Dokument, alle erhalten, keine ausgewählt — {fundstellen}. Bitte manuell prüfen.</li>")
+        else:
+            zeilen.append(f"<li><strong>{h(label)}</strong>: mehrere unterschiedliche Fundstellen im Dokument — {fundstellen}. Bitte manuell entscheiden.</li>")
     return f'<div class="flash-error"><strong>Mehrdeutige Angaben im Dokument gefunden (kein automatischer Vorschlag):</strong><ul>{"".join(zeilen)}</ul></div>'
 
 
@@ -585,11 +646,12 @@ def review_formular(
     *, ist_neu: bool, kontext_hidden: dict, werte: dict, vorschlaege: dict, warnungen: tuple[str, ...],
     csrf: str, aktion_url: str, zurueck_href: str, kaution_bereits_vorhanden: bool = False,
     eckdaten: dict | None = None, mehrdeutigkeiten: dict | None = None,
+    extraktion=None, quellenstand=None,
 ) -> str:
     hidden_felder = "".join(f'<input type="hidden" name="{h(k)}" value="{h(str(v))}">' for k, v in kontext_hidden.items())
     warnblock = "".join(f'<p class="warn">{h(w)}</p>' for w in warnungen)
     eckdaten_block = _eckdaten_block(eckdaten, vorschlaege)
-    mehrdeutigkeit_block = _mehrdeutigkeit_block(mehrdeutigkeiten or {})
+    mehrdeutigkeit_block = _mehrdeutigkeit_block(mehrdeutigkeiten or {}) + _dokumentquellen_block(extraktion, quellenstand)
     nutzungsart_optionen = "".join(
         option(n, n, selected=(werte.get("nutzungsart") or "UNGEKLAERT") == n) for n in NUTZUNGSARTEN
     )

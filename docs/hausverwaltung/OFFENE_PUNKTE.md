@@ -8454,3 +8454,42 @@ ohne Ausweichen auf SFTP. Offen:
   Löschen aus dem Warenkorb, Freigabe eines Versand-Claims.
 - Backoffice zeigt einen ungewissen Mitmieter-Brief weiter als "noch nicht
   übermittelt" mit Nachsende-Knopf; der Knopf liefert `UNKLAR` ohne Request.
+
+## Vertragsquellen, Kontoabdeckung, Antwortentwürfe (Auftrag Markus 01.11.2026)
+
+Umgesetzt: `vertragsanlage/pdf_extraktion.py` (Formularwerte + Textlayer),
+`abgleichstatus/kontoabdeckung.py`, `abgleichstatus/antwortentwurf.py`,
+`backoffice/routes/vertragscheck.py`. Kein Schemawechsel, keine Datenmigration.
+
+Offen:
+
+- **Keine gespeicherte Periodenquelle.** Die Prüfseite zeigt für alle Verträge
+  „Belegte Perioden fehlen“, bis der bestehende Bankowner verifizierte Perioden mit Konto-ID, Beleg-ID, Hash
+  und vollständigem Erfolg an die vorhandene Leseschnittstelle liefert. Kein zweiter Importer;
+  eine zusätzliche Datenbank ist dafür nicht vorgegeben.
+- **Fremdzahler sind nicht erkennbar:** das Datenmodell kennt keine IBAN des Mieters;
+  die Seite zeigt den Zahlernamen laut Bank als Rohangabe nach Gesellschaftsprüfung.
+  Die bestehende belegte Zuordnung bleibt maßgeblich, kein Namensabgleich und keine automatische Mahnung.
+- **Formular-Whitelist ist generisch:** die Feldnamen der realen Vertragsvorlagen sind
+  nicht geprüft (synthetic-only). Unbekannte Namen werden nur als Hinweis gelistet und
+  müssen von Codex am echten Bestand gegen `_FORMULARFELDER` abgeglichen werden.
+- **Keine OCR, kein XFA, keine Signaturprüfung:** solche Inhalte bleiben offene Stellen
+  bzw. Hinweise. Ein Scan-Bild neben genügend Text auf derselben Seite wird nicht erkannt.
+- **Antwortregeln sind begrenzte vollständige Frageformen:** unbekannte Zusätze und
+  abweichende Adressen bleiben manuell. Jeder Originalpunkt bleibt erhalten.
+  Menschliche Prüfung jedes Entwurfs bleibt Pflicht; keine Rechts- oder Versandfreigabe.
+- **Keine Bankdaten-Antwort:** die Antwort auf IBAN-Fragen bleibt manuell, obwohl eine
+  Zahlungszielbindung existiert. Bewusst konservativ, Markus kann das freigeben.
+
+
+### Unabhängige Abnahme 01.11.2026 – Vertragsquellen
+Codex hat Vertrags-/Form-Konflikte und Scope-/Antwortfehler unabhängig reproduziert
+und die Reviewkorrekturen mit Regressionstests ergänzt. 187 gezielte Vertrags-/Abgleich-/
+Antworttests und 150 Bestandsprüfungen lokal bestanden. 19 eigene PDF-Prüffälle und
+250 setzbasierte Intervallfälle zusätzlich geprüft; Scope-/Fragen-Gegenproben nach Korrektur
+bestanden. Bestehende HTTP-Routen/Closed-Antworten unverändert, drei neue Routen geschlossen.
+Windows-Lokalabnahme, keine Linux-/Liveabnahme. Dokumentierte alte Snapshot-/Font-/
+modulgeteilte-Client-Testprobleme im Ausgangsstand nicht als neue Regression ausgeben.
+Der erste Claude-Schreiblauf wurde nach vorliegendem Code kontrolliert beendet; kein
+Claude-Abschlussbericht oder erfolgreich abgeschlossene externe Gegenprüfung behauptet.
+Keine Sendung, Bank-/OP-Buchung, Datenmigration, Aktivierung oder produktive Installation.

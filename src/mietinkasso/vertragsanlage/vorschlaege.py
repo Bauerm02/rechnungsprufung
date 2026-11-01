@@ -26,11 +26,59 @@ class Vorschlag:
     formularwert: str
     seite: int
     auszug: str
+    quellart: str = "TEXT"
+    weitere_belege: tuple[FeldTreffer, ...] = ()
 
 
 @dataclass(frozen=True)
 class Mehrdeutigkeit:
     funde: tuple[FeldTreffer, ...]
+    #: Parteien/Einheiten: mehrere Angaben können zugleich richtig sein. Sie
+    #: bleiben als Liste erhalten, keine wird ausgewählt.
+    ist_liste: bool = False
+
+
+@dataclass(frozen=True)
+class Quellenstand:
+    """Vergleich des Quellhashes mit den bisherigen Profilversionen."""
+
+    status: str  # ERSTE_QUELLE | WIEDERHOLUNG | NEUE_VERSION
+    hinweis: str
+
+
+def quellenstand(quelle_referenz: str, bisherige_referenzen: list[str | None]) -> Quellenstand:
+    """Unveränderte Datei und neue Dokumentversion werden allein über den
+    Inhaltshash unterschieden, nie über den Dateinamen. Reine Anzeige."""
+
+    frueher = [r for r in bisherige_referenzen if r and r.startswith("pdf-sha256:")]
+    kurz = quelle_referenz.removeprefix("pdf-sha256:")[:12]
+    if not frueher:
+        return Quellenstand("ERSTE_QUELLE", f"Erstes hinterlegtes PDF zu diesem Vertrag (Prüfsumme {kurz}…).")
+    if quelle_referenz == frueher[-1]:
+        return Quellenstand("WIEDERHOLUNG", f"Unveränderte Wiederholung der zuletzt hinterlegten Datei (Prüfsumme {kurz}…).")
+    if quelle_referenz in frueher:
+        return Quellenstand(
+            "WIEDERHOLUNG", f"Identisch mit einer ÄLTEREN hinterlegten Datei, nicht mit der zuletzt verwendeten (Prüfsumme {kurz}…).",
+        )
+    return Quellenstand(
+        "NEUE_VERSION",
+        f"Neue Dokumentversion (Prüfsumme {kurz}…), weicht von der zuletzt hinterlegten Datei ab "
+        f"(Prüfsumme {frueher[-1].removeprefix('pdf-sha256:')[:12]}…). Geänderte Angaben bitte prüfen.",
+    )
+
+
+def _aus_treffer(formularwert: str, tr: FeldTreffer) -> Vorschlag:
+    return Vorschlag(formularwert, tr.seite, tr.auszug, tr.quellart, tr.weitere_belege)
+
+
+def _genau_einer(ergebnis: ExtraktionsErgebnis, optionen: dict[str, str]) -> tuple[str, FeldTreffer] | None:
+    """Tri-State: nur wenn GENAU EIN Hinweis trifft und keiner der Hinweise in
+    sich widersprüchlich ist - sonst bleibt das Feld ungeklärt."""
+
+    if any(feld in ergebnis.mehrdeutige_treffer for feld in optionen.values()):
+        return None
+    gefunden = [(wert, ergebnis.treffer[feld]) for wert, feld in optionen.items() if feld in ergebnis.treffer]
+    return gefunden[0] if len(gefunden) == 1 else None
 
 
 def _mietbeginn_iso(ddmmyyyy: str) -> str | None:
@@ -126,6 +174,17 @@ _DIREKTE_FELDER = {
     "mitmieter_name": "mitmieter_name_hinweis",
     "mitmieter_telefon": "mitmieter_telefon_hinweis",
     "mitmieter_email": "mitmieter_email_hinweis",
+    "einheit_bezeichnung": "einheit_hinweis",
+}
+
+_BEFRISTUNG = {"BEFRISTET": "befristet_hinweis", "UNBEFRISTET": "unbefristet_hinweis"}
+_BK_HK = {"AKONTO_VORAUSZAHLUNG": "bk_hk_akonto_hinweis", "PAUSCHALE_INKLUSIVMIETE": "bk_hk_pauschale_hinweis"}
+_NUTZUNGSART = {"WOHNUNG": "nutzungsart_wohnung", "BUERO": "nutzungsart_buero", "GESCHAEFTSLOKAL": "nutzungsart_geschaeft"}
+_SCHWELLE = {"0": "index_schwelle_exklusiv_hinweis", "1": "index_schwelle_inklusiv_hinweis"}
+_MRG = {"VOLL": "mrg_vollanwendung_hinweis", "TEIL": "mrg_teilanwendung_hinweis", "AUSNAHME": "mrg_ausnahme_hinweis"}
+_MIETZINSBILDUNG = {
+    "FREI": "mietzinsbildung_frei_hinweis", "RICHTWERT": "mietzinsbildung_richtwert_hinweis",
+    "KATEGORIE": "mietzinsbildung_kategorie_hinweis",
 }
 
 
@@ -136,79 +195,63 @@ def vorschlaege_aus_extraktion(ergebnis: ExtraktionsErgebnis) -> dict[str, Vorsc
     for quellfeld, formularfeld in _DIREKTE_FELDER.items():
         if quellfeld in t:
             tr = t[quellfeld]
-            vorschlaege[formularfeld] = Vorschlag(tr.wert.strip(), tr.seite, tr.auszug)
+            vorschlaege[formularfeld] = _aus_treffer(tr.wert.strip(), tr)
 
     if "mietbeginn" in t:
         tr = t["mietbeginn"]
         iso = _mietbeginn_iso(tr.wert)
         if iso is not None:
-            vorschlaege["urspruenglicher_mietbeginn"] = Vorschlag(iso, tr.seite, tr.auszug)
+            vorschlaege["urspruenglicher_mietbeginn"] = _aus_treffer(iso, tr)
 
     if "mietende" in t:
         tr = t["mietende"]
         iso = _mietbeginn_iso(tr.wert)
         if iso is not None:
-            vorschlaege["gueltig_bis"] = Vorschlag(iso, tr.seite, tr.auszug)
+            vorschlaege["gueltig_bis"] = _aus_treffer(iso, tr)
 
     if "unterzeichnungsdatum" in t:
         tr = t["unterzeichnungsdatum"]
         iso = _mietbeginn_iso(tr.wert)
         if iso is not None:
-            vorschlaege["unterzeichnungsdatum"] = Vorschlag(iso, tr.seite, tr.auszug)
+            vorschlaege["unterzeichnungsdatum"] = _aus_treffer(iso, tr)
 
     if "uebergabe_am" in t:
         tr = t["uebergabe_am"]
         iso = _mietbeginn_iso(tr.wert)
         if iso is not None:
-            vorschlaege["uebergabe_am"] = Vorschlag(iso, tr.seite, tr.auszug)
+            vorschlaege["uebergabe_am"] = _aus_treffer(iso, tr)
 
     if "index_urspruenglicher_basismonat" in t:
         tr = t["index_urspruenglicher_basismonat"]
         iso_monat = _basismonat_iso(tr.wert)
         if iso_monat is not None:
-            vorschlaege["index_urspruenglicher_basismonat"] = Vorschlag(iso_monat, tr.seite, tr.auszug)
+            vorschlaege["index_urspruenglicher_basismonat"] = _aus_treffer(iso_monat, tr)
 
     # Tri-State wie `nutzungsart` oben: NUR bei GENAU EINEM der beiden
     # Hinweise ein Vorschlag - bei beiden/keinem bleibt das Feld
     # UNGEKLAERT (Auftrag Markus: "Leeres Ende darf NICHT automatisch
     # unbefristet sein" - dasselbe Vorsichtsprinzip gilt hier für die
     # Erkennung selbst, nicht nur für das leere `gueltig_bis`).
-    befristungsstatus_treffer = {
-        "BEFRISTET": t.get("befristet_hinweis"),
-        "UNBEFRISTET": t.get("unbefristet_hinweis"),
-    }
-    gefundene_befristung = {k: v for k, v in befristungsstatus_treffer.items() if v is not None}
-    if len(gefundene_befristung) == 1:
-        (status, tr), = gefundene_befristung.items()
-        vorschlaege["befristungsstatus"] = Vorschlag(status, tr.seite, tr.auszug)
-
-    bk_hk_treffer = {
-        "AKONTO_VORAUSZAHLUNG": t.get("bk_hk_akonto_hinweis"),
-        "PAUSCHALE_INKLUSIVMIETE": t.get("bk_hk_pauschale_hinweis"),
-    }
-    gefundene_bk_hk = {k: v for k, v in bk_hk_treffer.items() if v is not None}
-    if len(gefundene_bk_hk) == 1:
-        (abrechnungsart, tr), = gefundene_bk_hk.items()
-        vorschlaege["bk_hk_abrechnungsart"] = Vorschlag(abrechnungsart, tr.seite, tr.auszug)
-
-    nutzungsart_treffer = {
-        "WOHNUNG": t.get("nutzungsart_wohnung"),
-        "BUERO": t.get("nutzungsart_buero"),
-        "GESCHAEFTSLOKAL": t.get("nutzungsart_geschaeft"),
-    }
-    gefundene = {k: v for k, v in nutzungsart_treffer.items() if v is not None}
-    if len(gefundene) == 1:
-        (nutzungsart, tr), = gefundene.items()
-        vorschlaege["nutzungsart"] = Vorschlag(nutzungsart, tr.seite, tr.auszug)
+    for formularfeld, optionen in (
+        ("befristungsstatus", _BEFRISTUNG), ("bk_hk_abrechnungsart", _BK_HK), ("nutzungsart", _NUTZUNGSART),
+    ):
+        eindeutig = _genau_einer(ergebnis, optionen)
+        if eindeutig is not None:
+            vorschlaege[formularfeld] = _aus_treffer(*eindeutig)
     # Mehrdeutig (mehrere Muster gleichzeitig) oder kein Treffer: bewusst
     # KEIN Vorschlag - das Formular bleibt bei UNGEKLAERT.
 
-    if "mahngebuehr_keine" in t:
+    # "Keine Mahngebühr" und ein Betrag widersprechen sich: kein Vorschlag,
+    # sondern eine sichtbare Mehrdeutigkeit (`mehrdeutigkeiten_aus_extraktion`).
+    betrag_genannt = "mahngebuehr_cent" in t or "mahngebuehr_cent" in ergebnis.mehrdeutige_treffer
+    if "mahngebuehr_keine" in t and betrag_genannt:
+        pass
+    elif "mahngebuehr_keine" in t:
         tr = t["mahngebuehr_keine"]
-        vorschlaege["mahngebuehr_cent"] = Vorschlag("0", tr.seite, tr.auszug)
+        vorschlaege["mahngebuehr_cent"] = _aus_treffer("0", tr)
     elif "mahngebuehr_cent" in t:
         tr = t["mahngebuehr_cent"]
-        vorschlaege["mahngebuehr_cent"] = Vorschlag(tr.wert, tr.seite, tr.auszug)
+        vorschlaege["mahngebuehr_cent"] = _aus_treffer(tr.wert, tr)
     # sonst: kein Vorschlag - Feld bleibt leer -> None (unbekannt, KEIN erfundenes 0)
 
     # Abnahme-Folgefix (Codex, zweiter Praxistest): Brutto/Netto/USt je
@@ -230,7 +273,7 @@ def vorschlaege_aus_extraktion(ergebnis: ExtraktionsErgebnis) -> dict[str, Vorsc
     ):
         if netto_feld in t:
             tr = t[netto_feld]
-            vorschlaege[f"{formular_praefix}_netto"] = Vorschlag(tr.wert.strip(), tr.seite, tr.auszug)
+            vorschlaege[f"{formular_praefix}_netto"] = _aus_treffer(tr.wert.strip(), tr)
             if ust_feld in t:
                 tr_ust = t[ust_feld]
                 # Abnahme-Folgefix: die Auswahlfelder im Review bieten nur
@@ -238,10 +281,10 @@ def vorschlaege_aus_extraktion(ergebnis: ExtraktionsErgebnis) -> dict[str, Vorsc
                 # PROZENT`) - ein erkannter Wert wird auf eine glatte
                 # Ganzzahl normalisiert ("20,0" -> "20"), damit die
                 # entsprechende Option tatsächlich vorausgewählt erscheint.
-                vorschlaege[f"{formular_praefix}_ust"] = Vorschlag(_prozent_normalisiert(tr_ust.wert), tr_ust.seite, tr_ust.auszug)
-        elif brutto_feld in t:
+                vorschlaege[f"{formular_praefix}_ust"] = _aus_treffer(_prozent_normalisiert(tr_ust.wert), tr_ust)
+        elif brutto_feld in t and netto_feld not in ergebnis.mehrdeutige_treffer:
             tr = t[brutto_feld]
-            vorschlaege[formular_praefix] = Vorschlag(tr.wert.strip(), tr.seite, tr.auszug)
+            vorschlaege[formular_praefix] = _aus_treffer(tr.wert.strip(), tr)
 
     # Ein belegter Verzugszins-SATZ ist selbst der Beleg für
     # "vertraglich vereinbart" - ohne eigenes Fundmuster für diese
@@ -249,45 +292,24 @@ def vorschlaege_aus_extraktion(ergebnis: ExtraktionsErgebnis) -> dict[str, Vorsc
     # obwohl der Satz direkt daneben bereits als Vorschlag steht.
     if "verzugszins_satz_prozent" in t:
         tr = t["verzugszins_satz_prozent"]
-        vorschlaege["verzugszins_art"] = Vorschlag("VERTRAGLICH_VEREINBART", tr.seite, tr.auszug)
+        vorschlaege["verzugszins_art"] = _aus_treffer("VERTRAGLICH_VEREINBART", tr)
 
     if "index_anpassungsmonat_name" in t:
         tr = t["index_anpassungsmonat_name"]
         monat = _MONATSNAMEN.get(tr.wert.strip().lower())
         if monat is not None:
-            vorschlaege["index_anpassungsmonat"] = Vorschlag(str(monat), tr.seite, tr.auszug)
+            vorschlaege["index_anpassungsmonat"] = _aus_treffer(str(monat), tr)
 
     # Tri-State wie `befristungsstatus`/`nutzungsart` oben: NUR bei GENAU
     # EINEM der beiden Hinweise ein Vorschlag - bei beiden/keinem bleibt
     # die Einordnung ungeklärt statt geraten.
-    schwelle_treffer = {
-        "0": t.get("index_schwelle_exklusiv_hinweis"),
-        "1": t.get("index_schwelle_inklusiv_hinweis"),
-    }
-    gefundene_schwelle = {k: v for k, v in schwelle_treffer.items() if v is not None}
-    if len(gefundene_schwelle) == 1:
-        (inklusive, tr), = gefundene_schwelle.items()
-        vorschlaege["index_schwelle_inklusive"] = Vorschlag(inklusive, tr.seite, tr.auszug)
-
-    mrg_treffer = {
-        "VOLL": t.get("mrg_vollanwendung_hinweis"),
-        "TEIL": t.get("mrg_teilanwendung_hinweis"),
-        "AUSNAHME": t.get("mrg_ausnahme_hinweis"),
-    }
-    gefundene_mrg = {k: v for k, v in mrg_treffer.items() if v is not None}
-    if len(gefundene_mrg) == 1:
-        (anwendungsbereich, tr), = gefundene_mrg.items()
-        vorschlaege["rechtsachse_mrg_anwendungsbereich"] = Vorschlag(anwendungsbereich, tr.seite, tr.auszug)
-
-    mietzinsbildung_treffer = {
-        "FREI": t.get("mietzinsbildung_frei_hinweis"),
-        "RICHTWERT": t.get("mietzinsbildung_richtwert_hinweis"),
-        "KATEGORIE": t.get("mietzinsbildung_kategorie_hinweis"),
-    }
-    gefundene_mietzinsbildung = {k: v for k, v in mietzinsbildung_treffer.items() if v is not None}
-    if len(gefundene_mietzinsbildung) == 1:
-        (mietzinsbildung, tr), = gefundene_mietzinsbildung.items()
-        vorschlaege["rechtsachse_mietzinsbildung"] = Vorschlag(mietzinsbildung, tr.seite, tr.auszug)
+    for formularfeld, optionen in (
+        ("index_schwelle_inklusive", _SCHWELLE), ("rechtsachse_mrg_anwendungsbereich", _MRG),
+        ("rechtsachse_mietzinsbildung", _MIETZINSBILDUNG),
+    ):
+        eindeutig = _genau_einer(ergebnis, optionen)
+        if eindeutig is not None:
+            vorschlaege[formularfeld] = _aus_treffer(*eindeutig)
 
     return vorschlaege
 
@@ -326,7 +348,28 @@ _FELD_LABELS = {
     "mitmieter_name": "Mitmieter (Name laut Dokument)",
     "mitmieter_telefon": "Mitmieter (Telefon laut Dokument)",
     "mitmieter_email": "Mitmieter (E-Mail laut Dokument)",
+    "einheit_bezeichnung": "Einheit (laut Dokument)",
+    "hauptmietzins_netto_cent": "Hauptmietzins netto",
+    "hauptmietzins_ust_prozent": "Hauptmietzins USt",
+    "betriebskosten_netto_cent": "Betriebskosten netto",
+    "betriebskosten_ust_prozent": "Betriebskosten USt",
+    "heizkosten_netto_cent": "Heizkosten netto",
+    "heizkosten_ust_prozent": "Heizkosten USt",
+    "kueche_netto_cent": "Küche netto",
+    "kueche_ust_prozent": "Küche USt",
+    "parkplatz_netto_cent": "Parkplatz netto",
+    "parkplatz_ust_prozent": "Parkplatz USt",
+    "mieter_adresse": "Mieter (Anschrift laut Dokument)",
+    "faelligkeit_tag": "Fälligkeitstag",
+    "verzugszins_satz_prozent": "Verzugszinssatz",
 }
+
+#: Mehrere Angaben sind hier nicht zwingend ein Widerspruch, sondern eine Liste
+#: - auch dann wird keine ausgewählt.
+_LISTENFELDER = frozenset({
+    "mieter_name", "mieter_email", "mieter_telefon", "mieter_adresse", "vermieter_name",
+    "mitmieter_name", "mitmieter_telefon", "mitmieter_email", "einheit_bezeichnung",
+})
 
 
 def mehrdeutigkeiten_aus_extraktion(ergebnis: ExtraktionsErgebnis) -> dict[str, Mehrdeutigkeit]:
@@ -334,7 +377,22 @@ def mehrdeutigkeiten_aus_extraktion(ergebnis: ExtraktionsErgebnis) -> dict[str, 
     Label + alle Fundstellen - für die "Mehrdeutigkeit"-Warnung im
     Review-Formular (siehe Moduldoc)."""
 
-    return {
-        _FELD_LABELS.get(feld, feld): Mehrdeutigkeit(tuple(funde))
+    ergebnis_je_label = {
+        _FELD_LABELS.get(feld, feld): Mehrdeutigkeit(tuple(funde), ist_liste=feld in _LISTENFELDER)
         for feld, funde in ergebnis.mehrdeutige_treffer.items()
     }
+    t = ergebnis.treffer
+    if "mahngebuehr_keine" in t:
+        betraege = (t["mahngebuehr_cent"],) if "mahngebuehr_cent" in t else ()
+        bisher = ergebnis_je_label.get("Mahngebühr")
+        betraege += bisher.funde if bisher else ()
+        if betraege:
+            ergebnis_je_label["Mahngebühr"] = Mehrdeutigkeit((t["mahngebuehr_keine"], *betraege))
+    for label, optionen in (
+        ("Befristung", _BEFRISTUNG), ("BK/HK-Abrechnungsart", _BK_HK), ("Nutzungsart", _NUTZUNGSART),
+        ("MRG-Anwendungsbereich", _MRG), ("Mietzinsbildung", _MIETZINSBILDUNG), ("Index-Schwelle (Einordnung)", _SCHWELLE),
+    ):
+        gefunden = [t[feld] for feld in optionen.values() if feld in t]
+        if len(gefunden) > 1:
+            ergebnis_je_label[label] = Mehrdeutigkeit(tuple(gefunden))
+    return ergebnis_je_label

@@ -16,22 +16,39 @@ dasselbe Feld (z. B. eine Kaution in der Präambel und ein abweichender
 Betrag in einem späteren Nachtrag), wird das NICHT stillschweigend zu
 einem einzelnen "ersten Treffer gewinnt"-Vorschlag - stattdessen landet
 das Feld in `mehrdeutige_treffer` mit ALLEN Fundstellen, und es wird
-KEIN Formularwert vorgeschlagen (siehe `vorschlaege.py`)."""
+KEIN Formularwert vorgeschlagen (siehe `vorschlaege.py`).
+
+Auftrag Markus 01.11.2026 (Vertragsquellen): PDF-Formularwerte fließen über
+dieselbe Fundstellen-Zusammenführung ein wie der Textlayer. Ausgewertet wird
+ein Widget nur, wenn es (a) über `/Annots` einer ausgewerteten Seite erreicht
+wurde (verifizierte Seite) und (b) sein normalisierter Name in der festen
+Whitelist `_FORMULARFELDER` steht. Formularinhalte sind reine Daten: unbekannte
+Felder werden NICHT geraten, ihre Werte nicht übernommen (nur Name/Seite als
+Prüfhinweis). `hat_textlage` beschreibt weiterhin AUSSCHLIESSLICH den
+Textlayer. Ein Signaturfeld ist nur ein Prüfhinweis: es wird nicht validiert
+und setzt keinerlei "unterschrieben"-Aussage."""
 
 from __future__ import annotations
 
 import io
 import re
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, replace
+from datetime import date
+from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 
-from pypdf import PdfReader
+from pypdf import PasswordType, PdfReader
 from pypdf.errors import PdfReadError
+from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject, NameObject, NumberObject, TextStringObject
 
 
 class PdfNichtLesbarError(Exception):
     """Datei konnte nicht als PDF geparst werden (beschädigt, entgegen der
-    Magic-Byte-Prüfung in `ablage.py` doch kein valides PDF, verschlüsselt
-    ohne bekanntes Passwort o. Ä.)."""
+    Magic-Byte-Prüfung in `ablage.py` doch kein valides PDF o. Ä.). Ein
+    verschlüsseltes PDF ist KEIN Lesefehler, sondern eine offene Stelle
+    (`OffeneStelle.grund == "VERSCHLUESSELT"`): die manuelle Erfassung bleibt
+    möglich, der Quellhash bleibt erhalten."""
 
 
 @dataclass(frozen=True)
@@ -39,6 +56,41 @@ class FeldTreffer:
     wert: str
     seite: int  # 1-basiert
     auszug: str  # Textumgebung des Treffers als Beleg, gekürzt
+    quellart: str = "TEXT"  # TEXT | FORMULAR | TEXT_UND_FORMULAR
+    feldname: str | None = None  # normalisierter Whitelist-Name bei FORMULAR
+    im_nachtrag: bool = False  # steht hinter einem "Nachtrag"-Hinweis; entscheidet nichts
+    #: Alle weiteren Fundstellen desselben (inhaltsgleichen) Werts.
+    weitere_belege: tuple["FeldTreffer", ...] = ()
+
+
+@dataclass(frozen=True)
+class OffeneStelle:
+    """Etwas im Dokument, das NICHT ausgewertet wurde - nie ein stiller
+    Erfolg. `seite=None` betrifft das gesamte Dokument."""
+
+    seite: int | None
+    #: VERSCHLUESSELT | NICHT_AUSGEWERTET | KEIN_TEXT | NUR_FORMULAR | LESEFEHLER |
+    #: FORMULARWERT_UNLESBAR | FORMULARFELD_OHNE_SEITE | XFA_NICHT_AUSGEWERTET
+    grund: str
+    text: str
+
+
+@dataclass(frozen=True)
+class FormularfeldHinweis:
+    """Nicht auf der Whitelist: nur Name/Seite, der Wert bleibt draußen."""
+
+    name: str
+    seite: int
+
+
+@dataclass(frozen=True)
+class SignaturfeldHinweis:
+    """Reiner Prüfhinweis. Ein vorhandener Wert ist nicht validiert und
+    beweist keine wirksame Unterschrift."""
+
+    name: str
+    seite: int
+    wert_vorhanden: bool
 
 
 @dataclass(frozen=True)
@@ -52,6 +104,10 @@ class ExtraktionsErgebnis:
     #: dasselbe Feld.
     mehrdeutige_treffer: dict[str, list[FeldTreffer]]
     warnungen: tuple[str, ...]
+    offene_stellen: tuple[OffeneStelle, ...] = ()
+    unbekannte_formularfelder: tuple[FormularfeldHinweis, ...] = ()
+    signaturfelder: tuple[SignaturfeldHinweis, ...] = ()
+    quelle_sha256: str | None = None
 
 
 _MAX_AUSZUG_LAENGE = 220
@@ -355,6 +411,9 @@ _MUSTER: dict[str, re.Pattern[str]] = {
         r"(?:Zustellanschrift|Anschrift (?:des )?Mieters?|Adresse (?:des )?Mieters?)\s*:?\s*([^\n]{3,120})",
         re.IGNORECASE,
     ),
+    # Reiner Hinweis (Auftrag 01.11.2026): mehrere Einheiten bleiben alle
+    # sichtbar, die Zuordnung zur gewählten Einheit bleibt menschlich.
+    "einheit_bezeichnung": re.compile(r"\b(Top\s*(?:Nr\.?\s*)?[0-9]+[A-Za-z]?(?:/[0-9]+)?)\b"),
     "nutzungsart_wohnung": re.compile(r"(Wohnungsmietvertrag|zu Wohnzwecken)", re.IGNORECASE),
     "nutzungsart_geschaeft": re.compile(r"(Gesch(?:ä|ae)ftsraummietvertrag|Gesch(?:ä|ae)ftslokal)", re.IGNORECASE),
     "nutzungsart_buero": re.compile(r"(B(?:ü|ue)romietvertrag|als B(?:ü|ue)ro vermietet)", re.IGNORECASE),
@@ -410,22 +469,488 @@ def _normalisiere(wert: str) -> str:
     return " ".join(wert.split()).casefold()
 
 
+def _betrag_in_cent(wert: str) -> int | None:
+    """Nur für den Vergleich und ausschließlich ganzzahlig (nie float):
+    "1.500,00", "1500,00" und "1500" sind derselbe Betrag."""
+
+    treffer = re.fullmatch(r"([0-9]+(?:[.,][0-9]{3})*)(?:[.,]([0-9]{2}))?", wert.strip())
+    if treffer is None:
+        return None
+    euro = re.sub(r"[.,]", "", treffer.group(1))
+    return int(euro) * 100 + int(treffer.group(2) or 0)
+
+
+def _datum_oder_none(wert: str) -> date | None:
+    treffer = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", wert.strip())
+    if treffer is None:
+        return None
+    try:
+        return date(int(treffer.group(3)), int(treffer.group(2)), int(treffer.group(1)))
+    except ValueError:
+        return None
+
+
+def _dezimal_oder_none(wert: str) -> Decimal | None:
+    if not re.fullmatch(r"[0-9]+(?:[.,][0-9]+)?", wert.strip()):
+        return None
+    try:
+        return Decimal(wert.strip().replace(",", "."))
+    except InvalidOperation:
+        return None
+
+
+_DATUMSFELDER = frozenset({"mietbeginn", "mietende", "unterzeichnungsdatum", "uebergabe_am"})
+_ZAHLENFELDER = frozenset({
+    "index_schwelle_prozent", "index_urspruenglicher_basiswert", "verzugszins_satz_prozent",
+    "hauptmietzins_ust_prozent", "betriebskosten_ust_prozent", "heizkosten_ust_prozent",
+    "kueche_ust_prozent", "parkplatz_ust_prozent", "faelligkeit_tag", "index_mindestintervall_monate",
+})
+
+
+def _ist_ja_hinweis(feld: str) -> bool:
+    """Felder, die nur "kommt vor" belegen: ein Häkchen bestätigt den Hinweis,
+    ohne selbst einen abweichenden Wortlaut einzubringen."""
+
+    return feld.endswith("_hinweis") or feld.startswith("nutzungsart_") or feld == "mahngebuehr_keine"
+
+
+def _vergleichswert(feld: str, wert: str) -> str:
+    """Inhaltlicher Vergleich quer über Text und Formular. Nicht erkannte
+    Formate fallen auf den Wortlaut zurück und bleiben dadurch ein sichtbarer
+    Unterschied statt einer stillen Gleichsetzung."""
+
+    if feld.endswith("_cent"):
+        cent = _betrag_in_cent(wert)
+        if cent is not None:
+            return f"cent:{cent}"
+    elif feld in _DATUMSFELDER:
+        datum = _datum_oder_none(wert)
+        if datum is not None:
+            return datum.isoformat()
+    elif feld in _ZAHLENFELDER:
+        zahl = _dezimal_oder_none(wert)
+        if zahl is not None:
+            return f"zahl:{zahl.normalize():f}"
+    elif feld in ("mieter_telefon", "mitmieter_telefon"):
+        return re.sub(r"[\s/().-]", "", wert)
+    return _normalisiere(wert)
+
+
 def _auszug(text: str, start: int, ende: int) -> str:
     von = max(0, start - 80)
     bis = min(len(text), ende + 80)
     return text[von:bis].replace("\n", " ").strip()[:_MAX_AUSZUG_LAENGE]
 
 
+# -- PDF-Formularfelder --------------------------------------------------------
+
+_TYP_BETRAG = "BETRAG"
+_TYP_DATUM = "DATUM"
+_TYP_PROZENT = "PROZENT"
+_TYP_NAME = "NAME"
+_TYP_EMAIL = "EMAIL"
+_TYP_TELEFON = "TELEFON"
+_TYP_ADRESSE = "ADRESSE"
+_TYP_TAG = "TAG"
+_TYP_GANZZAHL = "GANZZAHL"
+_TYP_DEZIMAL = "DEZIMAL"
+_TYP_INDEXREIHE = "INDEXREIHE"
+_TYP_BASISMONAT = "BASISMONAT"
+_TYP_MONAT = "MONAT"
+_TYP_EINHEIT = "EINHEIT"
+_TYP_HAKEN = "HAKEN"
+
+_MONATE = (
+    r"J(?:ä|ae)nner|Januar|Februar|M(?:ä|ae)rz|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember"
+)
+
+
+def _komponenten_formularfelder() -> dict[str, tuple[str, str]]:
+    felder: dict[str, tuple[str, str]] = {}
+    for name in ("hauptmietzins", "betriebskosten", "heizkosten", "kueche", "parkplatz"):
+        felder[name] = (f"{name}_cent", _TYP_BETRAG)
+        felder[f"{name}_brutto"] = (f"{name}_cent", _TYP_BETRAG)
+        felder[f"{name}_netto"] = (f"{name}_netto_cent", _TYP_BETRAG)
+        felder[f"{name}_ust"] = (f"{name}_ust_prozent", _TYP_PROZENT)
+    return felder
+
+
+#: Bewusst explizit und abschließend: normalisierter Feldname -> (Extraktions-
+#: schlüssel, Werttyp). Was hier fehlt, wird NICHT aus dem Namen erraten.
+_FORMULARFELDER: dict[str, tuple[str, str]] = {
+    **_komponenten_formularfelder(),
+    "kaution": ("kaution_cent", _TYP_BETRAG),
+    "kautionsbetrag": ("kaution_cent", _TYP_BETRAG),
+    "nettomiete": ("nettomiete_cent", _TYP_BETRAG),
+    "mahngebuehr": ("mahngebuehr_cent", _TYP_BETRAG),
+    "mahnspesen": ("mahngebuehr_cent", _TYP_BETRAG),
+    "mieter": ("mieter_name", _TYP_NAME),
+    "mieter_name": ("mieter_name", _TYP_NAME),
+    "name_mieter": ("mieter_name", _TYP_NAME),
+    "vermieter": ("vermieter_name", _TYP_NAME),
+    "vermieter_name": ("vermieter_name", _TYP_NAME),
+    "name_vermieter": ("vermieter_name", _TYP_NAME),
+    "mitmieter": ("mitmieter_name", _TYP_NAME),
+    "mitmieter_name": ("mitmieter_name", _TYP_NAME),
+    "mieter_email": ("mieter_email", _TYP_EMAIL),
+    "email_mieter": ("mieter_email", _TYP_EMAIL),
+    "e_mail_mieter": ("mieter_email", _TYP_EMAIL),
+    "mieter_telefon": ("mieter_telefon", _TYP_TELEFON),
+    "telefon_mieter": ("mieter_telefon", _TYP_TELEFON),
+    "mitmieter_email": ("mitmieter_email", _TYP_EMAIL),
+    "email_mitmieter": ("mitmieter_email", _TYP_EMAIL),
+    "mitmieter_telefon": ("mitmieter_telefon", _TYP_TELEFON),
+    "telefon_mitmieter": ("mitmieter_telefon", _TYP_TELEFON),
+    "mieter_adresse": ("mieter_adresse", _TYP_ADRESSE),
+    "anschrift_mieter": ("mieter_adresse", _TYP_ADRESSE),
+    "zustellanschrift": ("mieter_adresse", _TYP_ADRESSE),
+    "einheit": ("einheit_bezeichnung", _TYP_EINHEIT),
+    "top": ("einheit_bezeichnung", _TYP_EINHEIT),
+    "top_nr": ("einheit_bezeichnung", _TYP_EINHEIT),
+    "mietbeginn": ("mietbeginn", _TYP_DATUM),
+    "mietende": ("mietende", _TYP_DATUM),
+    "unterzeichnungsdatum": ("unterzeichnungsdatum", _TYP_DATUM),
+    "uebergabe_am": ("uebergabe_am", _TYP_DATUM),
+    "uebergabedatum": ("uebergabe_am", _TYP_DATUM),
+    "faelligkeit_tag": ("faelligkeit_tag", _TYP_TAG),
+    "index_reihe": ("index_reihe", _TYP_INDEXREIHE),
+    "indexreihe": ("index_reihe", _TYP_INDEXREIHE),
+    "index_schwelle": ("index_schwelle_prozent", _TYP_PROZENT),
+    "index_schwelle_prozent": ("index_schwelle_prozent", _TYP_PROZENT),
+    "index_basismonat": ("index_urspruenglicher_basismonat", _TYP_BASISMONAT),
+    "index_basiswert": ("index_urspruenglicher_basiswert", _TYP_DEZIMAL),
+    "index_anpassungsmonat": ("index_anpassungsmonat_name", _TYP_MONAT),
+    "index_mindestintervall_monate": ("index_mindestintervall_monate", _TYP_GANZZAHL),
+    "verzugszins_satz": ("verzugszins_satz_prozent", _TYP_PROZENT),
+    "verzugszins_prozent": ("verzugszins_satz_prozent", _TYP_PROZENT),
+    # Häkchen: nur ein gesetzter Zustand belegt etwas, "Off" belegt nichts.
+    "befristet": ("befristet_hinweis", _TYP_HAKEN),
+    "unbefristet": ("unbefristet_hinweis", _TYP_HAKEN),
+    "wohnung": ("nutzungsart_wohnung", _TYP_HAKEN),
+    "buero": ("nutzungsart_buero", _TYP_HAKEN),
+    "geschaeftslokal": ("nutzungsart_geschaeft", _TYP_HAKEN),
+    "keine_mahngebuehr": ("mahngebuehr_keine", _TYP_HAKEN),
+}
+
+#: Auswahlfelder (Radio/Choice): Feldname -> {normalisierter Wert -> Schlüssel}.
+_AUSWAHLFELDER: dict[str, dict[str, str]] = {
+    "nutzungsart": {
+        "wohnung": "nutzungsart_wohnung", "buero": "nutzungsart_buero", "geschaeftslokal": "nutzungsart_geschaeft",
+    },
+    "befristung": {"befristet": "befristet_hinweis", "unbefristet": "unbefristet_hinweis"},
+}
+
+#: Technische Container in Feldhierarchien; nur diese dürfen wegfallen.
+_GENERISCHE_FELDCONTAINER = re.compile(r"(?:topmostsubform|form(?:ular)?\d*|page\d*|seite\d*)")
+_MAX_FORMULARWERT = 500
+_MAX_WIDGETS = 5000
+_MAX_FELDTIEFE = 32
+
+
+def _name_normalisiert(teil: str) -> str:
+    teil = unicodedata.normalize("NFKC", teil).casefold()
+    for von, nach in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        teil = teil.replace(von, nach)
+    return re.sub(r"[^a-z0-9]+", "_", teil).strip("_")
+
+
+def _feld_aufloesen(voller_name: str) -> tuple[str, str, bool] | None:
+    """Liefert (Whitelist-Name, Anzeigename, im_nachtrag) oder `None`. Löst
+    nur explizit erlaubte Abwandlungen auf: technische Container, ein Präfix
+    `nachtrag_` und eine laufende Nummer (`mieter_2`) - mehrere nummerierte
+    Felder bleiben dadurch mehrere Fundstellen desselben Schlüssels."""
+
+    teile = [_name_normalisiert(re.sub(r"\[\d+\]", "", t)) for t in voller_name.split(".")]
+    teile = [t for t in teile if t]
+    if not teile:
+        return None
+    while len(teile) > 1 and _GENERISCHE_FELDCONTAINER.fullmatch(teile[0]):
+        teile = teile[1:]
+    kandidat = "_".join(teile)
+    anzeige = kandidat[:80]
+    im_nachtrag = False
+    if kandidat.startswith("nachtrag_"):
+        im_nachtrag = True
+        kandidat = kandidat[len("nachtrag_"):]
+    if kandidat in _FORMULARFELDER or kandidat in _AUSWAHLFELDER:
+        return kandidat, anzeige, im_nachtrag
+    nummeriert = re.fullmatch(r"(.+?)_?\d{1,2}", kandidat)
+    if nummeriert and nummeriert.group(1) in _FORMULARFELDER:
+        return nummeriert.group(1), anzeige, im_nachtrag
+    return None
+
+
+def _wert_normalisiert(typ: str, roh: str) -> str | None:
+    """Prüft den GESAMTEN Wert gegen das Format des Typs. Passt er nicht,
+    gibt es keinen Teiltreffer und keine Korrektur (`None` -> offene Stelle)."""
+
+    wert = roh.strip()
+    if typ == _TYP_ADRESSE:
+        wert = re.sub(r"\s*[\r\n]+\s*", ", ", wert)
+        return wert if re.fullmatch(r"[^\x00-\x1f<>]{3,160}", wert) else None
+    if re.search(r"[\x00-\x1f]", wert):
+        return None
+    if typ == _TYP_BETRAG:
+        treffer = re.fullmatch(
+            r"(?:€|EUR)?\s*((?:[0-9]+|[0-9]{1,3}(?:\.[0-9]{3})+)(?:,[0-9]{1,2})?|[0-9]+\.[0-9]{2})\s*(?:€|EUR)?", wert,
+        )
+        if treffer is None:
+            return None
+        zahl = treffer.group(1)
+        if "," in zahl:
+            euro, cent = zahl.split(",")
+            cent = cent.ljust(2, "0")
+        elif re.fullmatch(r"[0-9]+\.[0-9]{2}", zahl):
+            euro, cent = zahl.split(".")
+        else:
+            euro, cent = zahl, "00"
+        return f"{euro.replace('.', '')},{cent}"
+    if typ == _TYP_DATUM:
+        datum = _datum_oder_none(wert)
+        if datum is None:
+            try:
+                datum = date.fromisoformat(wert)
+            except ValueError:
+                return None
+        return datum.strftime("%d.%m.%Y")
+    if typ == _TYP_PROZENT:
+        wert = re.sub(r"\s*%$", "", wert)
+        return wert if re.fullmatch(r"[0-9]{1,2}(?:[.,][0-9]{1,3})?", wert) else None
+    if typ == _TYP_NAME:
+        return wert if re.fullmatch(r"[^\W\d_][\w .,&'-]{1,118}", wert) else None
+    if typ == _TYP_EMAIL:
+        return wert if re.fullmatch(r"[\w.+-]+@[\w.-]+\.\w+", wert) else None
+    if typ == _TYP_TELEFON:
+        return wert if re.fullmatch(r"[0-9+()/ .-]{6,25}", wert) else None
+    if typ == _TYP_TAG:
+        return wert if re.fullmatch(r"[0-9]{1,2}", wert) and 1 <= int(wert) <= 31 else None
+    if typ == _TYP_GANZZAHL:
+        return wert if re.fullmatch(r"[0-9]{1,3}", wert) else None
+    if typ == _TYP_DEZIMAL:
+        return wert if re.fullmatch(r"[0-9]{1,8}(?:[.,][0-9]{1,4})?", wert) else None
+    if typ == _TYP_INDEXREIHE:
+        return wert if re.fullmatch(r"(?:Verbraucherpreisindex|VPI)\s*\d{4}", wert, re.IGNORECASE) else None
+    if typ == _TYP_BASISMONAT:
+        return wert if re.fullmatch(rf"(?:{_MONATE})\s*\d{{4}}|\d{{1,2}}[./]\d{{4}}", wert, re.IGNORECASE) else None
+    if typ == _TYP_MONAT:
+        return wert if re.fullmatch(_MONATE, wert, re.IGNORECASE) else None
+    if typ == _TYP_EINHEIT:
+        return wert if re.fullmatch(r"[\w ./-]{1,40}", wert) else None
+    return None
+
+
+def _objekt(wert):
+    return wert.get_object() if wert is not None else None
+
+
+def _roh(dictionary: DictionaryObject, schluessel: str):
+    return dictionary.raw_get(schluessel) if schluessel in dictionary else None
+
+
+def _vererbt(feld: DictionaryObject, schluessel: str):
+    aktuell, tiefe = feld, 0
+    while isinstance(aktuell, DictionaryObject) and tiefe < _MAX_FELDTIEFE:
+        if schluessel in aktuell:
+            return _objekt(_roh(aktuell, schluessel))
+        aktuell, tiefe = _objekt(_roh(aktuell, "/Parent")), tiefe + 1
+    return None
+
+
+def _voller_feldname(feld: DictionaryObject) -> str:
+    teile: list[str] = []
+    aktuell, tiefe = feld, 0
+    while isinstance(aktuell, DictionaryObject) and tiefe < _MAX_FELDTIEFE:
+        teil = _objekt(_roh(aktuell, "/T"))
+        if isinstance(teil, str) and teil:
+            teile.append(str(teil))
+        aktuell, tiefe = _objekt(_roh(aktuell, "/Parent")), tiefe + 1
+    return ".".join(reversed(teile))
+
+
+def _skalarer_wert(wert) -> str | None:
+    if isinstance(wert, NameObject):
+        return str(wert)[1:]
+    if isinstance(wert, (TextStringObject, NumberObject)):
+        return str(wert)
+    return None
+
+
+def _widgets(seite) -> list[tuple[DictionaryObject, int | None]]:
+    anmerkungen = _objekt(_roh(seite, "/Annots"))
+    if not isinstance(anmerkungen, ArrayObject):
+        return []
+    ergebnis = []
+    for roh in list.__iter__(anmerkungen):
+        widget = _objekt(roh)
+        if isinstance(widget, DictionaryObject) and _objekt(_roh(widget, "/Subtype")) == "/Widget":
+            ergebnis.append((widget, roh.idnum if isinstance(roh, IndirectObject) else None))
+    return ergebnis
+
+
+def _felder_ohne_seite(reader: PdfReader, gesehen: set[int]) -> tuple[list[str], bool]:
+    """Befüllte AcroForm-Felder ohne Widget auf einer ausgewerteten Seite:
+    ihr Wert hat keinen verifizierten Ort und wird nicht übernommen."""
+
+    wurzel = reader.trailer["/Root"]
+    acroform = _objekt(_roh(wurzel, "/AcroForm"))
+    if not isinstance(acroform, DictionaryObject):
+        return [], False
+    hat_xfa = "/XFA" in acroform
+    felder = _objekt(_roh(acroform, "/Fields"))
+    namen: list[str] = []
+    if not isinstance(felder, ArrayObject):
+        return namen, hat_xfa
+    besucht: set[int] = set()
+    stapel = [(roh, 0) for roh in list.__iter__(felder)]
+    while stapel and len(besucht) < _MAX_WIDGETS:
+        roh, tiefe = stapel.pop()
+        kennung = roh.idnum if isinstance(roh, IndirectObject) else None
+        if kennung is not None:
+            if kennung in besucht:
+                continue
+            besucht.add(kennung)
+        feld = _objekt(roh)
+        if not isinstance(feld, DictionaryObject) or tiefe > _MAX_FELDTIEFE:
+            continue
+        kinder = _objekt(_roh(feld, "/Kids"))
+        kinder_roh = list(list.__iter__(kinder)) if isinstance(kinder, ArrayObject) else []
+        unterfelder = [k for k in kinder_roh if isinstance(_objekt(k), DictionaryObject) and "/T" in _objekt(k)]
+        if unterfelder:
+            stapel.extend((k, tiefe + 1) for k in unterfelder)
+            continue
+        kennungen = {k.idnum for k in kinder_roh if isinstance(k, IndirectObject)}
+        if kennung is not None:
+            kennungen.add(kennung)
+        if not kennungen & gesehen and _vererbt(feld, "/V") not in (None, ""):
+            namen.append(_voller_feldname(feld)[:80])
+    return sorted(namen), hat_xfa
+
+
+@dataclass
+class _Formularstand:
+    funde: dict[str, list[FeldTreffer]]
+    offen: list[OffeneStelle]
+    unbekannt: list[FormularfeldHinweis]
+    signaturen: list[SignaturfeldHinweis]
+    gesehen: set[int]
+
+
+def _lese_widget(
+    widget: DictionaryObject, seite_nr: int, nachtrag_ab_seite: int | None, stand: _Formularstand,
+) -> None:
+    voller_name = _voller_feldname(widget)
+    feldtyp = _vererbt(widget, "/FT")
+    wert = _vererbt(widget, "/V")
+    if feldtyp == "/Sig":
+        stand.signaturen.append(SignaturfeldHinweis(voller_name[:80], seite_nr, wert is not None))
+        return
+    if feldtyp == "/Btn":
+        flags = _vererbt(widget, "/Ff")
+        if isinstance(flags, int) and flags & 65536:  # reine Schaltfläche, kein Wert
+            return
+        zustand = _objekt(_roh(widget, "/AS"))
+        if isinstance(zustand, NameObject) and zustand == "/Off":
+            return
+        if not isinstance(wert, NameObject) or wert == "/Off":
+            return
+    roh = _skalarer_wert(wert)
+    if wert is None or roh == "":
+        return
+
+    aufgeloest = _feld_aufloesen(voller_name)
+    if aufgeloest is None:
+        stand.unbekannt.append(FormularfeldHinweis(voller_name[:80], seite_nr))
+        return
+    name, anzeige, nachtrag_im_namen = aufgeloest
+    unlesbar = OffeneStelle(
+        seite_nr, "FORMULARWERT_UNLESBAR", f"Formularfeld „{anzeige}“: Wert hat nicht das erwartete Format, nicht übernommen.",
+    )
+    if roh is None or len(roh) > _MAX_FORMULARWERT:
+        stand.offen.append(unlesbar)
+        return
+
+    if name in _AUSWAHLFELDER:
+        feld = _AUSWAHLFELDER[name].get(_name_normalisiert(roh))
+        normalisiert = _name_normalisiert(roh) if feld else None
+    else:
+        feld, typ = _FORMULARFELDER[name]
+        if typ == _TYP_HAKEN:
+            normalisiert = name if feldtyp == "/Btn" else None
+        else:
+            normalisiert = _wert_normalisiert(typ, roh) if feldtyp in ("/Tx", "/Ch") else None
+    if feld is None or normalisiert is None:
+        stand.offen.append(unlesbar)
+        return
+    stand.funde.setdefault(feld, []).append(FeldTreffer(
+        wert=normalisiert, seite=seite_nr, auszug=f"Formularfeld „{anzeige}“: {normalisiert}"[:_MAX_AUSZUG_LAENGE],
+        quellart="FORMULAR", feldname=name,
+        im_nachtrag=nachtrag_im_namen or (nachtrag_ab_seite is not None and seite_nr >= nachtrag_ab_seite),
+    ))
+
+
+def _lese_formular(reader: PdfReader, seiten: list, nachtrag_ab_seite: int | None) -> _Formularstand:
+    stand = _Formularstand(funde={}, offen=[], unbekannt=[], signaturen=[], gesehen=set())
+    gelesen = 0
+    for seiten_index, seite in enumerate(seiten):
+        seite_nr = seiten_index + 1
+        try:
+            for widget, kennung in _widgets(seite):
+                gelesen += 1
+                if gelesen > _MAX_WIDGETS:
+                    stand.offen.append(OffeneStelle(
+                        seite_nr, "LESEFEHLER", f"Mehr als {_MAX_WIDGETS} Formularfelder: Rest nicht ausgewertet.",
+                    ))
+                    return stand
+                if kennung is not None:
+                    stand.gesehen.add(kennung)
+                _lese_widget(widget, seite_nr, nachtrag_ab_seite, stand)
+        except Exception:
+            stand.offen.append(OffeneStelle(seite_nr, "LESEFEHLER", "Formularfelder dieser Seite konnten nicht gelesen werden."))
+    try:
+        ohne_seite, hat_xfa = _felder_ohne_seite(reader, stand.gesehen)
+    except Exception:
+        stand.offen.append(OffeneStelle(None, "LESEFEHLER", "Formularstruktur konnte nicht vollständig gelesen werden."))
+        return stand
+    if hat_xfa:
+        stand.offen.append(OffeneStelle(None, "XFA_NICHT_AUSGEWERTET", "Dokument enthält XFA-Formulardaten; diese wurden nicht ausgewertet."))
+    for name in ohne_seite:
+        stand.offen.append(OffeneStelle(
+            None, "FORMULARFELD_OHNE_SEITE", f"Formularfeld „{name}“ hat auf keiner ausgewerteten Seite ein Widget: Wert nicht übernommen.",
+        ))
+    return stand
+
+
+def _zusammenfuehren(feld: str, funde: list[FeldTreffer]) -> tuple[FeldTreffer | None, list[FeldTreffer] | None]:
+    """Gleicher Inhalt: EIN Treffer mit allen Belegen. Unterschiedlicher
+    Inhalt (auch Text gegen Formular oder Nachtrag): kein Treffer, alle
+    Fundstellen bleiben erhalten - nie "erster gewinnt", nie "Nachtrag gewinnt"."""
+
+    if _ist_ja_hinweis(feld):
+        # Ein Häkchen bestätigt nur; Unterschiede im Textwortlaut bleiben wie bisher.
+        distinkt = {_vergleichswert(feld, f.wert) for f in funde if f.quellart == "TEXT"} or {"JA"}
+    else:
+        distinkt = {_vergleichswert(feld, f.wert) for f in funde}
+    if len(distinkt) > 1:
+        return None, funde
+    arten = {f.quellart for f in funde}
+    quellart = "TEXT_UND_FORMULAR" if len(arten) > 1 else funde[0].quellart
+    return replace(funde[0], quellart=quellart, weitere_belege=tuple(funde[1:])), None
+
+
+_NACHTRAG = re.compile(r"\bNachtrag\b", re.IGNORECASE)
+
+
 def extrahiere(rohbytes: bytes, *, max_seiten: int) -> ExtraktionsErgebnis:
     """Liest Text seitenweise aus (kein OCR - ein gescanntes Bild ohne
-    Textlayer liefert leeren Text) und sucht die `_MUSTER` je Feld über
-    ALLE ausgewerteten Seiten hinweg. Anders als ein "erster Treffer
-    gewinnt"-Ansatz werden ALLE Fundstellen gesammelt: liefern sie
-    denselben (normalisierten) Wert, wird GENAU EIN `FeldTreffer`
+    Textlayer liefert leeren Text), sucht die `_MUSTER` je Feld über ALLE
+    ausgewerteten Seiten hinweg und ergänzt die Whitelist-Formularfelder.
+    Anders als ein "erster Treffer gewinnt"-Ansatz werden ALLE Fundstellen
+    gesammelt: liefern sie denselben Wert, wird GENAU EIN `FeldTreffer`
     vorgeschlagen; widersprechen sie sich, landet das Feld in
     `mehrdeutige_treffer` mit allen Fundstellen und OHNE Formularvorschlag
     (siehe Moduldoc)."""
 
+    quelle_sha256 = sha256(rohbytes).hexdigest()
     try:
         reader = PdfReader(io.BytesIO(rohbytes))
     except (PdfReadError, ValueError, KeyError) as exc:
@@ -433,27 +958,44 @@ def extrahiere(rohbytes: bytes, *, max_seiten: int) -> ExtraktionsErgebnis:
 
     if reader.is_encrypted:
         try:
-            reader.decrypt("")
-        except Exception as exc:
-            raise PdfNichtLesbarError("PDF ist passwortgeschützt - kein automatischer Textzugriff möglich.") from exc
+            entschluesselt = reader.decrypt("") != PasswordType.NOT_DECRYPTED
+        except Exception:
+            entschluesselt = False
+        if not entschluesselt:
+            meldung = "PDF ist passwortgeschützt - kein automatischer Zugriff auf Text oder Formularfelder, bitte vollständig manuell erfassen."
+            return ExtraktionsErgebnis(
+                seiten_anzahl=0, ausgewertete_seiten=0, hat_textlage=False, treffer={}, mehrdeutige_treffer={},
+                warnungen=(meldung,), offene_stellen=(OffeneStelle(None, "VERSCHLUESSELT", meldung),),
+                quelle_sha256=quelle_sha256,
+            )
 
-    alle_seiten = reader.pages
-    seiten_anzahl = len(alle_seiten)
+    try:
+        alle_seiten = reader.pages
+        seiten_anzahl = len(alle_seiten)
+    except (PdfReadError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise PdfNichtLesbarError(f"PDF konnte nicht gelesen werden: {exc}") from exc
     warnungen: list[str] = []
+    offen: list[OffeneStelle] = []
     ausgewertete_seiten = min(seiten_anzahl, max_seiten)
     if seiten_anzahl > max_seiten:
         warnungen.append(
             f"Dokument hat {seiten_anzahl} Seiten, es wurden nur die ersten {max_seiten} ausgewertet."
         )
+        offen.extend(
+            OffeneStelle(nr, "NICHT_AUSGEWERTET", "Seitenlimit überschritten: Seite wurde nicht ausgewertet.")
+            for nr in range(ausgewertete_seiten + 1, seiten_anzahl + 1)
+        )
 
+    seiten = list(alle_seiten[:ausgewertete_seiten])
     seiten_texte: list[str] = []
     fehlgeschlagene_seiten = 0
-    for seite in alle_seiten[:ausgewertete_seiten]:
+    for nr, seite in enumerate(seiten, start=1):
         try:
             seiten_texte.append(seite.extract_text() or "")
         except Exception:
             seiten_texte.append("")
             fehlgeschlagene_seiten += 1
+            offen.append(OffeneStelle(nr, "LESEFEHLER", "Text dieser Seite konnte nicht gelesen werden."))
     if fehlgeschlagene_seiten:
         warnungen.append(
             f"Auf {fehlgeschlagene_seiten} von {ausgewertete_seiten} ausgewerteten Seite(n) konnte kein Text "
@@ -462,33 +1004,68 @@ def extrahiere(rohbytes: bytes, *, max_seiten: int) -> ExtraktionsErgebnis:
 
     gesamtlaenge = sum(len(t.strip()) for t in seiten_texte)
     hat_textlage = gesamtlaenge >= _MINDEST_TEXTLAENGE_FUER_TEXTLAGE
+
+    nachtrag_stelle = next(
+        ((i, m.start()) for i, t in enumerate(seiten_texte) for m in [_NACHTRAG.search(t)] if m), None,
+    ) if hat_textlage else None
+    formular = _lese_formular(reader, seiten, nachtrag_stelle[0] + 1 if nachtrag_stelle else None)
+    offen.extend(formular.offen)
+
+    seiten_mit_formularwert = {f.seite for funde in formular.funde.values() for f in funde}
+    lesefehler_seiten = {o.seite for o in offen if o.grund == "LESEFEHLER"}
+    leere_seiten = []
+    for nr, text in enumerate(seiten_texte, start=1):
+        if len(text.strip()) >= _MINDEST_TEXTLAENGE_FUER_TEXTLAGE or nr in lesefehler_seiten:
+            continue
+        leere_seiten.append(nr)
+        offen.append(
+            OffeneStelle(nr, "NUR_FORMULAR", "Seite ohne Textlayer: nur Formularfelder ausgewertet, übriger Inhalt ungeprüft.")
+            if nr in seiten_mit_formularwert else
+            OffeneStelle(nr, "KEIN_TEXT", "Seite ohne auswertbaren Text (vermutlich Scan): nicht ausgewertet.")
+        )
     if not hat_textlage:
         warnungen.append(
+            "Kein auswertbarer Textlayer gefunden - Belegwerte stammen ausschließlich aus Formularfeldern, "
+            "bitte den übrigen Inhalt manuell prüfen."
+            if formular.funde else
             "Kein auswertbarer Textlayer gefunden (vermutlich gescanntes Dokument ohne OCR) - "
             "es konnten KEINE Felder automatisch vorgeschlagen werden, bitte vollständig manuell erfassen."
         )
-        return ExtraktionsErgebnis(
-            seiten_anzahl=seiten_anzahl, ausgewertete_seiten=ausgewertete_seiten,
-            hat_textlage=False, treffer={}, mehrdeutige_treffer={}, warnungen=tuple(warnungen),
+    elif leere_seiten:
+        warnungen.append(
+            f"Seite(n) {', '.join(map(str, leere_seiten))} ohne auswertbaren Text - Inhalt ungeprüft, bitte manuell prüfen."
         )
+    if nachtrag_stelle is not None:
+        warnungen.append(
+            f"Dokument enthält ab Seite {nachtrag_stelle[0] + 1} einen Nachtrag-Hinweis - Rangfolge der Regelungen bitte manuell prüfen."
+        )
+
+    funde_je_feld: dict[str, list[FeldTreffer]] = {}
+    if hat_textlage:
+        for feld, muster in _MUSTER.items():
+            for seiten_index, text in enumerate(seiten_texte):
+                for match in muster.finditer(text):
+                    im_nachtrag = nachtrag_stelle is not None and (seiten_index, match.start()) >= nachtrag_stelle
+                    funde_je_feld.setdefault(feld, []).append(FeldTreffer(
+                        wert=_erste_gruppe(match), seite=seiten_index + 1,
+                        auszug=_auszug(text, match.start(), match.end()), im_nachtrag=im_nachtrag,
+                    ))
+    for feld, funde in formular.funde.items():
+        funde_je_feld.setdefault(feld, []).extend(funde)
 
     treffer: dict[str, FeldTreffer] = {}
     mehrdeutige_treffer: dict[str, list[FeldTreffer]] = {}
-    for feld, muster in _MUSTER.items():
-        funde: list[FeldTreffer] = []
-        for seiten_index, text in enumerate(seiten_texte):
-            for match in muster.finditer(text):
-                wert = _erste_gruppe(match)
-                funde.append(FeldTreffer(wert=wert, seite=seiten_index + 1, auszug=_auszug(text, match.start(), match.end())))
-        if not funde:
-            continue
-        distinkte_werte = {_normalisiere(f.wert) for f in funde}
-        if len(distinkte_werte) == 1:
-            treffer[feld] = funde[0]
+    for feld, funde in funde_je_feld.items():
+        einzeln, mehrere = _zusammenfuehren(feld, funde)
+        if einzeln is not None:
+            treffer[feld] = einzeln
         else:
-            mehrdeutige_treffer[feld] = funde
+            mehrdeutige_treffer[feld] = mehrere
 
     return ExtraktionsErgebnis(
         seiten_anzahl=seiten_anzahl, ausgewertete_seiten=ausgewertete_seiten,
-        hat_textlage=True, treffer=treffer, mehrdeutige_treffer=mehrdeutige_treffer, warnungen=tuple(warnungen),
+        hat_textlage=hat_textlage, treffer=treffer, mehrdeutige_treffer=mehrdeutige_treffer,
+        warnungen=tuple(warnungen), offene_stellen=tuple(offen),
+        unbekannte_formularfelder=tuple(formular.unbekannt), signaturfelder=tuple(formular.signaturen),
+        quelle_sha256=quelle_sha256,
     )

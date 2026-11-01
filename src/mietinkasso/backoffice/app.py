@@ -26,6 +26,7 @@ from mietinkasso.backoffice.routes import (
     monatsbericht as monatsbericht_routes,
     variableabrechnung as variableabrechnung_routes,
     vertragsanlage as vertragsanlage_routes,
+    vertragscheck as vertragscheck_routes,
     vertragspruefung as vertragspruefung_routes,
     zinsprofile as zinsprofile_routes,
 )
@@ -53,6 +54,8 @@ router.include_router(indexprofile_routes.router)
 router.include_router(indexbetrieb_routes.router)
 router.include_router(monatsbericht_routes.router)
 router.include_router(variableabrechnung_routes.router)
+# Dreisegmentige Pfade unter /vertrag/{id}/..., überlappen mit keinem Platzhalter.
+router.include_router(vertragscheck_routes.router)
 # Bewusst zuletzt: `GET /vertrag/{vertrag_id}` ist der einzige
 # zweisegmentige Platzhalter unter /vertrag/ und steht modulintern NACH
 # `GET /vertrag/weiterleiten`. Diese beiden Routen dürfen weder getrennt
