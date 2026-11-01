@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import ssl
 import stat
 import threading
@@ -71,6 +72,7 @@ def _sende(adapter, pdf_bytes=None):
 def _settings(tmp_path, **overrides) -> SimpleNamespace:
     key = tmp_path / "post-api-key"
     key.write_text(_KEY + "\n", encoding="utf-8")
+    key.chmod(0o600)
     werte = dict(
         brief_transport="rest", brief_rest_basis_url=_TEST, brief_rest_api_key_datei=str(key),
         brief_rest_registered_mail_type="Einschreiben", brief_rest_preisobergrenze=Decimal("10"),
@@ -134,6 +136,7 @@ def test_unvollstaendige_oder_ungueltige_werte_bleiben_geschlossen(tmp_path, fel
 def test_ungueltiger_schluesseldateiinhalt_bleibt_geschlossen(tmp_path, inhalt):
     key = tmp_path / "key"
     key.write_bytes(inhalt)
+    key.chmod(0o600)  # abgelehnt wird der Inhalt, nicht das Dateirecht
     assert konfiguration_aus_settings(_settings(tmp_path, brief_rest_api_key_datei=str(key))) is None
 
 
@@ -164,6 +167,14 @@ def test_offene_schluesseldatei_wird_bei_aktiver_rechtepruefung_abgelehnt(tmp_pa
     settings = _settings(tmp_path)
     Path(settings.brief_rest_api_key_datei).chmod(0o644)  # unter Windows meldet lstat ohnehin 0o666
     monkeypatch.setattr(brief_rest, "_POSIX_RECHTE_PRUEFEN", True)
+    assert konfiguration_aus_settings(settings) is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="braucht echte POSIX-Dateirechte")
+def test_echte_posix_rechte_entscheiden_ueber_die_schluesseldatei(tmp_path):
+    settings = _settings(tmp_path)
+    assert konfiguration_aus_settings(settings).api_key == _KEY
+    Path(settings.brief_rest_api_key_datei).chmod(0o644)
     assert konfiguration_aus_settings(settings) is None
 
 

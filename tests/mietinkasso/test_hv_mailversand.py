@@ -2331,6 +2331,7 @@ def test_rest_ohne_geprueften_empfaenger_macht_keinen_request(hv, basis_vertrag,
 def _transport_service(session_factory, tmp_path, **overrides):
     key = tmp_path / "post-api-key"
     key.write_text("SYNTHETIC-KEY", encoding="utf-8")
+    key.chmod(0o600)
     sftp_user, sftp_pass = tmp_path / "sftp-user", tmp_path / "sftp-pass"
     sftp_user.write_text("synthetic", encoding="utf-8")
     sftp_pass.write_text("synthetic", encoding="utf-8")
