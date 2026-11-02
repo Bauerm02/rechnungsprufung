@@ -61,6 +61,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
+from mietinkasso.domain.enums import OPTyp
 from mietinkasso.infrastructure.db.tables import BriefAnbieterProfilTable, OPPositionTable, OenbBasiszinssatzTable, ZinsprofilTable
 from mietinkasso.op.service import OffeneForderung, compute_content_hash
 
@@ -205,16 +206,16 @@ def balance_zeitreihe_fuer_forderung(
     aber schon je Ereignis - jetzt identisch, Ereignis für Ereignis."""
 
     from mietinkasso.domain.enums import OPTyp
-    from mietinkasso.op.service import verteile_minderung
+    from mietinkasso.op.service import forderungswirksame_rows, verteile_minderung, zahlungsziele
 
     positive_typen = {OPTyp.EROEFFNUNG.value, OPTyp.SOLL.value, OPTyp.RUECKLASTSCHRIFT.value}
     negative_typen = {OPTyp.GUTSCHRIFT.value, OPTyp.ZAHLUNG.value}
 
-    forderungs_rows = [p for p in alle_positionen if p.typ in positive_typen and p.betrag_cent > 0]
-    forderungs_rows.sort(key=lambda p: (p.faelligkeit or p.belegdatum, p.belegdatum, p.id))
-    forderung_by_id = {p.id: p for p in forderungs_rows}
+    forderungs_rows = forderungswirksame_rows(alle_positionen)
+    forderung_by_id = zahlungsziele(forderungs_rows)
+    forderungswirksam_by_id = {p.id: p for p in forderungs_rows}
 
-    ziel = forderung_by_id.get(ziel_op_position_id)
+    ziel = forderungswirksam_by_id.get(ziel_op_position_id)
     if ziel is None or not ziel.faelligkeit_bekannt or ziel.faelligkeit is None:
         return None
 
@@ -491,6 +492,10 @@ def _entgeltforderung_schluessel(forderung: OffeneForderung) -> str:
 def _faellige_entgeltforderungs_schluessel(forderungen: list[OffeneForderung], heute: date) -> list[str]:
     gesehen: list[str] = []
     for forderung in forderungen:
+        # Eine positive KORREKTUR ist ohne fachliche Qualifikation keine
+        # Entgeltforderung und loest keine Pauschale/Versandkosten aus.
+        if forderung.art == OPTyp.KORREKTUR.value:
+            continue
         if not forderung.faelligkeit_bekannt or forderung.faelligkeit is None or forderung.faelligkeit > heute:
             continue
         schluessel = _entgeltforderung_schluessel(forderung)
@@ -857,6 +862,12 @@ def berechne_mahnkosten_vorschau(
     alle_segmente: list[ZinsSegment] = []
 
     for forderung in forderungen_fuer_verzinsung:
+        if forderung.art == OPTyp.KORREKTUR.value:
+            ausgeschlossen.append(
+                f"Forderung #{forderung.op_position_id} (KORREKTUR): Zinsqualifikation nicht geprueft - "
+                "wird NICHT automatisch verzinst."
+            )
+            continue
         perioden = balance_zeitreihe_fuer_forderung(
             ziel_op_position_id=forderung.op_position_id, alle_positionen=alle_positionen, heute=heute,
         )

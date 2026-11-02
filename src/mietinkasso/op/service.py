@@ -48,6 +48,42 @@ def _effect_cent(row: OPPositionTable) -> int:
     raise ValueError(f"Unbekannter OP-Typ {row.typ}")
 
 
+def ist_positive_korrektur(row: OPPositionTable) -> bool:
+    """Positive, nicht stornierte KORREKTUR: erhoeht den Kontosaldo und ist
+    deshalb als forderungswirksame Gegenposition zu fuehren. Der Statusfilter
+    schuetzt `balance_zeitreihe_fuer_forderung`, deren Aufrufer auch
+    `list_alle_positionen` (inkl. STORNIERT) uebergeben kann."""
+
+    return (
+        OPTyp(row.typ) is OPTyp.KORREKTUR
+        and row.betrag_cent > 0
+        and row.status != "STORNIERT"
+    )
+
+
+def forderungswirksame_rows(positionen: list[OPPositionTable]) -> list[OPPositionTable]:
+    """Gemeinsame Quelle fuer `offene_forderungen` und
+    `mahnwesen.kosten.balance_zeitreihe_fuer_forderung`: echte Forderungen
+    plus positive KORREKTUR, sortiert nach Faelligkeit/Belegdatum. Eine
+    positive KORREKTUR ohne Faelligkeit wird nie mit einer erfundenen
+    Faelligkeit versehen; das Belegdatum dient nur der Sortierung."""
+
+    rows = [
+        p for p in positionen
+        if (OPTyp(p.typ) in _POSITIVE_TYPEN and p.betrag_cent > 0) or ist_positive_korrektur(p)
+    ]
+    rows.sort(key=lambda p: (p.faelligkeit or p.belegdatum, p.belegdatum, p.id))
+    return rows
+
+
+def zahlungsziele(rows: list[OPPositionTable]) -> dict[int, OPPositionTable]:
+    """Zulaessige Ziele einer expliziten Zahlungsbindung. Positive KORREKTUR
+    bleibt ausgeschlossen, damit `resolve_zahlungsziel` unveraendert
+    fehlschlaegt, wenn eine Zahlung auf eine KORREKTUR zeigt."""
+
+    return {p.id: p for p in rows if not ist_positive_korrektur(p)}
+
+
 def resolve_zahlungsziel(
     zahlung: OPPositionTable, forderung_by_id: dict[int, OPPositionTable]
 ) -> OPPositionTable:
@@ -131,6 +167,11 @@ def verteile_minderung(
             abzug = min(aktuell, rest_zu_verteilen)
             rest_by_id[p.id] -= abzug
             rest_zu_verteilen -= abzug
+        # Traegt nur eine positive KORREKTUR diese Periode (keine echte
+        # Forderung), bleibt ein Ueberschuss wie bisher gebundenes Guthaben,
+        # statt durch eine Teilerstattung in den generischen Pool zu fallen.
+        if rest_zu_verteilen > 0 and not any(p.leistungsperiode == periode for p in forderung_by_id.values()):
+            return
 
     if rest_zu_verteilen <= 0:
         return
@@ -147,6 +188,53 @@ def verteile_minderung(
         abzug = min(aktuell, rest_zu_verteilen)
         rest_by_id[p.id] -= abzug
         rest_zu_verteilen -= abzug
+
+
+def _minderungsereignisse(positionen: list[OPPositionTable]) -> list[tuple[date, int, OPPositionTable | None, int]]:
+    """Chronologische Minderungsereignisse; Logik unveraendert aus `offene_forderungen` uebernommen."""
+
+    minderungen: list[tuple[date, int, OPPositionTable | None, int]] = []
+    for p in positionen:
+        typ = OPTyp(p.typ)
+        if typ in _NEGATIVE_TYPEN:
+            minderungen.append((p.buchungsdatum, p.id, p, p.betrag_cent))
+        elif typ in _POSITIVE_TYPEN and p.betrag_cent < 0:
+            minderungen.append((p.buchungsdatum, p.id, None, -p.betrag_cent))
+        elif typ is OPTyp.KORREKTUR:
+            effekt = _effect_cent(p)
+            if effekt < 0:
+                minderungen.append((p.buchungsdatum, p.id, None, -effekt))
+    minderungen.sort(key=lambda m: (m[0], m[1]))
+    return minderungen
+
+
+def _ungedeckter_nicht_faelliger_korrekturrest(positionen: list[OPPositionTable], heute: date) -> int:
+    """Ungedeckter Rest positiver KORREKTUREN ohne eingetretene Faelligkeit.
+    Bei inkonsistenter Bindung gilt konservativ der volle Betrag als nicht
+    faellig; `offene_forderungen` meldet die Fehlbindung weiterhin selbst."""
+
+    kandidaten = [
+        p for p in positionen
+        if ist_positive_korrektur(p)
+        and not (p.faelligkeit_bekannt and p.faelligkeit is not None and p.faelligkeit <= heute)
+    ]
+    if not kandidaten:
+        return 0
+    rows = forderungswirksame_rows(positionen)
+    forderung_by_id = zahlungsziele(rows)
+    rest_by_id = {p.id: p.betrag_cent for p in rows}
+    try:
+        for _datum, _id, quelle, betrag in _minderungsereignisse(positionen):
+            verteile_minderung(
+                quelle=quelle,
+                rest_zu_verteilen=betrag,
+                forderungs_rows=rows,
+                forderung_by_id=forderung_by_id,
+                rest_by_id=rest_by_id,
+            )
+    except ZahlungsbindungInkonsistentError:
+        return sum(p.betrag_cent for p in kandidaten)
+    return sum(rest_by_id[p.id] for p in kandidaten)
 
 
 @dataclass(frozen=True)
@@ -584,6 +672,11 @@ class OPService:
             elif position.faelligkeit_bekannt and position.faelligkeit is not None and position.faelligkeit <= heute:
                 faellig_rest += effekt
 
+        # Eine positive KORREKTUR bleibt in der Summe, soweit sie Guthaben
+        # verbraucht; nur ein ungedeckter, nicht faelliger Rest gibt keine
+        # Mahngrundlage (keine automatische Mahnfreigabe).
+        faellig_rest -= _ungedeckter_nicht_faelliger_korrekturrest(positionen, heute)
+
         return OPSaldo(
             konto_id=konto_id,
             saldo_cent=saldo_cent,
@@ -658,9 +751,8 @@ class OPService:
         # landet stattdessen im Minderungs-Pool (siehe unten) - sonst würde
         # sie weder als Forderung noch als Guthaben gezählt und würde
         # spurlos verschwinden, ohne spätere Forderungen zu mindern.
-        forderungs_rows = [p for p in positionen if OPTyp(p.typ) in _POSITIVE_TYPEN and p.betrag_cent > 0]
-        forderungs_rows.sort(key=lambda p: (p.faelligkeit or p.belegdatum, p.belegdatum, p.id))
-        forderung_by_id = {p.id: p for p in forderungs_rows}
+        forderungs_rows = forderungswirksame_rows(positionen)
+        forderung_by_id = zahlungsziele(forderungs_rows)
         rest_by_id = {p.id: p.betrag_cent for p in forderungs_rows}
 
         # Minderungsereignisse (Zahlung/Gutschrift, Guthaben in
@@ -668,18 +760,7 @@ class OPService:
         # sammeln - `quelle` ist NUR für Zahlung/Gutschrift gesetzt (die
         # einzigen Typen, die eine `bezieht_sich_auf_id`/`leistungsperiode`
         # im hier relevanten Sinn tragen können).
-        minderungen: list[tuple[date, int, OPPositionTable | None, int]] = []
-        for p in positionen:
-            typ = OPTyp(p.typ)
-            if typ in _NEGATIVE_TYPEN:
-                minderungen.append((p.buchungsdatum, p.id, p, p.betrag_cent))
-            elif typ in _POSITIVE_TYPEN and p.betrag_cent < 0:
-                minderungen.append((p.buchungsdatum, p.id, None, -p.betrag_cent))
-            elif typ is OPTyp.KORREKTUR:
-                effekt = _effect_cent(p)
-                if effekt < 0:
-                    minderungen.append((p.buchungsdatum, p.id, None, -effekt))
-        minderungen.sort(key=lambda m: (m[0], m[1]))
+        minderungen = _minderungsereignisse(positionen)
 
         for _datum, _id, quelle, betrag in minderungen:
             verteile_minderung(

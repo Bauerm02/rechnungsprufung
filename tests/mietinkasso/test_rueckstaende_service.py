@@ -269,15 +269,12 @@ def test_offene_position_zeigt_op_id_und_belegreferenz(admin_ctx, bestand, stamm
     assert original is not None and original.beleg_referenz == v1_position.beleg_referenz
 
 
-def test_kontostand_ohne_entsprechende_einzelposition_zeigt_abweichung(
+def test_positive_korrektur_bleibt_als_nicht_faellige_einzelposition_sichtbar(
     admin_ctx, stammdaten_repo, op_service, mahn_fall_repo
 ):
-    """Unabhängiger Review, exakt reproduziert: eine positive KORREKTUR-
-    Buchung von 777 Cent erhöht den Kontostand auf 7,77 EUR, erzeugt aber
-    KEINE eigene offene Einzelposition (KORREKTUR ist keine Forderungsart
-    in `OPService.offene_forderungen`) - die Abweichung (7,77 EUR) muss
-    explizit an der Mietkonto-Zeile ausgewiesen werden, statt beide Werte
-    fälschlich gleichzusetzen."""
+    """Unabhängige Abnahme: Eine ungedeckte positive KORREKTUR bleibt
+    sowohl im Kontostand als auch als Einzelposition sichtbar. Ohne
+    bekannte Fälligkeit entsteht daraus keine fällige Mietforderung."""
 
     stammdaten_repo.upsert_gesellschaft(id="7DI", name="7D Immobilien GmbH")
     stammdaten_repo.upsert_objekt(id="601", gesellschaft_id="7DI", bezeichnung="Am Corso")
@@ -299,9 +296,14 @@ def test_kontostand_ohne_entsprechende_einzelposition_zeigt_abweichung(
     )
     zeile = uebersicht.mietkonten[0]
     assert zeile.saldo_cent == 777
-    assert zeile.positionen_rest_gesamt_cent == 0
-    assert zeile.abweichung_saldo_zu_positionen_cent == 777
-    assert not any(p.vertrag_id == "V-601-1" for p in uebersicht.offene_positionen)
+    assert zeile.positionen_rest_gesamt_cent == 777
+    assert zeile.abweichung_saldo_zu_positionen_cent == 0
+    assert zeile.positionen_faelliger_rest_cent == 0
+    assert op_service.berechne_saldo(konto.id, stichtag=_HEUTE).faelliger_unstrittiger_rest_cent == 0
+    position = next(p for p in uebersicht.offene_positionen if p.vertrag_id == "V-601-1")
+    assert position.art == "KORREKTUR" and position.rest_cent == 777
+    assert position.faelligkeit is None and not position.faelligkeit_bekannt
+    assert position.faelligkeitsklasse == "UNBEKANNT"
 
 
 def test_reines_guthaben_ohne_offene_position_zeigt_keine_abweichung(
